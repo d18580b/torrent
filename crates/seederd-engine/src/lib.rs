@@ -42,6 +42,6 @@ pub use resume_store::{FsResumeStore, MemoryResumeStore, ResumeStore};
 pub use slot::{Slot, SlotConfig, SlotId, SlotStatus};
 pub use source::{AlertSource, MultiSlotSource, SingleSessionSource};
 pub use state::{RetryState, StateMap, TorrentPhase, TorrentState};
-pub use vpn::{MockVpn, VpnManager, VpnProfile, VpnType};
+pub use vpn::{MockVpn, VpnError, VpnManager, VpnProfile, VpnType};
 
 pub use alert_loop::{AlertLoopHandle, AlertLoopBuilder, ShutdownReason};
