@@ -33,7 +33,7 @@ clap = { version = "4", features = ["derive"] }
 
 # Logging / metrics
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt", "chrono"] }
 tracing-futures = "0.2"
 prometheus = { version = "0.13", default-features = false }
 

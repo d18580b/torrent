@@ -1,0 +1,226 @@
+//! Startup orchestrator: build the engine(s), wire the alert loop, bind
+//! the HTTP server, install signal handlers, and run until shutdown.
+//!
+//! The single-session and multi-slot paths converge at the AlertSource
+//! trait — both produce an `Arc<dyn AlertSource>` that the rest of the
+//! daemon consumes uniformly.
+
+use std::sync::Arc;
+
+use anyhow::Context;
+use axum::Router;
+use tokio::sync::{broadcast, mpsc};
+use tracing::{error, info, warn};
+
+use seederd_engine::{
+    AlertLoopBuilder, AlertSource, AssignmentRegistry, FsResumeStore, MultiSlotSource,
+    RealEngine, ResumeStore, ShutdownReason, SingleSessionSource, SlotId, StateMap, SystemClock,
+    TorrentEngine,
+};
+
+use crate::app_state::{AppState, Mode};
+use crate::config::Config;
+use crate::http;
+use crate::metrics_sink::PromSink;
+use crate::reload;
+use crate::signals::{self, SignalChannels};
+
+pub struct DaemonHandle {
+    cfg: Config,
+    state: Arc<StateMap>,
+    source: Arc<dyn AlertSource>,
+    shutdown_tx: broadcast::Sender<ShutdownReason>,
+    reload_rx: mpsc::Receiver<()>,
+    metrics: Arc<PromSink>,
+    registry: Arc<AssignmentRegistry>,
+    alert_loop: seederd_engine::AlertLoopHandle,
+}
+
+pub async fn boot(cfg: Config) -> anyhow::Result<DaemonHandle> {
+    info!("starting seederd");
+    let mode = if cfg.slot.is_empty() { Mode::Single } else { Mode::MultiSlot };
+
+    // Resume store — single root for both modes; FsResumeStore partitions
+    // by slot id internally.
+    let resume_store: Arc<dyn ResumeStore> = Arc::new(FsResumeStore::new(cfg.resume_dir.clone()));
+
+    // Assignment registry.
+    let registry = Arc::new(
+        AssignmentRegistry::load(cfg.registry_path())
+            .context("load assignment registry")?,
+    );
+
+    // Engines per slot (or one for single-session).
+    let source: Arc<dyn AlertSource> = match mode {
+        Mode::Single => {
+            let engine: Arc<dyn TorrentEngine> = Arc::new(
+                RealEngine::new(&cfg.libtorrent_settings()).context("construct RealEngine")?,
+            );
+            Arc::new(SingleSessionSource::new(engine))
+        }
+        Mode::MultiSlot => {
+            let mut entries: Vec<(SlotId, Arc<dyn TorrentEngine>)> = Vec::new();
+            for s in &cfg.slot {
+                let mut settings = cfg.libtorrent_settings();
+                settings.user_agent = Some(s.user_agent.clone());
+                settings.handshake_client_version = Some(s.user_agent.clone());
+                settings.peer_fingerprint = Some(s.peer_fingerprint_hex.clone());
+                // VPN integration goes here in Phase 9; for now we trust
+                // the operator to have brought the tunnel up out-of-band.
+                settings.listen_interfaces = Some(format!("0.0.0.0:{}", s.listen_port));
+                settings.enable_dht = Some(false);
+                settings.enable_lsd = Some(false);
+                match RealEngine::new(&settings) {
+                    Ok(engine) => entries.push((s.id.clone(), Arc::new(engine))),
+                    Err(e) => {
+                        error!(slot_id = %s.id, error.cause = %e, "slot engine construction failed");
+                    }
+                }
+            }
+            if entries.is_empty() {
+                anyhow::bail!("multi-slot mode: no slots came up");
+            }
+            Arc::new(MultiSlotSource::new(entries))
+        }
+    };
+
+    // Resume scan: load every saved resume file per slot. The shim
+    // already deduplicates duplicate adds so a future torrent dir scan
+    // won't double-add.
+    for slot in source.slots() {
+        let entries = resume_store
+            .load_all(&slot)
+            .context("scan resume dir")?;
+        let count = entries.len();
+        let engine = source
+            .engine_for(&slot)
+            .ok_or_else(|| anyhow::anyhow!("no engine for slot {}", slot))?;
+        for (ih, data) in entries {
+            // Cross-check the registry; PRD aborts the slot on mismatch.
+            // Single-session always uses SlotId::DEFAULT, so the check
+            // mainly guards multi-slot mode.
+            if let Some(existing) = registry.lookup(&ih) {
+                if existing != slot {
+                    warn!(
+                        slot_id = %slot,
+                        infohash = %ih,
+                        existing_slot = %existing,
+                        "resume file in wrong slot; skipping (operator must reconcile)",
+                    );
+                    continue;
+                }
+            } else {
+                let _ = registry.assign(ih, slot.clone());
+            }
+            if let Err(e) = engine.add_torrent(libtorrent_safe::AddParams::Resume {
+                bytes: data.into_inner(),
+            }) {
+                warn!(slot_id = %slot, infohash = %ih, error.cause = %e, "resume add failed");
+            }
+        }
+        info!(slot_id = %slot, torrent_count = count, "resume scan complete");
+    }
+
+    // Metrics + alert loop.
+    let metrics = Arc::new(PromSink::new());
+    let metrics_for_loop: Arc<dyn seederd_engine::MetricsSink> = metrics.clone();
+    let state = Arc::new(StateMap::new());
+    let clock: Arc<dyn seederd_engine::Clock> = Arc::new(SystemClock);
+
+    let alert_loop = AlertLoopBuilder::new(
+        source.clone(),
+        state.clone(),
+        resume_store.clone(),
+        metrics_for_loop,
+        clock,
+    )
+    .spawn();
+
+    // Signals.
+    let channels = SignalChannels::new();
+    let (reload_tx, reload_rx) = mpsc::channel::<()>(8);
+    let channels = SignalChannels::from_parts(channels.shutdown_tx, reload_tx);
+    // Drop the receiver returned by signals::run; we wired our own pair.
+    let _ = signals::run(channels.clone(), 8).await;
+    let shutdown_tx = channels.shutdown_tx;
+
+    Ok(DaemonHandle {
+        cfg,
+        state,
+        source,
+        shutdown_tx,
+        reload_rx,
+        metrics,
+        registry,
+        alert_loop,
+    })
+}
+
+impl DaemonHandle {
+    /// Run the daemon until a shutdown signal arrives, returning the
+    /// process exit code.
+    pub async fn run_until_signal(self) -> i32 {
+        let DaemonHandle {
+            cfg,
+            state,
+            source,
+            shutdown_tx,
+            reload_rx,
+            metrics,
+            registry,
+            alert_loop,
+        } = self;
+
+        let app_state = AppState {
+            source: source.clone(),
+            registry: registry.clone(),
+            state,
+            metrics,
+            mode: if cfg.slot.is_empty() { Mode::Single } else { Mode::MultiSlot },
+        };
+
+        let app: Router = http::router(app_state);
+        let http_listen = cfg.http_listen;
+
+        // SIGHUP pump.
+        let reload_source = source.clone();
+        let cfg_path = std::env::args()
+            .skip_while(|a| a != "--config" && !a.starts_with("--config="))
+            .nth(1)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default();
+        let cfg_clone = cfg.clone();
+        tokio::spawn(reload::run(cfg_path, cfg_clone, reload_source, reload_rx));
+
+        let listener = match tokio::net::TcpListener::bind(http_listen).await {
+            Ok(l) => l,
+            Err(e) => {
+                error!(addr = %http_listen, error.cause = %e, "bind HTTP listener");
+                return 70;
+            }
+        };
+        info!(addr = %http_listen, "HTTP server listening");
+
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        let server = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.recv().await;
+            });
+
+        let exit_code = match server.await {
+            Ok(()) => 0,
+            Err(e) => {
+                error!(error.cause = %e, "HTTP server exited with error");
+                70
+            }
+        };
+
+        // Trigger alert-loop shutdown and join.
+        alert_loop.signal_shutdown(ShutdownReason::Sigterm);
+        if let Err(e) = alert_loop.join() {
+            warn!(error.cause = ?e, "alert loop join panicked");
+        }
+        info!("seederd: clean exit");
+        exit_code
+    }
+}
