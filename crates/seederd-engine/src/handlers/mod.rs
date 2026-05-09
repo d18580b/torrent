@@ -1,0 +1,35 @@
+//! Per-alert dispatch. One module per alert family; each exposes a
+//! `handle(&Alert, &mut HandlerCtx)` free function. The central dispatcher
+//! in `alert_loop.rs` matches on the `Alert` variant and routes here.
+
+pub mod add;
+pub mod dropped;
+pub mod error;
+pub mod listen;
+pub mod log_msg;
+pub mod resume;
+pub mod state_update;
+
+use std::sync::Arc;
+
+use tracing::Span;
+
+use crate::clock::Clock;
+use crate::engine::TorrentEngine;
+use crate::metrics::MetricsSink;
+use crate::resume_store::ResumeStore;
+use crate::slot::SlotId;
+use crate::state::StateMap;
+
+/// Borrowed state passed to every handler. One ctx per alert (cheap to
+/// build because everything is a reference). The lifetime is tied to the
+/// dispatch call, not the alert loop's lifetime.
+pub struct HandlerCtx<'a> {
+    pub state:   &'a StateMap,
+    pub resume:  &'a dyn ResumeStore,
+    pub metrics: &'a dyn MetricsSink,
+    pub clock:   &'a dyn Clock,
+    pub engine:  &'a Arc<dyn TorrentEngine>,
+    pub slot_id: SlotId,
+    pub span:    Span,
+}

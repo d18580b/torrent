@@ -31,9 +31,7 @@ const ERR_BUF_LEN: usize = 512;
 
 pub struct Session {
     ptr: *mut ffi::lt_session,
-    /// Disable Send/Sync; concurrent shim calls on the same session are
-    /// permitted only with external locking.
-    _no_send_sync: PhantomData<*mut ()>,
+    _marker: PhantomData<()>,
 }
 
 impl std::fmt::Debug for Session {
@@ -41,6 +39,16 @@ impl std::fmt::Debug for Session {
         f.debug_struct("Session").field("ptr", &self.ptr).finish()
     }
 }
+
+// Safety: the C shim's `lt_session` is internally thread-safe — every shim
+// function takes the per-session handle mutex before touching state. The
+// underlying `lt::session` from libtorrent is documented thread-safe.
+// `Session` is thus Send (ownership can move across threads). We deliberately
+// do NOT implement Sync; engine layers that share a `Session` between threads
+// place it behind a `Mutex` so calls are ordered, which keeps the FFI surface
+// linearizable even though libtorrent would technically tolerate concurrent
+// calls.
+unsafe impl Send for Session {}
 
 impl Session {
     /// Construct a new session with the given settings layered on top of
@@ -56,7 +64,7 @@ impl Session {
             return Err(Error::Shim(err.into_string()));
         }
         debug!(target: "libtorrent_safe", "session created");
-        Ok(Self { ptr, _no_send_sync: PhantomData })
+        Ok(Self { ptr, _marker: PhantomData })
     }
 
     /// Apply settings on a running session. Used by SIGHUP reload and per-slot
