@@ -16,6 +16,7 @@ mod reload;
 mod signals;
 mod startup;
 mod tracing_init;
+mod vpn;
 
 use anyhow::Context;
 use clap::Parser;

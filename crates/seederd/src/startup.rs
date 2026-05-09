@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use seederd_engine::{
     AlertLoopBuilder, AlertSource, AssignmentRegistry, FsResumeStore, MultiSlotSource,
     RealEngine, ResumeStore, ShutdownReason, SingleSessionSource, SlotId, StateMap, SystemClock,
-    TorrentEngine,
+    TorrentEngine, VpnManager,
 };
 
 use crate::app_state::{AppState, Mode};
@@ -24,6 +24,7 @@ use crate::http;
 use crate::metrics_sink::PromSink;
 use crate::reload;
 use crate::signals::{self, SignalChannels};
+use crate::vpn;
 
 pub struct DaemonHandle {
     cfg: Config,
@@ -61,19 +62,50 @@ pub async fn boot(cfg: Config) -> anyhow::Result<DaemonHandle> {
         Mode::MultiSlot => {
             let mut entries: Vec<(SlotId, Arc<dyn TorrentEngine>)> = Vec::new();
             for s in &cfg.slot {
+                // 1) Bring the VPN up first. PRD Safety Rule 1: if it
+                //    fails, the slot's lt::session is never constructed
+                //    — no bare-IP fallback.
+                let vpn = vpn::for_type(s.vpn_type);
+                let tunnel_ip = match vpn.bring_up(&s.vpn_profile()) {
+                    Ok(ip) => ip,
+                    Err(e) => {
+                        error!(
+                            slot_id = %s.id,
+                            error.cause = %e,
+                            "VPN bring-up failed; slot disabled (no bare-IP fallback)",
+                        );
+                        continue;
+                    }
+                };
+
+                // 2) Bind libtorrent to the tunnel IP only.
                 let mut settings = cfg.libtorrent_settings();
                 settings.user_agent = Some(s.user_agent.clone());
                 settings.handshake_client_version = Some(s.user_agent.clone());
                 settings.peer_fingerprint = Some(s.peer_fingerprint_hex.clone());
-                // VPN integration goes here in Phase 9; for now we trust
-                // the operator to have brought the tunnel up out-of-band.
-                settings.listen_interfaces = Some(format!("0.0.0.0:{}", s.listen_port));
+                settings.listen_interfaces = Some(format!("{}:{}", tunnel_ip, s.listen_port));
+                settings.outgoing_interfaces = Some(tunnel_ip.to_string());
                 settings.enable_dht = Some(false);
                 settings.enable_lsd = Some(false);
+                settings.enable_upnp = Some(false);
+                settings.enable_natpmp = Some(false);
+
                 match RealEngine::new(&settings) {
-                    Ok(engine) => entries.push((s.id.clone(), Arc::new(engine))),
+                    Ok(engine) => {
+                        info!(
+                            slot_id = %s.id,
+                            tunnel_ip = %tunnel_ip,
+                            "slot engine up",
+                        );
+                        entries.push((s.id.clone(), Arc::new(engine)));
+                    }
                     Err(e) => {
-                        error!(slot_id = %s.id, error.cause = %e, "slot engine construction failed");
+                        error!(
+                            slot_id = %s.id,
+                            error.cause = %e,
+                            "slot engine construction failed; tearing down VPN",
+                        );
+                        vpn.bring_down(&s.vpn_interface);
                     }
                 }
             }
