@@ -9,3 +9,12 @@ description = "Safe RAII wrappers over libtorrent-sys."
 publish = false
 
 [dependencies]
+libtorrent-sys = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+bitflags = { workspace = true }
+
+[dev-dependencies]
