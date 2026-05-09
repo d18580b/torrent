@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy-and-test:
+    name: clippy + test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Recursive submodule clone — vendor/libtorrent + vendor/boost
+          # (with all 162 boost sub-libs).
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@1.90
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Cache vendored native build
+        uses: actions/cache@v4
+        with:
+          # Cache OUT_DIR-style artifacts under target/
+          path: |
+            target/debug/build/libtorrent-sys-*/out
+            target/release/build/libtorrent-sys-*/out
+          key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
+
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - run: cargo test --workspace
+
+  tracing-lint:
+    name: tracing field-name lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Reject info_hash typos and bare infohash logs
+        run: |
+          set -euo pipefail
+          # Common typo: info_hash anywhere under crates/
+          if grep -RnE '\binfo_hash\b' crates/; then
+            echo "::error::Field name must be 'infohash' (no underscore)."
+            exit 1
+          fi
+          # Free-standing log lines that emit `infohash =` outside an
+          # instrument-decorated function aren't strictly forbidden, but
+          # we want the parent span to carry the field. Soft warn only.
+          if grep -RnE 'tracing::(info|warn|error|debug)!\([^)]*infohash *=' crates/ | grep -v 'fields(' >/dev/null; then
+            echo "::warning::Free-standing infohash field in a log macro; prefer #[instrument] on the parent function."
+          fi
+
+  shim-asan:
+    name: shim ASAN
+    runs-on: ubuntu-24.04
+    # Layer 2 ASAN harness lands with the test crate (Phase 11 T22).
+    # Job is registered now so the matrix is in place; it currently no-ops.
+    if: ${{ false }}
+    steps:
+      - run: echo "shim-asan is reserved for Phase 11 T22"
