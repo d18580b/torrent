@@ -1,0 +1,37 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Cargo lock for libraries (kept in repo for the binary; libraries excluded)
+# We keep Cargo.lock at the workspace root because seederd ships a binary.
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated bindings / build artifacts
+**/bindings.rs
+**/*.bc
+**/build/
+
+# Resume data / runtime artifacts
+*.resume
+*.resume.tmp
+slot_assignments.json
+
+# Environment
+.env
+.env.local
+
+# Coverage
+*.profraw
+*.profdata
+/coverage

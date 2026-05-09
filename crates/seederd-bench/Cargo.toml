@@ -1,0 +1,15 @@
+[package]
+name = "seederd-bench"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Layer 4 soak / load harness for seederd (memory scaling, alert throughput, startup time)."
+publish = false
+
+[[bin]]
+name = "seederd-bench"
+path = "src/main.rs"
+
+[dependencies]

@@ -1,0 +1,19 @@
+# Vendored third-party sources should not skew language stats or trigger reviews.
+vendor/** linguist-vendored=true
+vendor/** linguist-generated=true
+
+# Generated bindings
+crates/libtorrent-sys/src/bindings.rs linguist-generated=true
+
+# Normalize line endings
+*           text=auto eol=lf
+*.sh        text eol=lf
+*.bat       text eol=crlf
+
+# Binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.torrent   binary
+*.resume    binary
