@@ -12,11 +12,17 @@
 
 pub mod clock;
 pub mod engine;
+pub mod handlers;
 pub mod metrics;
 pub mod mock;
+pub mod real;
 pub mod resume_store;
 pub mod slot;
+pub mod source;
+pub mod state;
 pub mod vpn;
+
+pub mod alert_loop;
 
 // Re-exports from libtorrent-safe so downstream crates don't need to know
 // about the internal crate split.
@@ -29,6 +35,11 @@ pub use clock::{Clock, MockClock, SystemClock};
 pub use engine::{EngineError, TorrentEngine};
 pub use metrics::{MetricsSink, NoopSink, RecordingSink};
 pub use mock::{MockEngine, RecordedCall};
+pub use real::RealEngine;
 pub use resume_store::{FsResumeStore, MemoryResumeStore, ResumeStore};
 pub use slot::SlotId;
+pub use source::{AlertSource, MultiSlotSource, SingleSessionSource};
+pub use state::{RetryState, StateMap, TorrentPhase, TorrentState};
 pub use vpn::{MockVpn, VpnManager, VpnProfile, VpnType};
+
+pub use alert_loop::{AlertLoopHandle, AlertLoopBuilder, ShutdownReason};

@@ -11,13 +11,16 @@
 //!     `TorrentHandle` the test can hold and pass back through the trait.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
 
 use crate::engine::{EngineError, TorrentEngine};
-use libtorrent_safe::{AddParams, Alert, InfoHash, ResumeFlags, Settings, TorrentHandle};
+use libtorrent_safe::alert::AlertHeader;
+use libtorrent_safe::{
+    AddParams, Alert, AlertKind, InfoHash, ResumeData, ResumeFlags, Settings, TorrentHandle,
+};
 
 /// Trait-method invocation captured by `MockEngine`.
 #[derive(Debug, Clone)]
@@ -73,6 +76,12 @@ pub struct MockEngine {
     error_inject: DashMap<&'static str, EngineError>,
     /// infohash → handle, so add/remove are consistent across calls.
     handles: DashMap<InfoHash, TorrentHandle>,
+    /// When set, every successful `save_resume_data(h, _)` immediately
+    /// pushes a synthetic `Alert::SaveResumeData` for `h` so callers can
+    /// drive the alert loop's shutdown coordinator without orchestrating
+    /// alerts manually. Defaults to off — tests that want full control
+    /// keep their own alert script.
+    auto_save_resume: AtomicBool,
 }
 
 impl Default for MockEngine {
@@ -87,7 +96,19 @@ impl MockEngine {
             next_handle_id: AtomicU64::new(1),
             error_inject: DashMap::new(),
             handles: DashMap::new(),
+            auto_save_resume: AtomicBool::new(false),
         }
+    }
+
+    /// Make every successful save_resume_data call enqueue a synthetic
+    /// SaveResumeData alert for the same handle. Mirrors what libtorrent
+    /// does asynchronously; useful for shutdown-coordinator tests.
+    pub fn with_auto_save_resume(self, on: bool) -> Self {
+        self.auto_save_resume.store(on, Ordering::SeqCst);
+        self
+    }
+    pub fn set_auto_save_resume(&self, on: bool) {
+        self.auto_save_resume.store(on, Ordering::SeqCst);
     }
 
     // --- test fixture helpers -----------------------------------------------
@@ -179,7 +200,19 @@ impl TorrentEngine for MockEngine {
 
     fn save_resume_data(&self, h: TorrentHandle, flags: ResumeFlags) -> Result<(), EngineError> {
         self.record(RecordedCall::SaveResumeData { handle: h, flags });
-        self.check_error("save_resume_data")
+        self.check_error("save_resume_data")?;
+        if self.auto_save_resume.load(Ordering::SeqCst) {
+            self.push_alert(Alert::SaveResumeData {
+                hdr: AlertHeader {
+                    kind: AlertKind::SaveResumeData,
+                    infohash: Some(h.infohash),
+                    handle: Some(h),
+                    timestamp_us: 0,
+                },
+                data: ResumeData::new(Vec::new()),
+            });
+        }
+        Ok(())
     }
 
     fn pop_alerts(&self) -> Vec<Alert> {
