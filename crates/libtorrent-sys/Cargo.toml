@@ -10,8 +10,21 @@ publish = false
 links = "libtorrent_shim"
 
 [features]
-default = []
+default = ["bundled"]
+# `bundled` (default) builds Boost (headers-only install) and libtorrent from
+# the vendored submodules, then compiles the C shim and runs bindgen. Without
+# the feature, build.rs is a no-op and the consuming crate must supply the
+# linker arguments itself (intended for future system-package consumers; not
+# yet wired up).
+bundled = []
+
+# Layer 2 ASAN test harness (compiled separately from the real shim; lands
+# in Phase 3 T22).
+shim-tests = []
 
 [dependencies]
 
 [build-dependencies]
+cc = "1.1"
+cmake = "0.1"
+bindgen = "0.70"

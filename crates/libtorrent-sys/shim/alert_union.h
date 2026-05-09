@@ -19,6 +19,9 @@
 
 #ifdef __cplusplus
 extern "C" {
+#else
+/* Re-open the C linkage block opened in libtorrent_shim.h since the
+ * function declarations below need to be `extern "C"` from C++ TUs. */
 #endif
 
 /* Per-variant string capacity (incl. trailing NUL). */
@@ -161,6 +164,29 @@ struct lt_alert_add_torrent {
 /* The discriminated union                                             */
 /* ------------------------------------------------------------------ */
 
+/* Named union tag — anonymous unions cause bindgen to emit an opaque
+ * placeholder for the enclosing struct; a named tag produces a proper
+ * `pub union lt_alert_payload_u { ... }` on the Rust side. */
+union lt_alert_payload_u {
+    struct lt_alert_add_torrent       add_torrent;
+    struct lt_alert_torrent_removed   torrent_removed;
+    struct lt_alert_state_update      state_update;
+    struct lt_alert_torrent_finished  torrent_finished;
+    struct lt_alert_torrent_error     torrent_error;
+    struct lt_alert_file_error        file_error;
+    struct lt_alert_hash_failed       hash_failed;
+    struct lt_alert_metadata_received metadata_received;
+    struct lt_alert_save_resume       save_resume;
+    struct lt_alert_resume_failed     resume_failed;
+    struct lt_alert_listen_failed     listen_failed;
+    struct lt_alert_listen_succeeded  listen_succeeded;
+    struct lt_alert_session_stats     session_stats;
+    struct lt_alert_alerts_dropped    alerts_dropped;
+    struct lt_alert_tracker_error     tracker_error;
+    struct lt_alert_peer_disconnected peer_disconnected;
+    struct lt_alert_log               log_msg;
+};
+
 struct lt_alert_union {
     uint32_t kind;             /* lt_alert_kind */
     uint32_t _pad;             /* keep payload 8-byte aligned */
@@ -169,26 +195,28 @@ struct lt_alert_union {
     lt_handle handle;          /* 0 if not torrent-scoped */
     int64_t  timestamp_us;     /* libtorrent alert timestamp, microseconds since session start */
 
-    union {
-        struct lt_alert_add_torrent       add_torrent;
-        struct lt_alert_torrent_removed   torrent_removed;
-        struct lt_alert_state_update      state_update;
-        struct lt_alert_torrent_finished  torrent_finished;
-        struct lt_alert_torrent_error     torrent_error;
-        struct lt_alert_file_error        file_error;
-        struct lt_alert_hash_failed       hash_failed;
-        struct lt_alert_metadata_received metadata_received;
-        struct lt_alert_save_resume       save_resume;
-        struct lt_alert_resume_failed     resume_failed;
-        struct lt_alert_listen_failed     listen_failed;
-        struct lt_alert_listen_succeeded  listen_succeeded;
-        struct lt_alert_session_stats     session_stats;
-        struct lt_alert_alerts_dropped    alerts_dropped;
-        struct lt_alert_tracker_error     tracker_error;
-        struct lt_alert_peer_disconnected peer_disconnected;
-        struct lt_alert_log               log_msg;
-    } payload;
+    union lt_alert_payload_u payload;
 };
+
+/* ------------------------------------------------------------------ */
+/* Functions over the discriminated union                              */
+/*                                                                     */
+/* These live here, after the full struct definition, so bindgen sees  */
+/* the complete type before the function signatures and emits a proper */
+/* Rust struct with all fields.                                        */
+/* ------------------------------------------------------------------ */
+
+/* Pop one alert from the session.
+ * Returns 1 if an alert was written to *out, 0 if the queue is empty.
+ * After consuming an alert, the caller MUST call lt_alert_payload_free(out)
+ * to release any heap-allocated payload (resume data, stats counters, etc.)
+ * regardless of whether the payload was inspected.
+ */
+int  lt_pop_alert(lt_session* s, struct lt_alert_union* out);
+
+/* Free heap payloads owned by a previously-popped alert. Idempotent;
+ * safe to call on a zero-initialized union. */
+void lt_alert_payload_free(struct lt_alert_union* u);
 
 #ifdef __cplusplus
 }

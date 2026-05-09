@@ -239,11 +239,6 @@ void apply_settings_from_json(lt::settings_pack& pack, const char* json) {
 // Translation utilities
 // -------------------------------------------------------------------------
 
-void infohash_to_bytes(const lt::info_hash_t& ih, std::uint8_t out[20]) {
-    auto best = ih.get_best();
-    std::memcpy(out, best.data(), 20);
-}
-
 std::uint32_t map_torrent_flags(lt::torrent_flags_t f) {
     std::uint32_t out = 0;
     if (f & lt::torrent_flags::seed_mode)    out |= LT_TF_SEED_MODE;
