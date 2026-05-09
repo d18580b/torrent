@@ -40,8 +40,10 @@ typedef struct lt_session lt_session;
 /* Stable torrent handle. 0 is the null sentinel. */
 typedef uintptr_t lt_handle;
 
-/* Forward declaration of the alert union; full layout in alert_union.h. */
-struct lt_alert_union;
+/* Functions that take a `struct lt_alert_union*` (lt_pop_alert,
+ * lt_alert_payload_free) are declared in alert_union.h instead, after the
+ * struct's full definition. Forward-declaring it here would make bindgen
+ * treat the type as opaque even after the full definition is parsed. */
 
 /* ------------------------------------------------------------------ */
 /* Return codes                                                        */
@@ -177,17 +179,8 @@ void        lt_post_session_stats(lt_session* s);
  * a save_resume_data_alert (success) or save_resume_data_failed_alert. */
 int         lt_save_resume_data(lt_session* s, lt_handle h, uint32_t flags);
 
-/* Pop one alert from the session.
- * Returns 1 if an alert was written to *out, 0 if the queue is empty.
- * After consuming an alert, the caller MUST call lt_alert_payload_free(out)
- * to release any heap-allocated payload (resume data, stats counters, etc.)
- * regardless of whether the payload was inspected.
- */
-int         lt_pop_alert(lt_session* s, struct lt_alert_union* out);
-
-/* Free heap payloads owned by a previously-popped alert. Idempotent;
- * safe to call on a zero-initialized union. */
-void        lt_alert_payload_free(struct lt_alert_union* u);
+/* lt_pop_alert and lt_alert_payload_free are declared in alert_union.h
+ * after the full struct definition for bindgen's benefit. */
 
 #ifdef __cplusplus
 }
