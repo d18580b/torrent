@@ -1,0 +1,36 @@
+services:
+  seederd:
+    build:
+      context: ..
+      dockerfile: deploy/Containerfile
+    image: seederd:latest
+    restart: unless-stopped
+    # Multi-slot mode brings up its own WireGuard tunnels. Single-session
+    # mode doesn't need NET_ADMIN; remove the cap_add + devices stanzas
+    # in that case.
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    sysctls:
+      net.ipv4.conf.all.rp_filter: "2"
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    ports:
+      - "6881:6881/tcp"
+      - "6881:6881/udp"
+      - "127.0.0.1:8080:8080"   # HTTP API — bind to localhost; front
+                                # with reverse proxy for remote access.
+    volumes:
+      - ./seederd.toml:/etc/seederd/seederd.toml:ro
+      - seederd-resume:/var/lib/seederd/resume
+      - seederd-torrents:/var/lib/seederd/torrents
+      - /etc/wireguard:/etc/wireguard:ro
+      # Operator places the actual data here; seederd reads only.
+      - /data/torrents:/data/torrents:ro
+
+volumes:
+  seederd-resume:
+  seederd-torrents:

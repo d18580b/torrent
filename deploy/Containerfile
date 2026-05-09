@@ -1,0 +1,56 @@
+# Multi-stage Containerfile for seederd.
+#
+# Stage 1 (builder): Fedora with gcc/cmake/openssl-dev + Rust via rustup.
+# Compiles vendored Boost + libtorrent + the shim + the daemon.
+# Stage 2 (runtime): Fedora minimal + just OpenSSL + ca-certificates.
+
+FROM fedora:43 AS builder
+
+RUN dnf install -y \
+        gcc-c++ make cmake ninja-build pkgconf-pkg-config \
+        openssl-devel clang-devel \
+        git curl ca-certificates \
+    && dnf clean all
+
+# Rust toolchain — pinned to whatever rust-toolchain.toml in the repo
+# requests (currently 1.90).
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --default-toolchain none --profile minimal
+ENV PATH=/root/.cargo/bin:${PATH}
+
+WORKDIR /src
+COPY . /src
+
+# `cargo build --release` will re-read rust-toolchain.toml and download
+# the matching channel automatically.
+RUN cargo build --release --workspace --bin seederd
+
+# ---- runtime --------------------------------------------------------------
+
+FROM fedora:43-minimal
+
+RUN microdnf install -y \
+        openssl ca-certificates iproute wireguard-tools \
+    && microdnf clean all
+
+COPY --from=builder /src/target/release/seederd /usr/local/bin/seederd
+COPY deploy/seederd.sample.toml /etc/seederd/seederd.toml.sample
+
+# Default config path matches the systemd unit / ExecStart.
+ENV SEEDERD_CONFIG=/etc/seederd/seederd.toml
+
+# State directories (persisted via a volume mount in compose.yaml).
+RUN mkdir -p /var/lib/seederd/resume /var/lib/seederd/torrents /data/torrents \
+    && chmod 0755 /var/lib/seederd /data/torrents
+
+EXPOSE 6881/tcp 6881/udp 8080/tcp
+
+# Drop privileges. The container needs CAP_NET_ADMIN at runtime if
+# multi-slot mode brings up VPN tunnels itself; in that case run as
+# root with `cap_add: NET_ADMIN`.
+USER 1000:1000
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -fsS http://localhost:8080/healthz || exit 1
+
+ENTRYPOINT ["/usr/local/bin/seederd", "--config", "/etc/seederd/seederd.toml"]
