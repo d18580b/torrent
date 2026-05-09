@@ -1,0 +1,306 @@
+//! `Session` — RAII handle around a libtorrent session.
+//!
+//! The struct is `!Send + !Sync` by construction (raw pointer field). The
+//! engine layer wraps a `Session` in an `Arc<Mutex<…>>` or owns it from a
+//! single thread; concurrent access is the caller's responsibility.
+//!
+//! Methods return `Result<…, Error>`, never panic on shim failures, and
+//! never expose raw pointers.
+
+use std::ffi::CString;
+use std::marker::PhantomData;
+use std::path::Path;
+
+use libtorrent_sys as ffi;
+use tracing::debug;
+
+use crate::alert::Alert;
+use crate::error::{Error, Result};
+use crate::handle::{InfoHash, TorrentHandle};
+use crate::settings::{ResumeFlags, Settings, TorrentFlags};
+
+/// Caller-friendly enum for `Session::add_torrent`.
+#[derive(Clone, Debug)]
+pub enum AddParams {
+    File { bytes: Vec<u8>, save_path: String, flags: TorrentFlags },
+    Magnet { uri: String, save_path: String, flags: TorrentFlags },
+    Resume { bytes: Vec<u8> },
+}
+
+const ERR_BUF_LEN: usize = 512;
+
+pub struct Session {
+    ptr: *mut ffi::lt_session,
+    /// Disable Send/Sync; concurrent shim calls on the same session are
+    /// permitted only with external locking.
+    _no_send_sync: PhantomData<*mut ()>,
+}
+
+impl std::fmt::Debug for Session {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Session").field("ptr", &self.ptr).finish()
+    }
+}
+
+impl Session {
+    /// Construct a new session with the given settings layered on top of
+    /// libtorrent's `high_performance_seed()` preset.
+    pub fn new(settings: &Settings) -> Result<Self> {
+        let json = settings.to_shim_json()?;
+        let json_c = CString::new(json).map_err(|_| Error::InteriorNul("settings_json".into()))?;
+        let mut err = ErrBuf::new();
+        let ptr = unsafe {
+            ffi::lt_session_create(json_c.as_ptr(), err.ptr(), err.len() as i32)
+        };
+        if ptr.is_null() {
+            return Err(Error::Shim(err.into_string()));
+        }
+        debug!(target: "libtorrent_safe", "session created");
+        Ok(Self { ptr, _no_send_sync: PhantomData })
+    }
+
+    /// Apply settings on a running session. Used by SIGHUP reload and per-slot
+    /// startup overrides.
+    pub fn apply_settings(&self, settings: &Settings) -> Result<()> {
+        let json = settings.to_shim_json()?;
+        let json_c = CString::new(json).map_err(|_| Error::InteriorNul("settings_json".into()))?;
+        let mut err = ErrBuf::new();
+        let rc = unsafe {
+            ffi::lt_session_apply_settings(self.ptr, json_c.as_ptr(), err.ptr(), err.len() as i32)
+        };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::Shim(err.into_string()))
+        }
+    }
+
+    /// Save serialized session state (DHT routing table, settings) for
+    /// restoration.
+    pub fn save_state(&self) -> Result<Vec<u8>> {
+        let mut buf: *mut u8 = std::ptr::null_mut();
+        let mut len: usize = 0;
+        let mut err = ErrBuf::new();
+        let rc = unsafe {
+            ffi::lt_session_save_state(self.ptr, &mut buf, &mut len, err.ptr(), err.len() as i32)
+        };
+        if rc != ffi::LT_OK as i32 {
+            return Err(Error::Shim(err.into_string()));
+        }
+        if buf.is_null() || len == 0 {
+            return Ok(Vec::new());
+        }
+        let v = unsafe { std::slice::from_raw_parts(buf, len).to_vec() };
+        unsafe { ffi::lt_buf_free(buf) };
+        Ok(v)
+    }
+
+    pub fn load_state(&self, buf: &[u8]) -> Result<()> {
+        if buf.is_empty() {
+            return Err(Error::InvalidInput("empty session-state buffer"));
+        }
+        let mut err = ErrBuf::new();
+        let rc = unsafe {
+            ffi::lt_session_load_state(
+                self.ptr,
+                buf.as_ptr(),
+                buf.len(),
+                err.ptr(),
+                err.len() as i32,
+            )
+        };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::Shim(err.into_string()))
+        }
+    }
+
+    /// Add a torrent. Returns the stable `TorrentHandle` (or an error).
+    pub fn add_torrent(&self, params: AddParams) -> Result<TorrentHandle> {
+        let mut err = ErrBuf::new();
+        let mut infohash = [0u8; 20];
+
+        let raw_handle = match params {
+            AddParams::File { bytes, save_path, flags } => {
+                if bytes.is_empty() { return Err(Error::InvalidInput("empty .torrent buffer")); }
+                let save_c = CString::new(save_path).map_err(|_| Error::InteriorNul("save_path".into()))?;
+                unsafe {
+                    ffi::lt_add_torrent_file(
+                        self.ptr,
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        save_c.as_ptr(),
+                        flags.bits(),
+                        infohash.as_mut_ptr(),
+                        err.ptr(),
+                        err.len() as i32,
+                    )
+                }
+            }
+            AddParams::Magnet { uri, save_path, flags } => {
+                let uri_c = CString::new(uri).map_err(|_| Error::InteriorNul("magnet uri".into()))?;
+                let save_c = CString::new(save_path).map_err(|_| Error::InteriorNul("save_path".into()))?;
+                unsafe {
+                    ffi::lt_add_torrent_magnet(
+                        self.ptr,
+                        uri_c.as_ptr(),
+                        save_c.as_ptr(),
+                        flags.bits(),
+                        infohash.as_mut_ptr(),
+                        err.ptr(),
+                        err.len() as i32,
+                    )
+                }
+            }
+            AddParams::Resume { bytes } => {
+                if bytes.is_empty() { return Err(Error::InvalidInput("empty resume buffer")); }
+                unsafe {
+                    ffi::lt_add_torrent_resume(
+                        self.ptr,
+                        bytes.as_ptr(),
+                        bytes.len(),
+                        infohash.as_mut_ptr(),
+                        err.ptr(),
+                        err.len() as i32,
+                    )
+                }
+            }
+        };
+
+        if raw_handle == 0 {
+            return Err(Error::Shim(err.into_string()));
+        }
+        Ok(TorrentHandle { id: raw_handle as u64, infohash: InfoHash(infohash) })
+    }
+
+    pub fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<()> {
+        let rc = unsafe {
+            ffi::lt_remove_torrent(self.ptr, h.id as ffi::lt_handle, delete_files as i32)
+        };
+        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+    }
+
+    pub fn pause_torrent(&self, h: TorrentHandle) -> Result<()> {
+        let rc = unsafe { ffi::lt_torrent_pause(self.ptr, h.id as ffi::lt_handle) };
+        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+    }
+
+    pub fn resume_torrent(&self, h: TorrentHandle) -> Result<()> {
+        let rc = unsafe { ffi::lt_torrent_resume(self.ptr, h.id as ffi::lt_handle) };
+        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+    }
+
+    pub fn set_upload_limit(&self, h: TorrentHandle, bytes_per_sec: i32) -> Result<()> {
+        let rc = unsafe {
+            ffi::lt_torrent_set_upload_limit(self.ptr, h.id as ffi::lt_handle, bytes_per_sec)
+        };
+        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+    }
+
+    pub fn set_file_priority(&self, h: TorrentHandle, file_idx: i32, priority: u8) -> Result<()> {
+        let rc = unsafe {
+            ffi::lt_torrent_set_file_priority(
+                self.ptr, h.id as ffi::lt_handle, file_idx, priority,
+            )
+        };
+        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+    }
+
+    pub fn save_resume_data(&self, h: TorrentHandle, flags: ResumeFlags) -> Result<()> {
+        let rc = unsafe {
+            ffi::lt_save_resume_data(self.ptr, h.id as ffi::lt_handle, flags.bits())
+        };
+        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+    }
+
+    /// Triggers a `state_update_alert` covering all subscribed torrents.
+    pub fn post_torrent_updates(&self) {
+        unsafe { ffi::lt_post_torrent_updates(self.ptr) }
+    }
+
+    /// Triggers a `session_stats_alert` with the current counters.
+    pub fn post_session_stats(&self) {
+        unsafe { ffi::lt_post_session_stats(self.ptr) }
+    }
+
+    /// Drain one alert from the queue. Returns `None` if empty (after one
+    /// pop_alerts inside the shim has already drained the libtorrent side).
+    pub fn pop_alert(&self) -> Option<Alert> {
+        loop {
+            let mut raw: ffi::lt_alert_union = unsafe { std::mem::zeroed() };
+            let got = unsafe { ffi::lt_pop_alert(self.ptr, &mut raw) };
+            if got == 0 {
+                return None;
+            }
+            // SAFETY: raw is uninitialized only outside this branch; here it
+            // was filled by lt_pop_alert.
+            match unsafe { Alert::from_raw_owned(&mut raw) } {
+                Some(alert) => return Some(alert),
+                None => {
+                    // Unknown alert kind. Skip and try the next one.
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Drain *all* alerts currently queued (after a single shim drain).
+    ///
+    /// Convenience for the engine's poll thread; equivalent to calling
+    /// `pop_alert` in a loop until it returns None.
+    pub fn drain_alerts(&self) -> Vec<Alert> {
+        let mut out = Vec::new();
+        while let Some(a) = self.pop_alert() {
+            out.push(a);
+        }
+        out
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe { ffi::lt_session_destroy(self.ptr) };
+            self.ptr = std::ptr::null_mut();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+struct ErrBuf {
+    buf: [std::os::raw::c_char; ERR_BUF_LEN],
+}
+
+impl ErrBuf {
+    fn new() -> Self { Self { buf: [0; ERR_BUF_LEN] } }
+    fn ptr(&mut self) -> *mut std::os::raw::c_char { self.buf.as_mut_ptr() }
+    fn len(&self) -> usize { ERR_BUF_LEN }
+
+    fn into_string(self) -> String {
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, ERR_BUF_LEN)
+        };
+        let nul = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
+        String::from_utf8_lossy(&bytes[..nul]).into_owned()
+    }
+}
+
+// `Path`-only helper for downstream callers. Not public; the AddParams
+// variants already accept `String`.
+#[allow(dead_code)]
+fn path_to_string(p: &Path) -> Result<String> {
+    p.to_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::InvalidInput("non-UTF8 save_path"))
+}
+
+#[cfg(test)]
+mod tests {
+    // Real session tests require the C++ build to succeed; covered by the
+    // integration tests in `crates/seederd/tests`. Pure unit tests live in
+    // settings.rs and handle.rs where they don't need libtorrent.
+}
