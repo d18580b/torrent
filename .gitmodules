@@ -1,0 +1,7 @@
+[submodule "vendor/libtorrent"]
+	path = vendor/libtorrent
+	url = https://github.com/arvidn/libtorrent.git
+	branch = RC_2_0
+[submodule "vendor/boost"]
+	path = vendor/boost
+	url = https://github.com/boostorg/boost.git
