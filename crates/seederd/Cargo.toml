@@ -13,3 +13,35 @@ name = "seederd"
 path = "src/main.rs"
 
 [dependencies]
+seederd-engine = { workspace = true }
+libtorrent-safe = { workspace = true }
+
+# Async runtime + HTTP
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+
+# CLI / config
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging / metrics
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+prometheus = { workspace = true }
+
+# Errors
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+
+# Misc
+parking_lot = { workspace = true }
+hex = { workspace = true }
+sha1 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

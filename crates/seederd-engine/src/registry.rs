@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::slot::SlotId;
 use libtorrent_safe::InfoHash;
@@ -61,7 +61,7 @@ impl AssignmentRegistry {
                 let mut out = HashMap::with_capacity(raw.len());
                 for (k, v) in raw {
                     let Some(ih) = InfoHash::from_hex(&k) else {
-                        warn!(
+                        tracing::warn!(
                             target: "seederd_engine::registry",
                             key = %k,
                             "skipping registry entry with invalid infohash hex",

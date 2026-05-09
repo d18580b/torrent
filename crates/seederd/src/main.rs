@@ -1,7 +1,60 @@
-// seederd — headless torrent seeding daemon.
-//
-// Full implementation lands in Phase 8.
-fn main() {
-    eprintln!("seederd: not yet implemented; run after Phase 8 lands");
-    std::process::exit(64);
+//! `seederd` — headless petabyte-scale torrent seeding daemon.
+//!
+//! See PRD.md for the full spec. This binary wires together the
+//! seederd-engine layer (TorrentEngine, alert loop, registry) with
+//! configuration, signals, an axum HTTP control plane, and the VPN /
+//! netlink integration. The CLI takes one argument: `--config <path>`.
+
+#![deny(unsafe_op_in_unsafe_fn)]
+
+mod app_state;
+mod cli;
+mod config;
+mod http;
+mod metrics_sink;
+mod reload;
+mod signals;
+mod startup;
+mod tracing_init;
+
+use anyhow::Context;
+use clap::Parser;
+use tracing::{error, info};
+
+use crate::cli::Cli;
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let cfg = config::Config::load(&cli.config)
+        .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+
+    if cli.check_config {
+        eprintln!("config OK");
+        return Ok(());
+    }
+
+    tracing_init::init(cfg.log_level);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("seederd-tokio")
+        .build()
+        .context("build tokio runtime")?;
+
+    runtime.block_on(async move {
+        match startup::boot(cfg).await {
+            Ok(handle) => {
+                let exit_code = handle.run_until_signal().await;
+                std::process::exit(exit_code);
+            }
+            Err(e) => {
+                error!(error.cause = %e, "startup failed");
+                std::process::exit(70); // EX_SOFTWARE
+            }
+        }
+    });
+
+    // unreachable
+    info!("seederd: clean exit");
+    Ok(())
 }
