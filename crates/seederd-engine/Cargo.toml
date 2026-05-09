@@ -9,3 +9,31 @@ description = "TorrentEngine trait, real + mock implementations, and orchestrati
 publish = false
 
 [dependencies]
+libtorrent-safe = { workspace = true }
+
+# Async / concurrency
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Errors
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Serialization (for AssignmentRegistry JSON)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Misc
+bytes = { workspace = true }
+hex = { workspace = true }
+once_cell = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

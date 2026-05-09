@@ -10,7 +10,7 @@ members = [
 
 [workspace.package]
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.90"
 license = "Apache-2.0"
 authors = ["Justin Chung"]
 repository = "https://github.com/d18580b/torrent"

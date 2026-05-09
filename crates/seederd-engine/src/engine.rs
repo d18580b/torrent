@@ -1,0 +1,87 @@
+//! `TorrentEngine` — the trait every business-logic component is written
+//! against.
+//!
+//! Concrete implementations:
+//!   - `crate::mock::MockEngine` — pre-loaded alert queue, call recorder,
+//!     per-method error injection. Drives every Layer 1 unit test.
+//!   - `RealEngine` (in `crate::real`) — delegates to a
+//!     `libtorrent_safe::Session`.
+
+use std::sync::Arc;
+
+use thiserror::Error;
+
+pub use libtorrent_safe::{AddParams, Alert, InfoHash, ResumeData, ResumeFlags, Settings, TorrentHandle};
+
+#[derive(Debug, Error)]
+pub enum EngineError {
+    #[error(transparent)]
+    Safe(#[from] libtorrent_safe::Error),
+
+    /// Caller asked for a torrent that is not in the engine's handle map.
+    /// Distinct from `Safe(TorrentNotFound)` — this is the engine layer's
+    /// view of registry/handle bookkeeping.
+    #[error("torrent not registered with engine: {}", .0)]
+    UnknownHandle(InfoHash),
+
+    /// The engine has been shut down; further calls are rejected.
+    #[error("engine shut down")]
+    Shutdown,
+
+    /// MockEngine: a method was called that the test injected an error for.
+    #[error("mock injected error on `{op}`: {message}")]
+    MockInjected { op: &'static str, message: String },
+}
+
+/// All operations the daemon's business logic performs against libtorrent.
+///
+/// Conventions:
+///   - `add_torrent` returns the canonical handle the caller should keep;
+///     duplicate adds resolve to the same handle (libtorrent and the shim
+///     handle map enforce this).
+///   - `save_resume_data` is asynchronous — the result lands as a
+///     `Alert::SaveResumeData{Failed}` event. Callers that need to wait
+///     should track an outstanding-save counter and watch the alert
+///     stream.
+///   - `pop_alerts` is non-blocking; an empty `Vec` means the queue is
+///     drained.
+///   - `post_updates` and `post_stats` trigger libtorrent to emit a
+///     `state_update_alert` and `session_stats_alert` respectively.
+pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
+    fn add_torrent(&self, params: AddParams) -> Result<TorrentHandle, EngineError>;
+    fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<(), EngineError>;
+    fn pause_torrent(&self, h: TorrentHandle) -> Result<(), EngineError>;
+    fn resume_torrent(&self, h: TorrentHandle) -> Result<(), EngineError>;
+    fn save_resume_data(&self, h: TorrentHandle, flags: ResumeFlags) -> Result<(), EngineError>;
+    fn pop_alerts(&self) -> Vec<Alert>;
+    fn post_updates(&self);
+    fn post_stats(&self);
+    fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError>;
+    fn session_state(&self) -> Result<Vec<u8>, EngineError>;
+}
+
+// Convenience: any Arc<dyn TorrentEngine> is itself a TorrentEngine.
+impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
+    fn add_torrent(&self, params: AddParams) -> Result<TorrentHandle, EngineError> {
+        (**self).add_torrent(params)
+    }
+    fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<(), EngineError> {
+        (**self).remove_torrent(h, delete_files)
+    }
+    fn pause_torrent(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        (**self).pause_torrent(h)
+    }
+    fn resume_torrent(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        (**self).resume_torrent(h)
+    }
+    fn save_resume_data(&self, h: TorrentHandle, flags: ResumeFlags) -> Result<(), EngineError> {
+        (**self).save_resume_data(h, flags)
+    }
+    fn pop_alerts(&self) -> Vec<Alert> { (**self).pop_alerts() }
+    fn post_updates(&self) { (**self).post_updates() }
+    fn post_stats(&self) { (**self).post_stats() }
+    fn apply_settings(&self, s: &Settings) -> Result<(), EngineError> {
+        (**self).apply_settings(s)
+    }
+    fn session_state(&self) -> Result<Vec<u8>, EngineError> { (**self).session_state() }
+}
