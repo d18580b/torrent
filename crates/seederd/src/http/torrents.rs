@@ -367,6 +367,60 @@ pub async fn resume(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Deserialize)]
+pub struct UploadLimitBody {
+    /// Bytes per second; 0 = unlimited.
+    bytes_per_sec: i32,
+}
+
+pub async fn set_upload_limit(
+    State(s): State<AppState>,
+    Path(infohash): Path<String>,
+    Json(body): Json<UploadLimitBody>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (st, engine) = lookup_engine(&s, &infohash)?;
+    engine.set_upload_limit(st.handle, body.bytes_per_sec).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")})))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct FilePriorityBody {
+    file_idx: i32,
+    /// libtorrent download_priority: 0=skip, 1=low, 4=normal, 7=high.
+    priority: u8,
+}
+
+pub async fn set_file_priority(
+    State(s): State<AppState>,
+    Path(infohash): Path<String>,
+    Json(body): Json<FilePriorityBody>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (st, engine) = lookup_engine(&s, &infohash)?;
+    engine.set_file_priority(st.handle, body.file_idx, body.priority).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")})))
+    })?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+type EngineRef = std::sync::Arc<dyn seederd_engine::TorrentEngine>;
+
+/// Resolve `(state, engine)` for a torrent by hex infohash, or an HTTP error.
+fn lookup_engine(
+    s: &AppState,
+    infohash: &str,
+) -> Result<(seederd_engine::TorrentState, EngineRef), AddError> {
+    let ih = InfoHash::from_hex(infohash).ok_or_else(bad_infohash)?;
+    let st = s.state.get(&ih).ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not_found"})))
+    })?;
+    let engine = s.source.engine_for(&st.slot_id).ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "engine missing"})))
+    })?;
+    Ok((st, engine))
+}
+
 fn bad_infohash() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid infohash hex"})))
 }

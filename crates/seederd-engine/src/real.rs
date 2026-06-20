@@ -70,6 +70,16 @@ impl TorrentEngine for RealEngine {
         Ok(self.session.lock().save_resume_data(h, flags)?)
     }
 
+    #[instrument(skip_all, fields(op = "set_upload_limit", infohash = %h.infohash))]
+    fn set_upload_limit(&self, h: TorrentHandle, bytes_per_sec: i32) -> Result<(), EngineError> {
+        Ok(self.session.lock().set_upload_limit(h, bytes_per_sec)?)
+    }
+
+    #[instrument(skip_all, fields(op = "set_file_priority", infohash = %h.infohash))]
+    fn set_file_priority(&self, h: TorrentHandle, file_idx: i32, priority: u8) -> Result<(), EngineError> {
+        Ok(self.session.lock().set_file_priority(h, file_idx, priority)?)
+    }
+
     fn pop_alerts(&self) -> Vec<Alert> {
         self.session.lock().drain_alerts()
     }
