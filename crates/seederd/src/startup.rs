@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 use seederd_engine::{
     AlertLoopBuilder, AlertSource, AssignmentRegistry, FsResumeStore, MultiSlotSource,
     RealEngine, ResumeStore, ShutdownReason, SingleSessionSource, SlotId, StateMap, SystemClock,
-    TorrentEngine, VpnManager,
+    TorrentEngine,
 };
 
 use crate::app_state::{AppState, Mode};

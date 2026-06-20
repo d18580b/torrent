@@ -9,7 +9,6 @@ mod ip_lookup;
 mod openvpn;
 mod wireguard;
 
-pub use ip_lookup::first_ipv4;
 pub use openvpn::OpenvpnManager;
 pub use wireguard::WireguardManager;
 

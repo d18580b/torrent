@@ -39,7 +39,7 @@ pub struct ListResponse {
 }
 
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Json<ListResponse> {
-    let limit = q.limit.unwrap_or(DEFAULT_PAGE_SIZE).min(MAX_PAGE_SIZE).max(1);
+    let limit = q.limit.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
     let after = q.after.as_deref().and_then(InfoHash::from_hex);
 
     let mut all = s.registry.entries();
