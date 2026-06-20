@@ -582,10 +582,7 @@ void drain_session_alerts(lt_session* s) {
 // Public API: session lifecycle
 // -------------------------------------------------------------------------
 
-extern "C" lt_session* lt_session_create(const char* settings_json,
-                                         char* err_out, int err_len)
-{
-    LT_SHIM_TRY
+static lt::settings_pack make_seed_settings(const char* settings_json) {
     lt::settings_pack pack = lt::high_performance_seed();
     apply_settings_from_json(pack, settings_json);
 
@@ -606,10 +603,33 @@ extern "C" lt_session* lt_session_create(const char* settings_json,
                | lt::alert_category::stats
                | lt::alert_category::session_log
                | lt::alert_category::torrent_log);
+    return pack;
+}
 
-    lt::session_params params(std::move(pack));
+extern "C" lt_session* lt_session_create_with_state(const char* settings_json,
+                                                    const uint8_t* state_buf, size_t state_len,
+                                                    char* err_out, int err_len)
+{
+    LT_SHIM_TRY
+    lt::settings_pack pack = make_seed_settings(settings_json);
+    lt::session_params params;
+    if (state_buf && state_len > 0) {
+        // Restore DHT routing table + session state from the saved blob, then
+        // overlay our freshly-derived settings so config wins on every boot.
+        params = lt::read_session_params(
+            lt::span<char const>(reinterpret_cast<const char*>(state_buf), state_len));
+        params.settings = std::move(pack);
+    } else {
+        params = lt::session_params(std::move(pack));
+    }
     return new lt_session(std::move(params));
     LT_SHIM_CATCH(err_out, err_len, nullptr)
+}
+
+extern "C" lt_session* lt_session_create(const char* settings_json,
+                                         char* err_out, int err_len)
+{
+    return lt_session_create_with_state(settings_json, nullptr, 0, err_out, err_len);
 }
 
 extern "C" void lt_session_destroy(lt_session* s) {
