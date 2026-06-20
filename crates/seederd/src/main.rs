@@ -34,7 +34,7 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    tracing_init::init(cfg.log_level);
+    let log_handle = tracing_init::init(cfg.log_level);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -43,7 +43,7 @@ fn main() -> anyhow::Result<()> {
         .context("build tokio runtime")?;
 
     runtime.block_on(async move {
-        match startup::boot(cfg).await {
+        match startup::boot(cfg, log_handle).await {
             Ok(handle) => {
                 let exit_code = handle.run_until_signal().await;
                 std::process::exit(exit_code);
