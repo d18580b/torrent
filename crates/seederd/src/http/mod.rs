@@ -1,26 +1,36 @@
 //! axum HTTP control plane.
 
 mod healthz;
-mod status;
-mod torrents;
 mod metrics;
+mod slots;
+mod status;
+pub(crate) mod torrents;
 
+use axum::routing::{get, post};
 use axum::Router;
 
 use crate::app_state::AppState;
 
-/// Build the full router. Slot-specific endpoints are mounted only when
-/// the daemon runs in multi-slot mode.
+/// Build the full router. Slot-specific endpoints are mounted only when the
+/// daemon runs in multi-slot mode (`AppState::slots` is `Some`).
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", axum::routing::get(healthz::healthz))
-        .route("/status",  axum::routing::get(status::status))
-        .route("/torrents", axum::routing::get(torrents::list).post(torrents::add))
-        .route("/torrents/:infohash", axum::routing::get(torrents::get).delete(torrents::remove))
-        .route("/torrents/:infohash/pause",  axum::routing::post(torrents::pause))
-        .route("/torrents/:infohash/resume", axum::routing::post(torrents::resume))
-        .route("/metrics", axum::routing::get(metrics::metrics))
-        .with_state(state)
-    // /slots endpoints land in a follow-up; the trait surface is in
-    // place but the routes are deferred to keep this commit focused.
+    let mut router = Router::new()
+        .route("/healthz", get(healthz::healthz))
+        .route("/status", get(status::status))
+        .route("/torrents", get(torrents::list).post(torrents::add))
+        .route("/torrents/:infohash", get(torrents::get).delete(torrents::remove))
+        .route("/torrents/:infohash/pause", post(torrents::pause))
+        .route("/torrents/:infohash/resume", post(torrents::resume))
+        .route("/metrics", get(metrics::metrics));
+
+    if state.slots.is_some() {
+        router = router
+            .route("/slots", get(slots::list))
+            .route("/slots/:slot_id", get(slots::get))
+            .route("/slots/:slot_id/torrents", get(slots::torrents))
+            .route("/slots/:slot_id/pause-all", post(slots::pause_all))
+            .route("/slots/:slot_id/resume-all", post(slots::resume_all));
+    }
+
+    router.with_state(state)
 }

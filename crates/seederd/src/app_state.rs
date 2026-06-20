@@ -6,11 +6,15 @@ use std::sync::Arc;
 use seederd_engine::{AlertSource, AssignmentRegistry, StateMap, TorrentStore};
 
 use crate::metrics_sink::PromSink;
+use crate::slot_registry::SlotRegistry;
 
 #[derive(Clone)]
 pub struct AppState {
     pub source: Arc<dyn AlertSource>,
     pub registry: Arc<AssignmentRegistry>,
+    /// Runtime slot registry; `None` in single-session mode. Drives the
+    /// `/slots` endpoints and the VPN health monitor.
+    pub slots: Option<Arc<SlotRegistry>>,
     pub state: Arc<StateMap>,
     /// Raw `.torrent` file store; the add path persists uploads here so the
     /// startup inventory scan can re-add them if resume data is lost.

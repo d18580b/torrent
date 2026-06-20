@@ -14,9 +14,11 @@ mod http;
 mod metrics_sink;
 mod reload;
 mod signals;
+mod slot_registry;
 mod startup;
 mod tracing_init;
 mod vpn;
+mod vpn_monitor;
 
 use anyhow::Context;
 use clap::Parser;

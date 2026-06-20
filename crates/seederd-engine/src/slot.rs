@@ -189,6 +189,16 @@ pub enum SlotStatus {
     VpnDown,
 }
 
+impl SlotStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SlotStatus::Active => "active",
+            SlotStatus::Failed => "failed",
+            SlotStatus::VpnDown => "vpn_down",
+        }
+    }
+}
+
 /// Runtime per-slot state. Owns an `Arc<dyn TorrentEngine>` so the
 /// `MultiSlotSource` and HTTP handlers can share it.
 #[derive(Debug)]
