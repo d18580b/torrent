@@ -20,6 +20,7 @@ pub use error::{Error, Result};
 pub use handle::{InfoHash, TorrentHandle};
 pub use resume::ResumeData;
 pub use session::{
-    info_hash_from_magnet, info_hash_from_torrent, session_stats_metric_index, AddParams, Session,
+    info_hash_from_magnet, info_hash_from_torrent, session_stats_metric_index,
+    torrent_tracker_host_matches, AddParams, Session,
 };
 pub use settings::{ResumeFlags, Settings, TorrentFlags};
