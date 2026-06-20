@@ -11,7 +11,13 @@ default_save_path = "/data/torrents"
 resume_dir        = "/var/lib/seederd/resume"
 torrent_dir       = "/var/lib/seederd/torrents"
 http_listen       = "127.0.0.1:8080"
-log_level         = "info"   # error | warn | info | debug
+log_level         = "info"   # error | warn | info | debug (reloadable on SIGHUP)
+
+# Optional daemon paths (defaults derived from resume_dir's parent):
+#   - DHT/session state, persisted across restarts (single-session mode only).
+#   - torrent -> slot assignment registry.
+# session_state_path = "/var/lib/seederd/session_state.dat"
+# registry_path      = "/var/lib/seederd/slot_assignments.json"
 
 # libtorrent settings overrides (applied on top of high_performance_seed
 # preset). All optional; omit any to use the preset's default.
