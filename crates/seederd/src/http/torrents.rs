@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use libtorrent_safe::{
     info_hash_from_magnet, info_hash_from_torrent, AddParams, InfoHash, TorrentFlags,
 };
-use seederd_engine::SlotId;
+use seederd_engine::{MetricsSink, SlotId};
 
 use crate::app_state::{AppState, Mode};
 
@@ -48,6 +48,22 @@ pub struct ListResponse {
     next_cursor: Option<String>,
 }
 
+/// Build the wire summary for one torrent (registry slot + live state).
+pub(crate) fn summarize(s: &AppState, ih: &InfoHash, slot: &SlotId) -> TorrentSummary {
+    let st = s.state.get(ih);
+    TorrentSummary {
+        infohash: ih.to_hex(),
+        slot_id: slot.as_str().to_string(),
+        phase: st.as_ref().map(|s| s.phase.as_str().to_string()).unwrap_or_else(|| "unknown".into()),
+        upload_rate: st.as_ref().map(|s| s.upload_rate).unwrap_or(0),
+        download_rate: st.as_ref().map(|s| s.download_rate).unwrap_or(0),
+        num_peers: st.as_ref().map(|s| s.num_peers).unwrap_or(0),
+        progress: st.as_ref().map(|s| s.progress).unwrap_or(0.0),
+        is_finished: st.as_ref().map(|s| s.is_finished).unwrap_or(false),
+        is_seeding: st.as_ref().map(|s| s.is_seeding).unwrap_or(false),
+    }
+}
+
 pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Json<ListResponse> {
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
     let after = q.after.as_deref().and_then(InfoHash::from_hex);
@@ -67,20 +83,7 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Json
 
     let items = all[start..end]
         .iter()
-        .map(|(ih, slot)| {
-            let st = s.state.get(ih);
-            TorrentSummary {
-                infohash: ih.to_hex(),
-                slot_id: slot.as_str().to_string(),
-                phase: st.as_ref().map(|s| s.phase.as_str().to_string()).unwrap_or_else(|| "unknown".into()),
-                upload_rate: st.as_ref().map(|s| s.upload_rate).unwrap_or(0),
-                download_rate: st.as_ref().map(|s| s.download_rate).unwrap_or(0),
-                num_peers: st.as_ref().map(|s| s.num_peers).unwrap_or(0),
-                progress: st.as_ref().map(|s| s.progress).unwrap_or(0.0),
-                is_finished: st.as_ref().map(|s| s.is_finished).unwrap_or(false),
-                is_seeding: st.as_ref().map(|s| s.is_seeding).unwrap_or(false),
-            }
-        })
+        .map(|(ih, slot)| summarize(&s, ih, slot))
         .collect();
 
     Json(ListResponse { items, next_cursor })
@@ -94,18 +97,7 @@ pub async fn get(
     let slot = s.registry.lookup(&ih).ok_or_else(|| {
         (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not_found"})))
     })?;
-    let st = s.state.get(&ih);
-    Ok(Json(TorrentSummary {
-        infohash: ih.to_hex(),
-        slot_id: slot.as_str().to_string(),
-        phase: st.as_ref().map(|s| s.phase.as_str().to_string()).unwrap_or_else(|| "unknown".into()),
-        upload_rate: st.as_ref().map(|s| s.upload_rate).unwrap_or(0),
-        download_rate: st.as_ref().map(|s| s.download_rate).unwrap_or(0),
-        num_peers: st.as_ref().map(|s| s.num_peers).unwrap_or(0),
-        progress: st.as_ref().map(|s| s.progress).unwrap_or(0.0),
-        is_finished: st.as_ref().map(|s| s.is_finished).unwrap_or(false),
-        is_seeding: st.as_ref().map(|s| s.is_seeding).unwrap_or(false),
-    }))
+    Ok(Json(summarize(&s, &ih, &slot)))
 }
 
 #[derive(Deserialize)]
@@ -174,10 +166,14 @@ pub async fn add(
     // Reject duplicates before the session sees the torrent (PRD: 409 if the
     // info-hash is already loaded in any slot).
     if s.registry.lookup(&infohash).is_some() {
+        s.metrics
+            .inc_counter("slot_assignment_registry_errors_total", &[("slot_id", slot_id.as_str())]);
         return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": "info-hash already loaded"}))));
     }
     // Reserve the assignment; assign() re-checks uniqueness to close any race.
     if let Err(e) = s.registry.assign(infohash, slot_id.clone()) {
+        s.metrics
+            .inc_counter("slot_assignment_registry_errors_total", &[("slot_id", slot_id.as_str())]);
         return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": format!("{e}")}))));
     }
 

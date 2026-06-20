@@ -161,6 +161,16 @@ impl StateMap {
         self.inner.iter().map(|e| e.value().handle).collect()
     }
 
+    /// All torrent handles currently assigned to `slot` — for slot-wide
+    /// pause/resume and VPN-down handling (PRD §Multi-Account).
+    pub fn handles_for_slot(&self, slot: &SlotId) -> Vec<TorrentHandle> {
+        self.inner
+            .iter()
+            .filter(|e| &e.value().slot_id == slot)
+            .map(|e| e.value().handle)
+            .collect()
+    }
+
     /// Mutate the entry in place via a closure. Returns `false` if the
     /// entry doesn't exist (caller should log and move on).
     pub fn update<F: FnOnce(&mut TorrentState)>(&self, ih: &InfoHash, f: F) -> bool {

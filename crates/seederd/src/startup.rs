@@ -14,8 +14,8 @@ use tracing::{error, info, warn};
 
 use seederd_engine::{
     AddParams, AlertLoopBuilder, AlertSource, AssignmentRegistry, FsResumeStore, FsTorrentStore,
-    MultiSlotSource, RealEngine, ResumeStore, ShutdownReason, SingleSessionSource, SlotId, StateMap,
-    SystemClock, TorrentEngine, TorrentFlags, TorrentStore,
+    MetricsSink, MultiSlotSource, RealEngine, ResumeStore, ShutdownReason, SingleSessionSource,
+    SlotId, StateMap, SystemClock, TorrentEngine, TorrentFlags, TorrentStore,
 };
 
 use crate::app_state::{AppState, Mode};
@@ -24,6 +24,7 @@ use crate::http;
 use crate::metrics_sink::PromSink;
 use crate::reload;
 use crate::signals::{self, SignalChannels};
+use crate::slot_registry::{SlotEntry, SlotRegistry};
 use crate::vpn;
 
 pub struct DaemonHandle {
@@ -35,6 +36,7 @@ pub struct DaemonHandle {
     reload_rx: mpsc::Receiver<()>,
     metrics: Arc<PromSink>,
     registry: Arc<AssignmentRegistry>,
+    slot_registry: Option<Arc<SlotRegistry>>,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: seederd_engine::AlertLoopHandle,
 }
@@ -62,7 +64,14 @@ pub async fn boot(
             .context("load assignment registry")?,
     );
 
-    // Engines per slot (or one for single-session).
+    // Metrics sink — created early so the startup scans can record registry
+    // rejections (slot_assignment_registry_errors_total).
+    let metrics = Arc::new(PromSink::new());
+
+    // Engines per slot (or one for single-session). In multi-slot mode we
+    // also build the runtime slot registry that the /slots API and the VPN
+    // health monitor consume.
+    let mut slot_registry: Option<Arc<SlotRegistry>> = None;
     let source: Arc<dyn AlertSource> = match mode {
         Mode::Single => {
             // Restore the DHT routing table + session state across restarts
@@ -81,7 +90,7 @@ pub async fn boot(
             Arc::new(SingleSessionSource::new(engine))
         }
         Mode::MultiSlot => {
-            let mut entries: Vec<(SlotId, Arc<dyn TorrentEngine>)> = Vec::new();
+            let mut slot_entries: Vec<SlotEntry> = Vec::new();
             for s in &cfg.slot {
                 // 1) Bring the VPN up first. PRD Safety Rule 1: if it
                 //    fails, the slot's lt::session is never constructed
@@ -118,7 +127,8 @@ pub async fn boot(
                             tunnel_ip = %tunnel_ip,
                             "slot engine up",
                         );
-                        entries.push((s.id.clone(), Arc::new(engine)));
+                        let engine: Arc<dyn TorrentEngine> = Arc::new(engine);
+                        slot_entries.push(SlotEntry::new(s.clone(), engine, tunnel_ip));
                     }
                     Err(e) => {
                         error!(
@@ -130,10 +140,15 @@ pub async fn boot(
                     }
                 }
             }
-            if entries.is_empty() {
+            if slot_entries.is_empty() {
                 anyhow::bail!("multi-slot mode: no slots came up");
             }
-            Arc::new(MultiSlotSource::new(entries))
+            let source_entries: Vec<(SlotId, Arc<dyn TorrentEngine>)> = slot_entries
+                .iter()
+                .map(|e| (e.config.id.clone(), e.engine.clone()))
+                .collect();
+            slot_registry = Some(Arc::new(SlotRegistry::new(slot_entries)));
+            Arc::new(MultiSlotSource::new(source_entries))
         }
     };
 
@@ -159,6 +174,10 @@ pub async fn boot(
                         infohash = %ih,
                         existing_slot = %existing,
                         "resume file in wrong slot; skipping (operator must reconcile)",
+                    );
+                    metrics.inc_counter(
+                        "slot_assignment_registry_errors_total",
+                        &[("slot_id", slot.as_str())],
                     );
                     continue;
                 }
@@ -220,9 +239,8 @@ pub async fn boot(
         }
     }
 
-    // Metrics + alert loop.
-    let metrics = Arc::new(PromSink::new());
-    let metrics_for_loop: Arc<dyn seederd_engine::MetricsSink> = metrics.clone();
+    // Alert loop.
+    let metrics_for_loop: Arc<dyn MetricsSink> = metrics.clone();
     let state = Arc::new(StateMap::new());
     let clock: Arc<dyn seederd_engine::Clock> = Arc::new(SystemClock);
 
@@ -253,6 +271,7 @@ pub async fn boot(
         reload_rx,
         metrics,
         registry,
+        slot_registry,
         log_handle,
         alert_loop,
     })
@@ -271,13 +290,26 @@ impl DaemonHandle {
             reload_rx,
             metrics,
             registry,
+            slot_registry,
             log_handle,
             alert_loop,
         } = self;
 
+        // VPN health monitor (multi-slot only). Spawned before AppState
+        // consumes the registry/state/metrics.
+        if let Some(slots) = slot_registry.clone() {
+            tokio::spawn(crate::vpn_monitor::run(
+                slots,
+                state.clone(),
+                metrics.clone(),
+                shutdown_tx.subscribe(),
+            ));
+        }
+
         let app_state = AppState {
             source: source.clone(),
             registry: registry.clone(),
+            slots: slot_registry,
             state,
             torrents,
             metrics,
