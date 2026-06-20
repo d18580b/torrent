@@ -67,6 +67,29 @@ impl Session {
         Ok(Self { ptr, _marker: PhantomData })
     }
 
+    /// Like [`Session::new`], but restores the DHT routing table + session
+    /// state from a blob previously produced by [`Session::save_state`]. Used
+    /// at startup for single-session (DHT-enabled) mode.
+    pub fn with_state(settings: &Settings, state: &[u8]) -> Result<Self> {
+        let json = settings.to_shim_json()?;
+        let json_c = CString::new(json).map_err(|_| Error::InteriorNul("settings_json".into()))?;
+        let mut err = ErrBuf::new();
+        let ptr = unsafe {
+            ffi::lt_session_create_with_state(
+                json_c.as_ptr(),
+                state.as_ptr(),
+                state.len(),
+                err.ptr(),
+                err.len() as i32,
+            )
+        };
+        if ptr.is_null() {
+            return Err(Error::Shim(err.into_string()));
+        }
+        debug!(target: "libtorrent_safe", "session created from saved state");
+        Ok(Self { ptr, _marker: PhantomData })
+    }
+
     /// Apply settings on a running session. Used by SIGHUP reload and per-slot
     /// startup overrides.
     pub fn apply_settings(&self, settings: &Settings) -> Result<()> {

@@ -61,9 +61,19 @@ pub async fn boot(cfg: Config) -> anyhow::Result<DaemonHandle> {
     // Engines per slot (or one for single-session).
     let source: Arc<dyn AlertSource> = match mode {
         Mode::Single => {
-            let engine: Arc<dyn TorrentEngine> = Arc::new(
-                RealEngine::new(&cfg.libtorrent_settings()).context("construct RealEngine")?,
-            );
+            // Restore the DHT routing table + session state across restarts
+            // (PRD §Session Management). DHT is enabled only in single-session
+            // mode, so this is the only path that loads/saves session state.
+            let settings = cfg.libtorrent_settings();
+            let session = match load_session_state(&cfg.session_state_path()) {
+                Some(state) => {
+                    info!(bytes = state.len(), "restoring session state");
+                    libtorrent_safe::Session::with_state(&settings, &state)
+                        .context("construct session from saved state")?
+                }
+                None => libtorrent_safe::Session::new(&settings).context("construct session")?,
+            };
+            let engine: Arc<dyn TorrentEngine> = Arc::new(RealEngine::from_session(session));
             Arc::new(SingleSessionSource::new(engine))
         }
         Mode::MultiSlot => {
@@ -305,12 +315,58 @@ impl DaemonHandle {
             }
         };
 
-        // Trigger alert-loop shutdown and join.
+        // Trigger alert-loop shutdown and join (saves all resume data).
         alert_loop.signal_shutdown(ShutdownReason::Sigterm);
         if let Err(e) = alert_loop.join() {
             warn!(error.cause = ?e, "alert loop join panicked");
         }
+
+        // Persist DHT/session state for the next start (single-session mode;
+        // slots run with enable_dht=false and skip this per PRD). The session
+        // is still alive here — only dropped when `source` goes out of scope.
+        if cfg.slot.is_empty() {
+            if let Some(engine) = source.engine_for(&SlotId::default_single()) {
+                match engine.session_state() {
+                    Ok(bytes) if !bytes.is_empty() => {
+                        match save_session_state(&cfg.session_state_path(), &bytes) {
+                            Ok(()) => info!(bytes = bytes.len(), "session state saved"),
+                            Err(e) => warn!(error.cause = %e, "failed to save session state"),
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(error.cause = %e, "session_state() failed"),
+                }
+            }
+        }
+
         info!("seederd: clean exit");
         exit_code
     }
+}
+
+/// Read the persisted DHT/session-state blob, or `None` if absent/empty.
+fn load_session_state(path: &std::path::Path) -> Option<Vec<u8>> {
+    match std::fs::read(path) {
+        Ok(b) if !b.is_empty() => Some(b),
+        _ => None,
+    }
+}
+
+/// Atomically persist the DHT/session-state blob (temp + fsync + rename), so a
+/// crash mid-write leaves the previous blob intact.
+fn save_session_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }

@@ -114,6 +114,14 @@ typedef enum {
 lt_session* lt_session_create(const char* settings_json,
                               char* err_out, int err_len);
 
+/* Like lt_session_create, but restores the DHT routing table + session state
+ * from a blob previously returned by lt_session_save_state (used at startup
+ * for single-session / DHT-enabled mode). Pass state_buf=NULL to behave like
+ * lt_session_create. Our settings always override the saved ones. */
+lt_session* lt_session_create_with_state(const char* settings_json,
+                                         const uint8_t* state_buf, size_t state_len,
+                                         char* err_out, int err_len);
+
 void        lt_session_destroy(lt_session* s);
 
 int         lt_session_apply_settings(lt_session* s,

@@ -46,6 +46,12 @@ pub struct Config {
     #[serde(default)]
     pub registry_path: Option<PathBuf>,
 
+    /// Where DHT/session state is persisted across restarts (single-session
+    /// mode only; slots run with `enable_dht=false`). Defaults to
+    /// `<resume_dir parent>/session_state.dat`.
+    #[serde(default)]
+    pub session_state_path: Option<PathBuf>,
+
     // libtorrent settings overrides (PRD §5).
     #[serde(default)]
     pub connections_limit: Option<u32>,
@@ -121,6 +127,9 @@ impl Config {
         if old.user_agent != new.user_agent {
             d.non_reloadable_changes.push("user_agent");
         }
+        if old.session_state_path != new.session_state_path {
+            d.non_reloadable_changes.push("session_state_path");
+        }
         d
     }
 
@@ -151,6 +160,17 @@ impl Config {
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|| PathBuf::from("/var/lib/seederd"))
                 .join("slot_assignments.json")
+        })
+    }
+
+    /// Where DHT/session state should be persisted (single-session mode).
+    pub fn session_state_path(&self) -> PathBuf {
+        self.session_state_path.clone().unwrap_or_else(|| {
+            self.resume_dir
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("/var/lib/seederd"))
+                .join("session_state.dat")
         })
     }
 }
