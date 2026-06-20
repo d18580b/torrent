@@ -266,6 +266,46 @@ impl Session {
     }
 }
 
+/// Compute the info-hash of a `.torrent` buffer without adding it to a
+/// session — used to enforce registry uniqueness before any session sees the
+/// torrent (PRD Safety Rule 4).
+pub fn info_hash_from_torrent(bytes: &[u8]) -> Result<InfoHash> {
+    if bytes.is_empty() {
+        return Err(Error::InvalidInput("empty .torrent buffer"));
+    }
+    let mut out = [0u8; 20];
+    let mut err = ErrBuf::new();
+    let rc = unsafe {
+        ffi::lt_torrent_info_hash(
+            bytes.as_ptr(),
+            bytes.len(),
+            out.as_mut_ptr(),
+            err.ptr(),
+            err.len() as i32,
+        )
+    };
+    if rc == ffi::LT_OK as i32 {
+        Ok(InfoHash(out))
+    } else {
+        Err(Error::Shim(err.into_string()))
+    }
+}
+
+/// Compute the info-hash encoded in a magnet URI without adding it.
+pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
+    let uri_c = CString::new(uri).map_err(|_| Error::InteriorNul("magnet uri".into()))?;
+    let mut out = [0u8; 20];
+    let mut err = ErrBuf::new();
+    let rc = unsafe {
+        ffi::lt_magnet_info_hash(uri_c.as_ptr(), out.as_mut_ptr(), err.ptr(), err.len() as i32)
+    };
+    if rc == ffi::LT_OK as i32 {
+        Ok(InfoHash(out))
+    } else {
+        Err(Error::Shim(err.into_string()))
+    }
+}
+
 /// Resolve a libtorrent session-stats counter name (e.g. `"net.sent_bytes"`)
 /// to its index in the `session_stats_alert` counter array, or `None` if the
 /// name is unknown to this libtorrent build. The mapping is a build-time
