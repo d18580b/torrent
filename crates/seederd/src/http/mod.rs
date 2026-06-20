@@ -21,6 +21,8 @@ pub fn router(state: AppState) -> Router {
         .route("/torrents/:infohash", get(torrents::get).delete(torrents::remove))
         .route("/torrents/:infohash/pause", post(torrents::pause))
         .route("/torrents/:infohash/resume", post(torrents::resume))
+        .route("/torrents/:infohash/upload-limit", post(torrents::set_upload_limit))
+        .route("/torrents/:infohash/file-priority", post(torrents::set_file_priority))
         .route("/metrics", get(metrics::metrics));
 
     if state.slots.is_some() {

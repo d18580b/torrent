@@ -29,6 +29,8 @@ pub enum RecordedCall {
     RemoveTorrent { handle: TorrentHandle, delete_files: bool },
     PauseTorrent(TorrentHandle),
     ResumeTorrent(TorrentHandle),
+    SetUploadLimit { handle: TorrentHandle, bytes_per_sec: i32 },
+    SetFilePriority { handle: TorrentHandle, file_idx: i32, priority: u8 },
     SaveResumeData { handle: TorrentHandle, flags: ResumeFlags },
     PopAlerts,
     PostUpdates,
@@ -196,6 +198,16 @@ impl TorrentEngine for MockEngine {
     fn resume_torrent(&self, h: TorrentHandle) -> Result<(), EngineError> {
         self.record(RecordedCall::ResumeTorrent(h));
         self.check_error("resume_torrent")
+    }
+
+    fn set_upload_limit(&self, h: TorrentHandle, bytes_per_sec: i32) -> Result<(), EngineError> {
+        self.record(RecordedCall::SetUploadLimit { handle: h, bytes_per_sec });
+        self.check_error("set_upload_limit")
+    }
+
+    fn set_file_priority(&self, h: TorrentHandle, file_idx: i32, priority: u8) -> Result<(), EngineError> {
+        self.record(RecordedCall::SetFilePriority { handle: h, file_idx, priority });
+        self.check_error("set_file_priority")
     }
 
     fn save_resume_data(&self, h: TorrentHandle, flags: ResumeFlags) -> Result<(), EngineError> {

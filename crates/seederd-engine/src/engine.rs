@@ -56,6 +56,13 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     fn pop_alerts(&self) -> Vec<Alert>;
     fn post_updates(&self);
     fn post_stats(&self);
+    fn set_upload_limit(&self, h: TorrentHandle, bytes_per_sec: i32) -> Result<(), EngineError>;
+    fn set_file_priority(
+        &self,
+        h: TorrentHandle,
+        file_idx: i32,
+        priority: u8,
+    ) -> Result<(), EngineError>;
     fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError>;
     fn session_state(&self) -> Result<Vec<u8>, EngineError>;
 }
@@ -76,6 +83,12 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn save_resume_data(&self, h: TorrentHandle, flags: ResumeFlags) -> Result<(), EngineError> {
         (**self).save_resume_data(h, flags)
+    }
+    fn set_upload_limit(&self, h: TorrentHandle, bps: i32) -> Result<(), EngineError> {
+        (**self).set_upload_limit(h, bps)
+    }
+    fn set_file_priority(&self, h: TorrentHandle, idx: i32, prio: u8) -> Result<(), EngineError> {
+        (**self).set_file_priority(h, idx, prio)
     }
     fn pop_alerts(&self) -> Vec<Alert> { (**self).pop_alerts() }
     fn post_updates(&self) { (**self).post_updates() }
