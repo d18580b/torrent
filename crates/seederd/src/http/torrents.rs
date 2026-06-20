@@ -130,7 +130,9 @@ pub async fn add(
         (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown slot_id"})))
     })?;
 
-    let save_path = req.save_path.unwrap_or_default();
+    let save_path = req
+        .save_path
+        .unwrap_or_else(|| s.default_save_path.to_string_lossy().into_owned());
     let flags = TorrentFlags::SEED_MODE
         | if !slot_id.is_default() {
             TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
@@ -138,13 +140,16 @@ pub async fn add(
             TorrentFlags::empty()
         };
 
-    let params = if let Some(uri) = req.magnet {
-        AddParams::Magnet { uri, save_path, flags }
+    // Capture the .torrent bytes for file/path adds so we can persist them
+    // after a successful add; magnets carry no bytes here (their metadata is
+    // persisted by the metadata_received handler once it arrives).
+    let (params, torrent_bytes) = if let Some(uri) = req.magnet {
+        (AddParams::Magnet { uri, save_path, flags }, None)
     } else if let Some(path) = req.torrent_path {
         let bytes = std::fs::read(&path).map_err(|e| {
             (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("read torrent file: {e}")})))
         })?;
-        AddParams::File { bytes, save_path, flags }
+        (AddParams::File { bytes: bytes.clone(), save_path, flags }, Some(bytes))
     } else {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "magnet or torrent_path required"}))));
     };
@@ -158,6 +163,18 @@ pub async fn add(
         // Best-effort rollback: remove the torrent we just added.
         let _ = engine.remove_torrent(handle, false);
         return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": format!("{e}")}))));
+    }
+
+    // Persist the .torrent so the startup inventory scan can recover it if
+    // resume data is ever lost (PRD §Session Management).
+    if let Some(bytes) = torrent_bytes {
+        if let Err(e) = s.torrents.write(&slot_id, &handle.infohash, &bytes) {
+            tracing::warn!(
+                infohash = %handle.infohash,
+                error.cause = %e,
+                "failed to persist .torrent file",
+            );
+        }
     }
 
     Ok((

@@ -31,6 +31,7 @@ use crate::resume_store::ResumeStore;
 use crate::slot::SlotId;
 use crate::source::AlertSource;
 use crate::state::StateMap;
+use crate::torrent_store::TorrentStore;
 use libtorrent_safe::{Alert, ResumeFlags, TorrentHandle};
 
 const POLL_IDLE_INTERVAL: Duration = Duration::from_millis(100);
@@ -56,6 +57,7 @@ pub struct AlertLoopBuilder {
     source: Arc<dyn AlertSource>,
     state: Arc<StateMap>,
     resume: Arc<dyn ResumeStore>,
+    torrents: Arc<dyn TorrentStore>,
     metrics: Arc<dyn MetricsSink>,
     clock: Arc<dyn Clock>,
 }
@@ -71,10 +73,11 @@ impl AlertLoopBuilder {
         source: Arc<dyn AlertSource>,
         state: Arc<StateMap>,
         resume: Arc<dyn ResumeStore>,
+        torrents: Arc<dyn TorrentStore>,
         metrics: Arc<dyn MetricsSink>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        Self { source, state, resume, metrics, clock }
+        Self { source, state, resume, torrents, metrics, clock }
     }
 
     /// Spawn the loop on a dedicated OS thread. Returns a handle the
@@ -90,13 +93,14 @@ impl AlertLoopBuilder {
                 let source = Arc::clone(&self.source);
                 let state = Arc::clone(&self.state);
                 let resume = Arc::clone(&self.resume);
+                let torrents = Arc::clone(&self.torrents);
                 let metrics = Arc::clone(&self.metrics);
                 let clock = Arc::clone(&self.clock);
                 move || {
                     let span = info_span!(parent: parent, "alert_loop");
                     let _enter = span.enter();
                     info!(target: "seederd_engine::alert_loop", "alert loop started");
-                    run(rx, source, state, resume, metrics, clock);
+                    run(rx, source, state, resume, torrents, metrics, clock);
                     info!(target: "seederd_engine::alert_loop", "alert loop exited");
                 }
             })
@@ -143,6 +147,7 @@ fn run(
     source: Arc<dyn AlertSource>,
     state: Arc<StateMap>,
     resume: Arc<dyn ResumeStore>,
+    torrents: Arc<dyn TorrentStore>,
     metrics: Arc<dyn MetricsSink>,
     clock: Arc<dyn Clock>,
 ) {
@@ -160,6 +165,7 @@ fn run(
                 &source,
                 &state,
                 &resume,
+                &torrents,
                 &metrics,
                 &clock,
             );
@@ -176,6 +182,7 @@ fn run(
                 &source,
                 &state,
                 &resume,
+                &torrents,
                 &metrics,
                 &clock,
             );
@@ -206,12 +213,14 @@ fn run(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch_alert(
     slot: SlotId,
     alert: Alert,
     source: &Arc<dyn AlertSource>,
     state: &Arc<StateMap>,
     resume: &Arc<dyn ResumeStore>,
+    torrents: &Arc<dyn TorrentStore>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
 ) {
@@ -229,12 +238,13 @@ fn dispatch_alert(
         alert_type = alert.kind().as_str(),
     );
     let mut ctx = HandlerCtx {
-        state:   state.as_ref(),
-        resume:  resume.as_ref(),
-        metrics: metrics.as_ref(),
-        clock:   clock.as_ref(),
-        engine:  &engine,
-        slot_id: slot,
+        state:    state.as_ref(),
+        resume:   resume.as_ref(),
+        torrents: torrents.as_ref(),
+        metrics:  metrics.as_ref(),
+        clock:    clock.as_ref(),
+        engine:   &engine,
+        slot_id:  slot,
         span,
     };
 
@@ -255,11 +265,12 @@ fn dispatch_alert(
             handlers::log_msg::handle(&alert, &mut ctx),
         Alert::SessionStats { .. } =>
             handlers::stats::handle(&alert, &mut ctx),
+        Alert::MetadataReceived { .. } =>
+            handlers::metadata::handle(&alert, &mut ctx),
 
-        // Other alerts (metadata_received, tracker_error, peer_disconnected)
-        // are interesting for ops/metrics but not yet wired up; emit a debug
-        // log so we can spot them in field traces without losing the loop's
-        // progress.
+        // Other alerts (tracker_error, peer_disconnected) are interesting for
+        // ops/metrics but not yet wired up; emit a debug log so we can spot
+        // them in field traces without losing the loop's progress.
         other => tracing::debug!(
             target: "seederd_engine::alert_loop",
             alert_type = other.kind().as_str(),
@@ -363,12 +374,14 @@ fn request_save(
 // Shutdown coordinator
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn run_shutdown(
     reason: ShutdownReason,
     deadline: Duration,
     source: &Arc<dyn AlertSource>,
     state: &Arc<StateMap>,
     resume: &Arc<dyn ResumeStore>,
+    torrents: &Arc<dyn TorrentStore>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
 ) {
@@ -376,7 +389,7 @@ fn run_shutdown(
     let started_count = state.len();
 
     // Drain whatever's pending so the resume queue is in a known state.
-    drain_once(source, state, resume, metrics, clock);
+    drain_once(source, state, resume, torrents, metrics, clock);
 
     // Trigger one save_resume_data per torrent. Tracking via the shared
     // `pending_resume_count`; the per-handler `note_resume_settled` will
@@ -398,7 +411,7 @@ fn run_shutdown(
     let stop_at = started + deadline;
     while clock.now() < stop_at {
         if state.pending_resume_count() == 0 { break; }
-        drain_once(source, state, resume, metrics, clock);
+        drain_once(source, state, resume, torrents, metrics, clock);
         clock.sleep(SHUTDOWN_DRAIN_INTERVAL);
     }
 
@@ -430,12 +443,13 @@ fn drain_once(
     source: &Arc<dyn AlertSource>,
     state: &Arc<StateMap>,
     resume: &Arc<dyn ResumeStore>,
+    torrents: &Arc<dyn TorrentStore>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
 ) {
     let alerts = source.drain();
     for (slot, alert) in alerts {
-        dispatch_alert(slot, alert, source, state, resume, metrics, clock);
+        dispatch_alert(slot, alert, source, state, resume, torrents, metrics, clock);
     }
 }
 
@@ -451,6 +465,7 @@ mod tests {
     use crate::mock::MockEngine;
     use crate::resume_store::MemoryResumeStore;
     use crate::source::SingleSessionSource;
+    use crate::torrent_store::MemoryTorrentStore;
     use libtorrent_safe::alert::AlertHeader;
     use libtorrent_safe::{AlertKind, InfoHash, ResumeData};
 
@@ -502,6 +517,7 @@ mod tests {
         let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
         let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
@@ -511,6 +527,7 @@ mod tests {
             &source,
             &state,
             &resume,
+            &torrents,
             &metrics,
             &clock,
         );
@@ -526,6 +543,7 @@ mod tests {
         let state = Arc::new(StateMap::new());
         let resume_store = Arc::new(MemoryResumeStore::new());
         let resume: Arc<dyn ResumeStore> = resume_store.clone();
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
         let metrics: Arc<dyn MetricsSink> = Arc::new(RecordingSink::new());
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
@@ -548,6 +566,7 @@ mod tests {
             &source,
             &state,
             &resume,
+            &torrents,
             &metrics,
             &clock,
         );
@@ -562,6 +581,7 @@ mod tests {
         let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
         let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
@@ -574,6 +594,7 @@ mod tests {
             &source,
             &state,
             &resume,
+            &torrents,
             &metrics,
             &clock,
         );
@@ -594,6 +615,7 @@ mod tests {
         let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
         let metrics: Arc<dyn MetricsSink> = Arc::new(RecordingSink::new());
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
@@ -607,6 +629,7 @@ mod tests {
             &source,
             &state,
             &resume,
+            &torrents,
             &metrics,
             &clock,
         );
@@ -634,6 +657,7 @@ mod tests {
         let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
         let metrics: Arc<dyn MetricsSink> = Arc::new(RecordingSink::new());
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
@@ -655,6 +679,7 @@ mod tests {
             &source,
             &state,
             &resume,
+            &torrents,
             &metrics,
             &clock,
         );
@@ -670,6 +695,7 @@ mod tests {
         let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
         let metrics: Arc<dyn MetricsSink> = Arc::new(RecordingSink::new());
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
@@ -686,6 +712,7 @@ mod tests {
             &source,
             &state,
             &resume,
+            &torrents,
             &metrics,
             &clock,
         );

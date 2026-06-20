@@ -13,9 +13,9 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use seederd_engine::{
-    AlertLoopBuilder, AlertSource, AssignmentRegistry, FsResumeStore, MultiSlotSource,
-    RealEngine, ResumeStore, ShutdownReason, SingleSessionSource, SlotId, StateMap, SystemClock,
-    TorrentEngine,
+    AddParams, AlertLoopBuilder, AlertSource, AssignmentRegistry, FsResumeStore, FsTorrentStore,
+    MultiSlotSource, RealEngine, ResumeStore, ShutdownReason, SingleSessionSource, SlotId, StateMap,
+    SystemClock, TorrentEngine, TorrentFlags, TorrentStore,
 };
 
 use crate::app_state::{AppState, Mode};
@@ -30,6 +30,7 @@ pub struct DaemonHandle {
     cfg: Config,
     state: Arc<StateMap>,
     source: Arc<dyn AlertSource>,
+    torrents: Arc<dyn TorrentStore>,
     shutdown_tx: broadcast::Sender<ShutdownReason>,
     reload_rx: mpsc::Receiver<()>,
     metrics: Arc<PromSink>,
@@ -44,6 +45,12 @@ pub async fn boot(cfg: Config) -> anyhow::Result<DaemonHandle> {
     // Resume store — single root for both modes; FsResumeStore partitions
     // by slot id internally.
     let resume_store: Arc<dyn ResumeStore> = Arc::new(FsResumeStore::new(cfg.resume_dir.clone()));
+
+    // Torrent store — same per-slot partitioning as the resume store; holds
+    // the raw .torrent files for the startup inventory scan, magnet-metadata
+    // persistence, and removal cleanup (PRD §6 / §Session Management).
+    let torrent_store: Arc<dyn TorrentStore> =
+        Arc::new(FsTorrentStore::new(cfg.torrent_dir.clone()));
 
     // Assignment registry.
     let registry = Arc::new(
@@ -144,13 +151,59 @@ pub async fn boot(cfg: Config) -> anyhow::Result<DaemonHandle> {
             } else {
                 let _ = registry.assign(ih, slot.clone());
             }
-            if let Err(e) = engine.add_torrent(libtorrent_safe::AddParams::Resume {
+            if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: data.into_inner(),
             }) {
                 warn!(slot_id = %slot, infohash = %ih, error.cause = %e, "resume add failed");
             }
         }
         info!(slot_id = %slot, torrent_count = count, "resume scan complete");
+    }
+
+    // Torrent-dir scan: add any .torrent whose info-hash has no resume file
+    // (resume always wins; PRD §6 startup inventory). After this the torrent
+    // dir is not re-scanned — new torrents arrive only via the API.
+    let scan_save_path = cfg.default_save_path.to_string_lossy().into_owned();
+    for slot in source.slots() {
+        let entries = torrent_store.load_all(&slot).context("scan torrent dir")?;
+        let engine = source
+            .engine_for(&slot)
+            .ok_or_else(|| anyhow::anyhow!("no engine for slot {}", slot))?;
+        let mut added = 0usize;
+        for (ih, bytes) in entries {
+            // Resume data already loaded this torrent (the registry holds
+            // every resume-loaded info-hash after the scan above) — skip.
+            if registry.lookup(&ih).is_some() {
+                continue;
+            }
+            let flags = if slot.is_default() {
+                TorrentFlags::SEED_MODE
+            } else {
+                TorrentFlags::SEED_MODE
+                    | TorrentFlags::DISABLE_PEX
+                    | TorrentFlags::DISABLE_DHT
+                    | TorrentFlags::DISABLE_LSD
+            };
+            match engine.add_torrent(AddParams::File {
+                bytes,
+                save_path: scan_save_path.clone(),
+                flags,
+            }) {
+                Ok(_) => {
+                    let _ = registry.assign(ih, slot.clone());
+                    added += 1;
+                }
+                Err(e) => warn!(
+                    slot_id = %slot,
+                    infohash = %ih,
+                    error.cause = %e,
+                    "torrent-dir add failed",
+                ),
+            }
+        }
+        if added > 0 {
+            info!(slot_id = %slot, torrent_count = added, "torrent dir scan: added new torrents");
+        }
     }
 
     // Metrics + alert loop.
@@ -163,6 +216,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<DaemonHandle> {
         source.clone(),
         state.clone(),
         resume_store.clone(),
+        torrent_store.clone(),
         metrics_for_loop,
         clock,
     )
@@ -180,6 +234,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<DaemonHandle> {
         cfg,
         state,
         source,
+        torrents: torrent_store,
         shutdown_tx,
         reload_rx,
         metrics,
@@ -196,6 +251,7 @@ impl DaemonHandle {
             cfg,
             state,
             source,
+            torrents,
             shutdown_tx,
             reload_rx,
             metrics,
@@ -207,7 +263,9 @@ impl DaemonHandle {
             source: source.clone(),
             registry: registry.clone(),
             state,
+            torrents,
             metrics,
+            default_save_path: cfg.default_save_path.clone(),
             mode: if cfg.slot.is_empty() { Mode::Single } else { Mode::MultiSlot },
         };
 
