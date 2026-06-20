@@ -1047,6 +1047,11 @@ dependencies = [
 [[package]]
 name = "seederd-bench"
 version = "0.1.0"
+dependencies = [
+ "clap",
+ "libtorrent-safe",
+ "seederd-engine",
+]
 
 [[package]]
 name = "seederd-engine"

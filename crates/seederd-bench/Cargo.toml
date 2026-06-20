@@ -13,3 +13,6 @@ name = "seederd-bench"
 path = "src/main.rs"
 
 [dependencies]
+clap = { workspace = true }
+seederd-engine = { path = "../seederd-engine" }
+libtorrent-safe = { path = "../libtorrent-safe" }
