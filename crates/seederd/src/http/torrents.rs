@@ -229,6 +229,40 @@ async fn do_add(
         (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid torrent: {e}")})))
     })?;
 
+    // Misconfiguration guard (multi-slot): a .torrent must announce to one of
+    // the slot's allowed tracker domains. Catches uploading the wrong slot's
+    // .torrent into another slot (PRD §Torrent-to-Slot Assignment). Only
+    // checked for file adds against a configured, non-empty allow-list.
+    if let AddSource::File(bytes) = &source {
+        let domains = s
+            .slots
+            .as_ref()
+            .and_then(|sr| sr.get(&slot_id))
+            .map(|e| e.config.allowed_tracker_domains.clone())
+            .unwrap_or_default();
+        if !domains.is_empty() {
+            match libtorrent_safe::torrent_tracker_host_matches(bytes, &domains) {
+                Ok(true) => {}
+                Ok(false) => {
+                    s.metrics.inc_counter(
+                        "slot_assignment_registry_errors_total",
+                        &[("slot_id", slot_id.as_str())],
+                    );
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": "torrent does not announce to the slot's allowed_tracker_domains"})),
+                    ));
+                }
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("tracker check: {e}")})),
+                    ));
+                }
+            }
+        }
+    }
+
     // Reject duplicates before the session sees the torrent (PRD: 409 if the
     // info-hash is already loaded in any slot).
     if s.registry.lookup(&infohash).is_some() {

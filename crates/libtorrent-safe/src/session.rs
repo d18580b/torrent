@@ -329,6 +329,33 @@ pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
     }
 }
 
+/// Check whether any tracker host in a `.torrent` buffer matches one of
+/// `domains` (exact or subdomain). Misconfiguration guard for slot assignment
+/// (PRD §Torrent-to-Slot Assignment). Returns `Ok(false)` for an empty buffer
+/// or empty domain list.
+pub fn torrent_tracker_host_matches(bytes: &[u8], domains: &[String]) -> Result<bool> {
+    if bytes.is_empty() || domains.is_empty() {
+        return Ok(false);
+    }
+    let csv = domains.join(",");
+    let csv_c = CString::new(csv).map_err(|_| Error::InteriorNul("domains".into()))?;
+    let mut err = ErrBuf::new();
+    let rc = unsafe {
+        ffi::lt_torrent_tracker_host_matches(
+            bytes.as_ptr(),
+            bytes.len(),
+            csv_c.as_ptr(),
+            err.ptr(),
+            err.len() as i32,
+        )
+    };
+    match rc {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => Err(Error::Shim(err.into_string())),
+    }
+}
+
 /// Resolve a libtorrent session-stats counter name (e.g. `"net.sent_bytes"`)
 /// to its index in the `session_stats_alert` counter array, or `None` if the
 /// name is unknown to this libtorrent build. The mapping is a build-time

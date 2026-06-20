@@ -187,6 +187,14 @@ int         lt_torrent_info_hash(const uint8_t* data, size_t len,
 int         lt_magnet_info_hash(const char* uri,
                                 uint8_t* out20, char* err_out, int err_len);
 
+/* Return 1 if any tracker URL host in the .torrent buffer matches (equals or
+ * is a subdomain of) one of the comma-separated `domains_csv`, 0 if none
+ * match, LT_ERR on parse error. Misconfiguration guard for slot assignment
+ * (PRD §Torrent-to-Slot Assignment). */
+int         lt_torrent_tracker_host_matches(const uint8_t* data, size_t len,
+                                            const char* domains_csv,
+                                            char* err_out, int err_len);
+
 /* ------------------------------------------------------------------ */
 /* Status & alerts                                                     */
 /* ------------------------------------------------------------------ */

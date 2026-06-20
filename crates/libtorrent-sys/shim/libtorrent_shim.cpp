@@ -39,6 +39,7 @@
 #include <libtorrent/operations.hpp>
 #include <libtorrent/socket.hpp>
 #include <libtorrent/session_stats.hpp>
+#include <libtorrent/announce_entry.hpp>
 
 // stdlib
 #include <atomic>
@@ -799,6 +800,55 @@ extern "C" int lt_magnet_info_hash(const char* uri,
     auto ih = atp.info_hashes.get_best();
     std::memcpy(out20, ih.data(), 20);
     return LT_OK;
+    LT_SHIM_CATCH(err_out, err_len, LT_ERR)
+}
+
+namespace {
+
+bool host_matches_domain(const std::string& host, const std::string& domain) {
+    if (host == domain) return true;
+    // Subdomain: host ends with "." + domain.
+    if (host.size() > domain.size() + 1) {
+        const std::string suffix = "." + domain;
+        if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0) return true;
+    }
+    return false;
+}
+
+std::string url_host(const std::string& url) {
+    auto pos = url.find("://");
+    if (pos == std::string::npos) return {};
+    auto start = pos + 3;
+    auto end = url.find_first_of(":/", start);
+    return url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
+}  // namespace
+
+extern "C" int lt_torrent_tracker_host_matches(const uint8_t* data, size_t len,
+                                               const char* domains_csv,
+                                               char* err_out, int err_len)
+{
+    if (!data || !domains_csv) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    LT_SHIM_TRY
+    lt::torrent_info ti(reinterpret_cast<const char*>(data), static_cast<int>(len));
+    std::vector<std::string> domains;
+    {
+        std::string cur;
+        for (const char* p = domains_csv; *p; ++p) {
+            if (*p == ',') { if (!cur.empty()) domains.push_back(cur); cur.clear(); }
+            else cur += *p;
+        }
+        if (!cur.empty()) domains.push_back(cur);
+    }
+    for (auto const& ae : ti.trackers()) {
+        std::string host = url_host(ae.url);
+        if (host.empty()) continue;
+        for (auto const& d : domains) {
+            if (host_matches_domain(host, d)) return 1;
+        }
+    }
+    return 0;
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)
 }
 
