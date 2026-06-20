@@ -1,6 +1,6 @@
 //! `/torrents` and `/torrents/:infohash` endpoints.
 
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
 use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
@@ -14,6 +14,10 @@ use crate::app_state::{AppState, Mode};
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 1000;
+
+/// Upper bound on a `POST /torrents` body (JSON or a multipart `.torrent`
+/// upload). Also installed as the router's `DefaultBodyLimit`.
+pub(crate) const MAX_BODY_BYTES: usize = 50 * 1024 * 1024;
 
 /// Resolved add source, carrying the bytes/uri needed to (a) compute the
 /// info-hash up front and (b) build the engine params after the registry
@@ -115,11 +119,84 @@ pub struct AddResponse {
     slot_id: String,
 }
 
+type AddParse = (Option<String>, Option<String>, AddSource);
+type AddError = (StatusCode, Json<serde_json::Value>);
+
+/// `POST /torrents` accepts either a JSON body (`{magnet}` / `{torrent_path}`)
+/// or a multipart upload carrying the `.torrent` file (PRD HTTP API). Dispatch
+/// on Content-Type, normalize to `(slot_id, save_path, AddSource)`, then run
+/// one shared add path.
 pub async fn add(
     State(s): State<AppState>,
-    Json(req): Json<AddRequest>,
-) -> Result<(StatusCode, Json<AddResponse>), (StatusCode, Json<serde_json::Value>)> {
-    let slot_id = match (s.mode, req.slot_id.as_deref()) {
+    req: Request,
+) -> Result<(StatusCode, Json<AddResponse>), AddError> {
+    let is_multipart = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("multipart/form-data"));
+    let (slot_id_opt, save_path_opt, source) = if is_multipart {
+        parse_multipart(req, &s).await?
+    } else {
+        parse_json(req).await?
+    };
+    do_add(&s, slot_id_opt, save_path_opt, source).await
+}
+
+async fn parse_json(req: Request) -> Result<AddParse, AddError> {
+    let bytes = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("read body: {e}")}))))?;
+    let r: AddRequest = serde_json::from_slice(&bytes)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid JSON: {e}")}))))?;
+    let source = if let Some(uri) = r.magnet {
+        AddSource::Magnet(uri)
+    } else if let Some(path) = r.torrent_path {
+        let bytes = std::fs::read(&path).map_err(|e| {
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("read torrent file: {e}")})))
+        })?;
+        AddSource::File(bytes)
+    } else {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "magnet or torrent_path required"}))));
+    };
+    Ok((r.slot_id, r.save_path, source))
+}
+
+async fn parse_multipart(req: Request, state: &AppState) -> Result<AddParse, AddError> {
+    let mut mp = Multipart::from_request(req, state)
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid multipart: {e}")}))))?;
+    let mut torrent: Option<Vec<u8>> = None;
+    let mut slot_id: Option<String> = None;
+    let mut save_path: Option<String> = None;
+    while let Some(field) = mp.next_field().await.map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("multipart field: {e}")})))
+    })? {
+        match field.name().map(|n| n.to_string()).as_deref() {
+            Some("torrent") => {
+                let b = field.bytes().await.map_err(|e| {
+                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("read torrent field: {e}")})))
+                })?;
+                torrent = Some(b.to_vec());
+            }
+            Some("slot_id") => slot_id = field.text().await.ok(),
+            Some("save_path") => save_path = field.text().await.ok(),
+            _ => {}
+        }
+    }
+    let torrent = torrent.ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "multipart: missing 'torrent' file field"})))
+    })?;
+    Ok((slot_id, save_path, AddSource::File(torrent)))
+}
+
+async fn do_add(
+    s: &AppState,
+    slot_id_opt: Option<String>,
+    save_path_opt: Option<String>,
+    source: AddSource,
+) -> Result<(StatusCode, Json<AddResponse>), AddError> {
+    let slot_id = match (s.mode, slot_id_opt.as_deref()) {
         (Mode::Single, _) => SlotId::default_single(),
         (Mode::MultiSlot, Some(id)) => SlotId::new(id),
         (Mode::MultiSlot, None) => return Err((
@@ -132,8 +209,7 @@ pub async fn add(
         (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown slot_id"})))
     })?;
 
-    let save_path = req
-        .save_path
+    let save_path = save_path_opt
         .unwrap_or_else(|| s.default_save_path.to_string_lossy().into_owned());
     let flags = TorrentFlags::SEED_MODE
         | if !slot_id.is_default() {
@@ -142,19 +218,9 @@ pub async fn add(
             TorrentFlags::empty()
         };
 
-    // Resolve the source and compute its info-hash WITHOUT touching any
-    // session: PRD Safety Rule 4 (the session never receives an unverified
-    // torrent) and Safety Rule 3 (global info-hash uniqueness across slots).
-    let source = if let Some(uri) = req.magnet {
-        AddSource::Magnet(uri)
-    } else if let Some(path) = req.torrent_path {
-        let bytes = std::fs::read(&path).map_err(|e| {
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("read torrent file: {e}")})))
-        })?;
-        AddSource::File(bytes)
-    } else {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "magnet or torrent_path required"}))));
-    };
+    // Compute the info-hash WITHOUT touching any session: PRD Safety Rule 4
+    // (the session never receives an unverified torrent) and Rule 3 (global
+    // info-hash uniqueness across slots).
     let infohash = match &source {
         AddSource::Magnet(uri) => info_hash_from_magnet(uri),
         AddSource::File(bytes) => info_hash_from_torrent(bytes),

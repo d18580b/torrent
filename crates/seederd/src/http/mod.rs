@@ -32,5 +32,7 @@ pub fn router(state: AppState) -> Router {
             .route("/slots/:slot_id/resume-all", post(slots::resume_all));
     }
 
-    router.with_state(state)
+    router
+        .layer(axum::extract::DefaultBodyLimit::max(torrents::MAX_BODY_BYTES))
+        .with_state(state)
 }
