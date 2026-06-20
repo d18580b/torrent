@@ -74,3 +74,108 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         _ => unreachable!("error::handle called with non-error alert"),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use crate::clock::MockClock;
+    use crate::engine::TorrentEngine;
+    use crate::metrics::{MetricCall, RecordingSink};
+    use crate::mock::MockEngine;
+    use crate::resume_store::MemoryResumeStore;
+    use crate::slot::SlotId;
+    use crate::state::{StateMap, TorrentState};
+    use crate::torrent_store::MemoryTorrentStore;
+    use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::{AlertKind, InfoHash, TorrentHandle};
+
+    fn ih(b: u8) -> InfoHash {
+        InfoHash([b; 20])
+    }
+
+    fn seed_state(state: &StateMap, b: u8) {
+        let h = TorrentHandle { id: b as u64, infohash: ih(b) };
+        state.insert(ih(b), TorrentState::newly_added(h, SlotId::default_single(), Instant::now()));
+    }
+
+    fn dispatch(alert: &Alert, state: &StateMap, metrics: &RecordingSink) {
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let mut ctx = HandlerCtx {
+            state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics,
+            clock: &clock,
+            engine: &engine,
+            slot_id: SlotId::default_single(),
+            span: tracing::info_span!("test"),
+        };
+        handle(alert, &mut ctx);
+    }
+
+    fn hdr(b: u8, kind: AlertKind) -> AlertHeader {
+        AlertHeader { kind, infohash: Some(ih(b)), handle: None, timestamp_us: 0 }
+    }
+
+    #[test]
+    fn file_error_enters_upload_mode_with_retry() {
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        seed_state(&state, 0x11);
+        dispatch(
+            &Alert::FileError {
+                hdr: hdr(0x11, AlertKind::FileError),
+                error_code: 28,
+                filename: "data.bin".into(),
+                operation: "write".into(),
+                message: "no space left".into(),
+            },
+            &state,
+            &metrics,
+        );
+        let st = state.get(&ih(0x11)).unwrap();
+        assert_eq!(st.phase, TorrentPhase::UploadMode);
+        assert!(st.retry.is_some(), "retry timer must be armed");
+        assert!(metrics
+            .calls()
+            .iter()
+            .any(|c| matches!(c, MetricCall::IncCounter { name, .. } if name == "disk_errors_total")));
+    }
+
+    #[test]
+    fn torrent_error_marks_errored() {
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        seed_state(&state, 0x22);
+        dispatch(
+            &Alert::TorrentError {
+                hdr: hdr(0x22, AlertKind::TorrentError),
+                error_code: 2,
+                filename: String::new(),
+                message: "boom".into(),
+            },
+            &state,
+            &metrics,
+        );
+        assert_eq!(state.get(&ih(0x22)).unwrap().phase, TorrentPhase::Errored);
+    }
+
+    #[test]
+    fn hash_failed_marks_checking() {
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        seed_state(&state, 0x33);
+        dispatch(
+            &Alert::HashFailed { hdr: hdr(0x33, AlertKind::HashFailed), piece_index: 7 },
+            &state,
+            &metrics,
+        );
+        assert_eq!(state.get(&ih(0x33)).unwrap().phase, TorrentPhase::Checking);
+    }
+}

@@ -113,7 +113,7 @@ pub struct AddRequest {
     pub slot_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct AddResponse {
     infohash: String,
     slot_id: String,
@@ -369,4 +369,88 @@ pub async fn resume(
 
 fn bad_infohash() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid infohash hex"})))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use seederd_engine::{
+        AlertSource, AssignmentRegistry, MemoryTorrentStore, MockEngine, SingleSessionSource,
+        StateMap, TorrentEngine,
+    };
+
+    use crate::metrics_sink::PromSink;
+
+    fn test_state(dir: &std::path::Path) -> AppState {
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine));
+        AppState {
+            source,
+            registry: Arc::new(AssignmentRegistry::new_empty(dir.join("reg.json"))),
+            slots: None,
+            state: Arc::new(StateMap::new()),
+            torrents: Arc::new(MemoryTorrentStore::new()),
+            metrics: Arc::new(PromSink::new()),
+            default_save_path: dir.to_path_buf(),
+            mode: Mode::Single,
+        }
+    }
+
+    const MAGNET: &str =
+        "magnet:?xt=urn:btih:0101010101010101010101010101010101010101";
+    const MAGNET_HEX: &str = "0101010101010101010101010101010101010101";
+
+    #[test]
+    fn add_request_parses_magnet_and_slot() {
+        let r: AddRequest =
+            serde_json::from_str(r#"{"magnet":"magnet:?x","slot_id":"acct_a"}"#).unwrap();
+        assert_eq!(r.magnet.as_deref(), Some("magnet:?x"));
+        assert_eq!(r.slot_id.as_deref(), Some("acct_a"));
+        assert!(r.torrent_path.is_none());
+    }
+
+    #[test]
+    fn torrent_summary_serializes_expected_schema() {
+        let ts = TorrentSummary {
+            infohash: "aa".into(),
+            slot_id: "default".into(),
+            phase: "seeding".into(),
+            upload_rate: 10,
+            download_rate: 0,
+            num_peers: 2,
+            progress: 0.5,
+            is_finished: false,
+            is_seeding: true,
+        };
+        let v = serde_json::to_value(&ts).unwrap();
+        assert_eq!(v["phase"], "seeding");
+        assert_eq!(v["upload_rate"], 10);
+        assert_eq!(v["is_seeding"], true);
+    }
+
+    #[tokio::test]
+    async fn do_add_magnet_assigns_and_calls_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_state(dir.path());
+        let (code, resp) = do_add(&app, None, None, AddSource::Magnet(MAGNET.into()))
+            .await
+            .unwrap();
+        assert_eq!(code, StatusCode::CREATED);
+        assert_eq!(resp.0.infohash, MAGNET_HEX);
+        assert_eq!(app.registry.len(), 1);
+        assert_eq!(app.registry.lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap()).unwrap().as_str(), "default");
+    }
+
+    #[tokio::test]
+    async fn do_add_duplicate_is_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_state(dir.path());
+        let _ = do_add(&app, None, None, AddSource::Magnet(MAGNET.into())).await.unwrap();
+        let err = do_add(&app, None, None, AddSource::Magnet(MAGNET.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
 }
