@@ -317,7 +317,7 @@ impl ErrBuf {
 fn path_to_string(p: &Path) -> Result<String> {
     p.to_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| Error::InvalidInput("non-UTF8 save_path"))
+        .ok_or(Error::InvalidInput("non-UTF8 save_path"))
 }
 
 #[cfg(test)]

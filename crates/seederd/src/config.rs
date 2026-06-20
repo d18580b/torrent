@@ -172,14 +172,15 @@ pub struct ConfigDiff {
 impl ConfigDiff {
     /// Build a `Settings` patch containing only the reloadable fields
     /// that changed.
-    pub fn into_settings_patch(&self) -> libtorrent_safe::Settings {
-        let mut s = libtorrent_safe::Settings::default();
-        s.connections_limit = self.connections_limit;
-        s.upload_rate_limit = self.upload_rate_limit;
-        s.max_concurrent_http_announces = self.max_concurrent_http_announces;
-        s.aio_threads = self.aio_threads;
-        s.enable_lsd = self.enable_lsd;
-        s
+    pub fn to_settings_patch(&self) -> libtorrent_safe::Settings {
+        libtorrent_safe::Settings {
+            connections_limit: self.connections_limit,
+            upload_rate_limit: self.upload_rate_limit,
+            max_concurrent_http_announces: self.max_concurrent_http_announces,
+            aio_threads: self.aio_threads,
+            enable_lsd: self.enable_lsd,
+            ..Default::default()
+        }
     }
 
     pub fn is_empty(&self) -> bool {

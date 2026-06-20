@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
-use tracing::{error, info, info_span, warn, Span};
+use tracing::{info, info_span, warn, Span};
 
 use crate::clock::Clock;
 use crate::engine::TorrentEngine;
@@ -437,14 +437,6 @@ fn drain_once(
     for (slot, alert) in alerts {
         dispatch_alert(slot, alert, source, state, resume, metrics, clock);
     }
-}
-
-// Suppress missing helper in case the eprintln! macro isn't pulled by
-// the trait import set above. This module is intentionally compile-tested
-// only when the broader engine builds.
-#[allow(dead_code)]
-fn _force_metric_caller(metrics: &dyn MetricsSink) {
-    let _ = metrics.observe_histogram("dummy", 0.0, &[]);
 }
 
 // ---------------------------------------------------------------------------

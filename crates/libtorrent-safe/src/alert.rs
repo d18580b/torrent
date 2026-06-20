@@ -347,9 +347,8 @@ impl Alert {
 /// never want a stray byte from libtorrent to crash the daemon.
 fn c_str_to_owned(buf: &[std::os::raw::c_char]) -> String {
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
-    let cstr = CStr::from_bytes_until_nul(bytes).unwrap_or_else(|_| {
-        // No NUL found — treat the entire buffer as the message body.
-        unsafe { CStr::from_ptr(b"\0".as_ptr() as *const _) }
-    });
+    // No NUL found — fall back to an empty string rather than read past the
+    // buffer. `c""` is a `&'static CStr`; no `unsafe` needed.
+    let cstr = CStr::from_bytes_until_nul(bytes).unwrap_or(c"");
     String::from_utf8_lossy(cstr.to_bytes()).into_owned()
 }

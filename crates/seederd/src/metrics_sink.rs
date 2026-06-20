@@ -30,8 +30,6 @@ impl PromSink {
         }
     }
 
-    pub fn registry(&self) -> &Registry { &self.registry }
-
     pub fn render(&self) -> Vec<u8> {
         let metric_families = self.registry.gather();
         let encoder = TextEncoder::new();

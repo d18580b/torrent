@@ -51,7 +51,7 @@ pub async fn run(
             // reload integration.
             info!(new_log_level = level.as_str(), "SIGHUP: log_level change requested");
         }
-        let patch = diff.into_settings_patch();
+        let patch = diff.to_settings_patch();
         for slot in source.slots() {
             if let Some(eng) = source.engine_for(&slot) {
                 if let Err(e) = eng.apply_settings(&patch).context("apply_settings") {
