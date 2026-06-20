@@ -91,11 +91,41 @@ jobs:
             echo "::warning::Free-standing infohash field in a log macro; prefer #[instrument] on the parent function."
           fi
 
-  shim-asan:
-    name: shim ASAN
+  shim-tests:
+    name: shim FFI tests (Layer 2)
     runs-on: ubuntu-24.04
-    # Layer 2 ASAN harness lands with the test crate (Phase 11 T22).
-    # Job is registered now so the matrix is in place; it currently no-ops.
-    if: ${{ false }}
     steps:
-      - run: echo "shim-asan is reserved for Phase 11 T22"
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@1.90
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-shimtests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-shimtests-${{ runner.os }}-
+
+      - name: Cache vendored native build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/debug/build/libtorrent-sys-*/out
+          key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
+
+      # Layer 2 (PRD Validation §): struct marshalling, exception isolation,
+      # null-handle safety, and buffer ownership across the C ABI boundary.
+      - run: cargo test -p libtorrent-sys --features shim-tests

@@ -203,6 +203,16 @@ fn compile_shim(manifest_dir: &Path, lt_install: &Path, boost_install: &Path) {
     // Match libtorrent's compile flags so layouts agree. Most relevantly,
     // libtorrent's headers consult TORRENT_USE_OPENSSL via its own config,
     // which is on by default with `encryption=ON`.
+    //
+    // NOTE on ASan: instrumenting only the shim (`-fsanitize=address`) and
+    // letting rustc link it does not work on this toolchain — rustc's lld
+    // doesn't expand the `-fsanitize=address` driver flag, so the `__asan_*`
+    // runtime symbols go unresolved, and the prebuilt libtorrent is not
+    // instrumented either. Full ASan would require building libtorrent with
+    // ASan and linking via the C++ driver (a standalone test binary). The
+    // `shim-tests` feature therefore runs the FFI correctness suite (struct
+    // marshalling, exception isolation, null-handle safety, buffer ownership)
+    // without ASan; that remains a follow-up.
     build.compile("libtorrent_shim");
 }
 
