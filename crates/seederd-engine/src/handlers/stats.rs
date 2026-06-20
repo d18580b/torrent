@@ -111,6 +111,7 @@ mod tests {
     use crate::resume_store::MemoryResumeStore;
     use crate::slot::SlotId;
     use crate::state::StateMap;
+    use crate::torrent_store::MemoryTorrentStore;
     use libtorrent_safe::alert::AlertHeader;
     use libtorrent_safe::AlertKind;
 
@@ -130,12 +131,14 @@ mod tests {
     fn run(table: &StatsMetrics, counters: Vec<i64>) -> Vec<MetricCall> {
         let state = StateMap::new();
         let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
         let metrics = RecordingSink::new();
         let clock = MockClock::new();
         let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
         let mut ctx = HandlerCtx {
             state: &state,
             resume: &resume,
+            torrents: &torrents,
             metrics: &metrics,
             clock: &clock,
             engine: &engine,

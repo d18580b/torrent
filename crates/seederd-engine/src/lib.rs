@@ -21,6 +21,7 @@ pub mod resume_store;
 pub mod slot;
 pub mod source;
 pub mod state;
+pub mod torrent_store;
 pub mod vpn;
 
 pub mod alert_loop;
@@ -42,6 +43,7 @@ pub use resume_store::{FsResumeStore, MemoryResumeStore, ResumeStore};
 pub use slot::{Slot, SlotConfig, SlotId, SlotStatus};
 pub use source::{AlertSource, MultiSlotSource, SingleSessionSource};
 pub use state::{RetryState, StateMap, TorrentPhase, TorrentState};
+pub use torrent_store::{FsTorrentStore, MemoryTorrentStore, TorrentStore};
 pub use vpn::{MockVpn, VpnError, VpnManager, VpnProfile, VpnType};
 
 pub use alert_loop::{AlertLoopHandle, AlertLoopBuilder, ShutdownReason};

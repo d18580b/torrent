@@ -7,6 +7,7 @@ pub mod dropped;
 pub mod error;
 pub mod listen;
 pub mod log_msg;
+pub mod metadata;
 pub mod resume;
 pub mod state_update;
 pub mod stats;
@@ -21,18 +22,20 @@ use crate::metrics::MetricsSink;
 use crate::resume_store::ResumeStore;
 use crate::slot::SlotId;
 use crate::state::StateMap;
+use crate::torrent_store::TorrentStore;
 
 /// Borrowed state passed to every handler. One ctx per alert (cheap to
 /// build because everything is a reference). The lifetime is tied to the
 /// dispatch call, not the alert loop's lifetime.
 pub struct HandlerCtx<'a> {
-    pub state:   &'a StateMap,
-    pub resume:  &'a dyn ResumeStore,
-    pub metrics: &'a dyn MetricsSink,
-    pub clock:   &'a dyn Clock,
-    pub engine:  &'a Arc<dyn TorrentEngine>,
-    pub slot_id: SlotId,
-    pub span:    Span,
+    pub state:    &'a StateMap,
+    pub resume:   &'a dyn ResumeStore,
+    pub torrents: &'a dyn TorrentStore,
+    pub metrics:  &'a dyn MetricsSink,
+    pub clock:    &'a dyn Clock,
+    pub engine:   &'a Arc<dyn TorrentEngine>,
+    pub slot_id:  SlotId,
+    pub span:     Span,
 }
 
 impl<'a> std::fmt::Debug for HandlerCtx<'a> {
