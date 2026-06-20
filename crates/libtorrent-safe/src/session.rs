@@ -266,6 +266,20 @@ impl Session {
     }
 }
 
+/// Resolve a libtorrent session-stats counter name (e.g. `"net.sent_bytes"`)
+/// to its index in the `session_stats_alert` counter array, or `None` if the
+/// name is unknown to this libtorrent build. The mapping is a build-time
+/// constant — resolve once and cache.
+pub fn session_stats_metric_index(name: &str) -> Option<usize> {
+    let c = CString::new(name).ok()?;
+    let idx = unsafe { ffi::lt_session_stats_metric_index(c.as_ptr()) };
+    if idx < 0 {
+        None
+    } else {
+        Some(idx as usize)
+    }
+}
+
 impl Drop for Session {
     fn drop(&mut self) {
         if !self.ptr.is_null() {

@@ -9,6 +9,7 @@ pub mod listen;
 pub mod log_msg;
 pub mod resume;
 pub mod state_update;
+pub mod stats;
 
 use std::sync::Arc;
 
