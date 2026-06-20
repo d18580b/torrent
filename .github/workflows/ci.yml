@@ -129,3 +129,41 @@ jobs:
       # Layer 2 (PRD Validation §): struct marshalling, exception isolation,
       # null-handle safety, and buffer ownership across the C ABI boundary.
       - run: cargo test -p libtorrent-sys --features shim-tests
+
+  integration:
+    name: daemon integration (Layer 3)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@1.90
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-integration-${{ runner.os }}-
+
+      - name: Cache vendored native build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/debug/build/libtorrent-sys-*/out
+          key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
+
+      # Layer 3 (PRD Validation §): real daemon + libtorrent, driven over HTTP.
+      - run: cargo test -p seederd --test daemon -- --ignored
