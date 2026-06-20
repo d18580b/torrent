@@ -756,6 +756,32 @@ extern "C" lt_handle lt_add_torrent_resume(lt_session* s,
     LT_SHIM_CATCH(err_out, err_len, 0)
 }
 
+extern "C" int lt_torrent_info_hash(const uint8_t* data, size_t len,
+                                    uint8_t* out20, char* err_out, int err_len)
+{
+    if (!data || !out20) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    LT_SHIM_TRY
+    lt::torrent_info ti(reinterpret_cast<const char*>(data), static_cast<int>(len));
+    auto ih = ti.info_hashes().get_best();
+    std::memcpy(out20, ih.data(), 20);
+    return LT_OK;
+    LT_SHIM_CATCH(err_out, err_len, LT_ERR)
+}
+
+extern "C" int lt_magnet_info_hash(const char* uri,
+                                   uint8_t* out20, char* err_out, int err_len)
+{
+    if (!uri || !out20) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    LT_SHIM_TRY
+    lt::error_code ec;
+    lt::add_torrent_params atp = lt::parse_magnet_uri(uri, ec);
+    if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
+    auto ih = atp.info_hashes.get_best();
+    std::memcpy(out20, ih.data(), 20);
+    return LT_OK;
+    LT_SHIM_CATCH(err_out, err_len, LT_ERR)
+}
+
 extern "C" int lt_remove_torrent(lt_session* s, lt_handle h, int delete_files) {
     if (!s) return LT_ERR;
     LT_SHIM_TRY

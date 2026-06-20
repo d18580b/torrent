@@ -168,6 +168,17 @@ int         lt_torrent_set_upload_limit(lt_session* s, lt_handle h, int bytes_pe
 int         lt_torrent_set_file_priority(lt_session* s, lt_handle h,
                                          int file_idx, uint8_t priority);
 
+/* Compute the best (v1, or v2-truncated) info-hash of a .torrent buffer
+ * without adding it to any session. Writes 20 bytes to out20. Used to
+ * enforce registry uniqueness before the session sees the torrent
+ * (PRD Safety Rule 4). Returns LT_OK / LT_ERR (err_out populated). */
+int         lt_torrent_info_hash(const uint8_t* data, size_t len,
+                                 uint8_t* out20, char* err_out, int err_len);
+
+/* Same, for the info-hash encoded in a magnet URI. */
+int         lt_magnet_info_hash(const char* uri,
+                                uint8_t* out20, char* err_out, int err_len);
+
 /* ------------------------------------------------------------------ */
 /* Status & alerts                                                     */
 /* ------------------------------------------------------------------ */

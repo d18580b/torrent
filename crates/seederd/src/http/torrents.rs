@@ -5,13 +5,23 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use libtorrent_safe::{AddParams, InfoHash, TorrentFlags};
+use libtorrent_safe::{
+    info_hash_from_magnet, info_hash_from_torrent, AddParams, InfoHash, TorrentFlags,
+};
 use seederd_engine::SlotId;
 
 use crate::app_state::{AppState, Mode};
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 1000;
+
+/// Resolved add source, carrying the bytes/uri needed to (a) compute the
+/// info-hash up front and (b) build the engine params after the registry
+/// reservation succeeds (PRD Safety Rule 4).
+enum AddSource {
+    Magnet(String),
+    File(Vec<u8>),
+}
 
 #[derive(Deserialize)]
 pub struct ListQuery {
@@ -140,37 +150,56 @@ pub async fn add(
             TorrentFlags::empty()
         };
 
-    // Capture the .torrent bytes for file/path adds so we can persist them
-    // after a successful add; magnets carry no bytes here (their metadata is
-    // persisted by the metadata_received handler once it arrives).
-    let (params, torrent_bytes) = if let Some(uri) = req.magnet {
-        (AddParams::Magnet { uri, save_path, flags }, None)
+    // Resolve the source and compute its info-hash WITHOUT touching any
+    // session: PRD Safety Rule 4 (the session never receives an unverified
+    // torrent) and Safety Rule 3 (global info-hash uniqueness across slots).
+    let source = if let Some(uri) = req.magnet {
+        AddSource::Magnet(uri)
     } else if let Some(path) = req.torrent_path {
         let bytes = std::fs::read(&path).map_err(|e| {
             (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("read torrent file: {e}")})))
         })?;
-        (AddParams::File { bytes: bytes.clone(), save_path, flags }, Some(bytes))
+        AddSource::File(bytes)
     } else {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "magnet or torrent_path required"}))));
     };
-
-    let handle = engine.add_torrent(params).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")})))
+    let infohash = match &source {
+        AddSource::Magnet(uri) => info_hash_from_magnet(uri),
+        AddSource::File(bytes) => info_hash_from_torrent(bytes),
+    }
+    .map_err(|e| {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid torrent: {e}")})))
     })?;
 
-    // Enforce cross-slot uniqueness via the registry.
-    if let Err(e) = s.registry.assign(handle.infohash, slot_id.clone()) {
-        // Best-effort rollback: remove the torrent we just added.
-        let _ = engine.remove_torrent(handle, false);
+    // Reject duplicates before the session sees the torrent (PRD: 409 if the
+    // info-hash is already loaded in any slot).
+    if s.registry.lookup(&infohash).is_some() {
+        return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": "info-hash already loaded"}))));
+    }
+    // Reserve the assignment; assign() re-checks uniqueness to close any race.
+    if let Err(e) = s.registry.assign(infohash, slot_id.clone()) {
         return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": format!("{e}")}))));
+    }
+
+    // Now build params and hand the torrent to the session. Release the
+    // reservation if the add fails so the info-hash can be retried.
+    let (params, torrent_bytes) = match source {
+        AddSource::Magnet(uri) => (AddParams::Magnet { uri, save_path, flags }, None),
+        AddSource::File(bytes) => {
+            (AddParams::File { bytes: bytes.clone(), save_path, flags }, Some(bytes))
+        }
+    };
+    if let Err(e) = engine.add_torrent(params) {
+        let _ = s.registry.remove(&infohash);
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")}))));
     }
 
     // Persist the .torrent so the startup inventory scan can recover it if
     // resume data is ever lost (PRD §Session Management).
     if let Some(bytes) = torrent_bytes {
-        if let Err(e) = s.torrents.write(&slot_id, &handle.infohash, &bytes) {
+        if let Err(e) = s.torrents.write(&slot_id, &infohash, &bytes) {
             tracing::warn!(
-                infohash = %handle.infohash,
+                infohash = %infohash,
                 error.cause = %e,
                 "failed to persist .torrent file",
             );
@@ -179,7 +208,7 @@ pub async fn add(
 
     Ok((
         StatusCode::CREATED,
-        Json(AddResponse { infohash: handle.infohash.to_hex(), slot_id: slot_id.as_str().to_string() }),
+        Json(AddResponse { infohash: infohash.to_hex(), slot_id: slot_id.as_str().to_string() }),
     ))
 }
 
