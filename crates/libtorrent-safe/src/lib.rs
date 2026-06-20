@@ -19,5 +19,5 @@ pub use alert::{Alert, AlertKind};
 pub use error::{Error, Result};
 pub use handle::{InfoHash, TorrentHandle};
 pub use resume::ResumeData;
-pub use session::{AddParams, Session};
+pub use session::{session_stats_metric_index, AddParams, Session};
 pub use settings::{ResumeFlags, Settings, TorrentFlags};

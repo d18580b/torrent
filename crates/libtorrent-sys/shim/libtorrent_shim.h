@@ -175,6 +175,12 @@ int         lt_torrent_set_file_priority(lt_session* s, lt_handle h,
 void        lt_post_torrent_updates(lt_session* s);
 void        lt_post_session_stats(lt_session* s);
 
+/* Resolve a libtorrent session-stats counter name (e.g. "net.sent_bytes")
+ * to its index in the session_stats_alert counter array. Returns the index,
+ * or -1 if the name is unknown to this libtorrent build. The mapping is a
+ * build-time constant; resolve once on the Rust side and cache. */
+int         lt_session_stats_metric_index(const char* name);
+
 /* Initiates an asynchronous resume-data save. The result is delivered as
  * a save_resume_data_alert (success) or save_resume_data_failed_alert. */
 int         lt_save_resume_data(lt_session* s, lt_handle h, uint32_t flags);

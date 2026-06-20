@@ -253,11 +253,13 @@ fn dispatch_alert(
             handlers::dropped::handle(&alert, &mut ctx),
         Alert::TorrentLog { .. } | Alert::Log { .. } =>
             handlers::log_msg::handle(&alert, &mut ctx),
+        Alert::SessionStats { .. } =>
+            handlers::stats::handle(&alert, &mut ctx),
 
-        // Other alerts (metadata_received, session_stats, tracker_error,
-        // peer_disconnected) are interesting for ops/metrics but not yet
-        // wired up; emit a debug log so we can spot them in field traces
-        // without losing the loop's progress.
+        // Other alerts (metadata_received, tracker_error, peer_disconnected)
+        // are interesting for ops/metrics but not yet wired up; emit a debug
+        // log so we can spot them in field traces without losing the loop's
+        // progress.
         other => tracing::debug!(
             target: "seederd_engine::alert_loop",
             alert_type = other.kind().as_str(),

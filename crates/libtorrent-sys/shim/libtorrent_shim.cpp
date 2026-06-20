@@ -38,6 +38,7 @@
 #include <libtorrent/info_hash.hpp>
 #include <libtorrent/operations.hpp>
 #include <libtorrent/socket.hpp>
+#include <libtorrent/session_stats.hpp>
 
 // stdlib
 #include <atomic>
@@ -825,6 +826,19 @@ extern "C" void lt_post_session_stats(lt_session* s) {
     LT_SHIM_TRY_VOID
     s->ses.post_session_stats();
     LT_SHIM_CATCH_VOID
+}
+
+extern "C" int lt_session_stats_metric_index(const char* name) {
+    if (!name) return -1;
+    LT_SHIM_TRY
+    // session_stats_metrics() is a pure function of the libtorrent build;
+    // compute the table once and reuse it across calls.
+    static const std::vector<lt::stats_metric> metrics = lt::session_stats_metrics();
+    for (auto const& m : metrics) {
+        if (std::strcmp(m.name, name) == 0) return m.value_index;
+    }
+    return -1;
+    LT_SHIM_CATCH(nullptr, 0, -1)
 }
 
 extern "C" int lt_save_resume_data(lt_session* s, lt_handle h, uint32_t flags) {
