@@ -21,6 +21,7 @@ pub async fn run(
     initial: Config,
     source: Arc<dyn AlertSource>,
     mut reload_rx: Receiver<()>,
+    log_handle: crate::tracing_init::LogReloadHandle,
 ) {
     let mut current = initial;
     while reload_rx.recv().await.is_some() {
@@ -46,10 +47,10 @@ pub async fn run(
             );
         }
         if let Some(level) = diff.log_level {
-            // The fmt subscriber's filter is fixed at startup; we log the
-            // intent but defer the actual switch to a future tracing-
-            // reload integration.
-            info!(new_log_level = level.as_str(), "SIGHUP: log_level change requested");
+            match log_handle.set_level(level) {
+                Ok(()) => info!(new_log_level = level.as_str(), "SIGHUP: log level applied"),
+                Err(e) => warn!(error.cause = %e, "SIGHUP: failed to apply log level"),
+            }
         }
         let patch = diff.to_settings_patch();
         for slot in source.slots() {

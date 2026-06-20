@@ -35,10 +35,14 @@ pub struct DaemonHandle {
     reload_rx: mpsc::Receiver<()>,
     metrics: Arc<PromSink>,
     registry: Arc<AssignmentRegistry>,
+    log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: seederd_engine::AlertLoopHandle,
 }
 
-pub async fn boot(cfg: Config) -> anyhow::Result<DaemonHandle> {
+pub async fn boot(
+    cfg: Config,
+    log_handle: crate::tracing_init::LogReloadHandle,
+) -> anyhow::Result<DaemonHandle> {
     info!("starting seederd");
     let mode = if cfg.slot.is_empty() { Mode::Single } else { Mode::MultiSlot };
 
@@ -249,6 +253,7 @@ pub async fn boot(cfg: Config) -> anyhow::Result<DaemonHandle> {
         reload_rx,
         metrics,
         registry,
+        log_handle,
         alert_loop,
     })
 }
@@ -266,6 +271,7 @@ impl DaemonHandle {
             reload_rx,
             metrics,
             registry,
+            log_handle,
             alert_loop,
         } = self;
 
@@ -290,7 +296,7 @@ impl DaemonHandle {
             .map(std::path::PathBuf::from)
             .unwrap_or_default();
         let cfg_clone = cfg.clone();
-        tokio::spawn(reload::run(cfg_path, cfg_clone, reload_source, reload_rx));
+        tokio::spawn(reload::run(cfg_path, cfg_clone, reload_source, reload_rx, log_handle));
 
         let listener = match tokio::net::TcpListener::bind(http_listen).await {
             Ok(l) => l,
