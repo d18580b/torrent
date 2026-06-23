@@ -4,8 +4,12 @@
 //!   - `alert-throughput`: drive the in-memory state map at high rate and
 //!     report updates/sec — verifies the alert-dispatch hot path keeps up
 //!     (PRD target: >=100k/s). Pure Rust, no libtorrent.
-//!   - `memory-scaling`: add N magnets to a real libtorrent session and
-//!     report resident-set size per torrent (PRD target: <200 KB/torrent).
+//!   - `memory-scaling`: add N real *seeding* torrents to a libtorrent session
+//!     built with the no-op disk backend (`_disabled_disk_io`) and report
+//!     resident-set size per torrent (PRD target: <200 KB/torrent). Using real
+//!     added torrents (not metadata-pending magnets) means RSS reflects
+//!     libtorrent's true per-torrent structures; the no-op disk backend lets us
+//!     reach 50K seeds without provisioning any payload on disk.
 //!   - `startup-time`: time how long a real session takes to ingest N
 //!     torrents (PRD startup targets).
 //!
@@ -107,7 +111,39 @@ fn bench_settings() -> Settings {
     s.enable_upnp = Some(false);
     s.enable_natpmp = Some(false);
     s.listen_interfaces = Some("127.0.0.1:0".into());
+    // No-op disk backend: reads return zero-filled blocks, writes are dropped.
+    // Lets the harness add real seeding torrents at 50K scale with no payload
+    // on disk, so the only memory we measure is libtorrent's own per-torrent
+    // bookkeeping.
+    s.disabled_disk_io = Some(true);
     s
+}
+
+/// Build a minimal valid single-file `.torrent` for index `i`. The info dict is
+/// unique per index (distinct `name`), so each yields a distinct info-hash and
+/// add never collides. Piece hashes are arbitrary zero bytes: under `SEED_MODE`
+/// with the no-op disk backend libtorrent never verifies them, and the harness
+/// only measures resident memory. 1024 × 256 KiB pieces (a 256 MiB torrent) is
+/// a representative medium torrent — ~20 KB of piece hashes drives realistic
+/// per-torrent overhead.
+fn make_torrent(i: usize) -> Vec<u8> {
+    const PIECE_LEN: i64 = 256 * 1024;
+    const NUM_PIECES: usize = 1024;
+    let length: i64 = PIECE_LEN * NUM_PIECES as i64;
+    let name = format!("seed-{i}");
+    let pieces = vec![0u8; NUM_PIECES * 20];
+
+    // Info-dict keys in bencode (byte-lexicographic) order:
+    // length < name < piece length < pieces.
+    let mut out = Vec::with_capacity(pieces.len() + 128);
+    out.extend_from_slice(b"d4:infod");
+    out.extend_from_slice(format!("6:lengthi{length}e").as_bytes());
+    out.extend_from_slice(format!("4:name{}:{name}", name.len()).as_bytes());
+    out.extend_from_slice(format!("12:piece lengthi{PIECE_LEN}e").as_bytes());
+    out.extend_from_slice(format!("6:pieces{}:", pieces.len()).as_bytes());
+    out.extend_from_slice(&pieces);
+    out.extend_from_slice(b"ee");
+    out
 }
 
 fn vmrss_kb() -> u64 {
@@ -125,12 +161,11 @@ fn vmrss_kb() -> u64 {
 fn memory_scaling(count: usize) {
     let session = Session::new(&bench_settings()).expect("create session");
     let base = vmrss_kb();
-    println!("memory-scaling: baseline RSS = {base} KB; adding {count} magnets...");
+    println!("memory-scaling: baseline RSS = {base} KB; adding {count} real seeding torrents (no-op disk)...");
     for i in 0..count {
-        let uri = format!("magnet:?xt=urn:btih:{}", ih_from(i).to_hex());
-        let _ = session.add_torrent(AddParams::Magnet {
-            uri,
-            save_path: "/tmp".into(),
+        let _ = session.add_torrent(AddParams::File {
+            save_path: "/tmp/seederd-bench".into(),
+            bytes: make_torrent(i),
             flags: TorrentFlags::SEED_MODE,
         });
         if i > 0 && i % 10_000 == 0 {
@@ -150,19 +185,20 @@ fn memory_scaling(count: usize) {
         0.0
     };
     println!(
-        "memory-scaling: final RSS = {rss} KB; {per:.0} KB/torrent over baseline \
-         (PRD target <200; NOTE: metadata-pending magnets, not seeding torrents)"
+        "memory-scaling: final RSS = {rss} KB; {per:.0} KB/torrent over baseline (PRD target <200)"
     );
+    if per > 200.0 {
+        eprintln!("WARNING: above PRD target of 200 KB/torrent");
+    }
 }
 
 fn startup_time(count: usize) {
     let session = Session::new(&bench_settings()).expect("create session");
     let start = Instant::now();
     for i in 0..count {
-        let uri = format!("magnet:?xt=urn:btih:{}", ih_from(i).to_hex());
-        let _ = session.add_torrent(AddParams::Magnet {
-            uri,
-            save_path: "/tmp".into(),
+        let _ = session.add_torrent(AddParams::File {
+            save_path: "/tmp/seederd-bench".into(),
+            bytes: make_torrent(i),
             flags: TorrentFlags::SEED_MODE,
         });
     }
