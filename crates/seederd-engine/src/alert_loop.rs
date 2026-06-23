@@ -77,7 +77,14 @@ impl AlertLoopBuilder {
         metrics: Arc<dyn MetricsSink>,
         clock: Arc<dyn Clock>,
     ) -> Self {
-        Self { source, state, resume, torrents, metrics, clock }
+        Self {
+            source,
+            state,
+            resume,
+            torrents,
+            metrics,
+            clock,
+        }
     }
 
     /// Spawn the loop on a dedicated OS thread. Returns a handle the
@@ -106,7 +113,11 @@ impl AlertLoopBuilder {
             })
             .expect("spawn alert loop thread");
 
-        AlertLoopHandle { join, shutdown: tx, state: state_arc }
+        AlertLoopHandle {
+            join,
+            shutdown: tx,
+            state: state_arc,
+        }
     }
 }
 
@@ -120,7 +131,9 @@ pub struct AlertLoopHandle {
 impl AlertLoopHandle {
     /// Get a clone of the shared state map (for HTTP API queries, tests,
     /// etc.).
-    pub fn state(&self) -> Arc<StateMap> { Arc::clone(&self.state) }
+    pub fn state(&self) -> Arc<StateMap> {
+        Arc::clone(&self.state)
+    }
 
     /// Send a shutdown signal. Idempotent; returns true on the first
     /// call, false if the channel was already filled.
@@ -129,7 +142,9 @@ impl AlertLoopHandle {
     }
 
     /// Wait for the loop thread to exit. Useful in tests.
-    pub fn join(self) -> std::thread::Result<()> { self.join.join() }
+    pub fn join(self) -> std::thread::Result<()> {
+        self.join.join()
+    }
 }
 
 impl std::fmt::Debug for AlertLoopHandle {
@@ -177,14 +192,7 @@ fn run(
         let was_empty = drained.is_empty();
         for (slot, alert) in drained {
             dispatch_alert(
-                slot,
-                alert,
-                &source,
-                &state,
-                &resume,
-                &torrents,
-                &metrics,
-                &clock,
+                slot, alert, &source, &state, &resume, &torrents, &metrics, &clock,
             );
         }
 
@@ -238,35 +246,36 @@ fn dispatch_alert(
         alert_type = alert.kind().as_str(),
     );
     let mut ctx = HandlerCtx {
-        state:    state.as_ref(),
-        resume:   resume.as_ref(),
+        state: state.as_ref(),
+        resume: resume.as_ref(),
         torrents: torrents.as_ref(),
-        metrics:  metrics.as_ref(),
-        clock:    clock.as_ref(),
-        engine:   &engine,
-        slot_id:  slot,
+        metrics: metrics.as_ref(),
+        clock: clock.as_ref(),
+        engine: &engine,
+        slot_id: slot,
         span,
     };
 
     match &alert {
-        Alert::AddTorrent { .. } | Alert::TorrentRemoved { .. } =>
-            handlers::add::handle(&alert, &mut ctx),
-        Alert::StateUpdate { .. } | Alert::TorrentFinished { .. } =>
-            handlers::state_update::handle(&alert, &mut ctx),
-        Alert::SaveResumeData { .. } | Alert::SaveResumeDataFailed { .. } =>
-            handlers::resume::handle(&alert, &mut ctx),
-        Alert::TorrentError { .. } | Alert::FileError { .. } | Alert::HashFailed { .. } =>
-            handlers::error::handle(&alert, &mut ctx),
-        Alert::ListenFailed { .. } | Alert::ListenSucceeded { .. } =>
-            handlers::listen::handle(&alert, &mut ctx),
-        Alert::AlertsDropped { .. } =>
-            handlers::dropped::handle(&alert, &mut ctx),
-        Alert::TorrentLog { .. } | Alert::Log { .. } =>
-            handlers::log_msg::handle(&alert, &mut ctx),
-        Alert::SessionStats { .. } =>
-            handlers::stats::handle(&alert, &mut ctx),
-        Alert::MetadataReceived { .. } =>
-            handlers::metadata::handle(&alert, &mut ctx),
+        Alert::AddTorrent { .. } | Alert::TorrentRemoved { .. } => {
+            handlers::add::handle(&alert, &mut ctx)
+        }
+        Alert::StateUpdate { .. } | Alert::TorrentFinished { .. } => {
+            handlers::state_update::handle(&alert, &mut ctx)
+        }
+        Alert::SaveResumeData { .. } | Alert::SaveResumeDataFailed { .. } => {
+            handlers::resume::handle(&alert, &mut ctx)
+        }
+        Alert::TorrentError { .. } | Alert::FileError { .. } | Alert::HashFailed { .. } => {
+            handlers::error::handle(&alert, &mut ctx)
+        }
+        Alert::ListenFailed { .. } | Alert::ListenSucceeded { .. } => {
+            handlers::listen::handle(&alert, &mut ctx)
+        }
+        Alert::AlertsDropped { .. } => handlers::dropped::handle(&alert, &mut ctx),
+        Alert::TorrentLog { .. } | Alert::Log { .. } => handlers::log_msg::handle(&alert, &mut ctx),
+        Alert::SessionStats { .. } => handlers::stats::handle(&alert, &mut ctx),
+        Alert::MetadataReceived { .. } => handlers::metadata::handle(&alert, &mut ctx),
 
         // Other alerts (tracker_error, peer_disconnected) are interesting for
         // ops/metrics but not yet wired up; emit a debug log so we can spot
@@ -285,7 +294,9 @@ fn schedule_periodic_resume_saves(
     metrics: &Arc<dyn MetricsSink>,
 ) {
     let handles = state.needing_resume_save();
-    if handles.is_empty() { return; }
+    if handles.is_empty() {
+        return;
+    }
     info!(
         target: "seederd_engine::alert_loop",
         torrent_count = handles.len(),
@@ -304,10 +315,16 @@ fn execute_due_retries(
     now: Instant,
 ) {
     let due = state.retries_due(now);
-    if due.is_empty() { return; }
+    if due.is_empty() {
+        return;
+    }
     for handle in due {
-        let Some(st) = state.get(&handle.infohash) else { continue };
-        let Some(engine) = source.engine_for(&st.slot_id) else { continue };
+        let Some(st) = state.get(&handle.infohash) else {
+            continue;
+        };
+        let Some(engine) = source.engine_for(&st.slot_id) else {
+            continue;
+        };
         match engine.resume_torrent(handle) {
             Ok(()) => {
                 info!(
@@ -349,8 +366,12 @@ fn request_save(
     handle: TorrentHandle,
     flags: ResumeFlags,
 ) {
-    let Some(st) = state.get(&handle.infohash) else { return };
-    let Some(engine) = source.engine_for(&st.slot_id) else { return };
+    let Some(st) = state.get(&handle.infohash) else {
+        return;
+    };
+    let Some(engine) = source.engine_for(&st.slot_id) else {
+        return;
+    };
     state.note_resume_requested();
     if let Err(e) = engine.save_resume_data(handle, flags) {
         // Failed before reaching libtorrent — settle immediately or the
@@ -410,7 +431,9 @@ fn run_shutdown(
 
     let stop_at = started + deadline;
     while clock.now() < stop_at {
-        if state.pending_resume_count() == 0 { break; }
+        if state.pending_resume_count() == 0 {
+            break;
+        }
         drain_once(source, state, resume, torrents, metrics, clock);
         clock.sleep(SHUTDOWN_DRAIN_INTERVAL);
     }
@@ -424,11 +447,7 @@ fn run_shutdown(
             elapsed_ms = clock.now().saturating_duration_since(started).as_millis() as u64,
             "shutdown deadline elapsed with unsaved resume data",
         );
-        metrics.add_counter(
-            "shutdown_unsaved_resumes_total",
-            outstanding,
-            &[],
-        );
+        metrics.add_counter("shutdown_unsaved_resumes_total", outstanding, &[]);
     } else {
         info!(
             target: "seederd_engine::alert_loop",
@@ -554,7 +573,10 @@ mod tests {
         state.insert(
             InfoHash([0xAA; 20]),
             crate::state::TorrentState::newly_added(
-                TorrentHandle { id: 1, infohash: InfoHash([0xAA; 20]) },
+                TorrentHandle {
+                    id: 1,
+                    infohash: InfoHash([0xAA; 20]),
+                },
                 SlotId::default_single(),
                 clock.now(),
             ),
@@ -620,8 +642,14 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
         let now = clock.now();
-        state.insert(h1.infohash, crate::state::TorrentState::newly_added(h1, SlotId::default_single(), now));
-        state.insert(h2.infohash, crate::state::TorrentState::newly_added(h2, SlotId::default_single(), now));
+        state.insert(
+            h1.infohash,
+            crate::state::TorrentState::newly_added(h1, SlotId::default_single(), now),
+        );
+        state.insert(
+            h2.infohash,
+            crate::state::TorrentState::newly_added(h2, SlotId::default_single(), now),
+        );
 
         run_shutdown(
             ShutdownReason::Test,
@@ -635,9 +663,11 @@ mod tests {
         );
 
         assert_eq!(state.pending_resume_count(), 0);
-        let saves = engine.calls().iter().filter(|c| matches!(
-            c, crate::mock::RecordedCall::SaveResumeData { .. }
-        )).count();
+        let saves = engine
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, crate::mock::RecordedCall::SaveResumeData { .. }))
+            .count();
         assert_eq!(saves, 2);
     }
 
@@ -662,8 +692,14 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
         let now = clock.now();
-        state.insert(h1.infohash, crate::state::TorrentState::newly_added(h1, SlotId::default_single(), now));
-        state.insert(h2.infohash, crate::state::TorrentState::newly_added(h2, SlotId::default_single(), now));
+        state.insert(
+            h1.infohash,
+            crate::state::TorrentState::newly_added(h1, SlotId::default_single(), now),
+        );
+        state.insert(
+            h2.infohash,
+            crate::state::TorrentState::newly_added(h2, SlotId::default_single(), now),
+        );
 
         // Both alerts are queued before run_shutdown. The first drain
         // inside run_shutdown will consume them; both note_resume_settled

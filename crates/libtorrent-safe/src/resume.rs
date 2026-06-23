@@ -9,21 +9,33 @@ pub struct ResumeData(pub Vec<u8>);
 
 impl ResumeData {
     #[inline]
-    pub fn new(buf: Vec<u8>) -> Self { Self(buf) }
+    pub fn new(buf: Vec<u8>) -> Self {
+        Self(buf)
+    }
 
     #[inline]
-    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 
     #[inline]
-    pub fn into_inner(self) -> Vec<u8> { self.0 }
+    pub fn into_inner(self) -> Vec<u8> {
+        self.0
+    }
 
     #[inline]
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 
     #[inline]
-    pub fn len(&self) -> usize { self.0.len() }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
 }
 
 impl From<Vec<u8>> for ResumeData {
-    fn from(v: Vec<u8>) -> Self { Self(v) }
+    fn from(v: Vec<u8>) -> Self {
+        Self(v)
+    }
 }

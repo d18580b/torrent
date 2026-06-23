@@ -21,6 +21,6 @@ use seederd_engine::{VpnManager, VpnType};
 pub fn for_type(t: VpnType) -> Arc<dyn VpnManager> {
     match t {
         VpnType::Wireguard => Arc::new(WireguardManager::new()),
-        VpnType::Openvpn   => Arc::new(OpenvpnManager::new()),
+        VpnType::Openvpn => Arc::new(OpenvpnManager::new()),
     }
 }

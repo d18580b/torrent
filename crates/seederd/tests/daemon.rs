@@ -19,7 +19,9 @@ const HTTP: &str = "127.0.0.1:18091";
 /// whole response to EOF. Returns `(status, body)`.
 fn http(method: &str, path: &str, body: Option<&str>) -> (u16, String) {
     let mut stream = TcpStream::connect(HTTP).expect("connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     let body = body.unwrap_or("");
     let req = format!(
         "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
@@ -36,7 +38,11 @@ fn http(method: &str, path: &str, body: Option<&str>) -> (u16, String) {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let body = resp.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("").to_string();
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b)
+        .unwrap_or("")
+        .to_string();
     (status, body)
 }
 

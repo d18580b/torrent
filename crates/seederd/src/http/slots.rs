@@ -45,10 +45,16 @@ fn summary_of(s: &AppState, e: &SlotEntry) -> SlotSummary {
 }
 
 fn not_configured() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "slots not configured"})))
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "slots not configured"})),
+    )
 }
 fn no_such_slot() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "unknown slot_id"})))
+    (
+        StatusCode::NOT_FOUND,
+        Json(serde_json::json!({"error": "unknown slot_id"})),
+    )
 }
 
 pub async fn list(

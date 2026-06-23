@@ -39,24 +39,24 @@ pub enum AlertKind {
 impl AlertKind {
     pub fn as_str(&self) -> &'static str {
         match self {
-            AlertKind::AddTorrent           => "add_torrent",
-            AlertKind::TorrentRemoved       => "torrent_removed",
-            AlertKind::StateUpdate          => "state_update",
-            AlertKind::TorrentFinished      => "torrent_finished",
-            AlertKind::TorrentError         => "torrent_error",
-            AlertKind::FileError            => "file_error",
-            AlertKind::HashFailed           => "hash_failed",
-            AlertKind::MetadataReceived     => "metadata_received",
-            AlertKind::SaveResumeData       => "save_resume_data",
+            AlertKind::AddTorrent => "add_torrent",
+            AlertKind::TorrentRemoved => "torrent_removed",
+            AlertKind::StateUpdate => "state_update",
+            AlertKind::TorrentFinished => "torrent_finished",
+            AlertKind::TorrentError => "torrent_error",
+            AlertKind::FileError => "file_error",
+            AlertKind::HashFailed => "hash_failed",
+            AlertKind::MetadataReceived => "metadata_received",
+            AlertKind::SaveResumeData => "save_resume_data",
             AlertKind::SaveResumeDataFailed => "save_resume_data_failed",
-            AlertKind::ListenFailed         => "listen_failed",
-            AlertKind::ListenSucceeded      => "listen_succeeded",
-            AlertKind::SessionStats         => "session_stats",
-            AlertKind::AlertsDropped        => "alerts_dropped",
-            AlertKind::TrackerError         => "tracker_error",
-            AlertKind::PeerDisconnected     => "peer_disconnected",
-            AlertKind::TorrentLog           => "torrent_log",
-            AlertKind::Log                  => "log",
+            AlertKind::ListenFailed => "listen_failed",
+            AlertKind::ListenSucceeded => "listen_succeeded",
+            AlertKind::SessionStats => "session_stats",
+            AlertKind::AlertsDropped => "alerts_dropped",
+            AlertKind::TrackerError => "tracker_error",
+            AlertKind::PeerDisconnected => "peer_disconnected",
+            AlertKind::TorrentLog => "torrent_log",
+            AlertKind::Log => "log",
         }
     }
 }
@@ -91,24 +91,94 @@ pub struct TorrentStatusView {
 
 #[derive(Clone, Debug)]
 pub enum Alert {
-    AddTorrent { hdr: AlertHeader, error_code: i32, message: Option<String> },
-    TorrentRemoved { hdr: AlertHeader },
-    StateUpdate { hdr: AlertHeader, statuses: Vec<TorrentStatusView> },
-    TorrentFinished { hdr: AlertHeader },
-    TorrentError { hdr: AlertHeader, error_code: i32, filename: String, message: String },
-    FileError { hdr: AlertHeader, error_code: i32, filename: String, operation: String, message: String },
-    HashFailed { hdr: AlertHeader, piece_index: i32 },
-    MetadataReceived { hdr: AlertHeader, info_section: Vec<u8> },
-    SaveResumeData { hdr: AlertHeader, data: ResumeData },
-    SaveResumeDataFailed { hdr: AlertHeader, error_code: i32, not_modified: bool, message: String },
-    ListenFailed { hdr: AlertHeader, error_code: i32, operation: String, endpoint: String, iface: String, message: String },
-    ListenSucceeded { hdr: AlertHeader, endpoint: String },
-    SessionStats { hdr: AlertHeader, counters: Vec<i64>, timestamp_ns: i64 },
-    AlertsDropped { hdr: AlertHeader, bits: [u64; 2] },
-    TrackerError { hdr: AlertHeader, error_code: i32, times_in_row: i32, tracker_url: String, message: String },
-    PeerDisconnected { hdr: AlertHeader, peer_address: String, error_code: i32, message: String },
-    TorrentLog { hdr: AlertHeader, message: String },
-    Log { hdr: AlertHeader, message: String },
+    AddTorrent {
+        hdr: AlertHeader,
+        error_code: i32,
+        message: Option<String>,
+    },
+    TorrentRemoved {
+        hdr: AlertHeader,
+    },
+    StateUpdate {
+        hdr: AlertHeader,
+        statuses: Vec<TorrentStatusView>,
+    },
+    TorrentFinished {
+        hdr: AlertHeader,
+    },
+    TorrentError {
+        hdr: AlertHeader,
+        error_code: i32,
+        filename: String,
+        message: String,
+    },
+    FileError {
+        hdr: AlertHeader,
+        error_code: i32,
+        filename: String,
+        operation: String,
+        message: String,
+    },
+    HashFailed {
+        hdr: AlertHeader,
+        piece_index: i32,
+    },
+    MetadataReceived {
+        hdr: AlertHeader,
+        info_section: Vec<u8>,
+    },
+    SaveResumeData {
+        hdr: AlertHeader,
+        data: ResumeData,
+    },
+    SaveResumeDataFailed {
+        hdr: AlertHeader,
+        error_code: i32,
+        not_modified: bool,
+        message: String,
+    },
+    ListenFailed {
+        hdr: AlertHeader,
+        error_code: i32,
+        operation: String,
+        endpoint: String,
+        iface: String,
+        message: String,
+    },
+    ListenSucceeded {
+        hdr: AlertHeader,
+        endpoint: String,
+    },
+    SessionStats {
+        hdr: AlertHeader,
+        counters: Vec<i64>,
+        timestamp_ns: i64,
+    },
+    AlertsDropped {
+        hdr: AlertHeader,
+        bits: [u64; 2],
+    },
+    TrackerError {
+        hdr: AlertHeader,
+        error_code: i32,
+        times_in_row: i32,
+        tracker_url: String,
+        message: String,
+    },
+    PeerDisconnected {
+        hdr: AlertHeader,
+        peer_address: String,
+        error_code: i32,
+        message: String,
+    },
+    TorrentLog {
+        hdr: AlertHeader,
+        message: String,
+    },
+    Log {
+        hdr: AlertHeader,
+        message: String,
+    },
 }
 
 impl Alert {
@@ -135,8 +205,12 @@ impl Alert {
         }
     }
 
-    pub fn kind(&self) -> AlertKind { self.header().kind }
-    pub fn infohash(&self) -> Option<InfoHash> { self.header().infohash }
+    pub fn kind(&self) -> AlertKind {
+        self.header().kind
+    }
+    pub fn infohash(&self) -> Option<InfoHash> {
+        self.header().infohash
+    }
 
     /// Convert from a popped `lt_alert_union`, taking ownership of heap
     /// payloads. Callers MUST NOT call `lt_alert_payload_free` separately —
@@ -152,24 +226,24 @@ impl Alert {
     /// same `raw` to `lt_alert_payload_free` is a no-op.
     pub(crate) unsafe fn from_raw_owned(raw: &mut ffi::lt_alert_union) -> Option<Self> {
         let kind = match raw.kind {
-            ffi::lt_alert_kind_LT_ALERT_ADD_TORRENT             => AlertKind::AddTorrent,
-            ffi::lt_alert_kind_LT_ALERT_TORRENT_REMOVED         => AlertKind::TorrentRemoved,
-            ffi::lt_alert_kind_LT_ALERT_STATE_UPDATE            => AlertKind::StateUpdate,
-            ffi::lt_alert_kind_LT_ALERT_TORRENT_FINISHED        => AlertKind::TorrentFinished,
-            ffi::lt_alert_kind_LT_ALERT_TORRENT_ERROR           => AlertKind::TorrentError,
-            ffi::lt_alert_kind_LT_ALERT_FILE_ERROR              => AlertKind::FileError,
-            ffi::lt_alert_kind_LT_ALERT_HASH_FAILED             => AlertKind::HashFailed,
-            ffi::lt_alert_kind_LT_ALERT_METADATA_RECEIVED       => AlertKind::MetadataReceived,
-            ffi::lt_alert_kind_LT_ALERT_SAVE_RESUME_DATA        => AlertKind::SaveResumeData,
+            ffi::lt_alert_kind_LT_ALERT_ADD_TORRENT => AlertKind::AddTorrent,
+            ffi::lt_alert_kind_LT_ALERT_TORRENT_REMOVED => AlertKind::TorrentRemoved,
+            ffi::lt_alert_kind_LT_ALERT_STATE_UPDATE => AlertKind::StateUpdate,
+            ffi::lt_alert_kind_LT_ALERT_TORRENT_FINISHED => AlertKind::TorrentFinished,
+            ffi::lt_alert_kind_LT_ALERT_TORRENT_ERROR => AlertKind::TorrentError,
+            ffi::lt_alert_kind_LT_ALERT_FILE_ERROR => AlertKind::FileError,
+            ffi::lt_alert_kind_LT_ALERT_HASH_FAILED => AlertKind::HashFailed,
+            ffi::lt_alert_kind_LT_ALERT_METADATA_RECEIVED => AlertKind::MetadataReceived,
+            ffi::lt_alert_kind_LT_ALERT_SAVE_RESUME_DATA => AlertKind::SaveResumeData,
             ffi::lt_alert_kind_LT_ALERT_SAVE_RESUME_DATA_FAILED => AlertKind::SaveResumeDataFailed,
-            ffi::lt_alert_kind_LT_ALERT_LISTEN_FAILED           => AlertKind::ListenFailed,
-            ffi::lt_alert_kind_LT_ALERT_LISTEN_SUCCEEDED        => AlertKind::ListenSucceeded,
-            ffi::lt_alert_kind_LT_ALERT_SESSION_STATS           => AlertKind::SessionStats,
-            ffi::lt_alert_kind_LT_ALERT_ALERTS_DROPPED          => AlertKind::AlertsDropped,
-            ffi::lt_alert_kind_LT_ALERT_TRACKER_ERROR           => AlertKind::TrackerError,
-            ffi::lt_alert_kind_LT_ALERT_PEER_DISCONNECTED       => AlertKind::PeerDisconnected,
-            ffi::lt_alert_kind_LT_ALERT_TORRENT_LOG             => AlertKind::TorrentLog,
-            ffi::lt_alert_kind_LT_ALERT_LOG                     => AlertKind::Log,
+            ffi::lt_alert_kind_LT_ALERT_LISTEN_FAILED => AlertKind::ListenFailed,
+            ffi::lt_alert_kind_LT_ALERT_LISTEN_SUCCEEDED => AlertKind::ListenSucceeded,
+            ffi::lt_alert_kind_LT_ALERT_SESSION_STATS => AlertKind::SessionStats,
+            ffi::lt_alert_kind_LT_ALERT_ALERTS_DROPPED => AlertKind::AlertsDropped,
+            ffi::lt_alert_kind_LT_ALERT_TRACKER_ERROR => AlertKind::TrackerError,
+            ffi::lt_alert_kind_LT_ALERT_PEER_DISCONNECTED => AlertKind::PeerDisconnected,
+            ffi::lt_alert_kind_LT_ALERT_TORRENT_LOG => AlertKind::TorrentLog,
+            ffi::lt_alert_kind_LT_ALERT_LOG => AlertKind::Log,
             _ => {
                 // Unknown — still free any payload to avoid leaks.
                 unsafe { ffi::lt_alert_payload_free(raw as *mut _) };
@@ -183,7 +257,12 @@ impl Alert {
             Some(InfoHash(raw.infohash))
         };
         let handle = TorrentHandle::from_raw(raw.handle as u64, raw.infohash);
-        let hdr = AlertHeader { kind, infohash, handle, timestamp_us: raw.timestamp_us };
+        let hdr = AlertHeader {
+            kind,
+            infohash,
+            handle,
+            timestamp_us: raw.timestamp_us,
+        };
 
         let alert = match kind {
             AlertKind::AddTorrent => {
@@ -248,7 +327,10 @@ impl Alert {
             }
             AlertKind::HashFailed => {
                 let p = unsafe { &raw.payload.hash_failed };
-                Alert::HashFailed { hdr, piece_index: p.piece_index }
+                Alert::HashFailed {
+                    hdr,
+                    piece_index: p.piece_index,
+                }
             }
             AlertKind::MetadataReceived => {
                 let p = unsafe { &raw.payload.metadata_received };
@@ -257,7 +339,10 @@ impl Alert {
                 } else {
                     unsafe { std::slice::from_raw_parts(p.buf, p.len).to_vec() }
                 };
-                Alert::MetadataReceived { hdr, info_section: bytes }
+                Alert::MetadataReceived {
+                    hdr,
+                    info_section: bytes,
+                }
             }
             AlertKind::SaveResumeData => {
                 let p = unsafe { &raw.payload.save_resume };
@@ -266,7 +351,10 @@ impl Alert {
                 } else {
                     unsafe { std::slice::from_raw_parts(p.buf, p.len).to_vec() }
                 };
-                Alert::SaveResumeData { hdr, data: ResumeData(bytes) }
+                Alert::SaveResumeData {
+                    hdr,
+                    data: ResumeData(bytes),
+                }
             }
             AlertKind::SaveResumeDataFailed => {
                 let p = unsafe { &raw.payload.resume_failed };
@@ -290,7 +378,10 @@ impl Alert {
             }
             AlertKind::ListenSucceeded => {
                 let p = unsafe { &raw.payload.listen_succeeded };
-                Alert::ListenSucceeded { hdr, endpoint: c_str_to_owned(&p.endpoint) }
+                Alert::ListenSucceeded {
+                    hdr,
+                    endpoint: c_str_to_owned(&p.endpoint),
+                }
             }
             AlertKind::SessionStats => {
                 let p = unsafe { &raw.payload.session_stats };
@@ -299,7 +390,11 @@ impl Alert {
                 } else {
                     unsafe { std::slice::from_raw_parts(p.counters, p.count).to_vec() }
                 };
-                Alert::SessionStats { hdr, counters, timestamp_ns: p.timestamp_ns }
+                Alert::SessionStats {
+                    hdr,
+                    counters,
+                    timestamp_ns: p.timestamp_ns,
+                }
             }
             AlertKind::AlertsDropped => {
                 let p = unsafe { &raw.payload.alerts_dropped };
@@ -337,7 +432,7 @@ impl Alert {
 
         // We've copied all heap payloads; release the C-side allocations.
         unsafe { ffi::lt_alert_payload_free(raw as *mut _) };
-        let _ = infohash;  // keep the variable alive for the unused-warning lint
+        let _ = infohash; // keep the variable alive for the unused-warning lint
         Some(alert)
     }
 }

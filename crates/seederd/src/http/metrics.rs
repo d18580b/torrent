@@ -8,8 +8,5 @@ use crate::app_state::AppState;
 
 pub async fn metrics(State(s): State<AppState>) -> impl IntoResponse {
     let body = s.metrics.render();
-    (
-        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
-        body,
-    )
+    ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], body)
 }

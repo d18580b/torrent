@@ -30,11 +30,11 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                         bytes = data.as_bytes().len(),
                         "resume data persisted",
                     );
-                    ctx.metrics.inc_counter(
-                        "resume_writes_total",
-                        &[("slot_id", ctx.slot_id.as_str())],
-                    );
-                    ctx.state.update(&ih, |st| { st.needs_save_resume = false; });
+                    ctx.metrics
+                        .inc_counter("resume_writes_total", &[("slot_id", ctx.slot_id.as_str())]);
+                    ctx.state.update(&ih, |st| {
+                        st.needs_save_resume = false;
+                    });
                 }
                 Err(e) => {
                     error!(
@@ -52,7 +52,12 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             }
             ctx.state.note_resume_settled();
         }
-        Alert::SaveResumeDataFailed { hdr, error_code, not_modified, message } => {
+        Alert::SaveResumeDataFailed {
+            hdr,
+            error_code,
+            not_modified,
+            message,
+        } => {
             let _enter = ctx.span.enter();
             // PRD: resume_data_not_modified is the silent path — libtorrent
             // signals the resume buffer is unchanged since the last save, so

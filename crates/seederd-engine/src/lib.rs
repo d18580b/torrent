@@ -46,4 +46,4 @@ pub use state::{RetryState, StateMap, TorrentPhase, TorrentState};
 pub use torrent_store::{FsTorrentStore, MemoryTorrentStore, TorrentStore};
 pub use vpn::{MockVpn, VpnError, VpnManager, VpnProfile, VpnType};
 
-pub use alert_loop::{AlertLoopHandle, AlertLoopBuilder, ShutdownReason};
+pub use alert_loop::{AlertLoopBuilder, AlertLoopHandle, ShutdownReason};

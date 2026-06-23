@@ -9,7 +9,7 @@ use clap::Parser;
     name = "seederd",
     version,
     about = "Headless petabyte-scale torrent seeding daemon",
-    long_about = "See PRD.md and the sample config in deploy/seederd.sample.toml.",
+    long_about = "See PRD.md and the sample config in deploy/seederd.sample.toml."
 )]
 pub struct Cli {
     /// Path to the daemon's TOML configuration file.

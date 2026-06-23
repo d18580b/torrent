@@ -26,12 +26,7 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     fn load_all(&self, slot: &SlotId) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError>;
 
     /// Atomically replace the resume file for `(slot, ih)` with `data`.
-    fn write(
-        &self,
-        slot: &SlotId,
-        ih: &InfoHash,
-        data: &[u8],
-    ) -> Result<(), ResumeStoreError>;
+    fn write(&self, slot: &SlotId, ih: &InfoHash, data: &[u8]) -> Result<(), ResumeStoreError>;
 
     /// Delete the resume file for `(slot, ih)`. Missing files are not an
     /// error.
@@ -56,14 +51,19 @@ pub struct FsResumeStore {
 }
 
 impl FsResumeStore {
-    pub fn new(base: impl Into<PathBuf>) -> Self { Self { base: base.into() } }
+    pub fn new(base: impl Into<PathBuf>) -> Self {
+        Self { base: base.into() }
+    }
 
     fn dir_for(&self, slot: &SlotId) -> PathBuf {
         // SlotId::DEFAULT lives directly under base for single-session mode;
         // otherwise we partition by slot id so multi-slot mode never
         // co-mingles resume files (PRD Multi-Account Resume Data Isolation).
-        if slot.is_default() { self.base.clone() }
-        else                 { self.base.join(slot.as_str()) }
+        if slot.is_default() {
+            self.base.clone()
+        } else {
+            self.base.join(slot.as_str())
+        }
     }
 
     fn file_for(&self, slot: &SlotId, ih: &InfoHash) -> PathBuf {
@@ -84,7 +84,9 @@ impl ResumeStore for FsResumeStore {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let Some(stem) = name.strip_suffix(".resume") else { continue };
+            let Some(stem) = name.strip_suffix(".resume") else {
+                continue;
+            };
             match InfoHash::from_hex(stem) {
                 Some(ih) => {
                     let bytes = fs::read(&path)?;
@@ -103,12 +105,7 @@ impl ResumeStore for FsResumeStore {
         Ok(out)
     }
 
-    fn write(
-        &self,
-        slot: &SlotId,
-        ih: &InfoHash,
-        data: &[u8],
-    ) -> Result<(), ResumeStoreError> {
+    fn write(&self, slot: &SlotId, ih: &InfoHash, data: &[u8]) -> Result<(), ResumeStoreError> {
         let dir = self.dir_for(slot);
         fs::create_dir_all(&dir)?;
         let final_path = self.file_for(slot, ih);
@@ -162,10 +159,16 @@ pub struct MemoryResumeStore {
 }
 
 impl MemoryResumeStore {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn len(&self) -> usize { self.inner.len() }
-    pub fn is_empty(&self) -> bool { self.inner.is_empty() }
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 
     /// Test helper: contents for a slot.
     pub fn snapshot(&self, slot: &SlotId) -> Vec<(InfoHash, Vec<u8>)> {

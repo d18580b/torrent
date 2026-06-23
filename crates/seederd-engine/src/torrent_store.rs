@@ -84,7 +84,9 @@ impl TorrentStore for FsTorrentStore {
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            let Some(stem) = name.strip_suffix(".torrent") else { continue };
+            let Some(stem) = name.strip_suffix(".torrent") else {
+                continue;
+            };
             match InfoHash::from_hex(stem) {
                 Some(ih) => out.push((ih, fs::read(&path)?)),
                 None => warn!(
@@ -220,8 +222,15 @@ mod tests {
         let a = SlotId::new("acct_a");
         let ih = InfoHash([0x01u8; 20]);
         store.write(&a, &ih, b"x").unwrap();
-        assert!(dir.path().join("acct_a").join(format!("{}.torrent", ih.to_hex())).exists());
-        assert!(store.load_all(&SlotId::default_single()).unwrap().is_empty());
+        assert!(dir
+            .path()
+            .join("acct_a")
+            .join(format!("{}.torrent", ih.to_hex()))
+            .exists());
+        assert!(store
+            .load_all(&SlotId::default_single())
+            .unwrap()
+            .is_empty());
         assert_eq!(store.load_all(&a).unwrap().len(), 1);
     }
 }
