@@ -166,4 +166,5 @@ jobs:
           key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
 
       # Layer 3 (PRD Validation §): real daemon + libtorrent, driven over HTTP.
+      - run: cargo test -p seederd-engine --test lifecycle -- --ignored
       - run: cargo test -p seederd --test daemon -- --ignored
