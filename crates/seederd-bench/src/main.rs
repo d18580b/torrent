@@ -19,7 +19,10 @@ use libtorrent_safe::{AddParams, Session, Settings, TorrentFlags};
 use seederd_engine::{InfoHash, SlotId, StateMap, TorrentHandle, TorrentState};
 
 #[derive(Parser)]
-#[command(name = "seederd-bench", about = "Layer 4 load/soak harness for seederd")]
+#[command(
+    name = "seederd-bench",
+    about = "Layer 4 load/soak harness for seederd"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -66,8 +69,14 @@ fn ih_from(i: usize) -> InfoHash {
 fn alert_throughput(torrents: usize, rounds: usize) {
     let state = StateMap::new();
     for i in 0..torrents {
-        let h = TorrentHandle { id: i as u64 + 1, infohash: ih_from(i) };
-        state.insert(h.infohash, TorrentState::newly_added(h, SlotId::default_single(), Instant::now()));
+        let h = TorrentHandle {
+            id: i as u64 + 1,
+            infohash: ih_from(i),
+        };
+        state.insert(
+            h.infohash,
+            TorrentState::newly_added(h, SlotId::default_single(), Instant::now()),
+        );
     }
 
     let start = Instant::now();

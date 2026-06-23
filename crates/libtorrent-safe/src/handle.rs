@@ -13,10 +13,14 @@ impl InfoHash {
     pub const ZERO: Self = Self([0u8; 20]);
 
     #[inline]
-    pub fn as_bytes(&self) -> &[u8; 20] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8; 20] {
+        &self.0
+    }
 
     #[inline]
-    pub fn to_hex(&self) -> String { hex::encode(self.0) }
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
 
     pub fn from_hex(s: &str) -> Option<Self> {
         let mut buf = [0u8; 20];
@@ -38,7 +42,9 @@ impl fmt::Display for InfoHash {
 }
 
 impl From<[u8; 20]> for InfoHash {
-    fn from(v: [u8; 20]) -> Self { Self(v) }
+    fn from(v: [u8; 20]) -> Self {
+        Self(v)
+    }
 }
 
 /// Stable, copyable handle into a session's torrent map.
@@ -58,9 +64,14 @@ impl TorrentHandle {
         if id == 0 {
             None
         } else {
-            Some(Self { id, infohash: InfoHash(infohash) })
+            Some(Self {
+                id,
+                infohash: InfoHash(infohash),
+            })
         }
     }
 
-    pub fn raw_id(&self) -> u64 { self.id }
+    pub fn raw_id(&self) -> u64 {
+        self.id
+    }
 }

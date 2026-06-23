@@ -10,7 +10,9 @@ use parking_lot::Mutex;
 pub trait MetricsSink: Send + Sync + std::fmt::Debug {
     fn inc_counter(&self, name: &str, labels: &[(&str, &str)]);
     fn add_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
-        for _ in 0..value { self.inc_counter(name, labels); }
+        for _ in 0..value {
+            self.inc_counter(name, labels);
+        }
     }
     fn set_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]);
     fn observe_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
@@ -32,10 +34,25 @@ impl MetricsSink for NoopSink {
 
 #[derive(Debug, Clone)]
 pub enum MetricCall {
-    IncCounter { name: String, labels: Vec<(String, String)> },
-    AddCounter { name: String, value: u64, labels: Vec<(String, String)> },
-    SetGauge   { name: String, value: f64, labels: Vec<(String, String)> },
-    Histogram  { name: String, value: f64, labels: Vec<(String, String)> },
+    IncCounter {
+        name: String,
+        labels: Vec<(String, String)>,
+    },
+    AddCounter {
+        name: String,
+        value: u64,
+        labels: Vec<(String, String)>,
+    },
+    SetGauge {
+        name: String,
+        value: f64,
+        labels: Vec<(String, String)>,
+    },
+    Histogram {
+        name: String,
+        value: f64,
+        labels: Vec<(String, String)>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -44,9 +61,13 @@ pub struct RecordingSink {
 }
 
 impl RecordingSink {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn calls(&self) -> Vec<MetricCall> { self.calls.lock().clone() }
+    pub fn calls(&self) -> Vec<MetricCall> {
+        self.calls.lock().clone()
+    }
 
     pub fn count_for(&self, name: &str) -> u64 {
         self.calls
@@ -62,7 +83,10 @@ impl RecordingSink {
 }
 
 fn own_labels(labels: &[(&str, &str)]) -> Vec<(String, String)> {
-    labels.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+    labels
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
 }
 
 impl MetricsSink for RecordingSink {

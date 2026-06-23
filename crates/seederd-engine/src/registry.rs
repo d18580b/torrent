@@ -34,7 +34,10 @@ pub enum RegistryError {
     Parse(#[from] serde_json::Error),
 
     #[error("infohash {infohash} already assigned to slot {existing}")]
-    Conflict { infohash: InfoHash, existing: SlotId },
+    Conflict {
+        infohash: InfoHash,
+        existing: SlotId,
+    },
 }
 
 #[derive(Debug)]
@@ -82,11 +85,18 @@ impl AssignmentRegistry {
             entries = map.len(),
             "registry loaded",
         );
-        Ok(Self { path, inner: RwLock::new(map) })
+        Ok(Self {
+            path,
+            inner: RwLock::new(map),
+        })
     }
 
-    pub fn len(&self) -> usize { self.inner.read().len() }
-    pub fn is_empty(&self) -> bool { self.inner.read().is_empty() }
+    pub fn len(&self) -> usize {
+        self.inner.read().len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.read().is_empty()
+    }
 
     pub fn lookup(&self, ih: &InfoHash) -> Option<SlotId> {
         self.inner.read().get(ih).cloned()
@@ -141,9 +151,13 @@ impl AssignmentRegistry {
     /// Snapshot of every (infohash, slot) pair, sorted by slot for
     /// deterministic iteration in tests and startup logs.
     pub fn entries(&self) -> Vec<(InfoHash, SlotId)> {
-        let mut v: Vec<(InfoHash, SlotId)> =
-            self.inner.read().iter().map(|(k, v)| (*k, v.clone())).collect();
-        v.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()).then(a.0.0.cmp(&b.0.0)));
+        let mut v: Vec<(InfoHash, SlotId)> = self
+            .inner
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        v.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()).then(a.0 .0.cmp(&b.0 .0)));
         v
     }
 
@@ -182,9 +196,12 @@ impl AssignmentRegistry {
 /// Atomic write: temp file → fsync → rename. Same-fs guaranteed because
 /// the temp lives in the target's parent directory.
 fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let parent = target
-        .parent()
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "registry path has no parent"))?;
+    let parent = target.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "registry path has no parent",
+        )
+    })?;
     fs::create_dir_all(parent)?;
     let tmp = parent.join(match target.file_name() {
         Some(n) => format!(".{}.tmp", n.to_string_lossy()),
@@ -200,7 +217,9 @@ fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
         f.sync_all()?;
     }
     fs::rename(&tmp, target)?;
-    if let Ok(d) = fs::File::open(parent) { let _ = d.sync_all(); }
+    if let Ok(d) = fs::File::open(parent) {
+        let _ = d.sync_all();
+    }
     Ok(())
 }
 
@@ -226,7 +245,9 @@ mod tests {
         let ih = InfoHash([2u8; 20]);
         r.assign(ih, SlotId::new("a")).unwrap();
         let err = r.assign(ih, SlotId::new("b")).unwrap_err();
-        assert!(matches!(err, RegistryError::Conflict { existing, .. } if existing.as_str() == "a"));
+        assert!(
+            matches!(err, RegistryError::Conflict { existing, .. } if existing.as_str() == "a")
+        );
     }
 
     #[test]
@@ -247,8 +268,10 @@ mod tests {
 
         {
             let r = AssignmentRegistry::new_empty(&path);
-            r.assign(InfoHash([0xAA; 20]), SlotId::new("acct_a")).unwrap();
-            r.assign(InfoHash([0xBB; 20]), SlotId::new("acct_b")).unwrap();
+            r.assign(InfoHash([0xAA; 20]), SlotId::new("acct_a"))
+                .unwrap();
+            r.assign(InfoHash([0xBB; 20]), SlotId::new("acct_b"))
+                .unwrap();
             assert_eq!(r.len(), 2);
         }
 

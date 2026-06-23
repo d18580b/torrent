@@ -31,8 +31,10 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/libtorrent_shim.cpp");
 
     if env::var_os("CARGO_FEATURE_BUNDLED").is_none() {
-        println!("cargo:warning=libtorrent-sys: `bundled` feature disabled; \
-                  no native build performed. Provide libtorrent + shim symbols externally.");
+        println!(
+            "cargo:warning=libtorrent-sys: `bundled` feature disabled; \
+                  no native build performed. Provide libtorrent + shim symbols externally."
+        );
         // Emit an empty bindings.rs so src/lib.rs still includes a valid file.
         let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
         std::fs::write(out_dir.join("bindings.rs"), "// bundled feature disabled\n")
@@ -40,7 +42,8 @@ fn main() {
         return;
     }
 
-    let manifest_dir = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let boost_src = manifest_dir.join(BOOST_DIR);
     let lt_src = manifest_dir.join(LIBTORRENT_DIR);
 
@@ -93,26 +96,45 @@ fn is_executable(p: &Path) -> bool {
         .unwrap_or(false)
 }
 #[cfg(not(unix))]
-fn is_executable(_: &Path) -> bool { true }
+fn is_executable(_: &Path) -> bool {
+    true
+}
 
 fn sanity_check_submodules(boost: &Path, lt: &Path) {
     let lt_marker = lt.join("CMakeLists.txt");
     let boost_marker = boost.join("CMakeLists.txt");
-    let boost_libs_marker = boost.join("libs").join("config").join("include").join("boost").join("version.hpp");
+    let boost_libs_marker = boost
+        .join("libs")
+        .join("config")
+        .join("include")
+        .join("boost")
+        .join("version.hpp");
 
     let mut missing = Vec::new();
-    if !lt_marker.exists() { missing.push(lt_marker.display().to_string()); }
-    if !boost_marker.exists() { missing.push(boost_marker.display().to_string()); }
-    if !boost_libs_marker.exists() { missing.push(boost_libs_marker.display().to_string()); }
+    if !lt_marker.exists() {
+        missing.push(lt_marker.display().to_string());
+    }
+    if !boost_marker.exists() {
+        missing.push(boost_marker.display().to_string());
+    }
+    if !boost_libs_marker.exists() {
+        missing.push(boost_libs_marker.display().to_string());
+    }
 
     if !missing.is_empty() {
-        eprintln!("\n\n\
-            error: libtorrent-sys build prerequisites missing:\n");
-        for m in &missing { eprintln!("  - {m}"); }
-        eprintln!("\n\
+        eprintln!(
+            "\n\n\
+            error: libtorrent-sys build prerequisites missing:\n"
+        );
+        for m in &missing {
+            eprintln!("  - {m}");
+        }
+        eprintln!(
+            "\n\
             Run from the workspace root:\n\
                 git submodule update --init --recursive --depth 1\n\
-            See CONTRIBUTING.md for full prerequisites.\n");
+            See CONTRIBUTING.md for full prerequisites.\n"
+        );
         std::process::exit(1);
     }
 }
@@ -141,7 +163,10 @@ fn build_boost(src: &Path) -> PathBuf {
 }
 
 fn build_libtorrent(src: &Path, boost_install: &Path) -> PathBuf {
-    eprintln!("libtorrent-sys: configuring libtorrent from {}", src.display());
+    eprintln!(
+        "libtorrent-sys: configuring libtorrent from {}",
+        src.display()
+    );
     let mut cfg = cmake::Config::new(src);
     cfg.profile("Release")
         .define("BUILD_SHARED_LIBS", "OFF")
@@ -177,7 +202,9 @@ fn build_libtorrent(src: &Path, boost_install: &Path) -> PathBuf {
 
 fn find_boost_cmake_dir(install: &Path) -> Option<PathBuf> {
     let cmake_root = install.join("lib").join("cmake");
-    if !cmake_root.exists() { return None; }
+    if !cmake_root.exists() {
+        return None;
+    }
     for entry in std::fs::read_dir(&cmake_root).ok()?.flatten() {
         let p = entry.path();
         if p.is_dir() && p.file_name()?.to_string_lossy().starts_with("Boost-") {
@@ -258,7 +285,10 @@ fn emit_link_directives(lt_install: &Path, boost_install: &Path) {
         println!("cargo:rustc-link-search=native={}", libstdcxx_dir.display());
         // Also embed the path as an rpath so the resulting binary actually
         // finds the right libstdc++.so.6 at runtime.
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", libstdcxx_dir.display());
+        println!(
+            "cargo:rustc-link-arg=-Wl,-rpath,{}",
+            libstdcxx_dir.display()
+        );
     }
 
     println!("cargo:rustc-link-lib=ssl");
@@ -277,12 +307,18 @@ fn locate_libstdcxx_dir() -> Option<PathBuf> {
         .arg("-print-file-name=libstdc++.so")
         .output()
         .ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
     let path = String::from_utf8(out.stdout).ok()?;
     let trimmed = path.trim();
-    if trimmed.is_empty() || trimmed == "libstdc++.so" { return None; }
+    if trimmed.is_empty() || trimmed == "libstdc++.so" {
+        return None;
+    }
     let p = PathBuf::from(trimmed);
-    if !p.is_absolute() { return None; }
+    if !p.is_absolute() {
+        return None;
+    }
     // Resolve any symlink so the rpath actually reaches the install dir.
     let canon = p.canonicalize().unwrap_or(p);
     canon.parent().map(|d| d.to_path_buf())
@@ -290,5 +326,9 @@ fn locate_libstdcxx_dir() -> Option<PathBuf> {
 
 fn pick_libdir(install: &Path) -> PathBuf {
     let lib64 = install.join("lib64");
-    if lib64.exists() { lib64 } else { install.join("lib") }
+    if lib64.exists() {
+        lib64
+    } else {
+        install.join("lib")
+    }
 }

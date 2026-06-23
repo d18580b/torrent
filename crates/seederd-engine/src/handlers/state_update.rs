@@ -27,8 +27,14 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     //   5=seeding, 6=allocating, 7=checking_resume_data
                     let phase = match s.state {
                         1 | 7 => TorrentPhase::Checking,
-                        4 | 5 => if s.is_seeding { TorrentPhase::Seeding } else { TorrentPhase::Idle },
-                        _     => st.phase,    // preserve current; other states aren't seeder-relevant
+                        4 | 5 => {
+                            if s.is_seeding {
+                                TorrentPhase::Seeding
+                            } else {
+                                TorrentPhase::Idle
+                            }
+                        }
+                        _ => st.phase, // preserve current; other states aren't seeder-relevant
                     };
                     if st.phase != phase {
                         st.phase = phase;
@@ -80,7 +86,10 @@ mod tests {
     }
 
     fn seed_state(state: &StateMap, h: TorrentHandle) {
-        state.insert(h.infohash, TorrentState::newly_added(h, SlotId::default_single(), Instant::now()));
+        state.insert(
+            h.infohash,
+            TorrentState::newly_added(h, SlotId::default_single(), Instant::now()),
+        );
     }
 
     fn dispatch(alert: &Alert, state: &StateMap, metrics: &RecordingSink) {
@@ -105,7 +114,10 @@ mod tests {
     fn state_update_sets_seeding_phase_and_rates() {
         let state = StateMap::new();
         let metrics = RecordingSink::new();
-        let h = TorrentHandle { id: 1, infohash: ih(0x44) };
+        let h = TorrentHandle {
+            id: 1,
+            infohash: ih(0x44),
+        };
         seed_state(&state, h);
         let view = TorrentStatusView {
             handle: h,
@@ -126,7 +138,12 @@ mod tests {
         };
         dispatch(
             &Alert::StateUpdate {
-                hdr: AlertHeader { kind: AlertKind::StateUpdate, infohash: None, handle: None, timestamp_us: 0 },
+                hdr: AlertHeader {
+                    kind: AlertKind::StateUpdate,
+                    infohash: None,
+                    handle: None,
+                    timestamp_us: 0,
+                },
                 statuses: vec![view],
             },
             &state,
@@ -143,11 +160,19 @@ mod tests {
     fn torrent_finished_marks_finished_seeding() {
         let state = StateMap::new();
         let metrics = RecordingSink::new();
-        let h = TorrentHandle { id: 2, infohash: ih(0x55) };
+        let h = TorrentHandle {
+            id: 2,
+            infohash: ih(0x55),
+        };
         seed_state(&state, h);
         dispatch(
             &Alert::TorrentFinished {
-                hdr: AlertHeader { kind: AlertKind::TorrentFinished, infohash: Some(ih(0x55)), handle: None, timestamp_us: 0 },
+                hdr: AlertHeader {
+                    kind: AlertKind::TorrentFinished,
+                    infohash: Some(ih(0x55)),
+                    handle: None,
+                    timestamp_us: 0,
+                },
             },
             &state,
             &metrics,

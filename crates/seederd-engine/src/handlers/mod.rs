@@ -28,14 +28,14 @@ use crate::torrent_store::TorrentStore;
 /// build because everything is a reference). The lifetime is tied to the
 /// dispatch call, not the alert loop's lifetime.
 pub struct HandlerCtx<'a> {
-    pub state:    &'a StateMap,
-    pub resume:   &'a dyn ResumeStore,
+    pub state: &'a StateMap,
+    pub resume: &'a dyn ResumeStore,
     pub torrents: &'a dyn TorrentStore,
-    pub metrics:  &'a dyn MetricsSink,
-    pub clock:    &'a dyn Clock,
-    pub engine:   &'a Arc<dyn TorrentEngine>,
-    pub slot_id:  SlotId,
-    pub span:     Span,
+    pub metrics: &'a dyn MetricsSink,
+    pub clock: &'a dyn Clock,
+    pub engine: &'a Arc<dyn TorrentEngine>,
+    pub slot_id: SlotId,
+    pub span: Span,
 }
 
 impl<'a> std::fmt::Debug for HandlerCtx<'a> {

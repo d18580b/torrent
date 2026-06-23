@@ -46,7 +46,11 @@ pub async fn boot(
     log_handle: crate::tracing_init::LogReloadHandle,
 ) -> anyhow::Result<DaemonHandle> {
     info!("starting seederd");
-    let mode = if cfg.slot.is_empty() { Mode::Single } else { Mode::MultiSlot };
+    let mode = if cfg.slot.is_empty() {
+        Mode::Single
+    } else {
+        Mode::MultiSlot
+    };
 
     // Resume store — single root for both modes; FsResumeStore partitions
     // by slot id internally.
@@ -60,8 +64,7 @@ pub async fn boot(
 
     // Assignment registry.
     let registry = Arc::new(
-        AssignmentRegistry::load(cfg.registry_path())
-            .context("load assignment registry")?,
+        AssignmentRegistry::load(cfg.registry_path()).context("load assignment registry")?,
     );
 
     // Metrics sink — created early so the startup scans can record registry
@@ -156,9 +159,7 @@ pub async fn boot(
     // already deduplicates duplicate adds so a future torrent dir scan
     // won't double-add.
     for slot in source.slots() {
-        let entries = resume_store
-            .load_all(&slot)
-            .context("scan resume dir")?;
+        let entries = resume_store.load_all(&slot).context("scan resume dir")?;
         let count = entries.len();
         let engine = source
             .engine_for(&slot)
@@ -314,7 +315,11 @@ impl DaemonHandle {
             torrents,
             metrics,
             default_save_path: cfg.default_save_path.clone(),
-            mode: if cfg.slot.is_empty() { Mode::Single } else { Mode::MultiSlot },
+            mode: if cfg.slot.is_empty() {
+                Mode::Single
+            } else {
+                Mode::MultiSlot
+            },
         };
 
         let app: Router = http::router(app_state);
@@ -328,7 +333,13 @@ impl DaemonHandle {
             .map(std::path::PathBuf::from)
             .unwrap_or_default();
         let cfg_clone = cfg.clone();
-        tokio::spawn(reload::run(cfg_path, cfg_clone, reload_source, reload_rx, log_handle));
+        tokio::spawn(reload::run(
+            cfg_path,
+            cfg_clone,
+            reload_source,
+            reload_rx,
+            log_handle,
+        ));
 
         let listener = match tokio::net::TcpListener::bind(http_listen).await {
             Ok(l) => l,
@@ -340,10 +351,9 @@ impl DaemonHandle {
         info!(addr = %http_listen, "HTTP server listening");
 
         let mut shutdown_rx = shutdown_tx.subscribe();
-        let server = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.recv().await;
-            });
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let _ = shutdown_rx.recv().await;
+        });
 
         let exit_code = match server.await {
             Ok(()) => 0,

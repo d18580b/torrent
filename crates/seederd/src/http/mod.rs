@@ -18,11 +18,20 @@ pub fn router(state: AppState) -> Router {
         .route("/healthz", get(healthz::healthz))
         .route("/status", get(status::status))
         .route("/torrents", get(torrents::list).post(torrents::add))
-        .route("/torrents/:infohash", get(torrents::get).delete(torrents::remove))
+        .route(
+            "/torrents/:infohash",
+            get(torrents::get).delete(torrents::remove),
+        )
         .route("/torrents/:infohash/pause", post(torrents::pause))
         .route("/torrents/:infohash/resume", post(torrents::resume))
-        .route("/torrents/:infohash/upload-limit", post(torrents::set_upload_limit))
-        .route("/torrents/:infohash/file-priority", post(torrents::set_file_priority))
+        .route(
+            "/torrents/:infohash/upload-limit",
+            post(torrents::set_upload_limit),
+        )
+        .route(
+            "/torrents/:infohash/file-priority",
+            post(torrents::set_file_priority),
+        )
         .route("/metrics", get(metrics::metrics));
 
     if state.slots.is_some() {
@@ -35,6 +44,8 @@ pub fn router(state: AppState) -> Router {
     }
 
     router
-        .layer(axum::extract::DefaultBodyLimit::max(torrents::MAX_BODY_BYTES))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            torrents::MAX_BODY_BYTES,
+        ))
         .with_state(state)
 }

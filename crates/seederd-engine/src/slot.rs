@@ -28,22 +28,40 @@ pub struct SlotId(Arc<str>);
 impl SlotId {
     pub const DEFAULT: &'static str = "default";
 
-    pub fn new(id: impl Into<String>) -> Self { Self(Arc::from(id.into())) }
-    pub fn default_single() -> Self { Self(Arc::from(Self::DEFAULT)) }
-    pub fn as_str(&self) -> &str { &self.0 }
-    pub fn is_default(&self) -> bool { &*self.0 == Self::DEFAULT }
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(Arc::from(id.into()))
+    }
+    pub fn default_single() -> Self {
+        Self(Arc::from(Self::DEFAULT))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn is_default(&self) -> bool {
+        &*self.0 == Self::DEFAULT
+    }
 }
 
 impl fmt::Display for SlotId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 impl fmt::Debug for SlotId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SlotId({})", self.0)
     }
 }
-impl From<&str> for SlotId   { fn from(s: &str)   -> Self { Self::new(s) } }
-impl From<String> for SlotId { fn from(s: String) -> Self { Self::new(s) } }
+impl From<&str> for SlotId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+impl From<String> for SlotId {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
 
 impl Serialize for SlotId {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -128,11 +146,11 @@ impl SlotConfig {
     /// Should be called at startup (PRD §Multi-Account constraints) and
     /// on SIGHUP for the new config.
     pub fn validate_set(slots: &[SlotConfig]) -> Result<(), SlotConfigError> {
-        let mut seen_id   = std::collections::HashSet::new();
+        let mut seen_id = std::collections::HashSet::new();
         let mut seen_port = std::collections::HashSet::new();
         let mut seen_iface = std::collections::HashSet::new();
-        let mut seen_fp   = std::collections::HashSet::new();
-        let mut seen_ua   = std::collections::HashSet::new();
+        let mut seen_fp = std::collections::HashSet::new();
+        let mut seen_ua = std::collections::HashSet::new();
         let mut seen_resume = std::collections::HashSet::new();
         let mut seen_torrent = std::collections::HashSet::new();
 
@@ -147,13 +165,17 @@ impl SlotConfig {
                 return Err(SlotConfigError::DuplicateInterface(s.vpn_interface.clone()));
             }
             if s.peer_fingerprint_hex.len() != 16 {
-                return Err(SlotConfigError::BadFingerprintLength(s.peer_fingerprint_hex.clone()));
+                return Err(SlotConfigError::BadFingerprintLength(
+                    s.peer_fingerprint_hex.clone(),
+                ));
             }
             if Self::is_libtorrent_default_fingerprint(&s.peer_fingerprint_hex) {
                 return Err(SlotConfigError::DefaultFingerprintForbidden);
             }
             if !seen_fp.insert(s.peer_fingerprint_hex.clone()) {
-                return Err(SlotConfigError::DuplicateFingerprint(s.peer_fingerprint_hex.clone()));
+                return Err(SlotConfigError::DuplicateFingerprint(
+                    s.peer_fingerprint_hex.clone(),
+                ));
             }
             if !seen_ua.insert(s.user_agent.clone()) {
                 return Err(SlotConfigError::DuplicateUserAgent(s.user_agent.clone()));
@@ -161,11 +183,17 @@ impl SlotConfig {
             // Resolve symlinks to canonical paths. If the dir doesn't yet
             // exist (first run), fall back to the literal value — startup
             // will create it.
-            let r = s.resume_dir.canonicalize().unwrap_or_else(|_| s.resume_dir.clone());
+            let r = s
+                .resume_dir
+                .canonicalize()
+                .unwrap_or_else(|_| s.resume_dir.clone());
             if !seen_resume.insert(r.clone()) {
                 return Err(SlotConfigError::DuplicateResumeDir(r));
             }
-            let t = s.torrent_dir.canonicalize().unwrap_or_else(|_| s.torrent_dir.clone());
+            let t = s
+                .torrent_dir
+                .canonicalize()
+                .unwrap_or_else(|_| s.torrent_dir.clone());
             if !seen_torrent.insert(t.clone()) {
                 return Err(SlotConfigError::DuplicateTorrentDir(t));
             }

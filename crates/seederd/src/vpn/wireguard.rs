@@ -20,7 +20,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 pub struct WireguardManager;
 
 impl WireguardManager {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl VpnManager for WireguardManager {
@@ -37,9 +39,7 @@ impl VpnManager for WireguardManager {
             .status()
             .map_err(VpnError::Io)?;
         if !status.success() {
-            return Err(VpnError::Spawn(format!(
-                "wg-quick up exited with {status}"
-            )));
+            return Err(VpnError::Spawn(format!("wg-quick up exited with {status}")));
         }
 
         let deadline = Instant::now() + BRING_UP_TIMEOUT;
@@ -74,8 +74,9 @@ impl VpnManager for WireguardManager {
     }
 
     fn current_ip(&self, iface: &str) -> Result<IpAddr, VpnError> {
-        let v4 = super::ip_lookup::first_ipv4(iface)
-            .map_err(|_| VpnError::NoAddress { iface: iface.to_string() })?;
+        let v4 = super::ip_lookup::first_ipv4(iface).map_err(|_| VpnError::NoAddress {
+            iface: iface.to_string(),
+        })?;
         Ok(IpAddr::V4(v4))
     }
 

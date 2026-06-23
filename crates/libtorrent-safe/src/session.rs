@@ -22,9 +22,19 @@ use crate::settings::{ResumeFlags, Settings, TorrentFlags};
 /// Caller-friendly enum for `Session::add_torrent`.
 #[derive(Clone, Debug)]
 pub enum AddParams {
-    File { bytes: Vec<u8>, save_path: String, flags: TorrentFlags },
-    Magnet { uri: String, save_path: String, flags: TorrentFlags },
-    Resume { bytes: Vec<u8> },
+    File {
+        bytes: Vec<u8>,
+        save_path: String,
+        flags: TorrentFlags,
+    },
+    Magnet {
+        uri: String,
+        save_path: String,
+        flags: TorrentFlags,
+    },
+    Resume {
+        bytes: Vec<u8>,
+    },
 }
 
 const ERR_BUF_LEN: usize = 512;
@@ -57,14 +67,15 @@ impl Session {
         let json = settings.to_shim_json()?;
         let json_c = CString::new(json).map_err(|_| Error::InteriorNul("settings_json".into()))?;
         let mut err = ErrBuf::new();
-        let ptr = unsafe {
-            ffi::lt_session_create(json_c.as_ptr(), err.ptr(), err.len() as i32)
-        };
+        let ptr = unsafe { ffi::lt_session_create(json_c.as_ptr(), err.ptr(), err.len() as i32) };
         if ptr.is_null() {
             return Err(Error::Shim(err.into_string()));
         }
         debug!(target: "libtorrent_safe", "session created");
-        Ok(Self { ptr, _marker: PhantomData })
+        Ok(Self {
+            ptr,
+            _marker: PhantomData,
+        })
     }
 
     /// Like [`Session::new`], but restores the DHT routing table + session
@@ -87,7 +98,10 @@ impl Session {
             return Err(Error::Shim(err.into_string()));
         }
         debug!(target: "libtorrent_safe", "session created from saved state");
-        Ok(Self { ptr, _marker: PhantomData })
+        Ok(Self {
+            ptr,
+            _marker: PhantomData,
+        })
     }
 
     /// Apply settings on a running session. Used by SIGHUP reload and per-slot
@@ -153,9 +167,16 @@ impl Session {
         let mut infohash = [0u8; 20];
 
         let raw_handle = match params {
-            AddParams::File { bytes, save_path, flags } => {
-                if bytes.is_empty() { return Err(Error::InvalidInput("empty .torrent buffer")); }
-                let save_c = CString::new(save_path).map_err(|_| Error::InteriorNul("save_path".into()))?;
+            AddParams::File {
+                bytes,
+                save_path,
+                flags,
+            } => {
+                if bytes.is_empty() {
+                    return Err(Error::InvalidInput("empty .torrent buffer"));
+                }
+                let save_c =
+                    CString::new(save_path).map_err(|_| Error::InteriorNul("save_path".into()))?;
                 unsafe {
                     ffi::lt_add_torrent_file(
                         self.ptr,
@@ -169,9 +190,15 @@ impl Session {
                     )
                 }
             }
-            AddParams::Magnet { uri, save_path, flags } => {
-                let uri_c = CString::new(uri).map_err(|_| Error::InteriorNul("magnet uri".into()))?;
-                let save_c = CString::new(save_path).map_err(|_| Error::InteriorNul("save_path".into()))?;
+            AddParams::Magnet {
+                uri,
+                save_path,
+                flags,
+            } => {
+                let uri_c =
+                    CString::new(uri).map_err(|_| Error::InteriorNul("magnet uri".into()))?;
+                let save_c =
+                    CString::new(save_path).map_err(|_| Error::InteriorNul("save_path".into()))?;
                 unsafe {
                     ffi::lt_add_torrent_magnet(
                         self.ptr,
@@ -185,7 +212,9 @@ impl Session {
                 }
             }
             AddParams::Resume { bytes } => {
-                if bytes.is_empty() { return Err(Error::InvalidInput("empty resume buffer")); }
+                if bytes.is_empty() {
+                    return Err(Error::InvalidInput("empty resume buffer"));
+                }
                 unsafe {
                     ffi::lt_add_torrent_resume(
                         self.ptr,
@@ -202,47 +231,71 @@ impl Session {
         if raw_handle == 0 {
             return Err(Error::Shim(err.into_string()));
         }
-        Ok(TorrentHandle { id: raw_handle as u64, infohash: InfoHash(infohash) })
+        Ok(TorrentHandle {
+            id: raw_handle as u64,
+            infohash: InfoHash(infohash),
+        })
     }
 
     pub fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<()> {
         let rc = unsafe {
             ffi::lt_remove_torrent(self.ptr, h.id as ffi::lt_handle, delete_files as i32)
         };
-        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
     }
 
     pub fn pause_torrent(&self, h: TorrentHandle) -> Result<()> {
         let rc = unsafe { ffi::lt_torrent_pause(self.ptr, h.id as ffi::lt_handle) };
-        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
     }
 
     pub fn resume_torrent(&self, h: TorrentHandle) -> Result<()> {
         let rc = unsafe { ffi::lt_torrent_resume(self.ptr, h.id as ffi::lt_handle) };
-        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
     }
 
     pub fn set_upload_limit(&self, h: TorrentHandle, bytes_per_sec: i32) -> Result<()> {
         let rc = unsafe {
             ffi::lt_torrent_set_upload_limit(self.ptr, h.id as ffi::lt_handle, bytes_per_sec)
         };
-        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
     }
 
     pub fn set_file_priority(&self, h: TorrentHandle, file_idx: i32, priority: u8) -> Result<()> {
         let rc = unsafe {
-            ffi::lt_torrent_set_file_priority(
-                self.ptr, h.id as ffi::lt_handle, file_idx, priority,
-            )
+            ffi::lt_torrent_set_file_priority(self.ptr, h.id as ffi::lt_handle, file_idx, priority)
         };
-        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
     }
 
     pub fn save_resume_data(&self, h: TorrentHandle, flags: ResumeFlags) -> Result<()> {
-        let rc = unsafe {
-            ffi::lt_save_resume_data(self.ptr, h.id as ffi::lt_handle, flags.bits())
-        };
-        if rc == ffi::LT_OK as i32 { Ok(()) } else { Err(Error::TorrentNotFound(h.infohash)) }
+        let rc =
+            unsafe { ffi::lt_save_resume_data(self.ptr, h.id as ffi::lt_handle, flags.bits()) };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
     }
 
     /// Triggers a `state_update_alert` covering all subscribed torrents.
@@ -320,7 +373,12 @@ pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
     let mut out = [0u8; 20];
     let mut err = ErrBuf::new();
     let rc = unsafe {
-        ffi::lt_magnet_info_hash(uri_c.as_ptr(), out.as_mut_ptr(), err.ptr(), err.len() as i32)
+        ffi::lt_magnet_info_hash(
+            uri_c.as_ptr(),
+            out.as_mut_ptr(),
+            err.ptr(),
+            err.len() as i32,
+        )
     };
     if rc == ffi::LT_OK as i32 {
         Ok(InfoHash(out))
@@ -388,14 +446,21 @@ struct ErrBuf {
 }
 
 impl ErrBuf {
-    fn new() -> Self { Self { buf: [0; ERR_BUF_LEN] } }
-    fn ptr(&mut self) -> *mut std::os::raw::c_char { self.buf.as_mut_ptr() }
-    fn len(&self) -> usize { ERR_BUF_LEN }
+    fn new() -> Self {
+        Self {
+            buf: [0; ERR_BUF_LEN],
+        }
+    }
+    fn ptr(&mut self) -> *mut std::os::raw::c_char {
+        self.buf.as_mut_ptr()
+    }
+    fn len(&self) -> usize {
+        ERR_BUF_LEN
+    }
 
     fn into_string(self) -> String {
-        let bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, ERR_BUF_LEN)
-        };
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, ERR_BUF_LEN) };
         let nul = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..nul]).into_owned()
     }

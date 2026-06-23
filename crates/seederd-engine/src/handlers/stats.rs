@@ -168,6 +168,9 @@ mod tests {
         // Index 9 against a 3-element counter array must be silently skipped.
         let table = StatsMetrics::from_pairs(&[("libtorrent_absent", 9)]);
         let calls = run(&table, vec![1, 2, 3]);
-        assert!(calls.is_empty(), "no gauge should be emitted, got {calls:?}");
+        assert!(
+            calls.is_empty(),
+            "no gauge should be emitted, got {calls:?}"
+        );
     }
 }

@@ -50,8 +50,9 @@ pub async fn run(
                 continue;
             }
 
-            let current: Option<IpAddr> =
-                vpn::first_ipv4(&e.config.vpn_interface).ok().map(IpAddr::V4);
+            let current: Option<IpAddr> = vpn::first_ipv4(&e.config.vpn_interface)
+                .ok()
+                .map(IpAddr::V4);
             let healthy = matches!((current, health.tunnel_ip), (Some(c), Some(x)) if c == x);
 
             if healthy {

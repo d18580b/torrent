@@ -22,8 +22,12 @@ pub trait Clock: Send + Sync + std::fmt::Debug {
 pub struct SystemClock;
 
 impl Clock for SystemClock {
-    fn now(&self) -> Instant { Instant::now() }
-    fn sleep(&self, d: Duration) { std::thread::sleep(d) }
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn sleep(&self, d: Duration) {
+        std::thread::sleep(d)
+    }
 }
 
 /// Deterministic clock for unit tests. `now()` returns the current
@@ -63,11 +67,15 @@ impl MockClock {
 }
 
 impl Default for MockClock {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Clock for MockClock {
-    fn now(&self) -> Instant { self.inner.lock().now }
+    fn now(&self) -> Instant {
+        self.inner.lock().now
+    }
 
     fn sleep(&self, d: Duration) {
         let mut g = self.inner.lock();

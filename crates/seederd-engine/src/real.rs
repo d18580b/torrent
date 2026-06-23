@@ -15,9 +15,7 @@ use parking_lot::Mutex;
 use tracing::instrument;
 
 use crate::engine::{EngineError, TorrentEngine};
-use libtorrent_safe::{
-    AddParams, Alert, ResumeFlags, Session, Settings, TorrentHandle,
-};
+use libtorrent_safe::{AddParams, Alert, ResumeFlags, Session, Settings, TorrentHandle};
 
 pub struct RealEngine {
     session: Mutex<Session>,
@@ -34,13 +32,17 @@ impl RealEngine {
     /// libtorrent's `high_performance_seed()` preset.
     pub fn new(settings: &Settings) -> Result<Self, EngineError> {
         let session = Session::new(settings)?;
-        Ok(Self { session: Mutex::new(session) })
+        Ok(Self {
+            session: Mutex::new(session),
+        })
     }
 
     /// Build from an existing `Session`. Useful when the caller wants to
     /// `load_state` first.
     pub fn from_session(session: Session) -> Self {
-        Self { session: Mutex::new(session) }
+        Self {
+            session: Mutex::new(session),
+        }
     }
 }
 
@@ -76,16 +78,28 @@ impl TorrentEngine for RealEngine {
     }
 
     #[instrument(skip_all, fields(op = "set_file_priority", infohash = %h.infohash))]
-    fn set_file_priority(&self, h: TorrentHandle, file_idx: i32, priority: u8) -> Result<(), EngineError> {
-        Ok(self.session.lock().set_file_priority(h, file_idx, priority)?)
+    fn set_file_priority(
+        &self,
+        h: TorrentHandle,
+        file_idx: i32,
+        priority: u8,
+    ) -> Result<(), EngineError> {
+        Ok(self
+            .session
+            .lock()
+            .set_file_priority(h, file_idx, priority)?)
     }
 
     fn pop_alerts(&self) -> Vec<Alert> {
         self.session.lock().drain_alerts()
     }
 
-    fn post_updates(&self) { self.session.lock().post_torrent_updates() }
-    fn post_stats(&self)   { self.session.lock().post_session_stats() }
+    fn post_updates(&self) {
+        self.session.lock().post_torrent_updates()
+    }
+    fn post_stats(&self) {
+        self.session.lock().post_session_stats()
+    }
 
     #[instrument(skip_all, fields(op = "apply_settings"))]
     fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError> {
