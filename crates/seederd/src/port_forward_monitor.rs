@@ -76,6 +76,7 @@ pub async fn run(
         tokio::select! {
             _ = tokio::time::sleep(RENEW_INTERVAL) => {}
             _ = shutdown.recv() => {
+                release_mappings(&slots, &forwarder);
                 info!(target: "seederd::port_forward_monitor", "port-forward monitor shutting down");
                 return;
             }
@@ -193,6 +194,40 @@ pub async fn run(
                     );
                 }
             }
+        }
+    }
+}
+
+/// Best-effort release of every live NAT-PMP mapping on graceful shutdown, so
+/// the gateway isn't left holding a stale forward for the rest of the ~60s
+/// lease. Skips slots whose tunnel is already down (nothing reachable to tell).
+fn release_mappings(slots: &SlotRegistry, forwarder: &NatpmpForwarder) {
+    for e in slots.iter() {
+        if e.config.port_forward != PortForwardMode::Natpmp {
+            continue;
+        }
+        let health = e.health();
+        if health.status == SlotStatus::VpnDown {
+            continue;
+        }
+        let Some(tunnel_ip) = health.tunnel_ip else {
+            continue;
+        };
+        let gw_str = e.config.port_forward_gateway_or_default();
+        let Ok(gateway) = gw_str.parse::<IpAddr>() else {
+            continue;
+        };
+        match forwarder.unmap(gateway, tunnel_ip) {
+            Ok(()) => info!(
+                target: "seederd::port_forward_monitor",
+                slot_id = %e.id(),
+                "released NAT-PMP mapping on shutdown",
+            ),
+            Err(err) => warn!(
+                target: "seederd::port_forward_monitor",
+                slot_id = %e.id(), error.cause = %err,
+                "failed to release NAT-PMP mapping on shutdown (best-effort)",
+            ),
         }
     }
 }
