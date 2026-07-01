@@ -16,14 +16,16 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
+use libtorrent_safe::InfoHash;
 use parking_lot::RwLock;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::debug;
+use tracing::info;
 
 use crate::slot::SlotId;
-use libtorrent_safe::InfoHash;
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
@@ -225,8 +227,9 @@ fn atomic_write(target: &Path, contents: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     #[test]
     fn assign_then_lookup() {

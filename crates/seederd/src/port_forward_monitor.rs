@@ -16,13 +16,16 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use seederd_engine::renew_and_rebind;
+use seederd_engine::MetricsSink;
+use seederd_engine::PortForwardMode;
+use seederd_engine::PortMapRequest;
+use seederd_engine::RenewOutcome;
+use seederd_engine::ShutdownReason;
+use seederd_engine::SlotStatus;
 use tokio::sync::broadcast;
-use tracing::{info, warn};
-
-use seederd_engine::{
-    renew_and_rebind, MetricsSink, PortForwardMode, PortMapRequest, RenewOutcome, ShutdownReason,
-    SlotStatus,
-};
+use tracing::info;
+use tracing::warn;
 
 use crate::metrics_sink::PromSink;
 use crate::slot_registry::SlotRegistry;

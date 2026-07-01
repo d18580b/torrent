@@ -15,9 +15,13 @@ use libtorrent_sys as ffi;
 use tracing::debug;
 
 use crate::alert::Alert;
-use crate::error::{Error, Result};
-use crate::handle::{InfoHash, TorrentHandle};
-use crate::settings::{ResumeFlags, Settings, TorrentFlags};
+use crate::error::Error;
+use crate::error::Result;
+use crate::handle::InfoHash;
+use crate::handle::TorrentHandle;
+use crate::settings::ResumeFlags;
+use crate::settings::Settings;
+use crate::settings::TorrentFlags;
 
 /// Caller-friendly enum for `Session::add_torrent`.
 #[derive(Clone, Debug)]

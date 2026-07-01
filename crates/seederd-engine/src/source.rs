@@ -8,9 +8,10 @@
 
 use std::sync::Arc;
 
+use libtorrent_safe::Alert;
+
 use crate::engine::TorrentEngine;
 use crate::slot::SlotId;
-use libtorrent_safe::Alert;
 
 pub trait AlertSource: Send + Sync + std::fmt::Debug {
     /// Drain all queued alerts from every engine in this source.
@@ -121,10 +122,12 @@ impl AlertSource for MultiSlotSource {
 
 #[cfg(test)]
 mod tests {
+    use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::AlertKind;
+    use libtorrent_safe::InfoHash;
+
     use super::*;
     use crate::mock::MockEngine;
-    use libtorrent_safe::alert::AlertHeader;
-    use libtorrent_safe::{AlertKind, InfoHash};
 
     fn finished(byte: u8) -> Alert {
         Alert::TorrentFinished {

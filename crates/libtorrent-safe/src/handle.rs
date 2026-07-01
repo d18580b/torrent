@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// 20-byte BitTorrent v1 infohash. Always lowercase hex when displayed.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]

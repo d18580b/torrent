@@ -5,13 +5,15 @@
 //! belongs to, its libtorrent state, and timer / counter state used by
 //! the alert handlers and the shutdown coordinator.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use dashmap::DashMap;
+use libtorrent_safe::InfoHash;
+use libtorrent_safe::TorrentHandle;
 use parking_lot::Mutex;
 
 use crate::slot::SlotId;
-use libtorrent_safe::{InfoHash, TorrentHandle};
 
 /// Lifecycle phases the daemon tracks for a torrent. Mostly mirrors
 /// libtorrent's `torrent_status::state_t` but adds an explicit

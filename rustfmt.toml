@@ -1,0 +1,15 @@
+# Formatting is deterministic and merge-resilient.
+#
+# Requires nightly rustfmt — invoked via `cargo +nightly fmt` (centralized in the
+# mise `fmt` / `fmt-fix` tasks). `imports_granularity` and `group_imports` are
+# unstable, hence nightly. Everything else stays on the pinned stable toolchain.
+
+# One import per line: adding/removing an import touches a single distinct line,
+# so parallel branches auto-merge instead of colliding on a shared `use {...}`.
+imports_granularity = "Item"
+
+# Group imports into std / external-crate / self blocks for a stable ordering.
+group_imports = "StdExternalCrate"
+
+# Kept explicit (stable default) so ordering never depends on tool defaults.
+reorder_imports = true

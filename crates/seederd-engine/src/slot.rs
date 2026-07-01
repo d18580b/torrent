@@ -11,12 +11,16 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::Deserialize;
+use serde::Deserializer;
+use serde::Serialize;
+use serde::Serializer;
 use thiserror::Error;
 
 use crate::engine::TorrentEngine;
 use crate::port_forward::PortForwardMode;
-use crate::vpn::{VpnProfile, VpnType};
+use crate::vpn::VpnProfile;
+use crate::vpn::VpnType;
 
 // ---------------------------------------------------------------------------
 // SlotId
@@ -275,8 +279,9 @@ pub struct Slot {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::path::PathBuf;
+
+    use super::*;
 
     fn cfg(id: &str, port: u16, iface: &str, fp: &str, ua: &str) -> SlotConfig {
         SlotConfig {

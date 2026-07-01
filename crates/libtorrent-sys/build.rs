@@ -18,7 +18,8 @@
 // want a check-pass.
 
 use std::env;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 const BOOST_DIR: &str = "../../vendor/boost";
 const LIBTORRENT_DIR: &str = "../../vendor/libtorrent";

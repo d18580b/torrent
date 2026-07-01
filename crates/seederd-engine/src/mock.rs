@@ -11,16 +11,24 @@
 //!     `TorrentHandle` the test can hold and pass back through the trait.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use dashmap::DashMap;
+use libtorrent_safe::alert::AlertHeader;
+use libtorrent_safe::AddParams;
+use libtorrent_safe::Alert;
+use libtorrent_safe::AlertKind;
+use libtorrent_safe::InfoHash;
+use libtorrent_safe::ResumeData;
+use libtorrent_safe::ResumeFlags;
+use libtorrent_safe::Settings;
+use libtorrent_safe::TorrentHandle;
 use parking_lot::Mutex;
 
-use crate::engine::{EngineError, TorrentEngine};
-use libtorrent_safe::alert::AlertHeader;
-use libtorrent_safe::{
-    AddParams, Alert, AlertKind, InfoHash, ResumeData, ResumeFlags, Settings, TorrentHandle,
-};
+use crate::engine::EngineError;
+use crate::engine::TorrentEngine;
 
 /// Trait-method invocation captured by `MockEngine`.
 #[derive(Debug, Clone)]

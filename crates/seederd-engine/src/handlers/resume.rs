@@ -5,10 +5,11 @@
 //! `pending_resume_count` is decremented here; the shutdown coordinator
 //! waits for it to reach zero.
 
-use tracing::{debug, error};
+use libtorrent_safe::Alert;
+use tracing::debug;
+use tracing::error;
 
 use crate::handlers::HandlerCtx;
-use libtorrent_safe::Alert;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
