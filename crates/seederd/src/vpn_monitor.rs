@@ -31,8 +31,14 @@ pub async fn run(
     mut shutdown: broadcast::Receiver<ShutdownReason>,
 ) {
     // Slots start healthy (their session was constructed on a confirmed IP).
+    // Pre-register every per-slot series at its baseline so `rate()`/alerting
+    // queries resolve from a cold start instead of reading "no data" until the
+    // first tunnel event ever occurs.
     for e in slots.iter() {
-        metrics.set_gauge("slot_vpn_tunnel_up", 1.0, &[("slot_id", e.id().as_str())]);
+        let labels = [("slot_id", e.id().as_str())];
+        metrics.set_gauge("slot_vpn_tunnel_up", 1.0, &labels);
+        metrics.set_gauge("slot_torrents_paused_vpn_down", 0.0, &labels);
+        metrics.add_counter("slot_vpn_tunnel_ip_changes_total", 0, &labels);
     }
 
     loop {
