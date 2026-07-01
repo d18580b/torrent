@@ -16,3 +16,6 @@ path = "src/main.rs"
 clap = { workspace = true }
 seederd-engine = { path = "../seederd-engine" }
 libtorrent-safe = { path = "../libtorrent-safe" }
+
+[lints]
+workspace = true
