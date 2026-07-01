@@ -39,3 +39,6 @@ tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 # Layer 3 integration fixtures: real SHA-1 piece hashes for generated .torrents.
 sha1 = { workspace = true }
+
+[lints]
+workspace = true

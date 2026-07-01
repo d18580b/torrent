@@ -35,3 +35,6 @@ slot_assignments.json
 *.profraw
 *.profdata
 /coverage
+
+# mise — local, per-developer tool/env overrides (mise.toml is committed)
+/.mise.local.toml

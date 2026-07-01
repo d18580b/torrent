@@ -1,0 +1,2 @@
+# Keep clippy suggestions MSRV-safe and identical across contributors.
+msrv = "1.90"

@@ -1,0 +1,53 @@
+# Developer tooling for the seederd workspace.
+#
+# Single source of truth for the fmt / lint / test commands: `hk` git hooks and
+# CI both call `mise run <task>` so the commands live in exactly one place.
+#
+#   mise install        # provision the tools below
+#   mise run setup       # install nightly rustfmt + activate git hooks (once)
+#   mise run fmt|lint|test|check
+
+[tools]
+hk = "1.48.0"
+# convco is not in the mise/aqua registry; the cargo backend fetches a prebuilt
+# binary via cargo-binstall when available, else compiles from source.
+"cargo:convco" = "0.6.4"
+# pkl is intentionally omitted: hk parses hk.pkl with its built-in evaluator.
+# Set HK_PKL_BACKEND=pkl and add `pkl` here only if you want the pkl CLI instead.
+
+[env]
+# Nightly is used ONLY for rustfmt: granular import normalization
+# (imports_granularity / group_imports in rustfmt.toml) is an unstable feature.
+# Everything else builds/lints/tests on the pinned stable toolchain.
+RUSTFMT_TOOLCHAIN = "nightly"
+
+[tasks.fmt]
+description = "Check formatting (nightly rustfmt)"
+run = "cargo +$RUSTFMT_TOOLCHAIN fmt --all --check"
+
+[tasks.fmt-fix]
+description = "Apply formatting (nightly rustfmt)"
+run = "cargo +$RUSTFMT_TOOLCHAIN fmt --all"
+
+[tasks.lint]
+description = "Clippy across the workspace, warnings denied"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.lint-fix]
+description = "Clippy autofix — safe under the hk pre-commit hook (allows staged/dirty index)"
+run = "cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged -- -D warnings"
+
+[tasks.test]
+description = "Workspace tests (default features; parity with CI)"
+run = "cargo test --workspace"
+
+[tasks.check]
+description = "Formatting + clippy"
+depends = ["fmt", "lint"]
+
+[tasks.setup]
+description = "One-time dev setup: nightly rustfmt toolchain + activate git hooks"
+run = [
+  "rustup toolchain install nightly --profile minimal --component rustfmt",
+  "hk install",
+]
