@@ -54,7 +54,9 @@ pub async fn run(
 
     let forwarder = NatpmpForwarder::new();
 
-    // Seed gauges from the ports negotiated at startup.
+    // Seed gauges from the ports negotiated at startup, and pre-register the
+    // renewal/failure/change counters at 0 so `rate()`/alerting queries resolve
+    // on a healthy daemon (they are otherwise absent until the first event).
     for e in slots.iter() {
         if e.config.port_forward != PortForwardMode::Natpmp {
             continue;
@@ -64,6 +66,9 @@ pub async fn run(
         if let Some(p) = e.health().forwarded_port {
             metrics.set_gauge("slot_forwarded_port", p as f64, &labels);
         }
+        metrics.add_counter("slot_port_forward_renewals_total", 0, &labels);
+        metrics.add_counter("slot_port_forward_failures_total", 0, &labels);
+        metrics.add_counter("slot_forwarded_port_changes_total", 0, &labels);
     }
 
     loop {
