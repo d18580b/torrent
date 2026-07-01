@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use seederd_engine::AlertSource;
 use seederd_engine::AssignmentRegistry;
+use seederd_engine::SlotId;
+use seederd_engine::SlotStatus;
 use seederd_engine::StateMap;
 use seederd_engine::TorrentStore;
 
@@ -28,6 +30,20 @@ pub struct AppState {
     /// One of `single` | `multi-slot`. Used by routes that decide
     /// whether `slot_id` is required on POST /torrents.
     pub mode: Mode,
+}
+
+impl AppState {
+    /// True when `slot_id` names a slot whose VPN tunnel is down and whose
+    /// torrents the monitor has fenced (paused, awaiting operator restart).
+    /// Always false in single-session mode (no slots, no tunnel). Callers use
+    /// this to refuse mutations that would un-quarantine a fenced slot.
+    pub fn slot_vpn_down(&self, slot_id: &SlotId) -> bool {
+        self.slots
+            .as_ref()
+            .and_then(|sr| sr.get(slot_id))
+            .map(|e| e.health().status == SlotStatus::VpnDown)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
