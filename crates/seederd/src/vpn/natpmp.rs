@@ -83,16 +83,22 @@ impl NatpmpForwarder {
     }
 
     /// Issue one mapping request (single protocol) with retransmission, and
-    /// return the gateway-assigned public port and epoch.
+    /// return the gateway-assigned public port and epoch. `suggested_external`
+    /// is the port we'd prefer (0 = no preference); the gateway is free to
+    /// assign a different one.
     fn map_one(
         &self,
         sock: &UdpSocket,
         opcode: u8,
         req: &PortMapRequest,
+        suggested_external: u16,
     ) -> Result<(u16, u32), PortForwardError> {
-        // Suggested external port 0 = "no preference"; the gateway assigns one
-        // (the ProtonVPN convention).
-        let msg = encode_request(opcode, req.internal_port, 0, req.lifetime_secs);
+        let msg = encode_request(
+            opcode,
+            req.internal_port,
+            suggested_external,
+            req.lifetime_secs,
+        );
         for t in &self.timeouts {
             sock.set_read_timeout(Some(*t))
                 .map_err(|e| PortForwardError::Io(e.to_string()))?;
@@ -157,17 +163,35 @@ impl PortForwarder for NatpmpForwarder {
         sock.connect((req.gateway, self.gateway_port))
             .map_err(|e| PortForwardError::Io(format!("connect {}: {e}", req.gateway)))?;
 
-        let (udp_port, _udp_epoch) = self.map_one(&sock, OP_MAP_UDP, req)?;
-        let (tcp_port, epoch) = self.map_one(&sock, OP_MAP_TCP, req)?;
-        if udp_port != tcp_port {
-            warn!(
-                target: "seederd::vpn::natpmp",
-                udp_port,
-                tcp_port,
-                "NAT-PMP gateway returned different UDP/TCP ports; binding the TCP port",
-            );
+        // TCP carries inbound BitTorrent peers, so map it first and let it be
+        // authoritative. Then ask for a UDP (uTP) mapping on the *same* external
+        // port so libtorrent — which binds TCP + uTP to one listen port — gets a
+        // consistent forward.
+        let (tcp_port, epoch) = self.map_one(&sock, OP_MAP_TCP, req, 0)?;
+        match self.map_one(&sock, OP_MAP_UDP, req, tcp_port) {
+            Ok((udp_port, _)) if udp_port == tcp_port => {}
+            Ok((udp_port, _)) => {
+                // Gateway wouldn't honour the suggestion. A UDP mapping on a
+                // different port is useless (we can't split the listen port), so
+                // release it rather than leave it orphaned until the lease ends.
+                warn!(
+                    target: "seederd::vpn::natpmp",
+                    udp_port,
+                    tcp_port,
+                    "NAT-PMP gateway assigned divergent UDP/TCP ports; releasing the UDP mapping and binding TCP",
+                );
+                let _ = self.delete_one(&sock, OP_MAP_UDP, req.gateway);
+            }
+            Err(e) => {
+                // UDP is best-effort for a seeder; TCP already succeeded.
+                warn!(
+                    target: "seederd::vpn::natpmp",
+                    tcp_port,
+                    error.cause = %e,
+                    "NAT-PMP UDP mapping failed; proceeding with TCP only",
+                );
+            }
         }
-        // BitTorrent inbound peer connections are primarily TCP.
         Ok(MapResult {
             port: tcp_port,
             epoch,
@@ -266,6 +290,9 @@ fn is_timeout(e: &io::Error) -> bool {
 mod tests {
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use std::thread;
 
     use super::*;
@@ -393,6 +420,48 @@ mod tests {
         };
         assert!(matches!(fwd.map(&req), Err(PortForwardError::Gateway(2))));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn loopback_divergent_udp_is_released_and_tcp_bound() {
+        // Gateway maps TCP=40001 but ignores the suggestion and hands UDP=40002.
+        // map() must return the TCP port and release the orphan UDP mapping.
+        let gw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let gw_port = gw.local_addr().unwrap().port();
+        let saw_udp_delete = Arc::new(AtomicBool::new(false));
+        let flag = saw_udp_delete.clone();
+        let server = thread::spawn(move || {
+            // 1) TCP map → 40001
+            let mut buf = [0u8; 12];
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[1], OP_MAP_TCP);
+            gw.send_to(&success_response(buf[1], 40001), peer).unwrap();
+            // 2) UDP map, suggested 40001 → gateway insists on 40002
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[1], OP_MAP_UDP);
+            assert_eq!(&buf[6..8], &40001u16.to_be_bytes()); // we suggested TCP's port
+            gw.send_to(&success_response(buf[1], 40002), peer).unwrap();
+            // 3) UDP deletion (lifetime 0)
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            if buf[1] == OP_MAP_UDP && buf[8..12] == 0u32.to_be_bytes() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            gw.send_to(&success_response(buf[1], 0), peer).unwrap();
+        });
+
+        let fwd = test_forwarder(gw_port);
+        let req = PortMapRequest {
+            gateway: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            internal_port: 0,
+            lifetime_secs: 60,
+        };
+        assert_eq!(fwd.map(&req).unwrap().port, 40001);
+        server.join().unwrap();
+        assert!(
+            saw_udp_delete.load(Ordering::SeqCst),
+            "divergent UDP mapping should have been released",
+        );
     }
 
     #[test]
