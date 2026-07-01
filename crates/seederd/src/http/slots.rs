@@ -160,3 +160,42 @@ pub async fn resume_all(
     info!(slot_id = %slot_id, torrent_count = count, "resumed all torrents in slot");
     Ok(StatusCode::NO_CONTENT)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use axum::extract::Path;
+    use axum::extract::State;
+
+    use super::*;
+    use crate::app_state::build_test_state;
+    use crate::slot_registry::test_entry;
+    use crate::slot_registry::SlotRegistry;
+
+    #[tokio::test]
+    async fn resume_all_on_vpndown_slot_is_409() {
+        let reg = Arc::new(SlotRegistry::new(vec![test_entry(
+            "acct_a",
+            SlotStatus::VpnDown,
+        )]));
+        let s = build_test_state(Some(reg));
+        let err = resume_all(State(s), Path("acct_a".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn resume_all_on_active_slot_is_204() {
+        let reg = Arc::new(SlotRegistry::new(vec![test_entry(
+            "acct_a",
+            SlotStatus::Active,
+        )]));
+        let s = build_test_state(Some(reg));
+        let code = resume_all(State(s), Path("acct_a".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(code, StatusCode::NO_CONTENT);
+    }
+}

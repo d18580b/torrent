@@ -88,6 +88,44 @@ pub struct SlotRegistry {
     entries: Vec<SlotEntry>,
 }
 
+/// Build a static WireGuard slot entry with the given id and status, for tests
+/// across the http/app_state modules.
+#[cfg(test)]
+pub(crate) fn test_entry(id: &str, status: SlotStatus) -> SlotEntry {
+    use std::net::Ipv4Addr;
+    use std::path::PathBuf;
+
+    use seederd_engine::MockEngine;
+    use seederd_engine::PortForwardMode;
+    use seederd_engine::VpnType;
+
+    let config = SlotConfig {
+        id: SlotId::new(id),
+        vpn_profile: PathBuf::from(format!("/etc/wg/{id}.conf")),
+        vpn_type: VpnType::Wireguard,
+        vpn_interface: format!("wg-{id}"),
+        listen_port: Some(6881),
+        peer_fingerprint_hex: "a1b2c3d4e5f60718".to_string(),
+        user_agent: format!("ua-{id}"),
+        resume_dir: PathBuf::from("/tmp/seederd-test/resume"),
+        torrent_dir: PathBuf::from("/tmp/seederd-test/torrents"),
+        allowed_tracker_domains: vec![],
+        upload_rate_limit: 0,
+        port_forward: PortForwardMode::Static,
+        port_forward_gateway: None,
+    };
+    let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+    let entry = SlotEntry::new(
+        config,
+        engine,
+        IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)),
+        None,
+        0,
+    );
+    entry.update_health(|h| h.status = status);
+    entry
+}
+
 impl SlotRegistry {
     pub fn new(entries: Vec<SlotEntry>) -> Self {
         Self { entries }
