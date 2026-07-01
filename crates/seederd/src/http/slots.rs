@@ -5,6 +5,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use seederd_engine::SlotId;
+use seederd_engine::SlotStatus;
 use serde::Serialize;
 use tracing::info;
 
@@ -69,6 +70,12 @@ fn no_such_slot() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::NOT_FOUND,
         Json(serde_json::json!({"error": "unknown slot_id"})),
+    )
+}
+fn slot_vpn_down() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": "slot vpn_down; restart daemon to resume"})),
     )
 }
 
@@ -139,6 +146,11 @@ pub async fn resume_all(
     let slots = s.slots.as_ref().ok_or_else(not_configured)?;
     let slot_id = SlotId::new(id);
     let entry = slots.get(&slot_id).ok_or_else(no_such_slot)?;
+    // A VpnDown slot is fenced: its torrents were paused because the tunnel is
+    // gone. Refuse to resume until the operator restarts (PRD: no auto-restart).
+    if entry.health().status == SlotStatus::VpnDown {
+        return Err(slot_vpn_down());
+    }
     let mut count = 0usize;
     for h in s.state.handles_for_slot(&slot_id) {
         if entry.engine.resume_torrent(h).is_ok() {
