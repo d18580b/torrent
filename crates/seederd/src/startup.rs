@@ -170,7 +170,7 @@ pub async fn boot(
                             internal_port: 0,
                             lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
                         };
-                        match vpn::NatpmpForwarder::new().map(&req) {
+                        match vpn::NatpmpForwarder::for_startup().map(&req) {
                             Ok(m) => {
                                 info!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
                                 (m.port, Some(m.port), m.epoch)

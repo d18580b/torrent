@@ -20,6 +20,7 @@
 //! bind libtorrent to the returned public port.
 
 use std::io;
+use std::net::IpAddr;
 use std::net::UdpSocket;
 use std::time::Duration;
 
@@ -36,33 +37,49 @@ const OP_MAP_TCP: u8 = 2;
 /// Responses set the high bit of the request opcode.
 const RESP_OPCODE_FLAG: u8 = 0x80;
 
+/// Retransmission schedules (ms), one read timeout per attempt. RFC 6886 §3.1
+/// doubles the timeout each retry; the full 9-retry/~128s schedule would exceed
+/// our 45s renewal interval and 60s lease, so both profiles are bounded well
+/// under that. A lost *renewal* is soft (retried next tick), so it stays snappy;
+/// a lost *startup* negotiate disables the slot, so it gets the longer budget to
+/// ride out a lossy boot.
+const RENEWAL_TIMEOUTS_MS: &[u64] = &[250, 500, 1000, 2000, 4000]; // ~7.75s
+const STARTUP_TIMEOUTS_MS: &[u64] = &[250, 500, 1000, 2000, 4000, 8000]; // ~15.75s
+/// Teardown is best-effort on the shutdown path; keep it quick.
+const TEARDOWN_TIMEOUTS_MS: &[u64] = &[250, 500];
+
 /// Native RFC 6886 NAT-PMP client. Stateless; each `map` call opens a fresh
 /// socket, so it is safe to renew from a background task on every tick.
 #[derive(Debug, Clone)]
 pub struct NatpmpForwarder {
     gateway_port: u16,
-    /// Retransmission schedule: one read timeout per attempt. RFC 6886 doubles
-    /// the timeout each retry; we bound it so startup stays responsive.
+    /// Retransmission schedule: one read timeout per attempt.
     timeouts: Vec<Duration>,
 }
 
 impl Default for NatpmpForwarder {
     fn default() -> Self {
-        Self {
-            gateway_port: NATPMP_PORT,
-            timeouts: vec![
-                Duration::from_millis(250),
-                Duration::from_millis(500),
-                Duration::from_millis(1000),
-                Duration::from_millis(2000),
-            ],
-        }
+        Self::new()
     }
 }
 
 impl NatpmpForwarder {
+    /// Client for steady-state renewals (snappy retransmit budget).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_timeouts_ms(RENEWAL_TIMEOUTS_MS)
+    }
+
+    /// Client for the one-shot startup negotiate (longer budget: failure here
+    /// disables the slot).
+    pub fn for_startup() -> Self {
+        Self::with_timeouts_ms(STARTUP_TIMEOUTS_MS)
+    }
+
+    fn with_timeouts_ms(ms: &[u64]) -> Self {
+        Self {
+            gateway_port: NATPMP_PORT,
+            timeouts: ms.iter().map(|&m| Duration::from_millis(m)).collect(),
+        }
     }
 
     /// Issue one mapping request (single protocol) with retransmission, and
@@ -91,6 +108,44 @@ impl NatpmpForwarder {
         Err(PortForwardError::Timeout {
             gateway: req.gateway,
         })
+    }
+
+    /// Release this client's mappings (RFC 6886 §3.4: internal port 0 + lifetime
+    /// 0 deletes all of the client's mappings for the protocol). Best-effort,
+    /// bound to the tunnel IP like `map`, and used on graceful shutdown so a
+    /// stale mapping doesn't linger for the ~60s lease. Uses a short retransmit
+    /// budget so it can't stall shutdown.
+    pub fn unmap(&self, gateway: IpAddr, bind_ip: IpAddr) -> Result<(), PortForwardError> {
+        let sock = UdpSocket::bind((bind_ip, 0))
+            .map_err(|e| PortForwardError::Io(format!("bind {bind_ip}: {e}")))?;
+        sock.connect((gateway, self.gateway_port))
+            .map_err(|e| PortForwardError::Io(format!("connect {gateway}: {e}")))?;
+        self.delete_one(&sock, OP_MAP_UDP, gateway)?;
+        self.delete_one(&sock, OP_MAP_TCP, gateway)?;
+        Ok(())
+    }
+
+    fn delete_one(
+        &self,
+        sock: &UdpSocket,
+        opcode: u8,
+        gateway: IpAddr,
+    ) -> Result<(), PortForwardError> {
+        // internal port 0, suggested external 0, lifetime 0 = delete.
+        let msg = encode_request(opcode, 0, 0, 0);
+        for &m in TEARDOWN_TIMEOUTS_MS {
+            sock.set_read_timeout(Some(Duration::from_millis(m)))
+                .map_err(|e| PortForwardError::Io(e.to_string()))?;
+            sock.send(&msg)
+                .map_err(|e| PortForwardError::Io(e.to_string()))?;
+            let mut buf = [0u8; 16];
+            match sock.recv(&mut buf) {
+                Ok(n) => return decode_delete(&buf[..n], opcode),
+                Err(e) if is_timeout(&e) => continue,
+                Err(e) => return Err(PortForwardError::Io(e.to_string())),
+            }
+        }
+        Err(PortForwardError::Timeout { gateway })
     }
 }
 
@@ -168,6 +223,36 @@ fn decode_response(buf: &[u8], req_opcode: u8) -> Result<(u16, u32), PortForward
         ));
     }
     Ok((external, epoch))
+}
+
+/// Decode a NAT-PMP deletion (lifetime-0) response. Unlike a mapping response,
+/// the mapped external port is legitimately 0, so we only validate the header
+/// and result code.
+fn decode_delete(buf: &[u8], req_opcode: u8) -> Result<(), PortForwardError> {
+    if buf.len() < 16 {
+        return Err(PortForwardError::Parse(format!(
+            "delete response too short: {} bytes",
+            buf.len()
+        )));
+    }
+    if buf[0] != 0 {
+        return Err(PortForwardError::Parse(format!(
+            "unexpected version {}",
+            buf[0]
+        )));
+    }
+    if buf[1] != req_opcode | RESP_OPCODE_FLAG {
+        return Err(PortForwardError::Parse(format!(
+            "unexpected opcode {} (wanted {})",
+            buf[1],
+            req_opcode | RESP_OPCODE_FLAG
+        )));
+    }
+    let result_code = u16::from_be_bytes([buf[2], buf[3]]);
+    if result_code != 0 {
+        return Err(PortForwardError::Gateway(result_code));
+    }
+    Ok(())
 }
 
 fn is_timeout(e: &io::Error) -> bool {
@@ -307,6 +392,38 @@ mod tests {
             lifetime_secs: 60,
         };
         assert!(matches!(fwd.map(&req), Err(PortForwardError::Gateway(2))));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn startup_profile_has_more_retransmits_than_renewal() {
+        assert!(
+            NatpmpForwarder::for_startup().timeouts.len() > NatpmpForwarder::new().timeouts.len()
+        );
+    }
+
+    #[test]
+    fn loopback_unmap_releases_mapping() {
+        // Fake gateway answers the UDP then TCP deletion requests.
+        let gw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let gw_port = gw.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let mut buf = [0u8; 12];
+                let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+                // A deletion request carries lifetime 0 (RFC 6886 §3.4).
+                assert_eq!(&buf[8..12], &0u32.to_be_bytes());
+                let resp = success_response(buf[1], 0); // external port 0 = deleted
+                gw.send_to(&resp, peer).unwrap();
+            }
+        });
+
+        let fwd = test_forwarder(gw_port);
+        fwd.unmap(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .unwrap();
         server.join().unwrap();
     }
 }
