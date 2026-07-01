@@ -23,6 +23,7 @@ use std::io;
 use std::net::UdpSocket;
 use std::time::Duration;
 
+use seederd_engine::MapResult;
 use seederd_engine::PortForwardError;
 use seederd_engine::PortForwarder;
 use seederd_engine::PortMapRequest;
@@ -65,13 +66,13 @@ impl NatpmpForwarder {
     }
 
     /// Issue one mapping request (single protocol) with retransmission, and
-    /// return the gateway-assigned public port.
+    /// return the gateway-assigned public port and epoch.
     fn map_one(
         &self,
         sock: &UdpSocket,
         opcode: u8,
         req: &PortMapRequest,
-    ) -> Result<u16, PortForwardError> {
+    ) -> Result<(u16, u32), PortForwardError> {
         // Suggested external port 0 = "no preference"; the gateway assigns one
         // (the ProtonVPN convention).
         let msg = encode_request(opcode, req.internal_port, 0, req.lifetime_secs);
@@ -94,15 +95,15 @@ impl NatpmpForwarder {
 }
 
 impl PortForwarder for NatpmpForwarder {
-    fn map(&self, req: &PortMapRequest) -> Result<u16, PortForwardError> {
+    fn map(&self, req: &PortMapRequest) -> Result<MapResult, PortForwardError> {
         // Bind to the tunnel IP so the request never leaves the tunnel.
         let sock = UdpSocket::bind((req.bind_ip, 0))
             .map_err(|e| PortForwardError::Io(format!("bind {}: {e}", req.bind_ip)))?;
         sock.connect((req.gateway, self.gateway_port))
             .map_err(|e| PortForwardError::Io(format!("connect {}: {e}", req.gateway)))?;
 
-        let udp_port = self.map_one(&sock, OP_MAP_UDP, req)?;
-        let tcp_port = self.map_one(&sock, OP_MAP_TCP, req)?;
+        let (udp_port, _udp_epoch) = self.map_one(&sock, OP_MAP_UDP, req)?;
+        let (tcp_port, epoch) = self.map_one(&sock, OP_MAP_TCP, req)?;
         if udp_port != tcp_port {
             warn!(
                 target: "seederd::vpn::natpmp",
@@ -112,7 +113,10 @@ impl PortForwarder for NatpmpForwarder {
             );
         }
         // BitTorrent inbound peer connections are primarily TCP.
-        Ok(tcp_port)
+        Ok(MapResult {
+            port: tcp_port,
+            epoch,
+        })
     }
 }
 
@@ -128,10 +132,11 @@ fn encode_request(opcode: u8, internal: u16, suggested_external: u16, lifetime: 
     b
 }
 
-/// Decode a NAT-PMP mapping response, returning the mapped public port on
-/// success. `req_opcode` is the opcode we sent (the response echoes it with the
-/// high bit set).
-fn decode_response(buf: &[u8], req_opcode: u8) -> Result<u16, PortForwardError> {
+/// Decode a NAT-PMP mapping response, returning the mapped public port and the
+/// gateway epoch (`buf[4..8]`, seconds since the gateway booted) on success.
+/// `req_opcode` is the opcode we sent (the response echoes it with the high bit
+/// set).
+fn decode_response(buf: &[u8], req_opcode: u8) -> Result<(u16, u32), PortForwardError> {
     if buf.len() < 16 {
         return Err(PortForwardError::Parse(format!(
             "response too short: {} bytes",
@@ -155,13 +160,14 @@ fn decode_response(buf: &[u8], req_opcode: u8) -> Result<u16, PortForwardError> 
     if result_code != 0 {
         return Err(PortForwardError::Gateway(result_code));
     }
+    let epoch = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let external = u16::from_be_bytes([buf[10], buf[11]]);
     if external == 0 {
         return Err(PortForwardError::Parse(
             "gateway mapped external port 0".to_string(),
         ));
     }
-    Ok(external)
+    Ok((external, epoch))
 }
 
 fn is_timeout(e: &io::Error) -> bool {
@@ -203,7 +209,14 @@ mod tests {
     #[test]
     fn decode_success_returns_mapped_port() {
         let r = success_response(OP_MAP_TCP, 40001);
-        assert_eq!(decode_response(&r, OP_MAP_TCP).unwrap(), 40001);
+        assert_eq!(decode_response(&r, OP_MAP_TCP).unwrap(), (40001, 0));
+    }
+
+    #[test]
+    fn decode_parses_gateway_epoch() {
+        let mut r = success_response(OP_MAP_TCP, 40001);
+        r[4..8].copy_from_slice(&123_456u32.to_be_bytes());
+        assert_eq!(decode_response(&r, OP_MAP_TCP).unwrap(), (40001, 123_456));
     }
 
     #[test]
@@ -270,7 +283,7 @@ mod tests {
             internal_port: 0,
             lifetime_secs: 60,
         };
-        assert_eq!(fwd.map(&req).unwrap(), 40001);
+        assert_eq!(fwd.map(&req).unwrap().port, 40001);
         server.join().unwrap();
     }
 

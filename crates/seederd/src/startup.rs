@@ -144,9 +144,9 @@ pub async fn boot(
                 //    silently seeding on an unforwarded port. Mid-session
                 //    renewal failures are the soft warn+keep-seeding path
                 //    (see port_forward_monitor).
-                let (effective_port, forwarded_port) = match s.port_forward {
+                let (effective_port, forwarded_port, forwarded_epoch) = match s.port_forward {
                     PortForwardMode::Static => match s.listen_port {
-                        Some(port) => (port, None),
+                        Some(port) => (port, None, 0),
                         None => {
                             // validate_set should have caught this; be defensive.
                             error!(slot_id = %s.id, "static slot missing listen_port; slot disabled");
@@ -171,9 +171,9 @@ pub async fn boot(
                             lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
                         };
                         match vpn::NatpmpForwarder::new().map(&req) {
-                            Ok(port) => {
-                                info!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, forwarded_port = port, "NAT-PMP port negotiated");
-                                (port, Some(port))
+                            Ok(m) => {
+                                info!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
+                                (m.port, Some(m.port), m.epoch)
                             }
                             Err(e) => {
                                 error!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; slot disabled (no bare-IP fallback)");
@@ -210,6 +210,7 @@ pub async fn boot(
                             engine,
                             tunnel_ip,
                             forwarded_port,
+                            forwarded_epoch,
                         ));
                     }
                     Err(e) => {

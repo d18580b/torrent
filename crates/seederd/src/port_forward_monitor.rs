@@ -69,6 +69,7 @@ pub async fn run(
         metrics.add_counter("slot_port_forward_renewals_total", 0, &labels);
         metrics.add_counter("slot_port_forward_failures_total", 0, &labels);
         metrics.add_counter("slot_forwarded_port_changes_total", 0, &labels);
+        metrics.add_counter("slot_vpn_gateway_reboots_total", 0, &labels);
     }
 
     loop {
@@ -94,6 +95,7 @@ pub async fn run(
             else {
                 continue;
             };
+            let previous_epoch = health.forwarded_epoch;
 
             let gw_str = e.config.port_forward_gateway_or_default();
             let gateway: IpAddr = match gw_str.parse() {
@@ -116,25 +118,57 @@ pub async fn run(
             };
 
             let labels = [("slot_id", slot_id.as_str())];
-            match renew_and_rebind(&forwarder, &*e.engine, &req, previous_port, tunnel_ip) {
-                RenewOutcome::Unchanged(port) => {
+            match renew_and_rebind(
+                &forwarder,
+                &*e.engine,
+                &req,
+                previous_port,
+                previous_epoch,
+                tunnel_ip,
+            ) {
+                RenewOutcome::Unchanged {
+                    port,
+                    epoch,
+                    rebooted,
+                } => {
                     metrics.inc_counter("slot_port_forward_renewals_total", &labels);
                     metrics.set_gauge("slot_port_forward_up", 1.0, &labels);
                     metrics.set_gauge("slot_forwarded_port", port as f64, &labels);
-                    e.update_health(|h| h.port_forward_ok = true);
+                    e.update_health(|h| {
+                        h.forwarded_epoch = epoch;
+                        h.port_forward_ok = true;
+                    });
+                    if rebooted {
+                        metrics.inc_counter("slot_vpn_gateway_reboots_total", &labels);
+                        info!(
+                            target: "seederd::port_forward_monitor",
+                            slot_id = %slot_id, gateway_epoch = epoch,
+                            "NAT-PMP gateway rebooted; mapping re-established on the same port",
+                        );
+                    }
                 }
-                RenewOutcome::Rebound { previous, new } => {
+                RenewOutcome::Rebound {
+                    previous,
+                    new,
+                    epoch,
+                    rebooted,
+                } => {
                     metrics.inc_counter("slot_port_forward_renewals_total", &labels);
                     metrics.inc_counter("slot_forwarded_port_changes_total", &labels);
                     metrics.set_gauge("slot_port_forward_up", 1.0, &labels);
                     metrics.set_gauge("slot_forwarded_port", new as f64, &labels);
                     e.update_health(|h| {
                         h.forwarded_port = Some(new);
+                        h.forwarded_epoch = epoch;
                         h.port_forward_ok = true;
                     });
+                    if rebooted {
+                        metrics.inc_counter("slot_vpn_gateway_reboots_total", &labels);
+                    }
                     info!(
                         target: "seederd::port_forward_monitor",
                         slot_id = %slot_id, previous_port = previous, forwarded_port = new,
+                        gateway_epoch = epoch, gateway_rebooted = rebooted,
                         "NAT-PMP port changed; rebound live session",
                     );
                 }
