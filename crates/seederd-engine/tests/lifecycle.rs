@@ -20,7 +20,11 @@ mod support;
 
 use std::time::Duration;
 
-use libtorrent_safe::{AddParams, Alert, ResumeFlags, Session, TorrentFlags};
+use libtorrent_safe::AddParams;
+use libtorrent_safe::Alert;
+use libtorrent_safe::ResumeFlags;
+use libtorrent_safe::Session;
+use libtorrent_safe::TorrentFlags;
 
 const PIECE_LEN: usize = 32 * 1024;
 const FILE_LEN: usize = 256 * 1024; // 8 pieces

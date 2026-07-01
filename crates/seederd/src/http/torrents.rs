@@ -1,16 +1,25 @@
 //! `/torrents` and `/torrents/:infohash` endpoints.
 
-use axum::extract::{FromRequest, Multipart, Path, Query, Request, State};
+use axum::extract::FromRequest;
+use axum::extract::Multipart;
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::extract::Request;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
-use serde::{Deserialize, Serialize};
+use libtorrent_safe::info_hash_from_magnet;
+use libtorrent_safe::info_hash_from_torrent;
+use libtorrent_safe::AddParams;
+use libtorrent_safe::InfoHash;
+use libtorrent_safe::TorrentFlags;
+use seederd_engine::MetricsSink;
+use seederd_engine::SlotId;
+use serde::Deserialize;
+use serde::Serialize;
 
-use libtorrent_safe::{
-    info_hash_from_magnet, info_hash_from_torrent, AddParams, InfoHash, TorrentFlags,
-};
-use seederd_engine::{MetricsSink, SlotId};
-
-use crate::app_state::{AppState, Mode};
+use crate::app_state::AppState;
+use crate::app_state::Mode;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 1000;
@@ -555,14 +564,17 @@ fn bad_infohash() -> (StatusCode, Json<serde_json::Value>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
-    use seederd_engine::{
-        AlertSource, AssignmentRegistry, MemoryTorrentStore, MockEngine, SingleSessionSource,
-        StateMap, TorrentEngine,
-    };
+    use seederd_engine::AlertSource;
+    use seederd_engine::AssignmentRegistry;
+    use seederd_engine::MemoryTorrentStore;
+    use seederd_engine::MockEngine;
+    use seederd_engine::SingleSessionSource;
+    use seederd_engine::StateMap;
+    use seederd_engine::TorrentEngine;
 
+    use super::*;
     use crate::metrics_sink::PromSink;
 
     fn test_state(dir: &std::path::Path) -> AppState {

@@ -11,7 +11,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -120,8 +121,9 @@ impl VpnManager for MockVpn {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::net::Ipv4Addr;
+
+    use super::*;
 
     #[test]
     fn mock_vpn_records_calls() {

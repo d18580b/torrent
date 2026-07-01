@@ -4,11 +4,13 @@
 //! (for FileError) schedule the upload-mode retry timer per PRD §Error
 //! Handling. The retry execution itself happens in `alert_loop::tick`.
 
-use tracing::{error, warn};
+use libtorrent_safe::Alert;
+use tracing::error;
+use tracing::warn;
 
 use crate::handlers::HandlerCtx;
-use crate::state::{RetryState, TorrentPhase};
-use libtorrent_safe::Alert;
+use crate::state::RetryState;
+use crate::state::TorrentPhase;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
@@ -90,20 +92,25 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
     use std::time::Instant;
 
+    use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::AlertKind;
+    use libtorrent_safe::InfoHash;
+    use libtorrent_safe::TorrentHandle;
+
+    use super::*;
     use crate::clock::MockClock;
     use crate::engine::TorrentEngine;
-    use crate::metrics::{MetricCall, RecordingSink};
+    use crate::metrics::MetricCall;
+    use crate::metrics::RecordingSink;
     use crate::mock::MockEngine;
     use crate::resume_store::MemoryResumeStore;
     use crate::slot::SlotId;
-    use crate::state::{StateMap, TorrentState};
+    use crate::state::StateMap;
+    use crate::state::TorrentState;
     use crate::torrent_store::MemoryTorrentStore;
-    use libtorrent_safe::alert::AlertHeader;
-    use libtorrent_safe::{AlertKind, InfoHash, TorrentHandle};
 
     fn ih(b: u8) -> InfoHash {
         InfoHash([b; 20])

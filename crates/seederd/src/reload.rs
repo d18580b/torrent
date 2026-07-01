@@ -9,10 +9,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
-use tokio::sync::mpsc::Receiver;
-use tracing::{info, warn};
-
 use seederd_engine::AlertSource;
+use tokio::sync::mpsc::Receiver;
+use tracing::info;
+use tracing::warn;
 
 use crate::config::Config;
 

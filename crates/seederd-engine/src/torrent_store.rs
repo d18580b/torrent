@@ -15,11 +15,12 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use dashmap::DashMap;
+use libtorrent_safe::InfoHash;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
+use tracing::warn;
 
 use crate::slot::SlotId;
-use libtorrent_safe::InfoHash;
 
 pub trait TorrentStore: Send + Sync + std::fmt::Debug {
     /// Load every `.torrent` file owned by `slot`, returning
@@ -193,8 +194,9 @@ impl TorrentStore for MemoryTorrentStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     #[test]
     fn fs_store_atomic_roundtrip() {

@@ -2,10 +2,10 @@
 //! Higher levels are too noisy for production but invaluable when
 //! reproducing a peer-protocol or DHT issue.
 
+use libtorrent_safe::Alert;
 use tracing::debug;
 
 use crate::handlers::HandlerCtx;
-use libtorrent_safe::Alert;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     let _enter = ctx.span.enter();

@@ -11,7 +11,8 @@
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;
 use tracing_subscriber::prelude::*;
-use tracing_subscriber::{reload, Registry};
+use tracing_subscriber::reload;
+use tracing_subscriber::Registry;
 
 use crate::config::LogLevel;
 

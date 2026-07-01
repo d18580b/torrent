@@ -11,11 +11,17 @@
 //! is small for the shape of work seederd does (one engine call per
 //! second per torrent, max).
 
+use libtorrent_safe::AddParams;
+use libtorrent_safe::Alert;
+use libtorrent_safe::ResumeFlags;
+use libtorrent_safe::Session;
+use libtorrent_safe::Settings;
+use libtorrent_safe::TorrentHandle;
 use parking_lot::Mutex;
 use tracing::instrument;
 
-use crate::engine::{EngineError, TorrentEngine};
-use libtorrent_safe::{AddParams, Alert, ResumeFlags, Session, Settings, TorrentHandle};
+use crate::engine::EngineError;
+use crate::engine::TorrentEngine;
 
 pub struct RealEngine {
     session: Mutex<Session>,

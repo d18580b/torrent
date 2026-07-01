@@ -29,26 +29,58 @@ pub mod alert_loop;
 
 // Re-exports from libtorrent-safe so downstream crates don't need to know
 // about the internal crate split.
-pub use libtorrent_safe::{
-    AddParams, Alert, AlertKind, Error as SafeError, InfoHash, ResumeData, ResumeFlags, Settings,
-    TorrentFlags, TorrentHandle,
-};
-
-pub use clock::{Clock, MockClock, SystemClock};
-pub use engine::{EngineError, TorrentEngine};
-pub use metrics::{MetricsSink, NoopSink, RecordingSink};
-pub use mock::{MockEngine, RecordedCall};
-pub use port_forward::{
-    renew_and_rebind, MockForwarder, PortForwardError, PortForwardMode, PortForwarder,
-    PortMapRequest, RenewOutcome,
-};
+pub use alert_loop::AlertLoopBuilder;
+pub use alert_loop::AlertLoopHandle;
+pub use alert_loop::ShutdownReason;
+pub use clock::Clock;
+pub use clock::MockClock;
+pub use clock::SystemClock;
+pub use engine::EngineError;
+pub use engine::TorrentEngine;
+pub use libtorrent_safe::AddParams;
+pub use libtorrent_safe::Alert;
+pub use libtorrent_safe::AlertKind;
+pub use libtorrent_safe::Error as SafeError;
+pub use libtorrent_safe::InfoHash;
+pub use libtorrent_safe::ResumeData;
+pub use libtorrent_safe::ResumeFlags;
+pub use libtorrent_safe::Settings;
+pub use libtorrent_safe::TorrentFlags;
+pub use libtorrent_safe::TorrentHandle;
+pub use metrics::MetricsSink;
+pub use metrics::NoopSink;
+pub use metrics::RecordingSink;
+pub use mock::MockEngine;
+pub use mock::RecordedCall;
+pub use port_forward::renew_and_rebind;
+pub use port_forward::MockForwarder;
+pub use port_forward::PortForwardError;
+pub use port_forward::PortForwardMode;
+pub use port_forward::PortForwarder;
+pub use port_forward::PortMapRequest;
+pub use port_forward::RenewOutcome;
 pub use real::RealEngine;
-pub use registry::{AssignmentRegistry, RegistryError};
-pub use resume_store::{FsResumeStore, MemoryResumeStore, ResumeStore};
-pub use slot::{Slot, SlotConfig, SlotId, SlotStatus};
-pub use source::{AlertSource, MultiSlotSource, SingleSessionSource};
-pub use state::{RetryState, StateMap, TorrentPhase, TorrentState};
-pub use torrent_store::{FsTorrentStore, MemoryTorrentStore, TorrentStore};
-pub use vpn::{MockVpn, VpnError, VpnManager, VpnProfile, VpnType};
-
-pub use alert_loop::{AlertLoopBuilder, AlertLoopHandle, ShutdownReason};
+pub use registry::AssignmentRegistry;
+pub use registry::RegistryError;
+pub use resume_store::FsResumeStore;
+pub use resume_store::MemoryResumeStore;
+pub use resume_store::ResumeStore;
+pub use slot::Slot;
+pub use slot::SlotConfig;
+pub use slot::SlotId;
+pub use slot::SlotStatus;
+pub use source::AlertSource;
+pub use source::MultiSlotSource;
+pub use source::SingleSessionSource;
+pub use state::RetryState;
+pub use state::StateMap;
+pub use state::TorrentPhase;
+pub use state::TorrentState;
+pub use torrent_store::FsTorrentStore;
+pub use torrent_store::MemoryTorrentStore;
+pub use torrent_store::TorrentStore;
+pub use vpn::MockVpn;
+pub use vpn::VpnError;
+pub use vpn::VpnManager;
+pub use vpn::VpnProfile;
+pub use vpn::VpnType;

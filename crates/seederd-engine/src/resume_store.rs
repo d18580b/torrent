@@ -14,11 +14,13 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use dashmap::DashMap;
+use libtorrent_safe::InfoHash;
+use libtorrent_safe::ResumeData;
 use thiserror::Error;
-use tracing::{debug, warn};
+use tracing::debug;
+use tracing::warn;
 
 use crate::slot::SlotId;
-use libtorrent_safe::{InfoHash, ResumeData};
 
 pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     /// Load every resume file owned by `slot`. Implementations skip
@@ -203,8 +205,9 @@ impl ResumeStore for MemoryResumeStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     #[test]
     fn fs_store_atomic_roundtrip() {

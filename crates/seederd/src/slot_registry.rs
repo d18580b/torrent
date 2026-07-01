@@ -8,7 +8,10 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use seederd_engine::{SlotConfig, SlotId, SlotStatus, TorrentEngine};
+use seederd_engine::SlotConfig;
+use seederd_engine::SlotId;
+use seederd_engine::SlotStatus;
+use seederd_engine::TorrentEngine;
 
 /// Mutable per-slot health, updated by the VPN monitor and read by `/slots`.
 #[derive(Clone, Debug)]

@@ -6,7 +6,8 @@ mod slots;
 mod status;
 pub(crate) mod torrents;
 
-use axum::routing::{get, post};
+use axum::routing::get;
+use axum::routing::post;
 use axum::Router;
 
 use crate::app_state::AppState;

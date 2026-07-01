@@ -13,8 +13,9 @@
 
 use std::sync::OnceLock;
 
-use crate::handlers::HandlerCtx;
 use libtorrent_safe::Alert;
+
+use crate::handlers::HandlerCtx;
 
 /// `(prometheus gauge suffix, libtorrent counter name)`. The exported metric
 /// is `seederd_libtorrent_<suffix>` — the `seederd_` namespace is prepended by
@@ -101,19 +102,21 @@ pub fn handle_with(alert: &Alert, ctx: &mut HandlerCtx<'_>, metrics: &StatsMetri
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
+    use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::AlertKind;
+
+    use super::*;
     use crate::clock::MockClock;
     use crate::engine::TorrentEngine;
-    use crate::metrics::{MetricCall, RecordingSink};
+    use crate::metrics::MetricCall;
+    use crate::metrics::RecordingSink;
     use crate::mock::MockEngine;
     use crate::resume_store::MemoryResumeStore;
     use crate::slot::SlotId;
     use crate::state::StateMap;
     use crate::torrent_store::MemoryTorrentStore;
-    use libtorrent_safe::alert::AlertHeader;
-    use libtorrent_safe::AlertKind;
 
     fn session_stats(counters: Vec<i64>) -> Alert {
         Alert::SessionStats {
