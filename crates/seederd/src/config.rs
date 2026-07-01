@@ -77,6 +77,13 @@ pub struct Config {
     #[serde(default)]
     pub user_agent: Option<String>,
 
+    /// Install a fail-closed nftables kill switch (multi-slot mode) that
+    /// confines the daemon's egress to loopback + the slots' tunnel interfaces.
+    /// Off by default; requires `CAP_NET_ADMIN` and that seederd runs as its own
+    /// user. See `vpn::killswitch`.
+    #[serde(default)]
+    pub network_kill_switch: bool,
+
     /// `[[slot]]` array. Empty → single-session mode.
     #[serde(default)]
     pub slot: Vec<SlotConfig>,
