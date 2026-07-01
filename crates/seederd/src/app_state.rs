@@ -51,3 +51,58 @@ pub enum Mode {
     Single,
     MultiSlot,
 }
+
+/// Minimal AppState for handler/unit tests. `slots = Some(..)` puts it in
+/// multi-slot mode; everything else is a throwaway in-memory double.
+#[cfg(test)]
+pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
+    use seederd_engine::AssignmentRegistry;
+    use seederd_engine::MemoryTorrentStore;
+    use seederd_engine::MockEngine;
+    use seederd_engine::SingleSessionSource;
+    use seederd_engine::TorrentEngine;
+
+    let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+    let mode = if slots.is_some() {
+        Mode::MultiSlot
+    } else {
+        Mode::Single
+    };
+    AppState {
+        source: Arc::new(SingleSessionSource::new(engine)),
+        registry: Arc::new(AssignmentRegistry::new_empty(
+            std::env::temp_dir().join("seederd-test-reg.json"),
+        )),
+        slots,
+        state: Arc::new(StateMap::new()),
+        torrents: Arc::new(MemoryTorrentStore::new()),
+        metrics: Arc::new(PromSink::new()),
+        default_save_path: std::env::temp_dir(),
+        mode,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::slot_registry::test_entry;
+
+    #[test]
+    fn slot_vpn_down_true_only_for_vpndown_slots() {
+        let reg = Arc::new(SlotRegistry::new(vec![
+            test_entry("up", SlotStatus::Active),
+            test_entry("down", SlotStatus::VpnDown),
+        ]));
+        let s = build_test_state(Some(reg));
+        assert!(!s.slot_vpn_down(&SlotId::new("up")));
+        assert!(s.slot_vpn_down(&SlotId::new("down")));
+        // Unknown slot → not "down" (handlers resolve it to a 404 elsewhere).
+        assert!(!s.slot_vpn_down(&SlotId::new("missing")));
+    }
+
+    #[test]
+    fn slot_vpn_down_false_in_single_session() {
+        let s = build_test_state(None);
+        assert!(!s.slot_vpn_down(&SlotId::default_single()));
+    }
+}
