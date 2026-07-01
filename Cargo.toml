@@ -15,6 +15,11 @@ license = "Apache-2.0"
 authors = ["Justin Chung"]
 repository = "https://github.com/d18580b/torrent"
 
+# Centralized, inherited lint policy — each crate opts in via `[lints] workspace = true`.
+# One source of truth (merge-resilient) that mirrors the historical `-D warnings` gate.
+[workspace.lints.clippy]
+all = "deny"
+
 [workspace.dependencies]
 # Core
 tokio = { version = "1.42", features = ["full"] }

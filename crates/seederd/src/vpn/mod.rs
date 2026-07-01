@@ -10,14 +10,14 @@ mod natpmp;
 mod openvpn;
 mod wireguard;
 
+use std::sync::Arc;
+
 pub use ip_lookup::first_ipv4;
 pub use natpmp::NatpmpForwarder;
 pub use openvpn::OpenvpnManager;
+use seederd_engine::VpnManager;
+use seederd_engine::VpnType;
 pub use wireguard::WireguardManager;
-
-use std::sync::Arc;
-
-use seederd_engine::{VpnManager, VpnType};
 
 /// Build the matching real implementation for a `VpnType`.
 pub fn for_type(t: VpnType) -> Arc<dyn VpnManager> {

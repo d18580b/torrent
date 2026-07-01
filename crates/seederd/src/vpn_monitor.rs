@@ -10,10 +10,13 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use seederd_engine::MetricsSink;
+use seederd_engine::ShutdownReason;
+use seederd_engine::SlotStatus;
+use seederd_engine::StateMap;
 use tokio::sync::broadcast;
-use tracing::{error, info};
-
-use seederd_engine::{MetricsSink, ShutdownReason, SlotStatus, StateMap};
+use tracing::error;
+use tracing::info;
 
 use crate::metrics_sink::PromSink;
 use crate::slot_registry::SlotRegistry;

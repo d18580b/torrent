@@ -23,7 +23,8 @@ mod vpn_monitor;
 
 use anyhow::Context;
 use clap::Parser;
-use tracing::{error, info};
+use tracing::error;
+use tracing::info;
 
 use crate::cli::Cli;
 

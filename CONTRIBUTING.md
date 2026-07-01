@@ -47,6 +47,44 @@ fetch the channel automatically; if you don't have rustup yet:
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
+### Developer tooling (mise + hk)
+
+Formatting, linting, and the git hooks are managed with [`mise`](https://mise.jdx.dev)
+and [`hk`](https://hk.jdx.dev). `mise` provisions the pinned `hk` and `convco`, and every
+fmt/lint/test command is defined once in [`mise.toml`](./mise.toml) so local runs and CI
+stay in lock-step.
+
+```bash
+mise install     # provision hk + convco (from [tools] in mise.toml)
+mise run setup    # install the nightly rustfmt toolchain and activate git hooks (once)
+```
+
+Everyday tasks:
+
+| Command            | What it does                                             |
+| ------------------ | -------------------------------------------------------- |
+| `mise run fmt`     | Check formatting (nightly rustfmt)                       |
+| `mise run fmt-fix` | Apply formatting                                         |
+| `mise run lint`    | Clippy across the workspace, warnings denied             |
+| `mise run lint-fix`| Clippy autofix                                           |
+| `mise run test`    | `cargo test --workspace`                                 |
+| `mise run check`   | fmt + lint                                               |
+
+Formatting requires **nightly rustfmt** (`imports_granularity`/`group_imports` are
+unstable); `mise run setup` installs it and the `fmt` tasks invoke `cargo +nightly fmt`.
+Everything else builds/lints/tests on the pinned stable toolchain.
+
+### Git hooks
+
+`mise run setup` runs `hk install`, wiring up the hooks defined in [`hk.pkl`](./hk.pkl):
+
+- **pre-commit** — formats and clippy-fixes the *staged* snapshot and re-stages the result,
+  so what you commit is already clean.
+- **commit-msg** — enforces [Conventional Commits](https://www.conventionalcommits.org)
+  via `convco` **at commit time**. `feat:`, `fix:`, `chore:`, `build:`, `ci:`, `docs:`,
+  `refactor:`, `style:`, `perf:`, `test:` (optionally scoped, e.g. `feat(engine):`).
+- **pre-push** — runs the full `fmt` + `lint` + `test` suite before a push.
+
 ### Submodules
 
 Vendored C/C++ dependencies live under `vendor/` as git submodules:
@@ -93,10 +131,11 @@ single-node smoke and the multi-slot / VPN path — see
 
 ## Style
 
-- `cargo fmt --all -- --check`
-- `cargo clippy --all-targets -- -D warnings`
+- `mise run fmt` — formatting (nightly rustfmt; see Developer tooling above)
+- `mise run lint` — clippy, warnings denied
 
-Do not commit code with `unwrap()` outside tests — return a `Result` or expect-with-context.
+The pre-commit hook applies both automatically to staged changes. Do not commit code with
+`unwrap()` outside tests — return a `Result` or expect-with-context.
 
 ## Logging conventions
 

@@ -1,0 +1,68 @@
+amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.pkl"
+
+// The fmt / lint / test commands live ONLY in mise.toml. hk deliberately does
+// not use its cargo_fmt / cargo_clippy / check_conventional_commit builtins:
+// keeping a single source of truth (mise tasks) is the whole point. hk's job
+// here is orchestration — stashing so fixes run against the staged snapshot,
+// and re-staging the files its fix commands touch.
+local rust = new Mapping<String, Step> {
+  ["fmt"] {
+    glob = "**/*.rs"
+    check = "mise run fmt"
+    fix = "mise run fmt-fix"
+  }
+  ["clippy"] {
+    glob = "**/*.rs"
+    check = "mise run lint"
+    fix = "mise run lint-fix"
+  }
+}
+
+hooks {
+  // Format + lint the STAGED snapshot, then re-stage whatever was fixed.
+  // stash = "git" hides unstaged changes so the fix commands only see staged
+  // content; hk auto-stages the files its fix commands modify.
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = rust
+  }
+
+  // Enforce Conventional Commits AT COMMIT TIME (not pre-push, which is easy to
+  // force through). convco reads the message from stdin; --strip removes the
+  // comment / scissor lines git writes into the message file.
+  ["commit-msg"] {
+    steps {
+      ["convco"] {
+        check = "mise exec -- convco check --from-stdin --strip < {{commit_msg_file}}"
+      }
+    }
+  }
+
+  // Gate pushes on the full suite — checks only, no fixing.
+  ["pre-push"] {
+    fix = false
+    steps {
+      ["fmt"] {
+        glob = "**/*.rs"
+        check = "mise run fmt"
+      }
+      ["clippy"] {
+        glob = "**/*.rs"
+        check = "mise run lint"
+      }
+      ["test"] {
+        check = "mise run test"
+      }
+    }
+  }
+
+  // `hk check` / `hk fix` manual entrypoints mirror the pre-commit steps.
+  ["check"] {
+    steps = rust
+  }
+  ["fix"] {
+    fix = true
+    steps = rust
+  }
+}

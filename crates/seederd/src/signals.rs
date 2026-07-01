@@ -4,11 +4,13 @@
 //! signals. SIGTERM/SIGINT broadcast on `shutdown_tx`. SIGHUP fires on
 //! `reload_tx`.
 
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{broadcast, mpsc};
-use tracing::{info, warn};
-
 use seederd_engine::ShutdownReason;
+use tokio::signal::unix::signal;
+use tokio::signal::unix::SignalKind;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tracing::info;
+use tracing::warn;
 
 #[derive(Clone, Debug)]
 pub struct SignalChannels {

@@ -8,11 +8,13 @@
 
 use std::fs;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use seederd_engine::SlotConfig;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -245,8 +247,9 @@ impl ConfigDiff {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use tempfile::tempdir;
+
+    use super::*;
 
     fn write_cfg(dir: &Path, body: &str) -> PathBuf {
         let p = dir.join("seederd.toml");

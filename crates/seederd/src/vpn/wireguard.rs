@@ -7,11 +7,14 @@
 use std::net::IpAddr;
 use std::process::Command;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use tracing::{info, warn};
-
-use seederd_engine::{VpnError, VpnManager, VpnProfile};
+use seederd_engine::VpnError;
+use seederd_engine::VpnManager;
+use seederd_engine::VpnProfile;
+use tracing::info;
+use tracing::warn;
 
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);

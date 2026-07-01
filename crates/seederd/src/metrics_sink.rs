@@ -3,12 +3,15 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use prometheus::{
-    register_counter_vec_with_registry, register_gauge_vec_with_registry,
-    register_histogram_vec_with_registry, CounterVec, Encoder, GaugeVec, HistogramVec, Registry,
-    TextEncoder,
-};
-
+use prometheus::register_counter_vec_with_registry;
+use prometheus::register_gauge_vec_with_registry;
+use prometheus::register_histogram_vec_with_registry;
+use prometheus::CounterVec;
+use prometheus::Encoder;
+use prometheus::GaugeVec;
+use prometheus::HistogramVec;
+use prometheus::Registry;
+use prometheus::TextEncoder;
 use seederd_engine::MetricsSink;
 
 #[derive(Debug)]

@@ -3,7 +3,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use seederd_engine::{AlertSource, AssignmentRegistry, StateMap, TorrentStore};
+use seederd_engine::AlertSource;
+use seederd_engine::AssignmentRegistry;
+use seederd_engine::StateMap;
+use seederd_engine::TorrentStore;
 
 use crate::metrics_sink::PromSink;
 use crate::slot_registry::SlotRegistry;

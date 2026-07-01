@@ -19,10 +19,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: false
-      - uses: dtolnay/rust-toolchain@stable
+      # Nightly is required ONLY for rustfmt (imports_granularity / group_imports
+      # are unstable). The mise `fmt` task invokes `cargo +nightly fmt`.
+      - uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+      - run: mise run fmt
 
   clippy-and-test:
     name: clippy + test
@@ -46,6 +51,10 @@ jobs:
         with:
           components: clippy
 
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+
       - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
@@ -65,9 +74,10 @@ jobs:
             target/release/build/libtorrent-sys-*/out
           key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
 
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # fmt/lint/test commands are defined once in mise.toml (parity with local hooks).
+      - run: mise run lint
 
-      - run: cargo test --workspace
+      - run: mise run test
 
   tracing-lint:
     name: tracing field-name lint
@@ -170,3 +180,19 @@ jobs:
       # Layer 3 (PRD Validation §): real daemon + libtorrent, driven over HTTP.
       - run: cargo test -p seederd-engine --test lifecycle -- --ignored
       - run: cargo test -p seederd --test daemon -- --ignored
+
+  commit-lint:
+    name: conventional commits
+    runs-on: ubuntu-24.04
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          fetch-depth: 0
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+      # Backstop the local commit-msg hook against `--no-verify`: every commit the
+      # PR adds must be a valid Conventional Commit (same convco used on commit).
+      - run: mise exec -- convco check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}

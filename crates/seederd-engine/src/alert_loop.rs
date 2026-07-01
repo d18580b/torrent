@@ -18,21 +18,30 @@
 
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
-use tracing::{info, info_span, warn, Span};
+use crossbeam_channel::bounded;
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+use libtorrent_safe::Alert;
+use libtorrent_safe::ResumeFlags;
+use libtorrent_safe::TorrentHandle;
+use tracing::info;
+use tracing::info_span;
+use tracing::warn;
+use tracing::Span;
 
 use crate::clock::Clock;
 use crate::engine::TorrentEngine;
-use crate::handlers::{self, HandlerCtx};
+use crate::handlers::HandlerCtx;
+use crate::handlers::{self};
 use crate::metrics::MetricsSink;
 use crate::resume_store::ResumeStore;
 use crate::slot::SlotId;
 use crate::source::AlertSource;
 use crate::state::StateMap;
 use crate::torrent_store::TorrentStore;
-use libtorrent_safe::{Alert, ResumeFlags, TorrentHandle};
 
 const POLL_IDLE_INTERVAL: Duration = Duration::from_millis(100);
 const POST_UPDATES_INTERVAL: Duration = Duration::from_secs(1);
@@ -478,15 +487,19 @@ fn drain_once(
 
 #[cfg(test)]
 mod tests {
+    use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::AlertKind;
+    use libtorrent_safe::InfoHash;
+    use libtorrent_safe::ResumeData;
+
     use super::*;
     use crate::clock::MockClock;
-    use crate::metrics::{NoopSink, RecordingSink};
+    use crate::metrics::NoopSink;
+    use crate::metrics::RecordingSink;
     use crate::mock::MockEngine;
     use crate::resume_store::MemoryResumeStore;
     use crate::source::SingleSessionSource;
     use crate::torrent_store::MemoryTorrentStore;
-    use libtorrent_safe::alert::AlertHeader;
-    use libtorrent_safe::{AlertKind, InfoHash, ResumeData};
 
     fn add_torrent_alert(byte: u8, id: u64) -> Alert {
         let ih = InfoHash([byte; 20]);

@@ -10,10 +10,11 @@
 //! For now we log + record the metric; the seederd binary's main loop
 //! reads the metric to decide whether to exit.
 
-use tracing::{error, info};
+use libtorrent_safe::Alert;
+use tracing::error;
+use tracing::info;
 
 use crate::handlers::HandlerCtx;
-use libtorrent_safe::Alert;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {

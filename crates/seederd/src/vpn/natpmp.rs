@@ -23,9 +23,10 @@ use std::io;
 use std::net::UdpSocket;
 use std::time::Duration;
 
+use seederd_engine::PortForwardError;
+use seederd_engine::PortForwarder;
+use seederd_engine::PortMapRequest;
 use tracing::warn;
-
-use seederd_engine::{PortForwardError, PortForwarder, PortMapRequest};
 
 /// Well-known NAT-PMP server port on the gateway.
 const NATPMP_PORT: u16 = 5351;
@@ -172,9 +173,11 @@ fn is_timeout(e: &io::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::IpAddr;
+    use std::net::Ipv4Addr;
     use std::thread;
+
+    use super::*;
 
     #[test]
     fn request_encoding_matches_rfc_layout() {

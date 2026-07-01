@@ -15,12 +15,19 @@ pub mod resume;
 pub mod session;
 pub mod settings;
 
-pub use alert::{Alert, AlertKind};
-pub use error::{Error, Result};
-pub use handle::{InfoHash, TorrentHandle};
+pub use alert::Alert;
+pub use alert::AlertKind;
+pub use error::Error;
+pub use error::Result;
+pub use handle::InfoHash;
+pub use handle::TorrentHandle;
 pub use resume::ResumeData;
-pub use session::{
-    info_hash_from_magnet, info_hash_from_torrent, session_stats_metric_index,
-    torrent_tracker_host_matches, AddParams, Session,
-};
-pub use settings::{ResumeFlags, Settings, TorrentFlags};
+pub use session::info_hash_from_magnet;
+pub use session::info_hash_from_torrent;
+pub use session::session_stats_metric_index;
+pub use session::torrent_tracker_host_matches;
+pub use session::AddParams;
+pub use session::Session;
+pub use settings::ResumeFlags;
+pub use settings::Settings;
+pub use settings::TorrentFlags;

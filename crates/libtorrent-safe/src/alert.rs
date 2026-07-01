@@ -9,7 +9,8 @@ use std::ffi::CStr;
 
 use libtorrent_sys as ffi;
 
-use crate::handle::{InfoHash, TorrentHandle};
+use crate::handle::InfoHash;
+use crate::handle::TorrentHandle;
 use crate::resume::ResumeData;
 
 /// Compact tag enum mirroring `lt_alert_kind`. Useful for routing /

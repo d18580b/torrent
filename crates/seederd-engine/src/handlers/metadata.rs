@@ -4,10 +4,11 @@
 //! metadata we persist it so the startup inventory scan can re-add the torrent
 //! if its resume file is ever lost (PRD §6 / §Session Management).
 
-use tracing::{debug, warn};
+use libtorrent_safe::Alert;
+use tracing::debug;
+use tracing::warn;
 
 use crate::handlers::HandlerCtx;
-use libtorrent_safe::Alert;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     let Alert::MetadataReceived { hdr, info_section } = alert else {
@@ -49,9 +50,13 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
+    use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::AlertKind;
+    use libtorrent_safe::InfoHash;
+
+    use super::*;
     use crate::clock::MockClock;
     use crate::engine::TorrentEngine;
     use crate::metrics::NoopSink;
@@ -59,9 +64,8 @@ mod tests {
     use crate::resume_store::MemoryResumeStore;
     use crate::slot::SlotId;
     use crate::state::StateMap;
-    use crate::torrent_store::{MemoryTorrentStore, TorrentStore};
-    use libtorrent_safe::alert::AlertHeader;
-    use libtorrent_safe::{AlertKind, InfoHash};
+    use crate::torrent_store::MemoryTorrentStore;
+    use crate::torrent_store::TorrentStore;
 
     #[test]
     fn persists_wrapped_info_dict_as_torrent() {
