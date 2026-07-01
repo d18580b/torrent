@@ -28,4 +28,7 @@ pub struct AppState {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Mode { Single, MultiSlot }
+pub enum Mode {
+    Single,
+    MultiSlot,
+}

@@ -15,6 +15,7 @@ pub mod engine;
 pub mod handlers;
 pub mod metrics;
 pub mod mock;
+pub mod port_forward;
 pub mod real;
 pub mod registry;
 pub mod resume_store;
@@ -37,6 +38,10 @@ pub use clock::{Clock, MockClock, SystemClock};
 pub use engine::{EngineError, TorrentEngine};
 pub use metrics::{MetricsSink, NoopSink, RecordingSink};
 pub use mock::{MockEngine, RecordedCall};
+pub use port_forward::{
+    renew_and_rebind, MockForwarder, PortForwardError, PortForwardMode, PortForwarder,
+    PortMapRequest, RenewOutcome,
+};
 pub use real::RealEngine;
 pub use registry::{AssignmentRegistry, RegistryError};
 pub use resume_store::{FsResumeStore, MemoryResumeStore, ResumeStore};
@@ -46,4 +51,4 @@ pub use state::{RetryState, StateMap, TorrentPhase, TorrentState};
 pub use torrent_store::{FsTorrentStore, MemoryTorrentStore, TorrentStore};
 pub use vpn::{MockVpn, VpnError, VpnManager, VpnProfile, VpnType};
 
-pub use alert_loop::{AlertLoopHandle, AlertLoopBuilder, ShutdownReason};
+pub use alert_loop::{AlertLoopBuilder, AlertLoopHandle, ShutdownReason};

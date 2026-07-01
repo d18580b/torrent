@@ -45,7 +45,10 @@ fn exception_isolation_bad_torrent_returns_null() {
             512,
         )
     };
-    assert_eq!(h, 0, "a bad .torrent must return the null handle, not unwind");
+    assert_eq!(
+        h, 0,
+        "a bad .torrent must return the null handle, not unwind"
+    );
     assert_ne!(err[0], 0, "err_out should describe the parse failure");
     unsafe { lt_session_destroy(s) };
 }
@@ -57,7 +60,10 @@ fn null_and_unknown_handle_ops_are_safe() {
     assert_eq!(unsafe { lt_torrent_pause(s, 0) }, LT_ERR);
     assert_eq!(unsafe { lt_torrent_resume(s, 0) }, LT_ERR);
     assert_eq!(unsafe { lt_remove_torrent(s, 0, 0) }, LT_ERR);
-    assert_eq!(unsafe { lt_torrent_set_upload_limit(s, 999_999, 100) }, LT_ERR);
+    assert_eq!(
+        unsafe { lt_torrent_set_upload_limit(s, 999_999, 100) },
+        LT_ERR
+    );
     assert_eq!(unsafe { lt_torrent_pause(ptr::null_mut(), 1) }, LT_ERR);
     unsafe { lt_session_destroy(s) };
 }
@@ -70,7 +76,10 @@ fn save_state_buffer_ownership_roundtrip() {
     let mut err = [0 as c_char; 512];
     let rc = unsafe { lt_session_save_state(s, &mut buf, &mut len, err.as_mut_ptr(), 512) };
     assert_eq!(rc, LT_OK as i32);
-    assert!(!buf.is_null() && len > 0, "expected a non-empty state buffer");
+    assert!(
+        !buf.is_null() && len > 0,
+        "expected a non-empty state buffer"
+    );
     // ASan verifies this frees exactly what the shim malloc'd (no double-free
     // / no leak). Reloading the same blob must round-trip.
     let rc2 = unsafe { lt_session_load_state(s, buf, len, err.as_mut_ptr(), 512) };
@@ -81,12 +90,10 @@ fn save_state_buffer_ownership_roundtrip() {
 
 #[test]
 fn magnet_info_hash_marshals_20_bytes() {
-    let uri =
-        CString::new("magnet:?xt=urn:btih:0101010101010101010101010101010101010101").unwrap();
+    let uri = CString::new("magnet:?xt=urn:btih:0101010101010101010101010101010101010101").unwrap();
     let mut out = [0u8; 20];
     let mut err = [0 as c_char; 512];
-    let rc =
-        unsafe { lt_magnet_info_hash(uri.as_ptr(), out.as_mut_ptr(), err.as_mut_ptr(), 512) };
+    let rc = unsafe { lt_magnet_info_hash(uri.as_ptr(), out.as_mut_ptr(), err.as_mut_ptr(), 512) };
     assert_eq!(rc, LT_OK as i32);
     assert_eq!(out, [0x01u8; 20]);
 }
@@ -97,7 +104,13 @@ fn torrent_info_hash_bad_buffer_errors_cleanly() {
     let mut out = [0u8; 20];
     let mut err = [0 as c_char; 512];
     let rc = unsafe {
-        lt_torrent_info_hash(garbage.as_ptr(), garbage.len(), out.as_mut_ptr(), err.as_mut_ptr(), 512)
+        lt_torrent_info_hash(
+            garbage.as_ptr(),
+            garbage.len(),
+            out.as_mut_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
     };
     assert_eq!(rc, LT_ERR);
     assert_ne!(err[0], 0);

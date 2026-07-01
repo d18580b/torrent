@@ -15,18 +15,17 @@ use seederd_engine::MetricsSink;
 pub struct PromSink {
     registry: Registry,
     counters: Mutex<HashMap<String, CounterVec>>,
-    gauges:   Mutex<HashMap<String, GaugeVec>>,
-    histos:   Mutex<HashMap<String, HistogramVec>>,
+    gauges: Mutex<HashMap<String, GaugeVec>>,
+    histos: Mutex<HashMap<String, HistogramVec>>,
 }
 
 impl PromSink {
     pub fn new() -> Self {
         Self {
-            registry: Registry::new_custom(Some("seederd".into()), None)
-                .expect("create registry"),
+            registry: Registry::new_custom(Some("seederd".into()), None).expect("create registry"),
             counters: Mutex::new(HashMap::new()),
-            gauges:   Mutex::new(HashMap::new()),
-            histos:   Mutex::new(HashMap::new()),
+            gauges: Mutex::new(HashMap::new()),
+            histos: Mutex::new(HashMap::new()),
         }
     }
 
@@ -45,10 +44,12 @@ impl PromSink {
         }
         let label_names: Vec<&str> = labels.iter().map(|(k, _)| *k).collect();
         let cv = register_counter_vec_with_registry!(
-            name, "seederd counter",
+            name,
+            "seederd counter",
             &label_names,
             self.registry,
-        ).expect("register counter");
+        )
+        .expect("register counter");
         g.insert(name.to_string(), cv.clone());
         cv
     }
@@ -59,11 +60,9 @@ impl PromSink {
             return c.clone();
         }
         let label_names: Vec<&str> = labels.iter().map(|(k, _)| *k).collect();
-        let gv = register_gauge_vec_with_registry!(
-            name, "seederd gauge",
-            &label_names,
-            self.registry,
-        ).expect("register gauge");
+        let gv =
+            register_gauge_vec_with_registry!(name, "seederd gauge", &label_names, self.registry,)
+                .expect("register gauge");
         g.insert(name.to_string(), gv.clone());
         gv
     }
@@ -78,7 +77,8 @@ impl PromSink {
             prometheus::HistogramOpts::new(name, "seederd histogram"),
             &label_names,
             self.registry,
-        ).expect("register histogram");
+        )
+        .expect("register histogram");
         g.insert(name.to_string(), hv.clone());
         hv
     }

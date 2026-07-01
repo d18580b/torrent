@@ -84,6 +84,14 @@ pub struct Settings {
     pub aio_threads: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_atime_storage: Option<bool>,
+    /// Shim pseudo-setting (serialized as `_disabled_disk_io`, not a libtorrent
+    /// `settings_pack` entry): build the session with libtorrent's no-op disk
+    /// backend (`disabled_disk_io_constructor`). All reads return zero-filled
+    /// blocks and writes are discarded. Intended only for the load harness, to
+    /// measure per-torrent memory without real payload on disk — never for the
+    /// daemon.
+    #[serde(rename = "_disabled_disk_io", skip_serializing_if = "Option::is_none")]
+    pub disabled_disk_io: Option<bool>,
 
     // ---- Discovery toggles ----
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -8,7 +8,11 @@ use libtorrent_safe::Alert;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
-        Alert::AddTorrent { hdr, error_code, message } => {
+        Alert::AddTorrent {
+            hdr,
+            error_code,
+            message,
+        } => {
             let _enter = ctx.span.enter();
             if *error_code != 0 {
                 error!(
@@ -41,10 +45,8 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 infohash = %handle.infohash,
                 "torrent added",
             );
-            ctx.metrics.inc_counter(
-                "torrents_added_total",
-                &[("slot_id", ctx.slot_id.as_str())],
-            );
+            ctx.metrics
+                .inc_counter("torrents_added_total", &[("slot_id", ctx.slot_id.as_str())]);
         }
         Alert::TorrentRemoved { hdr } => {
             let _enter = ctx.span.enter();
@@ -113,7 +115,10 @@ mod tests {
         let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
 
         // The torrent exists with persisted resume + .torrent on disk.
-        let th = TorrentHandle { id: 1, infohash: ih };
+        let th = TorrentHandle {
+            id: 1,
+            infohash: ih,
+        };
         state.insert(ih, TorrentState::newly_added(th, slot.clone(), clock.now()));
         resume.write(&slot, &ih, b"resume-bytes").unwrap();
         torrents.write(&slot, &ih, b"torrent-bytes").unwrap();

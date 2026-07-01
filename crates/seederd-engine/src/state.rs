@@ -38,13 +38,13 @@ pub enum TorrentPhase {
 impl TorrentPhase {
     pub fn as_str(self) -> &'static str {
         match self {
-            TorrentPhase::Checking   => "checking",
-            TorrentPhase::Idle       => "idle",
-            TorrentPhase::Seeding    => "seeding",
-            TorrentPhase::Paused     => "paused",
+            TorrentPhase::Checking => "checking",
+            TorrentPhase::Idle => "idle",
+            TorrentPhase::Seeding => "seeding",
+            TorrentPhase::Paused => "paused",
             TorrentPhase::UploadMode => "upload_mode",
-            TorrentPhase::Errored    => "errored",
-            TorrentPhase::Removed    => "removed",
+            TorrentPhase::Errored => "errored",
+            TorrentPhase::Removed => "removed",
         }
     }
 }
@@ -61,7 +61,10 @@ impl RetryState {
     pub const MAX_DELAY: Duration = Duration::from_secs(3600);
 
     pub fn first(now: Instant) -> Self {
-        Self { next_attempt: now + Self::INITIAL_DELAY, attempts: 1 }
+        Self {
+            next_attempt: now + Self::INITIAL_DELAY,
+            attempts: 1,
+        }
     }
 
     pub fn delay_for_attempt(attempts: u32) -> Duration {
@@ -138,10 +141,16 @@ impl Default for StateMap {
 }
 
 impl StateMap {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub fn len(&self) -> usize { self.inner.len() }
-    pub fn is_empty(&self) -> bool { self.inner.is_empty() }
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
 
     pub fn insert(&self, ih: InfoHash, state: TorrentState) {
         self.inner.insert(ih, state);
@@ -155,7 +164,9 @@ impl StateMap {
         self.inner.get(ih).map(|e| e.value().clone())
     }
 
-    pub fn contains(&self, ih: &InfoHash) -> bool { self.inner.contains_key(ih) }
+    pub fn contains(&self, ih: &InfoHash) -> bool {
+        self.inner.contains_key(ih)
+    }
 
     pub fn handles(&self) -> Vec<TorrentHandle> {
         self.inner.iter().map(|e| e.value().handle).collect()
@@ -207,21 +218,32 @@ impl StateMap {
 
     // --- pending_resume_count -----------------------------------------------
 
-    pub fn note_resume_requested(&self) { *self.pending_resume_count.lock() += 1; }
+    pub fn note_resume_requested(&self) {
+        *self.pending_resume_count.lock() += 1;
+    }
     pub fn note_resume_settled(&self) {
         let mut g = self.pending_resume_count.lock();
-        if *g > 0 { *g -= 1; }
+        if *g > 0 {
+            *g -= 1;
+        }
     }
-    pub fn pending_resume_count(&self) -> u64 { *self.pending_resume_count.lock() }
+    pub fn pending_resume_count(&self) -> u64 {
+        *self.pending_resume_count.lock()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ih(byte: u8) -> InfoHash { InfoHash([byte; 20]) }
+    fn ih(byte: u8) -> InfoHash {
+        InfoHash([byte; 20])
+    }
     fn handle(id: u64, byte: u8) -> TorrentHandle {
-        TorrentHandle { id, infohash: ih(byte) }
+        TorrentHandle {
+            id,
+            infohash: ih(byte),
+        }
     }
 
     #[test]
@@ -231,9 +253,15 @@ mod tests {
         let h1 = handle(1, 1);
         let h2 = handle(2, 2);
         let mut s1 = TorrentState::newly_added(h1, SlotId::default_single(), now);
-        s1.retry = Some(RetryState { next_attempt: now - Duration::from_secs(1), attempts: 1 });
+        s1.retry = Some(RetryState {
+            next_attempt: now - Duration::from_secs(1),
+            attempts: 1,
+        });
         let mut s2 = TorrentState::newly_added(h2, SlotId::default_single(), now);
-        s2.retry = Some(RetryState { next_attempt: now + Duration::from_secs(60), attempts: 1 });
+        s2.retry = Some(RetryState {
+            next_attempt: now + Duration::from_secs(60),
+            attempts: 1,
+        });
         m.insert(s1.handle.infohash, s1);
         m.insert(s2.handle.infohash, s2);
         let due = m.retries_due(now);

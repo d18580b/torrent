@@ -35,10 +35,10 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
             down += st.download_rate;
             use seederd_engine::TorrentPhase::*;
             match st.phase {
-                Seeding   => seeding += 1,
-                Paused    => paused  += 1,
-                UploadMode=> upload_mode += 1,
-                Errored   => errored += 1,
+                Seeding => seeding += 1,
+                Paused => paused += 1,
+                UploadMode => upload_mode += 1,
+                Errored => errored += 1,
                 _ => {}
             }
         }
@@ -46,7 +46,10 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
 
     Json(StatusResponse {
         torrents_total: total,
-        seeding, paused, upload_mode, errored,
+        seeding,
+        paused,
+        upload_mode,
+        errored,
         upload_rate_total: up,
         download_rate_total: down,
         pending_resume_count: s.state.pending_resume_count(),

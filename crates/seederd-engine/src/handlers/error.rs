@@ -12,10 +12,17 @@ use libtorrent_safe::Alert;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
-        Alert::TorrentError { hdr, error_code, filename, message } => {
+        Alert::TorrentError {
+            hdr,
+            error_code,
+            filename,
+            message,
+        } => {
             let _enter = ctx.span.enter();
             let Some(ih) = hdr.infohash else { return };
-            ctx.state.update(&ih, |st| { st.phase = TorrentPhase::Errored; });
+            ctx.state.update(&ih, |st| {
+                st.phase = TorrentPhase::Errored;
+            });
             error!(
                 target: "seederd_engine::handler::error",
                 infohash = %ih,
@@ -25,12 +32,16 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 error.cause = %message,
                 "torrent entered error state",
             );
-            ctx.metrics.inc_counter(
-                "torrent_errors_total",
-                &[("slot_id", ctx.slot_id.as_str())],
-            );
+            ctx.metrics
+                .inc_counter("torrent_errors_total", &[("slot_id", ctx.slot_id.as_str())]);
         }
-        Alert::FileError { hdr, error_code, filename, operation, message } => {
+        Alert::FileError {
+            hdr,
+            error_code,
+            filename,
+            operation,
+            message,
+        } => {
             let _enter = ctx.span.enter();
             let Some(ih) = hdr.infohash else { return };
             let now = ctx.clock.now();
@@ -52,24 +63,26 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             );
             ctx.metrics.inc_counter(
                 "disk_errors_total",
-                &[("slot_id", ctx.slot_id.as_str()),
-                  ("op", operation.as_str())],
+                &[
+                    ("slot_id", ctx.slot_id.as_str()),
+                    ("op", operation.as_str()),
+                ],
             );
         }
         Alert::HashFailed { hdr, piece_index } => {
             let _enter = ctx.span.enter();
             let Some(ih) = hdr.infohash else { return };
-            ctx.state.update(&ih, |st| { st.phase = TorrentPhase::Checking; });
+            ctx.state.update(&ih, |st| {
+                st.phase = TorrentPhase::Checking;
+            });
             warn!(
                 target: "seederd_engine::handler::error",
                 infohash = %ih,
                 piece_index = *piece_index,
                 "hash failed; libtorrent will recheck full torrent",
             );
-            ctx.metrics.inc_counter(
-                "hash_failures_total",
-                &[("slot_id", ctx.slot_id.as_str())],
-            );
+            ctx.metrics
+                .inc_counter("hash_failures_total", &[("slot_id", ctx.slot_id.as_str())]);
         }
         _ => unreachable!("error::handle called with non-error alert"),
     }
@@ -97,8 +110,14 @@ mod tests {
     }
 
     fn seed_state(state: &StateMap, b: u8) {
-        let h = TorrentHandle { id: b as u64, infohash: ih(b) };
-        state.insert(ih(b), TorrentState::newly_added(h, SlotId::default_single(), Instant::now()));
+        let h = TorrentHandle {
+            id: b as u64,
+            infohash: ih(b),
+        };
+        state.insert(
+            ih(b),
+            TorrentState::newly_added(h, SlotId::default_single(), Instant::now()),
+        );
     }
 
     fn dispatch(alert: &Alert, state: &StateMap, metrics: &RecordingSink) {
@@ -120,7 +139,12 @@ mod tests {
     }
 
     fn hdr(b: u8, kind: AlertKind) -> AlertHeader {
-        AlertHeader { kind, infohash: Some(ih(b)), handle: None, timestamp_us: 0 }
+        AlertHeader {
+            kind,
+            infohash: Some(ih(b)),
+            handle: None,
+            timestamp_us: 0,
+        }
     }
 
     #[test]
@@ -142,10 +166,9 @@ mod tests {
         let st = state.get(&ih(0x11)).unwrap();
         assert_eq!(st.phase, TorrentPhase::UploadMode);
         assert!(st.retry.is_some(), "retry timer must be armed");
-        assert!(metrics
-            .calls()
-            .iter()
-            .any(|c| matches!(c, MetricCall::IncCounter { name, .. } if name == "disk_errors_total")));
+        assert!(metrics.calls().iter().any(
+            |c| matches!(c, MetricCall::IncCounter { name, .. } if name == "disk_errors_total")
+        ));
     }
 
     #[test]
@@ -172,7 +195,10 @@ mod tests {
         let metrics = RecordingSink::new();
         seed_state(&state, 0x33);
         dispatch(
-            &Alert::HashFailed { hdr: hdr(0x33, AlertKind::HashFailed), piece_index: 7 },
+            &Alert::HashFailed {
+                hdr: hdr(0x33, AlertKind::HashFailed),
+                piece_index: 7,
+            },
             &state,
             &metrics,
         );

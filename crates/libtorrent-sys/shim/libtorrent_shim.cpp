@@ -23,6 +23,7 @@
 #include <libtorrent/session.hpp>
 #include <libtorrent/session_params.hpp>
 #include <libtorrent/settings_pack.hpp>
+#include <libtorrent/disabled_disk_io.hpp>
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_info.hpp>
 #include <libtorrent/torrent_status.hpp>
@@ -212,6 +213,11 @@ void apply_settings_from_json(lt::settings_pack& pack, const char* json) {
     if (!json || !*json) return;
     json_parser pp(json, std::strlen(json));
     pp.parse_object([&pack](const std::string& key, const json_value& v) {
+        // Underscore-prefixed keys are shim-level pseudo-settings (e.g.
+        // `_disabled_disk_io`), not libtorrent settings_pack entries. They are
+        // consumed elsewhere (see disabled_disk_io_requested); skip them here so
+        // setting_by_name doesn't reject them.
+        if (!key.empty() && key.front() == '_') return;
         int idx = lt::setting_by_name(key);
         if (idx < 0) throw std::runtime_error("unknown setting: " + key);
         int type = idx & lt::settings_pack::type_mask;
@@ -607,6 +613,21 @@ static lt::settings_pack make_seed_settings(const char* settings_json) {
     return pack;
 }
 
+// Scan the settings JSON for the `_disabled_disk_io` pseudo-setting (a shim
+// directive, not a libtorrent setting). When true the session is built with
+// libtorrent's no-op disk backend — used by the load harness to measure the
+// true per-torrent memory footprint of seeding torrents without provisioning
+// real payload on disk. Has no effect on normal daemon operation.
+static bool disabled_disk_io_requested(const char* json) {
+    if (!json || !*json) return false;
+    bool out = false;
+    json_parser pp(json, std::strlen(json));
+    pp.parse_object([&out](const std::string& key, const json_value& v) {
+        if (key == "_disabled_disk_io" && v.k == json_value::kind::Bool) out = v.b;
+    });
+    return out;
+}
+
 extern "C" lt_session* lt_session_create_with_state(const char* settings_json,
                                                     const uint8_t* state_buf, size_t state_len,
                                                     char* err_out, int err_len)
@@ -622,6 +643,9 @@ extern "C" lt_session* lt_session_create_with_state(const char* settings_json,
         params.settings = std::move(pack);
     } else {
         params = lt::session_params(std::move(pack));
+    }
+    if (disabled_disk_io_requested(settings_json)) {
+        params.disk_io_constructor = lt::disabled_disk_io_constructor;
     }
     return new lt_session(std::move(params));
     LT_SHIM_CATCH(err_out, err_len, nullptr)
