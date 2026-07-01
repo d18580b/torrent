@@ -1,15 +1,16 @@
 //! `/slots` endpoints (multi-slot mode only; mounted conditionally).
 
-use axum::extract::{Path, State};
+use axum::extract::Path;
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
+use seederd_engine::SlotId;
 use serde::Serialize;
 use tracing::info;
 
-use seederd_engine::SlotId;
-
 use crate::app_state::AppState;
-use crate::http::torrents::{summarize, TorrentSummary};
+use crate::http::torrents::summarize;
+use crate::http::torrents::TorrentSummary;
 use crate::slot_registry::SlotEntry;
 
 #[derive(Serialize)]

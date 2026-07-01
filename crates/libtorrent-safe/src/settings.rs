@@ -7,7 +7,8 @@
 use libtorrent_sys as ffi;
 use serde::Serialize;
 
-use crate::error::{Error, Result};
+use crate::error::Error;
+use crate::error::Result;
 
 bitflags::bitflags! {
     /// Per-torrent flags applied at add time. Maps onto the `LT_TF_*` shim

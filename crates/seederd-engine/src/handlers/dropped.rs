@@ -2,10 +2,10 @@
 //! it and log which alert types were lost. Indicates the alert loop is
 //! falling behind.
 
+use libtorrent_safe::Alert;
 use tracing::warn;
 
 use crate::handlers::HandlerCtx;
-use libtorrent_safe::Alert;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     let Alert::AlertsDropped { bits, .. } = alert else {

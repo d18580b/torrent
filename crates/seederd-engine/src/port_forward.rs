@@ -18,12 +18,13 @@ use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use libtorrent_safe::Settings;
 use parking_lot::Mutex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::engine::TorrentEngine;
-use libtorrent_safe::Settings;
 
 /// How a slot's listening port is determined.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -201,9 +202,11 @@ impl PortForwarder for MockForwarder {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::mock::{MockEngine, RecordedCall};
     use std::net::Ipv4Addr;
+
+    use super::*;
+    use crate::mock::MockEngine;
+    use crate::mock::RecordedCall;
 
     fn req() -> PortMapRequest {
         PortMapRequest {

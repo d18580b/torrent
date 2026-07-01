@@ -9,11 +9,14 @@
 
 use std::sync::Arc;
 
+pub use libtorrent_safe::AddParams;
+pub use libtorrent_safe::Alert;
+pub use libtorrent_safe::InfoHash;
+pub use libtorrent_safe::ResumeData;
+pub use libtorrent_safe::ResumeFlags;
+pub use libtorrent_safe::Settings;
+pub use libtorrent_safe::TorrentHandle;
 use thiserror::Error;
-
-pub use libtorrent_safe::{
-    AddParams, Alert, InfoHash, ResumeData, ResumeFlags, Settings, TorrentHandle,
-};
 
 #[derive(Debug, Error)]
 pub enum EngineError {

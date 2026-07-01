@@ -8,10 +8,13 @@
 //!
 //!   cargo test -p seederd --test daemon -- --ignored
 
-use std::io::{Read, Write};
+use std::io::Read;
+use std::io::Write;
 use std::net::TcpStream;
-use std::process::{Child, Command};
-use std::time::{Duration, Instant};
+use std::process::Child;
+use std::process::Command;
+use std::time::Duration;
+use std::time::Instant;
 
 /// Minimal blocking HTTP/1.1 client: sends `Connection: close` and reads the
 /// whole response to EOF. Returns `(status, body)`.

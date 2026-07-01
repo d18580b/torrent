@@ -6,7 +6,8 @@
 //! tests advance time deterministically via `MockClock`.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use parking_lot::Mutex;
 

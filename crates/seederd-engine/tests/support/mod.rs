@@ -7,11 +7,16 @@
 
 #![allow(dead_code)] // each test binary uses a subset of these helpers
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use libtorrent_safe::alert::TorrentStatusView;
-use libtorrent_safe::{Alert, Session, Settings, TorrentHandle};
-use sha1::{Digest, Sha1};
+use libtorrent_safe::Alert;
+use libtorrent_safe::Session;
+use libtorrent_safe::Settings;
+use libtorrent_safe::TorrentHandle;
+use sha1::Digest;
+use sha1::Sha1;
 
 /// Settings for a fully local, discovery-free seeding session with REAL disk
 /// I/O — libtorrent actually reads and verifies on-disk payload. No DHT/LSD/

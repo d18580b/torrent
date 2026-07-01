@@ -1,10 +1,12 @@
 //! `AddTorrent` and `TorrentRemoved` alert handlers.
 
-use tracing::{error, info, warn};
+use libtorrent_safe::Alert;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
 
 use crate::handlers::HandlerCtx;
 use crate::state::TorrentState;
-use libtorrent_safe::Alert;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
@@ -89,19 +91,26 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
-    use crate::clock::{Clock, MockClock};
+    use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::AlertKind;
+    use libtorrent_safe::InfoHash;
+    use libtorrent_safe::TorrentHandle;
+
+    use super::*;
+    use crate::clock::Clock;
+    use crate::clock::MockClock;
     use crate::engine::TorrentEngine;
     use crate::metrics::NoopSink;
     use crate::mock::MockEngine;
-    use crate::resume_store::{MemoryResumeStore, ResumeStore};
+    use crate::resume_store::MemoryResumeStore;
+    use crate::resume_store::ResumeStore;
     use crate::slot::SlotId;
-    use crate::state::{StateMap, TorrentState};
-    use crate::torrent_store::{MemoryTorrentStore, TorrentStore};
-    use libtorrent_safe::alert::AlertHeader;
-    use libtorrent_safe::{AlertKind, InfoHash, TorrentHandle};
+    use crate::state::StateMap;
+    use crate::state::TorrentState;
+    use crate::torrent_store::MemoryTorrentStore;
+    use crate::torrent_store::TorrentStore;
 
     #[test]
     fn removed_torrent_deletes_resume_and_torrent_files() {
