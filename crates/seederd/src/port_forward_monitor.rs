@@ -54,7 +54,9 @@ pub async fn run(
 
     let forwarder = NatpmpForwarder::new();
 
-    // Seed gauges from the ports negotiated at startup.
+    // Seed gauges from the ports negotiated at startup, and pre-register the
+    // renewal/failure/change counters at 0 so `rate()`/alerting queries resolve
+    // on a healthy daemon (they are otherwise absent until the first event).
     for e in slots.iter() {
         if e.config.port_forward != PortForwardMode::Natpmp {
             continue;
@@ -64,12 +66,17 @@ pub async fn run(
         if let Some(p) = e.health().forwarded_port {
             metrics.set_gauge("slot_forwarded_port", p as f64, &labels);
         }
+        metrics.add_counter("slot_port_forward_renewals_total", 0, &labels);
+        metrics.add_counter("slot_port_forward_failures_total", 0, &labels);
+        metrics.add_counter("slot_forwarded_port_changes_total", 0, &labels);
+        metrics.add_counter("slot_vpn_gateway_reboots_total", 0, &labels);
     }
 
     loop {
         tokio::select! {
             _ = tokio::time::sleep(RENEW_INTERVAL) => {}
             _ = shutdown.recv() => {
+                release_mappings(&slots, &forwarder);
                 info!(target: "seederd::port_forward_monitor", "port-forward monitor shutting down");
                 return;
             }
@@ -89,6 +96,7 @@ pub async fn run(
             else {
                 continue;
             };
+            let previous_epoch = health.forwarded_epoch;
 
             let gw_str = e.config.port_forward_gateway_or_default();
             let gateway: IpAddr = match gw_str.parse() {
@@ -111,25 +119,57 @@ pub async fn run(
             };
 
             let labels = [("slot_id", slot_id.as_str())];
-            match renew_and_rebind(&forwarder, &*e.engine, &req, previous_port, tunnel_ip) {
-                RenewOutcome::Unchanged(port) => {
+            match renew_and_rebind(
+                &forwarder,
+                &*e.engine,
+                &req,
+                previous_port,
+                previous_epoch,
+                tunnel_ip,
+            ) {
+                RenewOutcome::Unchanged {
+                    port,
+                    epoch,
+                    rebooted,
+                } => {
                     metrics.inc_counter("slot_port_forward_renewals_total", &labels);
                     metrics.set_gauge("slot_port_forward_up", 1.0, &labels);
                     metrics.set_gauge("slot_forwarded_port", port as f64, &labels);
-                    e.update_health(|h| h.port_forward_ok = true);
+                    e.update_health(|h| {
+                        h.forwarded_epoch = epoch;
+                        h.port_forward_ok = true;
+                    });
+                    if rebooted {
+                        metrics.inc_counter("slot_vpn_gateway_reboots_total", &labels);
+                        info!(
+                            target: "seederd::port_forward_monitor",
+                            slot_id = %slot_id, gateway_epoch = epoch,
+                            "NAT-PMP gateway rebooted; mapping re-established on the same port",
+                        );
+                    }
                 }
-                RenewOutcome::Rebound { previous, new } => {
+                RenewOutcome::Rebound {
+                    previous,
+                    new,
+                    epoch,
+                    rebooted,
+                } => {
                     metrics.inc_counter("slot_port_forward_renewals_total", &labels);
                     metrics.inc_counter("slot_forwarded_port_changes_total", &labels);
                     metrics.set_gauge("slot_port_forward_up", 1.0, &labels);
                     metrics.set_gauge("slot_forwarded_port", new as f64, &labels);
                     e.update_health(|h| {
                         h.forwarded_port = Some(new);
+                        h.forwarded_epoch = epoch;
                         h.port_forward_ok = true;
                     });
+                    if rebooted {
+                        metrics.inc_counter("slot_vpn_gateway_reboots_total", &labels);
+                    }
                     info!(
                         target: "seederd::port_forward_monitor",
                         slot_id = %slot_id, previous_port = previous, forwarded_port = new,
+                        gateway_epoch = epoch, gateway_rebooted = rebooted,
                         "NAT-PMP port changed; rebound live session",
                     );
                 }
@@ -154,6 +194,40 @@ pub async fn run(
                     );
                 }
             }
+        }
+    }
+}
+
+/// Best-effort release of every live NAT-PMP mapping on graceful shutdown, so
+/// the gateway isn't left holding a stale forward for the rest of the ~60s
+/// lease. Skips slots whose tunnel is already down (nothing reachable to tell).
+fn release_mappings(slots: &SlotRegistry, forwarder: &NatpmpForwarder) {
+    for e in slots.iter() {
+        if e.config.port_forward != PortForwardMode::Natpmp {
+            continue;
+        }
+        let health = e.health();
+        if health.status == SlotStatus::VpnDown {
+            continue;
+        }
+        let Some(tunnel_ip) = health.tunnel_ip else {
+            continue;
+        };
+        let gw_str = e.config.port_forward_gateway_or_default();
+        let Ok(gateway) = gw_str.parse::<IpAddr>() else {
+            continue;
+        };
+        match forwarder.unmap(gateway, tunnel_ip) {
+            Ok(()) => info!(
+                target: "seederd::port_forward_monitor",
+                slot_id = %e.id(),
+                "released NAT-PMP mapping on shutdown",
+            ),
+            Err(err) => warn!(
+                target: "seederd::port_forward_monitor",
+                slot_id = %e.id(), error.cause = %err,
+                "failed to release NAT-PMP mapping on shutdown (best-effort)",
+            ),
         }
     }
 }

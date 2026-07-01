@@ -53,6 +53,7 @@ pub use metrics::RecordingSink;
 pub use mock::MockEngine;
 pub use mock::RecordedCall;
 pub use port_forward::renew_and_rebind;
+pub use port_forward::MapResult;
 pub use port_forward::MockForwarder;
 pub use port_forward::PortForwardError;
 pub use port_forward::PortForwardMode;

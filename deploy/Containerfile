@@ -30,7 +30,7 @@ RUN cargo build --release --workspace --bin seederd
 FROM fedora:43-minimal
 
 RUN microdnf install -y \
-        openssl ca-certificates iproute wireguard-tools \
+        openssl ca-certificates iproute wireguard-tools nftables \
     && microdnf clean all
 
 COPY --from=builder /src/target/release/seederd /usr/local/bin/seederd

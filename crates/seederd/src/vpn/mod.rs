@@ -6,6 +6,7 @@
 //! a netlink-based implementation later without changing any caller.
 
 mod ip_lookup;
+pub mod killswitch;
 mod natpmp;
 mod openvpn;
 mod wireguard;
@@ -17,6 +18,7 @@ pub use natpmp::NatpmpForwarder;
 pub use openvpn::OpenvpnManager;
 use seederd_engine::VpnManager;
 use seederd_engine::VpnType;
+pub use wireguard::latest_handshake_age as wireguard_handshake_age;
 pub use wireguard::WireguardManager;
 
 /// Build the matching real implementation for a `VpnType`.

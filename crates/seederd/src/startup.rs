@@ -59,6 +59,9 @@ pub struct DaemonHandle {
     metrics: Arc<PromSink>,
     registry: Arc<AssignmentRegistry>,
     slot_registry: Option<Arc<SlotRegistry>>,
+    /// Whether the nftables kill switch was installed and must be torn down on
+    /// graceful shutdown.
+    kill_switch_active: bool,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: seederd_engine::AlertLoopHandle,
 }
@@ -141,9 +144,9 @@ pub async fn boot(
                 //    silently seeding on an unforwarded port. Mid-session
                 //    renewal failures are the soft warn+keep-seeding path
                 //    (see port_forward_monitor).
-                let (effective_port, forwarded_port) = match s.port_forward {
+                let (effective_port, forwarded_port, forwarded_epoch) = match s.port_forward {
                     PortForwardMode::Static => match s.listen_port {
-                        Some(port) => (port, None),
+                        Some(port) => (port, None, 0),
                         None => {
                             // validate_set should have caught this; be defensive.
                             error!(slot_id = %s.id, "static slot missing listen_port; slot disabled");
@@ -167,10 +170,10 @@ pub async fn boot(
                             internal_port: 0,
                             lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
                         };
-                        match vpn::NatpmpForwarder::new().map(&req) {
-                            Ok(port) => {
-                                info!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, forwarded_port = port, "NAT-PMP port negotiated");
-                                (port, Some(port))
+                        match vpn::NatpmpForwarder::for_startup().map(&req) {
+                            Ok(m) => {
+                                info!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
+                                (m.port, Some(m.port), m.epoch)
                             }
                             Err(e) => {
                                 error!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; slot disabled (no bare-IP fallback)");
@@ -207,6 +210,7 @@ pub async fn boot(
                             engine,
                             tunnel_ip,
                             forwarded_port,
+                            forwarded_epoch,
                         ));
                     }
                     Err(e) => {
@@ -230,6 +234,29 @@ pub async fn boot(
             Arc::new(MultiSlotSource::new(source_entries))
         }
     };
+
+    // Network-layer kill switch (defence-in-depth; multi-slot + opt-in).
+    // Installed once, after every slot's tunnel is up, so the ruleset covers all
+    // tunnel interfaces. Fail-closed: if the operator asked for it and it can't
+    // be installed, abort rather than seed without the backstop.
+    let mut kill_switch_active = false;
+    if cfg.network_kill_switch {
+        match &slot_registry {
+            Some(sr) => {
+                let tunnels: Vec<String> =
+                    sr.iter().map(|e| e.config.vpn_interface.clone()).collect();
+                let uid = vpn::killswitch::enable(&tunnels)
+                    .context("install nftables kill switch (network_kill_switch=true)")?;
+                kill_switch_active = true;
+                metrics.set_gauge("kill_switch_active", 1.0, &[]);
+                info!(uid, "network kill switch active");
+            }
+            None => warn!(
+                "network_kill_switch set but no slots configured; \
+                 ignoring (single-session mode has no tunnel to protect)",
+            ),
+        }
+    }
 
     // Resume scan: load every saved resume file per slot. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
@@ -349,6 +376,7 @@ pub async fn boot(
         metrics,
         registry,
         slot_registry,
+        kill_switch_active,
         log_handle,
         alert_loop,
     })
@@ -368,6 +396,7 @@ impl DaemonHandle {
             metrics,
             registry,
             slot_registry,
+            kill_switch_active,
             log_handle,
             alert_loop,
         } = self;
@@ -379,6 +408,7 @@ impl DaemonHandle {
                 slots.clone(),
                 state.clone(),
                 metrics.clone(),
+                std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
                 shutdown_tx.subscribe(),
             ));
             // Port-forward renewal monitor: keeps NAT-PMP leases alive and
@@ -467,6 +497,16 @@ impl DaemonHandle {
                     Ok(_) => {}
                     Err(e) => warn!(error.cause = %e, "session_state() failed"),
                 }
+            }
+        }
+
+        // Remove the network kill switch last, once seeding has drained. The
+        // tunnel is still up during a graceful shutdown, so the slots' sockets
+        // (still source-bound to the tunnel IP) can't leak in this window.
+        if kill_switch_active {
+            match crate::vpn::killswitch::disable() {
+                Ok(()) => info!("network kill switch removed"),
+                Err(e) => warn!(error.cause = %e, "failed to remove network kill switch"),
             }
         }
 
