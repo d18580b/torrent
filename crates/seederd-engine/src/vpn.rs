@@ -16,7 +16,10 @@ use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum VpnType { Wireguard, Openvpn }
+pub enum VpnType {
+    Wireguard,
+    Openvpn,
+}
 
 #[derive(Clone, Debug)]
 pub struct VpnProfile {
@@ -70,7 +73,9 @@ struct MockVpnInner {
 }
 
 impl MockVpn {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Pre-seed an interface so `bring_up` returns this IP.
     pub fn set_ip(&self, iface: &str, ip: IpAddr) {
@@ -103,7 +108,9 @@ impl VpnManager for MockVpn {
             .ips
             .get(iface)
             .copied()
-            .ok_or_else(|| VpnError::NoAddress { iface: iface.to_string() })
+            .ok_or_else(|| VpnError::NoAddress {
+                iface: iface.to_string(),
+            })
     }
 
     fn bring_down(&self, iface: &str) {

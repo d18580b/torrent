@@ -58,7 +58,10 @@ pub(crate) fn summarize(s: &AppState, ih: &InfoHash, slot: &SlotId) -> TorrentSu
     TorrentSummary {
         infohash: ih.to_hex(),
         slot_id: slot.as_str().to_string(),
-        phase: st.as_ref().map(|s| s.phase.as_str().to_string()).unwrap_or_else(|| "unknown".into()),
+        phase: st
+            .as_ref()
+            .map(|s| s.phase.as_str().to_string())
+            .unwrap_or_else(|| "unknown".into()),
         upload_rate: st.as_ref().map(|s| s.upload_rate).unwrap_or(0),
         download_rate: st.as_ref().map(|s| s.download_rate).unwrap_or(0),
         num_peers: st.as_ref().map(|s| s.num_peers).unwrap_or(0),
@@ -75,7 +78,10 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Json
     let mut all = s.registry.entries();
     all.sort_by_key(|(ih, _)| ih.0);
     let start = match after {
-        Some(a) => all.iter().position(|(ih, _)| ih.0 > a.0).unwrap_or(all.len()),
+        Some(a) => all
+            .iter()
+            .position(|(ih, _)| ih.0 > a.0)
+            .unwrap_or(all.len()),
         None => 0,
     };
     let end = (start + limit).min(all.len());
@@ -99,7 +105,10 @@ pub async fn get(
 ) -> Result<Json<TorrentSummary>, (StatusCode, Json<serde_json::Value>)> {
     let ih = InfoHash::from_hex(&infohash).ok_or_else(bad_infohash)?;
     let slot = s.registry.lookup(&ih).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not_found"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not_found"})),
+        )
     })?;
     Ok(Json(summarize(&s, &ih, &slot)))
 }
@@ -146,36 +155,60 @@ pub async fn add(
 async fn parse_json(req: Request) -> Result<AddParse, AddError> {
     let bytes = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
         .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("read body: {e}")}))))?;
-    let r: AddRequest = serde_json::from_slice(&bytes)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid JSON: {e}")}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("read body: {e}")})),
+            )
+        })?;
+    let r: AddRequest = serde_json::from_slice(&bytes).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid JSON: {e}")})),
+        )
+    })?;
     let source = if let Some(uri) = r.magnet {
         AddSource::Magnet(uri)
     } else if let Some(path) = r.torrent_path {
         let bytes = std::fs::read(&path).map_err(|e| {
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("read torrent file: {e}")})))
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("read torrent file: {e}")})),
+            )
         })?;
         AddSource::File(bytes)
     } else {
-        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "magnet or torrent_path required"}))));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "magnet or torrent_path required"})),
+        ));
     };
     Ok((r.slot_id, r.save_path, source))
 }
 
 async fn parse_multipart(req: Request, state: &AppState) -> Result<AddParse, AddError> {
-    let mut mp = Multipart::from_request(req, state)
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid multipart: {e}")}))))?;
+    let mut mp = Multipart::from_request(req, state).await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid multipart: {e}")})),
+        )
+    })?;
     let mut torrent: Option<Vec<u8>> = None;
     let mut slot_id: Option<String> = None;
     let mut save_path: Option<String> = None;
     while let Some(field) = mp.next_field().await.map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("multipart field: {e}")})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("multipart field: {e}")})),
+        )
     })? {
         match field.name().map(|n| n.to_string()).as_deref() {
             Some("torrent") => {
                 let b = field.bytes().await.map_err(|e| {
-                    (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("read torrent field: {e}")})))
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("read torrent field: {e}")})),
+                    )
                 })?;
                 torrent = Some(b.to_vec());
             }
@@ -185,7 +218,10 @@ async fn parse_multipart(req: Request, state: &AppState) -> Result<AddParse, Add
         }
     }
     let torrent = torrent.ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "multipart: missing 'torrent' file field"})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "multipart: missing 'torrent' file field"})),
+        )
     })?;
     Ok((slot_id, save_path, AddSource::File(torrent)))
 }
@@ -199,18 +235,23 @@ async fn do_add(
     let slot_id = match (s.mode, slot_id_opt.as_deref()) {
         (Mode::Single, _) => SlotId::default_single(),
         (Mode::MultiSlot, Some(id)) => SlotId::new(id),
-        (Mode::MultiSlot, None) => return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "slot_id required in multi-slot mode"})),
-        )),
+        (Mode::MultiSlot, None) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "slot_id required in multi-slot mode"})),
+            ))
+        }
     };
 
     let engine = s.source.engine_for(&slot_id).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "unknown slot_id"})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "unknown slot_id"})),
+        )
     })?;
 
-    let save_path = save_path_opt
-        .unwrap_or_else(|| s.default_save_path.to_string_lossy().into_owned());
+    let save_path =
+        save_path_opt.unwrap_or_else(|| s.default_save_path.to_string_lossy().into_owned());
     let flags = TorrentFlags::SEED_MODE
         | if !slot_id.is_default() {
             TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
@@ -226,7 +267,10 @@ async fn do_add(
         AddSource::File(bytes) => info_hash_from_torrent(bytes),
     }
     .map_err(|e| {
-        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("invalid torrent: {e}")})))
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid torrent: {e}")})),
+        )
     })?;
 
     // Misconfiguration guard (multi-slot): a .torrent must announce to one of
@@ -250,7 +294,9 @@ async fn do_add(
                     );
                     return Err((
                         StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "torrent does not announce to the slot's allowed_tracker_domains"})),
+                        Json(
+                            serde_json::json!({"error": "torrent does not announce to the slot's allowed_tracker_domains"}),
+                        ),
                     ));
                 }
                 Err(e) => {
@@ -266,28 +312,53 @@ async fn do_add(
     // Reject duplicates before the session sees the torrent (PRD: 409 if the
     // info-hash is already loaded in any slot).
     if s.registry.lookup(&infohash).is_some() {
-        s.metrics
-            .inc_counter("slot_assignment_registry_errors_total", &[("slot_id", slot_id.as_str())]);
-        return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": "info-hash already loaded"}))));
+        s.metrics.inc_counter(
+            "slot_assignment_registry_errors_total",
+            &[("slot_id", slot_id.as_str())],
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": "info-hash already loaded"})),
+        ));
     }
     // Reserve the assignment; assign() re-checks uniqueness to close any race.
     if let Err(e) = s.registry.assign(infohash, slot_id.clone()) {
-        s.metrics
-            .inc_counter("slot_assignment_registry_errors_total", &[("slot_id", slot_id.as_str())]);
-        return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": format!("{e}")}))));
+        s.metrics.inc_counter(
+            "slot_assignment_registry_errors_total",
+            &[("slot_id", slot_id.as_str())],
+        );
+        return Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ));
     }
 
     // Now build params and hand the torrent to the session. Release the
     // reservation if the add fails so the info-hash can be retried.
     let (params, torrent_bytes) = match source {
-        AddSource::Magnet(uri) => (AddParams::Magnet { uri, save_path, flags }, None),
-        AddSource::File(bytes) => {
-            (AddParams::File { bytes: bytes.clone(), save_path, flags }, Some(bytes))
-        }
+        AddSource::Magnet(uri) => (
+            AddParams::Magnet {
+                uri,
+                save_path,
+                flags,
+            },
+            None,
+        ),
+        AddSource::File(bytes) => (
+            AddParams::File {
+                bytes: bytes.clone(),
+                save_path,
+                flags,
+            },
+            Some(bytes),
+        ),
     };
     if let Err(e) = engine.add_torrent(params) {
         let _ = s.registry.remove(&infohash);
-        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")}))));
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ));
     }
 
     // Persist the .torrent so the startup inventory scan can recover it if
@@ -304,12 +375,18 @@ async fn do_add(
 
     Ok((
         StatusCode::CREATED,
-        Json(AddResponse { infohash: infohash.to_hex(), slot_id: slot_id.as_str().to_string() }),
+        Json(AddResponse {
+            infohash: infohash.to_hex(),
+            slot_id: slot_id.as_str().to_string(),
+        }),
     ))
 }
 
 #[derive(Deserialize, Default)]
-pub struct DeleteQuery { #[serde(default)] delete_files: bool }
+pub struct DeleteQuery {
+    #[serde(default)]
+    delete_files: bool,
+}
 
 pub async fn remove(
     State(s): State<AppState>,
@@ -318,17 +395,31 @@ pub async fn remove(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let ih = InfoHash::from_hex(&infohash).ok_or_else(bad_infohash)?;
     let slot = s.registry.lookup(&ih).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not_found"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not_found"})),
+        )
     })?;
     let engine = s.source.engine_for(&slot).ok_or_else(|| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "engine missing"})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "engine missing"})),
+        )
     })?;
     let st = s.state.get(&ih).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not_in_state_map"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not_in_state_map"})),
+        )
     })?;
-    engine.remove_torrent(st.handle, q.delete_files).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")})))
-    })?;
+    engine
+        .remove_torrent(st.handle, q.delete_files)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            )
+        })?;
     let _ = s.registry.remove(&ih);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -339,13 +430,22 @@ pub async fn pause(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let ih = InfoHash::from_hex(&infohash).ok_or_else(bad_infohash)?;
     let st = s.state.get(&ih).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not_found"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not_found"})),
+        )
     })?;
     let engine = s.source.engine_for(&st.slot_id).ok_or_else(|| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "engine missing"})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "engine missing"})),
+        )
     })?;
     engine.pause_torrent(st.handle).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        )
     })?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -356,13 +456,22 @@ pub async fn resume(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let ih = InfoHash::from_hex(&infohash).ok_or_else(bad_infohash)?;
     let st = s.state.get(&ih).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not_found"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not_found"})),
+        )
     })?;
     let engine = s.source.engine_for(&st.slot_id).ok_or_else(|| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "engine missing"})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "engine missing"})),
+        )
     })?;
     engine.resume_torrent(st.handle).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        )
     })?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -379,9 +488,14 @@ pub async fn set_upload_limit(
     Json(body): Json<UploadLimitBody>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let (st, engine) = lookup_engine(&s, &infohash)?;
-    engine.set_upload_limit(st.handle, body.bytes_per_sec).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")})))
-    })?;
+    engine
+        .set_upload_limit(st.handle, body.bytes_per_sec)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            )
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -398,9 +512,14 @@ pub async fn set_file_priority(
     Json(body): Json<FilePriorityBody>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let (st, engine) = lookup_engine(&s, &infohash)?;
-    engine.set_file_priority(st.handle, body.file_idx, body.priority).map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": format!("{e}")})))
-    })?;
+    engine
+        .set_file_priority(st.handle, body.file_idx, body.priority)
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            )
+        })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -413,16 +532,25 @@ fn lookup_engine(
 ) -> Result<(seederd_engine::TorrentState, EngineRef), AddError> {
     let ih = InfoHash::from_hex(infohash).ok_or_else(bad_infohash)?;
     let st = s.state.get(&ih).ok_or_else(|| {
-        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not_found"})))
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not_found"})),
+        )
     })?;
     let engine = s.source.engine_for(&st.slot_id).ok_or_else(|| {
-        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "engine missing"})))
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "engine missing"})),
+        )
     })?;
     Ok((st, engine))
 }
 
 fn bad_infohash() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "invalid infohash hex"})))
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({"error": "invalid infohash hex"})),
+    )
 }
 
 #[cfg(test)]
@@ -452,8 +580,7 @@ mod tests {
         }
     }
 
-    const MAGNET: &str =
-        "magnet:?xt=urn:btih:0101010101010101010101010101010101010101";
+    const MAGNET: &str = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101";
     const MAGNET_HEX: &str = "0101010101010101010101010101010101010101";
 
     #[test]
@@ -494,14 +621,22 @@ mod tests {
         assert_eq!(code, StatusCode::CREATED);
         assert_eq!(resp.0.infohash, MAGNET_HEX);
         assert_eq!(app.registry.len(), 1);
-        assert_eq!(app.registry.lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap()).unwrap().as_str(), "default");
+        assert_eq!(
+            app.registry
+                .lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap())
+                .unwrap()
+                .as_str(),
+            "default"
+        );
     }
 
     #[tokio::test]
     async fn do_add_duplicate_is_409() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_state(dir.path());
-        let _ = do_add(&app, None, None, AddSource::Magnet(MAGNET.into())).await.unwrap();
+        let _ = do_add(&app, None, None, AddSource::Magnet(MAGNET.into()))
+            .await
+            .unwrap();
         let err = do_add(&app, None, None, AddSource::Magnet(MAGNET.into()))
             .await
             .unwrap_err();

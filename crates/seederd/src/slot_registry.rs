@@ -17,6 +17,12 @@ pub struct SlotHealth {
     pub tunnel_ip: Option<IpAddr>,
     /// Number of torrents currently paused because the tunnel went down.
     pub paused_for_vpn: u64,
+    /// Current NAT-PMP-negotiated listening port (natpmp slots only; `None`
+    /// for static slots).
+    pub forwarded_port: Option<u16>,
+    /// Whether the last port-forward renewal succeeded. Always `true` for
+    /// static slots (nothing to renew).
+    pub port_forward_ok: bool,
 }
 
 /// One slot's immutable identity (config + engine) plus its mutable health.
@@ -27,7 +33,12 @@ pub struct SlotEntry {
 }
 
 impl SlotEntry {
-    pub fn new(config: SlotConfig, engine: Arc<dyn TorrentEngine>, tunnel_ip: IpAddr) -> Self {
+    pub fn new(
+        config: SlotConfig,
+        engine: Arc<dyn TorrentEngine>,
+        tunnel_ip: IpAddr,
+        forwarded_port: Option<u16>,
+    ) -> Self {
         Self {
             config,
             engine,
@@ -35,6 +46,8 @@ impl SlotEntry {
                 status: SlotStatus::Active,
                 tunnel_ip: Some(tunnel_ip),
                 paused_for_vpn: 0,
+                forwarded_port,
+                port_forward_ok: true,
             }),
         }
     }

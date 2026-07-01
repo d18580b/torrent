@@ -15,6 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::engine::TorrentEngine;
+use crate::port_forward::PortForwardMode;
 use crate::vpn::{VpnProfile, VpnType};
 
 // ---------------------------------------------------------------------------
@@ -28,22 +29,40 @@ pub struct SlotId(Arc<str>);
 impl SlotId {
     pub const DEFAULT: &'static str = "default";
 
-    pub fn new(id: impl Into<String>) -> Self { Self(Arc::from(id.into())) }
-    pub fn default_single() -> Self { Self(Arc::from(Self::DEFAULT)) }
-    pub fn as_str(&self) -> &str { &self.0 }
-    pub fn is_default(&self) -> bool { &*self.0 == Self::DEFAULT }
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(Arc::from(id.into()))
+    }
+    pub fn default_single() -> Self {
+        Self(Arc::from(Self::DEFAULT))
+    }
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub fn is_default(&self) -> bool {
+        &*self.0 == Self::DEFAULT
+    }
 }
 
 impl fmt::Display for SlotId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(&self.0) }
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 impl fmt::Debug for SlotId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SlotId({})", self.0)
     }
 }
-impl From<&str> for SlotId   { fn from(s: &str)   -> Self { Self::new(s) } }
-impl From<String> for SlotId { fn from(s: String) -> Self { Self::new(s) } }
+impl From<&str> for SlotId {
+    fn from(s: &str) -> Self {
+        Self::new(s)
+    }
+}
+impl From<String> for SlotId {
+    fn from(s: String) -> Self {
+        Self::new(s)
+    }
+}
 
 impl Serialize for SlotId {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -71,7 +90,11 @@ pub struct SlotConfig {
     pub vpn_profile: PathBuf,
     pub vpn_type: VpnType,
     pub vpn_interface: String,
-    pub listen_port: u16,
+    /// Static listening port. Required for `port_forward = "static"`; unused
+    /// (and typically omitted) for `port_forward = "natpmp"`, where the port
+    /// is negotiated with the gateway at runtime.
+    #[serde(default)]
+    pub listen_port: Option<u16>,
     pub peer_fingerprint_hex: String,
     pub user_agent: String,
     pub resume_dir: PathBuf,
@@ -80,6 +103,25 @@ pub struct SlotConfig {
     pub allowed_tracker_domains: Vec<String>,
     #[serde(default)]
     pub upload_rate_limit: u32,
+    /// How this slot's listening port is chosen (default: static).
+    #[serde(default)]
+    pub port_forward: PortForwardMode,
+    /// NAT-PMP gateway to negotiate the forwarded port against (natpmp mode).
+    /// Defaults to `10.2.0.1` (the ProtonVPN WireGuard gateway) at use.
+    #[serde(default)]
+    pub port_forward_gateway: Option<String>,
+}
+
+impl SlotConfig {
+    /// The NAT-PMP gateway for this slot, defaulting to ProtonVPN's WireGuard
+    /// gateway. Only meaningful when `port_forward == Natpmp`.
+    pub const DEFAULT_NATPMP_GATEWAY: &'static str = "10.2.0.1";
+
+    pub fn port_forward_gateway_or_default(&self) -> &str {
+        self.port_forward_gateway
+            .as_deref()
+            .unwrap_or(Self::DEFAULT_NATPMP_GATEWAY)
+    }
 }
 
 #[derive(Debug, Error)]
@@ -88,6 +130,8 @@ pub enum SlotConfigError {
     DuplicateId(String),
     #[error("listen_port {0} appears more than once")]
     DuplicatePort(u16),
+    #[error("slot {0:?} uses port_forward = \"static\" but has no listen_port")]
+    MissingListenPort(String),
     #[error("vpn_interface {0:?} appears more than once")]
     DuplicateInterface(String),
     #[error("peer_fingerprint_hex {0:?} appears more than once")]
@@ -114,25 +158,22 @@ impl SlotConfig {
         }
     }
 
-    /// PRD: hex form of `-LT20C0-` is `2d4c5432304330_2d` (16 hex). The
-    /// underscore here is illustrative; real check compares lowercased
-    /// hex.
+    /// The hex form of libtorrent's default fingerprint `-LT20C0-` (16 hex
+    /// chars). Slots must set a distinct fingerprint so peers can't trivially
+    /// tie them back to the default client identity.
     fn is_libtorrent_default_fingerprint(hex: &str) -> bool {
-        hex.eq_ignore_ascii_case("2d4c5432304330\x002d")
-            // The literal above is wrong-ish — keep also a friendlier
-            // ASCII compare.
-            || hex.eq_ignore_ascii_case("2d4c54323043302d")
+        hex.eq_ignore_ascii_case("2d4c54323043302d")
     }
 
     /// Validate the global uniqueness invariants across all slots.
     /// Should be called at startup (PRD §Multi-Account constraints) and
     /// on SIGHUP for the new config.
     pub fn validate_set(slots: &[SlotConfig]) -> Result<(), SlotConfigError> {
-        let mut seen_id   = std::collections::HashSet::new();
+        let mut seen_id = std::collections::HashSet::new();
         let mut seen_port = std::collections::HashSet::new();
         let mut seen_iface = std::collections::HashSet::new();
-        let mut seen_fp   = std::collections::HashSet::new();
-        let mut seen_ua   = std::collections::HashSet::new();
+        let mut seen_fp = std::collections::HashSet::new();
+        let mut seen_ua = std::collections::HashSet::new();
         let mut seen_resume = std::collections::HashSet::new();
         let mut seen_torrent = std::collections::HashSet::new();
 
@@ -140,20 +181,36 @@ impl SlotConfig {
             if !seen_id.insert(s.id.as_str().to_string()) {
                 return Err(SlotConfigError::DuplicateId(s.id.as_str().to_string()));
             }
-            if !seen_port.insert(s.listen_port) {
-                return Err(SlotConfigError::DuplicatePort(s.listen_port));
+            match s.port_forward {
+                PortForwardMode::Static => {
+                    // Static slots must pin a unique listen_port.
+                    let port = s.listen_port.ok_or_else(|| {
+                        SlotConfigError::MissingListenPort(s.id.as_str().to_string())
+                    })?;
+                    if !seen_port.insert(port) {
+                        return Err(SlotConfigError::DuplicatePort(port));
+                    }
+                }
+                PortForwardMode::Natpmp => {
+                    // The port is negotiated with the gateway at runtime and is
+                    // provider-assigned-unique; no static uniqueness to enforce.
+                }
             }
             if !seen_iface.insert(s.vpn_interface.clone()) {
                 return Err(SlotConfigError::DuplicateInterface(s.vpn_interface.clone()));
             }
             if s.peer_fingerprint_hex.len() != 16 {
-                return Err(SlotConfigError::BadFingerprintLength(s.peer_fingerprint_hex.clone()));
+                return Err(SlotConfigError::BadFingerprintLength(
+                    s.peer_fingerprint_hex.clone(),
+                ));
             }
             if Self::is_libtorrent_default_fingerprint(&s.peer_fingerprint_hex) {
                 return Err(SlotConfigError::DefaultFingerprintForbidden);
             }
             if !seen_fp.insert(s.peer_fingerprint_hex.clone()) {
-                return Err(SlotConfigError::DuplicateFingerprint(s.peer_fingerprint_hex.clone()));
+                return Err(SlotConfigError::DuplicateFingerprint(
+                    s.peer_fingerprint_hex.clone(),
+                ));
             }
             if !seen_ua.insert(s.user_agent.clone()) {
                 return Err(SlotConfigError::DuplicateUserAgent(s.user_agent.clone()));
@@ -161,11 +218,17 @@ impl SlotConfig {
             // Resolve symlinks to canonical paths. If the dir doesn't yet
             // exist (first run), fall back to the literal value — startup
             // will create it.
-            let r = s.resume_dir.canonicalize().unwrap_or_else(|_| s.resume_dir.clone());
+            let r = s
+                .resume_dir
+                .canonicalize()
+                .unwrap_or_else(|_| s.resume_dir.clone());
             if !seen_resume.insert(r.clone()) {
                 return Err(SlotConfigError::DuplicateResumeDir(r));
             }
-            let t = s.torrent_dir.canonicalize().unwrap_or_else(|_| s.torrent_dir.clone());
+            let t = s
+                .torrent_dir
+                .canonicalize()
+                .unwrap_or_else(|_| s.torrent_dir.clone());
             if !seen_torrent.insert(t.clone()) {
                 return Err(SlotConfigError::DuplicateTorrentDir(t));
             }
@@ -221,13 +284,15 @@ mod tests {
             vpn_profile: PathBuf::from(format!("/etc/wg/{id}.conf")),
             vpn_type: VpnType::Wireguard,
             vpn_interface: iface.to_string(),
-            listen_port: port,
+            listen_port: Some(port),
             peer_fingerprint_hex: fp.to_string(),
             user_agent: ua.to_string(),
             resume_dir: PathBuf::from(format!("/var/lib/seederd/resume/{id}")),
             torrent_dir: PathBuf::from(format!("/var/lib/seederd/torrents/{id}")),
             allowed_tracker_domains: vec![],
             upload_rate_limit: 0,
+            port_forward: PortForwardMode::Static,
+            port_forward_gateway: None,
         }
     }
 
@@ -293,5 +358,45 @@ mod tests {
             SlotConfig::validate_set(&slots),
             Err(SlotConfigError::BadFingerprintLength(_))
         ));
+    }
+
+    #[test]
+    fn static_slot_without_listen_port_rejected() {
+        let mut s = cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a");
+        s.listen_port = None; // stays in static mode
+        assert!(matches!(
+            SlotConfig::validate_set(&[s]),
+            Err(SlotConfigError::MissingListenPort(_))
+        ));
+    }
+
+    #[test]
+    fn natpmp_slot_may_omit_listen_port() {
+        let mut s = cfg("a", 0, "wg0", "a1b2c3d4e5f60718", "ua-a");
+        s.port_forward = PortForwardMode::Natpmp;
+        s.listen_port = None;
+        SlotConfig::validate_set(&[s]).unwrap();
+    }
+
+    #[test]
+    fn natpmp_slots_skip_port_uniqueness() {
+        // Two natpmp slots: the (ignored) listen_port collision must NOT fail —
+        // their ports are gateway-assigned at runtime.
+        let mut a = cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a");
+        let mut b = cfg("b", 6881, "wg1", "9f8e7d6c5b4a3210", "ua-b");
+        a.port_forward = PortForwardMode::Natpmp;
+        b.port_forward = PortForwardMode::Natpmp;
+        a.listen_port = None;
+        b.listen_port = None;
+        SlotConfig::validate_set(&[a, b]).unwrap();
+    }
+
+    #[test]
+    fn gateway_defaults_to_proton() {
+        let s = cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a");
+        assert_eq!(s.port_forward_gateway_or_default(), "10.2.0.1");
+        let mut s2 = s;
+        s2.port_forward_gateway = Some("10.9.9.1".to_string());
+        assert_eq!(s2.port_forward_gateway_or_default(), "10.9.9.1");
     }
 }

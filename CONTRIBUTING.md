@@ -81,11 +81,15 @@ unless the submodules update.
 
 ```bash
 cargo test --workspace                              # all unit + integration tests
-cargo test -p libtorrent-sys --features shim-tests  # Layer 2 ASAN shim tests (Linux only)
+cargo test -p libtorrent-sys --features shim-tests  # Layer 2 shim FFI tests (Linux only)
 ```
 
 Integration tests that spin up real libtorrent sessions are gated behind `--ignored`
 and run as a separate CI job — see PRD §Validation Strategy.
+
+For a full hands-on walkthrough — the Layer 1–4 test ladder plus a manual
+single-node smoke and the multi-slot / VPN path — see
+[`docs/VERIFICATION.md`](docs/VERIFICATION.md).
 
 ## Style
 

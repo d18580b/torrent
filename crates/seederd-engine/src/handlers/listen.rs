@@ -17,7 +17,14 @@ use libtorrent_safe::Alert;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
-        Alert::ListenFailed { error_code, operation, endpoint, iface, message, .. } => {
+        Alert::ListenFailed {
+            error_code,
+            operation,
+            endpoint,
+            iface,
+            message,
+            ..
+        } => {
             let _enter = ctx.span.enter();
             error!(
                 target: "seederd_engine::handler::listen",

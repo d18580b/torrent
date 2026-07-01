@@ -20,13 +20,19 @@ impl SignalChannels {
     pub fn new() -> Self {
         let (shutdown_tx, _) = broadcast::channel(8);
         let (reload_tx, _) = mpsc::channel(8);
-        Self { shutdown_tx, reload_tx }
+        Self {
+            shutdown_tx,
+            reload_tx,
+        }
     }
     pub fn from_parts(
         shutdown_tx: broadcast::Sender<ShutdownReason>,
         reload_tx: mpsc::Sender<()>,
     ) -> Self {
-        Self { shutdown_tx, reload_tx }
+        Self {
+            shutdown_tx,
+            reload_tx,
+        }
     }
 }
 
@@ -39,20 +45,32 @@ pub async fn run(channels: SignalChannels, reload_recv_capacity: usize) -> mpsc:
     // the receiver we return. Actually we use the caller-provided one;
     // this fn just spawns watchers.
     let _ = reload_pub;
-    let SignalChannels { shutdown_tx, reload_tx } = channels;
+    let SignalChannels {
+        shutdown_tx,
+        reload_tx,
+    } = channels;
 
     tokio::spawn(async move {
         let mut term = match signal(SignalKind::terminate()) {
             Ok(s) => s,
-            Err(e) => { warn!(error.cause = %e, "failed to install SIGTERM handler"); return }
+            Err(e) => {
+                warn!(error.cause = %e, "failed to install SIGTERM handler");
+                return;
+            }
         };
         let mut int_ = match signal(SignalKind::interrupt()) {
             Ok(s) => s,
-            Err(e) => { warn!(error.cause = %e, "failed to install SIGINT handler"); return }
+            Err(e) => {
+                warn!(error.cause = %e, "failed to install SIGINT handler");
+                return;
+            }
         };
         let mut hup = match signal(SignalKind::hangup()) {
             Ok(s) => s,
-            Err(e) => { warn!(error.cause = %e, "failed to install SIGHUP handler"); return }
+            Err(e) => {
+                warn!(error.cause = %e, "failed to install SIGHUP handler");
+                return;
+            }
         };
 
         loop {

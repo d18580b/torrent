@@ -79,15 +79,17 @@ jobs:
       - name: Reject info_hash typos and bare infohash logs
         run: |
           set -euo pipefail
-          # Common typo: info_hash anywhere under crates/
-          if grep -RnE '\binfo_hash\b' crates/; then
+          # Common typo: info_hash in a Rust tracing field name.
+          # Scoped to *.rs so we don't flag legitimate C++ includes of
+          # libtorrent's real header (<libtorrent/info_hash.hpp>) in the shim.
+          if grep -RnE --include='*.rs' '\binfo_hash\b' crates/; then
             echo "::error::Field name must be 'infohash' (no underscore)."
             exit 1
           fi
           # Free-standing log lines that emit `infohash =` outside an
           # instrument-decorated function aren't strictly forbidden, but
           # we want the parent span to carry the field. Soft warn only.
-          if grep -RnE 'tracing::(info|warn|error|debug)!\([^)]*infohash *=' crates/ | grep -v 'fields(' >/dev/null; then
+          if grep -RnE --include='*.rs' 'tracing::(info|warn|error|debug)!\([^)]*infohash *=' crates/ | grep -v 'fields(' >/dev/null; then
             echo "::warning::Free-standing infohash field in a log macro; prefer #[instrument] on the parent function."
           fi
 
@@ -166,4 +168,5 @@ jobs:
           key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
 
       # Layer 3 (PRD Validation §): real daemon + libtorrent, driven over HTTP.
+      - run: cargo test -p seederd-engine --test lifecycle -- --ignored
       - run: cargo test -p seederd --test daemon -- --ignored

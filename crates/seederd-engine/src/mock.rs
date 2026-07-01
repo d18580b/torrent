@@ -26,12 +26,25 @@ use libtorrent_safe::{
 #[derive(Debug, Clone)]
 pub enum RecordedCall {
     AddTorrent(AddParamsSummary),
-    RemoveTorrent { handle: TorrentHandle, delete_files: bool },
+    RemoveTorrent {
+        handle: TorrentHandle,
+        delete_files: bool,
+    },
     PauseTorrent(TorrentHandle),
     ResumeTorrent(TorrentHandle),
-    SetUploadLimit { handle: TorrentHandle, bytes_per_sec: i32 },
-    SetFilePriority { handle: TorrentHandle, file_idx: i32, priority: u8 },
-    SaveResumeData { handle: TorrentHandle, flags: ResumeFlags },
+    SetUploadLimit {
+        handle: TorrentHandle,
+        bytes_per_sec: i32,
+    },
+    SetFilePriority {
+        handle: TorrentHandle,
+        file_idx: i32,
+        priority: u8,
+    },
+    SaveResumeData {
+        handle: TorrentHandle,
+        flags: ResumeFlags,
+    },
     PopAlerts,
     PostUpdates,
     PostStats,
@@ -43,28 +56,45 @@ pub enum RecordedCall {
 /// without dragging the byte buffers into every test assertion.
 #[derive(Debug, Clone)]
 pub enum AddParamsSummary {
-    File { save_path: String, byte_len: usize, flags_bits: u32 },
-    Magnet { uri: String, save_path: String, flags_bits: u32 },
-    Resume { byte_len: usize },
+    File {
+        save_path: String,
+        byte_len: usize,
+        flags_bits: u32,
+    },
+    Magnet {
+        uri: String,
+        save_path: String,
+        flags_bits: u32,
+    },
+    Resume {
+        byte_len: usize,
+    },
 }
 
 impl From<&AddParams> for AddParamsSummary {
     fn from(p: &AddParams) -> Self {
         match p {
-            AddParams::File { save_path, bytes, flags } =>
-                AddParamsSummary::File {
-                    save_path: save_path.clone(),
-                    byte_len: bytes.len(),
-                    flags_bits: flags.bits(),
-                },
-            AddParams::Magnet { uri, save_path, flags } =>
-                AddParamsSummary::Magnet {
-                    uri: uri.clone(),
-                    save_path: save_path.clone(),
-                    flags_bits: flags.bits(),
-                },
-            AddParams::Resume { bytes } =>
-                AddParamsSummary::Resume { byte_len: bytes.len() },
+            AddParams::File {
+                save_path,
+                bytes,
+                flags,
+            } => AddParamsSummary::File {
+                save_path: save_path.clone(),
+                byte_len: bytes.len(),
+                flags_bits: flags.bits(),
+            },
+            AddParams::Magnet {
+                uri,
+                save_path,
+                flags,
+            } => AddParamsSummary::Magnet {
+                uri: uri.clone(),
+                save_path: save_path.clone(),
+                flags_bits: flags.bits(),
+            },
+            AddParams::Resume { bytes } => AddParamsSummary::Resume {
+                byte_len: bytes.len(),
+            },
         }
     }
 }
@@ -87,7 +117,9 @@ pub struct MockEngine {
 }
 
 impl Default for MockEngine {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MockEngine {
@@ -122,7 +154,9 @@ impl MockEngine {
 
     pub fn push_alerts(&self, alerts: impl IntoIterator<Item = Alert>) {
         let mut g = self.alerts.lock();
-        for a in alerts { g.push_back(a); }
+        for a in alerts {
+            g.push_back(a);
+        }
     }
 
     /// Inject a one-shot error for a specific trait method (by name).
@@ -132,7 +166,9 @@ impl MockEngine {
         self.error_inject.insert(op, err);
     }
 
-    pub fn calls(&self) -> Vec<RecordedCall> { self.calls.lock().clone() }
+    pub fn calls(&self) -> Vec<RecordedCall> {
+        self.calls.lock().clone()
+    }
 
     /// Pre-register a handle so `add_torrent`/lookups behave consistently.
     pub fn register_handle(&self, ih: InfoHash) -> TorrentHandle {
@@ -145,7 +181,9 @@ impl MockEngine {
         h
     }
 
-    pub fn handle_count(&self) -> usize { self.handles.len() }
+    pub fn handle_count(&self) -> usize {
+        self.handles.len()
+    }
 
     // --- internal -----------------------------------------------------------
 
@@ -171,12 +209,16 @@ impl TorrentEngine for MockEngine {
         let ih = match &params {
             AddParams::Resume { bytes } | AddParams::File { bytes, .. } => {
                 let mut buf = [0u8; 20];
-                for (i, b) in bytes.iter().take(20).enumerate() { buf[i] = *b; }
+                for (i, b) in bytes.iter().take(20).enumerate() {
+                    buf[i] = *b;
+                }
                 InfoHash(buf)
             }
             AddParams::Magnet { uri, .. } => {
                 let mut buf = [0u8; 20];
-                for (i, b) in uri.as_bytes().iter().take(20).enumerate() { buf[i] = *b; }
+                for (i, b) in uri.as_bytes().iter().take(20).enumerate() {
+                    buf[i] = *b;
+                }
                 InfoHash(buf)
             }
         };
@@ -184,7 +226,10 @@ impl TorrentEngine for MockEngine {
     }
 
     fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<(), EngineError> {
-        self.record(RecordedCall::RemoveTorrent { handle: h, delete_files });
+        self.record(RecordedCall::RemoveTorrent {
+            handle: h,
+            delete_files,
+        });
         self.check_error("remove_torrent")?;
         self.handles.remove(&h.infohash);
         Ok(())
@@ -201,12 +246,24 @@ impl TorrentEngine for MockEngine {
     }
 
     fn set_upload_limit(&self, h: TorrentHandle, bytes_per_sec: i32) -> Result<(), EngineError> {
-        self.record(RecordedCall::SetUploadLimit { handle: h, bytes_per_sec });
+        self.record(RecordedCall::SetUploadLimit {
+            handle: h,
+            bytes_per_sec,
+        });
         self.check_error("set_upload_limit")
     }
 
-    fn set_file_priority(&self, h: TorrentHandle, file_idx: i32, priority: u8) -> Result<(), EngineError> {
-        self.record(RecordedCall::SetFilePriority { handle: h, file_idx, priority });
+    fn set_file_priority(
+        &self,
+        h: TorrentHandle,
+        file_idx: i32,
+        priority: u8,
+    ) -> Result<(), EngineError> {
+        self.record(RecordedCall::SetFilePriority {
+            handle: h,
+            file_idx,
+            priority,
+        });
         self.check_error("set_file_priority")
     }
 
@@ -232,8 +289,12 @@ impl TorrentEngine for MockEngine {
         self.alerts.lock().drain(..).collect()
     }
 
-    fn post_updates(&self) { self.record(RecordedCall::PostUpdates); }
-    fn post_stats(&self)   { self.record(RecordedCall::PostStats);   }
+    fn post_updates(&self) {
+        self.record(RecordedCall::PostUpdates);
+    }
+    fn post_stats(&self) {
+        self.record(RecordedCall::PostStats);
+    }
 
     fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError> {
         self.record(RecordedCall::ApplySettings(settings.clone()));
@@ -272,7 +333,9 @@ mod tests {
         let m = MockEngine::new();
         let h = m.register_handle(InfoHash([1u8; 20]));
         m.inject_error("save_resume_data", EngineError::Shutdown);
-        assert!(m.save_resume_data(h, ResumeFlags::ONLY_IF_MODIFIED).is_err());
+        assert!(m
+            .save_resume_data(h, ResumeFlags::ONLY_IF_MODIFIED)
+            .is_err());
         // Second call: error consumed, succeeds.
         assert!(m.save_resume_data(h, ResumeFlags::ONLY_IF_MODIFIED).is_ok());
     }

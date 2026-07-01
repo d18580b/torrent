@@ -6,10 +6,12 @@
 //! a netlink-based implementation later without changing any caller.
 
 mod ip_lookup;
+mod natpmp;
 mod openvpn;
 mod wireguard;
 
 pub use ip_lookup::first_ipv4;
+pub use natpmp::NatpmpForwarder;
 pub use openvpn::OpenvpnManager;
 pub use wireguard::WireguardManager;
 
@@ -21,6 +23,6 @@ use seederd_engine::{VpnManager, VpnType};
 pub fn for_type(t: VpnType) -> Arc<dyn VpnManager> {
     match t {
         VpnType::Wireguard => Arc::new(WireguardManager::new()),
-        VpnType::Openvpn   => Arc::new(OpenvpnManager::new()),
+        VpnType::Openvpn => Arc::new(OpenvpnManager::new()),
     }
 }

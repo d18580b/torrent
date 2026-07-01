@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-pub use libtorrent_safe::{AddParams, Alert, InfoHash, ResumeData, ResumeFlags, Settings, TorrentHandle};
+pub use libtorrent_safe::{
+    AddParams, Alert, InfoHash, ResumeData, ResumeFlags, Settings, TorrentHandle,
+};
 
 #[derive(Debug, Error)]
 pub enum EngineError {
@@ -90,11 +92,19 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     fn set_file_priority(&self, h: TorrentHandle, idx: i32, prio: u8) -> Result<(), EngineError> {
         (**self).set_file_priority(h, idx, prio)
     }
-    fn pop_alerts(&self) -> Vec<Alert> { (**self).pop_alerts() }
-    fn post_updates(&self) { (**self).post_updates() }
-    fn post_stats(&self) { (**self).post_stats() }
+    fn pop_alerts(&self) -> Vec<Alert> {
+        (**self).pop_alerts()
+    }
+    fn post_updates(&self) {
+        (**self).post_updates()
+    }
+    fn post_stats(&self) {
+        (**self).post_stats()
+    }
     fn apply_settings(&self, s: &Settings) -> Result<(), EngineError> {
         (**self).apply_settings(s)
     }
-    fn session_state(&self) -> Result<Vec<u8>, EngineError> { (**self).session_state() }
+    fn session_state(&self) -> Result<Vec<u8>, EngineError> {
+        (**self).session_state()
+    }
 }

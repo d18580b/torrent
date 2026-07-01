@@ -16,14 +16,19 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum LogLevel { Error, Warn, Info, Debug }
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
 
 impl LogLevel {
     pub fn as_str(self) -> &'static str {
         match self {
             LogLevel::Error => "error",
-            LogLevel::Warn  => "warn",
-            LogLevel::Info  => "info",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
             LogLevel::Debug => "debug",
         }
     }
@@ -76,21 +81,21 @@ pub struct Config {
 }
 
 impl Config {
-    fn default_log_level() -> LogLevel { LogLevel::Info }
+    fn default_log_level() -> LogLevel {
+        LogLevel::Info
+    }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let bytes = fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
-        let cfg: Config = toml::from_str(&bytes)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let bytes = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        let cfg: Config =
+            toml::from_str(&bytes).with_context(|| format!("parse {}", path.display()))?;
         cfg.validate()?;
         Ok(cfg)
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.slot.is_empty() {
-            SlotConfig::validate_set(&self.slot)
-                .context("[[slot]] validation failed")?;
+            SlotConfig::validate_set(&self.slot).context("[[slot]] validation failed")?;
         }
         Ok(())
     }
@@ -99,14 +104,24 @@ impl Config {
     /// apply only the fields that may change without restart.
     pub fn diff(old: &Config, new: &Config) -> ConfigDiff {
         let mut d = ConfigDiff::default();
-        if old.connections_limit != new.connections_limit { d.connections_limit = new.connections_limit; }
-        if old.upload_rate_limit != new.upload_rate_limit { d.upload_rate_limit = new.upload_rate_limit; }
+        if old.connections_limit != new.connections_limit {
+            d.connections_limit = new.connections_limit;
+        }
+        if old.upload_rate_limit != new.upload_rate_limit {
+            d.upload_rate_limit = new.upload_rate_limit;
+        }
         if old.max_concurrent_http_announces != new.max_concurrent_http_announces {
             d.max_concurrent_http_announces = new.max_concurrent_http_announces;
         }
-        if old.aio_threads != new.aio_threads { d.aio_threads = new.aio_threads; }
-        if old.enable_lsd != new.enable_lsd { d.enable_lsd = new.enable_lsd; }
-        if old.log_level != new.log_level { d.log_level = Some(new.log_level); }
+        if old.aio_threads != new.aio_threads {
+            d.aio_threads = new.aio_threads;
+        }
+        if old.enable_lsd != new.enable_lsd {
+            d.enable_lsd = new.enable_lsd;
+        }
+        if old.log_level != new.log_level {
+            d.log_level = Some(new.log_level);
+        }
 
         // Identity-critical / non-reloadable fields (PRD): listen_interfaces,
         // resume_dir, torrent_dir, peer_fingerprint, user_agent. Any change
@@ -138,13 +153,27 @@ impl Config {
     pub fn libtorrent_settings(&self) -> libtorrent_safe::Settings {
         let mut s = libtorrent_safe::Settings::server_seed_overrides();
         s.listen_interfaces = Some(self.listen_interfaces.clone());
-        if let Some(v) = self.connections_limit { s.connections_limit = Some(v); }
-        if let Some(v) = self.file_pool_size { s.file_pool_size = Some(v); }
-        if let Some(v) = self.enable_lsd { s.enable_lsd = Some(v); }
-        if let Some(v) = self.aio_threads { s.aio_threads = Some(v); }
-        if let Some(v) = self.max_concurrent_http_announces { s.max_concurrent_http_announces = Some(v); }
-        if let Some(v) = self.upload_rate_limit { s.upload_rate_limit = Some(v); }
-        if let Some(v) = self.peer_fingerprint.as_ref() { s.peer_fingerprint = Some(v.clone()); }
+        if let Some(v) = self.connections_limit {
+            s.connections_limit = Some(v);
+        }
+        if let Some(v) = self.file_pool_size {
+            s.file_pool_size = Some(v);
+        }
+        if let Some(v) = self.enable_lsd {
+            s.enable_lsd = Some(v);
+        }
+        if let Some(v) = self.aio_threads {
+            s.aio_threads = Some(v);
+        }
+        if let Some(v) = self.max_concurrent_http_announces {
+            s.max_concurrent_http_announces = Some(v);
+        }
+        if let Some(v) = self.upload_rate_limit {
+            s.upload_rate_limit = Some(v);
+        }
+        if let Some(v) = self.peer_fingerprint.as_ref() {
+            s.peer_fingerprint = Some(v.clone());
+        }
         if let Some(v) = self.user_agent.as_ref() {
             s.user_agent = Some(v.clone());
             s.handshake_client_version = Some(v.clone());

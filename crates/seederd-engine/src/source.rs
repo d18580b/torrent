@@ -55,7 +55,9 @@ pub struct SingleSessionSource {
 }
 
 impl SingleSessionSource {
-    pub fn new(engine: Arc<dyn TorrentEngine>) -> Self { Self { engine } }
+    pub fn new(engine: Arc<dyn TorrentEngine>) -> Self {
+        Self { engine }
+    }
 }
 
 impl AlertSource for SingleSessionSource {
@@ -68,10 +70,16 @@ impl AlertSource for SingleSessionSource {
             .collect()
     }
 
-    fn slots(&self) -> Vec<SlotId> { vec![SlotId::default_single()] }
+    fn slots(&self) -> Vec<SlotId> {
+        vec![SlotId::default_single()]
+    }
 
     fn engine_for(&self, slot: &SlotId) -> Option<Arc<dyn TorrentEngine>> {
-        if slot.is_default() { Some(self.engine.clone()) } else { None }
+        if slot.is_default() {
+            Some(self.engine.clone())
+        } else {
+            None
+        }
     }
 }
 
@@ -92,7 +100,9 @@ impl AlertSource for MultiSlotSource {
     fn drain(&self) -> Vec<(SlotId, Alert)> {
         let mut out = Vec::new();
         for (slot, engine) in &self.entries {
-            for a in engine.pop_alerts() { out.push((slot.clone(), a)); }
+            for a in engine.pop_alerts() {
+                out.push((slot.clone(), a));
+            }
         }
         out
     }
@@ -102,7 +112,10 @@ impl AlertSource for MultiSlotSource {
     }
 
     fn engine_for(&self, slot: &SlotId) -> Option<Arc<dyn TorrentEngine>> {
-        self.entries.iter().find(|(s, _)| s == slot).map(|(_, e)| e.clone())
+        self.entries
+            .iter()
+            .find(|(s, _)| s == slot)
+            .map(|(_, e)| e.clone())
     }
 }
 
