@@ -6,6 +6,7 @@
 //! a netlink-based implementation later without changing any caller.
 
 mod ip_lookup;
+pub mod killswitch;
 mod natpmp;
 mod openvpn;
 mod wireguard;

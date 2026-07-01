@@ -59,6 +59,9 @@ pub struct DaemonHandle {
     metrics: Arc<PromSink>,
     registry: Arc<AssignmentRegistry>,
     slot_registry: Option<Arc<SlotRegistry>>,
+    /// Whether the nftables kill switch was installed and must be torn down on
+    /// graceful shutdown.
+    kill_switch_active: bool,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: seederd_engine::AlertLoopHandle,
 }
@@ -231,6 +234,29 @@ pub async fn boot(
         }
     };
 
+    // Network-layer kill switch (defence-in-depth; multi-slot + opt-in).
+    // Installed once, after every slot's tunnel is up, so the ruleset covers all
+    // tunnel interfaces. Fail-closed: if the operator asked for it and it can't
+    // be installed, abort rather than seed without the backstop.
+    let mut kill_switch_active = false;
+    if cfg.network_kill_switch {
+        match &slot_registry {
+            Some(sr) => {
+                let tunnels: Vec<String> =
+                    sr.iter().map(|e| e.config.vpn_interface.clone()).collect();
+                let uid = vpn::killswitch::enable(&tunnels)
+                    .context("install nftables kill switch (network_kill_switch=true)")?;
+                kill_switch_active = true;
+                metrics.set_gauge("kill_switch_active", 1.0, &[]);
+                info!(uid, "network kill switch active");
+            }
+            None => warn!(
+                "network_kill_switch set but no slots configured; \
+                 ignoring (single-session mode has no tunnel to protect)",
+            ),
+        }
+    }
+
     // Resume scan: load every saved resume file per slot. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
     // won't double-add.
@@ -349,6 +375,7 @@ pub async fn boot(
         metrics,
         registry,
         slot_registry,
+        kill_switch_active,
         log_handle,
         alert_loop,
     })
@@ -368,6 +395,7 @@ impl DaemonHandle {
             metrics,
             registry,
             slot_registry,
+            kill_switch_active,
             log_handle,
             alert_loop,
         } = self;
@@ -467,6 +495,16 @@ impl DaemonHandle {
                     Ok(_) => {}
                     Err(e) => warn!(error.cause = %e, "session_state() failed"),
                 }
+            }
+        }
+
+        // Remove the network kill switch last, once seeding has drained. The
+        // tunnel is still up during a graceful shutdown, so the slots' sockets
+        // (still source-bound to the tunnel IP) can't leak in this window.
+        if kill_switch_active {
+            match crate::vpn::killswitch::disable() {
+                Ok(()) => info!("network kill switch removed"),
+                Err(e) => warn!(error.cause = %e, "failed to remove network kill switch"),
             }
         }
 
