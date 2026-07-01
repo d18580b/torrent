@@ -23,6 +23,10 @@ pub struct SlotHealth {
     /// Current NAT-PMP-negotiated listening port (natpmp slots only; `None`
     /// for static slots).
     pub forwarded_port: Option<u16>,
+    /// Last gateway epoch seen for this slot's mapping (natpmp only; `0` when
+    /// unknown). A drop in this value across renewals means the gateway
+    /// rebooted (RFC 6886 §3.6).
+    pub forwarded_epoch: u32,
     /// Whether the last port-forward renewal succeeded. Always `true` for
     /// static slots (nothing to renew).
     pub port_forward_ok: bool,
@@ -41,6 +45,7 @@ impl SlotEntry {
         engine: Arc<dyn TorrentEngine>,
         tunnel_ip: IpAddr,
         forwarded_port: Option<u16>,
+        forwarded_epoch: u32,
     ) -> Self {
         Self {
             config,
@@ -50,6 +55,7 @@ impl SlotEntry {
                 tunnel_ip: Some(tunnel_ip),
                 paused_for_vpn: 0,
                 forwarded_port,
+                forwarded_epoch,
                 port_forward_ok: true,
             }),
         }
@@ -80,6 +86,44 @@ impl std::fmt::Debug for SlotEntry {
 #[derive(Debug)]
 pub struct SlotRegistry {
     entries: Vec<SlotEntry>,
+}
+
+/// Build a static WireGuard slot entry with the given id and status, for tests
+/// across the http/app_state modules.
+#[cfg(test)]
+pub(crate) fn test_entry(id: &str, status: SlotStatus) -> SlotEntry {
+    use std::net::Ipv4Addr;
+    use std::path::PathBuf;
+
+    use seederd_engine::MockEngine;
+    use seederd_engine::PortForwardMode;
+    use seederd_engine::VpnType;
+
+    let config = SlotConfig {
+        id: SlotId::new(id),
+        vpn_profile: PathBuf::from(format!("/etc/wg/{id}.conf")),
+        vpn_type: VpnType::Wireguard,
+        vpn_interface: format!("wg-{id}"),
+        listen_port: Some(6881),
+        peer_fingerprint_hex: "a1b2c3d4e5f60718".to_string(),
+        user_agent: format!("ua-{id}"),
+        resume_dir: PathBuf::from("/tmp/seederd-test/resume"),
+        torrent_dir: PathBuf::from("/tmp/seederd-test/torrents"),
+        allowed_tracker_domains: vec![],
+        upload_rate_limit: 0,
+        port_forward: PortForwardMode::Static,
+        port_forward_gateway: None,
+    };
+    let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+    let entry = SlotEntry::new(
+        config,
+        engine,
+        IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)),
+        None,
+        0,
+    );
+    entry.update_health(|h| h.status = status);
+    entry
 }
 
 impl SlotRegistry {

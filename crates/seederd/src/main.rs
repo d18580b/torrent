@@ -34,6 +34,11 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
     if cli.check_config {
+        // The kill switch shells out to `nft`; fail the pre-flight check now
+        // rather than aborting startup later (systemd ExecStartPre).
+        if cfg.network_kill_switch && !vpn::killswitch::nft_available() {
+            anyhow::bail!("network_kill_switch = true but the `nft` binary is not available");
+        }
         eprintln!("config OK");
         return Ok(());
     }

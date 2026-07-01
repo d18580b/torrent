@@ -39,6 +39,20 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # mode; in that case POST /torrents requires `slot_id`.
 # ---------------------------------------------------------------------------
 
+# Liveness: max age (seconds) of a WireGuard tunnel's latest handshake before
+# the health monitor declares the slot down and pauses it. Catches a tunnel
+# that keeps its IP but has silently stopped handshaking. Default 180.
+# vpn_handshake_max_age_secs = 180
+
+# Defence-in-depth kill switch (multi-slot only). When true, seederd installs a
+# fail-closed nftables table (`seederd_ks`) that confines the daemon's own
+# egress to loopback + the slots' tunnel interfaces — so if a tunnel drops, the
+# kernel drops the traffic regardless of libtorrent's socket bind or the 30s
+# monitor. Requires CAP_NET_ADMIN, the `nft` binary, and that seederd runs as a
+# dedicated user (the packaged systemd unit uses User=seederd). Also forces
+# tracker DNS through the tunnel. Removed cleanly on SIGTERM.
+# network_kill_switch = false
+
 # [[slot]]
 # id                       = "account_a"
 # vpn_profile              = "/etc/wireguard/wg-acct-a.conf"

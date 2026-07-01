@@ -20,9 +20,11 @@
 //! bind libtorrent to the returned public port.
 
 use std::io;
+use std::net::IpAddr;
 use std::net::UdpSocket;
 use std::time::Duration;
 
+use seederd_engine::MapResult;
 use seederd_engine::PortForwardError;
 use seederd_engine::PortForwarder;
 use seederd_engine::PortMapRequest;
@@ -35,46 +37,68 @@ const OP_MAP_TCP: u8 = 2;
 /// Responses set the high bit of the request opcode.
 const RESP_OPCODE_FLAG: u8 = 0x80;
 
+/// Retransmission schedules (ms), one read timeout per attempt. RFC 6886 §3.1
+/// doubles the timeout each retry; the full 9-retry/~128s schedule would exceed
+/// our 45s renewal interval and 60s lease, so both profiles are bounded well
+/// under that. A lost *renewal* is soft (retried next tick), so it stays snappy;
+/// a lost *startup* negotiate disables the slot, so it gets the longer budget to
+/// ride out a lossy boot.
+const RENEWAL_TIMEOUTS_MS: &[u64] = &[250, 500, 1000, 2000, 4000]; // ~7.75s
+const STARTUP_TIMEOUTS_MS: &[u64] = &[250, 500, 1000, 2000, 4000, 8000]; // ~15.75s
+/// Teardown is best-effort on the shutdown path; keep it quick.
+const TEARDOWN_TIMEOUTS_MS: &[u64] = &[250, 500];
+
 /// Native RFC 6886 NAT-PMP client. Stateless; each `map` call opens a fresh
 /// socket, so it is safe to renew from a background task on every tick.
 #[derive(Debug, Clone)]
 pub struct NatpmpForwarder {
     gateway_port: u16,
-    /// Retransmission schedule: one read timeout per attempt. RFC 6886 doubles
-    /// the timeout each retry; we bound it so startup stays responsive.
+    /// Retransmission schedule: one read timeout per attempt.
     timeouts: Vec<Duration>,
 }
 
 impl Default for NatpmpForwarder {
     fn default() -> Self {
-        Self {
-            gateway_port: NATPMP_PORT,
-            timeouts: vec![
-                Duration::from_millis(250),
-                Duration::from_millis(500),
-                Duration::from_millis(1000),
-                Duration::from_millis(2000),
-            ],
-        }
+        Self::new()
     }
 }
 
 impl NatpmpForwarder {
+    /// Client for steady-state renewals (snappy retransmit budget).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_timeouts_ms(RENEWAL_TIMEOUTS_MS)
+    }
+
+    /// Client for the one-shot startup negotiate (longer budget: failure here
+    /// disables the slot).
+    pub fn for_startup() -> Self {
+        Self::with_timeouts_ms(STARTUP_TIMEOUTS_MS)
+    }
+
+    fn with_timeouts_ms(ms: &[u64]) -> Self {
+        Self {
+            gateway_port: NATPMP_PORT,
+            timeouts: ms.iter().map(|&m| Duration::from_millis(m)).collect(),
+        }
     }
 
     /// Issue one mapping request (single protocol) with retransmission, and
-    /// return the gateway-assigned public port.
+    /// return the gateway-assigned public port and epoch. `suggested_external`
+    /// is the port we'd prefer (0 = no preference); the gateway is free to
+    /// assign a different one.
     fn map_one(
         &self,
         sock: &UdpSocket,
         opcode: u8,
         req: &PortMapRequest,
-    ) -> Result<u16, PortForwardError> {
-        // Suggested external port 0 = "no preference"; the gateway assigns one
-        // (the ProtonVPN convention).
-        let msg = encode_request(opcode, req.internal_port, 0, req.lifetime_secs);
+        suggested_external: u16,
+    ) -> Result<(u16, u32), PortForwardError> {
+        let msg = encode_request(
+            opcode,
+            req.internal_port,
+            suggested_external,
+            req.lifetime_secs,
+        );
         for t in &self.timeouts {
             sock.set_read_timeout(Some(*t))
                 .map_err(|e| PortForwardError::Io(e.to_string()))?;
@@ -91,28 +115,87 @@ impl NatpmpForwarder {
             gateway: req.gateway,
         })
     }
+
+    /// Release this client's mappings (RFC 6886 §3.4: internal port 0 + lifetime
+    /// 0 deletes all of the client's mappings for the protocol). Best-effort,
+    /// bound to the tunnel IP like `map`, and used on graceful shutdown so a
+    /// stale mapping doesn't linger for the ~60s lease. Uses a short retransmit
+    /// budget so it can't stall shutdown.
+    pub fn unmap(&self, gateway: IpAddr, bind_ip: IpAddr) -> Result<(), PortForwardError> {
+        let sock = UdpSocket::bind((bind_ip, 0))
+            .map_err(|e| PortForwardError::Io(format!("bind {bind_ip}: {e}")))?;
+        sock.connect((gateway, self.gateway_port))
+            .map_err(|e| PortForwardError::Io(format!("connect {gateway}: {e}")))?;
+        self.delete_one(&sock, OP_MAP_UDP, gateway)?;
+        self.delete_one(&sock, OP_MAP_TCP, gateway)?;
+        Ok(())
+    }
+
+    fn delete_one(
+        &self,
+        sock: &UdpSocket,
+        opcode: u8,
+        gateway: IpAddr,
+    ) -> Result<(), PortForwardError> {
+        // internal port 0, suggested external 0, lifetime 0 = delete.
+        let msg = encode_request(opcode, 0, 0, 0);
+        for &m in TEARDOWN_TIMEOUTS_MS {
+            sock.set_read_timeout(Some(Duration::from_millis(m)))
+                .map_err(|e| PortForwardError::Io(e.to_string()))?;
+            sock.send(&msg)
+                .map_err(|e| PortForwardError::Io(e.to_string()))?;
+            let mut buf = [0u8; 16];
+            match sock.recv(&mut buf) {
+                Ok(n) => return decode_delete(&buf[..n], opcode),
+                Err(e) if is_timeout(&e) => continue,
+                Err(e) => return Err(PortForwardError::Io(e.to_string())),
+            }
+        }
+        Err(PortForwardError::Timeout { gateway })
+    }
 }
 
 impl PortForwarder for NatpmpForwarder {
-    fn map(&self, req: &PortMapRequest) -> Result<u16, PortForwardError> {
+    fn map(&self, req: &PortMapRequest) -> Result<MapResult, PortForwardError> {
         // Bind to the tunnel IP so the request never leaves the tunnel.
         let sock = UdpSocket::bind((req.bind_ip, 0))
             .map_err(|e| PortForwardError::Io(format!("bind {}: {e}", req.bind_ip)))?;
         sock.connect((req.gateway, self.gateway_port))
             .map_err(|e| PortForwardError::Io(format!("connect {}: {e}", req.gateway)))?;
 
-        let udp_port = self.map_one(&sock, OP_MAP_UDP, req)?;
-        let tcp_port = self.map_one(&sock, OP_MAP_TCP, req)?;
-        if udp_port != tcp_port {
-            warn!(
-                target: "seederd::vpn::natpmp",
-                udp_port,
-                tcp_port,
-                "NAT-PMP gateway returned different UDP/TCP ports; binding the TCP port",
-            );
+        // TCP carries inbound BitTorrent peers, so map it first and let it be
+        // authoritative. Then ask for a UDP (uTP) mapping on the *same* external
+        // port so libtorrent — which binds TCP + uTP to one listen port — gets a
+        // consistent forward.
+        let (tcp_port, epoch) = self.map_one(&sock, OP_MAP_TCP, req, 0)?;
+        match self.map_one(&sock, OP_MAP_UDP, req, tcp_port) {
+            Ok((udp_port, _)) if udp_port == tcp_port => {}
+            Ok((udp_port, _)) => {
+                // Gateway wouldn't honour the suggestion. A UDP mapping on a
+                // different port is useless (we can't split the listen port), so
+                // release it rather than leave it orphaned until the lease ends.
+                warn!(
+                    target: "seederd::vpn::natpmp",
+                    udp_port,
+                    tcp_port,
+                    "NAT-PMP gateway assigned divergent UDP/TCP ports; releasing the UDP mapping and binding TCP",
+                );
+                let _ = self.delete_one(&sock, OP_MAP_UDP, req.gateway);
+            }
+            Err(e) => {
+                // UDP is best-effort for a seeder; TCP already succeeded.
+                warn!(
+                    target: "seederd::vpn::natpmp",
+                    tcp_port,
+                    error.cause = %e,
+                    "NAT-PMP UDP mapping failed; proceeding with TCP only",
+                );
+            }
         }
-        // BitTorrent inbound peer connections are primarily TCP.
-        Ok(tcp_port)
+        Ok(MapResult {
+            port: tcp_port,
+            epoch,
+        })
     }
 }
 
@@ -128,10 +211,11 @@ fn encode_request(opcode: u8, internal: u16, suggested_external: u16, lifetime: 
     b
 }
 
-/// Decode a NAT-PMP mapping response, returning the mapped public port on
-/// success. `req_opcode` is the opcode we sent (the response echoes it with the
-/// high bit set).
-fn decode_response(buf: &[u8], req_opcode: u8) -> Result<u16, PortForwardError> {
+/// Decode a NAT-PMP mapping response, returning the mapped public port and the
+/// gateway epoch (`buf[4..8]`, seconds since the gateway booted) on success.
+/// `req_opcode` is the opcode we sent (the response echoes it with the high bit
+/// set).
+fn decode_response(buf: &[u8], req_opcode: u8) -> Result<(u16, u32), PortForwardError> {
     if buf.len() < 16 {
         return Err(PortForwardError::Parse(format!(
             "response too short: {} bytes",
@@ -155,13 +239,44 @@ fn decode_response(buf: &[u8], req_opcode: u8) -> Result<u16, PortForwardError> 
     if result_code != 0 {
         return Err(PortForwardError::Gateway(result_code));
     }
+    let epoch = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
     let external = u16::from_be_bytes([buf[10], buf[11]]);
     if external == 0 {
         return Err(PortForwardError::Parse(
             "gateway mapped external port 0".to_string(),
         ));
     }
-    Ok(external)
+    Ok((external, epoch))
+}
+
+/// Decode a NAT-PMP deletion (lifetime-0) response. Unlike a mapping response,
+/// the mapped external port is legitimately 0, so we only validate the header
+/// and result code.
+fn decode_delete(buf: &[u8], req_opcode: u8) -> Result<(), PortForwardError> {
+    if buf.len() < 16 {
+        return Err(PortForwardError::Parse(format!(
+            "delete response too short: {} bytes",
+            buf.len()
+        )));
+    }
+    if buf[0] != 0 {
+        return Err(PortForwardError::Parse(format!(
+            "unexpected version {}",
+            buf[0]
+        )));
+    }
+    if buf[1] != req_opcode | RESP_OPCODE_FLAG {
+        return Err(PortForwardError::Parse(format!(
+            "unexpected opcode {} (wanted {})",
+            buf[1],
+            req_opcode | RESP_OPCODE_FLAG
+        )));
+    }
+    let result_code = u16::from_be_bytes([buf[2], buf[3]]);
+    if result_code != 0 {
+        return Err(PortForwardError::Gateway(result_code));
+    }
+    Ok(())
 }
 
 fn is_timeout(e: &io::Error) -> bool {
@@ -175,6 +290,9 @@ fn is_timeout(e: &io::Error) -> bool {
 mod tests {
     use std::net::IpAddr;
     use std::net::Ipv4Addr;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
     use std::thread;
 
     use super::*;
@@ -203,7 +321,14 @@ mod tests {
     #[test]
     fn decode_success_returns_mapped_port() {
         let r = success_response(OP_MAP_TCP, 40001);
-        assert_eq!(decode_response(&r, OP_MAP_TCP).unwrap(), 40001);
+        assert_eq!(decode_response(&r, OP_MAP_TCP).unwrap(), (40001, 0));
+    }
+
+    #[test]
+    fn decode_parses_gateway_epoch() {
+        let mut r = success_response(OP_MAP_TCP, 40001);
+        r[4..8].copy_from_slice(&123_456u32.to_be_bytes());
+        assert_eq!(decode_response(&r, OP_MAP_TCP).unwrap(), (40001, 123_456));
     }
 
     #[test]
@@ -270,7 +395,7 @@ mod tests {
             internal_port: 0,
             lifetime_secs: 60,
         };
-        assert_eq!(fwd.map(&req).unwrap(), 40001);
+        assert_eq!(fwd.map(&req).unwrap().port, 40001);
         server.join().unwrap();
     }
 
@@ -294,6 +419,80 @@ mod tests {
             lifetime_secs: 60,
         };
         assert!(matches!(fwd.map(&req), Err(PortForwardError::Gateway(2))));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn loopback_divergent_udp_is_released_and_tcp_bound() {
+        // Gateway maps TCP=40001 but ignores the suggestion and hands UDP=40002.
+        // map() must return the TCP port and release the orphan UDP mapping.
+        let gw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let gw_port = gw.local_addr().unwrap().port();
+        let saw_udp_delete = Arc::new(AtomicBool::new(false));
+        let flag = saw_udp_delete.clone();
+        let server = thread::spawn(move || {
+            // 1) TCP map → 40001
+            let mut buf = [0u8; 12];
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[1], OP_MAP_TCP);
+            gw.send_to(&success_response(buf[1], 40001), peer).unwrap();
+            // 2) UDP map, suggested 40001 → gateway insists on 40002
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[1], OP_MAP_UDP);
+            assert_eq!(&buf[6..8], &40001u16.to_be_bytes()); // we suggested TCP's port
+            gw.send_to(&success_response(buf[1], 40002), peer).unwrap();
+            // 3) UDP deletion (lifetime 0)
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            if buf[1] == OP_MAP_UDP && buf[8..12] == 0u32.to_be_bytes() {
+                flag.store(true, Ordering::SeqCst);
+            }
+            gw.send_to(&success_response(buf[1], 0), peer).unwrap();
+        });
+
+        let fwd = test_forwarder(gw_port);
+        let req = PortMapRequest {
+            gateway: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            internal_port: 0,
+            lifetime_secs: 60,
+        };
+        assert_eq!(fwd.map(&req).unwrap().port, 40001);
+        server.join().unwrap();
+        assert!(
+            saw_udp_delete.load(Ordering::SeqCst),
+            "divergent UDP mapping should have been released",
+        );
+    }
+
+    #[test]
+    fn startup_profile_has_more_retransmits_than_renewal() {
+        assert!(
+            NatpmpForwarder::for_startup().timeouts.len() > NatpmpForwarder::new().timeouts.len()
+        );
+    }
+
+    #[test]
+    fn loopback_unmap_releases_mapping() {
+        // Fake gateway answers the UDP then TCP deletion requests.
+        let gw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let gw_port = gw.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let mut buf = [0u8; 12];
+                let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+                // A deletion request carries lifetime 0 (RFC 6886 §3.4).
+                assert_eq!(&buf[8..12], &0u32.to_be_bytes());
+                let resp = success_response(buf[1], 0); // external port 0 = deleted
+                gw.send_to(&resp, peer).unwrap();
+            }
+        });
+
+        let fwd = test_forwarder(gw_port);
+        fwd.unmap(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .unwrap();
         server.join().unwrap();
     }
 }

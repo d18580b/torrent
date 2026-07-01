@@ -259,6 +259,12 @@ async fn do_add(
         )
     })?;
 
+    // Don't accept new torrents into a fenced (VpnDown) slot — they would land
+    // paused and mislead the operator into thinking the slot is healthy.
+    if s.slot_vpn_down(&slot_id) {
+        return Err(vpn_down());
+    }
+
     let save_path =
         save_path_opt.unwrap_or_else(|| s.default_save_path.to_string_lossy().into_owned());
     let flags = TorrentFlags::SEED_MODE
@@ -470,6 +476,10 @@ pub async fn resume(
             Json(serde_json::json!({"error": "not_found"})),
         )
     })?;
+    // Refuse to un-quarantine a torrent whose slot the VPN monitor fenced.
+    if s.slot_vpn_down(&st.slot_id) {
+        return Err(vpn_down());
+    }
     let engine = s.source.engine_for(&st.slot_id).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -559,6 +569,13 @@ fn bad_infohash() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({"error": "invalid infohash hex"})),
+    )
+}
+
+fn vpn_down() -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(serde_json::json!({"error": "slot vpn_down; restart daemon to resume"})),
     )
 }
 
