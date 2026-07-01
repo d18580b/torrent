@@ -9,6 +9,8 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use seederd_engine::VpnError;
 use seederd_engine::VpnManager;
@@ -18,6 +20,39 @@ use tracing::warn;
 
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Time since the most recent WireGuard handshake on `iface`, or `None` if it
+/// can't be determined (not a WireGuard interface, `wg` unavailable, or no peer
+/// has ever completed a handshake).
+///
+/// This is the liveness signal the health monitor uses on top of IP presence:
+/// a tunnel can keep its address while its handshake silently stops (peer gone,
+/// key rotation stalled), which the IP check alone can't see. A seeding host
+/// always has traffic, so a healthy tunnel rekeys well inside the threshold.
+pub fn latest_handshake_age(iface: &str) -> Option<Duration> {
+    // `wg show <iface> latest-handshakes` prints `<pubkey>\t<unix_secs>` per
+    // peer; 0 means "never". Take the freshest across peers.
+    let out = Command::new("wg")
+        .arg("show")
+        .arg(iface)
+        .arg("latest-handshakes")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let latest = text
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .filter_map(|s| s.parse::<u64>().ok())
+        .max()?;
+    if latest == 0 {
+        return None; // never handshaked → no liveness signal yet
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(Duration::from_secs(now.saturating_sub(latest)))
+}
 
 #[derive(Debug, Default)]
 pub struct WireguardManager;
