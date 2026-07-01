@@ -12,6 +12,7 @@ mod cli;
 mod config;
 mod http;
 mod metrics_sink;
+mod port_forward_monitor;
 mod reload;
 mod signals;
 mod slot_registry;
