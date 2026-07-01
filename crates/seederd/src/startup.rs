@@ -407,6 +407,7 @@ impl DaemonHandle {
                 slots.clone(),
                 state.clone(),
                 metrics.clone(),
+                std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
                 shutdown_tx.subscribe(),
             ));
             // Port-forward renewal monitor: keeps NAT-PMP leases alive and

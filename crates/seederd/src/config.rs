@@ -77,6 +77,12 @@ pub struct Config {
     #[serde(default)]
     pub user_agent: Option<String>,
 
+    /// Max age of a WireGuard tunnel's latest handshake before the health
+    /// monitor treats the slot as down (multi-slot mode). Catches a tunnel that
+    /// keeps its IP but has silently stopped handshaking. Default 180s.
+    #[serde(default = "Config::default_handshake_max_age")]
+    pub vpn_handshake_max_age_secs: u64,
+
     /// Install a fail-closed nftables kill switch (multi-slot mode) that
     /// confines the daemon's egress to loopback + the slots' tunnel interfaces.
     /// Off by default; requires `CAP_NET_ADMIN` and that seederd runs as its own
@@ -92,6 +98,10 @@ pub struct Config {
 impl Config {
     fn default_log_level() -> LogLevel {
         LogLevel::Info
+    }
+
+    fn default_handshake_max_age() -> u64 {
+        180
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
