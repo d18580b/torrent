@@ -23,6 +23,9 @@ graceful SIGTERM.
   ```
 - A C++ toolchain + `cmake` (see `CONTRIBUTING.md` → System prerequisites).
 - `curl` for the manual smoke; `python3` only to mint a demo `.torrent`.
+- **No `natpmpc`/`libnatpmp`** — NAT-PMP dynamic port forwarding (§6) is a
+  native in-process client, so there's no extra binary or capability beyond the
+  `CAP_NET_ADMIN` already needed for VPN bring-up.
 
 ---
 
@@ -48,6 +51,12 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Layer 1 — unit + in-memory (fast; no libtorrent networking/disk)
+# Also covers the NAT-PMP path deterministically (no VPN/root needed):
+#   • wire-format encode/decode + a loopback fake-gateway socket test
+#     (seederd::vpn::natpmp)
+#   • renew → live-rebind decision via MockForwarder + MockEngine
+#     (seederd_engine::port_forward::renew_and_rebind)
+#   • slot-config validation: static needs listen_port, natpmp may omit it
 cargo test --workspace
 
 # Layer 2 — shim FFI correctness against a real, non-networked session
@@ -258,6 +267,87 @@ Expected on tunnel loss: the slot's torrents are **paused**, the slot reports
 an operator must intervene (PRD multi-account safety rule). seeding continues
 unaffected on the other slot.
 
+### 6a. NAT-PMP dynamic port forwarding (ProtonVPN et al.)
+
+Providers like **ProtonVPN** don't hand out a static forwarded port — it's
+negotiated over **NAT-PMP** against the tunnel gateway (`10.2.0.1`), is
+ephemeral, and its ~60s lease is renewed continuously. Set `port_forward =
+"natpmp"` on the slot and **omit `listen_port`** (it's ignored); the port is
+negotiated at boot, bound, and then renewed every ~45s. A single ProtonVPN
+account is just one `[[slot]]`.
+
+```toml
+[[slot]]
+id                   = "proton_a"
+vpn_profile          = "/etc/wireguard/proton-a.conf"
+vpn_type             = "wireguard"
+vpn_interface        = "proton-a"
+port_forward         = "natpmp"
+port_forward_gateway = "10.2.0.1"   # default; override only if your gateway differs
+peer_fingerprint_hex = "3c2d1e0f4a5b6c7d"
+user_agent           = "qBittorrent/5.0.3"
+resume_dir           = "/var/lib/seederd/resume/proton_a"
+torrent_dir          = "/var/lib/seederd/torrents/proton_a"
+allowed_tracker_domains = ["tracker.example.com"]
+```
+
+Confirm the negotiated port is bound and surfaced:
+
+```bash
+curl -fsS http://127.0.0.1:8080/slots/proton_a
+# status:"active", port_forward:"natpmp", listen_port:null,
+# forwarded_port:<ephemeral, e.g. 41234>, port_forward_ok:true
+
+curl -fsS http://127.0.0.1:8080/metrics | grep 'slot_forwarded_port{slot_id="proton_a"}'         # = the port above
+curl -fsS http://127.0.0.1:8080/metrics | grep 'slot_port_forward_up{slot_id="proton_a"}'         # 1
+curl -fsS http://127.0.0.1:8080/metrics | grep 'slot_port_forward_renewals_total{slot_id="proton_a"}'  # climbs every ~45s
+```
+
+**Renewal-failure drill** (lose the mapping while the tunnel stays up):
+
+```bash
+# Drop NAT-PMP egress to the gateway but leave the tunnel itself up.
+sudo iptables -I OUTPUT -o proton-a -p udp --dport 5351 -j DROP
+# within ~45s (one renewal cycle):
+curl -fsS http://127.0.0.1:8080/slots/proton_a                                                    # port_forward_ok:false
+curl -fsS http://127.0.0.1:8080/metrics | grep 'slot_port_forward_up{slot_id="proton_a"}'          # 0
+curl -fsS http://127.0.0.1:8080/metrics | grep 'slot_port_forward_failures_total{slot_id="proton_a"}' # climbs
+```
+
+Expected: torrents **stay seeding** (NOT paused), the slot stays `active`, and
+the tunnel IP is unchanged — a lost mapping only blocks *new inbound* peers, so
+it's a warn-and-observe condition, not a privacy leak (contrast §6 tunnel loss,
+which pauses). Confirm no bare-IP leak — every seederd socket is on the tunnel
+IP, never the WAN IP:
+
+```bash
+sudo ss -tunp | grep seederd
+```
+
+Restore and watch it self-heal on the next cycle:
+
+```bash
+sudo iptables -D OUTPUT -o proton-a -p udp --dport 5351 -j DROP
+# within ~45s: port_forward_ok → true, slot_port_forward_up → 1
+```
+
+**Live rebind on port change:** when the gateway assigns a different port
+(typically after a reconnect), `slot_forwarded_port` updates and
+`slot_forwarded_port_changes_total` increments, and the live libtorrent session
+rebinds its listen socket with **no restart**. This is hard to force on demand
+with a real provider — it's covered deterministically by the mock/loopback
+tests below.
+
+**No-VPN local QA (deterministic, no root):** the negotiate → bind → renew →
+rebind logic is exercised end-to-end without a tunnel by the Layer-1 suite — a
+loopback fake-gateway UDP responder drives the real `NatpmpForwarder`, and
+`renew_and_rebind` is checked against `MockForwarder` + `MockEngine`:
+
+```bash
+cargo test -p seederd            --bin seederd vpn::natpmp
+cargo test -p seederd-engine     port_forward
+```
+
 ---
 
 ## 7. Success checklist
@@ -269,3 +359,7 @@ unaffected on the other slot.
       gauges appear after ~30 s.
 - [ ] SIGHUP switches log level live; SIGTERM writes `session_state.dat` + `.resume`.
 - [ ] (If applicable) tunnel loss pauses a slot, sets `slot_vpn_tunnel_up=0`, no auto-restart.
+- [ ] (If applicable) a natpmp slot binds a negotiated `forwarded_port` at boot;
+      `slot_port_forward_up=1` and `slot_port_forward_renewals_total` climbs.
+- [ ] (If applicable) blocking NAT-PMP egress flips `port_forward_ok=false` /
+      `slot_port_forward_up=0` **without pausing** torrents, with no bare-IP leak.

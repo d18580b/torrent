@@ -18,7 +18,13 @@ pub struct SlotSummary {
     status: String,
     tunnel_ip: Option<String>,
     torrent_count: usize,
-    listen_port: u16,
+    /// Configured static listen port (`null` for natpmp slots).
+    listen_port: Option<u16>,
+    /// How the listen port is chosen: `"static"` or `"natpmp"`.
+    port_forward: String,
+    /// Current effective listen port: the NAT-PMP-negotiated port for natpmp
+    /// slots, else the configured static port.
+    forwarded_port: Option<u16>,
     user_agent: String,
 }
 
@@ -30,16 +36,24 @@ pub struct SlotDetail {
     allowed_tracker_domains: Vec<String>,
     /// Torrents currently paused because the tunnel went down.
     paused_for_vpn: u64,
+    /// Whether the last NAT-PMP renewal succeeded (always `true` for static
+    /// slots, which have nothing to renew).
+    port_forward_ok: bool,
 }
 
 fn summary_of(s: &AppState, e: &SlotEntry) -> SlotSummary {
     let h = e.health();
+    // For natpmp slots the effective port is the negotiated one; for static
+    // slots it's the configured listen_port.
+    let forwarded_port = h.forwarded_port.or(e.config.listen_port);
     SlotSummary {
         slot_id: e.config.id.as_str().to_string(),
         status: h.status.as_str().to_string(),
         tunnel_ip: h.tunnel_ip.map(|ip| ip.to_string()),
         torrent_count: s.registry.for_slot(&e.config.id).len(),
         listen_port: e.config.listen_port,
+        port_forward: e.config.port_forward.as_str().to_string(),
+        forwarded_port,
         user_agent: e.config.user_agent.clone(),
     }
 }
@@ -78,6 +92,7 @@ pub async fn get(
         vpn_interface: e.config.vpn_interface.clone(),
         allowed_tracker_domains: e.config.allowed_tracker_domains.clone(),
         paused_for_vpn: h.paused_for_vpn,
+        port_forward_ok: h.port_forward_ok,
     }))
 }
 

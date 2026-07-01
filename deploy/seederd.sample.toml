@@ -64,3 +64,27 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # torrent_dir              = "/var/lib/seederd/torrents/account_b"
 # allowed_tracker_domains  = ["tracker.example.com"]
 # upload_rate_limit        = 0
+
+# ---------------------------------------------------------------------------
+# Dynamic port forwarding (ProtonVPN / PIA-style ephemeral ports)
+# ---------------------------------------------------------------------------
+# Providers like ProtonVPN don't give you a static forwarded port — it is
+# negotiated at runtime over NAT-PMP against the tunnel gateway, is ephemeral,
+# and its ~60s lease is renewed continuously. Set `port_forward = "natpmp"`;
+# `listen_port` is then ignored (omit it) and the negotiated port is bound and
+# surfaced via `GET /slots/<id>` (`forwarded_port`) plus the `slot_forwarded_port`
+# / `slot_port_forward_up` metrics.
+#
+# [[slot]]
+# id                       = "proton_a"
+# vpn_profile              = "/etc/wireguard/proton-a.conf"
+# vpn_type                 = "wireguard"
+# vpn_interface            = "proton-a"
+# port_forward             = "natpmp"
+# port_forward_gateway     = "10.2.0.1"   # ProtonVPN WireGuard gateway (default)
+# peer_fingerprint_hex     = "3c2d1e0f4a5b6c7d"
+# user_agent               = "qBittorrent/5.0.3"
+# resume_dir               = "/var/lib/seederd/resume/proton_a"
+# torrent_dir              = "/var/lib/seederd/torrents/proton_a"
+# allowed_tracker_domains  = ["tracker.example.com"]
+# upload_rate_limit        = 0

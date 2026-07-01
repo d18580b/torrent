@@ -5,6 +5,7 @@
 //! trait — both produce an `Arc<dyn AlertSource>` that the rest of the
 //! daemon consumes uniformly.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -14,8 +15,9 @@ use tracing::{error, info, warn};
 
 use seederd_engine::{
     AddParams, AlertLoopBuilder, AlertSource, AssignmentRegistry, FsResumeStore, FsTorrentStore,
-    MetricsSink, MultiSlotSource, RealEngine, ResumeStore, ShutdownReason, SingleSessionSource,
-    SlotId, StateMap, SystemClock, TorrentEngine, TorrentFlags, TorrentStore,
+    MetricsSink, MultiSlotSource, PortForwardMode, PortForwarder, PortMapRequest, RealEngine,
+    ResumeStore, ShutdownReason, SingleSessionSource, SlotId, StateMap, SystemClock, TorrentEngine,
+    TorrentFlags, TorrentStore,
 };
 
 use crate::app_state::{AppState, Mode};
@@ -111,12 +113,60 @@ pub async fn boot(
                     }
                 };
 
-                // 2) Bind libtorrent to the tunnel IP only.
+                // 2) Determine the listening port. Static slots bind the
+                //    operator's `listen_port`; natpmp slots negotiate an
+                //    ephemeral forwarded port from the tunnel gateway
+                //    (ProtonVPN et al.). A startup negotiation failure disables
+                //    the slot — loud, like a VPN bring-up failure — rather than
+                //    silently seeding on an unforwarded port. Mid-session
+                //    renewal failures are the soft warn+keep-seeding path
+                //    (see port_forward_monitor).
+                let (effective_port, forwarded_port) = match s.port_forward {
+                    PortForwardMode::Static => match s.listen_port {
+                        Some(port) => (port, None),
+                        None => {
+                            // validate_set should have caught this; be defensive.
+                            error!(slot_id = %s.id, "static slot missing listen_port; slot disabled");
+                            vpn.bring_down(&s.vpn_interface);
+                            continue;
+                        }
+                    },
+                    PortForwardMode::Natpmp => {
+                        let gw_str = s.port_forward_gateway_or_default();
+                        let gateway: IpAddr = match gw_str.parse() {
+                            Ok(ip) => ip,
+                            Err(e) => {
+                                error!(slot_id = %s.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; slot disabled");
+                                vpn.bring_down(&s.vpn_interface);
+                                continue;
+                            }
+                        };
+                        let req = PortMapRequest {
+                            gateway,
+                            bind_ip: tunnel_ip,
+                            internal_port: 0,
+                            lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
+                        };
+                        match vpn::NatpmpForwarder::new().map(&req) {
+                            Ok(port) => {
+                                info!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, forwarded_port = port, "NAT-PMP port negotiated");
+                                (port, Some(port))
+                            }
+                            Err(e) => {
+                                error!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; slot disabled (no bare-IP fallback)");
+                                vpn.bring_down(&s.vpn_interface);
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                // 3) Bind libtorrent to the tunnel IP + effective port only.
                 let mut settings = cfg.libtorrent_settings();
                 settings.user_agent = Some(s.user_agent.clone());
                 settings.handshake_client_version = Some(s.user_agent.clone());
                 settings.peer_fingerprint = Some(s.peer_fingerprint_hex.clone());
-                settings.listen_interfaces = Some(format!("{}:{}", tunnel_ip, s.listen_port));
+                settings.listen_interfaces = Some(format!("{}:{}", tunnel_ip, effective_port));
                 settings.outgoing_interfaces = Some(tunnel_ip.to_string());
                 settings.enable_dht = Some(false);
                 settings.enable_lsd = Some(false);
@@ -128,10 +178,16 @@ pub async fn boot(
                         info!(
                             slot_id = %s.id,
                             tunnel_ip = %tunnel_ip,
+                            listen_port = effective_port,
                             "slot engine up",
                         );
                         let engine: Arc<dyn TorrentEngine> = Arc::new(engine);
-                        slot_entries.push(SlotEntry::new(s.clone(), engine, tunnel_ip));
+                        slot_entries.push(SlotEntry::new(
+                            s.clone(),
+                            engine,
+                            tunnel_ip,
+                            forwarded_port,
+                        ));
                     }
                     Err(e) => {
                         error!(
@@ -300,8 +356,15 @@ impl DaemonHandle {
         // consumes the registry/state/metrics.
         if let Some(slots) = slot_registry.clone() {
             tokio::spawn(crate::vpn_monitor::run(
-                slots,
+                slots.clone(),
                 state.clone(),
+                metrics.clone(),
+                shutdown_tx.subscribe(),
+            ));
+            // Port-forward renewal monitor: keeps NAT-PMP leases alive and
+            // rebinds the live session if the forwarded port changes.
+            tokio::spawn(crate::port_forward_monitor::run(
+                slots,
                 metrics.clone(),
                 shutdown_tx.subscribe(),
             ));
