@@ -23,6 +23,10 @@ pub struct SlotHealth {
     /// Current NAT-PMP-negotiated listening port (natpmp slots only; `None`
     /// for static slots).
     pub forwarded_port: Option<u16>,
+    /// Last gateway epoch seen for this slot's mapping (natpmp only; `0` when
+    /// unknown). A drop in this value across renewals means the gateway
+    /// rebooted (RFC 6886 §3.6).
+    pub forwarded_epoch: u32,
     /// Whether the last port-forward renewal succeeded. Always `true` for
     /// static slots (nothing to renew).
     pub port_forward_ok: bool,
@@ -41,6 +45,7 @@ impl SlotEntry {
         engine: Arc<dyn TorrentEngine>,
         tunnel_ip: IpAddr,
         forwarded_port: Option<u16>,
+        forwarded_epoch: u32,
     ) -> Self {
         Self {
             config,
@@ -50,6 +55,7 @@ impl SlotEntry {
                 tunnel_ip: Some(tunnel_ip),
                 paused_for_vpn: 0,
                 forwarded_port,
+                forwarded_epoch,
                 port_forward_ok: true,
             }),
         }

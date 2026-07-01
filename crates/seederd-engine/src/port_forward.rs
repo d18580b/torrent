@@ -80,21 +80,50 @@ pub enum PortForwardError {
     Io(String),
 }
 
+/// A successful NAT-PMP mapping: the gateway-assigned public port plus the
+/// gateway's epoch (seconds since it booted, RFC 6886 §3.6). A drop in `epoch`
+/// across calls means the gateway rebooted and lost every mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MapResult {
+    pub port: u16,
+    pub epoch: u32,
+}
+
 /// Negotiates a forwarded listening port against a VPN gateway.
 pub trait PortForwarder: Send + Sync + std::fmt::Debug {
-    /// Create or renew the mapping and return the public port to bind
-    /// libtorrent to. Idempotent: call repeatedly to keep the lease alive.
-    fn map(&self, req: &PortMapRequest) -> Result<u16, PortForwardError>;
+    /// Create or renew the mapping and return the public port (plus the gateway
+    /// epoch) to bind libtorrent to. Idempotent: call repeatedly to keep the
+    /// lease alive.
+    fn map(&self, req: &PortMapRequest) -> Result<MapResult, PortForwardError>;
+}
+
+/// Whether the gateway rebooted between two renewals: its epoch went backwards
+/// (RFC 6886 §3.6). A zero `previous_epoch` means "no baseline yet" (the first
+/// renewal), which is not treated as a reboot.
+pub fn gateway_rebooted(previous_epoch: u32, epoch: u32) -> bool {
+    previous_epoch != 0 && epoch < previous_epoch
 }
 
 /// Outcome of a single renewal attempt. The monitor maps this onto metrics and
-/// slot health; keeping it separate keeps `renew_and_rebind` pure.
+/// slot health; keeping it separate keeps `renew_and_rebind` pure. Successful
+/// variants carry the gateway `epoch` (so the caller can persist it for the
+/// next comparison) and `rebooted` (whether the epoch regressed this cycle —
+/// the mapping was already re-created by the same `map` call).
 #[derive(Debug)]
 pub enum RenewOutcome {
     /// Renewed; the mapped port is unchanged from what the session is bound to.
-    Unchanged(u16),
+    Unchanged {
+        port: u16,
+        epoch: u32,
+        rebooted: bool,
+    },
     /// Renewed with a new port and the live session was successfully rebound.
-    Rebound { previous: u16, new: u16 },
+    Rebound {
+        previous: u16,
+        new: u16,
+        epoch: u32,
+        rebooted: bool,
+    },
     /// Renewed with a new port but re-applying the listen interface failed; the
     /// session is still bound to the old port.
     RebindFailed { previous: u16, new: u16 },
@@ -106,16 +135,28 @@ pub enum RenewOutcome {
 /// the live libtorrent session by re-applying `listen_interfaces`
 /// (`apply_settings` triggers libtorrent's `reopen_listen_sockets`). Pure with
 /// respect to metrics/health so it is unit-testable with mocks.
+///
+/// A gateway reboot (epoch regression vs `previous_epoch`) needs no special
+/// recovery here: the `map` call above already re-created the dropped mapping,
+/// so we only surface `rebooted` for the monitor to count and log.
 pub fn renew_and_rebind(
     forwarder: &dyn PortForwarder,
     engine: &dyn TorrentEngine,
     req: &PortMapRequest,
     previous_port: u16,
+    previous_epoch: u32,
     tunnel_ip: IpAddr,
 ) -> RenewOutcome {
     match forwarder.map(req) {
-        Ok(port) if port == previous_port => RenewOutcome::Unchanged(port),
-        Ok(port) => {
+        Ok(MapResult { port, epoch }) => {
+            let rebooted = gateway_rebooted(previous_epoch, epoch);
+            if port == previous_port {
+                return RenewOutcome::Unchanged {
+                    port,
+                    epoch,
+                    rebooted,
+                };
+            }
             let settings = Settings {
                 listen_interfaces: Some(format!("{tunnel_ip}:{port}")),
                 ..Default::default()
@@ -124,6 +165,8 @@ pub fn renew_and_rebind(
                 Ok(()) => RenewOutcome::Rebound {
                     previous: previous_port,
                     new: port,
+                    epoch,
+                    rebooted,
                 },
                 Err(_) => RenewOutcome::RebindFailed {
                     previous: previous_port,
@@ -145,8 +188,8 @@ pub struct MockForwarder {
 
 #[derive(Debug, Default)]
 struct MockForwarderInner {
-    script: VecDeque<Result<u16, PortForwardError>>,
-    last: Option<Result<u16, PortForwardError>>,
+    script: VecDeque<Result<MapResult, PortForwardError>>,
+    last: Option<Result<MapResult, PortForwardError>>,
     calls: Vec<PortMapRequest>,
 }
 
@@ -155,7 +198,7 @@ impl MockForwarder {
         Self::default()
     }
 
-    /// Script a fixed sequence of successful ports (in order).
+    /// Script a fixed sequence of successful ports (in order), all at epoch 0.
     pub fn with_ports(ports: impl IntoIterator<Item = u16>) -> Self {
         let m = Self::new();
         for p in ports {
@@ -164,12 +207,22 @@ impl MockForwarder {
         m
     }
 
+    /// Script a successful mapping at epoch 0 (the common case).
     pub fn push_ok(&self, port: u16) {
-        self.inner.lock().script.push_back(Ok(port));
+        self.push_result(Ok(MapResult { port, epoch: 0 }));
+    }
+
+    /// Script a successful mapping with an explicit gateway epoch.
+    pub fn push_ok_epoch(&self, port: u16, epoch: u32) {
+        self.push_result(Ok(MapResult { port, epoch }));
     }
 
     pub fn push_err(&self, err: PortForwardError) {
-        self.inner.lock().script.push_back(Err(err));
+        self.push_result(Err(err));
+    }
+
+    fn push_result(&self, r: Result<MapResult, PortForwardError>) {
+        self.inner.lock().script.push_back(r);
     }
 
     pub fn calls(&self) -> Vec<PortMapRequest> {
@@ -182,7 +235,7 @@ impl MockForwarder {
 }
 
 impl PortForwarder for MockForwarder {
-    fn map(&self, req: &PortMapRequest) -> Result<u16, PortForwardError> {
+    fn map(&self, req: &PortMapRequest) -> Result<MapResult, PortForwardError> {
         let mut g = self.inner.lock();
         g.calls.push(*req);
         match g.script.pop_front() {
@@ -231,9 +284,9 @@ mod tests {
     #[test]
     fn mock_repeats_last_result_when_script_exhausted() {
         let m = MockForwarder::with_ports([51413]);
-        assert_eq!(m.map(&req()).unwrap(), 51413);
+        assert_eq!(m.map(&req()).unwrap().port, 51413);
         // Script exhausted → repeats the last value.
-        assert_eq!(m.map(&req()).unwrap(), 51413);
+        assert_eq!(m.map(&req()).unwrap().port, 51413);
         assert_eq!(m.call_count(), 2);
     }
 
@@ -242,8 +295,8 @@ mod tests {
         let fwd = MockForwarder::with_ports([6881]);
         let eng = MockEngine::new();
         let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, tunnel);
-        assert!(matches!(out, RenewOutcome::Unchanged(6881)));
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel);
+        assert!(matches!(out, RenewOutcome::Unchanged { port: 6881, .. }));
         // No apply_settings when the port is stable.
         assert!(!eng
             .calls()
@@ -256,12 +309,13 @@ mod tests {
         let fwd = MockForwarder::with_ports([40001]);
         let eng = MockEngine::new();
         let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, tunnel);
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel);
         assert!(matches!(
             out,
             RenewOutcome::Rebound {
                 previous: 6881,
-                new: 40001
+                new: 40001,
+                ..
             }
         ));
         // Exactly one apply_settings carrying the new tunnel_ip:port bind.
@@ -282,12 +336,42 @@ mod tests {
         fwd.push_err(PortForwardError::Gateway(3));
         let eng = MockEngine::new();
         let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, tunnel);
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel);
         assert!(matches!(out, RenewOutcome::RenewFailed(_)));
         // Renewal failure must not rebind and must never pause torrents.
         assert!(eng.calls().iter().all(|c| !matches!(
             c,
             RecordedCall::ApplySettings(_) | RecordedCall::PauseTorrent(_)
         )));
+    }
+
+    #[test]
+    fn gateway_rebooted_only_on_epoch_regression() {
+        assert!(!gateway_rebooted(0, 5)); // no baseline yet
+        assert!(!gateway_rebooted(100, 160)); // epoch advanced (normal)
+        assert!(gateway_rebooted(100, 50)); // epoch went backwards → reboot
+    }
+
+    #[test]
+    fn renew_surfaces_gateway_reboot_without_extra_work() {
+        // Gateway rebooted: same port, but epoch regressed vs the baseline.
+        let fwd = MockForwarder::new();
+        fwd.push_ok_epoch(6881, 40);
+        let eng = MockEngine::new();
+        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 500, tunnel);
+        assert!(matches!(
+            out,
+            RenewOutcome::Unchanged {
+                port: 6881,
+                epoch: 40,
+                rebooted: true
+            }
+        ));
+        // The map() call already re-established the mapping — no rebind needed.
+        assert!(!eng
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::ApplySettings(_))));
     }
 }
