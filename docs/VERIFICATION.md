@@ -26,6 +26,9 @@ graceful SIGTERM.
 - **No `natpmpc`/`libnatpmp`** — NAT-PMP dynamic port forwarding (§6) is a
   native in-process client, so there's no extra binary or capability beyond the
   `CAP_NET_ADMIN` already needed for VPN bring-up.
+- For the optional network kill switch (§6b) only: the `nft` binary
+  (`nftables`) and running seederd as a dedicated user. Everything else in this
+  runbook works without it.
 
 ---
 
@@ -51,11 +54,16 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 
 # Layer 1 — unit + in-memory (fast; no libtorrent networking/disk)
-# Also covers the NAT-PMP path deterministically (no VPN/root needed):
-#   • wire-format encode/decode + a loopback fake-gateway socket test
-#     (seederd::vpn::natpmp)
-#   • renew → live-rebind decision via MockForwarder + MockEngine
-#     (seederd_engine::port_forward::renew_and_rebind)
+# Also covers, deterministically (no VPN/root needed):
+#   • NAT-PMP wire-format encode/decode incl. gateway epoch, a loopback
+#     fake-gateway socket test, UDP/TCP divergence → release, and lease
+#     teardown (seederd::vpn::natpmp)
+#   • renew → live-rebind + gateway-reboot (epoch regression) decision via
+#     MockForwarder + MockEngine (seederd_engine::port_forward)
+#   • VPN health verdict incl. stale-handshake liveness
+#     (seederd::vpn_monitor::evaluate)
+#   • fail-closed kill-switch ruleset rendering (seederd::vpn::killswitch)
+#   • the vpn_down HTTP guard: resume/add on a fenced slot → 409
 #   • slot-config validation: static needs listen_port, natpmp may omit it
 cargo test --workspace
 
@@ -267,6 +275,27 @@ Expected on tunnel loss: the slot's torrents are **paused**, the slot reports
 an operator must intervene (PRD multi-account safety rule). seeding continues
 unaffected on the other slot.
 
+A fenced slot also **refuses API mutations** that would un-quarantine it — the
+per-torrent `resume`, `resume-all`, and `add` endpoints return `409`:
+
+```bash
+curl -s -o/dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8080/slots/account_a/resume-all   # 409
+```
+
+**Stale-handshake liveness** (WireGuard only): a tunnel can keep its IP while its
+handshake silently stops. The monitor treats a latest-handshake older than
+`vpn_handshake_max_age_secs` (default 180) as down — same pause + `vpn_down` path
+as an IP loss. To force it without dropping the interface, block the WireGuard
+UDP so handshakes stop but the address stays:
+
+```bash
+sudo iptables -I OUTPUT -o wg-acct-a -p udp -j DROP   # freeze handshakes, keep the IP
+# within one poll after the age crosses the threshold:
+curl -fsS http://127.0.0.1:8080/slots/account_a   # status: "vpn_down"
+curl -fsS http://127.0.0.1:8080/metrics | grep 'slot_vpn_handshake_age_seconds{slot_id="account_a"}'  # climbing, then fenced
+sudo iptables -D OUTPUT -o wg-acct-a -p udp -j DROP   # restore (slot stays down; restart to recover)
+```
+
 ### 6a. NAT-PMP dynamic port forwarding (ProtonVPN et al.)
 
 Providers like **ProtonVPN** don't hand out a static forwarded port — it's
@@ -331,6 +360,16 @@ sudo iptables -D OUTPUT -o proton-a -p udp --dport 5351 -j DROP
 # within ~45s: port_forward_ok → true, slot_port_forward_up → 1
 ```
 
+**Gateway reboot (epoch):** the daemon tracks the NAT-PMP epoch. If the gateway
+reboots (epoch regresses) the same renewal re-creates the dropped mapping and
+`slot_vpn_gateway_reboots_total{slot_id="proton_a"}` increments — a real reboot
+is hard to force, but the metric lets you confirm detection if one occurs.
+
+**Lease teardown on shutdown:** on a clean SIGTERM the monitor sends a
+`lifetime=0` NAT-PMP delete per natpmp slot, so the gateway isn't left holding a
+stale forward for the rest of the ~60s lease (best-effort; a `vpn_down` slot is
+skipped since nothing is reachable).
+
 **Live rebind on port change:** when the gateway assigns a different port
 (typically after a reconnect), `slot_forwarded_port` updates and
 `slot_forwarded_port_changes_total` increments, and the live libtorrent session
@@ -348,6 +387,35 @@ cargo test -p seederd            --bin seederd vpn::natpmp
 cargo test -p seederd-engine     port_forward
 ```
 
+### 6b. Network kill switch (fail-closed nftables backstop)
+
+Opt-in defence-in-depth for multi-slot mode: independent of the source-bind and
+the 30s monitor, an nftables table confines the daemon's egress to loopback +
+the slots' tunnel interfaces, so a dropped tunnel fails closed at the kernel.
+Set `network_kill_switch = true`, run seederd as a dedicated user, and ensure
+`nft` is installed (`--check-config` fails early if it isn't).
+
+```bash
+# With the multi-slot daemon (from §6) running under network_kill_switch = true:
+sudo nft list ruleset | grep -A6 'table inet seederd_ks'   # the fail-closed table
+# every seederd socket rides a tunnel IP — never the WAN IP:
+sudo ss -tunp | grep seederd
+```
+
+Confirm it fails closed when a tunnel disappears (the interface, and its
+`oifname`, are gone):
+
+```bash
+sudo wg-quick down wg-acct-a
+# seederd's egress for that uid can no longer match a tunnel oifname → dropped.
+# No new WAN sockets appear; the §6 monitor still pauses the slot within ~30s.
+curl -fsS http://127.0.0.1:8080/metrics | grep '^seederd_kill_switch_active'   # 1 while running
+```
+
+A clean SIGTERM removes the table (`nft list ruleset` no longer shows
+`seederd_ks`). If the daemon is killed uncleanly, the next start replaces the
+stale table before installing the fresh one.
+
 ---
 
 ## 7. Success checklist
@@ -359,6 +427,10 @@ cargo test -p seederd-engine     port_forward
       gauges appear after ~30 s.
 - [ ] SIGHUP switches log level live; SIGTERM writes `session_state.dat` + `.resume`.
 - [ ] (If applicable) tunnel loss pauses a slot, sets `slot_vpn_tunnel_up=0`, no auto-restart.
+- [ ] (If applicable) a stale WireGuard handshake (IP intact) also fences the slot;
+      `resume`/`resume-all`/`add` on a `vpn_down` slot return `409`.
+- [ ] (If applicable) with `network_kill_switch=true`, `nft list ruleset` shows
+      `seederd_ks`, `seederd_kill_switch_active=1`, and SIGTERM removes the table.
 - [ ] (If applicable) a natpmp slot binds a negotiated `forwarded_port` at boot;
       `slot_port_forward_up=1` and `slot_port_forward_renewals_total` climbs.
 - [ ] (If applicable) blocking NAT-PMP egress flips `port_forward_ok=false` /
