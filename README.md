@@ -29,6 +29,7 @@ seederd does **one** thing: seed torrents whose payload already exists on disk.
 | `libtorrent-safe` | Safe RAII wrappers over the FFI. |
 | `libtorrent-sys` | Raw FFI bindings to libtorrent-rasterbar via a custom C shim. |
 | `seederd-bench` | Layer-4 load/soak harness (memory scaling, alert throughput, startup time). |
+| `web/` | React + TypeScript client, built by `crates/seederd/build.rs` and embedded in the binary. |
 
 ## Quick start
 
@@ -221,6 +222,35 @@ Private-tracker isolation is layered, and honest about its limits:
 `allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds, not
 an egress control. Public content that wants DHT belongs in single-session mode
 (bare IP); a private slot cannot serve DHT.
+
+## Web client
+
+The daemon serves a web client at `/`, embedded in the binary, so a deployment
+stays one artifact. Its primary view is the **pool browser**: the filesystem
+annotated with what is protected and what is not, with byte rollups per
+directory, so an unprotected subtree is visible without expanding anything.
+Adoption runs from there — always dry-run first, showing how many torrents seed
+immediately, how many need hashing, and how many bytes that is.
+
+There is also a virtualised torrent list (built for 100K rows) and a slot view
+for VPN and port-forward health.
+
+Updates arrive over SSE (`GET /api/events`): the daemon emits a tick when
+something visible changes and the client refetches only the panels it has
+mounted. Pushing per-torrent deltas would cost exactly what the state map was
+designed to avoid. Polling every 15s is the fallback when the stream drops.
+
+Client routes use the fragment (`#/pool`) rather than the path, because the
+pre-`/api` compatibility aliases mean `/pool` and `/torrents` are real API
+endpoints — a path-based route would collide with them and get a 401.
+
+`cargo build` builds the bundle and embeds it, so Node is a build dependency by
+default. `cargo build --no-default-features` skips all of that and produces the
+headless daemon, which CI covers as its own job.
+
+```bash
+cd web && npm run dev     # dev server, proxying the API to :8080
+```
 
 ## Authentication
 

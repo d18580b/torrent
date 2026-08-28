@@ -41,6 +41,11 @@ run = "cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
 description = "Workspace tests (default features; parity with CI)"
 run = "cargo test --workspace"
 
+[tasks.web]
+description = "Type-check and bundle the web client"
+dir = "web"
+run = ["npm ci", "npm run build"]
+
 [tasks.check]
 description = "Formatting + clippy"
 depends = ["fmt", "lint"]

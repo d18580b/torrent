@@ -575,11 +575,15 @@ All existing session-level metrics gain a `slot` label when slots are configured
 
 ## Out of Scope
 
+> **Superseded in part.** The web-frontend row was removed: a client now ships
+> embedded in the binary (README §Web client), and authentication is built in
+> rather than delegated entirely to a reverse proxy. Managing a multi-terabyte
+> pool through `curl` alone turned out not to be sufficient.
+
 | Feature | Reason |
 |---------|--------|
 | Downloading | Seeder-only; files placed externally |
 | Torrent creation | Separate tooling concern |
-| Web frontend | HTTP API is sufficient; frontend is operator's choice |
 | Windows / macOS | Linux server only; reduces porting surface |
 | Auto-discovery of torrents from disk | Operator controls inventory explicitly |
 | Plugin / extension interface | Increases surface area and complexity |
