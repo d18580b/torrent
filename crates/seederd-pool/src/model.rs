@@ -145,3 +145,73 @@ pub struct DirRollup {
     pub files_total: u64,
     pub files_orphan: u64,
 }
+
+// ---------------------------------------------------------------------------
+// Plans
+// ---------------------------------------------------------------------------
+
+/// A mutation the operator has asked for but not yet applied.
+///
+/// Every change to the filesystem goes through one of these. Computing the
+/// steps and executing them are separate calls so the operator always sees the
+/// exact diff first, and so an interrupted apply can be resumed from the
+/// journal rather than guessed at.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanRow {
+    pub id: i64,
+    pub kind: String,
+    pub created_at: i64,
+    pub applied_at: Option<i64>,
+    /// `draft` | `applying` | `applied` | `failed` | `cancelled`
+    pub status: String,
+    /// JSON describing what was requested, kept so a resumed plan can be
+    /// re-validated against the world as it is now.
+    pub spec: String,
+}
+
+/// One filesystem operation, written to the journal before it is attempted.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanStep {
+    /// `move_torrent` | `move_file` | `delete_file`
+    pub op: String,
+    pub src: String,
+    pub dst: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanStepRow {
+    pub seq: i64,
+    pub op: String,
+    pub src: String,
+    pub dst: Option<String>,
+    /// `pending` | `done` | `failed` | `skipped`
+    pub status: String,
+    pub error: Option<String>,
+}
+
+/// Operation names, kept in one place so the journal and the executor cannot
+/// drift apart.
+pub mod ops {
+    /// Relocate an adopted torrent's payload. libtorrent performs the move so
+    /// its storage state stays consistent with the session.
+    pub const MOVE_TORRENT: &str = "move_torrent";
+    /// Move a file no torrent claims. seederd performs this one directly.
+    pub const MOVE_FILE: &str = "move_file";
+    /// Delete a file no torrent claims.
+    pub const DELETE_FILE: &str = "delete_file";
+}
+
+pub mod plan_status {
+    pub const DRAFT: &str = "draft";
+    pub const APPLYING: &str = "applying";
+    pub const APPLIED: &str = "applied";
+    pub const FAILED: &str = "failed";
+    pub const CANCELLED: &str = "cancelled";
+}
+
+pub mod step_status {
+    pub const PENDING: &str = "pending";
+    pub const DONE: &str = "done";
+    pub const FAILED: &str = "failed";
+    pub const SKIPPED: &str = "skipped";
+}

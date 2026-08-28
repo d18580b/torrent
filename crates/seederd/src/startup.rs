@@ -491,6 +491,17 @@ impl DaemonHandle {
             ));
         }
 
+        // Re-drive any plan a crash or a kill left mid-apply, before the API
+        // can accept new ones. A half-applied reorganisation is exactly the
+        // state an operator cannot reason about.
+        if let Some(pool) = pool.clone() {
+            let src = source.clone();
+            let st = state.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::pool_apply::resume_unfinished(&pool, &src, &st)
+            });
+        }
+
         // Verify queue: admits a bounded number of adopt-time re-hashes so a
         // bulk adopt cannot starve whatever is already seeding.
         if let Some(pool) = pool.clone() {
