@@ -26,6 +26,9 @@ pub struct AppState {
     /// startup inventory scan can re-add them if resume data is lost.
     pub torrents: Arc<dyn TorrentStore>,
     pub metrics: Arc<PromSink>,
+    /// Managed-pool index + adoption. `None` when no `[pool]` section is set,
+    /// in which case the `/api/pool` routes are not mounted at all.
+    pub pool: Option<Arc<crate::pool_service::PoolService>>,
     /// Alert-loop liveness stamp (Unix millis at its last iteration). Read by
     /// `/healthz` so a wedged loop makes the daemon report unready.
     pub alert_heartbeat: Arc<AtomicU64>,
@@ -81,6 +84,7 @@ pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
         state: Arc::new(StateMap::new()),
         torrents: Arc::new(MemoryTorrentStore::new()),
         metrics: Arc::new(PromSink::new()),
+        pool: None,
         alert_heartbeat: Arc::new(AtomicU64::new(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

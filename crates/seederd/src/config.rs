@@ -117,6 +117,12 @@ pub struct PoolConfig {
     #[serde(default)]
     pub db_path: Option<PathBuf>,
 
+    /// How many torrents may be hashing at once during a bulk adopt. Adopting
+    /// a large subtree otherwise saturates the disk and starves whatever is
+    /// already seeding.
+    #[serde(default = "PoolConfig::default_max_concurrent_verify")]
+    pub max_concurrent_verify: usize,
+
     /// Fold a legacy `slot_assignments.json` into the index on the next scan.
     /// The JSON is left on disk; existing in-index assignments always win.
     #[serde(default = "PoolConfig::default_true")]
@@ -126,6 +132,9 @@ pub struct PoolConfig {
 impl PoolConfig {
     fn default_true() -> bool {
         true
+    }
+    fn default_max_concurrent_verify() -> usize {
+        4
     }
 }
 

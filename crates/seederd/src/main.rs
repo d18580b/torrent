@@ -13,6 +13,7 @@ mod config;
 mod http;
 mod metrics_sink;
 mod pool_cmd;
+mod pool_service;
 mod port_forward_monitor;
 mod reload;
 mod sd_notify;

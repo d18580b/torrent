@@ -30,6 +30,7 @@
 //!    no per-file digest — pieces span file boundaries — so they match on
 //!    `(path, size)` and are only confirmed by step 2.
 
+pub mod adopt;
 pub mod drift;
 pub mod fastresume;
 pub mod matcher;
@@ -37,6 +38,8 @@ pub mod model;
 pub mod scan;
 pub mod store;
 
+pub use adopt::AdoptPlan;
+pub use adopt::AdoptPreview;
 pub use matcher::match_all;
 pub use matcher::MatchStats;
 pub use model::AdoptionState;
