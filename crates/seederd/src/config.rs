@@ -93,6 +93,40 @@ pub struct Config {
     /// `[[slot]]` array. Empty → single-session mode.
     #[serde(default)]
     pub slot: Vec<SlotConfig>,
+
+    /// Managed-pool configuration. Absent → the pool index is not maintained
+    /// and the daemon behaves exactly as before.
+    #[serde(default)]
+    pub pool: Option<PoolConfig>,
+}
+
+/// The directories seederd indexes, and where it keeps the index.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PoolConfig {
+    /// Directories the daemon indexes. Read-only during scanning.
+    pub roots: Vec<PathBuf>,
+
+    /// Directory of `.torrent` files to match against. For a migration this is
+    /// the other client's state directory — qBittorrent's `BT_backup`, which
+    /// also holds the `.fastresume` sidecars the scanner reads for save-path,
+    /// category and tag hints.
+    pub library_dir: PathBuf,
+
+    /// Index location. Defaults to `<resume_dir parent>/pool.db`.
+    #[serde(default)]
+    pub db_path: Option<PathBuf>,
+
+    /// Fold a legacy `slot_assignments.json` into the index on the next scan.
+    /// The JSON is left on disk; existing in-index assignments always win.
+    #[serde(default = "PoolConfig::default_true")]
+    pub import_legacy_registry: bool,
+}
+
+impl PoolConfig {
+    fn default_true() -> bool {
+        true
+    }
 }
 
 impl Config {
@@ -115,6 +149,24 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.slot.is_empty() {
             SlotConfig::validate_set(&self.slot).context("[[slot]] validation failed")?;
+        }
+        if let Some(pool) = &self.pool {
+            if pool.roots.is_empty() {
+                anyhow::bail!("[pool] is configured but `roots` is empty");
+            }
+            // Nested roots would index the same bytes twice and report every
+            // torrent over them as an overlap.
+            for (i, a) in pool.roots.iter().enumerate() {
+                for b in pool.roots.iter().skip(i + 1) {
+                    if a.starts_with(b) || b.starts_with(a) {
+                        anyhow::bail!(
+                            "[pool] roots must not nest: {} and {}",
+                            a.display(),
+                            b.display(),
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -202,24 +254,32 @@ impl Config {
 
     /// Where the assignment registry should be persisted.
     pub fn registry_path(&self) -> PathBuf {
-        self.registry_path.clone().unwrap_or_else(|| {
-            self.resume_dir
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("/var/lib/seederd"))
-                .join("slot_assignments.json")
-        })
+        self.registry_path
+            .clone()
+            .unwrap_or_else(|| self.state_dir().join("slot_assignments.json"))
+    }
+
+    /// Where the pool index lives.
+    pub fn pool_db_path(&self) -> PathBuf {
+        self.pool
+            .as_ref()
+            .and_then(|p| p.db_path.clone())
+            .unwrap_or_else(|| self.state_dir().join("pool.db"))
+    }
+
+    /// Directory the daemon keeps its own state in, derived from `resume_dir`.
+    fn state_dir(&self) -> PathBuf {
+        self.resume_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("/var/lib/seederd"))
     }
 
     /// Where DHT/session state should be persisted (single-session mode).
     pub fn session_state_path(&self) -> PathBuf {
-        self.session_state_path.clone().unwrap_or_else(|| {
-            self.resume_dir
-                .parent()
-                .map(|p| p.to_path_buf())
-                .unwrap_or_else(|| PathBuf::from("/var/lib/seederd"))
-                .join("session_state.dat")
-        })
+        self.session_state_path
+            .clone()
+            .unwrap_or_else(|| self.state_dir().join("session_state.dat"))
     }
 }
 

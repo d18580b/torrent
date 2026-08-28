@@ -12,6 +12,7 @@ mod cli;
 mod config;
 mod http;
 mod metrics_sink;
+mod pool_cmd;
 mod port_forward_monitor;
 mod reload;
 mod sd_notify;
@@ -28,6 +29,8 @@ use tracing::error;
 use tracing::info;
 
 use crate::cli::Cli;
+use crate::cli::Command;
+use crate::cli::PoolCmd;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -42,6 +45,20 @@ fn main() -> anyhow::Result<()> {
         }
         eprintln!("config OK");
         return Ok(());
+    }
+
+    // Subcommands are operator tools, not the daemon: they run to completion
+    // on this thread and never construct a session.
+    if let Some(command) = cli.command {
+        tracing_init::init(cfg.log_level);
+        return match command {
+            Command::Pool { cmd } => match cmd {
+                PoolCmd::Scan => pool_cmd::scan(&cfg),
+                PoolCmd::Status => pool_cmd::status(&cfg),
+                PoolCmd::Check => pool_cmd::check(&cfg),
+                PoolCmd::Orphans { limit } => pool_cmd::orphans(&cfg, limit),
+            },
+        };
     }
 
     let log_handle = tracing_init::init(cfg.log_level);
