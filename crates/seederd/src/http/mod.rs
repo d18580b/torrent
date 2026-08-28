@@ -56,7 +56,13 @@ pub fn router(state: AppState) -> Router {
             .route("/pool/drift", get(pool::drift))
             .route("/pool/scan", post(pool::scan))
             .route("/pool/adopt", post(pool::adopt))
-            .route("/pool/verify", post(pool::verify));
+            .route("/pool/verify", post(pool::verify))
+            .route("/pool/plans", get(pool::list_plans).post(pool::create_plan))
+            .route(
+                "/pool/plans/:id",
+                get(pool::get_plan).delete(pool::delete_plan),
+            )
+            .route("/pool/plans/:id/apply", post(pool::apply_plan));
     }
 
     Router::new()

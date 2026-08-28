@@ -4,6 +4,7 @@
 //! and how much of it is protected" without shipping a file listing to the
 //! client, which is the only way this stays usable at petabyte scale.
 
+use axum::extract::Path as AxPath;
 use axum::extract::Query;
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -594,4 +595,191 @@ pub async fn drift(State(s): State<AppState>) -> Result<Json<DriftResponse>, Api
         files_changed: report.files_changed,
         files_vanished: report.files_vanished,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Mutation plans
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct CreatePlanRequest {
+    #[serde(flatten)]
+    spec: seederd_pool::PlanSpec,
+}
+
+#[derive(Serialize)]
+pub struct PlanView {
+    id: i64,
+    kind: String,
+    status: String,
+    created_at: i64,
+    applied_at: Option<i64>,
+    steps: Vec<seederd_pool::model::PlanStepRow>,
+    /// Present only for plans that destroy data; must be echoed back to apply.
+    confirm_token: Option<String>,
+}
+
+/// Compute a plan. Touches nothing on disk.
+pub async fn create_plan(
+    State(s): State<AppState>,
+    Json(req): Json<CreatePlanRequest>,
+) -> Result<(StatusCode, Json<PlanView>), ApiError> {
+    let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+    let kind = req.spec.kind();
+
+    let built = pool
+        .with_store(|st| seederd_pool::plan::build(st, &req.spec, |id| pool.root_path_of(id)))
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let steps = match built {
+        Ok(steps) => steps,
+        // A refusal is the expected outcome for overlap, drift, or an occupied
+        // destination — a 409 with the reason, not a 500.
+        Err(refused) => return Err(err(StatusCode::CONFLICT, refused)),
+    };
+
+    let spec_json =
+        serde_json::to_string(&req.spec).map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let id = pool
+        .with_store(|st| st.create_plan(kind, &spec_json, now_secs()))
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    pool.with_store_mut(|st| st.add_plan_steps(id, &steps))
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let view = plan_view(&s, id)?;
+    info!(
+        target: "seederd::http::pool",
+        plan_id = id,
+        kind = %kind,
+        step_count = view.steps.len(),
+        "plan created (nothing applied)",
+    );
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+pub async fn get_plan(
+    State(s): State<AppState>,
+    AxPath(id): AxPath<i64>,
+) -> Result<Json<PlanView>, ApiError> {
+    Ok(Json(plan_view(&s, id)?))
+}
+
+#[derive(Serialize)]
+pub struct PlanListEntry {
+    id: i64,
+    kind: String,
+    status: String,
+    created_at: i64,
+    applied_at: Option<i64>,
+}
+
+pub async fn list_plans(State(s): State<AppState>) -> Result<Json<Vec<PlanListEntry>>, ApiError> {
+    let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+    let rows = pool
+        .with_store(|st| st.plans())
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|p| PlanListEntry {
+                id: p.id,
+                kind: p.kind,
+                status: p.status,
+                created_at: p.created_at,
+                applied_at: p.applied_at,
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize, Default)]
+pub struct ApplyRequest {
+    /// Required for plans that destroy data; the value comes from the plan.
+    #[serde(default)]
+    confirm: Option<String>,
+}
+
+pub async fn apply_plan(
+    State(s): State<AppState>,
+    AxPath(id): AxPath<i64>,
+    body: Option<Json<ApplyRequest>>,
+) -> Result<Json<crate::pool_apply::ApplyOutcome>, ApiError> {
+    let pool = s.pool.clone().ok_or_else(no_pool)?;
+    let view = plan_view(&s, id)?;
+
+    // Deleting data takes a second, deliberate call carrying a value only the
+    // plan could have produced. Not a security control — a guard against
+    // applying the wrong plan id.
+    if let Some(expected) = &view.confirm_token {
+        let got = body.as_ref().and_then(|b| b.0.confirm.clone());
+        if got.as_deref() != Some(expected.as_str()) {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "this plan deletes data; re-send with the plan's confirm token",
+            ));
+        }
+    }
+
+    let source = s.source.clone();
+    let state = s.state.clone();
+    // Moving payload is blocking work and can run long; keep it off the async
+    // runtime so the rest of the API stays responsive.
+    let outcome =
+        tokio::task::spawn_blocking(move || crate::pool_apply::apply(&pool, &source, &state, id))
+            .await
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .map_err(|e| err(StatusCode::CONFLICT, e))?;
+
+    Ok(Json(outcome))
+}
+
+pub async fn delete_plan(
+    State(s): State<AppState>,
+    AxPath(id): AxPath<i64>,
+) -> Result<StatusCode, ApiError> {
+    let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+    let Some(plan) = pool
+        .with_store(|st| st.plan(id))
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    else {
+        return Err(err(StatusCode::NOT_FOUND, "no such plan"));
+    };
+    if plan.status == seederd_pool::model::plan_status::APPLYING {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "plan is mid-apply; it will be resumed rather than discarded",
+        ));
+    }
+    pool.with_store(|st| st.delete_plan(id))
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+fn plan_view(s: &AppState, id: i64) -> Result<PlanView, ApiError> {
+    let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+    let Some(plan) = pool
+        .with_store(|st| st.plan(id))
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    else {
+        return Err(err(StatusCode::NOT_FOUND, "no such plan"));
+    };
+    let steps = pool
+        .with_store(|st| st.plan_steps(id))
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let confirm_token = seederd_pool::plan::is_destructive(&plan.kind)
+        .then(|| seederd_pool::plan::confirm_token(id, &steps));
+    Ok(PlanView {
+        id: plan.id,
+        kind: plan.kind,
+        status: plan.status,
+        created_at: plan.created_at,
+        applied_at: plan.applied_at,
+        steps,
+        confirm_token,
+    })
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }

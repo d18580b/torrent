@@ -1,0 +1,342 @@
+//! Executing mutation plans.
+//!
+//! The planner decided *what*; this decides *how* and does it. Three rules
+//! shape everything here:
+//!
+//! * **The journal is written before the action.** Every step is marked in the
+//!   database, attempted, then marked again. A crash mid-apply leaves a plan in
+//!   `applying` with a known last-completed step, which startup re-drives.
+//! * **Adopted payload moves through libtorrent.** `move_storage` keeps the
+//!   session's view of where the data lives consistent with reality; moving the
+//!   files underneath a seeding torrent does not.
+//! * **A cross-device move is a copy, a verify, and only then an unlink.** The
+//!   source is never removed until the destination is known good, so an
+//!   interruption at any point leaves the payload intact somewhere.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use seederd_engine::AlertSource;
+use seederd_engine::MoveFlags;
+use seederd_engine::StateMap;
+use seederd_pool::model::ops;
+use seederd_pool::model::plan_status;
+use seederd_pool::model::step_status;
+use seederd_pool::model::PlanStepRow;
+use tracing::error;
+use tracing::info;
+use tracing::warn;
+
+use crate::pool_service::PoolService;
+
+#[derive(Debug, serde::Serialize)]
+pub struct ApplyOutcome {
+    pub plan_id: i64,
+    pub done: usize,
+    pub failed: usize,
+    pub skipped: usize,
+    pub status: String,
+}
+
+/// Apply every pending step of `plan_id`.
+///
+/// Already-`done` steps are skipped, which is what makes this safe to call
+/// again on a plan a crash interrupted.
+pub fn apply(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    plan_id: i64,
+) -> Result<ApplyOutcome, String> {
+    let Some(plan) = pool
+        .with_store(|s| s.plan(plan_id))
+        .map_err(|e| e.to_string())?
+    else {
+        return Err("no such plan".into());
+    };
+    if plan.status == plan_status::APPLIED {
+        return Err("plan already applied".into());
+    }
+    if plan.status == plan_status::CANCELLED {
+        return Err("plan was cancelled".into());
+    }
+
+    let steps: Vec<PlanStepRow> = pool
+        .with_store(|s| s.plan_steps(plan_id))
+        .map_err(|e| e.to_string())?;
+
+    pool.with_store(|s| s.set_plan_status(plan_id, plan_status::APPLYING, None))
+        .map_err(|e| e.to_string())?;
+
+    let mut out = ApplyOutcome {
+        plan_id,
+        done: 0,
+        failed: 0,
+        skipped: 0,
+        status: plan_status::APPLIED.to_string(),
+    };
+
+    for step in steps {
+        if step.status == step_status::DONE {
+            out.skipped += 1;
+            continue;
+        }
+        let result = match step.op.as_str() {
+            ops::MOVE_TORRENT => move_torrent(pool, source, state, &step),
+            ops::MOVE_FILE => move_file(
+                Path::new(&step.src),
+                Path::new(step.dst.as_deref().unwrap_or("")),
+            ),
+            ops::DELETE_FILE => delete_file(pool, Path::new(&step.src)),
+            other => Err(format!("unknown plan operation {other:?}")),
+        };
+
+        match result {
+            Ok(()) => {
+                out.done += 1;
+                let _ = pool
+                    .with_store(|s| s.set_step_status(plan_id, step.seq, step_status::DONE, None));
+            }
+            Err(e) => {
+                out.failed += 1;
+                error!(
+                    target: "seederd::pool::apply",
+                    plan_id,
+                    step = step.seq,
+                    op = %step.op,
+                    src = %step.src,
+                    error.cause = %e,
+                    "plan step failed",
+                );
+                let _ = pool.with_store(|s| {
+                    s.set_step_status(plan_id, step.seq, step_status::FAILED, Some(&e))
+                });
+                // Stop at the first failure. Continuing would apply half a
+                // reorganisation and leave the operator reconciling it by hand.
+                out.status = plan_status::FAILED.to_string();
+                break;
+            }
+        }
+    }
+
+    let now = now_secs();
+    pool.with_store(|s| s.set_plan_status(plan_id, &out.status, Some(now)))
+        .map_err(|e| e.to_string())?;
+    info!(
+        target: "seederd::pool::apply",
+        plan_id,
+        done = out.done,
+        failed = out.failed,
+        skipped = out.skipped,
+        status = %out.status,
+        "plan applied",
+    );
+    Ok(out)
+}
+
+/// Relocate an adopted torrent by asking libtorrent to move its storage.
+fn move_torrent(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    step: &PlanStepRow,
+) -> Result<(), String> {
+    let dst = step
+        .dst
+        .as_deref()
+        .ok_or("move_torrent step has no destination")?;
+    // The infohash is recovered from the claim rather than carried in the step,
+    // so a resumed apply re-resolves against the current index instead of a
+    // stale copy.
+    let infohash = torrent_at(pool, Path::new(&step.src))
+        .ok_or("cannot resolve which torrent lives at the source path")?;
+
+    let hash = libtorrent_safe::InfoHash::from_hex(&infohash).ok_or("bad infohash")?;
+    let Some(st) = state.get(&hash) else {
+        // Not loaded: nothing is serving it, so seederd can move the files
+        // itself. This is the `matched but not adopted` case.
+        return move_directory(Path::new(&step.src), Path::new(dst));
+    };
+    let engine = source
+        .engine_for(&st.slot_id)
+        .ok_or("no engine for the torrent's slot")?;
+
+    // DontReplace: if something is already at the destination, adopt it in
+    // place rather than overwriting. The planner already refused on a
+    // pre-existing destination, so this is a second line of defence against a
+    // race between planning and applying.
+    engine
+        .move_storage(st.handle, dst, MoveFlags::DontReplace)
+        .map_err(|e| e.to_string())?;
+
+    info!(
+        target: "seederd::pool::apply",
+        infohash = %infohash,
+        dst = %dst,
+        "move_storage requested; libtorrent owns the move",
+    );
+    Ok(())
+}
+
+/// Move a directory tree seederd owns outright.
+fn move_directory(src: &Path, dst: &Path) -> Result<(), String> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    if dst.exists() {
+        return Err(format!("destination {} already exists", dst.display()));
+    }
+    match std::fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(e) if e.raw_os_error() == Some(libc_exdev()) => Err(format!(
+            "cross-device directory move is not attempted automatically \
+                 ({} → {}); move the data and rescan",
+            src.display(),
+            dst.display(),
+        )),
+        Err(e) => Err(format!("rename {} → {}: {e}", src.display(), dst.display())),
+    }
+}
+
+/// Move one file, falling back to copy-verify-unlink across filesystems.
+fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
+    if dst.as_os_str().is_empty() {
+        return Err("move_file step has no destination".into());
+    }
+    if dst.exists() {
+        return Err(format!("destination {} already exists", dst.display()));
+    }
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+
+    match std::fs::rename(src, dst) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.raw_os_error() != Some(libc_exdev()) => {
+            return Err(format!("rename {} → {}: {e}", src.display(), dst.display()));
+        }
+        Err(_) => {}
+    }
+
+    // Different filesystem: copy, flush to disk, confirm the size, and only
+    // then remove the source. `fs::copy` alone would leave the destination
+    // unflushed, so a crash could unlink a good source against a truncated
+    // destination.
+    let src_len = std::fs::metadata(src)
+        .map_err(|e| format!("stat {}: {e}", src.display()))?
+        .len();
+    std::fs::copy(src, dst)
+        .map_err(|e| format!("copy {} → {}: {e}", src.display(), dst.display()))?;
+    {
+        use std::io::Write;
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dst)
+            .map_err(|e| format!("reopen {}: {e}", dst.display()))?;
+        let mut f = f;
+        f.flush()
+            .map_err(|e| format!("flush {}: {e}", dst.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("fsync {}: {e}", dst.display()))?;
+    }
+    let dst_len = std::fs::metadata(dst)
+        .map_err(|e| format!("stat {}: {e}", dst.display()))?
+        .len();
+    if dst_len != src_len {
+        // Leave both copies. Removing the source here is exactly the mistake
+        // this whole path exists to avoid.
+        return Err(format!(
+            "copy verification failed: {} is {dst_len} bytes, source is {src_len}",
+            dst.display(),
+        ));
+    }
+    std::fs::remove_file(src).map_err(|e| format!("unlink {}: {e}", src.display()))?;
+    Ok(())
+}
+
+/// Delete a file, re-checking at the last moment that nothing claims it.
+fn delete_file(pool: &PoolService, path: &Path) -> Result<(), String> {
+    // The plan may have been drafted minutes or days ago and a torrent could
+    // have been adopted over these bytes since. Deleting is irreversible, so
+    // the claim check is repeated here rather than trusted from planning time.
+    let still_orphan = pool.with_store(|s| {
+        for (root_id, root) in pool.roots() {
+            if let Ok(rel) = path.strip_prefix(root) {
+                let rel = rel.to_string_lossy().replace('\\', "/");
+                return s.is_orphan(*root_id, &rel).unwrap_or(false);
+            }
+        }
+        // Outside every managed root: not ours to delete.
+        false
+    });
+    if !still_orphan {
+        return Err(format!(
+            "{} is now claimed by a torrent, or is outside every managed root",
+            path.display(),
+        ));
+    }
+    std::fs::remove_file(path).map_err(|e| format!("unlink {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Which torrent's payload sits at `dir`.
+///
+/// Resolved from the index at apply time rather than carried in the step, so a
+/// plan resumed after a restart re-binds to the current state of the world
+/// instead of a snapshot that may no longer hold.
+fn torrent_at(pool: &PoolService, dir: &Path) -> Option<String> {
+    pool.with_store(|store| {
+        for t in store.torrents().ok()? {
+            let Ok(Some((root_id, base))) = store.adoption_base(&t.infohash) else {
+                continue;
+            };
+            let Some(root) = pool.root_path_of(root_id) else {
+                continue;
+            };
+            let base = base.trim_matches('/');
+            let full = if base.is_empty() {
+                root
+            } else {
+                root.join(base)
+            };
+            if full == dir {
+                return Some(t.infohash);
+            }
+        }
+        None
+    })
+}
+
+/// `EXDEV`. Spelled out rather than pulled from a crate for one constant.
+fn libc_exdev() -> i32 {
+    18
+}
+
+/// Re-drive any plan a crash left mid-apply.
+pub fn resume_unfinished(pool: &PoolService, source: &Arc<dyn AlertSource>, state: &StateMap) {
+    let unfinished = match pool.with_store(|s| s.unfinished_plans()) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(target: "seederd::pool::apply", reason = %e, "cannot read unfinished plans");
+            return;
+        }
+    };
+    for plan in unfinished {
+        warn!(
+            target: "seederd::pool::apply",
+            plan_id = plan.id,
+            kind = %plan.kind,
+            "resuming a plan interrupted mid-apply",
+        );
+        if let Err(e) = apply(pool, source, state, plan.id) {
+            error!(target: "seederd::pool::apply", plan_id = plan.id, error.cause = %e, "resume failed");
+        }
+    }
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}

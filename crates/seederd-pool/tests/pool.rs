@@ -705,3 +705,375 @@ fn preview_splits_a_subtree_by_what_it_would_cost() {
     // or days of disk reads.
     assert_eq!(pv.verify_bytes, 2000);
 }
+
+// ---------------------------------------------------------------------------
+// mutation plans
+// ---------------------------------------------------------------------------
+
+use seederd_pool::plan::PlanSpec;
+
+fn build_plan(
+    store: &PoolStore,
+    spec: &PlanSpec,
+    root_id: i64,
+    root: &Path,
+) -> Result<Vec<seederd_pool::model::PlanStep>, String> {
+    let r = root.to_path_buf();
+    seederd_pool::plan::build(store, spec, |id| (id == root_id).then(|| r.clone()))
+        .unwrap()
+        .map_err(|e| e.to_string())
+}
+
+#[test]
+fn a_relocate_plan_is_one_move_and_touches_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "src/T/a.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "r1", "T", None, &[("T/a.bin", 128)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "r1".into(),
+            dest_root_id: root_id,
+            dest_rel: "dest".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].op, seederd_pool::model::ops::MOVE_TORRENT);
+    assert!(steps[0].dst.as_ref().unwrap().ends_with("dest"));
+    // Planning must not have moved anything.
+    assert!(root.join("src/T/a.bin").exists());
+    assert!(!root.join("dest").exists());
+}
+
+#[test]
+fn relocating_an_overlapping_torrent_is_refused() {
+    // The rule that keeps full write authority survivable: these bytes belong
+    // to two torrents, so moving them for one breaks the other.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "S/shared.bin", 64);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "o1", "S", None, &[("S/shared.bin", 64)]);
+    add_torrent(&mut store, "o2", "S", None, &[("S/shared.bin", 64)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let e = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "o1".into(),
+            dest_root_id: root_id,
+            dest_rel: "elsewhere".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(e.contains("another torrent"), "got {e}");
+}
+
+#[test]
+fn relocating_a_drifted_torrent_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_file(&root, "D/a.bin", 256);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    seederd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "d1", "D", None, &[("D/a.bin", 256)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::write(root.join("D/a.bin"), vec![b'z'; 256]).unwrap();
+    let r = root.clone();
+    seederd_pool::drift::detect(&mut store, |_| Some(r.clone())).unwrap();
+
+    let e = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "d1".into(),
+            dest_root_id: root_id,
+            dest_rel: "dest".into(),
+        },
+        root_id,
+        &root,
+    )
+    .unwrap_err();
+    assert!(e.contains("changed since the last scan"), "got {e}");
+}
+
+#[test]
+fn relocating_onto_existing_files_is_refused() {
+    // Never merge, never overwrite: an occupied destination means stopping and
+    // letting a person look at it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 128);
+    write_file(root, "dest/T/a.bin", 999);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "x1", "T", None, &[("T/a.bin", 128)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let e = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "x1".into(),
+            dest_root_id: root_id,
+            dest_rel: "dest".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(e.contains("already contains"), "got {e}");
+}
+
+#[test]
+fn delete_orphans_targets_only_unclaimed_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "keep/claimed.bin", 100);
+    write_file(root, "keep/loose.bin", 200);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "k1", "keep", None, &[("keep/claimed.bin", 100)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: String::new(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+
+    assert_eq!(steps.len(), 1, "only the unclaimed file may be targeted");
+    assert!(steps[0].src.ends_with("keep/loose.bin"));
+    // Both files must still be on disk: planning is not applying.
+    assert!(root.join("keep/claimed.bin").exists());
+    assert!(root.join("keep/loose.bin").exists());
+}
+
+#[test]
+fn delete_orphans_is_scoped_to_the_named_subtree() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "a/loose1.bin", 10);
+    write_file(root, "b/loose2.bin", 20);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "a".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1);
+    assert!(
+        steps[0].src.ends_with("a/loose1.bin"),
+        "got {}",
+        steps[0].src
+    );
+}
+
+#[test]
+fn is_orphan_refuses_paths_the_index_has_never_seen() {
+    // The last-moment check before an irreversible delete. A path outside the
+    // index was never sanctioned for deletion, even though nothing claims it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "known.bin", 10);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+
+    assert!(store.is_orphan(root_id, "known.bin").unwrap());
+    assert!(!store.is_orphan(root_id, "never-indexed.bin").unwrap());
+
+    // Once claimed, it stops being a deletion candidate.
+    add_torrent(&mut store, "c1", "known", None, &[("known.bin", 10)]);
+    seederd_pool::match_all(&mut store).unwrap();
+    assert!(!store.is_orphan(root_id, "known.bin").unwrap());
+}
+
+#[test]
+fn the_confirm_token_changes_with_the_plan() {
+    // A token from one plan must not authorise a different one.
+    use seederd_pool::model::PlanStepRow;
+    let a = vec![PlanStepRow {
+        seq: 0,
+        op: "delete_file".into(),
+        src: "/data/a".into(),
+        dst: None,
+        status: "pending".into(),
+        error: None,
+    }];
+    let b = vec![PlanStepRow {
+        seq: 0,
+        op: "delete_file".into(),
+        src: "/data/b".into(),
+        dst: None,
+        status: "pending".into(),
+        error: None,
+    }];
+    assert_ne!(
+        seederd_pool::plan::confirm_token(1, &a),
+        seederd_pool::plan::confirm_token(1, &b),
+        "different steps must not share a token",
+    );
+    assert_ne!(
+        seederd_pool::plan::confirm_token(1, &a),
+        seederd_pool::plan::confirm_token(2, &a),
+        "different plan ids must not share a token",
+    );
+    assert_eq!(
+        seederd_pool::plan::confirm_token(1, &a),
+        seederd_pool::plan::confirm_token(1, &a),
+        "the token must be stable for the same plan",
+    );
+    assert!(seederd_pool::plan::is_destructive("delete_orphans"));
+    assert!(!seederd_pool::plan::is_destructive("relocate"));
+}
+
+#[test]
+fn plan_steps_are_journaled_before_they_run() {
+    // The journal is what makes an interrupted apply resumable: the steps must
+    // be durable, in order, and pending before anything executes.
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let id = store.create_plan("relocate", "{}", 123).unwrap();
+    store
+        .add_plan_steps(
+            id,
+            &[
+                seederd_pool::model::PlanStep {
+                    op: "move_file".into(),
+                    src: "/a".into(),
+                    dst: Some("/b".into()),
+                },
+                seederd_pool::model::PlanStep {
+                    op: "move_file".into(),
+                    src: "/c".into(),
+                    dst: Some("/d".into()),
+                },
+            ],
+        )
+        .unwrap();
+
+    let steps = store.plan_steps(id).unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].seq, 0);
+    assert_eq!(steps[1].seq, 1);
+    assert!(steps.iter().all(|s| s.status == "pending"));
+
+    // A plan mid-apply is discoverable after a restart.
+    store.set_plan_status(id, "applying", None).unwrap();
+    store.set_step_status(id, 0, "done", None).unwrap();
+    let unfinished = store.unfinished_plans().unwrap();
+    assert_eq!(unfinished.len(), 1);
+    assert_eq!(unfinished[0].id, id);
+    let steps = store.plan_steps(id).unwrap();
+    assert_eq!(steps[0].status, "done");
+    assert_eq!(steps[1].status, "pending");
+}
+
+#[test]
+fn a_v1_index_migrates_forward_in_place() {
+    // The upgrade path a running deployment takes: an index created before the
+    // journal existed must gain it without losing anything.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+
+    {
+        // Hand-build a v1 index: the v1 tables plus user_version = 1.
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "CREATE TABLE root (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                                enabled INTEGER NOT NULL DEFAULT 1);
+             CREATE TABLE file (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL,
+                                size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+                                ino INTEGER NOT NULL, dev INTEGER NOT NULL,
+                                v2_root BLOB, scanned_at INTEGER NOT NULL,
+                                PRIMARY KEY (root_id, rel_path)) WITHOUT ROWID;
+             CREATE TABLE torrent (infohash TEXT PRIMARY KEY, infohash_v1 TEXT,
+                                infohash_v2 TEXT, name TEXT NOT NULL,
+                                total_size INTEGER NOT NULL, num_files INTEGER NOT NULL,
+                                source_path TEXT NOT NULL, fastresume_path TEXT,
+                                declared_save_path TEXT, category TEXT, tags TEXT,
+                                slot TEXT, added_at INTEGER NOT NULL);
+             CREATE TABLE torrent_file (infohash TEXT NOT NULL, idx INTEGER NOT NULL,
+                                rel_path TEXT NOT NULL, size INTEGER NOT NULL,
+                                pieces_root BLOB, PRIMARY KEY (infohash, idx)) WITHOUT ROWID;
+             CREATE TABLE adoption (infohash TEXT PRIMARY KEY, state TEXT NOT NULL,
+                                root_id INTEGER, base_rel TEXT, verified_at INTEGER,
+                                drift_at INTEGER, last_error TEXT);
+             CREATE TABLE claim (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL,
+                                infohash TEXT NOT NULL,
+                                PRIMARY KEY (root_id, rel_path, infohash)) WITHOUT ROWID;",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO torrent(infohash, name, total_size, num_files, source_path, slot, added_at)
+             VALUES ('legacy', 'Old', 1, 1, '/lib/old.torrent', 'acct_a', 0)",
+            [],
+        )
+        .unwrap();
+        c.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+
+    let store = PoolStore::open(&db).unwrap();
+    // Pre-existing data survives…
+    assert_eq!(store.slot_of("legacy").unwrap().as_deref(), Some("acct_a"));
+    // …and the journal is now usable.
+    assert!(store.plans().unwrap().is_empty());
+    assert!(store.unfinished_plans().unwrap().is_empty());
+
+    // Reopening is idempotent — migration must not run twice.
+    drop(store);
+    let store = PoolStore::open(&db).unwrap();
+    assert_eq!(store.torrent_count().unwrap(), 1);
+}
+
+#[test]
+fn an_index_from_a_newer_build_is_refused_rather_than_guessed_at() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.pragma_update(None, "user_version", 999i64).unwrap();
+    }
+    let e = PoolStore::open(&db).unwrap_err();
+    assert!(
+        matches!(e, seederd_pool::PoolError::SchemaVersion { found: 999, .. }),
+        "got {e:?}",
+    );
+}
