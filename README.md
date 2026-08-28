@@ -14,8 +14,8 @@ seederd does **one** thing: seed torrents whose payload already exists on disk.
   no torrents, and does not verify/repair content beyond libtorrent's own hash
   checks on add.
 - **Linux x86-64 only** — it refuses to run elsewhere.
-- **No UI, no auth, no TLS on the API** — bind it to `127.0.0.1` (the default) and
-  front it with a reverse proxy for remote access.
+- **No TLS on the API** — the daemon speaks plain HTTP. Authentication is
+  built in (see below); terminate TLS at a reverse proxy for remote access.
 - Not a general-purpose client: no RSS, no sequential/streaming download, no
   auto-discovery of torrents from disk, no multi-instance coordination.
 
@@ -221,6 +221,49 @@ Private-tracker isolation is layered, and honest about its limits:
 `allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds, not
 an egress control. Public content that wants DHT belongs in single-session mode
 (bare IP); a private slot cannot serve DHT.
+
+## Authentication
+
+Optional. Without an `[auth]` section the daemon keeps its original posture —
+bind to `127.0.0.1` and let a reverse proxy handle access. With one, it
+authenticates on its own, which is what makes the web client safe to expose.
+
+Two credential kinds, hashed differently on purpose. The **operator password**
+is chosen by a human and therefore low-entropy, so it gets Argon2id, verified
+once at login. **API tokens** are 256 bits this daemon generated, so there is
+nothing to guess and a fast SHA-256 is correct — Argon2 on every Prometheus
+scrape would burn ~50ms of CPU per request by design.
+
+```bash
+seederd --config … hash-password                              # prompts twice
+seederd --config … new-token --name prometheus --scopes metrics
+```
+
+The token is printed once and never stored; only its hash goes in the config,
+so a leaked config cannot be replayed as a credential.
+
+```toml
+[auth]
+password_hash    = "$argon2id$v=19$m=19456,t=2,p=1$..."
+session_ttl_secs = 43200
+
+[[auth.token]]
+name   = "prometheus"
+sha256 = "0870bd54…"
+scopes = ["metrics"]
+```
+
+`POST /api/login` returns an `HttpOnly; SameSite=Strict` session cookie —
+`SameSite=Strict` is the CSRF defence for a cookie-authenticated mutating API.
+Sessions are opaque random ids looked up server-side, so the cookie carries no
+claims to forge and `POST /api/logout` is a real revocation. They live in memory
+only: a restart logs everyone out.
+
+Scopes are coarse on purpose. `read` covers safe methods, `write` covers
+everything that changes state, and `metrics` covers `/metrics` **and nothing
+else**, so a scrape credential can never reach the control plane. `/healthz`
+stays unauthenticated: it carries only liveness, and a probe that needs a
+credential is a probe that breaks during the incident it exists to detect.
 
 ## Metrics
 

@@ -34,6 +34,31 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # user_agent       = "libtorrent/2.0"
 
 # ---------------------------------------------------------------------------
+# Authentication (optional)
+# ---------------------------------------------------------------------------
+# Omit this section entirely to keep the original posture: no authentication,
+# bound to loopback, access control delegated to a reverse proxy.
+#
+# Generate the values — never write a password or token here by hand:
+#   seederd --config /etc/seederd/seederd.toml hash-password
+#   seederd --config /etc/seederd/seederd.toml new-token --name ci --scopes read
+#
+# The token is printed once and is not stored; only its SHA-256 goes below, so
+# a leaked config file cannot be replayed as a credential.
+#
+# Scopes: read (safe methods), write (anything that mutates), metrics
+# (/metrics and nothing else — keeps a scrape credential out of the API).
+#
+# [auth]
+# password_hash    = "$argon2id$v=19$m=19456,t=2,p=1$...$..."
+# session_ttl_secs = 43200
+#
+# [[auth.token]]
+# name   = "prometheus"
+# sha256 = "0870bd54c89de51c..."
+# scopes = ["metrics"]
+
+# ---------------------------------------------------------------------------
 # Managed pool (optional)
 # ---------------------------------------------------------------------------
 # Point seederd at the directories it should own and at a directory of

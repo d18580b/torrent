@@ -34,6 +34,17 @@ pub enum Command {
         #[command(subcommand)]
         cmd: PoolCmd,
     },
+    /// Hash a password for the `[auth] password_hash` config key.
+    HashPassword,
+    /// Generate an API token and the hash to record in the config.
+    NewToken {
+        /// Label for the token, so a leaked one is identifiable from logs.
+        #[arg(long)]
+        name: String,
+        /// One or more of: read, write, metrics.
+        #[arg(long, value_delimiter = ',', default_value = "read")]
+        scopes: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

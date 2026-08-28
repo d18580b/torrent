@@ -8,6 +8,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod app_state;
+mod auth;
 mod cli;
 mod config;
 mod http;
@@ -33,6 +34,63 @@ use tracing::info;
 use crate::cli::Cli;
 use crate::cli::Command;
 use crate::cli::PoolCmd;
+
+/// Read a password twice from the terminal and print its Argon2id hash.
+///
+/// Read from stdin rather than taken as an argument so the password never
+/// reaches the shell history or the process table.
+fn hash_password_cmd() -> anyhow::Result<()> {
+    use std::io::BufRead;
+    use std::io::Write;
+
+    eprint!("password: ");
+    std::io::stderr().flush()?;
+    let mut first = String::new();
+    std::io::stdin().lock().read_line(&mut first)?;
+    let first = first.trim_end_matches(['\n', '\r']).to_string();
+    if first.is_empty() {
+        anyhow::bail!("empty password");
+    }
+
+    // Only prompt twice when a human is typing; a piped password has already
+    // been decided elsewhere and there is nothing to confirm against.
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprint!("confirm : ");
+        std::io::stderr().flush()?;
+        let mut again = String::new();
+        std::io::stdin().lock().read_line(&mut again)?;
+        if again.trim_end_matches(['\n', '\r']) != first {
+            anyhow::bail!("passwords do not match");
+        }
+    }
+
+    println!("{}", auth::hash_password(&first)?);
+    eprintln!("\nAdd to your config:\n\n[auth]\npassword_hash = \"<the line above>\"");
+    Ok(())
+}
+
+/// Print a fresh API token and the config stanza that accepts it.
+fn new_token_cmd(name: &str, scopes: &[String]) -> anyhow::Result<()> {
+    for s in scopes {
+        if !matches!(s.as_str(), "read" | "write" | "metrics") {
+            anyhow::bail!("unknown scope {s:?}; expected read, write, or metrics");
+        }
+    }
+    let (token, digest) = auth::generate_token();
+    // The token itself goes to stdout and is never stored: only its hash lands
+    // in the config, so a leaked config cannot be replayed as a credential.
+    println!("{token}");
+    eprintln!(
+        "\nAdd to your config (the token above is shown once and not stored):\n\n\
+         [[auth.token]]\nname   = \"{name}\"\nsha256 = \"{digest}\"\nscopes = [{}]",
+        scopes
+            .iter()
+            .map(|s| format!("\"{s}\""))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    Ok(())
+}
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -60,6 +118,8 @@ fn main() -> anyhow::Result<()> {
                 PoolCmd::Check => pool_cmd::check(&cfg),
                 PoolCmd::Orphans { limit } => pool_cmd::orphans(&cfg, limit),
             },
+            Command::HashPassword => hash_password_cmd(),
+            Command::NewToken { name, scopes } => new_token_cmd(&name, &scopes),
         };
     }
 
