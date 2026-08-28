@@ -52,13 +52,17 @@ Signals: **SIGHUP** hot-reloads the reloadable settings (log level, rate limits,
 connection limits, …); **SIGTERM** drains resume data, persists session state,
 and exits cleanly. Validate a config without starting: `seederd --config … --check-config`.
 
+Under systemd the daemon speaks `sd_notify(3)`: `READY=1` once the HTTP listener
+is bound, `WATCHDOG=1` at half the unit's `WatchdogSec`, and `STOPPING=1` before
+the resume drain. Outside systemd these are no-ops.
+
 ## HTTP API
 
 Default bind `127.0.0.1:8080`. All bodies are JSON unless noted.
 
 | Method & path | Purpose |
 |---------------|---------|
-| `GET /healthz` | Readiness — `{"ok":true,"slots":N}` (503 until ≥1 session is up). |
+| `GET /healthz` | Readiness — `{"ok":true,"slots":N,"heartbeat_age_secs":S}`. 503 until ≥1 session is up, and again if the alert loop stops making progress. |
 | `GET /status` | Session overview: counts by state, upload rate, peers. |
 | `GET /torrents` | List (paginated: `?after=<infohash>&limit=<n>`). |
 | `POST /torrents` | Add a `{"magnet":…}` / `{"torrent_path":…}` (JSON) or a multipart `.torrent`. Optional `save_path`, `slot_id`. 409 on a duplicate info-hash. |

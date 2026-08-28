@@ -1,6 +1,7 @@
 //! Shared state passed to axum handlers via extractors.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use seederd_engine::AlertSource;
@@ -25,6 +26,9 @@ pub struct AppState {
     /// startup inventory scan can re-add them if resume data is lost.
     pub torrents: Arc<dyn TorrentStore>,
     pub metrics: Arc<PromSink>,
+    /// Alert-loop liveness stamp (Unix millis at its last iteration). Read by
+    /// `/healthz` so a wedged loop makes the daemon report unready.
+    pub alert_heartbeat: Arc<AtomicU64>,
     /// Save path used when `POST /torrents` omits `save_path` (PRD).
     pub default_save_path: PathBuf,
     /// One of `single` | `multi-slot`. Used by routes that decide
@@ -77,6 +81,12 @@ pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
         state: Arc::new(StateMap::new()),
         torrents: Arc::new(MemoryTorrentStore::new()),
         metrics: Arc::new(PromSink::new()),
+        alert_heartbeat: Arc::new(AtomicU64::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+        )),
         default_save_path: std::env::temp_dir(),
         mode,
     }

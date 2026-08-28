@@ -15,11 +15,19 @@
 //!     concurrently, then loop draining alerts until
 //!     `pending_resume_count == 0` or the global 30-second deadline
 //!     expires (PRD §Session Management).
+//!   - Liveness: every iteration stamps a wall-clock heartbeat that
+//!     `GET /healthz` reads. A wedged or panicked loop makes the daemon
+//!     report unready instead of quietly serving a stale state map.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use crossbeam_channel::bounded;
 use crossbeam_channel::Receiver;
@@ -27,6 +35,7 @@ use crossbeam_channel::Sender;
 use libtorrent_safe::Alert;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::TorrentHandle;
+use tracing::error;
 use tracing::info;
 use tracing::info_span;
 use tracing::warn;
@@ -69,7 +78,13 @@ pub struct AlertLoopBuilder {
     torrents: Arc<dyn TorrentStore>,
     metrics: Arc<dyn MetricsSink>,
     clock: Arc<dyn Clock>,
+    fatal_listen_failure: bool,
+    on_fatal: Option<FatalCallback>,
 }
+
+/// Invoked once, from the loop thread, when a fatal condition is detected —
+/// seederd wires this to the shutdown broadcast so the HTTP server unwinds.
+pub type FatalCallback = Arc<dyn Fn(ShutdownReason) + Send + Sync>;
 
 impl std::fmt::Debug for AlertLoopBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -93,7 +108,24 @@ impl AlertLoopBuilder {
             torrents,
             metrics,
             clock,
+            fatal_listen_failure: false,
+            on_fatal: None,
         }
+    }
+
+    /// Treat `listen_failed_alert` as fatal (PRD §Error Handling: fatal in
+    /// single-session mode; in multi-slot mode only the affected slot is
+    /// marked failed and the daemon keeps running).
+    pub fn fatal_listen_failure(mut self, yes: bool) -> Self {
+        self.fatal_listen_failure = yes;
+        self
+    }
+
+    /// Callback fired when the loop decides to self-terminate, before it
+    /// begins the resume-data drain.
+    pub fn on_fatal(mut self, f: FatalCallback) -> Self {
+        self.on_fatal = Some(f);
+        self
     }
 
     /// Spawn the loop on a dedicated OS thread. Returns a handle the
@@ -102,6 +134,8 @@ impl AlertLoopBuilder {
         let (tx, rx) = bounded::<ShutdownReason>(1);
         let parent = Span::current();
         let state_arc = Arc::clone(&self.state);
+        let heartbeat = Arc::new(AtomicU64::new(now_millis()));
+        let listen_failed = Arc::new(AtomicBool::new(false));
 
         let join = thread::Builder::new()
             .name("seederd-alert-loop".into())
@@ -112,11 +146,29 @@ impl AlertLoopBuilder {
                 let torrents = Arc::clone(&self.torrents);
                 let metrics = Arc::clone(&self.metrics);
                 let clock = Arc::clone(&self.clock);
+                let heartbeat = Arc::clone(&heartbeat);
+                let listen_failed = Arc::clone(&listen_failed);
+                let fatal_listen_failure = self.fatal_listen_failure;
+                let on_fatal = self.on_fatal.clone();
                 move || {
                     let span = info_span!(parent: parent, "alert_loop");
                     let _enter = span.enter();
                     info!(target: "seederd_engine::alert_loop", "alert loop started");
-                    run(rx, source, state, resume, torrents, metrics, clock);
+                    run(
+                        rx,
+                        source,
+                        state,
+                        resume,
+                        torrents,
+                        metrics,
+                        clock,
+                        LoopHooks {
+                            heartbeat,
+                            listen_failed,
+                            fatal_listen_failure,
+                            on_fatal,
+                        },
+                    );
                     info!(target: "seederd_engine::alert_loop", "alert loop exited");
                 }
             })
@@ -126,6 +178,8 @@ impl AlertLoopBuilder {
             join,
             shutdown: tx,
             state: state_arc,
+            heartbeat,
+            listen_failed,
         }
     }
 }
@@ -135,6 +189,8 @@ pub struct AlertLoopHandle {
     join: thread::JoinHandle<()>,
     shutdown: Sender<ShutdownReason>,
     state: Arc<StateMap>,
+    heartbeat: Arc<AtomicU64>,
+    listen_failed: Arc<AtomicBool>,
 }
 
 impl AlertLoopHandle {
@@ -142,6 +198,19 @@ impl AlertLoopHandle {
     /// etc.).
     pub fn state(&self) -> Arc<StateMap> {
         Arc::clone(&self.state)
+    }
+
+    /// Shared liveness stamp: Unix milliseconds at the loop's last
+    /// iteration. Handed to the HTTP layer so `/healthz` can fail when the
+    /// loop stops making progress. Read it with [`heartbeat_age`].
+    pub fn heartbeat(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.heartbeat)
+    }
+
+    /// Whether the loop terminated because a listen socket failed fatally.
+    /// Read before [`AlertLoopHandle::join`], which consumes the handle.
+    pub fn listen_failed(&self) -> bool {
+        self.listen_failed.load(Ordering::Relaxed)
     }
 
     /// Send a shutdown signal. Idempotent; returns true on the first
@@ -166,6 +235,34 @@ impl std::fmt::Debug for AlertLoopHandle {
 // Loop body
 // ---------------------------------------------------------------------------
 
+/// Wall-clock milliseconds since the Unix epoch. Deliberately not routed
+/// through `Clock`: the heartbeat is compared against `SystemTime::now()` by
+/// the HTTP layer, which a mocked monotonic clock would not line up with.
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How long since the alert loop last completed an iteration.
+///
+/// Saturates at zero rather than panicking if the clock steps backwards.
+pub fn heartbeat_age(heartbeat: &AtomicU64) -> Duration {
+    let last = heartbeat.load(Ordering::Relaxed);
+    Duration::from_millis(now_millis().saturating_sub(last))
+}
+
+/// Out-of-band wiring the loop shares with the daemon: liveness reporting and
+/// the fatal-failure escape hatch.
+struct LoopHooks {
+    heartbeat: Arc<AtomicU64>,
+    listen_failed: Arc<AtomicBool>,
+    fatal_listen_failure: bool,
+    on_fatal: Option<FatalCallback>,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run(
     shutdown_rx: Receiver<ShutdownReason>,
     source: Arc<dyn AlertSource>,
@@ -174,12 +271,17 @@ fn run(
     torrents: Arc<dyn TorrentStore>,
     metrics: Arc<dyn MetricsSink>,
     clock: Arc<dyn Clock>,
+    hooks: LoopHooks,
 ) {
     let mut last_post_updates = clock.now();
     let mut last_post_stats = clock.now();
     let mut last_resume_save = clock.now();
 
     loop {
+        // 0) Liveness stamp. Written at the top of every iteration so a loop
+        //    wedged inside a handler stops refreshing it and /healthz fails.
+        hooks.heartbeat.store(now_millis(), Ordering::Relaxed);
+
         // 1) Shutdown probe.
         if let Ok(reason) = shutdown_rx.try_recv() {
             info!(target: "seederd_engine::alert_loop", reason = ?reason, "shutdown signaled");
@@ -199,10 +301,40 @@ fn run(
         // 2) Drain alerts.
         let drained = source.drain();
         let was_empty = drained.is_empty();
+        let mut fatal = false;
         for (slot, alert) in drained {
+            // PRD §Error Handling: a listen socket that fails in
+            // single-session mode is fatal — there is no other session to
+            // carry the load, so seeding silently stops. Note it, finish
+            // dispatching the batch (so the failure is logged and counted),
+            // then unwind.
+            if hooks.fatal_listen_failure && matches!(alert, Alert::ListenFailed { .. }) {
+                fatal = true;
+            }
             dispatch_alert(
                 slot, alert, &source, &state, &resume, &torrents, &metrics, &clock,
             );
+        }
+        if fatal {
+            hooks.listen_failed.store(true, Ordering::Relaxed);
+            error!(
+                target: "seederd_engine::alert_loop",
+                "listen socket failed in single-session mode; shutting down",
+            );
+            if let Some(cb) = &hooks.on_fatal {
+                cb(ShutdownReason::ListenFailed);
+            }
+            run_shutdown(
+                ShutdownReason::ListenFailed,
+                SHUTDOWN_DEFAULT_DEADLINE,
+                &source,
+                &state,
+                &resume,
+                &torrents,
+                &metrics,
+                &clock,
+            );
+            return;
         }
 
         // 3) Tickers.
@@ -541,6 +673,102 @@ mod tests {
             not_modified: false,
             message: "spurious".into(),
         }
+    }
+
+    fn listen_failed_alert() -> Alert {
+        Alert::ListenFailed {
+            hdr: AlertHeader {
+                kind: AlertKind::ListenFailed,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            error_code: 98,
+            operation: "bind".into(),
+            endpoint: "0.0.0.0:6881".into(),
+            iface: "eth0".into(),
+            message: "address already in use".into(),
+        }
+    }
+
+    /// Spin until `cond` holds or the deadline passes. The loop runs on its own
+    /// thread, so tests can't assert on its progress synchronously.
+    fn wait_for(cond: impl Fn() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    fn builder_with(engine: Arc<MockEngine>) -> AlertLoopBuilder {
+        AlertLoopBuilder::new(
+            Arc::new(SingleSessionSource::new(engine)),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            Arc::new(NoopSink),
+            // A real clock: these tests exercise the spawned loop, and
+            // MockClock's zero-cost sleep would spin a core flat out.
+            Arc::new(crate::clock::SystemClock),
+        )
+    }
+
+    #[test]
+    fn fatal_listen_failure_stops_the_loop_and_notifies() {
+        let engine = Arc::new(MockEngine::new());
+        engine.push_alert(listen_failed_alert());
+
+        let seen: Arc<parking_lot::Mutex<Vec<ShutdownReason>>> = Arc::default();
+        let handle = builder_with(engine)
+            .fatal_listen_failure(true)
+            .on_fatal({
+                let seen = Arc::clone(&seen);
+                Arc::new(move |r| seen.lock().push(r)) as FatalCallback
+            })
+            .spawn();
+
+        assert!(
+            wait_for(|| handle.listen_failed()),
+            "loop should have flagged the fatal listen failure",
+        );
+        handle.join().expect("loop thread panicked");
+        assert_eq!(*seen.lock(), vec![ShutdownReason::ListenFailed]);
+    }
+
+    #[test]
+    fn listen_failure_is_survivable_when_not_fatal() {
+        // Multi-slot mode: the slot is marked failed by the handler, but the
+        // daemon keeps seeding the other slots.
+        let engine = Arc::new(MockEngine::new());
+        engine.push_alert(listen_failed_alert());
+        let handle = builder_with(engine).fatal_listen_failure(false).spawn();
+
+        // Give the loop a chance to process the alert and keep going.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!handle.listen_failed());
+
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread panicked");
+    }
+
+    #[test]
+    fn heartbeat_advances_while_the_loop_runs() {
+        let handle = builder_with(Arc::new(MockEngine::new())).spawn();
+        let hb = handle.heartbeat();
+        let first = hb.load(Ordering::Relaxed);
+
+        assert!(
+            wait_for(|| hb.load(Ordering::Relaxed) > first),
+            "heartbeat should advance on every iteration",
+        );
+        assert!(heartbeat_age(&hb) < Duration::from_secs(1));
+
+        handle.signal_shutdown(ShutdownReason::Test);
+        handle.join().expect("loop thread panicked");
     }
 
     #[test]
