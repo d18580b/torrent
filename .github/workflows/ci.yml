@@ -47,6 +47,14 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libssl-dev libclang-dev
 
+      # The default feature set embeds the web client, so the Rust build shells
+      # out to npm. The `daemon-only` job below proves that stays optional.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
       - uses: dtolnay/rust-toolchain@1.90
         with:
           components: clippy
@@ -180,6 +188,65 @@ jobs:
       # Layer 3 (PRD Validation §): real daemon + libtorrent, driven over HTTP.
       - run: cargo test -p seederd-engine --test lifecycle -- --ignored
       - run: cargo test -p seederd --test daemon -- --ignored
+
+  daemon-only:
+    name: daemon without the web UI
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@1.90
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-daemononly-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-daemononly-${{ runner.os }}-
+
+      - name: Cache vendored native build
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/debug/build/libtorrent-sys-*/out
+          key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
+
+      # No actions/setup-node here on purpose: this must build on a host with
+      # no Node whatsoever, which is what anyone running the headless daemon
+      # gets with `--no-default-features`.
+      - run: cargo build -p seederd --no-default-features
+
+  web:
+    name: web client
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      # `tsc -b` runs in strict mode with noUnusedLocals/noUnusedParameters, so
+      # this is the type gate as well as the bundle build.
+      - run: npm run build
+        working-directory: web
 
   commit-lint:
     name: conventional commits
