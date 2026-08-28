@@ -34,6 +34,33 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # user_agent       = "libtorrent/2.0"
 
 # ---------------------------------------------------------------------------
+# Managed pool (optional)
+# ---------------------------------------------------------------------------
+# Point seederd at the directories it should own and at a directory of
+# `.torrent` files to match them against. It indexes both and reports, per
+# path, what is adopted, matched, partial, missing, orphaned, or claimed by
+# two torrents at once — which is what makes a multi-terabyte library legible.
+#
+# Migrating from another client is not a special mode: set `library_dir` to
+# that client's state directory and scan. qBittorrent's BT_backup holds both
+# `<hash>.torrent` and `<hash>.fastresume`, and the sidecars are read for their
+# save-path, category and tag hints.
+#
+# Copy BT_backup somewhere scratch first rather than pointing at the live
+# profile. Scanning only reads, but there is no reason to have the other
+# client's state directory open at all.
+#
+#   seederd --config /etc/seederd/seederd.toml pool scan
+#   seederd --config /etc/seederd/seederd.toml pool status
+#   seederd --config /etc/seederd/seederd.toml pool orphans
+#
+# [pool]
+# roots       = ["/data/torrents"]        # must not nest
+# library_dir = "/var/lib/seederd/library"
+# db_path     = "/var/lib/seederd/pool.db"   # default: alongside resume_dir
+# import_legacy_registry = true              # fold slot_assignments.json in
+
+# ---------------------------------------------------------------------------
 # Multi-slot example — uncomment and adjust the [[slot]] tables below.
 # Presence of any [[slot]] entry switches the daemon into multi-slot
 # mode; in that case POST /torrents requires `slot_id`.
