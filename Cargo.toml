@@ -55,6 +55,11 @@ bitflags = { version = "2", features = ["serde"] }
 thiserror = "2"
 anyhow = "1"
 
+# Auth
+argon2 = "0.5"
+rand = "0.8"
+sha2 = "0.10"
+
 # Pool index
 rusqlite = { version = "0.32", features = ["bundled"] }
 jwalk = "0.8"

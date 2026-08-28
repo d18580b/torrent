@@ -521,6 +521,7 @@ impl DaemonHandle {
             state,
             torrents,
             metrics,
+            auth: cfg.auth.clone().map(crate::auth::Auth::new),
             pool,
             alert_heartbeat: alert_loop.heartbeat(),
             default_save_path: cfg.default_save_path.clone(),

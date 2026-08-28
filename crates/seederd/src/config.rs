@@ -94,6 +94,10 @@ pub struct Config {
     #[serde(default)]
     pub slot: Vec<SlotConfig>,
 
+    /// HTTP authentication. Absent → unauthenticated, as before.
+    #[serde(default)]
+    pub auth: Option<crate::auth::AuthConfig>,
+
     /// Managed-pool configuration. Absent → the pool index is not maintained
     /// and the daemon behaves exactly as before.
     #[serde(default)]
@@ -158,6 +162,9 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.slot.is_empty() {
             SlotConfig::validate_set(&self.slot).context("[[slot]] validation failed")?;
+        }
+        if let Some(auth) = &self.auth {
+            auth.validate()?;
         }
         if let Some(pool) = &self.pool {
             if pool.roots.is_empty() {
