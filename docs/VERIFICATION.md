@@ -68,6 +68,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 
 # Layer 2 — shim FFI correctness against a real, non-networked session
+# Also covers .torrent metadata extraction (lt_torrent_metadata): v1/v2/hybrid
+#   info-hashes and per-file v2 merkle roots, asserted against the constants
+#   libtorrent's own test_torrent_info.cpp uses, plus malformed/null input.
 cargo test -p libtorrent-sys --features shim-tests
 
 # Layer 3 — integration, real libtorrent + real disk (gated by --ignored)

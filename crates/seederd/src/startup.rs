@@ -273,6 +273,7 @@ pub async fn boot(
     for slot in source.slots() {
         let entries = resume_store.load_all(&slot).context("scan resume dir")?;
         let count = entries.len();
+        let mut missing_metadata = 0usize;
         let engine = source
             .engine_for(&slot)
             .ok_or_else(|| anyhow::anyhow!("no engine for slot {}", slot))?;
@@ -297,11 +298,44 @@ pub async fn boot(
             } else {
                 let _ = registry.assign(ih, slot.clone());
             }
+            // Re-attach metadata. libtorrent writes the info dict into resume
+            // data only when save_resume_data was called with SAVE_INFO_DICT
+            // (vendor/libtorrent/src/torrent.cpp: `ret.ti = m_torrent_file` is
+            // gated on that flag), so resume data alone leaves the torrent with
+            // no metadata and it re-enters downloading_metadata on restart —
+            // fatal for a private slot with DHT and PEX disabled. Setting the
+            // flag instead would embed a full piece-hash table in every resume
+            // file, so pass the .torrent already on disk.
+            let torrent = match torrent_store.read(&slot, &ih) {
+                Ok(t) => t,
+                Err(e) => {
+                    warn!(slot_id = %slot, infohash = %ih, error.cause = %e,
+                          "could not read .torrent for resume add; continuing without metadata");
+                    None
+                }
+            };
+            if torrent.is_none() {
+                missing_metadata += 1;
+            }
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: data.into_inner(),
+                torrent,
+                save_path: None,
+                flags_set: TorrentFlags::empty(),
+                flags_clear: TorrentFlags::empty(),
             }) {
                 warn!(slot_id = %slot, infohash = %ih, error.cause = %e, "resume add failed");
             }
+        }
+        if missing_metadata > 0 {
+            // Not fatal — libtorrent can still fetch metadata from peers where
+            // discovery is enabled — but on a private slot it usually means the
+            // torrent will sit idle, so make it visible rather than silent.
+            warn!(
+                slot_id = %slot,
+                torrent_count = missing_metadata,
+                "resume entries with no .torrent on disk; these rely on peer metadata exchange",
+            );
         }
         info!(slot_id = %slot, torrent_count = count, "resume scan complete");
     }

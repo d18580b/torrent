@@ -19,6 +19,7 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::handle::InfoHash;
 use crate::handle::TorrentHandle;
+use crate::settings::MoveFlags;
 use crate::settings::ResumeFlags;
 use crate::settings::Settings;
 use crate::settings::TorrentFlags;
@@ -36,9 +37,37 @@ pub enum AddParams {
         save_path: String,
         flags: TorrentFlags,
     },
+    /// Re-add from previously saved resume data.
+    ///
+    /// libtorrent only embeds the info dict in resume data when
+    /// `save_resume_data` was called with `SAVE_INFO_DICT`, so resume data
+    /// alone often carries no metadata and the torrent would re-enter
+    /// `downloading_metadata` on restart. `torrent` supplies the `.torrent`
+    /// bytes the daemon already keeps on disk to repair that, rather than
+    /// bloating every resume file with a full piece-hash table.
     Resume {
         bytes: Vec<u8>,
+        /// `.torrent` bytes, used only when the resume data has no info dict.
+        torrent: Option<Vec<u8>>,
+        /// Relocate the torrent's payload (adoption / relocation).
+        save_path: Option<String>,
+        /// Applied to the resume data's own flags, set before clear.
+        flags_set: TorrentFlags,
+        flags_clear: TorrentFlags,
     },
+}
+
+impl AddParams {
+    /// Re-add from resume data with no overrides — the common restart path.
+    pub fn resume(bytes: Vec<u8>) -> Self {
+        Self::Resume {
+            bytes,
+            torrent: None,
+            save_path: None,
+            flags_set: TorrentFlags::empty(),
+            flags_clear: TorrentFlags::empty(),
+        }
+    }
 }
 
 const ERR_BUF_LEN: usize = 512;
@@ -215,15 +244,33 @@ impl Session {
                     )
                 }
             }
-            AddParams::Resume { bytes } => {
+            AddParams::Resume {
+                bytes,
+                torrent,
+                save_path,
+                flags_set,
+                flags_clear,
+            } => {
                 if bytes.is_empty() {
                     return Err(Error::InvalidInput("empty resume buffer"));
                 }
+                let save_c = save_path
+                    .map(|p| CString::new(p).map_err(|_| Error::InteriorNul("save_path".into())))
+                    .transpose()?;
+                let (t_ptr, t_len) = match torrent.as_ref() {
+                    Some(t) if !t.is_empty() => (t.as_ptr(), t.len()),
+                    _ => (std::ptr::null(), 0),
+                };
                 unsafe {
-                    ffi::lt_add_torrent_resume(
+                    ffi::lt_add_torrent_resume_ex(
                         self.ptr,
                         bytes.as_ptr(),
                         bytes.len(),
+                        t_ptr,
+                        t_len,
+                        save_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                        flags_set.bits(),
+                        flags_clear.bits(),
                         infohash.as_mut_ptr(),
                         err.ptr(),
                         err.len() as i32,
@@ -284,6 +331,38 @@ impl Session {
     pub fn set_file_priority(&self, h: TorrentHandle, file_idx: i32, priority: u8) -> Result<()> {
         let rc = unsafe {
             ffi::lt_torrent_set_file_priority(self.ptr, h.id as ffi::lt_handle, file_idx, priority)
+        };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
+    }
+
+    /// Re-hash the payload against the torrent's piece hashes (v1 SHA-1 / v2
+    /// SHA-256 merkle). Asynchronous — completion arrives as
+    /// `Alert::TorrentChecked`.
+    pub fn force_recheck(&self, h: TorrentHandle) -> Result<()> {
+        let rc = unsafe { ffi::lt_torrent_force_recheck(self.ptr, h.id as ffi::lt_handle) };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
+    }
+
+    /// Relocate the torrent's payload, letting libtorrent perform the move so
+    /// its storage state stays consistent. Asynchronous — completion arrives
+    /// as `Alert::StorageMoved` or `Alert::StorageMovedFailed`.
+    pub fn move_storage(&self, h: TorrentHandle, new_path: &str, flags: MoveFlags) -> Result<()> {
+        let path = CString::new(new_path).map_err(|_| Error::InteriorNul("new_path".into()))?;
+        let rc = unsafe {
+            ffi::lt_torrent_move_storage(
+                self.ptr,
+                h.id as ffi::lt_handle,
+                path.as_ptr(),
+                flags as u32,
+            )
         };
         if rc == ffi::LT_OK as i32 {
             Ok(())

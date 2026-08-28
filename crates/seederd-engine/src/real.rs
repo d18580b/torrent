@@ -13,6 +13,7 @@
 
 use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
+use libtorrent_safe::MoveFlags;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::Session;
 use libtorrent_safe::Settings;
@@ -94,6 +95,21 @@ impl TorrentEngine for RealEngine {
             .session
             .lock()
             .set_file_priority(h, file_idx, priority)?)
+    }
+
+    #[instrument(skip_all, fields(op = "force_recheck", infohash = %h.infohash))]
+    fn force_recheck(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        Ok(self.session.lock().force_recheck(h)?)
+    }
+
+    #[instrument(skip_all, fields(op = "move_storage", infohash = %h.infohash, new_path))]
+    fn move_storage(
+        &self,
+        h: TorrentHandle,
+        new_path: &str,
+        flags: MoveFlags,
+    ) -> Result<(), EngineError> {
+        Ok(self.session.lock().move_storage(h, new_path, flags)?)
     }
 
     fn pop_alerts(&self) -> Vec<Alert> {

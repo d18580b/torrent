@@ -11,6 +11,7 @@ pub mod metadata;
 pub mod resume;
 pub mod state_update;
 pub mod stats;
+pub mod storage;
 
 use std::sync::Arc;
 

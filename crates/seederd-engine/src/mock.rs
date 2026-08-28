@@ -21,6 +21,7 @@ use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
 use libtorrent_safe::AlertKind;
 use libtorrent_safe::InfoHash;
+use libtorrent_safe::MoveFlags;
 use libtorrent_safe::ResumeData;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::Settings;
@@ -56,6 +57,12 @@ pub enum RecordedCall {
     PopAlerts,
     PostUpdates,
     PostStats,
+    ForceRecheck(TorrentHandle),
+    MoveStorage {
+        handle: TorrentHandle,
+        new_path: String,
+        flags: MoveFlags,
+    },
     ApplySettings(Settings),
     SessionState,
 }
@@ -76,6 +83,9 @@ pub enum AddParamsSummary {
     },
     Resume {
         byte_len: usize,
+        /// Whether `.torrent` bytes were supplied to repair missing metadata.
+        has_torrent: bool,
+        save_path: Option<String>,
     },
 }
 
@@ -100,8 +110,15 @@ impl From<&AddParams> for AddParamsSummary {
                 save_path: save_path.clone(),
                 flags_bits: flags.bits(),
             },
-            AddParams::Resume { bytes } => AddParamsSummary::Resume {
+            AddParams::Resume {
+                bytes,
+                torrent,
+                save_path,
+                ..
+            } => AddParamsSummary::Resume {
                 byte_len: bytes.len(),
+                has_torrent: torrent.as_ref().is_some_and(|t| !t.is_empty()),
+                save_path: save_path.clone(),
             },
         }
     }
@@ -122,6 +139,9 @@ pub struct MockEngine {
     /// alerts manually. Defaults to off — tests that want full control
     /// keep their own alert script.
     auto_save_resume: AtomicBool,
+    /// When set, `force_recheck` / `move_storage` synthesize their completion
+    /// alert immediately, mirroring libtorrent's async behaviour.
+    auto_check: AtomicBool,
 }
 
 impl Default for MockEngine {
@@ -139,6 +159,7 @@ impl MockEngine {
             error_inject: DashMap::new(),
             handles: DashMap::new(),
             auto_save_resume: AtomicBool::new(false),
+            auto_check: AtomicBool::new(false),
         }
     }
 
@@ -151,6 +172,15 @@ impl MockEngine {
     }
     pub fn set_auto_save_resume(&self, on: bool) {
         self.auto_save_resume.store(on, Ordering::SeqCst);
+    }
+
+    /// Synthesize `TorrentChecked` / `StorageMoved` completions.
+    pub fn with_auto_check(self, on: bool) -> Self {
+        self.auto_check.store(on, Ordering::SeqCst);
+        self
+    }
+    pub fn set_auto_check(&self, on: bool) {
+        self.auto_check.store(on, Ordering::SeqCst);
     }
 
     // --- test fixture helpers -----------------------------------------------
@@ -215,7 +245,7 @@ impl TorrentEngine for MockEngine {
         // Tests that need a specific infohash should pre-register via
         // `register_handle` and then push their own AddTorrent alert.
         let ih = match &params {
-            AddParams::Resume { bytes } | AddParams::File { bytes, .. } => {
+            AddParams::Resume { bytes, .. } | AddParams::File { bytes, .. } => {
                 let mut buf = [0u8; 20];
                 for (i, b) in bytes.iter().take(20).enumerate() {
                     buf[i] = *b;
@@ -287,6 +317,48 @@ impl TorrentEngine for MockEngine {
                     timestamp_us: 0,
                 },
                 data: ResumeData::new(Vec::new()),
+            });
+        }
+        Ok(())
+    }
+
+    fn force_recheck(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        self.record(RecordedCall::ForceRecheck(h));
+        self.check_error("force_recheck")?;
+        if self.auto_check.load(Ordering::SeqCst) {
+            self.push_alert(Alert::TorrentChecked {
+                hdr: AlertHeader {
+                    kind: AlertKind::TorrentChecked,
+                    infohash: Some(h.infohash),
+                    handle: Some(h),
+                    timestamp_us: 0,
+                },
+            });
+        }
+        Ok(())
+    }
+
+    fn move_storage(
+        &self,
+        h: TorrentHandle,
+        new_path: &str,
+        flags: MoveFlags,
+    ) -> Result<(), EngineError> {
+        self.record(RecordedCall::MoveStorage {
+            handle: h,
+            new_path: new_path.to_string(),
+            flags,
+        });
+        self.check_error("move_storage")?;
+        if self.auto_check.load(Ordering::SeqCst) {
+            self.push_alert(Alert::StorageMoved {
+                hdr: AlertHeader {
+                    kind: AlertKind::StorageMoved,
+                    infohash: Some(h.infohash),
+                    handle: Some(h),
+                    timestamp_us: 0,
+                },
+                path: new_path.to_string(),
             });
         }
         Ok(())

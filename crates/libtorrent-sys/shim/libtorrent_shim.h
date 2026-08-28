@@ -69,6 +69,20 @@ typedef uintptr_t lt_handle;
 /* save_resume_data flags                                              */
 /* ------------------------------------------------------------------ */
 
+/* Per-variant string capacity (incl. trailing NUL). Defined here rather than
+ * in alert_union.h because both that header and the metadata structs below
+ * need them, and alert_union.h is the one that includes this file. */
+#define LT_PATH_MAX 1024
+#define LT_MSG_MAX  2048
+#define LT_NAME_MAX 64
+#define LT_ADDR_MAX 64
+#define LT_OP_MAX   64
+
+/* move_storage collision policy (libtorrent move_flags_t). */
+#define LT_MOVE_ALWAYS_REPLACE_FILES 0u
+#define LT_MOVE_FAIL_IF_EXIST        1u
+#define LT_MOVE_DONT_REPLACE         2u
+
 #define LT_RD_FLUSH_DISK_CACHE     (1u << 0)
 #define LT_RD_SAVE_INFO_DICT       (1u << 1)
 #define LT_RD_ONLY_IF_MODIFIED     (1u << 2)
@@ -98,7 +112,10 @@ typedef enum {
     LT_ALERT_TRACKER_ERROR,
     LT_ALERT_PEER_DISCONNECTED,
     LT_ALERT_TORRENT_LOG,
-    LT_ALERT_LOG
+    LT_ALERT_LOG,
+    LT_ALERT_TORRENT_CHECKED,
+    LT_ALERT_STORAGE_MOVED,
+    LT_ALERT_STORAGE_MOVED_FAILED
 } lt_alert_kind;
 
 /* ------------------------------------------------------------------ */
@@ -168,7 +185,43 @@ lt_handle   lt_add_torrent_resume(lt_session* s,
                                   uint8_t* infohash_out,
                                   char* err_out, int err_len);
 
+/* Add from resume data with caller overrides — the general form of
+ * lt_add_torrent_resume.
+ *
+ * torrent_buf:        optional .torrent bytes. libtorrent only embeds the info
+ *                     dict in resume data when save_resume_data was called with
+ *                     save_info_dict, so resume data alone frequently carries
+ *                     no metadata and the torrent would re-enter
+ *                     downloading_metadata on restart. Supplying the .torrent
+ *                     the daemon already keeps on disk repairs that without
+ *                     bloating every resume file with a full piece-hash table.
+ *                     Ignored when the resume data already carries metadata.
+ * save_path_override: optional; relocates the torrent (adoption, relocation).
+ * flags_set/_clear:   applied to the resume data's own flags, in that order.
+ *
+ * Returns the lt_handle, or 0 on failure (err_out populated). */
+lt_handle   lt_add_torrent_resume_ex(lt_session* s,
+                                     const uint8_t* resume_buf, size_t resume_len,
+                                     const uint8_t* torrent_buf, size_t torrent_len,
+                                     const char* save_path_override,
+                                     uint32_t flags_set, uint32_t flags_clear,
+                                     uint8_t* infohash_out,
+                                     char* err_out, int err_len);
+
 int         lt_remove_torrent(lt_session* s, lt_handle h, int delete_files);
+
+/* Re-hash a torrent's payload against its piece hashes (v1 SHA-1 / v2 SHA-256
+ * merkle). Asynchronous: completion arrives as LT_ALERT_TORRENT_CHECKED. This
+ * is the authoritative verification path — the daemon never reimplements piece
+ * hashing. */
+int         lt_torrent_force_recheck(lt_session* s, lt_handle h);
+
+/* Move a torrent's payload to `new_path`, letting libtorrent perform the move
+ * so its own storage state stays consistent. Completion arrives as
+ * LT_ALERT_STORAGE_MOVED (or LT_ALERT_STORAGE_MOVED_FAILED).
+ * `flags` is one of the LT_MOVE_* constants above. */
+int         lt_torrent_move_storage(lt_session* s, lt_handle h,
+                                    const char* new_path, uint32_t flags);
 
 int         lt_torrent_pause(lt_session* s, lt_handle h);
 int         lt_torrent_resume(lt_session* s, lt_handle h);
@@ -186,6 +239,54 @@ int         lt_torrent_info_hash(const uint8_t* data, size_t len,
 /* Same, for the info-hash encoded in a magnet URI. */
 int         lt_magnet_info_hash(const char* uri,
                                 uint8_t* out20, char* err_out, int err_len);
+
+/* ------------------------------------------------------------------ */
+/* Torrent metadata extraction (no session required)                   */
+/* ------------------------------------------------------------------ */
+
+/* One entry of a torrent's file list.
+ *
+ * `pieces_root` is the BitTorrent v2 per-file merkle root (SHA-256 over 16 KiB
+ * leaves). It is a content identifier for the file on its own — independent of
+ * name and location — which is what lets the pool index recognise a file that
+ * moved or was renamed. `has_pieces_root` is 0 for v1-only torrents, where
+ * pieces span file boundaries and no per-file digest exists. */
+struct lt_torrent_meta_file {
+    char     path[LT_PATH_MAX];   /* torrent-relative, '/'-separated */
+    uint64_t size;
+    uint8_t  pieces_root[32];
+    uint8_t  has_pieces_root;
+    uint8_t  _pad[7];
+};
+
+/* Parsed .torrent metadata. `files` is heap-allocated; release the whole
+ * struct with lt_torrent_meta_free(). */
+struct lt_torrent_meta {
+    char     name[LT_PATH_MAX];
+    uint64_t total_size;
+    uint32_t piece_length;
+    uint8_t  has_v1;
+    uint8_t  has_v2;
+    uint8_t  _pad[2];
+    uint8_t  infohash_v1[20];     /* zeroed when has_v1 == 0 */
+    uint8_t  infohash_v2[32];     /* zeroed when has_v2 == 0 */
+    struct lt_torrent_meta_file* files;
+    size_t   num_files;
+};
+
+/* Parse a .torrent buffer into *out. Returns LT_OK / LT_ERR (err_out
+ * populated). On success the caller MUST call lt_torrent_meta_free(out).
+ *
+ * This is the pool library scanner's parser: libtorrent already handles v1,
+ * v2, and hybrid torrents plus hostile input, so the daemon does not carry a
+ * second bencode implementation that would have to agree with it byte-for-byte
+ * on info-hash computation. */
+int         lt_torrent_metadata(const uint8_t* data, size_t len,
+                                struct lt_torrent_meta* out,
+                                char* err_out, int err_len);
+
+/* Release the heap file list. Idempotent; safe on a zero-initialized struct. */
+void        lt_torrent_meta_free(struct lt_torrent_meta* m);
 
 /* Return 1 if any tracker URL host in the .torrent buffer matches (equals or
  * is a subdomain of) one of the comma-separated `domains_csv`, 0 if none
