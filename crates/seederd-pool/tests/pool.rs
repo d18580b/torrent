@@ -435,3 +435,273 @@ fn a_rescan_never_clears_a_slot_assignment() {
     add_torrent(&mut store, "9k", "A", None, &[("A/x", 1)]);
     assert_eq!(store.slot_of("9k").unwrap().as_deref(), Some("acct_a"));
 }
+
+// ---------------------------------------------------------------------------
+// adoption planning
+// ---------------------------------------------------------------------------
+
+use seederd_pool::adopt::AdoptPlan;
+
+/// Write a `.fastresume` next to a `.torrent`, as another client would.
+fn write_fastresume(dir: &Path, stem: &str, complete: bool) -> PathBuf {
+    let mut b = b"d".to_vec();
+    let sp = "/irrelevant";
+    b.extend_from_slice(format!("12:qBt-savePath{}:{sp}", sp.len()).as_bytes());
+    b.extend_from_slice(format!("14:qBt-seedStatusi{}e", if complete { 1 } else { 0 }).as_bytes());
+    b.push(b'e');
+    let p = dir.join(format!("{stem}.fastresume"));
+    std::fs::write(&p, b).unwrap();
+    p
+}
+
+/// A torrent whose `source_path`/`fastresume_path` point at real files.
+fn add_torrent_with_sidecar(
+    store: &mut PoolStore,
+    lib: &Path,
+    infohash: &str,
+    name: &str,
+    files: &[(&str, u64)],
+    complete: Option<bool>,
+) {
+    let torrent_path = lib.join(format!("{infohash}.torrent"));
+    std::fs::write(&torrent_path, b"not-parsed-by-these-tests").unwrap();
+    let fastresume_path = complete.map(|c| write_fastresume(lib, infohash, c));
+
+    let t = PoolTorrent {
+        infohash: infohash.to_string(),
+        infohash_v1: Some(infohash.to_string()),
+        infohash_v2: None,
+        name: name.to_string(),
+        total_size: files.iter().map(|(_, s)| *s).sum(),
+        num_files: files.len(),
+        source_path: torrent_path,
+        fastresume_path,
+        declared_save_path: None,
+        category: None,
+        tags: vec![],
+        slot: None,
+    };
+    store.upsert_torrent(&t, 0).unwrap();
+    let rows: Vec<TorrentFileRow> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (p, s))| TorrentFileRow {
+            infohash: infohash.to_string(),
+            idx: i as i64,
+            rel_path: p.to_string(),
+            size: *s,
+            pieces_root: None,
+        })
+        .collect();
+    store.replace_torrent_files(infohash, &rows).unwrap();
+}
+
+#[test]
+fn a_complete_fastresume_takes_the_fast_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "T/a.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    seederd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "fa",
+        "T",
+        &[("T/a.bin", 4096)],
+        Some(true),
+    );
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let r = root.clone();
+    let plan =
+        seederd_pool::adopt::plan(&store, "fa", |id| (id == root_id).then(|| r.clone())).unwrap();
+    match plan {
+        AdoptPlan::FastPath { save_path, .. } => assert_eq!(save_path, root),
+        other => panic!("expected fast path, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_incomplete_fastresume_falls_back_to_verifying() {
+    // The previous client never finished it, so its piece state vouches for
+    // nothing; libtorrent has to hash before this can seed.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "T/a.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    seederd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "fb",
+        "T",
+        &[("T/a.bin", 4096)],
+        Some(false),
+    );
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let r = root.clone();
+    let plan =
+        seederd_pool::adopt::plan(&store, "fb", |id| (id == root_id).then(|| r.clone())).unwrap();
+    assert!(matches!(plan, AdoptPlan::Verify { .. }), "got {plan:?}");
+}
+
+#[test]
+fn no_fastresume_means_verify() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "T/a.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    seederd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(&mut store, &lib, "fc", "T", &[("T/a.bin", 4096)], None);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let r = root.clone();
+    let plan =
+        seederd_pool::adopt::plan(&store, "fc", |id| (id == root_id).then(|| r.clone())).unwrap();
+    assert!(matches!(plan, AdoptPlan::Verify { .. }), "got {plan:?}");
+}
+
+#[test]
+fn partial_overlap_and_missing_are_all_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "P/a.bin", 100);
+    write_file(&root, "S/shared.bin", 200);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    seederd_pool::scan_root(&mut store, &root).unwrap();
+    // partial: b.bin absent
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "p1",
+        "P",
+        &[("P/a.bin", 100), ("P/b.bin", 300)],
+        Some(true),
+    );
+    // overlap: two torrents over the same file
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "o1",
+        "S",
+        &[("S/shared.bin", 200)],
+        Some(true),
+    );
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "o2",
+        "S",
+        &[("S/shared.bin", 200)],
+        Some(true),
+    );
+    // missing
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "m1",
+        "M",
+        &[("M/gone.bin", 999)],
+        Some(true),
+    );
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let r = root.clone();
+    let at = |ih: &str| {
+        seederd_pool::adopt::plan(&store, ih, |id| (id == root_id).then(|| r.clone())).unwrap()
+    };
+    for ih in ["p1", "o1", "o2", "m1"] {
+        assert!(
+            at(ih).is_refusal(),
+            "{ih} must be refused, got {:?}",
+            at(ih)
+        );
+    }
+}
+
+#[test]
+fn a_stale_fastresume_does_not_vouch_for_changed_payload() {
+    // The sidecar says complete, but the file on disk is a different size than
+    // the torrent describes. Trusting it here would advertise bad data.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "T/a.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    seederd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "fd",
+        "T",
+        &[("T/a.bin", 4096)],
+        Some(true),
+    );
+    seederd_pool::match_all(&mut store).unwrap();
+
+    // Shrink the file and reindex: the match now fails outright, which is the
+    // strongest possible refusal.
+    std::fs::write(root.join("T/a.bin"), vec![b'x'; 8]).unwrap();
+    seederd_pool::scan_root(&mut store, &root).unwrap();
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let r = root.clone();
+    let plan =
+        seederd_pool::adopt::plan(&store, "fd", |id| (id == root_id).then(|| r.clone())).unwrap();
+    assert!(plan.is_refusal(), "got {plan:?}");
+}
+
+#[test]
+fn preview_splits_a_subtree_by_what_it_would_cost() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("data");
+    let lib = dir.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    write_file(&root, "A/a.bin", 1000);
+    write_file(&root, "B/b.bin", 2000);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    seederd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent_with_sidecar(
+        &mut store,
+        &lib,
+        "pa",
+        "A",
+        &[("A/a.bin", 1000)],
+        Some(true),
+    );
+    add_torrent_with_sidecar(&mut store, &lib, "pb", "B", &[("B/b.bin", 2000)], None);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let r = root.clone();
+    let pv =
+        seederd_pool::adopt::preview(&store, root_id, "", |id| (id == root_id).then(|| r.clone()))
+            .unwrap();
+    assert_eq!(pv.fast_path, vec!["pa".to_string()]);
+    assert_eq!(pv.verify, vec!["pb".to_string()]);
+    // The operator needs this number to know whether a bulk adopt is minutes
+    // or days of disk reads.
+    assert_eq!(pv.verify_bytes, 2000);
+}

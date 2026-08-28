@@ -658,6 +658,45 @@ impl PoolStore {
         })
     }
 
+    /// Distinct adoption states of every torrent claiming a file under
+    /// `prefix`.
+    ///
+    /// Lets the tree view colour a directory in one query instead of one per
+    /// row, which matters when a page has 500 entries.
+    pub fn states_under(
+        &self,
+        root_id: i64,
+        prefix: &str,
+    ) -> Result<Vec<AdoptionState>, PoolError> {
+        let like = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_end_matches('/'))
+        };
+        let upper = prefix_upper_bound(&like);
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT a.state
+             FROM claim c
+             JOIN adoption a ON a.infohash = c.infohash
+             WHERE c.root_id = ?1
+               AND ((?2 = '' ) OR (c.rel_path >= ?2 AND c.rel_path < ?3) OR c.rel_path = ?4)",
+        )?;
+        // The trailing `= ?4` clause catches the case where `prefix` names a
+        // file rather than a directory, which has no '/'-terminated children.
+        let rows = st.query_map(
+            params![root_id, like, upper, prefix.trim_matches('/')],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut out: Vec<AdoptionState> = rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|s| AdoptionState::parse(&s))
+            .collect();
+        out.sort_by_key(|s| s.as_str());
+        out.dedup();
+        Ok(out)
+    }
+
     /// Immediate children of `prefix` — directories and files — for the tree
     /// browser. Directories are inferred from paths, not stored.
     pub fn children(&self, root_id: i64, prefix: &str) -> Result<Vec<(String, bool)>, PoolError> {

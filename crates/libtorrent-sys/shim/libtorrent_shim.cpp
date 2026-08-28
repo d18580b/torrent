@@ -258,11 +258,16 @@ std::uint32_t map_torrent_flags(lt::torrent_flags_t f) {
     return out;
 }
 
-lt::torrent_flags_t build_torrent_flags(std::uint32_t caller_flags) {
-    // Start from a quiet default: not paused, not auto-managed, but with
-    // update_subscribe so state_update_alert reaches us.
-    lt::torrent_flags_t f = lt::torrent_flags::update_subscribe
-                          | lt::torrent_flags::duplicate_is_error;
+// Translate caller bits to libtorrent flags and nothing else.
+//
+// Kept separate from build_torrent_flags because the set/clear masks on
+// lt_add_torrent_resume_ex must translate *exactly* the bits the caller named.
+// Folding the session defaults in here would mean clearing any flag also
+// cleared update_subscribe, which silently drops the torrent out of
+// state_update_alert — the torrent then seeds correctly while the daemon's
+// status, metrics and pool state stay frozen at their initial values.
+lt::torrent_flags_t translate_torrent_flags(std::uint32_t caller_flags) {
+    lt::torrent_flags_t f = {};
     if (caller_flags & LT_TF_SEED_MODE)         f |= lt::torrent_flags::seed_mode;
     if (caller_flags & LT_TF_PAUSED)            f |= lt::torrent_flags::paused;
     if (caller_flags & LT_TF_AUTO_MANAGED)      f |= lt::torrent_flags::auto_managed;
@@ -272,6 +277,14 @@ lt::torrent_flags_t build_torrent_flags(std::uint32_t caller_flags) {
     if (caller_flags & LT_TF_DISABLE_LSD)       f |= lt::torrent_flags::disable_lsd;
     if (caller_flags & LT_TF_APPLY_IP_FILTER)   f |= lt::torrent_flags::apply_ip_filter;
     return f;
+}
+
+lt::torrent_flags_t build_torrent_flags(std::uint32_t caller_flags) {
+    // Start from a quiet default: not paused, not auto-managed, but with
+    // update_subscribe so state_update_alert reaches us.
+    return lt::torrent_flags::update_subscribe
+         | lt::torrent_flags::duplicate_is_error
+         | translate_torrent_flags(caller_flags);
 }
 
 lt::move_flags_t build_move_flags(std::uint32_t flags) {
@@ -862,9 +875,16 @@ extern "C" lt_handle lt_add_torrent_resume_ex(lt_session* s,
     if (save_path_override && *save_path_override) atp.save_path = save_path_override;
 
     // Order matters: set then clear, so a caller can clear a broad group and
-    // re-set one bit within it.
-    if (flags_set)   atp.flags |= build_torrent_flags(flags_set);
-    if (flags_clear) atp.flags &= ~build_torrent_flags(flags_clear);
+    // re-set one bit within it. Translation only — see translate_torrent_flags.
+    if (flags_set)   atp.flags |= translate_torrent_flags(flags_set);
+    if (flags_clear) atp.flags &= ~translate_torrent_flags(flags_clear);
+
+    // The daemon reads every torrent's status from state_update_alert, and a
+    // torrent only appears there while subscribed. Resume data records whatever
+    // flags were in force when it was written, so a torrent saved without this
+    // would come back invisible to the status pipeline: seeding correctly, but
+    // reporting zero progress and never advancing out of its initial state.
+    atp.flags |= lt::torrent_flags::update_subscribe;
 
     lt::torrent_handle h = s->ses.add_torrent(std::move(atp), ec);
     if (ec) { set_err(err_out, err_len, ec.message()); return 0; }

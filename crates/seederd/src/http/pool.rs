@@ -1,0 +1,597 @@
+//! `/api/pool` — the managed-pool surface.
+//!
+//! The tree endpoint is the primary one: it answers "what is under this path,
+//! and how much of it is protected" without shipping a file listing to the
+//! client, which is the only way this stays usable at petabyte scale.
+
+use axum::extract::Query;
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::Json;
+use seederd_engine::SlotId;
+use seederd_pool::AdoptionState;
+use seederd_pool::DirRollup;
+use serde::Deserialize;
+use serde::Serialize;
+use tracing::info;
+
+use crate::app_state::AppState;
+use crate::app_state::Mode;
+use crate::pool_service::execute_adopt;
+
+type ApiError = (StatusCode, Json<serde_json::Value>);
+
+fn err(code: StatusCode, msg: impl std::fmt::Display) -> ApiError {
+    (code, Json(serde_json::json!({ "error": msg.to_string() })))
+}
+
+fn no_pool() -> ApiError {
+    err(
+        StatusCode::NOT_FOUND,
+        "no [pool] section is configured on this daemon",
+    )
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/pool  — roots + totals
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct RootSummary {
+    root_id: i64,
+    path: String,
+    #[serde(flatten)]
+    rollup: DirRollup,
+}
+
+#[derive(Serialize)]
+pub struct PoolOverview {
+    roots: Vec<RootSummary>,
+    library_dir: String,
+    torrents: u64,
+    files: u64,
+    states: std::collections::HashMap<String, u64>,
+    verify_queue_depth: usize,
+    verify_in_flight: usize,
+}
+
+pub async fn overview(State(s): State<AppState>) -> Result<Json<PoolOverview>, ApiError> {
+    let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+    let (roots, torrents, files, states) = pool.with_store(|st| {
+        let roots: Vec<RootSummary> = pool
+            .roots()
+            .iter()
+            .filter_map(|(id, path)| {
+                st.rollup(*id, "").ok().map(|rollup| RootSummary {
+                    root_id: *id,
+                    path: path.to_string_lossy().into_owned(),
+                    rollup,
+                })
+            })
+            .collect();
+        let states = st
+            .counts_by_state()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| (k.as_str().to_string(), v))
+            .collect();
+        (
+            roots,
+            st.torrent_count().unwrap_or(0),
+            st.file_count().unwrap_or(0),
+            states,
+        )
+    });
+
+    Ok(Json(PoolOverview {
+        roots,
+        library_dir: pool.library_dir().to_string_lossy().into_owned(),
+        torrents,
+        files,
+        states,
+        verify_queue_depth: pool.verify_queue().depth(),
+        verify_in_flight: pool.verify_queue().in_flight(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/pool/tree
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct TreeQuery {
+    root_id: i64,
+    #[serde(default)]
+    path: String,
+    #[serde(default = "default_tree_limit")]
+    limit: usize,
+}
+
+fn default_tree_limit() -> usize {
+    500
+}
+
+#[derive(Serialize)]
+pub struct TreeEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    #[serde(flatten)]
+    rollup: DirRollup,
+    /// Adoption states of the torrents claiming anything under this entry, so
+    /// the client can colour a directory without a second round trip per row.
+    states: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct TreeResponse {
+    root_id: i64,
+    path: String,
+    #[serde(flatten)]
+    rollup: DirRollup,
+    entries: Vec<TreeEntry>,
+    truncated: bool,
+}
+
+pub async fn tree(
+    State(s): State<AppState>,
+    Query(q): Query<TreeQuery>,
+) -> Result<Json<TreeResponse>, ApiError> {
+    let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+    if pool.root_path_of(q.root_id).is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "unknown root_id"));
+    }
+    let limit = q.limit.clamp(1, 5000);
+    let prefix = q.path.trim_matches('/').to_string();
+
+    pool.with_store(|st| {
+        let rollup = st
+            .rollup(q.root_id, &prefix)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let all = st
+            .children(q.root_id, &prefix)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let truncated = all.len() > limit;
+
+        let entries = all
+            .into_iter()
+            .take(limit)
+            .map(|(path, is_dir)| {
+                let child_rollup = if is_dir {
+                    st.rollup(q.root_id, &path).unwrap_or_default()
+                } else {
+                    // A file's own rollup is a one-row query; reuse the same
+                    // shape so the client renders rows uniformly.
+                    st.rollup(q.root_id, &path).unwrap_or_default()
+                };
+                let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                TreeEntry {
+                    name,
+                    states: st
+                        .states_under(q.root_id, &path)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|s| s.as_str().to_string())
+                        .collect(),
+                    path,
+                    is_dir,
+                    rollup: child_rollup,
+                }
+            })
+            .collect();
+
+        Ok(Json(TreeResponse {
+            root_id: q.root_id,
+            path: prefix,
+            rollup,
+            entries,
+            truncated,
+        }))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/pool/torrents
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct TorrentQuery {
+    /// Filter by adoption state.
+    state: Option<String>,
+    #[serde(default = "default_tree_limit")]
+    limit: usize,
+    #[serde(default)]
+    offset: usize,
+}
+
+#[derive(Serialize)]
+pub struct PoolTorrentView {
+    infohash: String,
+    name: String,
+    total_size: u64,
+    num_files: usize,
+    state: Option<String>,
+    base_rel: Option<String>,
+    slot: Option<String>,
+    category: Option<String>,
+    tags: Vec<String>,
+    has_fastresume: bool,
+}
+
+pub async fn torrents(
+    State(s): State<AppState>,
+    Query(q): Query<TorrentQuery>,
+) -> Result<Json<Vec<PoolTorrentView>>, ApiError> {
+    let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+    let want = q.state.as_deref().and_then(AdoptionState::parse);
+    if q.state.is_some() && want.is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "unknown state filter"));
+    }
+
+    pool.with_store(|st| {
+        let all = st
+            .torrents()
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        let mut out = Vec::new();
+        for t in all {
+            let state = st.adoption_state(&t.infohash).unwrap_or(None);
+            if let Some(w) = want {
+                if state != Some(w) {
+                    continue;
+                }
+            }
+            out.push(PoolTorrentView {
+                base_rel: st.adoption_base(&t.infohash).ok().flatten().map(|(_, b)| b),
+                state: state.map(|s| s.as_str().to_string()),
+                infohash: t.infohash,
+                name: t.name,
+                total_size: t.total_size,
+                num_files: t.num_files,
+                slot: t.slot,
+                category: t.category,
+                tags: t.tags,
+                has_fastresume: t.fastresume_path.is_some(),
+            });
+        }
+        let page = out
+            .into_iter()
+            .skip(q.offset)
+            .take(q.limit.clamp(1, 5000))
+            .collect();
+        Ok(Json(page))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/pool/scan
+// ---------------------------------------------------------------------------
+
+pub async fn scan(
+    State(s): State<AppState>,
+) -> Result<Json<crate::pool_service::ScanSummary>, ApiError> {
+    let pool = s.pool.clone().ok_or_else(no_pool)?;
+    // Walking millions of paths is blocking work; keeping it off the async
+    // runtime is what stops a scan from stalling every other request.
+    let summary = tokio::task::spawn_blocking(move || pool.scan())
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    info!(
+        target: "seederd::http::pool",
+        files = summary.files,
+        torrents = summary.torrents,
+        matched = summary.matched,
+        "pool scan complete",
+    );
+    Ok(Json(summary))
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/pool/adopt
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct AdoptRequest {
+    /// Adopt these specific torrents…
+    #[serde(default)]
+    infohashes: Vec<String>,
+    /// …or everything matched under this subtree.
+    root_id: Option<i64>,
+    #[serde(default)]
+    path: Option<String>,
+    /// Required in multi-slot mode.
+    slot_id: Option<String>,
+    /// Report what would happen and change nothing.
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Serialize)]
+pub struct AdoptResponse {
+    dry_run: bool,
+    fast_path: Vec<String>,
+    queued_for_verification: Vec<String>,
+    refused: Vec<RefusedTorrent>,
+    /// Bytes libtorrent must read to verify the queued set.
+    verify_bytes: u64,
+}
+
+#[derive(Serialize)]
+pub struct RefusedTorrent {
+    infohash: String,
+    reason: String,
+}
+
+pub async fn adopt(
+    State(s): State<AppState>,
+    Json(req): Json<AdoptRequest>,
+) -> Result<Json<AdoptResponse>, ApiError> {
+    let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+
+    let slot = match (s.mode, req.slot_id.as_deref()) {
+        (Mode::Single, _) => SlotId::default_single(),
+        (Mode::MultiSlot, Some(id)) => SlotId::new(id),
+        (Mode::MultiSlot, None) => {
+            return Err(err(
+                StatusCode::BAD_REQUEST,
+                "slot_id required in multi-slot mode",
+            ))
+        }
+    };
+    if s.source.engine_for(&slot).is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "unknown slot_id"));
+    }
+    // Adopting into a fenced slot would land every torrent paused and make the
+    // slot look healthy; same guard as POST /torrents.
+    if s.slot_vpn_down(&slot) {
+        return Err(err(
+            StatusCode::CONFLICT,
+            "slot vpn_down; restart daemon to resume",
+        ));
+    }
+
+    // Resolve the target set.
+    let targets: Vec<String> = if !req.infohashes.is_empty() {
+        req.infohashes.clone()
+    } else if let Some(root_id) = req.root_id {
+        let prefix = req.path.clone().unwrap_or_default();
+        let pv = pool
+            .with_store(|st| {
+                seederd_pool::adopt::preview(st, root_id, &prefix, |id| pool.root_path_of(id))
+            })
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        pv.fast_path
+            .into_iter()
+            .chain(pv.verify)
+            .chain(pv.refused.into_iter().map(|(ih, _)| ih))
+            .collect()
+    } else {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "either `infohashes` or `root_id` is required",
+        ));
+    };
+
+    let mut resp = AdoptResponse {
+        dry_run: req.dry_run,
+        fast_path: Vec::new(),
+        queued_for_verification: Vec::new(),
+        refused: Vec::new(),
+        verify_bytes: 0,
+    };
+
+    for ih in targets {
+        let plan = pool
+            .with_store(|st| seederd_pool::adopt::plan(st, &ih, |id| pool.root_path_of(id)))
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+        match plan {
+            seederd_pool::AdoptPlan::Refuse { reason } => resp.refused.push(RefusedTorrent {
+                infohash: ih,
+                reason: reason.to_string(),
+            }),
+            seederd_pool::AdoptPlan::FastPath { .. } => {
+                if req.dry_run {
+                    resp.fast_path.push(ih);
+                    continue;
+                }
+                match execute_adopt(pool, &s.source, &ih, slot.clone()) {
+                    Ok(_) => {
+                        assign_in_registry(&s, &ih, &slot);
+                        resp.fast_path.push(ih);
+                    }
+                    Err(reason) => resp.refused.push(RefusedTorrent {
+                        infohash: ih,
+                        reason,
+                    }),
+                }
+            }
+            seederd_pool::AdoptPlan::Verify { .. } => {
+                let size = pool
+                    .with_store(|st| st.torrent(&ih).ok().flatten().map(|t| t.total_size))
+                    .unwrap_or(0);
+                resp.verify_bytes += size;
+                if req.dry_run {
+                    resp.queued_for_verification.push(ih);
+                    continue;
+                }
+                match execute_adopt(pool, &s.source, &ih, slot.clone()) {
+                    Ok(_) => {
+                        assign_in_registry(&s, &ih, &slot);
+                        resp.queued_for_verification.push(ih);
+                    }
+                    Err(reason) => resp.refused.push(RefusedTorrent {
+                        infohash: ih,
+                        reason,
+                    }),
+                }
+            }
+        }
+    }
+
+    info!(
+        target: "seederd::http::pool",
+        dry_run = req.dry_run,
+        fast_path = resp.fast_path.len(),
+        queued = resp.queued_for_verification.len(),
+        refused = resp.refused.len(),
+        "adopt",
+    );
+    Ok(Json(resp))
+}
+
+/// Mirror the adoption into the assignment registry, which is still the
+/// authority for the cross-slot info-hash uniqueness rule that `POST /torrents`
+/// enforces. A conflict here means the torrent is already loaded in another
+/// slot; the add itself will have failed, so this only logs.
+fn assign_in_registry(s: &AppState, infohash: &str, slot: &SlotId) {
+    let Some(ih) = libtorrent_safe::InfoHash::from_hex(infohash) else {
+        return;
+    };
+    if let Err(e) = s.registry.assign(ih, slot.clone()) {
+        tracing::warn!(
+            target: "seederd::http::pool",
+            infohash = %infohash,
+            error.cause = %e,
+            "adopted torrent could not be recorded in the assignment registry",
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /api/pool/verify — re-hash an already-adopted torrent
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct VerifyRequest {
+    infohashes: Vec<String>,
+}
+
+#[derive(Serialize)]
+pub struct VerifyResponse {
+    requested: usize,
+    started: Vec<String>,
+    skipped: Vec<RefusedTorrent>,
+}
+
+pub async fn verify(
+    State(s): State<AppState>,
+    Json(req): Json<VerifyRequest>,
+) -> Result<Json<VerifyResponse>, ApiError> {
+    let _ = s.pool.as_ref().ok_or_else(no_pool)?;
+    let mut resp = VerifyResponse {
+        requested: req.infohashes.len(),
+        started: Vec::new(),
+        skipped: Vec::new(),
+    };
+
+    for ih in req.infohashes {
+        let Some(hash) = libtorrent_safe::InfoHash::from_hex(&ih) else {
+            resp.skipped.push(RefusedTorrent {
+                infohash: ih,
+                reason: "invalid infohash hex".into(),
+            });
+            continue;
+        };
+        let Some(st) = s.state.get(&hash) else {
+            resp.skipped.push(RefusedTorrent {
+                infohash: ih,
+                reason: "not loaded in any session".into(),
+            });
+            continue;
+        };
+        let Some(engine) = s.source.engine_for(&st.slot_id) else {
+            resp.skipped.push(RefusedTorrent {
+                infohash: ih,
+                reason: "engine missing".into(),
+            });
+            continue;
+        };
+        // libtorrent re-hashes against the piece hashes — v1 SHA-1, v2 SHA-256
+        // merkle. This is the daemon's only authoritative check.
+        match engine.force_recheck(st.handle) {
+            Ok(()) => resp.started.push(ih),
+            Err(e) => resp.skipped.push(RefusedTorrent {
+                infohash: ih,
+                reason: e.to_string(),
+            }),
+        }
+    }
+    Ok(Json(resp))
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/pool/orphans
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct OrphanQuery {
+    root_id: i64,
+    #[serde(default)]
+    path: String,
+    #[serde(default = "default_tree_limit")]
+    limit: usize,
+}
+
+pub async fn orphans(
+    State(s): State<AppState>,
+    Query(q): Query<OrphanQuery>,
+) -> Result<Json<Vec<TreeEntry>>, ApiError> {
+    let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+    if pool.root_path_of(q.root_id).is_none() {
+        return Err(err(StatusCode::NOT_FOUND, "unknown root_id"));
+    }
+    let prefix = q.path.trim_matches('/').to_string();
+    pool.with_store(|st| {
+        let entries = st
+            .children(q.root_id, &prefix)
+            .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+            .into_iter()
+            .filter_map(|(path, is_dir)| {
+                let rollup = st.rollup(q.root_id, &path).unwrap_or_default();
+                if rollup.bytes_orphan == 0 {
+                    return None;
+                }
+                let name = path.rsplit('/').next().unwrap_or(&path).to_string();
+                Some(TreeEntry {
+                    name,
+                    path,
+                    is_dir,
+                    rollup,
+                    states: Vec::new(),
+                })
+            })
+            .take(q.limit.clamp(1, 5000))
+            .collect();
+        Ok(Json(entries))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// GET /api/pool/drift
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct DriftResponse {
+    drifted: Vec<String>,
+    files_changed: u64,
+    files_vanished: u64,
+}
+
+pub async fn drift(State(s): State<AppState>) -> Result<Json<DriftResponse>, ApiError> {
+    let pool = s.pool.clone().ok_or_else(no_pool)?;
+    let report = tokio::task::spawn_blocking(move || {
+        let roots: std::collections::HashMap<i64, std::path::PathBuf> =
+            pool.roots().iter().cloned().collect();
+        pool.with_store_mut(|st| seederd_pool::drift::detect(st, |id| roots.get(&id).cloned()))
+    })
+    .await
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?
+    .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    Ok(Json(DriftResponse {
+        drifted: report.drifted,
+        files_changed: report.files_changed,
+        files_vanished: report.files_vanished,
+    }))
+}
