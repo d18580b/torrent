@@ -417,6 +417,9 @@ fn dispatch_alert(
         Alert::TorrentLog { .. } | Alert::Log { .. } => handlers::log_msg::handle(&alert, &mut ctx),
         Alert::SessionStats { .. } => handlers::stats::handle(&alert, &mut ctx),
         Alert::MetadataReceived { .. } => handlers::metadata::handle(&alert, &mut ctx),
+        Alert::TorrentChecked { .. }
+        | Alert::StorageMoved { .. }
+        | Alert::StorageMovedFailed { .. } => handlers::storage::handle(&alert, &mut ctx),
 
         // Other alerts (tracker_error, peer_disconnected) are interesting for
         // ops/metrics but not yet wired up; emit a debug log so we can spot

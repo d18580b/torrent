@@ -49,6 +49,8 @@ pub struct TorrentSummary {
     phase: String,
     upload_rate: i64,
     download_rate: i64,
+    total_uploaded: u64,
+    total_payload_uploaded: u64,
     num_peers: i32,
     progress: f32,
     is_finished: bool,
@@ -73,6 +75,8 @@ pub(crate) fn summarize(s: &AppState, ih: &InfoHash, slot: &SlotId) -> TorrentSu
             .unwrap_or_else(|| "unknown".into()),
         upload_rate: st.as_ref().map(|s| s.upload_rate).unwrap_or(0),
         download_rate: st.as_ref().map(|s| s.download_rate).unwrap_or(0),
+        total_uploaded: st.as_ref().map(|s| s.total_uploaded).unwrap_or(0),
+        total_payload_uploaded: st.as_ref().map(|s| s.total_payload_uploaded).unwrap_or(0),
         num_peers: st.as_ref().map(|s| s.num_peers).unwrap_or(0),
         progress: st.as_ref().map(|s| s.progress).unwrap_or(0.0),
         is_finished: st.as_ref().map(|s| s.is_finished).unwrap_or(false),
@@ -635,6 +639,8 @@ mod tests {
             phase: "seeding".into(),
             upload_rate: 10,
             download_rate: 0,
+            total_uploaded: 4096,
+            total_payload_uploaded: 4000,
             num_peers: 2,
             progress: 0.5,
             is_finished: false,
@@ -643,6 +649,7 @@ mod tests {
         let v = serde_json::to_value(&ts).unwrap();
         assert_eq!(v["phase"], "seeding");
         assert_eq!(v["upload_rate"], 10);
+        assert_eq!(v["total_uploaded"], 4096);
         assert_eq!(v["is_seeding"], true);
     }
 
