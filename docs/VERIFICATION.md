@@ -357,6 +357,49 @@ grep -c "$PASSWORD" "$WORK/daemon.log"    # 0
 grep "failed login attempt" "$WORK/daemon.log"
 ```
 
+---
+
+## 5d. Web client
+
+```bash
+cargo build --release                      # builds web/dist and embeds it
+cargo build --release --no-default-features   # headless; needs no Node at all
+```
+
+Both paths are covered in CI. With the daemon running:
+
+```
+GET /            200  text/html          the app shell
+GET /assets/…js  200  cache-control: public, max-age=31536000, immutable
+GET /            200  cache-control: no-cache      (index must never be cached)
+GET /assets/missing.js  404               a mistyped asset fails loudly
+GET /api/torrents       401               API wins over the SPA fallback
+GET /api/events         401               the SSE stream is gated too
+```
+
+The last two matter: the UI is mounted as a catch-all fallback, so an API route
+that stopped matching would silently start returning HTML instead of JSON.
+
+Client routing uses the fragment, so it cannot collide with the pre-`/api`
+aliases. Confirm the distinction holds:
+
+```bash
+curl -o /dev/null -w '%{http_code}\n' localhost:8080/        # 200 — the app
+curl -o /dev/null -w '%{http_code}\n' localhost:8080/pool    # 401 — API alias
+```
+
+SSE, with a session:
+
+```bash
+curl -sN -b jar localhost:8080/api/events
+# event: tick
+# data: 9095187084607530065
+```
+
+Ticks are emitted only when a fingerprint of the visible state changes, plus a
+keepalive every 10s, so an idle pool does not wake every open browser once a
+second.
+
 ## 6. Multi-slot + VPN isolation (requires root + WireGuard)
 
 Multi-slot binds each account to its own libtorrent session on a dedicated VPN
