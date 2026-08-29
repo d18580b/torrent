@@ -145,6 +145,15 @@ fn move_torrent(
         .dst
         .as_deref()
         .ok_or("move_torrent step has no destination")?;
+    // Containment is re-checked here for the same reason `delete_file` re-checks
+    // its claim: a plan is a stored record that may be applied minutes or days
+    // after it was built, by a process whose configured roots have since
+    // changed. The planner refuses an escaping destination, so reaching this is
+    // either a stale plan or a row edited underneath us — both worth refusing
+    // rather than handing to `move_storage`.
+    if !under_a_managed_root(pool, Path::new(dst)) {
+        return Err(format!("destination {dst} is outside every managed root",));
+    }
     // The infohash is recovered from the claim rather than carried in the step,
     // so a resumed apply re-resolves against the current index instead of a
     // stale copy.
@@ -277,6 +286,14 @@ fn delete_file(pool: &PoolService, path: &Path) -> Result<(), String> {
     }
     std::fs::remove_file(path).map_err(|e| format!("unlink {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// Whether `path` lies inside one of the configured managed roots.
+///
+/// Purely lexical, matching the planner: `Path::starts_with` compares whole
+/// components, so `/data/pool2` is correctly not inside `/data/pool`.
+fn under_a_managed_root(pool: &PoolService, path: &Path) -> bool {
+    pool.roots().iter().any(|(_, root)| path.starts_with(root))
 }
 
 /// Which torrent's payload sits at `dir`.

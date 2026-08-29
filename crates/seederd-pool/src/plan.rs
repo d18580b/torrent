@@ -14,6 +14,9 @@
 //! * **Orphans must be provably unclaimed.** Deletion only ever targets files
 //!   with no claim from any torrent in the library, and only inside the
 //!   subtree the operator named.
+//! * **Every path stays inside its managed root.** Destinations arrive from
+//!   the API as root-relative strings, so a `..` component in one would have
+//!   the daemon write payload wherever the caller pointed it.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -119,8 +122,16 @@ fn build_relocate(
     };
 
     let dest_rel = dest_rel.trim_matches('/');
-    let src_dir = join(&src_root, &src_base);
-    let dest_dir = join(&dest_root, dest_rel);
+    // `src_base` is the matcher's own record so it is already root-relative;
+    // `dest_rel` is caller-supplied and is the one that must be checked.
+    let src_dir = match resolve_under(&src_root, &src_base) {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(e)),
+    };
+    let dest_dir = match resolve_under(&dest_root, dest_rel) {
+        Ok(p) => p,
+        Err(e) => return Ok(Err(e)),
+    };
     if src_dir == dest_dir {
         return Ok(Err(Refused("destination is the current location".into())));
     }
@@ -169,24 +180,56 @@ fn build_delete_orphans(
         return Ok(Err(Refused("no unclaimed files under that path".into())));
     }
 
-    let steps = orphans
-        .into_iter()
-        .map(|rel| PlanStep {
-            op: ops::DELETE_FILE.to_string(),
-            src: root.join(&rel).to_string_lossy().into_owned(),
-            dst: None,
-        })
-        .collect();
+    // These come from the index, so they are root-relative by construction —
+    // but a step is a path the executor will act on, and every one of those is
+    // resolved the same way.
+    let mut steps = Vec::with_capacity(orphans.len());
+    for rel in orphans {
+        match resolve_under(&root, &rel) {
+            Ok(p) => steps.push(PlanStep {
+                op: ops::DELETE_FILE.to_string(),
+                src: p.to_string_lossy().into_owned(),
+                dst: None,
+            }),
+            Err(e) => return Ok(Err(e)),
+        }
+    }
     Ok(Ok(steps))
 }
 
-fn join(root: &Path, rel: &str) -> PathBuf {
+/// Resolve a root-relative path, refusing anything that escapes its root.
+///
+/// `dest_rel` comes straight from the API, and `Path::join` does not normalise:
+/// `root.join("../../etc")` is a path that resolves outside `root` the moment
+/// the filesystem sees it. Both executors would then act on it — `move_storage`
+/// relocates the payload there, and `move_directory` creates the destination's
+/// parents anywhere on the disk — so containment is enforced here, at the only
+/// point where a caller-supplied path becomes a plan step.
+///
+/// The check is lexical on purpose. Resolving symlinks would make the verdict
+/// depend on filesystem state that can change between planning and applying,
+/// and a plan whose safety expires is worse than one that is merely strict.
+/// [`crate::plan`]'s counterpart in the executor re-checks containment against
+/// the configured roots before acting.
+fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, Refused> {
     let rel = rel.trim_matches('/');
     if rel.is_empty() {
-        root.to_path_buf()
-    } else {
-        root.join(rel)
+        return Ok(root.to_path_buf());
     }
+    // A leading `/` was trimmed above, so an absolute-looking `dest_rel` is
+    // read as root-relative rather than refused. That is the pre-existing
+    // behaviour and it is contained; only traversal has to be rejected.
+    for c in Path::new(rel).components() {
+        match c {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            _ => {
+                return Err(Refused(format!(
+                    "{rel:?} would resolve outside the managed root",
+                )))
+            }
+        }
+    }
+    Ok(root.join(rel))
 }
 
 /// A stable token the caller must echo back to apply a destructive plan.
@@ -216,4 +259,97 @@ pub fn confirm_token(plan_id: i64, steps: &[crate::model::PlanStepRow]) -> Strin
 /// Whether a plan kind destroys data and therefore needs the confirm token.
 pub fn is_destructive(kind: &str) -> bool {
     kind == "delete_orphans"
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    use super::resolve_under;
+
+    fn root() -> PathBuf {
+        PathBuf::from("/data/pool")
+    }
+
+    #[test]
+    fn a_plain_relative_path_resolves_under_the_root() {
+        assert_eq!(
+            resolve_under(&root(), "shows/S01").unwrap(),
+            Path::new("/data/pool/shows/S01"),
+        );
+        assert_eq!(resolve_under(&root(), "").unwrap(), root());
+        assert_eq!(
+            resolve_under(&root(), "/leading/").unwrap(),
+            Path::new("/data/pool/leading")
+        );
+    }
+
+    /// The one that matters: `dest_rel` arrives from the API, and `Path::join`
+    /// does not normalise, so without this the daemon would relocate payload
+    /// to wherever the caller pointed it.
+    #[test]
+    fn a_parent_traversal_is_refused() {
+        for bad in [
+            "../escape",
+            "../../../var/tmp/evil",
+            "shows/../../escape",
+            "./../escape",
+        ] {
+            assert!(
+                resolve_under(&root(), bad).is_err(),
+                "{bad:?} should have been refused",
+            );
+        }
+    }
+
+    /// The invariant the whole function exists for, stated directly: whatever
+    /// comes back is inside the root, or nothing comes back at all.
+    ///
+    /// `starts_with` alone cannot express that — it is lexical, so
+    /// `/data/pool/../escape` satisfies it. The absence of a `ParentDir`
+    /// component is what makes the prefix meaningful, so both are asserted.
+    #[test]
+    fn anything_accepted_is_inside_the_root() {
+        for input in [
+            "",
+            "shows/S01",
+            "/etc/cron.d",
+            "./here",
+            "..hidden",
+            "../escape",
+            "a/../../../b",
+            "/../../etc",
+        ] {
+            if let Ok(p) = resolve_under(&root(), input) {
+                assert!(
+                    p.starts_with(root()),
+                    "{input:?} resolved to {p:?}, outside the root",
+                );
+                assert!(
+                    !p.components().any(|c| c == std::path::Component::ParentDir),
+                    "{input:?} resolved to {p:?}, which walks back out",
+                );
+            }
+        }
+    }
+
+    /// An absolute-looking destination is read as root-relative, not refused —
+    /// it is contained, which is what matters.
+    #[test]
+    fn an_absolute_looking_destination_is_taken_as_root_relative() {
+        assert_eq!(
+            resolve_under(&root(), "/etc/cron.d").unwrap(),
+            Path::new("/data/pool/etc/cron.d"),
+        );
+    }
+
+    #[test]
+    fn a_dotdot_inside_a_name_is_not_a_traversal() {
+        // `..foo` and `foo..bar` are ordinary filenames, not parent refs.
+        assert_eq!(
+            resolve_under(&root(), "..hidden/foo..bar").unwrap(),
+            Path::new("/data/pool/..hidden/foo..bar"),
+        );
+    }
 }
