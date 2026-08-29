@@ -25,6 +25,7 @@ seederd does **one** thing: seed torrents whose payload already exists on disk.
 |-------|---------|
 | `seederd` | The daemon binary: config, HTTP control plane, signals, VPN + NAT-PMP integration, metrics. |
 | `seederd-engine` | `TorrentEngine` trait, the alert loop, slot/assignment registry, and provider-agnostic port-forward core (plus mock doubles). |
+| `seederd-pool` | Managed-root filesystem index, torrent library, and adoption matching (SQLite). |
 | `libtorrent-safe` | Safe RAII wrappers over the FFI. |
 | `libtorrent-sys` | Raw FFI bindings to libtorrent-rasterbar via a custom C shim. |
 | `seederd-bench` | Layer-4 load/soak harness (memory scaling, alert throughput, startup time). |
@@ -75,6 +76,45 @@ Default bind `127.0.0.1:8080`. All bodies are JSON unless noted.
 
 Multi-slot mode additionally mounts `GET /slots`, `GET /slots/:id`,
 `GET /slots/:id/torrents`, and `POST /slots/:id/pause-all` \| `/resume-all`.
+
+## Managed pool
+
+Seeding from a library that already exists on disk raises questions a torrent
+list cannot answer: which files are protected by a torrent, which are not, and
+which torrents point at data that moved or vanished. The optional `[pool]`
+section indexes **managed roots** (directories seederd owns) and a **torrent
+library** (a directory of `.torrent` files), matches them, and reports per path:
+
+| State | Meaning |
+|-------|---------|
+| `adopted` | Loaded into a session and seeding. |
+| `matched` | Every file resolved on disk; not yet loaded. |
+| `partial` | Some files present. Adoption is refused — seeding it would advertise pieces the daemon cannot serve. |
+| `missing` | No payload found under any root. |
+| `drifted` | Was matched, but a claimed file's stats changed since the last scan. Needs verification. |
+| `overlap` | Two torrents claim the same file. Blocks any mutation touching those bytes. |
+
+Plus byte rollups per directory, so an unprotected subtree is visible without
+reading a file listing.
+
+Change detection is tiered, because hashing a petabyte is days of I/O:
+a `(size, mtime, inode)` sweep catches essentially every real change cheaply;
+libtorrent's own piece hashing (v1 SHA-1, v2 SHA-256 merkle) is the
+authoritative check and runs on adopt and on drift; and a v2 torrent's per-file
+merkle root identifies a file independently of its name or location. v1
+torrents have no per-file digest — pieces span file boundaries — so they match
+on `(path, size)` and are only confirmed by verification.
+
+**Migrating from another client is just the first scan.** Point `library_dir` at
+its state directory; for qBittorrent that is `BT_backup`, which holds both
+`<hash>.torrent` and `<hash>.fastresume`, and the sidecars supply save-path,
+category and tag hints. Copy it somewhere scratch first.
+
+```bash
+seederd --config /etc/seederd/seederd.toml pool scan      # index + match
+seederd --config /etc/seederd/seederd.toml pool status    # summarise
+seederd --config /etc/seederd/seederd.toml pool orphans   # unclaimed bytes
+```
 
 ## Configuration & modes
 
