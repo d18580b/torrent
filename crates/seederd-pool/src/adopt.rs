@@ -8,10 +8,12 @@
 //! Hashing a petabyte is days of I/O, so this tiers:
 //!
 //! * **Fast path** — the previous client left a `.fastresume` saying the
-//!   torrent was complete, and every file still has the size and mtime the
-//!   index recorded. Its piece state is then as good as a verification we would
-//!   have performed ourselves, so the torrent is added in seed mode and seeds
-//!   immediately.
+//!   torrent was complete, and every file is still in the index at the size the
+//!   torrent declares. Payload rewritten in place at the same size is caught
+//!   separately by the drift pass, which marks the torrent `Drifted` and so
+//!   refuses it here. Given both, its piece state is as good as a verification
+//!   we would have performed ourselves, so the torrent is added in seed mode
+//!   and seeds immediately.
 //! * **Verify path** — anything else. The torrent is added *without* seed mode,
 //!   which makes libtorrent hash the payload against the piece hashes (v1
 //!   SHA-1, v2 SHA-256 merkle) before it will seed. seederd never reimplements
@@ -148,8 +150,14 @@ pub fn plan(
 ///
 /// Two conditions, both necessary. The sidecar has to say the torrent was
 /// complete — an incomplete one has nothing useful to assert — and every file
-/// has to still look exactly as the index recorded it. The second is what stops
-/// a stale `.fastresume` from vouching for payload that has since changed.
+/// has to still be present in the index at the size the torrent declares.
+///
+/// Note what that second condition does *not* cover: it compares the torrent
+/// against the index, so it only rules out payload that changed size. Payload
+/// rewritten in place at the same size is caught by [`crate::drift`], which
+/// stats the live filesystem and marks the torrent `Drifted` — and `Drifted` is
+/// refused above. The guarantee is therefore only as fresh as the last drift
+/// pass, which is why one runs before a bulk adopt.
 fn fastresume_is_trustworthy(store: &PoolStore, infohash: &str) -> Result<bool, PoolError> {
     let Some(torrent) = store.torrent(infohash)? else {
         return Ok(false);

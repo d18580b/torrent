@@ -17,9 +17,14 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         Alert::TorrentChecked { hdr } => {
             let _enter = ctx.span.enter();
             let Some(ih) = hdr.infohash else { return };
-            // The verdict itself (complete / incomplete) arrives in the
-            // following state_update; this alert only marks that hashing
-            // finished, which is what releases a slot in the recheck queue.
+            // Stamp the state map: this alert is the only authoritative
+            // "hashing is over" signal. The verdict itself (complete /
+            // incomplete) arrives in the following state_update, and a torrent
+            // that failed its check never reaches a distinct phase — so a
+            // reader that waits for one waits forever. The verify queue keys
+            // its retirement off this.
+            ctx.state
+                .update(&ih, |st| st.checked_at = Some(ctx.clock.now()));
             info!(
                 target: "seederd_engine::handler::storage",
                 infohash = %ih,
