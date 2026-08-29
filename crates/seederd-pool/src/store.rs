@@ -20,6 +20,9 @@ use tracing::warn;
 
 use crate::model::AdoptionState;
 use crate::model::DirRollup;
+use crate::model::PlanRow;
+use crate::model::PlanStep;
+use crate::model::PlanStepRow;
 use crate::model::PoolError;
 use crate::model::PoolFile;
 use crate::model::PoolTorrent;
@@ -27,7 +30,7 @@ use crate::model::TorrentFileRow;
 
 /// Bumped whenever the schema changes; `migrate` walks forward from whatever
 /// the file reports. A file from the future is refused rather than guessed at.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE root (
@@ -107,6 +110,36 @@ CREATE TABLE claim (
 CREATE INDEX claim_by_torrent ON claim(infohash);
 "#;
 
+/// v2 adds the mutation journal. Applied on top of v1 rather than folded into
+/// it so an index created by an earlier build migrates forward in place.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE plan (
+    id         INTEGER PRIMARY KEY,
+    kind       TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    applied_at INTEGER,
+    -- draft | applying | applied | failed | cancelled
+    status     TEXT    NOT NULL,
+    spec       TEXT    NOT NULL
+);
+
+CREATE INDEX plan_by_status ON plan(status);
+
+-- Written before each step is attempted. A crash mid-apply leaves the plan
+-- `applying` with a known last-completed step, which startup re-drives.
+CREATE TABLE plan_step (
+    plan_id INTEGER NOT NULL REFERENCES plan(id) ON DELETE CASCADE,
+    seq     INTEGER NOT NULL,
+    op      TEXT    NOT NULL,
+    src     TEXT    NOT NULL,
+    dst     TEXT,
+    -- pending | done | failed | skipped
+    status  TEXT    NOT NULL,
+    error   TEXT,
+    PRIMARY KEY (plan_id, seq)
+) WITHOUT ROWID;
+"#;
+
 pub struct PoolStore {
     conn: Connection,
 }
@@ -157,6 +190,9 @@ impl PoolStore {
         }
         if found < 1 {
             self.conn.execute_batch(SCHEMA_V1)?;
+        }
+        if found < 2 {
+            self.conn.execute_batch(SCHEMA_V2)?;
         }
         if found != SCHEMA_VERSION {
             self.conn
@@ -602,6 +638,141 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    // -- plans ---------------------------------------------------------------
+
+    pub fn create_plan(&self, kind: &str, spec: &str, created_at: i64) -> Result<i64, PoolError> {
+        self.conn.execute(
+            "INSERT INTO plan(kind, created_at, status, spec) VALUES (?1,?2,'draft',?3)",
+            params![kind, created_at, spec],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn add_plan_steps(&mut self, plan_id: i64, steps: &[PlanStep]) -> Result<(), PoolError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO plan_step(plan_id, seq, op, src, dst, status, error)
+                 VALUES (?1,?2,?3,?4,?5,'pending',NULL)",
+            )?;
+            for (i, st) in steps.iter().enumerate() {
+                ins.execute(params![plan_id, i as i64, st.op, st.src, st.dst])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn plan(&self, id: i64) -> Result<Option<PlanRow>, PoolError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, kind, created_at, applied_at, status, spec FROM plan WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(PlanRow {
+                        id: r.get(0)?,
+                        kind: r.get(1)?,
+                        created_at: r.get(2)?,
+                        applied_at: r.get(3)?,
+                        status: r.get(4)?,
+                        spec: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn plans(&self) -> Result<Vec<PlanRow>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT id, kind, created_at, applied_at, status, spec FROM plan ORDER BY id DESC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(PlanRow {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                created_at: r.get(2)?,
+                applied_at: r.get(3)?,
+                status: r.get(4)?,
+                spec: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Plans left mid-apply by a crash or a kill, in id order so the oldest is
+    /// resumed first.
+    pub fn unfinished_plans(&self) -> Result<Vec<PlanRow>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT id, kind, created_at, applied_at, status, spec
+             FROM plan WHERE status = 'applying' ORDER BY id",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(PlanRow {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                created_at: r.get(2)?,
+                applied_at: r.get(3)?,
+                status: r.get(4)?,
+                spec: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn set_plan_status(
+        &self,
+        id: i64,
+        status: &str,
+        applied_at: Option<i64>,
+    ) -> Result<(), PoolError> {
+        self.conn.execute(
+            "UPDATE plan SET status = ?2, applied_at = COALESCE(?3, applied_at) WHERE id = ?1",
+            params![id, status, applied_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_plan(&self, id: i64) -> Result<(), PoolError> {
+        self.conn
+            .execute("DELETE FROM plan_step WHERE plan_id = ?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM plan WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn plan_steps(&self, plan_id: i64) -> Result<Vec<PlanStepRow>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT seq, op, src, dst, status, error FROM plan_step
+             WHERE plan_id = ?1 ORDER BY seq",
+        )?;
+        let rows = st.query_map(params![plan_id], |r| {
+            Ok(PlanStepRow {
+                seq: r.get(0)?,
+                op: r.get(1)?,
+                src: r.get(2)?,
+                dst: r.get(3)?,
+                status: r.get(4)?,
+                error: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn set_step_status(
+        &self,
+        plan_id: i64,
+        seq: i64,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), PoolError> {
+        self.conn.execute(
+            "UPDATE plan_step SET status = ?3, error = ?4 WHERE plan_id = ?1 AND seq = ?2",
+            params![plan_id, seq, status, error],
+        )?;
+        Ok(())
+    }
+
     // -- rollups -----------------------------------------------------------
 
     /// Byte accounting for everything under `prefix` in `root_id`.
@@ -656,6 +827,57 @@ impl PoolStore {
             files_total: files_total as u64,
             files_orphan: files_orphan as u64,
         })
+    }
+
+    /// Every file under `prefix` that no torrent claims.
+    ///
+    /// This is the only query a delete plan is allowed to build from: a file is
+    /// a deletion candidate solely because nothing in the library references
+    /// it, never because it merely looks unused.
+    pub fn orphan_files(&self, root_id: i64, prefix: &str) -> Result<Vec<String>, PoolError> {
+        let like = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_end_matches('/'))
+        };
+        let upper = prefix_upper_bound(&like);
+        let mut st = self.conn.prepare(
+            "SELECT f.rel_path FROM file f
+             WHERE f.root_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3
+               AND NOT EXISTS (
+                 SELECT 1 FROM claim c
+                 WHERE c.root_id = f.root_id AND c.rel_path = f.rel_path
+               )
+             ORDER BY f.rel_path",
+        )?;
+        let rows = st.query_map(params![root_id, like, upper], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether one specific file is claimed by no torrent.
+    ///
+    /// The single-file form of [`PoolStore::orphan_files`], for the last-moment
+    /// re-check before an irreversible delete. Listing every orphan in the root
+    /// and scanning it would be O(pool) per file.
+    pub fn is_orphan(&self, root_id: i64, rel_path: &str) -> Result<bool, PoolError> {
+        let claimed: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM claim WHERE root_id = ?1 AND rel_path = ?2
+             )",
+            params![root_id, rel_path],
+            |r| r.get(0),
+        )?;
+        if claimed != 0 {
+            return Ok(false);
+        }
+        // A path the index has never seen is not an orphan either — it is
+        // outside the pool's knowledge, and deleting it was never sanctioned.
+        let known: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file WHERE root_id = ?1 AND rel_path = ?2)",
+            params![root_id, rel_path],
+            |r| r.get(0),
+        )?;
+        Ok(known != 0)
     }
 
     /// Distinct adoption states of every torrent claiming a file under

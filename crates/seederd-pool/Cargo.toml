@@ -26,6 +26,8 @@ hex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# The migration test hand-builds a v1 index to prove the upgrade path.
+rusqlite = { workspace = true }
 
 [lints]
 workspace = true
