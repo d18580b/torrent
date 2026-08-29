@@ -311,6 +311,52 @@ A torrent already marked `drifted` is not re-reported until it has been
 verified. Drift is a reason to verify, never proof of corruption: only
 libtorrent re-hashing the payload settles that.
 
+---
+
+## 5c. Authentication
+
+```bash
+seederd --config "$WORK/seederd.toml" hash-password
+seederd --config "$WORK/seederd.toml" new-token --name prometheus --scopes metrics
+seederd --config "$WORK/seederd.toml" new-token --name script --scopes read
+```
+
+With those in an `[auth]` section, every boundary should hold:
+
+```
+healthz (unauthenticated, by design)                 200
+GET /api/torrents  no credential                     401
+GET /api/torrents  read token                        200
+GET /api/torrents  metrics token (wrong scope)       401
+POST /api/pool/scan  read token (needs write)        401
+GET /metrics  no credential                          401
+GET /metrics  metrics token                          200
+GET /metrics  read token (wrong scope)               401
+legacy bare path /torrents  no credential            401
+```
+
+The last two matter most: a scrape credential must not reach the control plane,
+and the pre-`/api` aliases must be gated exactly like the `/api` paths rather
+than surviving as an unauthenticated back door.
+
+Session flow:
+
+```bash
+curl -sX POST :8080/api/login -d '{"password":"wrong"}'    # 401
+curl -si -c jar -X POST :8080/api/login -d '{"password":"…"}'
+# set-cookie: seederd_session=…; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600
+curl -s -b jar  :8080/api/torrents                          # 200
+curl -s -b jar -X POST :8080/api/logout                     # 204
+curl -s -b jar  :8080/api/torrents                          # 401 — revoked server-side
+```
+
+Confirm the password never reaches the log:
+
+```bash
+grep -c "$PASSWORD" "$WORK/daemon.log"    # 0
+grep "failed login attempt" "$WORK/daemon.log"
+```
+
 ## 6. Multi-slot + VPN isolation (requires root + WireGuard)
 
 Multi-slot binds each account to its own libtorrent session on a dedicated VPN
