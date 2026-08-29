@@ -15,6 +15,8 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     st.last_alert = now;
                     st.upload_rate = s.upload_rate;
                     st.download_rate = s.download_rate;
+                    st.total_uploaded = s.total_uploaded;
+                    st.total_payload_uploaded = s.total_payload_uploaded;
                     st.num_peers = s.num_peers;
                     st.progress = s.progress;
                     st.is_finished = s.is_finished;
@@ -158,6 +160,8 @@ mod tests {
         let st = state.get(&ih(0x44)).unwrap();
         assert_eq!(st.phase, TorrentPhase::Seeding);
         assert_eq!(st.upload_rate, 4242);
+        assert_eq!(st.total_uploaded, 100);
+        assert_eq!(st.total_payload_uploaded, 90);
         assert_eq!(st.num_peers, 3);
         assert!(st.is_seeding && st.needs_save_resume);
     }

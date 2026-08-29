@@ -34,6 +34,20 @@ bitflags::bitflags! {
     }
 }
 
+/// Collision policy for [`crate::Session::move_storage`].
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Default)]
+#[repr(u32)]
+pub enum MoveFlags {
+    /// Overwrite any file already at the destination.
+    AlwaysReplaceFiles = ffi::LT_MOVE_ALWAYS_REPLACE_FILES,
+    /// Abort the whole move if any destination file exists.
+    FailIfExist = ffi::LT_MOVE_FAIL_IF_EXIST,
+    /// Leave existing destination files alone and adopt them in place. The
+    /// safe default for a pool relocation: it never destroys payload.
+    #[default]
+    DontReplace = ffi::LT_MOVE_DONT_REPLACE,
+}
+
 /// libtorrent settings the daemon may override at startup or via SIGHUP.
 ///
 /// Names match libtorrent's `settings_pack::*` identifiers verbatim — the

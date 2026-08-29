@@ -12,6 +12,7 @@ use std::sync::Arc;
 pub use libtorrent_safe::AddParams;
 pub use libtorrent_safe::Alert;
 pub use libtorrent_safe::InfoHash;
+pub use libtorrent_safe::MoveFlags;
 pub use libtorrent_safe::ResumeData;
 pub use libtorrent_safe::ResumeFlags;
 pub use libtorrent_safe::Settings;
@@ -68,6 +69,18 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
         file_idx: i32,
         priority: u8,
     ) -> Result<(), EngineError>;
+    /// Re-hash the payload against the torrent's piece hashes. Asynchronous:
+    /// completion lands as `Alert::TorrentChecked`. This is the daemon's only
+    /// verification path — piece hashing is never reimplemented.
+    fn force_recheck(&self, h: TorrentHandle) -> Result<(), EngineError>;
+    /// Relocate a torrent's payload via libtorrent, so its storage state stays
+    /// consistent. Asynchronous: `Alert::StorageMoved{,Failed}`.
+    fn move_storage(
+        &self,
+        h: TorrentHandle,
+        new_path: &str,
+        flags: MoveFlags,
+    ) -> Result<(), EngineError>;
     fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError>;
     fn session_state(&self) -> Result<Vec<u8>, EngineError>;
 }
@@ -103,6 +116,17 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn post_stats(&self) {
         (**self).post_stats()
+    }
+    fn force_recheck(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        (**self).force_recheck(h)
+    }
+    fn move_storage(
+        &self,
+        h: TorrentHandle,
+        new_path: &str,
+        flags: MoveFlags,
+    ) -> Result<(), EngineError> {
+        (**self).move_storage(h, new_path, flags)
     }
     fn apply_settings(&self, s: &Settings) -> Result<(), EngineError> {
         (**self).apply_settings(s)

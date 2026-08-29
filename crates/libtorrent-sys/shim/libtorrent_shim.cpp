@@ -26,6 +26,7 @@
 #include <libtorrent/disabled_disk_io.hpp>
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_info.hpp>
+#include <libtorrent/file_storage.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/torrent_flags.hpp>
 #include <libtorrent/add_torrent_params.hpp>
@@ -271,6 +272,14 @@ lt::torrent_flags_t build_torrent_flags(std::uint32_t caller_flags) {
     if (caller_flags & LT_TF_DISABLE_LSD)       f |= lt::torrent_flags::disable_lsd;
     if (caller_flags & LT_TF_APPLY_IP_FILTER)   f |= lt::torrent_flags::apply_ip_filter;
     return f;
+}
+
+lt::move_flags_t build_move_flags(std::uint32_t flags) {
+    switch (flags) {
+        case LT_MOVE_FAIL_IF_EXIST: return lt::move_flags_t::fail_if_exist;
+        case LT_MOVE_DONT_REPLACE:  return lt::move_flags_t::dont_replace;
+        default:                    return lt::move_flags_t::always_replace_files;
+    }
 }
 
 lt::resume_data_flags_t build_resume_flags(std::uint32_t flags) {
@@ -563,6 +572,30 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
         copy_str_truncated(out.payload.log_msg.message, LT_MSG_MAX, x->message());
         return true;
     }
+    if (auto* x = lt::alert_cast<lt::torrent_checked_alert>(a)) {
+        out.kind = LT_ALERT_TORRENT_CHECKED;
+        fill_torrent_scope(out, s, x->handle);
+        return true;
+    }
+    if (auto* x = lt::alert_cast<lt::storage_moved_alert>(a)) {
+        out.kind = LT_ALERT_STORAGE_MOVED;
+        copy_str_truncated(out.payload.storage_moved.path, LT_PATH_MAX,
+                           std::string(x->storage_path()));
+        fill_torrent_scope(out, s, x->handle);
+        return true;
+    }
+    if (auto* x = lt::alert_cast<lt::storage_moved_failed_alert>(a)) {
+        out.kind = LT_ALERT_STORAGE_MOVED_FAILED;
+        out.payload.storage_moved_failed.error_code = x->error.value();
+        copy_str_truncated(out.payload.storage_moved_failed.operation, LT_OP_MAX,
+                           lt::operation_name(x->op));
+        copy_str_truncated(out.payload.storage_moved_failed.path, LT_PATH_MAX,
+                           std::string(x->file_path()));
+        copy_str_truncated(out.payload.storage_moved_failed.message, LT_MSG_MAX,
+                           x->error.message());
+        fill_torrent_scope(out, s, x->handle);
+        return true;
+    }
     return false;
 }
 
@@ -801,6 +834,49 @@ extern "C" lt_handle lt_add_torrent_resume(lt_session* s,
     LT_SHIM_CATCH(err_out, err_len, 0)
 }
 
+extern "C" lt_handle lt_add_torrent_resume_ex(lt_session* s,
+                                              const uint8_t* resume_buf, size_t resume_len,
+                                              const uint8_t* torrent_buf, size_t torrent_len,
+                                              const char* save_path_override,
+                                              uint32_t flags_set, uint32_t flags_clear,
+                                              uint8_t* infohash_out,
+                                              char* err_out, int err_len)
+{
+    if (!s || !resume_buf) { set_err(err_out, err_len, "null arg"); return 0; }
+    LT_SHIM_TRY
+    lt::error_code ec;
+    lt::add_torrent_params atp = lt::read_resume_data(
+        lt::span<char const>(reinterpret_cast<const char*>(resume_buf), resume_len), ec);
+    if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
+
+    // Resume data only carries the info dict when save_resume_data was called
+    // with save_info_dict. Without it atp.ti is null and the torrent would
+    // re-enter downloading_metadata; attach the .torrent the caller kept on
+    // disk instead. libtorrent rejects a ti whose info-hash disagrees with the
+    // resume data, which is the check we want.
+    if (!atp.ti && torrent_buf && torrent_len > 0) {
+        atp.ti = std::make_shared<lt::torrent_info>(
+            reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+    }
+
+    if (save_path_override && *save_path_override) atp.save_path = save_path_override;
+
+    // Order matters: set then clear, so a caller can clear a broad group and
+    // re-set one bit within it.
+    if (flags_set)   atp.flags |= build_torrent_flags(flags_set);
+    if (flags_clear) atp.flags &= ~build_torrent_flags(flags_clear);
+
+    lt::torrent_handle h = s->ses.add_torrent(std::move(atp), ec);
+    if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
+    if (!h.is_valid()) { set_err(err_out, err_len, "invalid handle"); return 0; }
+    if (infohash_out) {
+        auto ih = h.info_hashes().get_best();
+        std::memcpy(infohash_out, ih.data(), 20);
+    }
+    return s->register_handle(h);
+    LT_SHIM_CATCH(err_out, err_len, 0)
+}
+
 extern "C" int lt_torrent_info_hash(const uint8_t* data, size_t len,
                                     uint8_t* out20, char* err_out, int err_len)
 {
@@ -848,6 +924,60 @@ std::string url_host(const std::string& url) {
 }
 
 }  // namespace
+
+extern "C" int lt_torrent_metadata(const uint8_t* data, size_t len,
+                                   struct lt_torrent_meta* out,
+                                   char* err_out, int err_len)
+{
+    if (!data || !out) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    LT_SHIM_TRY
+    std::memset(out, 0, sizeof(*out));
+
+    lt::torrent_info ti(reinterpret_cast<const char*>(data), static_cast<int>(len));
+    auto const& ih = ti.info_hashes();
+
+    copy_str_truncated(out->name, LT_PATH_MAX, ti.name());
+    out->total_size   = static_cast<std::uint64_t>(ti.total_size());
+    out->piece_length = static_cast<std::uint32_t>(ti.piece_length());
+    out->has_v1 = ih.has_v1() ? 1 : 0;
+    out->has_v2 = ih.has_v2() ? 1 : 0;
+    if (ih.has_v1()) std::memcpy(out->infohash_v1, ih.v1.data(), 20);
+    if (ih.has_v2()) std::memcpy(out->infohash_v2, ih.v2.data(), 32);
+
+    lt::file_storage const& fs = ti.files();
+    auto const n = static_cast<std::size_t>(fs.num_files());
+    if (n > 0) {
+        auto* arr = static_cast<lt_torrent_meta_file*>(
+            std::calloc(n, sizeof(lt_torrent_meta_file)));
+        if (!arr) throw std::bad_alloc{};
+        for (std::size_t i = 0; i < n; ++i) {
+            auto const idx = lt::file_index_t{static_cast<int>(i)};
+            // file_path() with an empty save_path yields the torrent-relative
+            // path, which is what the pool matcher joins onto a candidate base.
+            copy_str_truncated(arr[i].path, LT_PATH_MAX, fs.file_path(idx));
+            arr[i].size = static_cast<std::uint64_t>(fs.file_size(idx));
+            // v2 merkle root per file. root_ptr() is null for v1-only torrents
+            // and for v2 padding files, which have no root of their own.
+            if (ih.has_v2()) {
+                if (char const* r = fs.root_ptr(idx)) {
+                    std::memcpy(arr[i].pieces_root, r, 32);
+                    arr[i].has_pieces_root = 1;
+                }
+            }
+        }
+        out->files = arr;
+        out->num_files = n;
+    }
+    return LT_OK;
+    LT_SHIM_CATCH(err_out, err_len, LT_ERR)
+}
+
+extern "C" void lt_torrent_meta_free(struct lt_torrent_meta* m) {
+    if (!m) return;
+    std::free(m->files);
+    m->files = nullptr;
+    m->num_files = 0;
+}
 
 extern "C" int lt_torrent_tracker_host_matches(const uint8_t* data, size_t len,
                                                const char* domains_csv,
@@ -904,6 +1034,28 @@ extern "C" int lt_torrent_resume(lt_session* s, lt_handle h) {
     auto th = s->lookup(h);
     if (!th.is_valid()) return LT_ERR;
     th.resume();
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
+extern "C" int lt_torrent_force_recheck(lt_session* s, lt_handle h) {
+    if (!s) return LT_ERR;
+    LT_SHIM_TRY
+    auto th = s->lookup(h);
+    if (!th.is_valid()) return LT_ERR;
+    th.force_recheck();
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
+extern "C" int lt_torrent_move_storage(lt_session* s, lt_handle h,
+                                       const char* new_path, uint32_t flags)
+{
+    if (!s || !new_path) return LT_ERR;
+    LT_SHIM_TRY
+    auto th = s->lookup(h);
+    if (!th.is_valid()) return LT_ERR;
+    th.move_storage(new_path, build_move_flags(flags));
     return LT_OK;
     LT_SHIM_CATCH(nullptr, 0, LT_ERR)
 }

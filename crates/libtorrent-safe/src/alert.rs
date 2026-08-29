@@ -35,6 +35,9 @@ pub enum AlertKind {
     PeerDisconnected,
     TorrentLog,
     Log,
+    TorrentChecked,
+    StorageMoved,
+    StorageMovedFailed,
 }
 
 impl AlertKind {
@@ -50,6 +53,9 @@ impl AlertKind {
             AlertKind::MetadataReceived => "metadata_received",
             AlertKind::SaveResumeData => "save_resume_data",
             AlertKind::SaveResumeDataFailed => "save_resume_data_failed",
+            AlertKind::TorrentChecked => "torrent_checked",
+            AlertKind::StorageMoved => "storage_moved",
+            AlertKind::StorageMovedFailed => "storage_moved_failed",
             AlertKind::ListenFailed => "listen_failed",
             AlertKind::ListenSucceeded => "listen_succeeded",
             AlertKind::SessionStats => "session_stats",
@@ -150,6 +156,23 @@ pub enum Alert {
         hdr: AlertHeader,
         endpoint: String,
     },
+    /// A `force_recheck` finished hashing the payload. The result is read from
+    /// the following `StateUpdate` (progress / is_seeding), not from here.
+    TorrentChecked {
+        hdr: AlertHeader,
+    },
+    /// `move_storage` completed; `path` is the new save path.
+    StorageMoved {
+        hdr: AlertHeader,
+        path: String,
+    },
+    StorageMovedFailed {
+        hdr: AlertHeader,
+        error_code: i32,
+        operation: String,
+        path: String,
+        message: String,
+    },
     SessionStats {
         hdr: AlertHeader,
         counters: Vec<i64>,
@@ -197,6 +220,9 @@ impl Alert {
             | Alert::SaveResumeDataFailed { hdr, .. }
             | Alert::ListenFailed { hdr, .. }
             | Alert::ListenSucceeded { hdr, .. }
+            | Alert::TorrentChecked { hdr, .. }
+            | Alert::StorageMoved { hdr, .. }
+            | Alert::StorageMovedFailed { hdr, .. }
             | Alert::SessionStats { hdr, .. }
             | Alert::AlertsDropped { hdr, .. }
             | Alert::TrackerError { hdr, .. }
@@ -245,6 +271,9 @@ impl Alert {
             ffi::lt_alert_kind_LT_ALERT_PEER_DISCONNECTED => AlertKind::PeerDisconnected,
             ffi::lt_alert_kind_LT_ALERT_TORRENT_LOG => AlertKind::TorrentLog,
             ffi::lt_alert_kind_LT_ALERT_LOG => AlertKind::Log,
+            ffi::lt_alert_kind_LT_ALERT_TORRENT_CHECKED => AlertKind::TorrentChecked,
+            ffi::lt_alert_kind_LT_ALERT_STORAGE_MOVED => AlertKind::StorageMoved,
+            ffi::lt_alert_kind_LT_ALERT_STORAGE_MOVED_FAILED => AlertKind::StorageMovedFailed,
             _ => {
                 // Unknown — still free any payload to avoid leaks.
                 unsafe { ffi::lt_alert_payload_free(raw as *mut _) };
@@ -382,6 +411,24 @@ impl Alert {
                 Alert::ListenSucceeded {
                     hdr,
                     endpoint: c_str_to_owned(&p.endpoint),
+                }
+            }
+            AlertKind::TorrentChecked => Alert::TorrentChecked { hdr },
+            AlertKind::StorageMoved => {
+                let p = unsafe { &raw.payload.storage_moved };
+                Alert::StorageMoved {
+                    hdr,
+                    path: c_str_to_owned(&p.path),
+                }
+            }
+            AlertKind::StorageMovedFailed => {
+                let p = unsafe { &raw.payload.storage_moved_failed };
+                Alert::StorageMovedFailed {
+                    hdr,
+                    error_code: p.error_code,
+                    operation: c_str_to_owned(&p.operation),
+                    path: c_str_to_owned(&p.path),
+                    message: c_str_to_owned(&p.message),
                 }
             }
             AlertKind::SessionStats => {
