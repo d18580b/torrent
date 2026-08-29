@@ -1,5 +1,6 @@
 //! axum HTTP control plane.
 
+mod auth_routes;
 mod healthz;
 mod metrics;
 mod pool;
@@ -65,13 +66,33 @@ pub fn router(state: AppState) -> Router {
             .route("/pool/plans/:id/apply", post(pool::apply_plan));
     }
 
-    Router::new()
-        // Health and metrics stay at the root: probes and scrapes are
-        // configured once and should not have to move.
-        .route("/healthz", get(healthz::healthz))
+    // Everything in `api` requires a credential; read for safe methods, write
+    // for anything that changes state.
+    let api = api.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth_routes::require_api,
+    ));
+
+    // Scraping is gated separately so a Prometheus credential can never reach
+    // the control plane.
+    let metrics = Router::new()
         .route("/metrics", get(metrics::metrics))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth_routes::require_metrics,
+        ));
+
+    Router::new()
+        // /healthz is deliberately unauthenticated: it carries no data beyond
+        // liveness, and a probe that needs a credential is a probe that breaks
+        // during the incident it exists to detect.
+        .route("/healthz", get(healthz::healthz))
+        .merge(metrics)
+        // Login must sit outside the gate, or nobody can ever get in.
+        .route("/api/login", post(auth_routes::login))
+        .route("/api/logout", post(auth_routes::logout))
         .nest("/api", api.clone())
-        // Back-compat: the pre-/api paths, same handlers.
+        // Back-compat: the pre-/api paths, same handlers and same gate.
         .merge(api)
         .layer(axum::extract::DefaultBodyLimit::max(
             torrents::MAX_BODY_BYTES,

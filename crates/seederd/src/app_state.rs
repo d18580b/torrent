@@ -26,6 +26,10 @@ pub struct AppState {
     /// startup inventory scan can re-add them if resume data is lost.
     pub torrents: Arc<dyn TorrentStore>,
     pub metrics: Arc<PromSink>,
+    /// Authentication. `None` when no `[auth]` section is configured, in which
+    /// case the daemon keeps its original posture: access control belongs to
+    /// the operator's reverse proxy.
+    pub auth: Option<crate::auth::Auth>,
     /// Managed-pool index + adoption. `None` when no `[pool]` section is set,
     /// in which case the `/api/pool` routes are not mounted at all.
     pub pool: Option<Arc<crate::pool_service::PoolService>>,
@@ -84,6 +88,7 @@ pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
         state: Arc::new(StateMap::new()),
         torrents: Arc::new(MemoryTorrentStore::new()),
         metrics: Arc::new(PromSink::new()),
+        auth: None,
         pool: None,
         alert_heartbeat: Arc::new(AtomicU64::new(
             std::time::SystemTime::now()
