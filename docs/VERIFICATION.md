@@ -213,6 +213,49 @@ atomically (temp + fsync + rename), and persists session state before exit.
 
 ---
 
+## 5a. systemd readiness, watchdog, and fatal listen failure
+
+`deploy/seederd.service` is `Type=notify` with `WatchdogSec=60s`, so the daemon
+must speak `sd_notify(3)`. Without it systemd holds the unit in `activating`
+until `TimeoutStartSec` and then kills it — the packaged unit could never start.
+
+```bash
+# Readiness: the unit reaches `active (running)` rather than timing out, and
+# `systemctl status` shows the STATUS= line.
+sudo systemctl start seederd
+systemctl show seederd -p ActiveState -p StatusText
+# ActiveState=active
+# StatusText=seeding; API on 127.0.0.1:8080
+```
+
+`READY=1` is sent only after the HTTP listener is bound, so `active` genuinely
+means "serving". `WATCHDOG=1` then goes out every `WatchdogSec/2`; the daemon
+sends `STOPPING=1` before the resume drain so a slow drain can't trip the
+watchdog. Outside systemd (`NOTIFY_SOCKET` unset) every call is a no-op.
+
+```bash
+# Liveness: /healthz fails when the alert loop stops making progress, not just
+# when a session is missing. SIGSTOP freezes the loop thread with the HTTP
+# server still answering.
+curl -s localhost:8080/healthz            # {"ok":true,"slots":1,"heartbeat_age_secs":0}
+sudo kill -STOP $PID; sleep 16
+curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/healthz   # 503
+sudo kill -CONT $PID; sleep 1
+curl -s localhost:8080/healthz            # ok:true again
+```
+
+```bash
+# Fatal listen failure (single-session mode). Occupy the listen port first so
+# libtorrent's bind fails, then confirm the daemon exits non-zero instead of
+# idling with no listener (PRD §Error Handling).
+nc -l 6881 &
+seederd --config "$WORK/seederd.toml"; echo "exit=$?"     # exit=70
+# …"message":"listen socket failed in single-session mode; shutting down"…
+```
+
+In multi-slot mode the same alert marks only that slot failed and the remaining
+slots keep seeding.
+
 ## 6. Multi-slot + VPN isolation (requires root + WireGuard)
 
 Multi-slot binds each account to its own libtorrent session on a dedicated VPN

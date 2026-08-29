@@ -43,6 +43,7 @@ use crate::config::Config;
 use crate::http;
 use crate::metrics_sink::PromSink;
 use crate::reload;
+use crate::sd_notify;
 use crate::signals::SignalChannels;
 use crate::signals::{self};
 use crate::slot_registry::SlotEntry;
@@ -51,10 +52,17 @@ use crate::vpn;
 
 pub struct DaemonHandle {
     cfg: Config,
+    /// The `--config` path exactly as parsed by clap. Threaded through rather
+    /// than re-derived from `std::env::args()`, which mishandles `--config=X`
+    /// and the `-c X` short form and so silently disabled SIGHUP reload.
+    config_path: std::path::PathBuf,
     state: Arc<StateMap>,
     source: Arc<dyn AlertSource>,
     torrents: Arc<dyn TorrentStore>,
     shutdown_tx: broadcast::Sender<ShutdownReason>,
+    /// Subscribed in `boot`, before the HTTP server exists, so a SIGTERM
+    /// arriving during startup is buffered rather than dropped on the floor.
+    shutdown_rx: broadcast::Receiver<ShutdownReason>,
     reload_rx: mpsc::Receiver<()>,
     metrics: Arc<PromSink>,
     registry: Arc<AssignmentRegistry>,
@@ -68,6 +76,7 @@ pub struct DaemonHandle {
 
 pub async fn boot(
     cfg: Config,
+    config_path: std::path::PathBuf,
     log_handle: crate::tracing_init::LogReloadHandle,
 ) -> anyhow::Result<DaemonHandle> {
     info!("starting seederd");
@@ -343,6 +352,20 @@ pub async fn boot(
         }
     }
 
+    // Signals. Installed *before* the alert loop so the loop can trigger a
+    // shutdown itself on a fatal listen failure, and so the receiver exists
+    // before anything can send.
+    let channels = SignalChannels::new();
+    let (reload_tx, reload_rx) = mpsc::channel::<()>(8);
+    let channels = SignalChannels::from_parts(channels.shutdown_tx, reload_tx);
+    // Drop the receiver returned by signals::run; we wired our own pair.
+    let _ = signals::run(channels.clone(), 8).await;
+    let shutdown_tx = channels.shutdown_tx;
+    // Subscribe now, not when the HTTP server starts: a broadcast sent with no
+    // live receiver is discarded, so a SIGTERM during the resume scan would
+    // otherwise leave the daemon running with nothing left to stop it.
+    let shutdown_rx = shutdown_tx.subscribe();
+
     // Alert loop.
     let metrics_for_loop: Arc<dyn MetricsSink> = metrics.clone();
     let state = Arc::new(StateMap::new());
@@ -356,22 +379,27 @@ pub async fn boot(
         metrics_for_loop,
         clock,
     )
+    // PRD §Error Handling: `listen_failed` is fatal in single-session mode
+    // (nothing else is listening, so seeding just stops silently). In
+    // multi-slot mode the per-slot handler marks that slot failed and the
+    // remaining slots carry on.
+    .fatal_listen_failure(mode == Mode::Single)
+    .on_fatal({
+        let tx = shutdown_tx.clone();
+        Arc::new(move |reason| {
+            let _ = tx.send(reason);
+        }) as seederd_engine::FatalCallback
+    })
     .spawn();
-
-    // Signals.
-    let channels = SignalChannels::new();
-    let (reload_tx, reload_rx) = mpsc::channel::<()>(8);
-    let channels = SignalChannels::from_parts(channels.shutdown_tx, reload_tx);
-    // Drop the receiver returned by signals::run; we wired our own pair.
-    let _ = signals::run(channels.clone(), 8).await;
-    let shutdown_tx = channels.shutdown_tx;
 
     Ok(DaemonHandle {
         cfg,
+        config_path,
         state,
         source,
         torrents: torrent_store,
         shutdown_tx,
+        shutdown_rx,
         reload_rx,
         metrics,
         registry,
@@ -388,10 +416,12 @@ impl DaemonHandle {
     pub async fn run_until_signal(self) -> i32 {
         let DaemonHandle {
             cfg,
+            config_path,
             state,
             source,
             torrents,
             shutdown_tx,
+            shutdown_rx,
             reload_rx,
             metrics,
             registry,
@@ -427,6 +457,7 @@ impl DaemonHandle {
             state,
             torrents,
             metrics,
+            alert_heartbeat: alert_loop.heartbeat(),
             default_save_path: cfg.default_save_path.clone(),
             mode: if cfg.slot.is_empty() {
                 Mode::Single
@@ -440,14 +471,9 @@ impl DaemonHandle {
 
         // SIGHUP pump.
         let reload_source = source.clone();
-        let cfg_path = std::env::args()
-            .skip_while(|a| a != "--config" && !a.starts_with("--config="))
-            .nth(1)
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default();
         let cfg_clone = cfg.clone();
         tokio::spawn(reload::run(
-            cfg_path,
+            config_path,
             cfg_clone,
             reload_source,
             reload_rx,
@@ -463,12 +489,32 @@ impl DaemonHandle {
         };
         info!(addr = %http_listen, "HTTP server listening");
 
-        let mut shutdown_rx = shutdown_tx.subscribe();
+        // The unit is `Type=notify`: systemd holds it in `activating` until
+        // READY=1, so this must come after the listener is actually bound.
+        sd_notify::ready();
+        sd_notify::status(&format!("seeding; API on {http_listen}"));
+        if let Some(interval) = sd_notify::watchdog_interval() {
+            info!(
+                interval_secs = interval.as_secs(),
+                "systemd watchdog enabled"
+            );
+            let mut wd_shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => sd_notify::watchdog(),
+                        _ = wd_shutdown.recv() => return,
+                    }
+                }
+            });
+        }
+
+        let mut shutdown_rx = shutdown_rx;
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
             let _ = shutdown_rx.recv().await;
         });
 
-        let exit_code = match server.await {
+        let mut exit_code = match server.await {
             Ok(()) => 0,
             Err(e) => {
                 error!(error.cause = %e, "HTTP server exited with error");
@@ -476,8 +522,19 @@ impl DaemonHandle {
             }
         };
 
-        // Trigger alert-loop shutdown and join (saves all resume data).
+        // Tell systemd we're stopping before the resume drain, which may take
+        // the full 30s deadline — otherwise the watchdog can fire mid-drain.
+        sd_notify::stopping();
+        sd_notify::status("draining resume data");
+
+        // Trigger alert-loop shutdown and join (saves all resume data). If the
+        // loop already unwound on a fatal listen failure this is a no-op, but
+        // the daemon must still exit non-zero so systemd restarts it.
         alert_loop.signal_shutdown(ShutdownReason::Sigterm);
+        if alert_loop.listen_failed() {
+            error!("exiting non-zero: listen socket failed");
+            exit_code = 70;
+        }
         if let Err(e) = alert_loop.join() {
             warn!(error.cause = ?e, "alert loop join panicked");
         }

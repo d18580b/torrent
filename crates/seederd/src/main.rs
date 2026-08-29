@@ -14,6 +14,7 @@ mod http;
 mod metrics_sink;
 mod port_forward_monitor;
 mod reload;
+mod sd_notify;
 mod signals;
 mod slot_registry;
 mod startup;
@@ -52,7 +53,7 @@ fn main() -> anyhow::Result<()> {
         .context("build tokio runtime")?;
 
     runtime.block_on(async move {
-        match startup::boot(cfg, log_handle).await {
+        match startup::boot(cfg, cli.config, log_handle).await {
             Ok(handle) => {
                 let exit_code = handle.run_until_signal().await;
                 std::process::exit(exit_code);
