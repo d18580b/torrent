@@ -1,12 +1,15 @@
 //! axum HTTP control plane.
 
 mod auth_routes;
+mod events;
 mod healthz;
 mod metrics;
 mod pool;
 mod slots;
 mod status;
 pub(crate) mod torrents;
+#[cfg(feature = "web-ui")]
+mod ui;
 
 use axum::routing::get;
 use axum::routing::post;
@@ -23,6 +26,8 @@ use crate::app_state::AppState;
 pub fn router(state: AppState) -> Router {
     let mut api = Router::new()
         .route("/status", get(status::status))
+        // Live change notifications for the web client.
+        .route("/events", get(events::events))
         .route("/torrents", get(torrents::list).post(torrents::add))
         .route(
             "/torrents/:infohash",
@@ -82,7 +87,7 @@ pub fn router(state: AppState) -> Router {
             auth_routes::require_metrics,
         ));
 
-    Router::new()
+    let router = Router::new()
         // /healthz is deliberately unauthenticated: it carries no data beyond
         // liveness, and a probe that needs a credential is a probe that breaks
         // during the incident it exists to detect.
@@ -96,6 +101,13 @@ pub fn router(state: AppState) -> Router {
         .merge(api)
         .layer(axum::extract::DefaultBodyLimit::max(
             torrents::MAX_BODY_BYTES,
-        ))
-        .with_state(state)
+        ));
+
+    // The UI goes last, as a fallback, so it can never shadow an API route.
+    // It is served unauthenticated on purpose: it is a static bundle with no
+    // data in it, and it has to load in order to present the login form.
+    #[cfg(feature = "web-ui")]
+    let router = router.fallback(ui::serve);
+
+    router.with_state(state)
 }
