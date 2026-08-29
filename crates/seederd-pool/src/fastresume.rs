@@ -65,14 +65,23 @@ pub fn parse_hints(bytes: &[u8]) -> ResumeHints {
         })
         .unwrap_or_default();
 
+    // Completion can be asserted two ways, and either is enough.
+    //
+    // `qBt-seedStatus` is qBittorrent's own flag. `seed_mode` is libtorrent's,
+    // written by any client built on it once a torrent is a complete seed, so
+    // honouring it means a migration from something other than qBittorrent
+    // still gets the fast path instead of re-hashing the whole pool.
+    //
+    // Absent both, completion is unknown and adoption takes the verifying
+    // path — never the other way round.
+    let is_complete =
+        get_int("qBt-seedStatus").unwrap_or(0) != 0 || get_int("seed_mode").unwrap_or(0) != 0;
+
     ResumeHints {
         save_path: save_path.filter(|s| !s.is_empty()),
         category: get_str("qBt-category").filter(|s| !s.is_empty()),
         tags,
-        // `qBt-seedStatus` is set once qBittorrent considers the torrent
-        // complete. Absent it, treat completion as unknown (false) so adoption
-        // takes the verifying path rather than trusting an unverified claim.
-        is_complete: get_int("qBt-seedStatus").unwrap_or(0) != 0,
+        is_complete,
     }
 }
 
@@ -303,10 +312,20 @@ mod tests {
     }
 
     #[test]
+    fn libtorrents_own_seed_mode_flag_also_means_complete() {
+        // Resume data from any libtorrent-based client, not just qBittorrent.
+        let b = bdict(&[("save_path", bstr("/data")), ("seed_mode", bint(1))]);
+        assert!(parse_hints(&b).is_complete);
+    }
+
+    #[test]
     fn incomplete_torrents_are_not_reported_complete() {
         // No qBt-seedStatus at all: completion is unknown, so adoption must
         // take the verifying path rather than trusting the file.
         let b = bdict(&[("qBt-savePath", bstr("/data/pool"))]);
+        assert!(!parse_hints(&b).is_complete);
+        // An explicit zero on either key is still "not complete".
+        let b = bdict(&[("seed_mode", bint(0)), ("qBt-seedStatus", bint(0))]);
         assert!(!parse_hints(&b).is_complete);
     }
 

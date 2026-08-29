@@ -65,6 +65,7 @@ pub struct DaemonHandle {
     shutdown_rx: broadcast::Receiver<ShutdownReason>,
     reload_rx: mpsc::Receiver<()>,
     metrics: Arc<PromSink>,
+    pool: Option<Arc<crate::pool_service::PoolService>>,
     registry: Arc<AssignmentRegistry>,
     slot_registry: Option<Arc<SlotRegistry>>,
     /// Whether the nftables kill switch was installed and must be torn down on
@@ -400,6 +401,10 @@ pub async fn boot(
     // otherwise leave the daemon running with nothing left to stop it.
     let shutdown_rx = shutdown_tx.subscribe();
 
+    // Managed pool. Opened before the alert loop so a bad index path fails
+    // startup rather than surfacing as a 500 on the first API call.
+    let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
+
     // Alert loop.
     let metrics_for_loop: Arc<dyn MetricsSink> = metrics.clone();
     let state = Arc::new(StateMap::new());
@@ -436,6 +441,7 @@ pub async fn boot(
         shutdown_rx,
         reload_rx,
         metrics,
+        pool,
         registry,
         slot_registry,
         kill_switch_active,
@@ -458,6 +464,7 @@ impl DaemonHandle {
             shutdown_rx,
             reload_rx,
             metrics,
+            pool,
             registry,
             slot_registry,
             kill_switch_active,
@@ -484,6 +491,18 @@ impl DaemonHandle {
             ));
         }
 
+        // Verify queue: admits a bounded number of adopt-time re-hashes so a
+        // bulk adopt cannot starve whatever is already seeding.
+        if let Some(pool) = pool.clone() {
+            tokio::spawn(crate::pool_service::run_verify_queue(
+                pool,
+                source.clone(),
+                state.clone(),
+                metrics.clone(),
+                shutdown_tx.subscribe(),
+            ));
+        }
+
         let app_state = AppState {
             source: source.clone(),
             registry: registry.clone(),
@@ -491,6 +510,7 @@ impl DaemonHandle {
             state,
             torrents,
             metrics,
+            pool,
             alert_heartbeat: alert_loop.heartbeat(),
             default_save_path: cfg.default_save_path.clone(),
             mode: if cfg.slot.is_empty() {
