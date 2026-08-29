@@ -13,6 +13,8 @@
 //!     re-verification (no `hash_failed`, seeds immediately).
 //!   - resume WITHOUT the info dict (the daemon's actual save flags): proves
 //!     metadata is lost and re-attaching the stored `.torrent` restores it.
+//!   - a resume add that clears flags still reports status (update_subscribe
+//!     must survive the clear mask).
 //!   - verification & corruption: a full-check add seeds when on-disk bytes
 //!     match the piece hashes and never seeds when they don't.
 //!   - alert-queue overflow: a tiny `alert_queue_size` flooded without draining
@@ -175,6 +177,68 @@ fn resume_without_info_dict_needs_the_torrent_file() {
         assert!(!saw_hash_failed, "re-attaching metadata must not re-verify");
         assert!(seeded, "resume + .torrent should seed");
     }
+}
+
+/// A resume add that clears a flag must not also unsubscribe the torrent from
+/// status updates.
+///
+/// `flags_clear` is translated bit-for-bit, but an earlier version routed it
+/// through the same helper that prepends the session defaults — so clearing
+/// `PAUSED` also cleared `update_subscribe`. The torrent then seeded perfectly
+/// while never appearing in another `state_update_alert`, leaving the daemon
+/// reporting zero progress and zero upload for it forever. Nothing short of
+/// asserting on the alert stream catches that: the torrent is genuinely fine,
+/// only invisible.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn a_resume_add_that_clears_flags_still_reports_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = dir.path().to_str().unwrap().to_string();
+    let data = support::payload(9, FILE_LEN);
+    std::fs::write(dir.path().join("seed-D"), &data).unwrap();
+    let torrent = support::single_file_torrent("seed-D", &data, PIECE_LEN);
+
+    let blob = {
+        let s1 = Session::new(&support::local_seed_settings()).unwrap();
+        let h = s1
+            .add_torrent(AddParams::File {
+                bytes: torrent.clone(),
+                save_path: save.clone(),
+                flags: TorrentFlags::SEED_MODE,
+            })
+            .unwrap();
+        assert!(support::wait_for_seeding(&s1, h, Duration::from_secs(15)));
+        s1.save_resume_data(h, ResumeFlags::empty()).unwrap();
+        support::pump_until(&s1, Duration::from_secs(15), |a| match a {
+            Alert::SaveResumeData { data, .. } => Some(data.as_bytes().to_vec()),
+            _ => None,
+        })
+        .expect("resume data")
+    };
+
+    let s2 = Session::new(&support::local_seed_settings()).unwrap();
+    let h2 = s2
+        .add_torrent(AddParams::Resume {
+            bytes: blob,
+            torrent: Some(torrent),
+            save_path: Some(save),
+            flags_set: TorrentFlags::SEED_MODE,
+            // The clear that used to take update_subscribe down with it.
+            flags_clear: TorrentFlags::PAUSED,
+        })
+        .unwrap();
+
+    let seeding = support::pump_until(&s2, Duration::from_secs(15), |a| match a {
+        Alert::StateUpdate { statuses, .. } => statuses
+            .iter()
+            .find(|s| s.handle.infohash == h2.infohash && s.is_seeding && s.progress >= 1.0)
+            .map(|_| ()),
+        _ => None,
+    });
+    assert!(
+        seeding.is_some(),
+        "the torrent must keep reporting status after a flag clear",
+    );
 }
 
 #[test]

@@ -74,6 +74,21 @@ Default bind `127.0.0.1:8080`. All bodies are JSON unless noted.
 | `POST /torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}` (needs metadata). |
 | `GET /metrics` | Prometheus text format. |
 
+Everything above is also served under `/api/…`; the bare paths remain as
+aliases. `/healthz` and `/metrics` stay at the root so probes and scrapes do not
+have to move. With `[pool]` configured, these mount too:
+
+| Method & path | Purpose |
+|---------------|---------|
+| `GET /api/pool` | Roots, byte rollups, state counts, verify-queue depth. |
+| `GET /api/pool/tree?root_id=&path=` | Children of a path with per-entry rollups and adoption states. |
+| `GET /api/pool/torrents?state=` | Library torrents, filterable by adoption state. |
+| `GET /api/pool/orphans?root_id=` | Subtrees holding bytes no torrent claims. |
+| `GET /api/pool/drift` | Re-stat claimed files; report what moved. |
+| `POST /api/pool/scan` | Re-index roots + library, then re-match. |
+| `POST /api/pool/adopt` | Adopt by `infohashes` or by `root_id`+`path`. `dry_run` reports without acting. |
+| `POST /api/pool/verify` | Force a libtorrent re-hash of specific torrents. |
+
 Multi-slot mode additionally mounts `GET /slots`, `GET /slots/:id`,
 `GET /slots/:id/torrents`, and `POST /slots/:id/pause-all` \| `/resume-all`.
 
@@ -113,7 +128,24 @@ category and tag hints. Copy it somewhere scratch first.
 ```bash
 seederd --config /etc/seederd/seederd.toml pool scan      # index + match
 seederd --config /etc/seederd/seederd.toml pool status    # summarise
+seederd --config /etc/seederd/seederd.toml pool check     # what changed since the scan
 seederd --config /etc/seederd/seederd.toml pool orphans   # unclaimed bytes
+```
+
+**Adopting** a matched torrent is tiered, so bringing a large pool online takes
+minutes rather than days. If the previous client's `.fastresume` says the
+torrent was complete and every file still matches the index, it is added in seed
+mode and seeds immediately; otherwise it is added *without* seed mode so
+libtorrent hashes the payload first. Verifications are admitted a bounded number
+at a time (`max_concurrent_verify`) so a bulk adopt cannot starve whatever is
+already seeding. `partial`, `missing`, `overlap` and `drifted` are refused.
+
+```bash
+# Always dry-run first: it reports exactly what would happen, including how
+# many bytes libtorrent would have to read.
+curl -sX POST localhost:8080/api/pool/adopt \
+     -H 'content-type: application/json' \
+     -d '{"root_id":1,"path":"movies","dry_run":true}'
 ```
 
 ## Configuration & modes

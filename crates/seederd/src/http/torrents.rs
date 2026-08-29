@@ -608,6 +608,7 @@ mod tests {
             state: Arc::new(StateMap::new()),
             torrents: Arc::new(MemoryTorrentStore::new()),
             metrics: Arc::new(PromSink::new()),
+            pool: None,
             alert_heartbeat: Arc::new(std::sync::atomic::AtomicU64::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
