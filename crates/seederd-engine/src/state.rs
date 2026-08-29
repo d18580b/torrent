@@ -95,6 +95,11 @@ pub struct TorrentState {
     pub needs_save_resume: bool,
     pub upload_rate: i64,
     pub download_rate: i64,
+    /// Cumulative bytes uploaded this session, including protocol overhead.
+    /// Surfaced by the API because a seeding pool is judged on it; the
+    /// payload-only figure is tracked alongside for ratio accounting.
+    pub total_uploaded: u64,
+    pub total_payload_uploaded: u64,
     pub num_peers: i32,
     pub progress: f32,
     pub is_finished: bool,
@@ -112,6 +117,8 @@ impl TorrentState {
             needs_save_resume: false,
             upload_rate: 0,
             download_rate: 0,
+            total_uploaded: 0,
+            total_payload_uploaded: 0,
             num_peers: 0,
             progress: 0.0,
             is_finished: false,

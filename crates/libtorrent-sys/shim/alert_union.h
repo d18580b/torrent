@@ -24,12 +24,8 @@ extern "C" {
  * function declarations below need to be `extern "C"` from C++ TUs. */
 #endif
 
-/* Per-variant string capacity (incl. trailing NUL). */
-#define LT_PATH_MAX 1024
-#define LT_MSG_MAX  2048
-#define LT_NAME_MAX 64
-#define LT_ADDR_MAX 64
-#define LT_OP_MAX   64
+/* String capacities (LT_PATH_MAX, LT_MSG_MAX, …) come from libtorrent_shim.h,
+ * included above. */
 
 /* ------------------------------------------------------------------ */
 /* state_update_alert payload                                          */
@@ -152,8 +148,24 @@ struct lt_alert_log {
     char    message[LT_MSG_MAX];
 };
 
+/* ------------------------------------------------------------------ */
+/* Storage / verification variants                                     */
+/* ------------------------------------------------------------------ */
+
+struct lt_alert_storage_moved {
+    char    path[LT_PATH_MAX];      /* the new save_path */
+};
+
+struct lt_alert_storage_moved_failed {
+    int32_t error_code;
+    char    operation[LT_OP_MAX];
+    char    path[LT_PATH_MAX];
+    char    message[LT_MSG_MAX];
+};
+
 /* Empty payload markers (kept for layout symmetry). */
 struct lt_alert_torrent_finished { int32_t _empty; };
+struct lt_alert_torrent_checked  { int32_t _empty; };
 struct lt_alert_torrent_removed  { int32_t _empty; };
 struct lt_alert_add_torrent {
     int32_t error_code;       /* 0 on success */
@@ -185,6 +197,9 @@ union lt_alert_payload_u {
     struct lt_alert_tracker_error     tracker_error;
     struct lt_alert_peer_disconnected peer_disconnected;
     struct lt_alert_log               log_msg;
+    struct lt_alert_torrent_checked   torrent_checked;
+    struct lt_alert_storage_moved     storage_moved;
+    struct lt_alert_storage_moved_failed storage_moved_failed;
 };
 
 struct lt_alert_union {

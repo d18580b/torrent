@@ -37,6 +37,14 @@ pub trait TorrentStore: Send + Sync + std::fmt::Debug {
 
     /// Whether a `.torrent` file already exists for `(slot, ih)`.
     fn exists(&self, slot: &SlotId, ih: &InfoHash) -> bool;
+
+    /// Read one `.torrent`, or `None` if it isn't stored.
+    ///
+    /// The resume-add path uses this to re-attach metadata: libtorrent omits
+    /// the info dict from resume data unless `SAVE_INFO_DICT` was set, so the
+    /// `.torrent` kept here is what keeps a restarted torrent out of
+    /// `downloading_metadata`.
+    fn read(&self, slot: &SlotId, ih: &InfoHash) -> Result<Option<Vec<u8>>, TorrentStoreError>;
 }
 
 #[derive(Debug, Error)]
@@ -143,6 +151,14 @@ impl TorrentStore for FsTorrentStore {
     fn exists(&self, slot: &SlotId, ih: &InfoHash) -> bool {
         self.path_for(slot, ih).exists()
     }
+
+    fn read(&self, slot: &SlotId, ih: &InfoHash) -> Result<Option<Vec<u8>>, TorrentStoreError> {
+        match fs::read(self.path_for(slot, ih)) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +206,13 @@ impl TorrentStore for MemoryTorrentStore {
     fn exists(&self, slot: &SlotId, ih: &InfoHash) -> bool {
         self.inner.contains_key(&(slot.clone(), *ih))
     }
+
+    fn read(&self, slot: &SlotId, ih: &InfoHash) -> Result<Option<Vec<u8>>, TorrentStoreError> {
+        Ok(self
+            .inner
+            .get(&(slot.clone(), *ih))
+            .map(|e| e.value().clone()))
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +238,20 @@ mod tests {
         assert!(store.load_all(&slot).unwrap().is_empty());
         // Deleting a missing file is fine.
         store.delete(&slot, &ih).unwrap();
+    }
+
+    #[test]
+    fn read_returns_none_for_a_missing_torrent() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path());
+        let slot = SlotId::default_single();
+        let ih = InfoHash([0x9au8; 20]);
+        assert_eq!(store.read(&slot, &ih).unwrap(), None);
+        store.write(&slot, &ih, b"payload").unwrap();
+        assert_eq!(
+            store.read(&slot, &ih).unwrap().as_deref(),
+            Some(&b"payload"[..])
+        );
     }
 
     #[test]

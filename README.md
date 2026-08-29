@@ -64,7 +64,7 @@ Default bind `127.0.0.1:8080`. All bodies are JSON unless noted.
 |---------------|---------|
 | `GET /healthz` | Readiness — `{"ok":true,"slots":N,"heartbeat_age_secs":S}`. 503 until ≥1 session is up, and again if the alert loop stops making progress. |
 | `GET /status` | Session overview: counts by state, upload rate, peers. |
-| `GET /torrents` | List (paginated: `?after=<infohash>&limit=<n>`). |
+| `GET /torrents` | List (paginated: `?after=<infohash>&limit=<n>`). Each entry carries live rates plus cumulative `total_uploaded` / `total_payload_uploaded`. |
 | `POST /torrents` | Add a `{"magnet":…}` / `{"torrent_path":…}` (JSON) or a multipart `.torrent`. Optional `save_path`, `slot_id`. 409 on a duplicate info-hash. |
 | `GET /torrents/:infohash` | One torrent's live state. |
 | `DELETE /torrents/:infohash` | Remove (`?delete_files=true` to erase payload). |
@@ -123,7 +123,8 @@ All series are namespaced `seederd_*`. Session gauges are exported per slot
 (`slot_id` label); per-torrent series are intentionally not (unusable at 10K+
 torrents). Alongside the libtorrent session gauges (`seederd_libtorrent_*`, net
 bytes, peers, disk queues, seeding/error counts) and daemon counters
-(`torrents_*`, `resume_*`, `alerts_dropped_total`, …), multi-slot mode adds:
+(`torrents_*`, `resume_*`, `alerts_dropped_total`, `torrents_checked_total`,
+`storage_moves_total`, `storage_move_failures_total`, …), multi-slot mode adds:
 `slot_vpn_tunnel_up`, `slot_vpn_handshake_age_seconds`,
 `slot_torrents_paused_vpn_down`, `slot_vpn_tunnel_ip_changes_total`,
 `slot_forwarded_port`, `slot_port_forward_up`,
