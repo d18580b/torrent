@@ -104,6 +104,15 @@ pub struct TorrentState {
     pub progress: f32,
     pub is_finished: bool,
     pub is_seeding: bool,
+    /// When libtorrent last reported that it finished hashing this torrent
+    /// (`torrent_checked_alert`).
+    ///
+    /// This is the only authoritative "verification is over" signal. A torrent
+    /// that fails its check does not become `Errored` — libtorrent moves it to
+    /// `downloading`, which the phase mapping deliberately ignores — so
+    /// without this stamp a failed verification is indistinguishable from one
+    /// still in progress, and anything waiting on it waits forever.
+    pub checked_at: Option<Instant>,
 }
 
 impl TorrentState {
@@ -123,6 +132,7 @@ impl TorrentState {
             progress: 0.0,
             is_finished: false,
             is_seeding: false,
+            checked_at: None,
         }
     }
 }

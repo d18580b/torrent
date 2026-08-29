@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use parking_lot::Mutex;
@@ -28,6 +29,17 @@ use crate::config::Config;
 
 /// How often the verify queue re-checks what finished hashing.
 const ADMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long after `torrent_checked` to wait before calling a verification
+/// failed.
+///
+/// `torrent_checked_alert` fires when hashing ends, and libtorrent posts
+/// `torrent_finished_alert` immediately afterwards when the payload turned out
+/// to be complete. The two can land in different drain batches, so a tick
+/// falling between them would see "checked, not seeding" for a torrent that is
+/// perfectly healthy. Waiting a few ticks closes that window; it is not a
+/// verification deadline, which would have to be derived from payload size.
+const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct PoolService {
     store: Mutex<PoolStore>,
@@ -226,44 +238,38 @@ pub async fn run_verify_queue(
                 let Some(hash) = libtorrent_safe::InfoHash::from_hex(ih) else {
                     return false;
                 };
-                match state.get(&hash).map(|s| s.phase) {
-                    Some(TorrentPhase::Seeding) => {
+                let outcome = verify_outcome(state.get(&hash).as_ref(), VERIFY_SETTLE);
+                let (state_to_record, verified_at, drift_at, note) = match outcome {
+                    VerifyOutcome::Waiting => return true,
+                    VerifyOutcome::Verified => {
                         q.completed.fetch_add(1, Ordering::Relaxed);
-                        pool.with_store(|s| {
-                            let base = s.adoption_base(ih).ok().flatten();
-                            let _ = s.set_adoption(
-                                ih,
-                                AdoptionState::Adopted,
-                                base.as_ref().map(|(r, _)| *r),
-                                base.as_ref().map(|(_, b)| b.as_str()),
-                                Some(now_secs()),
-                                None,
-                                None,
-                            );
-                        });
                         info!(target: "seederd::pool", infohash = %ih, "verified and seeding");
-                        false
+                        (AdoptionState::Adopted, Some(now_secs()), None, None)
                     }
-                    Some(TorrentPhase::Errored) => {
+                    VerifyOutcome::Failed(reason) => {
                         q.failed.fetch_add(1, Ordering::Relaxed);
-                        pool.with_store(|s| {
-                            let base = s.adoption_base(ih).ok().flatten();
-                            let _ = s.set_adoption(
-                                ih,
-                                AdoptionState::Drifted,
-                                base.as_ref().map(|(r, _)| *r),
-                                base.as_ref().map(|(_, b)| b.as_str()),
-                                None,
-                                Some(now_secs()),
-                                Some("verification failed"),
-                            );
-                        });
-                        warn!(target: "seederd::pool", infohash = %ih, "verification failed");
-                        false
+                        warn!(
+                            target: "seederd::pool",
+                            infohash = %ih,
+                            reason = reason,
+                            "verification did not leave the torrent seeding",
+                        );
+                        (AdoptionState::Drifted, None, Some(now_secs()), Some(reason))
                     }
-                    // Still checking, or not yet in the state map.
-                    _ => true,
-                }
+                };
+                pool.with_store(|s| {
+                    let base = s.adoption_base(ih).ok().flatten();
+                    let _ = s.set_adoption(
+                        ih,
+                        state_to_record,
+                        base.as_ref().map(|(r, _)| *r),
+                        base.as_ref().map(|(_, b)| b.as_str()),
+                        verified_at,
+                        drift_at,
+                        note,
+                    );
+                });
+                false
             });
         }
 
@@ -328,6 +334,45 @@ pub async fn run_verify_queue(
         metrics.set_gauge("pool_verify_in_flight", q.in_flight() as f64, &[]);
         metrics.set_gauge("pool_verify_completed_total", q.completed() as f64, &[]);
         metrics.set_gauge("pool_verify_failed_total", q.failed() as f64, &[]);
+    }
+}
+
+/// What the verify queue should do with one in-flight torrent.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum VerifyOutcome {
+    /// Still hashing, or not in the state map yet.
+    Waiting,
+    Verified,
+    Failed(&'static str),
+}
+
+/// Decide an in-flight torrent's fate from its state-map entry alone.
+///
+/// Pure so the wedge this guards against is testable without a session. The
+/// `checked_at` arm is the load-bearing one: a torrent whose payload fails its
+/// check is moved to libtorrent's `downloading` state, which the phase mapping
+/// deliberately ignores, so it never becomes `Errored` and never becomes
+/// `Seeding`. Waiting on phase alone therefore waits forever, and a handful of
+/// corrupt torrents would hold every verify slot and wedge adoption for the
+/// whole pool.
+fn verify_outcome(entry: Option<&seederd_engine::TorrentState>, settle: Duration) -> VerifyOutcome {
+    let Some(st) = entry else {
+        return VerifyOutcome::Waiting;
+    };
+    if st.phase == TorrentPhase::Seeding {
+        return VerifyOutcome::Verified;
+    }
+    if st.phase == TorrentPhase::Errored {
+        return VerifyOutcome::Failed("libtorrent reported an unrecoverable error");
+    }
+    // Hashing is over and it still is not seeding, so the payload does not
+    // match the piece hashes. `torrent_finished` can trail `torrent_checked`
+    // into the next drain batch, so give the healthy case time to land first.
+    match st.checked_at {
+        Some(t) if t.elapsed() >= settle => {
+            VerifyOutcome::Failed("payload failed verification against the piece hashes")
+        }
+        _ => VerifyOutcome::Waiting,
     }
 }
 
@@ -452,4 +497,85 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use seederd_engine::InfoHash;
+    use seederd_engine::SlotId;
+    use seederd_engine::TorrentHandle;
+    use seederd_engine::TorrentPhase;
+    use seederd_engine::TorrentState;
+
+    use super::verify_outcome;
+    use super::VerifyOutcome;
+
+    const SETTLE: Duration = Duration::from_secs(5);
+
+    fn st(phase: TorrentPhase, checked_ago: Option<Duration>) -> TorrentState {
+        let now = Instant::now();
+        let mut s = TorrentState::newly_added(
+            TorrentHandle {
+                id: 1,
+                infohash: InfoHash([0x11; 20]),
+            },
+            SlotId::default_single(),
+            now,
+        );
+        s.phase = phase;
+        s.checked_at = checked_ago.map(|d| now - d);
+        s
+    }
+
+    #[test]
+    fn a_torrent_still_hashing_keeps_its_slot() {
+        let s = st(TorrentPhase::Checking, None);
+        assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Waiting);
+    }
+
+    #[test]
+    fn a_torrent_absent_from_the_state_map_keeps_its_slot() {
+        assert_eq!(verify_outcome(None, SETTLE), VerifyOutcome::Waiting);
+    }
+
+    #[test]
+    fn a_seeding_torrent_retires_as_verified() {
+        let s = st(TorrentPhase::Seeding, Some(Duration::from_secs(60)));
+        assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Verified);
+    }
+
+    /// The wedge this fix exists for. A torrent whose payload fails hashing is
+    /// left in libtorrent's `downloading` state, which the phase mapping keeps
+    /// as `Checking` — so it is neither `Seeding` nor `Errored`, and before the
+    /// `checked_at` arm it held a verify slot forever. Four of these were
+    /// enough to stop the whole pool adopting.
+    #[test]
+    fn a_torrent_that_failed_hashing_does_not_hold_its_slot_forever() {
+        let s = st(TorrentPhase::Checking, Some(Duration::from_secs(60)));
+        assert_eq!(
+            verify_outcome(Some(&s), SETTLE),
+            VerifyOutcome::Failed("payload failed verification against the piece hashes"),
+        );
+    }
+
+    /// `torrent_checked` and `torrent_finished` can arrive in different drain
+    /// batches, so a tick landing between them must not condemn a healthy
+    /// torrent.
+    #[test]
+    fn a_just_checked_torrent_is_given_time_to_report_seeding() {
+        let s = st(TorrentPhase::Checking, Some(Duration::from_millis(10)));
+        assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Waiting);
+    }
+
+    #[test]
+    fn an_errored_torrent_retires_as_failed() {
+        let s = st(TorrentPhase::Errored, None);
+        assert!(matches!(
+            verify_outcome(Some(&s), SETTLE),
+            VerifyOutcome::Failed(_),
+        ));
+    }
 }
