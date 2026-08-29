@@ -88,6 +88,9 @@ have to move. With `[pool]` configured, these mount too:
 | `POST /api/pool/scan` | Re-index roots + library, then re-match. |
 | `POST /api/pool/adopt` | Adopt by `infohashes` or by `root_id`+`path`. `dry_run` reports without acting. |
 | `POST /api/pool/verify` | Force a libtorrent re-hash of specific torrents. |
+| `GET`/`POST` `/api/pool/plans` | List, or compute, a mutation plan. Computing touches nothing. |
+| `GET`/`DELETE` `/api/pool/plans/:id` | Inspect or discard a plan. |
+| `POST /api/pool/plans/:id/apply` | Execute it. Destructive plans require the plan's `confirm` token. |
 
 Multi-slot mode additionally mounts `GET /slots`, `GET /slots/:id`,
 `GET /slots/:id/torrents`, and `POST /slots/:id/pause-all` \| `/resume-all`.
@@ -146,6 +149,36 @@ already seeding. `partial`, `missing`, `overlap` and `drifted` are refused.
 curl -sX POST localhost:8080/api/pool/adopt \
      -H 'content-type: application/json' \
      -d '{"root_id":1,"path":"movies","dry_run":true}'
+```
+
+### Reorganising the pool
+
+seederd can move, relocate and delete inside its managed roots, which means a
+mistake here destroys data. Every mutation is therefore planned, journaled and
+reversible-in-intent:
+
+- **Plan, then apply.** `POST /api/pool/plans` computes the step list and
+  touches nothing; you see the exact diff before anything moves.
+- **Journaled and resumable.** Each step is written to the database before it is
+  attempted, so a crash mid-apply leaves a known last-completed step that
+  startup re-drives — never a half-applied reorganisation.
+- **Adopted payload moves through libtorrent** (`move_storage`), so the
+  session's view of where data lives cannot diverge from the disk. The torrent
+  keeps seeding across the move.
+- **Cross-filesystem moves are copy → fsync → verify → unlink.** The source is
+  never removed until the destination is confirmed byte-length correct.
+- **Hard refusals**: a file two torrents claim (`overlap`), payload that changed
+  since the scan (`drifted`), or a destination that already exists. None are
+  resolved automatically.
+- **Deletion targets only provably unclaimed files**, re-checked at the moment
+  of deletion rather than trusted from planning time, and requires echoing back
+  a `confirm` token derived from the plan's own contents.
+
+```bash
+# Relocate a seeding torrent; it keeps seeding from the new path.
+curl -sX POST localhost:8080/api/pool/plans -H 'content-type: application/json' \
+  -d '{"kind":"relocate","infohash":"<hash>","dest_root_id":1,"dest_rel":"tv/archive"}'
+curl -sX POST localhost:8080/api/pool/plans/1/apply
 ```
 
 ## Configuration & modes

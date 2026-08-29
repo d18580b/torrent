@@ -38,6 +38,7 @@ pub use clock::Clock;
 pub use clock::MockClock;
 pub use clock::SystemClock;
 pub use engine::EngineError;
+pub use engine::MoveFlags;
 pub use engine::TorrentEngine;
 pub use libtorrent_safe::AddParams;
 pub use libtorrent_safe::Alert;
