@@ -29,8 +29,10 @@ pub mod alert_loop;
 
 // Re-exports from libtorrent-safe so downstream crates don't need to know
 // about the internal crate split.
+pub use alert_loop::heartbeat_age;
 pub use alert_loop::AlertLoopBuilder;
 pub use alert_loop::AlertLoopHandle;
+pub use alert_loop::FatalCallback;
 pub use alert_loop::ShutdownReason;
 pub use clock::Clock;
 pub use clock::MockClock;
