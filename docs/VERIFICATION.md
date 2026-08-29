@@ -259,6 +259,58 @@ seederd --config "$WORK/seederd.toml"; echo "exit=$?"     # exit=70
 In multi-slot mode the same alert marks only that slot failed and the remaining
 slots keep seeding.
 
+---
+
+## 5b. Managed pool: index, match, drift
+
+The pool is exercised without starting the daemon, so this can be run against a
+copy of a real library before committing to anything.
+
+```bash
+# A pool with one torrent where its name says, one whose payload was moved,
+# one whose payload is absent, and a file no torrent claims.
+seederd --config "$WORK/seederd.toml" pool scan
+#   matched 2   partial 0   missing 1   overlap 0
+#   total 2.8 MiB   adopted 0 B   matched 1.6 MiB   unclaimed 1.1 MiB
+
+seederd --config "$WORK/seederd.toml" pool orphans
+#   loose    1.1 MiB unclaimed
+```
+
+The moved torrent is the case worth confirming: with no usable save-path hint
+and a name matching no directory, it can only be located by the size anchor.
+Check that its recorded base is where the payload actually lives:
+
+```bash
+sqlite3 "$WORK/state/pool.db" \
+  "SELECT t.name, a.state, a.base_rel FROM torrent t JOIN adoption a USING(infohash)"
+# Show.S01|matched|
+# feature.mkv|matched|moved/elsewhere
+# absent.bin|missing|
+```
+
+Drift is a separate question from scanning — `scan` rewrites the index from the
+live filesystem and so can never disagree with it, while `check` compares them:
+
+```bash
+seederd --config "$WORK/seederd.toml" pool check
+#   no drift: every claimed file matches the indexed snapshot
+
+# Rewrite a claimed file in place at the SAME size — the case a size-only
+# check misses — then delete another.
+head -c 500000 /dev/urandom > "$WORK/data/Show.S01/ep2.mkv"
+seederd --config "$WORK/seederd.toml" pool check
+#   1 torrent(s) drifted — 1 file(s) changed, 0 vanished
+
+rm "$WORK/data/moved/elsewhere/feature.mkv"
+seederd --config "$WORK/seederd.toml" pool check
+#   1 torrent(s) drifted — 0 file(s) changed, 1 vanished
+```
+
+A torrent already marked `drifted` is not re-reported until it has been
+verified. Drift is a reason to verify, never proof of corruption: only
+libtorrent re-hashing the payload settles that.
+
 ## 6. Multi-slot + VPN isolation (requires root + WireGuard)
 
 Multi-slot binds each account to its own libtorrent session on a dedicated VPN
