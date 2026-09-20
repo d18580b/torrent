@@ -1,8 +1,8 @@
 //! Prometheus-backed `MetricsSink` implementation.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 
+use parking_lot::Mutex;
 use prometheus::register_counter_vec_with_registry;
 use prometheus::register_gauge_vec_with_registry;
 use prometheus::register_histogram_vec_with_registry;
@@ -14,6 +14,20 @@ use prometheus::Registry;
 use prometheus::TextEncoder;
 use seederd_engine::MetricsSink;
 
+/// Prometheus vectors, memoised by metric name.
+///
+/// Two properties matter more than they look:
+///
+/// * **No panic may escape.** Every handler in the alert loop goes through
+///   this sink, and a panic on that thread stops seeding (see
+///   `alert_loop::spawn`). Registration failures are therefore logged and
+///   dropped, never unwrapped — and never unwrapped *while holding the lock*,
+///   which is what made a single failure poison the mutex and turn every
+///   later metric emission into another panic.
+/// * **Label sets are fixed by first use.** A vector is created with the label
+///   names of whichever call registers it first; a later emission of the same
+///   name with different labels cannot be recorded. That used to be swallowed
+///   silently, so a metric simply went missing. It is now reported once.
 #[derive(Debug)]
 pub struct PromSink {
     registry: Registry,
@@ -40,10 +54,10 @@ impl PromSink {
         buf
     }
 
-    fn counter_for(&self, name: &str, labels: &[(&str, &str)]) -> CounterVec {
-        let mut g = self.counters.lock().unwrap();
+    fn counter_for(&self, name: &str, labels: &[(&str, &str)]) -> Option<CounterVec> {
+        let mut g = self.counters.lock();
         if let Some(c) = g.get(name) {
-            return c.clone();
+            return Some(c.clone());
         }
         let label_names: Vec<&str> = labels.iter().map(|(k, _)| *k).collect();
         let cv = register_counter_vec_with_registry!(
@@ -52,28 +66,30 @@ impl PromSink {
             &label_names,
             self.registry,
         )
-        .expect("register counter");
+        .map_err(|e| warn_registration("counter", name, &e))
+        .ok()?;
         g.insert(name.to_string(), cv.clone());
-        cv
+        Some(cv)
     }
 
-    fn gauge_for(&self, name: &str, labels: &[(&str, &str)]) -> GaugeVec {
-        let mut g = self.gauges.lock().unwrap();
+    fn gauge_for(&self, name: &str, labels: &[(&str, &str)]) -> Option<GaugeVec> {
+        let mut g = self.gauges.lock();
         if let Some(c) = g.get(name) {
-            return c.clone();
+            return Some(c.clone());
         }
         let label_names: Vec<&str> = labels.iter().map(|(k, _)| *k).collect();
         let gv =
             register_gauge_vec_with_registry!(name, "seederd gauge", &label_names, self.registry,)
-                .expect("register gauge");
+                .map_err(|e| warn_registration("gauge", name, &e))
+                .ok()?;
         g.insert(name.to_string(), gv.clone());
-        gv
+        Some(gv)
     }
 
-    fn histogram_for(&self, name: &str, labels: &[(&str, &str)]) -> HistogramVec {
-        let mut g = self.histos.lock().unwrap();
+    fn histogram_for(&self, name: &str, labels: &[(&str, &str)]) -> Option<HistogramVec> {
+        let mut g = self.histos.lock();
         if let Some(c) = g.get(name) {
-            return c.clone();
+            return Some(c.clone());
         }
         let label_names: Vec<&str> = labels.iter().map(|(k, _)| *k).collect();
         let hv = register_histogram_vec_with_registry!(
@@ -81,10 +97,32 @@ impl PromSink {
             &label_names,
             self.registry,
         )
-        .expect("register histogram");
+        .map_err(|e| warn_registration("histogram", name, &e))
+        .ok()?;
         g.insert(name.to_string(), hv.clone());
-        hv
+        Some(hv)
     }
+}
+
+/// Log a registration failure once per occurrence, outside any lock.
+fn warn_registration(kind: &str, name: &str, e: &prometheus::Error) {
+    tracing::warn!(
+        target: "seederd::metrics",
+        metric = name,
+        metric_kind = kind,
+        error.cause = %e,
+        "metric could not be registered; its samples will not be exported",
+    );
+}
+
+/// Log a label-set mismatch, which otherwise loses samples silently.
+fn warn_labels(name: &str, e: &prometheus::Error) {
+    tracing::warn!(
+        target: "seederd::metrics",
+        metric = name,
+        error.cause = %e,
+        "metric emitted with a label set that differs from its first use; sample dropped",
+    );
 }
 
 fn label_values<'a>(labels: &'a [(&str, &str)]) -> Vec<&'a str> {
@@ -93,30 +131,42 @@ fn label_values<'a>(labels: &'a [(&str, &str)]) -> Vec<&'a str> {
 
 impl MetricsSink for PromSink {
     fn inc_counter(&self, name: &str, labels: &[(&str, &str)]) {
-        let c = self.counter_for(name, labels);
-        if let Ok(child) = c.get_metric_with_label_values(&label_values(labels)) {
-            child.inc();
+        let Some(c) = self.counter_for(name, labels) else {
+            return;
+        };
+        match c.get_metric_with_label_values(&label_values(labels)) {
+            Ok(child) => child.inc(),
+            Err(e) => warn_labels(name, &e),
         }
     }
 
     fn add_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
-        let c = self.counter_for(name, labels);
-        if let Ok(child) = c.get_metric_with_label_values(&label_values(labels)) {
-            child.inc_by(value as f64);
+        let Some(c) = self.counter_for(name, labels) else {
+            return;
+        };
+        match c.get_metric_with_label_values(&label_values(labels)) {
+            Ok(child) => child.inc_by(value as f64),
+            Err(e) => warn_labels(name, &e),
         }
     }
 
     fn set_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
-        let g = self.gauge_for(name, labels);
-        if let Ok(child) = g.get_metric_with_label_values(&label_values(labels)) {
-            child.set(value);
+        let Some(g) = self.gauge_for(name, labels) else {
+            return;
+        };
+        match g.get_metric_with_label_values(&label_values(labels)) {
+            Ok(child) => child.set(value),
+            Err(e) => warn_labels(name, &e),
         }
     }
 
     fn observe_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
-        let h = self.histogram_for(name, labels);
-        if let Ok(child) = h.get_metric_with_label_values(&label_values(labels)) {
-            child.observe(value);
+        let Some(h) = self.histogram_for(name, labels) else {
+            return;
+        };
+        match h.get_metric_with_label_values(&label_values(labels)) {
+            Ok(child) => child.observe(value),
+            Err(e) => warn_labels(name, &e),
         }
     }
 }
