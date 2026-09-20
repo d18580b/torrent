@@ -171,6 +171,85 @@ impl SessionStore {
 pub struct Auth {
     pub config: Arc<AuthConfig>,
     pub sessions: Arc<SessionStore>,
+    /// Throttle for failed password attempts. See [`LoginThrottle`].
+    pub throttle: Arc<LoginThrottle>,
+}
+
+/// Rate limiter for `POST /api/login`.
+///
+/// Verifying the operator password runs Argon2id, which is *designed* to cost
+/// ~50 ms of CPU. Unauthenticated and unthrottled, that is a free
+/// CPU-exhaustion lever for anyone who can reach the port — and the operator
+/// password is the one credential here a human chose, so it is also the only
+/// one worth guessing.
+///
+/// Deliberately global rather than per-IP: there is one password, the daemon
+/// sits behind a reverse proxy where the peer address is usually the proxy,
+/// and a per-IP bucket keyed on a spoofable header is worse than none. The
+/// cost is that an attacker can lock the operator out of the login form for
+/// the backoff window — an inconvenience against a CPU exhaustion that takes
+/// the whole daemon down.
+#[derive(Debug)]
+pub struct LoginThrottle {
+    state: parking_lot::Mutex<ThrottleState>,
+    max_burst: u32,
+    penalty: Duration,
+}
+
+#[derive(Debug)]
+struct ThrottleState {
+    failures: u32,
+    locked_until: Option<Instant>,
+}
+
+impl LoginThrottle {
+    pub fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(ThrottleState {
+                failures: 0,
+                locked_until: None,
+            }),
+            max_burst: 5,
+            penalty: Duration::from_secs(30),
+        }
+    }
+
+    /// How long the caller must wait, or `None` if an attempt is allowed.
+    pub fn retry_after(&self) -> Option<Duration> {
+        let mut st = self.state.lock();
+        match st.locked_until {
+            Some(until) if Instant::now() < until => Some(until - Instant::now()),
+            Some(_) => {
+                // Window elapsed: allow another burst.
+                st.locked_until = None;
+                st.failures = 0;
+                None
+            }
+            None => None,
+        }
+    }
+
+    /// Record a failed attempt, locking out once the burst is spent.
+    pub fn note_failure(&self) {
+        let mut st = self.state.lock();
+        st.failures = st.failures.saturating_add(1);
+        if st.failures >= self.max_burst {
+            st.locked_until = Some(Instant::now() + self.penalty);
+        }
+    }
+
+    /// A success clears the record; the credential was not being guessed.
+    pub fn note_success(&self) {
+        let mut st = self.state.lock();
+        st.failures = 0;
+        st.locked_until = None;
+    }
+}
+
+impl Default for LoginThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl std::fmt::Debug for Auth {
@@ -189,6 +268,7 @@ impl Auth {
         Self {
             config: Arc::new(config),
             sessions: Arc::new(SessionStore::new(ttl)),
+            throttle: Arc::new(LoginThrottle::new()),
         }
     }
 
@@ -375,5 +455,30 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"ab"));
         assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn repeated_failures_throttle_the_login_route() {
+        // Argon2id is deliberately ~50ms of CPU, so an unthrottled login route
+        // is a free CPU-exhaustion lever for an unauthenticated caller.
+        let t = LoginThrottle::new();
+        assert!(t.retry_after().is_none());
+        for _ in 0..4 {
+            t.note_failure();
+            assert!(t.retry_after().is_none(), "locked out too early");
+        }
+        t.note_failure();
+        assert!(t.retry_after().is_some(), "burst was not capped");
+    }
+
+    #[test]
+    fn a_successful_login_clears_the_throttle() {
+        let t = LoginThrottle::new();
+        for _ in 0..5 {
+            t.note_failure();
+        }
+        assert!(t.retry_after().is_some());
+        t.note_success();
+        assert!(t.retry_after().is_none());
     }
 }
