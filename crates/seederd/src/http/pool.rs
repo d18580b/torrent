@@ -767,7 +767,7 @@ pub async fn delete_plan(
             "plan is mid-apply; it will be resumed rather than discarded",
         ));
     }
-    pool.with_store(|st| st.delete_plan(id))
+    pool.with_store_mut(|st| st.delete_plan(id))
         .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(StatusCode::NO_CONTENT)
 }

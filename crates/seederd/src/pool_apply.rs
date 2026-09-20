@@ -62,11 +62,21 @@ pub fn apply(
         return Err("plan was cancelled".into());
     }
 
+    // Take the plan in one conditional UPDATE. Reading the status and then
+    // setting it lets two concurrent apply requests both pass the checks above
+    // and both execute the same steps over the same files.
+    let claimed = pool
+        .with_store(|s| s.claim_plan_for_apply(plan_id))
+        .map_err(|e| e.to_string())?;
+    if !claimed {
+        return Err(format!(
+            "plan is {} and cannot be applied right now",
+            plan.status,
+        ));
+    }
+
     let steps: Vec<PlanStepRow> = pool
         .with_store(|s| s.plan_steps(plan_id))
-        .map_err(|e| e.to_string())?;
-
-    pool.with_store(|s| s.set_plan_status(plan_id, plan_status::APPLYING, None))
         .map_err(|e| e.to_string())?;
 
     let mut out = ApplyOutcome {

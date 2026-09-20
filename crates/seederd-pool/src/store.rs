@@ -817,11 +817,52 @@ impl PoolStore {
         Ok(())
     }
 
-    pub fn delete_plan(&self, id: i64) -> Result<(), PoolError> {
-        self.conn
-            .execute("DELETE FROM plan_step WHERE plan_id = ?1", params![id])?;
-        self.conn
-            .execute("DELETE FROM plan WHERE id = ?1", params![id])?;
+    /// Atomically take ownership of a plan for applying.
+    ///
+    /// Returns `true` if this caller now owns it. Two concurrent
+    /// `POST /plans/:id/apply` requests otherwise both read the steps as
+    /// `pending` and both execute them — the second one racing the first over
+    /// the same files. A conditional `UPDATE` in one statement makes exactly
+    /// one of them win.
+    ///
+    /// `applying` is deliberately not an applicable status: a plan already
+    /// mid-apply is either genuinely running, or was interrupted and belongs to
+    /// the startup re-drive.
+    pub fn claim_plan_for_apply(&self, id: i64) -> Result<bool, PoolError> {
+        let changed = self.conn.execute(
+            "UPDATE plan SET status = ?2 WHERE id = ?1 AND status IN (?3, ?4)",
+            params![
+                id,
+                crate::model::plan_status::APPLYING,
+                crate::model::plan_status::DRAFT,
+                crate::model::plan_status::FAILED,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Restore a plan the startup re-drive owns, so it can be claimed again.
+    pub fn release_interrupted_plan(&self, id: i64) -> Result<(), PoolError> {
+        self.conn.execute(
+            "UPDATE plan SET status = ?2 WHERE id = ?1 AND status = ?3",
+            params![
+                id,
+                crate::model::plan_status::FAILED,
+                crate::model::plan_status::APPLYING,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Discard a plan and its steps.
+    ///
+    /// One transaction: two bare `DELETE`s leave orphaned `plan_step` rows if
+    /// the process dies between them.
+    pub fn delete_plan(&mut self, id: i64) -> Result<(), PoolError> {
+        let tx = self.conn.savepoint()?;
+        tx.execute("DELETE FROM plan_step WHERE plan_id = ?1", params![id])?;
+        tx.execute("DELETE FROM plan WHERE id = ?1", params![id])?;
+        tx.commit()?;
         Ok(())
     }
 
