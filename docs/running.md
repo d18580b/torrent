@@ -45,17 +45,20 @@ Single-session mode needs none of them.
 libtorrent and Boost are vendored as git submodules and compiled from source.
 
 ```bash
-git submodule update --init --recursive --depth 1
+mise run native     # submodules, then the one-off libtorrent build
 ```
 
 Roughly 1.5 GB shallow (Boost's super-repo references ~150 sub-repos); over
-4 GB without `--depth 1`. If this is skipped the build fails with an error
-pointing back at this command rather than something cryptic.
+4 GB without `--depth 1`, which `mise run native` passes. If this is skipped
+the build fails with an error pointing back at this command rather than
+something cryptic.
 
-`.gitmodules` pins libtorrent to v2.0.12 and Boost to 1.83.0 by commit. It also
-sets `branch = RC_2_0` for libtorrent, which only matters if you run
-`git submodule update --remote` — that would move the pin to the branch tip.
-Don't, unless you mean to.
+The submodules are needed only to build the native prefix described in §3.
+Once that exists they can be absent.
+
+`.gitmodules` pins libtorrent to v2.0.14 and Boost to 1.83.0 by commit, and
+names immutable tags rather than branches — so `git submodule update --remote`
+cannot silently move a pin to a branch tip.
 
 ## 3. Build
 
@@ -63,8 +66,12 @@ Don't, unless you mean to.
 cargo build --workspace --release
 ```
 
-The first build compiles Boost and libtorrent and takes 5–15 minutes. Later
-builds are incremental.
+The first build compiles Boost and libtorrent and takes 5–15 minutes, into a
+content-addressed prefix under `${XDG_CACHE_HOME:-~/.cache}/torrentd/native`.
+Every later build reuses it — across cargo profiles, git worktrees and
+`cargo clean` alike — and costs about a second. `mise run native-clean` deletes
+it; `LIBTORRENT_SYS_FORCE_REBUILD=1` rebuilds past it. See CONTRIBUTING.md for
+the full set of knobs.
 
 **Node is a build dependency by default.** The `web-ui` feature is on by
 default and the build script shells out to `npm` to build the embedded client.
