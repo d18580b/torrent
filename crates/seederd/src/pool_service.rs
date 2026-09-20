@@ -49,6 +49,10 @@ pub struct PoolService {
     verify: VerifyQueue,
     /// `[pool] allow_mutations`. Every path that can destroy data checks this.
     allow_mutations: bool,
+    /// Torrents loaded since the last completed scan that the index has never
+    /// placed. Any non-zero value makes the claim table an incomplete account
+    /// of what is protected, so deletion is refused until a scan clears it.
+    unindexed_adds: AtomicU64,
 }
 
 impl std::fmt::Debug for PoolService {
@@ -67,6 +71,29 @@ impl PoolService {
     /// asked.
     pub fn allow_mutations(&self) -> bool {
         self.allow_mutations
+    }
+
+    /// Record that a torrent was loaded, and whether the index knows it.
+    ///
+    /// A torrent added through `POST /torrents` produces no `claim` rows until
+    /// the next full scan, because claims are written only by the matcher. Its
+    /// payload therefore reads as unclaimed — and "unclaimed" is what the
+    /// delete path acts on. Counting these is what lets deletion tell a stale
+    /// index from a current one.
+    pub fn note_torrent_loaded(&self, infohash: &str) {
+        let known = self
+            .with_store(|st| st.torrent(infohash))
+            .ok()
+            .flatten()
+            .is_some();
+        if !known {
+            self.unindexed_adds.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// How many loaded torrents the index has never placed.
+    pub fn unindexed_adds(&self) -> u64 {
+        self.unindexed_adds.load(Ordering::Relaxed)
     }
 
     pub fn open(cfg: &Config) -> anyhow::Result<Option<Arc<Self>>> {
@@ -97,6 +124,7 @@ impl PoolService {
             library_dir: pool_cfg.library_dir.clone(),
             verify: VerifyQueue::new(pool_cfg.max_concurrent_verify),
             allow_mutations: pool_cfg.allow_mutations,
+            unindexed_adds: AtomicU64::new(0),
         })))
     }
 
@@ -135,27 +163,33 @@ impl PoolService {
     /// predicate the delete path trusts.
     pub fn scan(&self) -> anyhow::Result<ScanSummary> {
         let mut store = self.store.lock();
-        store.in_transaction(|store| {
-            let mut summary = ScanSummary::default();
-            for (_, path) in &self.roots {
-                let s = seederd_pool::scan_root(store, path)
-                    .with_context(|| format!("scan root {}", path.display()))?;
-                summary.files += s.files_indexed;
-                summary.bytes += s.bytes_indexed;
-                summary.errors += s.errors;
-            }
-            let lib = seederd_pool::scan_library(store, &self.library_dir)
-                .with_context(|| format!("scan library {}", self.library_dir.display()))?;
-            summary.torrents = lib.torrents_indexed;
-            summary.errors += lib.errors;
+        store
+            .in_transaction(|store| {
+                let mut summary = ScanSummary::default();
+                for (_, path) in &self.roots {
+                    let s = seederd_pool::scan_root(store, path)
+                        .with_context(|| format!("scan root {}", path.display()))?;
+                    summary.files += s.files_indexed;
+                    summary.bytes += s.bytes_indexed;
+                    summary.errors += s.errors;
+                }
+                let lib = seederd_pool::scan_library(store, &self.library_dir)
+                    .with_context(|| format!("scan library {}", self.library_dir.display()))?;
+                summary.torrents = lib.torrents_indexed;
+                summary.errors += lib.errors;
 
-            let m = seederd_pool::match_all(store)?;
-            summary.matched = m.matched;
-            summary.partial = m.partial;
-            summary.missing = m.missing;
-            summary.overlap = m.overlap;
-            Ok(summary)
-        })
+                let m = seederd_pool::match_all(store)?;
+                summary.matched = m.matched;
+                summary.partial = m.partial;
+                summary.missing = m.missing;
+                summary.overlap = m.overlap;
+                Ok(summary)
+            })
+            .inspect(|_| {
+                // Everything loaded has now been re-placed, so the claim table is
+                // a complete account again.
+                self.unindexed_adds.store(0, Ordering::Relaxed);
+            })
     }
 }
 

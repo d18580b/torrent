@@ -50,6 +50,7 @@ pub use model::PoolFile;
 pub use model::PoolTorrent;
 pub use model::TorrentFileRow;
 pub use plan::PlanSpec;
+pub use scan::file_stamp;
 pub use scan::scan_library;
 pub use scan::scan_root;
 pub use scan::ScanStats;
