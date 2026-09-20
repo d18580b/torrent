@@ -14,7 +14,6 @@ use std::path::PathBuf;
 use rusqlite::params;
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
-use rusqlite::Transaction;
 use tracing::info;
 use tracing::warn;
 
@@ -142,6 +141,8 @@ CREATE TABLE plan_step (
 
 pub struct PoolStore {
     conn: Connection,
+    /// Nesting depth for [`PoolStore::in_transaction`]; 0 means autocommit.
+    tx_depth: u32,
 }
 
 impl std::fmt::Debug for PoolStore {
@@ -167,15 +168,90 @@ impl PoolStore {
 
     fn from_conn(conn: Connection) -> Result<Self, PoolError> {
         // WAL keeps the scanner's long write transactions from blocking the
-        // HTTP layer's reads. NORMAL is the right durability trade here: every
-        // row is reconstructible by rescanning, so trading an fsync per commit
-        // for throughput over millions of rows is worth it.
+        // HTTP layer's reads: a reader sees the pre-transaction snapshot for
+        // the whole duration of a rescan rather than a half-rebuilt index.
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        // FULL, not NORMAL. The file index really is reconstructible by
+        // rescanning — but the `plan` / `plan_step` mutation journal lives in
+        // this same database and is not. Under NORMAL a power loss can lose the
+        // last commits, which would resurrect a completed destructive step as
+        // `pending` and re-drive it at startup. An fsync per commit is cheap
+        // next to that.
+        conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let store = Self { conn };
+        // A scan takes the database's write lock for its whole duration (see
+        // `in_transaction`). A second writer — the CLI `pool scan` racing the
+        // daemon — must fail fast with SQLITE_BUSY so the caller can say so,
+        // not block for hours.
+        conn.busy_timeout(std::time::Duration::from_millis(0))?;
+        let store = Self { conn, tx_depth: 0 };
         store.migrate()?;
         Ok(store)
+    }
+
+    /// Run `f` with the whole store inside one write transaction.
+    ///
+    /// Every multi-statement rebuild must go through this. The claim table is
+    /// what proves a file is protected, and a rebuild that clears it outside a
+    /// transaction makes every file in every root read as an orphan until the
+    /// rebuild finishes — which is long enough for a concurrent delete plan to
+    /// enumerate the entire pool. `BEGIN IMMEDIATE` also takes SQLite's own
+    /// cross-process write lock, so a second scanner (the CLI racing the
+    /// daemon) is refused rather than interleaved.
+    ///
+    /// Re-entrant: a nested call becomes a savepoint, so callers can compose
+    /// without knowing whether they are already inside one.
+    pub fn in_transaction<T, E>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<PoolError>,
+    {
+        let depth = self.tx_depth;
+        let (begin, commit, rollback) = if depth == 0 {
+            (
+                "BEGIN IMMEDIATE".to_string(),
+                "COMMIT".to_string(),
+                "ROLLBACK".to_string(),
+            )
+        } else {
+            let name = format!("pool_tx_{depth}");
+            (
+                format!("SAVEPOINT {name}"),
+                format!("RELEASE {name}"),
+                format!("ROLLBACK TO {name}; RELEASE {name}"),
+            )
+        };
+        self.conn.execute_batch(&begin).map_err(|e| {
+            E::from({
+                if matches!(
+                    e.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) {
+                    PoolError::Busy
+                } else {
+                    PoolError::Sqlite(e)
+                }
+            })
+        })?;
+        self.tx_depth = depth + 1;
+        let out = f(self);
+        self.tx_depth = depth;
+        match out {
+            Ok(v) => {
+                self.conn
+                    .execute_batch(&commit)
+                    .map_err(|e| E::from(PoolError::Sqlite(e)))?;
+                Ok(v)
+            }
+            Err(e) => {
+                // Report the original failure; a rollback that itself fails
+                // means the connection is already unusable either way.
+                let _ = self.conn.execute_batch(&rollback);
+                Err(e)
+            }
+        }
     }
 
     fn migrate(&self) -> Result<(), PoolError> {
@@ -259,7 +335,7 @@ impl PoolStore {
         files: &[PoolFile],
         scanned_at: i64,
     ) -> Result<(), PoolError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM file WHERE root_id = ?1", params![root_id])?;
         {
             let mut ins = tx.prepare(
@@ -392,14 +468,14 @@ impl PoolStore {
         infohash: &str,
         files: &[TorrentFileRow],
     ) -> Result<(), PoolError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         Self::replace_torrent_files_tx(&tx, infohash, files)?;
         tx.commit()?;
         Ok(())
     }
 
     fn replace_torrent_files_tx(
-        tx: &Transaction<'_>,
+        tx: &Connection,
         infohash: &str,
         files: &[TorrentFileRow],
     ) -> Result<(), PoolError> {
@@ -498,7 +574,7 @@ impl PoolStore {
         &mut self,
         assignments: &HashMap<String, String>,
     ) -> Result<usize, PoolError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         let mut n = 0usize;
         {
             let mut up =
@@ -601,7 +677,7 @@ impl PoolStore {
         infohash: &str,
         claims: &[(i64, String)],
     ) -> Result<(), PoolError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM claim WHERE infohash = ?1", params![infohash])?;
         {
             let mut ins = tx.prepare(
@@ -615,7 +691,15 @@ impl PoolStore {
         Ok(())
     }
 
+    /// Drop every claim row.
+    ///
+    /// Only meaningful inside [`PoolStore::in_transaction`] — on its own it
+    /// publishes an empty claim table, under which every indexed file reads as
+    /// an orphan. Refuses rather than trusting the caller.
     pub fn clear_all_claims(&self) -> Result<(), PoolError> {
+        if self.tx_depth == 0 {
+            return Err(PoolError::ClaimsClearedOutsideTransaction);
+        }
         self.conn.execute("DELETE FROM claim", [])?;
         Ok(())
     }
@@ -649,7 +733,7 @@ impl PoolStore {
     }
 
     pub fn add_plan_steps(&mut self, plan_id: i64, steps: &[PlanStep]) -> Result<(), PoolError> {
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         {
             let mut ins = tx.prepare(
                 "INSERT INTO plan_step(plan_id, seq, op, src, dst, status, error)

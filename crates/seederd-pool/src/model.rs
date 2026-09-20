@@ -18,6 +18,17 @@ pub enum PoolError {
     UnknownRoot(PathBuf),
     #[error("pool database schema is version {found}, this build understands {expected}")]
     SchemaVersion { found: i64, expected: i64 },
+    /// Guard for the one bug that could delete a pool: an empty claim table
+    /// means every indexed file reads as unclaimed.
+    #[error("refusing to clear claims outside a transaction")]
+    ClaimsClearedOutsideTransaction,
+    /// Another process holds the pool database's write lock — almost always the
+    /// running daemon, or a second `pool scan`.
+    #[error(
+        "the pool index is locked by another process (the running daemon, or another `pool scan`); \
+         stop it or wait for it to finish"
+    )]
+    Busy,
 }
 
 /// Where a torrent stands relative to the payload on disk.

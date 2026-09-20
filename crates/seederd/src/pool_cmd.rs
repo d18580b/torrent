@@ -25,11 +25,22 @@ pub fn scan(cfg: &Config) -> anyhow::Result<()> {
     let mut store = PoolStore::open(&db).with_context(|| format!("open {}", db.display()))?;
     println!("index: {}", db.display());
 
+    // One transaction for the whole scan, which also takes SQLite's write lock:
+    // if the daemon is running and scanning, this refuses with PoolError::Busy
+    // rather than interleaving two rebuilds of the claim table.
+    store.in_transaction(|store| scan_inner(cfg, pool_cfg, store))
+}
+
+fn scan_inner(
+    cfg: &Config,
+    pool_cfg: &crate::config::PoolConfig,
+    store: &mut PoolStore,
+) -> anyhow::Result<()> {
     let mut files = 0u64;
     let mut bytes = 0u64;
     let mut errors = 0u64;
     for root in &pool_cfg.roots {
-        let s = seederd_pool::scan_root(&mut store, root)
+        let s = seederd_pool::scan_root(store, root)
             .with_context(|| format!("scan root {}", root.display()))?;
         println!(
             "  root {:<40} {:>10} files  {:>12}",
@@ -42,7 +53,7 @@ pub fn scan(cfg: &Config) -> anyhow::Result<()> {
         errors += s.errors;
     }
 
-    let lib = seederd_pool::scan_library(&mut store, &pool_cfg.library_dir)
+    let lib = seederd_pool::scan_library(store, &pool_cfg.library_dir)
         .with_context(|| format!("scan library {}", pool_cfg.library_dir.display()))?;
     println!(
         "  library {:<37} {:>10} torrents",
@@ -52,10 +63,10 @@ pub fn scan(cfg: &Config) -> anyhow::Result<()> {
     errors += lib.errors;
 
     if pool_cfg.import_legacy_registry {
-        import_legacy(&mut store, &cfg.registry_path())?;
+        import_legacy(store, &cfg.registry_path())?;
     }
 
-    let m = seederd_pool::match_all(&mut store)?;
+    let m = seederd_pool::match_all(store)?;
     println!(
         "\n{} files ({}) across {} torrents",
         files,
@@ -72,7 +83,7 @@ pub fn scan(cfg: &Config) -> anyhow::Result<()> {
         // and "you ran this as the wrong user".
         println!("  {errors} entries could not be read (see warnings above)");
     }
-    print_rollups(&store)?;
+    print_rollups(&*store)?;
     Ok(())
 }
 
