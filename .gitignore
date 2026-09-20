@@ -4,7 +4,7 @@
 *.pdb
 
 # Cargo lock for libraries (kept in repo for the binary; libraries excluded)
-# We keep Cargo.lock at the workspace root because seederd ships a binary.
+# We keep Cargo.lock at the workspace root because torrentd ships a binary.
 
 # Editor
 .vscode/
@@ -26,6 +26,12 @@ Thumbs.db
 *.resume
 *.resume.tmp
 slot_assignments.json
+session_state.dat
+# Pool index (SQLite, WAL mode) — a `pool scan` against a repo-local config
+# drops all three of these in the tree.
+*.db
+*.db-wal
+*.db-shm
 
 # Environment
 .env

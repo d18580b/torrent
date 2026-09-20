@@ -25,7 +25,7 @@ export function Login({ onDone }: { onDone: () => void }) {
   return (
     <form className="login stack" onSubmit={submit}>
       <div>
-        <h1 style={{ fontSize: 18, margin: '0 0 2px' }}>seederd</h1>
+        <h1 style={{ fontSize: 18, margin: '0 0 2px' }}>torrentd</h1>
         <p className="muted small" style={{ margin: 0 }}>Sign in to manage the pool.</p>
       </div>
       <div>
