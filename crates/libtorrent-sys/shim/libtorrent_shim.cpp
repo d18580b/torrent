@@ -1,5 +1,23 @@
 // libtorrent_shim.cpp — implementation of the C ABI declared in libtorrent_shim.h.
 //
+// Why this file exists
+// --------------------
+// Rust needs a C ABI to talk to libtorrent, and there were three ways to get
+// one. libtorrent ships its own C binding (bindings/c/library.cpp), but it is
+// functionally incomplete for a production client — no resume data read or
+// write, no per-file priorities, and alerts reduced to serialized text with no
+// structured payload — and it is not maintained at parity with the C++ API.
+//
+// Binding the C++ API directly is worse. It exposes ~99 concrete alert types
+// through polymorphic inheritance, uses exceptions, std::shared_ptr and
+// template dispatch (`alert_cast<T>` compares static type tags), none of which
+// the `cxx` crate handles; the alternative is hand-built vtables.
+//
+// A seeding client needs roughly twenty operations. Wrapping those in a C++
+// translation unit lets the C++ compiler deal with exception propagation, type
+// dispatch and ownership at the boundary, and hands Rust a flat `extern "C"`
+// surface that bindgen consumes directly. That is what this file is.
+//
 // Design highlights
 // -----------------
 //   - Every public function is wrapped in LT_SHIM_TRY/LT_SHIM_CATCH so no C++
