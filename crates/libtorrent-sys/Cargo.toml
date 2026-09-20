@@ -33,8 +33,10 @@ shim-tests = []
 cc = "1.1"
 cmake = "0.1"
 bindgen = "0.70"
-# Both are already in the workspace lockfile via other dependents, so keying
-# and staging the native cache compiles nothing new.
+# Keying and staging the native cache. Both are already in Cargo.lock, so no
+# new versions are resolved, but resolver v2 unifies build-dependencies
+# separately from the normal graph -- they are compiled once more for the
+# build-script graph.
 sha2 = "0.10"
 tempfile = "3"
 

@@ -15,8 +15,10 @@
 //      requires: shim -> libtorrent -> OpenSSL -> pthread -> stdc++.
 //
 // When the `bundled` feature is OFF, steps 2-4 are skipped but step 1 still
-// runs, so the generated bindings stay complete — used for system-package
-// consumers and for editor LSP runs that only want a check-pass.
+// runs, so the generated bindings stay complete and dependent crates type-
+// check — which the previous stub `bindings.rs` did not allow. Note the
+// trade: that path now needs libclang, where the stub needed no native
+// toolchain at all.
 //
 // Steps 2 and 3 write to a content-addressed prefix OUTSIDE OUT_DIR — by
 // default `$XDG_CACHE_HOME/torrentd/native` — rather than into the build
@@ -67,9 +69,14 @@ fn main() {
         "LIBTORRENT_SYS_CACHE_DIR",
         "LIBTORRENT_SYS_PREFIX",
         "LIBTORRENT_SYS_FORCE_REBUILD",
-        "CC",
-        "CXX",
     ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
+    // cc emits its own rerun-if-env-changed set from `compile()`, and
+    // `cargo_metadata(false)` (which we need, so cc does not advertise the
+    // staging directory as a link path) suppresses all of it. Re-emit them
+    // here, and hash the same list into the cache keys.
+    for var in toolchain_env_keys() {
         println!("cargo:rerun-if-env-changed={var}");
     }
 
@@ -110,7 +117,17 @@ fn main() {
                 "libtorrent-sys: using externally provided prefix {}",
                 p.display()
             );
-            let id = format!("external:{}", p.display());
+            // Keyed by the prefix's libtorrent version, not merely its path.
+            // A system package upgraded in place keeps the same path, and a
+            // shim compiled against the old headers linked against the new
+            // archive is a silent ABI mismatch.
+            let version_hpp = p.join("include").join("libtorrent").join("version.hpp");
+            println!("cargo:rerun-if-changed={}", version_hpp.display());
+            let mut id_key = Key::new();
+            id_key.str("external");
+            id_key.str(&p.display().to_string());
+            id_key.file(&version_hpp);
+            let id = format!("external:{}", id_key.hex());
             (p.clone(), p, id)
         }
         None => {
@@ -126,8 +143,8 @@ fn main() {
             let prefix = ensure_prefix(&root, "lt", &key, &detail, |dst| {
                 let boost_src = manifest_dir.join(BOOST_DIR);
                 let lt_src = manifest_dir.join(LIBTORRENT_DIR);
-                // Checked here rather than in main: on a cache hit the vendor
-                // submodules are legitimately absent, and this exits(1).
+                // Checked here rather than in main: on a cache hit the
+                // vendor submodules are legitimately absent, and this aborts.
                 sanity_check_submodules(&boost_src, &lt_src);
                 let boost_install = build_boost(&boost_src, &dst.join("boost"));
                 build_libtorrent(&lt_src, &dst.join("libtorrent"), &boost_install);
@@ -135,6 +152,21 @@ fn main() {
                 // read again once the install step has run.
                 let _ = std::fs::remove_dir_all(dst.join("boost").join("build"));
                 let _ = std::fs::remove_dir_all(dst.join("libtorrent").join("build"));
+                // Panic rather than let ensure_prefix stamp an empty tree as
+                // authoritative: a stamped-but-broken prefix would fail every
+                // later build with `cannot find -ltorrent-rasterbar` and keep
+                // failing, because the stamp says it is good.
+                require_file(
+                    &pick_libdir(&dst.join("libtorrent")).join("libtorrent-rasterbar.a"),
+                    "libtorrent static library",
+                );
+                require_file(
+                    &dst.join("boost")
+                        .join("include")
+                        .join("boost")
+                        .join("version.hpp"),
+                    "installed Boost headers",
+                );
             });
             let id = prefix
                 .file_name()
@@ -153,7 +185,11 @@ fn main() {
     let shim_prefix = ensure_prefix(&root, "shim", &shim_key, &shim_detail, |dst| {
         compile_shim(&manifest_dir, &lt_install, &boost_install, dst);
         // cc leaves object files and its flag-probe binaries behind.
-        prune_to(dst, &["liblibtorrent_shim.a"]);
+        prune_to(dst, &[SHIM_ARCHIVE]);
+        // Guards the allowlist above: if cc ever names its output something
+        // else, prune_to would delete the only artifact and we would stamp an
+        // empty prefix as complete.
+        require_file(&dst.join(SHIM_ARCHIVE), "compiled shim archive");
     });
 
     emit_link_directives(&lt_install, &boost_install, &shim_prefix);
@@ -224,20 +260,18 @@ fn sanity_check_submodules(boost: &Path, lt: &Path) {
     }
 
     if !missing.is_empty() {
-        eprintln!(
+        // panic, not process::exit: this runs inside ensure_prefix's populate
+        // closure, and exit() skips destructors, which would strand the
+        // staging directory in the cache root on every failure.
+        panic!(
             "\n\n\
-            error: libtorrent-sys build prerequisites missing:\n"
+            error: libtorrent-sys build prerequisites missing:\n\n  - {}\n\n\
+            Run from the workspace root:\n    \
+                mise run native\n\
+            (or `git submodule update --init --recursive --depth 1`)\n\
+            See CONTRIBUTING.md for full prerequisites.\n",
+            missing.join("\n  - ")
         );
-        for m in &missing {
-            eprintln!("  - {m}");
-        }
-        eprintln!(
-            "\n\
-            Run from the workspace root:\n\
-                git submodule update --init --recursive --depth 1\n\
-            See CONTRIBUTING.md for full prerequisites.\n"
-        );
-        std::process::exit(1);
     }
 }
 
@@ -469,6 +503,8 @@ fn pick_libdir(install: &Path) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 const STAMP: &str = ".stamp";
+/// What `cc::Build::compile("libtorrent_shim")` produces on unix.
+const SHIM_ARCHIVE: &str = "liblibtorrent_shim.a";
 const VENDOR_LIBTORRENT: &str = "vendor/libtorrent";
 const VENDOR_BOOST: &str = "vendor/boost";
 const LIBTORRENT_MARKERS: &[&str] = &["CMakeLists.txt", "include/libtorrent/version.hpp"];
@@ -553,7 +589,18 @@ where
         return prefix;
     }
     if forced {
-        let _ = std::fs::remove_dir_all(&prefix);
+        // Not `let _ =`: if this fails, the rename below hits ENOTEMPTY, the
+        // lost-race guard finds the old stamp still matching this same key,
+        // and the freshly built tree is discarded in favour of the stale one
+        // after paying the full build cost -- silently.
+        match std::fs::remove_dir_all(&prefix) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!(
+                "libtorrent-sys: LIBTORRENT_SYS_FORCE_REBUILD cannot remove {}: {e}",
+                prefix.display()
+            ),
+        }
     }
 
     eprintln!("libtorrent-sys: building {name}-{key}");
@@ -585,6 +632,16 @@ where
         ),
     }
     prefix
+}
+
+/// Fail the build if `path` is missing, before a prefix can be stamped.
+fn require_file(path: &Path, what: &str) {
+    assert!(
+        path.is_file(),
+        "libtorrent-sys: {what} missing after the native build ({});\n\
+         refusing to publish an incomplete prefix",
+        path.display()
+    );
 }
 
 fn stamp_matches(stamp: &Path, key: &str) -> bool {
@@ -620,8 +677,18 @@ fn vendor_id(workspace: &Path, rel: &str, markers: &[&str]) -> String {
     // 1. What is actually checked out. First on purpose: it is the only mode
     //    that notices a developer who ran `git checkout v2.0.14` inside the
     //    submodule but has not committed the bump yet.
-    if let Some(sha) = git(&submodule, &["rev-parse", "HEAD"]) {
-        return sha;
+    //
+    //    The toplevel check is load-bearing, not defensive. `git -C <dir>`
+    //    walks UP until it finds a repository, and `git checkout` materializes
+    //    an uninitialized submodule as an empty directory -- so on a CI job
+    //    that skipped the submodule fetch, a bare `rev-parse HEAD` here would
+    //    cheerfully return the *superproject's* HEAD. That is a different
+    //    value on every commit, so it would miss the restored cache every
+    //    time and then fail for want of the very submodules we skipped.
+    if is_repo_root(&submodule) {
+        if let Some(sha) = git(&submodule, &["rev-parse", "HEAD"]) {
+            return sha;
+        }
     }
     // 2. The committed gitlink, readable straight out of the superproject tree
     //    with the submodule absent — which is how a CI job keys the cache
@@ -640,6 +707,63 @@ fn vendor_id(workspace: &Path, rel: &str, markers: &[&str]) -> String {
         key.file(&submodule.join(marker));
     }
     format!("files:{}", key.hex())
+}
+
+/// Environment that changes what the compiler emits, and therefore has to be
+/// both hashed into the cache key and watched by cargo.
+///
+/// Missing any of these is not a loud failure: building libtorrent with, say,
+/// `CXXFLAGS=-D_GLIBCXX_DEBUG` and then reusing that prefix for a build
+/// without it puts two incompatible `std::string` layouts in one binary. It
+/// links fine and corrupts memory at runtime, so the list errs wide.
+fn toolchain_env_keys() -> Vec<String> {
+    let mut keys: Vec<String> = [
+        "CC",
+        "CFLAGS",
+        "CXX",
+        "CXXFLAGS",
+        "CXXSTDLIB",
+        "AR",
+        "ARFLAGS",
+        "HOST_CFLAGS",
+        "HOST_CXXFLAGS",
+        "TARGET_CFLAGS",
+        "TARGET_CXXFLAGS",
+        "CRATE_CC_NO_DEFAULTS",
+        // cmake finds OpenSSL for libtorrent's `encryption=ON`; these redirect
+        // it somewhere pkg-config's --modversion would not report.
+        "OPENSSL_ROOT_DIR",
+        "OPENSSL_DIR",
+        "PKG_CONFIG_PATH",
+        "PKG_CONFIG_SYSROOT_DIR",
+        "CMAKE_TOOLCHAIN_FILE",
+        "CMAKE_BUILD_PARALLEL_LEVEL",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+
+    // cc also honours the per-target forms, e.g. CXXFLAGS_x86_64-unknown-linux-gnu
+    // and its underscore variant.
+    if let Ok(target) = env::var("TARGET") {
+        for base in ["CFLAGS", "CXXFLAGS", "CC", "CXX", "AR"] {
+            keys.push(format!("{base}_{target}"));
+            keys.push(format!("{base}_{}", target.replace('-', "_")));
+        }
+    }
+    keys
+}
+
+/// Is `dir` the root of its own git repository, rather than merely sitting
+/// inside one? See the call site in [`vendor_id`] for why this matters.
+fn is_repo_root(dir: &Path) -> bool {
+    let Some(toplevel) = git(dir, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    match (std::fs::canonicalize(&toplevel), std::fs::canonicalize(dir)) {
+        (Ok(found), Ok(want)) => found == want,
+        _ => false,
+    }
 }
 
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
@@ -709,7 +833,25 @@ fn probe(command: &str, args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Fold the toolchain environment into a key.
+fn key_toolchain_env(key: &mut Key) {
+    for name in toolchain_env_keys() {
+        key.str(&name);
+        match env::var(&name) {
+            Ok(value) => key.str(&value),
+            Err(_) => key.str("<unset>"),
+        };
+    }
+}
+
 /// Key inputs for the Boost + libtorrent prefix.
+///
+/// Cargo's feature selection is deliberately absent. Nothing in this script
+/// branches on `CARGO_FEATURE_SHIM_TESTS`, so `--features shim-tests` produces
+/// a bit-identical native build and must share the prefix rather than pay for
+/// a second one. If a future change makes any of the native output depend on a
+/// feature, that feature has to be added here, or two selections will collide
+/// on one key.
 fn key_libtorrent(manifest_dir: &Path, workspace: &Path, cxx_id: &str) -> String {
     let mut key = Key::new();
     key.str("libtorrent-sys/lt/v1");
@@ -718,6 +860,7 @@ fn key_libtorrent(manifest_dir: &Path, workspace: &Path, cxx_id: &str) -> String
     key.str(&vendor_id(workspace, VENDOR_BOOST, BOOST_MARKERS));
     key.str(cxx_id);
     key.str(&openssl_version());
+    key_toolchain_env(&mut key);
     // Hashing the script that produces the cmake flags, rather than
     // enumerating the ~25 define() calls, is what keeps this from rotting:
     // there is no list for anyone to forget to update. It over-invalidates on
@@ -733,6 +876,7 @@ fn key_shim(manifest_dir: &Path, cxx_id: &str, tier_a_id: &str) -> String {
     key.str("libtorrent-sys/shim/v1");
     key.str(&env::var("TARGET").unwrap_or_default());
     key.str(cxx_id);
+    key_toolchain_env(&mut key);
     // Ties the shim to the exact libtorrent it was compiled against.
     key.str(tier_a_id);
     key.file(&manifest_dir.join("build.rs"));
