@@ -610,7 +610,7 @@ impl DaemonHandle {
         let app_state = AppState {
             source: source.clone(),
             registry: registry.clone(),
-            slots: slot_registry,
+            slots: slot_registry.clone(),
             state,
             torrents,
             metrics,
@@ -744,6 +744,23 @@ impl DaemonHandle {
             match crate::vpn::killswitch::disable() {
                 Ok(()) => info!("network kill switch removed"),
                 Err(e) => warn!(error.cause = %e, "failed to remove network kill switch"),
+            }
+        }
+
+        // Then bring the tunnels down, after the sessions are gone. The daemon
+        // brought them up, so it owns tearing them down; leaving them up meant
+        // every restart accumulated interfaces and left an idle tunnel
+        // connected to the provider indefinitely. Only on the graceful path —
+        // a startup failure already tears down what it created.
+        if let Some(slots) = &slot_registry {
+            for entry in slots.iter() {
+                let vpn = crate::vpn::for_type(entry.config.vpn_type);
+                vpn.bring_down(&entry.config.vpn_interface);
+                info!(
+                    slot_id = %entry.config.id,
+                    vpn_iface = %entry.config.vpn_interface,
+                    "tunnel down",
+                );
             }
         }
 
