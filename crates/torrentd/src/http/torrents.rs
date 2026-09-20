@@ -462,13 +462,6 @@ async fn do_add(
         }
     }
 
-    // The matcher, not the add path, writes claim rows — so until the next
-    // scan this torrent's payload reads as unclaimed. Tell the pool, so the
-    // delete path knows its index is no longer a complete account.
-    if let Some(pool) = s.pool.as_ref() {
-        pool.note_torrent_loaded(&infohash.to_hex());
-    }
-
     Ok((
         StatusCode::CREATED,
         Json(AddResponse {

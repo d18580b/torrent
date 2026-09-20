@@ -1018,6 +1018,33 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Of `loaded`, the info-hashes for which this index holds no claim rows.
+    ///
+    /// Claims are written by the matcher and by nothing else, so a torrent the
+    /// daemon is serving that the matcher has never placed contributes no
+    /// claims — and its payload therefore reads as unclaimed. Any non-empty
+    /// result means the claim table is an incomplete account of what is
+    /// protected, which is the one precondition a delete cannot do without.
+    ///
+    /// Derived from live state rather than counted as torrents are added, so
+    /// it is correct across a restart and cannot drift from reality.
+    pub fn loaded_without_claims(&self, loaded: &[String]) -> Result<Vec<String>, PoolError> {
+        if loaded.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut st = self
+            .conn
+            .prepare("SELECT EXISTS(SELECT 1 FROM claim WHERE infohash = ?1)")?;
+        let mut out = Vec::new();
+        for ih in loaded {
+            let claimed: i64 = st.query_row(params![ih], |r| r.get(0))?;
+            if claimed == 0 {
+                out.push(ih.clone());
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether one specific file is claimed by no torrent.
     ///
     /// The single-file form of [`PoolStore::orphan_files`], for the last-moment

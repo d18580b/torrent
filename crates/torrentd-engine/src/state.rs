@@ -194,6 +194,16 @@ impl StateMap {
         self.inner.is_empty()
     }
 
+    /// Every info-hash currently loaded into a session.
+    ///
+    /// This is the authoritative answer to "what is this daemon serving right
+    /// now", which is a different question from "what does the pool index know
+    /// about" — and the difference is exactly what the delete path has to
+    /// check before it believes a file is unclaimed.
+    pub fn infohashes(&self) -> Vec<InfoHash> {
+        self.inner.iter().map(|e| *e.key()).collect()
+    }
+
     pub fn insert(&self, ih: InfoHash, state: TorrentState) {
         self.inner.insert(ih, state);
     }
