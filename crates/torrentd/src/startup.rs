@@ -373,31 +373,30 @@ pub async fn boot(
                 missing_metadata += 1;
             }
             // Resume data carries the flags it was saved with, which is why
-            // this path does not re-assert SEED_MODE. Two of them must not be
-            // inherited, though:
+            // this path does not re-assert SEED_MODE.
             //
-            // * PAUSED is cleared. The VPN monitor pauses every torrent in a
-            //   slot when its tunnel drops; if the 30-minute resume sweep or
-            //   the shutdown drain runs in that window, every torrent is
-            //   persisted paused and comes back paused on the next start —
-            //   with /healthz green and nothing saying why the pool went quiet.
-            //   Pausing is a runtime quarantine, not a property of the torrent.
-            // * The private-slot guards are re-asserted. Safety Rule 5 says
-            //   disable_pex is set unconditionally on every torrent in every
-            //   slot, but resume data written before the flag existed — or by
-            //   any other path — would come back without it. These are
-            //   belt-and-braces against the torrent's own `private` bit, and
-            //   belt-and-braces that lapse on restart are neither.
-            let (flags_set, flags_clear) = if slot.is_default() {
-                (TorrentFlags::empty(), TorrentFlags::PAUSED)
+            // The private-slot guards *are* re-asserted. Safety Rule 5 says
+            // disable_pex is set unconditionally on every torrent in every
+            // slot, but resume data written before the flag existed — or by
+            // any other path — would come back without it. These are
+            // belt-and-braces against the torrent's own `private` bit, and
+            // belt-and-braces that lapse on restart are neither.
+            //
+            // PAUSED is deliberately *not* cleared. It is tempting: the VPN
+            // monitor pauses a whole slot when its tunnel drops, and if the
+            // resume sweep lands in that window every torrent comes back
+            // paused. But resume data does not record *why* a torrent was
+            // paused, so clearing it also silently restarts a torrent an
+            // operator paused on purpose — on a private tracker, the kind of
+            // mistake that ends an account. A pool that comes back paused is
+            // visible in `/status` and fixed with `resume-all`; a pool that
+            // comes back seeding when it was told not to is not recoverable.
+            let flags_set = if slot.is_default() {
+                TorrentFlags::empty()
             } else {
-                (
-                    TorrentFlags::DISABLE_PEX
-                        | TorrentFlags::DISABLE_DHT
-                        | TorrentFlags::DISABLE_LSD,
-                    TorrentFlags::PAUSED,
-                )
+                TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
             };
+            let flags_clear = TorrentFlags::empty();
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: data.into_inner(),
                 torrent,
