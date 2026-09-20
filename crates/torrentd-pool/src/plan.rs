@@ -287,7 +287,13 @@ pub fn contains(root: &Path, candidate: &Path) -> bool {
     let mut existing = candidate;
     let mut trailing = PathBuf::new();
     loop {
-        if existing.exists() {
+        // `symlink_metadata`, not `exists()`. `exists()` follows links and
+        // reports `false` for a *dangling* one, so the walk would step past
+        // `root/link` and canonicalize `root` instead — concluding that
+        // `root/link/x` is contained when the link points anywhere at all.
+        // A broken symlink is exactly the escape this function exists to
+        // catch, so the ancestor walk has to stop at the link itself.
+        if existing.symlink_metadata().is_ok() {
             break;
         }
         let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {

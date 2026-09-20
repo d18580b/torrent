@@ -244,25 +244,39 @@ impl PoolStore {
         // process. Axum installs no panic layer, so an HTTP handler is enough
         // to get there. Roll back, restore the depth, then re-raise.
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
-        self.tx_depth = depth;
         let out = match out {
             Ok(v) => v,
             Err(panic) => {
                 let _ = self.conn.execute_batch(&rollback);
+                self.tx_depth = depth;
                 std::panic::resume_unwind(panic);
             }
         };
         match out {
-            Ok(v) => {
-                self.conn
-                    .execute_batch(&commit)
-                    .map_err(|e| E::from(PoolError::Sqlite(e)))?;
-                Ok(v)
-            }
+            Ok(v) => match self.conn.execute_batch(&commit) {
+                Ok(()) => {
+                    self.tx_depth = depth;
+                    Ok(v)
+                }
+                Err(e) => {
+                    // A COMMIT can fail — SQLITE_FULL, SQLITE_IOERR, a WAL
+                    // snapshot conflict — and SQLite leaves the transaction
+                    // *open* when it does. Restoring the depth before this
+                    // point would have left the counter saying 0 while a
+                    // transaction was still live, after which every later
+                    // `BEGIN IMMEDIATE` fails with "cannot start a
+                    // transaction within a transaction" for the life of the
+                    // process. Roll back explicitly, then restore.
+                    let _ = self.conn.execute_batch(&rollback);
+                    self.tx_depth = depth;
+                    Err(E::from(PoolError::Sqlite(e)))
+                }
+            },
             Err(e) => {
                 // Report the original failure; a rollback that itself fails
                 // means the connection is already unusable either way.
                 let _ = self.conn.execute_batch(&rollback);
+                self.tx_depth = depth;
                 Err(e)
             }
         }
@@ -834,38 +848,29 @@ impl PoolStore {
     /// Atomically take ownership of a plan for applying.
     ///
     /// Returns `true` if this caller now owns it. Two concurrent
-    /// `POST /plans/:id/apply` requests otherwise both read the steps as
-    /// `pending` and both execute them — the second one racing the first over
+    /// `POST /api/pool/plans/:id/apply` requests otherwise both read the steps
+    /// as `pending` and both execute them — the second racing the first over
     /// the same files. A conditional `UPDATE` in one statement makes exactly
     /// one of them win.
     ///
-    /// `applying` is deliberately not an applicable status: a plan already
-    /// mid-apply is either genuinely running, or was interrupted and belongs to
-    /// the startup re-drive.
-    pub fn claim_plan_for_apply(&self, id: i64) -> Result<bool, PoolError> {
-        let changed = self.conn.execute(
-            "UPDATE plan SET status = ?2 WHERE id = ?1 AND status IN (?3, ?4)",
-            params![
-                id,
-                crate::model::plan_status::APPLYING,
-                crate::model::plan_status::DRAFT,
-                crate::model::plan_status::FAILED,
-            ],
-        )?;
+    /// `resume` additionally admits a plan already in `applying`, which is
+    /// what a crash leaves behind. Only the startup re-drive passes it: for an
+    /// API request `applying` means another caller is mid-apply right now, and
+    /// admitting it would be the very race this exists to prevent.
+    pub fn claim_plan_for_apply(&self, id: i64, resume: bool) -> Result<bool, PoolError> {
+        use crate::model::plan_status as ps;
+        let changed = if resume {
+            self.conn.execute(
+                "UPDATE plan SET status = ?2 WHERE id = ?1 AND status IN (?3, ?4, ?5)",
+                params![id, ps::APPLYING, ps::DRAFT, ps::FAILED, ps::APPLYING],
+            )?
+        } else {
+            self.conn.execute(
+                "UPDATE plan SET status = ?2 WHERE id = ?1 AND status IN (?3, ?4)",
+                params![id, ps::APPLYING, ps::DRAFT, ps::FAILED],
+            )?
+        };
         Ok(changed == 1)
-    }
-
-    /// Restore a plan the startup re-drive owns, so it can be claimed again.
-    pub fn release_interrupted_plan(&self, id: i64) -> Result<(), PoolError> {
-        self.conn.execute(
-            "UPDATE plan SET status = ?2 WHERE id = ?1 AND status = ?3",
-            params![
-                id,
-                crate::model::plan_status::FAILED,
-                crate::model::plan_status::APPLYING,
-            ],
-        )?;
-        Ok(())
     }
 
     /// Discard a plan and its steps.

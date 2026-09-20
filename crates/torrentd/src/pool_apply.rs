@@ -50,6 +50,38 @@ pub fn apply(
     state: &StateMap,
     plan_id: i64,
 ) -> Result<ApplyOutcome, String> {
+    apply_inner(pool, source, state, plan_id, false)
+}
+
+/// Whether the index accounts for everything the daemon currently serves.
+///
+/// Claims are written by the matcher and by nothing else, so a loaded torrent
+/// the matcher has never placed contributes none — and its payload reads as an
+/// orphan.
+fn check_index_accounts_for_live_state(pool: &PoolService, state: &StateMap) -> Result<(), String> {
+    let loaded: Vec<String> = state.infohashes().iter().map(|ih| ih.to_hex()).collect();
+    let unindexed = pool
+        .with_store(|st| st.loaded_without_claims(&loaded))
+        .map_err(|e| e.to_string())?;
+    if !unindexed.is_empty() {
+        return Err(format!(
+            "{} loaded torrent(s) have no claims in the index, so it cannot prove what is \
+             unclaimed — the first is {}. Run `pool scan` (or POST /api/pool/scan) and \
+             rebuild this plan.",
+            unindexed.len(),
+            unindexed[0],
+        ));
+    }
+    Ok(())
+}
+
+fn apply_inner(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    plan_id: i64,
+    resume: bool,
+) -> Result<ApplyOutcome, String> {
     let Some(plan) = pool
         .with_store(|s| s.plan(plan_id))
         .map_err(|e| e.to_string())?
@@ -63,51 +95,53 @@ pub fn apply(
         return Err("plan was cancelled".into());
     }
 
-    // Take the plan in one conditional UPDATE. Reading the status and then
-    // setting it lets two concurrent apply requests both pass the checks above
-    // and both execute the same steps over the same files.
-    let claimed = pool
-        .with_store(|s| s.claim_plan_for_apply(plan_id))
-        .map_err(|e| e.to_string())?;
-    if !claimed {
-        return Err(format!(
-            "plan is {} and cannot be applied right now",
-            plan.status,
-        ));
-    }
-
     let steps: Vec<PlanStepRow> = pool
         .with_store(|s| s.plan_steps(plan_id))
         .map_err(|e| e.to_string())?;
 
-    // Deleting rests on "the index is a complete account of what is
-    // protected". Establish that once, before any step runs, rather than
-    // trusting a counter: derived from the live session state, it is correct
-    // across a restart and cannot drift.
-    if steps.iter().any(|s| s.op == ops::DELETE_FILE) {
-        let loaded: Vec<String> = state.infohashes().iter().map(|ih| ih.to_hex()).collect();
-        let unindexed = pool
-            .with_store(|st| st.loaded_without_claims(&loaded))
-            .map_err(|e| e.to_string())?;
-        if !unindexed.is_empty() {
-            return Err(format!(
-                "{} loaded torrent(s) have no claims in the index, so it cannot prove what \
-                 is unclaimed — the first is {}. Run `pool scan` (or POST /api/pool/scan) \
-                 and rebuild this plan.",
-                unindexed.len(),
-                unindexed[0],
-            ));
-        }
-    }
+    // ---- preconditions, all of them before the plan is claimed -------------
+    //
+    // Ordering matters. Claiming flips the status to `applying`, and an early
+    // return after that would leave the plan in a state that `apply` refuses,
+    // `resume_unfinished` refuses, and `delete_plan` refuses — permanently
+    // stuck with no way out short of editing the database by hand.
 
     if let Some(stuck) = steps.iter().find(|s| s.status == step_status::IN_PROGRESS) {
         // Written before the attempt and cleared by the outcome, so finding
         // one here means a previous run died mid-step. Whether it happened is
         // unknown, and both re-running and skipping it can destroy data.
-        return Err(format!(
+        //
+        // Park it in `failed` rather than leaving it `applying`: a human has
+        // to look either way, and `failed` is a state they can discard.
+        let msg = format!(
             "step {} ({}) was interrupted and its outcome is unknown; inspect {} before \
              resuming this plan",
             stuck.seq, stuck.op, stuck.src,
+        );
+        let _ = pool.with_store(|s| s.set_plan_status(plan_id, plan_status::FAILED, None));
+        return Err(msg);
+    }
+
+    // Deleting rests on "the index is a complete account of what is
+    // protected". Derived from live session state, so it is correct on every
+    // load path and across a restart.
+    let deletes = steps.iter().any(|s| s.op == ops::DELETE_FILE);
+    if deletes {
+        check_index_accounts_for_live_state(pool, state)?;
+    }
+
+    // ---- claim -------------------------------------------------------------
+    //
+    // One conditional UPDATE. Reading the status and then setting it lets two
+    // concurrent apply requests both pass the checks above and both execute
+    // the same steps over the same files.
+    let claimed = pool
+        .with_store(|s| s.claim_plan_for_apply(plan_id, resume))
+        .map_err(|e| e.to_string())?;
+    if !claimed {
+        return Err(format!(
+            "plan is {} and cannot be applied right now",
+            plan.status,
         ));
     }
 
@@ -119,10 +153,38 @@ pub fn apply(
         status: plan_status::APPLIED.to_string(),
     };
 
+    // A delete plan over a large subtree runs for minutes. A `POST /torrents`
+    // landing in that window makes the index incomplete again, so the
+    // precondition is re-established whenever the loaded set changes. `len()`
+    // is O(1); the full check only runs when it has actually moved.
+    let mut loaded_len = state.len();
+
     for step in steps {
         if step.status == step_status::DONE {
             out.skipped += 1;
             continue;
+        }
+        if deletes && step.op == ops::DELETE_FILE && state.len() != loaded_len {
+            if let Err(e) = check_index_accounts_for_live_state(pool, state) {
+                // Stop, but as a *failed* plan rather than an early return:
+                // the plan is claimed at this point, and returning here would
+                // strand it in `applying` where nothing can apply, resume or
+                // discard it.
+                out.failed += 1;
+                out.status = plan_status::FAILED.to_string();
+                let _ = pool.with_store(|s| {
+                    s.set_step_status(plan_id, step.seq, step_status::FAILED, Some(&e))
+                });
+                error!(
+                    target: "torrentd::pool::apply",
+                    plan_id,
+                    step = step.seq,
+                    error.cause = %e,
+                    "stopping: the index no longer accounts for what is loaded",
+                );
+                break;
+            }
+            loaded_len = state.len();
         }
         // Written before the action, so a crash leaves `in_progress` behind.
         // Steps were inserted `pending` up front and only updated afterwards,
@@ -577,7 +639,7 @@ pub fn resume_unfinished(pool: &PoolService, source: &Arc<dyn AlertSource>, stat
             kind = %plan.kind,
             "resuming a plan interrupted mid-apply",
         );
-        if let Err(e) = apply(pool, source, state, plan.id) {
+        if let Err(e) = apply_inner(pool, source, state, plan.id, true) {
             error!(target: "torrentd::pool::apply", plan_id = plan.id, error.cause = %e, "resume failed");
         }
     }
@@ -610,13 +672,83 @@ mod tests {
         p
     }
 
+    /// Build a `delete_orphans` plan over the whole root.
+    fn delete_plan(pool: &PoolService) -> i64 {
+        let root_id = pool.roots()[0].0;
+        let spec = torrentd_pool::plan::PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: String::new(),
+        };
+        let steps = pool
+            .with_store(|st| torrentd_pool::plan::build(st, &spec, |id| pool.root_path_of(id)))
+            .unwrap()
+            .expect("plan builds");
+        let id = pool
+            .with_store(|st| st.create_plan("delete_orphans", "{}", 0))
+            .unwrap();
+        pool.with_store_mut(|st| st.add_plan_steps(id, &steps))
+            .unwrap();
+        id
+    }
+
+    fn engine_and_state() -> (Arc<dyn AlertSource>, StateMap) {
+        let engine: Arc<dyn torrentd_engine::TorrentEngine> =
+            Arc::new(torrentd_engine::MockEngine::new());
+        (
+            Arc::new(torrentd_engine::SingleSessionSource::new(engine)),
+            StateMap::new(),
+        )
+    }
+
     #[test]
-    fn an_unindexed_loaded_torrent_makes_the_index_incomplete() {
-        // The precondition `apply` checks before any delete step: a torrent the
-        // daemon is serving that the matcher has never placed contributes no
-        // claim rows, so its payload reads as an orphan. Derived from live
-        // state rather than counted as torrents are added, so it survives a
-        // restart — a counter would reset to zero while the hazard persisted.
+    fn applying_refuses_while_a_loaded_torrent_is_absent_from_the_index() {
+        // The end-to-end shape of the hazard: a torrent the daemon serves that
+        // the matcher has never placed contributes no claims, so its payload
+        // enumerates as an orphan. Driven through `apply` so that deleting the
+        // precondition from the executor fails this test.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = write(&root, "movies/feature.bin", 64);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+
+        let (source, state) = engine_and_state();
+        // A torrent is loaded that the index has never seen.
+        state.insert(
+            libtorrent_safe::InfoHash([0xff; 20]),
+            torrentd_engine::TorrentState::newly_added(
+                torrentd_engine::TorrentHandle {
+                    id: 1,
+                    infohash: libtorrent_safe::InfoHash([0xff; 20]),
+                },
+                torrentd_engine::SlotId::default_single(),
+                std::time::Instant::now(),
+            ),
+        );
+
+        let e = apply(&pool, &source, &state, plan_id).unwrap_err();
+        assert!(e.contains("no claims in the index"), "got {e}");
+        assert!(victim.exists(), "payload was deleted against a stale index");
+
+        // And the refusal must not have bricked the plan: it was never
+        // claimed, so it is still applicable once the index catches up.
+        let status = pool
+            .with_store(|st| st.plan(plan_id))
+            .unwrap()
+            .unwrap()
+            .status;
+        assert_eq!(status, torrentd_pool::model::plan_status::DRAFT);
+    }
+
+    #[test]
+    fn a_plan_interrupted_mid_step_can_still_be_resumed_and_discarded() {
+        // A crash leaves a step `in_progress` and the plan `applying`. The
+        // startup re-drive has to be able to claim it — with the claim
+        // restricted to draft/failed it could not, and the plan was
+        // unapplyable, unresumable and undeletable at the same time.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("pool");
         std::fs::create_dir_all(&root).unwrap();
@@ -624,19 +756,39 @@ mod tests {
 
         let pool = service(dir.path(), true);
         pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
 
-        // Nothing loaded: the index accounts for everything it knows.
+        // Simulate the crash: claimed, one step mid-flight.
         assert!(pool
-            .with_store(|st| st.loaded_without_claims(&[]))
-            .unwrap()
-            .is_empty());
+            .with_store(|st| st.claim_plan_for_apply(plan_id, false))
+            .unwrap());
+        pool.with_store(|st| {
+            st.set_step_status(
+                plan_id,
+                0,
+                torrentd_pool::model::step_status::IN_PROGRESS,
+                None,
+            )
+        })
+        .unwrap();
 
-        // A torrent loaded through the API has no claims until a rescan.
-        let ghost = "ff00000000000000000000000000000000000000".to_string();
-        let unindexed = pool
-            .with_store(|st| st.loaded_without_claims(std::slice::from_ref(&ghost)))
-            .unwrap();
-        assert_eq!(unindexed, vec![ghost]);
+        let (source, state) = engine_and_state();
+        let e = apply(&pool, &source, &state, plan_id).unwrap_err();
+        assert!(
+            e.contains("interrupted and its outcome is unknown"),
+            "got {e}"
+        );
+
+        // Parked in `failed`, not stranded in `applying`: an operator can now
+        // discard it, which `delete_plan` refuses for `applying`.
+        let status = pool
+            .with_store(|st| st.plan(plan_id))
+            .unwrap()
+            .unwrap()
+            .status;
+        assert_eq!(status, torrentd_pool::model::plan_status::FAILED);
+        pool.with_store_mut(|st| st.delete_plan(plan_id)).unwrap();
+        assert!(pool.with_store(|st| st.plan(plan_id)).unwrap().is_none());
     }
 
     #[test]

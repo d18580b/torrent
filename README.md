@@ -91,7 +91,8 @@ Requires `allow_mutations = true`. A mistake here destroys data, so:
   nothing; you see the exact diff first.
 - **Journaled.** Each step is written before it is attempted, so a crash
   leaves a step whose outcome is unknown rather than a half-applied
-  reorganisation silently resumed.
+  reorganisation silently resumed. Startup re-drives what it safely can and
+  parks the rest as `failed`, where you can inspect and discard it.
 - **Adopted payload moves through libtorrent** (`move_storage`), and the step
   is not complete until libtorrent confirms it — the torrent keeps seeding
   across the move.
@@ -117,7 +118,7 @@ probes and scrapes do not move.
 | `GET /status` | Counts by state, aggregate rates, peers. |
 | `GET /torrents` | List. `?after=<infohash>&limit=<n>` (default 100, max 1000), returns `{"items":[…],"next_cursor":…}`. |
 | `POST /torrents` | Add `{"magnet":…}` / `{"torrent_path":…}`, or a multipart `.torrent`. 409 on a duplicate info-hash. Body capped at 50 MiB. |
-| `GET`/`DELETE` `/torrents/:infohash` | One torrent; `?delete_files=true` needs `allow_mutations`. |
+| `GET`/`DELETE` `/torrents/:infohash` | One torrent; `?delete_files=true` requires a `[pool]` section with `allow_mutations`. |
 | `POST /torrents/:infohash/pause` \| `/resume` | Pause or resume one torrent. |
 | `POST /torrents/:infohash/upload-limit` | `{"bytes_per_sec":…}`, 0 = unlimited. |
 | `POST /torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 4 normal, 7 high). |
