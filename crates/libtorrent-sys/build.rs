@@ -46,13 +46,23 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/libtorrent_shim.h");
     println!("cargo:rerun-if-changed=shim/alert_union.h");
     println!("cargo:rerun-if-changed=shim/libtorrent_shim.cpp");
-    // Two small files, not `vendor/**`: cargo walks a rerun-if-changed
+    // Individual files, not `vendor/**`: cargo walks a rerun-if-changed
     // directory recursively, and walking 634 MB of Boost on every build is
-    // exactly what this cache exists to avoid. A libtorrent or Boost version
-    // bump nearly always touches one of these; LIBTORRENT_SYS_FORCE_REBUILD
-    // covers the case where it does not.
-    println!("cargo:rerun-if-changed=../../vendor/libtorrent/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=../../vendor/boost/CMakeLists.txt");
+    // exactly what this cache exists to avoid.
+    //
+    // These are the same markers vendor_id() falls back to, and version.hpp
+    // is the load-bearing one: checking out v2.0.14 over v2.0.12 leaves
+    // CMakeLists.txt byte-identical and touches only version.hpp, so watching
+    // CMakeLists.txt alone meant cargo never re-ran this script and kept
+    // linking the previous libtorrent.
+    for marker in [
+        "../../vendor/libtorrent/CMakeLists.txt",
+        "../../vendor/libtorrent/include/libtorrent/version.hpp",
+        "../../vendor/boost/CMakeLists.txt",
+        "../../vendor/boost/libs/config/include/boost/version.hpp",
+    ] {
+        println!("cargo:rerun-if-changed={marker}");
+    }
     for var in [
         "LIBTORRENT_SYS_CACHE_DIR",
         "LIBTORRENT_SYS_PREFIX",
