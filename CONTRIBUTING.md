@@ -126,9 +126,9 @@ cargo test -p libtorrent-sys --features shim-tests  # Layer 2 shim FFI tests (Li
 Integration tests that spin up real libtorrent sessions are gated behind `--ignored`
 and run as a separate CI job Strategy.
 
-For a full hands-on walkthrough — the Layer 1–4 test ladder plus a manual
-single-node smoke and the multi-slot / VPN path — see
-[`docs/VERIFICATION.md`](docs/VERIFICATION.md).
+Deploying it for real — packages, submodules, the service user, directories,
+config, auth bootstrap, ulimits, and the drills worth running once before you
+trust it — is in [`docs/running.md`](docs/running.md).
 
 ## Style
 
@@ -140,8 +140,26 @@ The pre-commit hook applies both automatically to staged changes. Do not commit 
 
 ## Logging conventions
 
-See [`docs/tracing.md`](./docs/tracing.md) for canonical structured field names. CI lints
-field-name spelling (`infohash`, never `info_hash`).
+Logs are JSON lines on stdout (`tracing` + `tracing-subscriber`), with an
+RFC3339 `timestamp`, `level`, `target` and `message` on every event. Domain
+fields have **one** spelling each, because log queries depend on it:
+
+| Field | Notes |
+| --- | --- |
+| `slot_id` | `default` in single-session mode. |
+| `infohash` | Lowercase hex, 40 chars. **Never** `info_hash` — CI fails on that spelling anywhere in `crates/`. |
+| `op` | The engine operation: `add_torrent`, `remove_torrent`, `pause_torrent`, `resume_torrent`, `save_resume_data`, `set_upload_limit`, `set_file_priority`, `force_recheck`, `move_storage`, `apply_settings`. |
+| `alert_type` | Lowercase `AlertKind`, e.g. `add_torrent`. |
+| `error.kind` / `error.code` / `error.cause` | Short identifier, OS or libtorrent code, human-readable cause. |
+| `vpn_iface`, `tunnel_ip` | Slot networking. |
+| `pending_resume_count` | Outstanding `save_resume_data` calls. |
+
+`error.kind` cannot be the first field in an `error!` macro — the macro name and
+the field path are ambiguous to the parser. Put another field first.
+
+Levels: `error` needs an operator, `warn` is an anomaly the daemon handled,
+`info` is lifecycle, `debug` is per-alert detail. `RUST_LOG` overrides per
+crate, e.g. `RUST_LOG=info,torrentd_engine::handler::resume=debug`.
 
 ## Reporting bugs
 
