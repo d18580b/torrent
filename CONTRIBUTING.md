@@ -149,9 +149,9 @@ Two consequences worth knowing:
 | `LIBTORRENT_SYS_PREFIX` | Build the shim against an existing libtorrent + Boost install instead of the vendored one |
 | `LIBTORRENT_SYS_FORCE_REBUILD` | Ignore both stamps and rebuild |
 
-If a build ever fails with `cannot find -ltorrent-rasterbar` after you deleted the cache
-directory by hand, run `touch crates/libtorrent-sys/build.rs` to force the build script to
-re-run.
+Deleting the cache directory by hand is safe even with a warm `target/`: the build script
+registers the stamp file with `rerun-if-changed`, so cargo treats its disappearance as a
+reason to re-run and rebuild rather than linking against paths that no longer exist.
 
 ## Test
 
