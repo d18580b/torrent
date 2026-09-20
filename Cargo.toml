@@ -14,7 +14,7 @@ edition = "2021"
 rust-version = "1.90"
 license = "Apache-2.0"
 authors = ["Justin Chung"]
-repository = "https://github.com/justin13888/milkyisles"
+repository = "https://github.com/milkyisles/torrent"
 
 # Centralized, inherited lint policy — each crate opts in via `[lints] workspace = true`.
 # One source of truth (merge-resilient) that mirrors the historical `-D warnings` gate.

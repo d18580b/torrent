@@ -2,8 +2,8 @@
 vendor/** linguist-vendored=true
 vendor/** linguist-generated=true
 
-# Generated bindings
-crates/libtorrent-sys/src/bindings.rs linguist-generated=true
+# Generated bindings live in OUT_DIR (see crates/libtorrent-sys/build.rs), not
+# in src/, so there is no path here to mark.
 
 # Normalize line endings
 *           text=auto eol=lf
