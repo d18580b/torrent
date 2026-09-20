@@ -1,8 +1,8 @@
 //! TOML configuration parser.
 //!
 //! `serde(deny_unknown_fields)` everywhere — typos in setting names
-//! produce fatal startup errors with the offending key (the spec: "Unknown
-//! keys cause a fatal startup error"). `Config::diff` separates fields
+//! produce fatal startup errors naming the offending key. `Config::diff`
+//! separates fields
 //! that can be hot-reloaded via SIGHUP from those requiring a full
 //! restart.
 

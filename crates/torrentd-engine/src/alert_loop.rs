@@ -127,16 +127,15 @@ impl AlertLoopBuilder {
         }
     }
 
-    /// Treat `listen_failed_alert` as fatal (Handling: fatal in
-    /// single-session mode; in multi-slot mode only the affected slot is
-    /// marked failed and the daemon keeps running).
+    /// Treat `listen_failed_alert` as fatal: correct in single-session mode,
+    /// where nothing else is listening and seeding would just stop silently.
+    /// In multi-slot mode only the affected slot is marked failed and the
+    /// daemon keeps running.
     pub fn fatal_listen_failure(mut self, yes: bool) -> Self {
         self.fatal_listen_failure = yes;
         self
     }
 
-    /// Callback fired when the loop decides to self-terminate, before it
-    /// begins the resume-data drain.
     /// Supply the fenced-slot predicate. Without one, no slot is ever fenced,
     /// which is correct for single-session mode and for tests.
     pub fn slot_fenced(mut self, f: SlotFenced) -> Self {
@@ -144,6 +143,8 @@ impl AlertLoopBuilder {
         self
     }
 
+    /// Callback fired when the loop decides to self-terminate, before it
+    /// begins the resume-data drain.
     pub fn on_fatal(mut self, f: FatalCallback) -> Self {
         self.on_fatal = Some(f);
         self
@@ -157,6 +158,10 @@ impl AlertLoopBuilder {
         let state_arc = Arc::clone(&self.state);
         let heartbeat = Arc::new(AtomicU64::new(now_millis()));
         let listen_failed = Arc::new(AtomicBool::new(false));
+        // Observed by the daemon to pick a non-zero exit code. `catch_unwind`
+        // means the thread returns normally, so `join()` reports success and
+        // the panic would otherwise be invisible to the exit path.
+        let panicked = Arc::new(AtomicBool::new(false));
 
         let join = thread::Builder::new()
             .name("torrentd-alert-loop".into())
@@ -169,6 +174,7 @@ impl AlertLoopBuilder {
                 let clock = Arc::clone(&self.clock);
                 let heartbeat = Arc::clone(&heartbeat);
                 let listen_failed = Arc::clone(&listen_failed);
+                let panicked = Arc::clone(&panicked);
                 let fatal_listen_failure = self.fatal_listen_failure;
                 let on_fatal = self.on_fatal.clone();
                 let slot_fenced = self.slot_fenced.clone();
@@ -201,6 +207,7 @@ impl AlertLoopBuilder {
                         );
                     }));
                     if outcome.is_err() {
+                        panicked.store(true, Ordering::Relaxed);
                         error!(
                             target: "torrentd_engine::alert_loop",
                             op = "alert_loop",
@@ -224,6 +231,7 @@ impl AlertLoopBuilder {
             state: state_arc,
             heartbeat,
             listen_failed,
+            panicked,
         }
     }
 }
@@ -235,6 +243,7 @@ pub struct AlertLoopHandle {
     state: Arc<StateMap>,
     heartbeat: Arc<AtomicU64>,
     listen_failed: Arc<AtomicBool>,
+    panicked: Arc<AtomicBool>,
 }
 
 impl AlertLoopHandle {
@@ -255,6 +264,16 @@ impl AlertLoopHandle {
     /// Read before [`AlertLoopHandle::join`], which consumes the handle.
     pub fn listen_failed(&self) -> bool {
         self.listen_failed.load(Ordering::Relaxed)
+    }
+
+    /// Whether the loop died to a panic.
+    ///
+    /// The thread catches its own unwind so the process can shut down
+    /// cleanly, which means `join()` returns `Ok` and says nothing. Without
+    /// this the daemon exits 0 and `Restart=on-failure` leaves it down —
+    /// the opposite of what catching the panic was for.
+    pub fn panicked(&self) -> bool {
+        self.panicked.load(Ordering::Relaxed)
     }
 
     /// Send a shutdown signal. Idempotent; returns true on the first
@@ -348,7 +367,7 @@ fn run(
         let was_empty = drained.is_empty();
         let mut fatal = false;
         for (slot, alert) in drained {
-            // Handling: a listen socket that fails in
+            // A listen socket that fails in
             // single-session mode is fatal — there is no other session to
             // carry the load, so seeding silently stops. Note it, finish
             // dispatching the batch (so the failure is logged and counted),

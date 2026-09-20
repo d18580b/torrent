@@ -498,7 +498,7 @@ pub async fn boot(
         metrics_for_loop,
         clock,
     )
-    // Handling: `listen_failed` is fatal in single-session mode
+    // `listen_failed` is fatal in single-session mode
     // (nothing else is listening, so seeding just stops silently). In
     // multi-slot mode the per-slot handler marks that slot failed and the
     // remaining slots carry on.
@@ -713,6 +713,12 @@ impl DaemonHandle {
         alert_loop.signal_shutdown(ShutdownReason::Sigterm);
         if alert_loop.listen_failed() {
             error!("exiting non-zero: listen socket failed");
+            exit_code = 70;
+        }
+        if alert_loop.panicked() {
+            // Must be non-zero or `Restart=on-failure` treats a daemon that
+            // stopped seeding as a clean stop and leaves it down.
+            error!("exiting non-zero: the alert loop panicked");
             exit_code = 70;
         }
         if let Err(e) = alert_loop.join() {

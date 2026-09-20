@@ -1203,11 +1203,15 @@ fn clearing_claims_outside_a_transaction_is_refused() {
 }
 
 #[test]
-fn a_rematch_never_publishes_an_empty_claim_table() {
+fn a_failed_rematch_leaves_the_previous_claims_in_place() {
     // `match_all` clears every claim before rebuilding. Inside one transaction
-    // that intermediate state is never observable; the assertion here is that
-    // a *failed* rematch rolls back to the previous claims rather than leaving
-    // the pool looking unprotected.
+    // that intermediate state is never observable, and a rematch that dies
+    // partway rolls back to the previous claims rather than leaving the pool
+    // looking unprotected.
+    //
+    // Driven through `match_all` itself rather than a hand-rolled
+    // transaction, so reverting `matcher.rs` to call `match_all_inner`
+    // directly fails this test.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_file(root, "T/a.bin", 128);
@@ -1219,15 +1223,22 @@ fn a_rematch_never_publishes_an_empty_claim_table() {
     torrentd_pool::match_all(&mut store).unwrap();
     assert!(store.orphan_files(root_id, "").unwrap().is_empty());
 
-    let err: Result<(), torrentd_pool::model::PoolError> = store.in_transaction(|st| {
-        st.clear_all_claims()?;
-        // Abort partway, exactly as an I/O error mid-rebuild would.
-        Err(torrentd_pool::model::PoolError::ClaimsClearedOutsideTransaction)
-    });
-    assert!(err.is_err());
+    // A rematch that panics partway is the realistic mid-rebuild failure.
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.in_transaction(|st| {
+            torrentd_pool::match_all(st)?;
+            // Past the clear and the rebuild, before the outer commit.
+            panic!("scan interrupted");
+            #[allow(unreachable_code)]
+            Ok::<(), torrentd_pool::model::PoolError>(())
+        });
+    }));
+    assert!(panicked.is_err());
+
     assert!(
         store.orphan_files(root_id, "").unwrap().is_empty(),
-        "a rolled-back rematch left the pool looking unclaimed",
+        "an interrupted rematch published an empty claim table; every file in \
+         the root now reads as deletable",
     );
 }
 

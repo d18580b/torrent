@@ -27,7 +27,7 @@ use torrentd_engine::MetricsSink;
 /// * **Label sets are fixed by first use.** A vector is created with the label
 ///   names of whichever call registers it first; a later emission of the same
 ///   name with different labels cannot be recorded. That used to be swallowed
-///   silently, so a metric simply went missing. It is now reported once.
+///   silently, so a metric simply went missing. It is now reported.
 #[derive(Debug)]
 pub struct PromSink {
     registry: Registry,
@@ -104,7 +104,11 @@ impl PromSink {
     }
 }
 
-/// Log a registration failure once per occurrence, outside any lock.
+/// Log a registration failure, outside any lock.
+///
+/// Re-attempted and re-warned on every emission — registration is cheap and a
+/// metric that starts working after a transient failure is better than one
+/// that is written off permanently.
 fn warn_registration(kind: &str, name: &str, e: &prometheus::Error) {
     tracing::warn!(
         target: "torrentd::metrics",

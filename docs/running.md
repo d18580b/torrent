@@ -282,10 +282,10 @@ On a scratch pool, not your real one.
    lost beyond the last 30-minute sweep.
 3. **A delete is refused against a stale index.** Add a torrent through the API
    with a `save_path` inside a managed root, then try a `delete_orphans` plan
-   over that path. It must refuse, naming the torrent: claims are written by
-   the matcher, so the index cannot prove anything about a torrent it has not
-   placed. This is derived from live session state, so restarting the daemon
-   does not clear it — only a rescan does.
+   over that path. It must refuse, naming the info-hash: claims are written
+   by the matcher, so the index cannot prove anything about a torrent it has
+   not placed. This is derived from live session state, so restarting the
+   daemon does not clear it — only a rescan does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
    /api/pool/plans` and `DELETE /torrents/:hash?delete_files=true` both 403.
 5. **Multi-slot: pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
@@ -303,7 +303,7 @@ On a scratch pool, not your real one.
 | Unit fails instantly, `Failed to set up mount namespacing` | A path in `ReadWritePaths=` does not exist (§4). |
 | Build panics mentioning `npm` | Node missing; install it or use `--no-default-features` (§3). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
-| `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. Check the log for a panic; the process should have exited. |
+| `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
 | Adds fail with 409 and `vpn_down` | The slot is fenced. An operator restart is required by design. |
-| Delete plan refuses, "since the last scan" | Torrents were loaded that the matcher has not placed. Run `pool scan`. |
-| Everything paused after a restart | Should not happen — resume loads clear the paused flag. Please report it. |
+| Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
+| Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole slot when its tunnel drops. Check `/slots`, then `POST /slots/<id>/resume-all`. |

@@ -398,8 +398,8 @@ async fn do_add(
         }
     }
 
-    // Reject duplicates before the session sees the torrent (the spec: 409 if the
-    // info-hash is already loaded in any slot).
+    // Reject duplicates before the session sees the torrent: 409 if the
+    // info-hash is already loaded in any slot.
     if s.registry.lookup(&infohash).is_some() {
         s.metrics.inc_counter(
             "slot_assignment_registry_errors_total",
@@ -487,25 +487,17 @@ pub async fn remove(
     // predates the plan/apply machinery and used to reach `delete_files` with
     // no plan, no confirmation and no overlap check — a single request with a
     // larger blast radius than everything the planner guards.
-    if q.delete_files && s.pool.as_ref().is_some_and(|p| !p.allow_mutations()) {
+    //
+    // Refused when `[pool]` is absent too. Without a pool there is no index to
+    // reason about what the payload is, which makes an unreviewable delete
+    // less defensible rather than more; and `is_some_and` here would have left
+    // the route wide open on exactly the deployments with the least context.
+    if q.delete_files && s.pool.as_ref().is_none_or(|p| !p.allow_mutations()) {
         return Err((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({
-                "error": "pool mutations are disabled; set `allow_mutations = true` in \
-                          the [pool] section to delete payload"
-            })),
-        ));
-    }
-    // Erasing payload is a pool mutation wherever it is spelled. This route
-    // predates the plan/apply machinery and used to reach `delete_files` with
-    // no plan, no confirmation and no overlap check — a single request with a
-    // larger blast radius than everything the planner guards.
-    if q.delete_files && s.pool.as_ref().is_some_and(|p| !p.allow_mutations()) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "pool mutations are disabled; set `allow_mutations = true` in \
-                          the [pool] section to delete payload"
+                "error": "deleting payload requires a [pool] section with \
+                          `allow_mutations = true`"
             })),
         ));
     }
