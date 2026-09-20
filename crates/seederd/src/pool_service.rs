@@ -47,6 +47,8 @@ pub struct PoolService {
     roots: Vec<(i64, PathBuf)>,
     library_dir: PathBuf,
     verify: VerifyQueue,
+    /// `[pool] allow_mutations`. Every path that can destroy data checks this.
+    allow_mutations: bool,
 }
 
 impl std::fmt::Debug for PoolService {
@@ -58,6 +60,15 @@ impl std::fmt::Debug for PoolService {
 }
 
 impl PoolService {
+    /// Whether `[pool] allow_mutations` is set.
+    ///
+    /// Checked at every entry point that can move or remove payload, not once
+    /// at startup, so there is no path that reaches the executor without having
+    /// asked.
+    pub fn allow_mutations(&self) -> bool {
+        self.allow_mutations
+    }
+
     pub fn open(cfg: &Config) -> anyhow::Result<Option<Arc<Self>>> {
         let Some(pool_cfg) = cfg.pool.as_ref() else {
             return Ok(None);
@@ -85,6 +96,7 @@ impl PoolService {
             roots,
             library_dir: pool_cfg.library_dir.clone(),
             verify: VerifyQueue::new(pool_cfg.max_concurrent_verify),
+            allow_mutations: pool_cfg.allow_mutations,
         })))
     }
 

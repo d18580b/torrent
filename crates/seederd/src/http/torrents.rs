@@ -413,6 +413,32 @@ pub async fn remove(
     Query(q): Query<DeleteQuery>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let ih = InfoHash::from_hex(&infohash).ok_or_else(bad_infohash)?;
+    // Erasing payload is a pool mutation wherever it is spelled. This route
+    // predates the plan/apply machinery and used to reach `delete_files` with
+    // no plan, no confirmation and no overlap check — a single request with a
+    // larger blast radius than everything the planner guards.
+    if q.delete_files && s.pool.as_ref().is_some_and(|p| !p.allow_mutations()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "pool mutations are disabled; set `allow_mutations = true` in \
+                          the [pool] section to delete payload"
+            })),
+        ));
+    }
+    // Erasing payload is a pool mutation wherever it is spelled. This route
+    // predates the plan/apply machinery and used to reach `delete_files` with
+    // no plan, no confirmation and no overlap check — a single request with a
+    // larger blast radius than everything the planner guards.
+    if q.delete_files && s.pool.as_ref().is_some_and(|p| !p.allow_mutations()) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "pool mutations are disabled; set `allow_mutations = true` in \
+                          the [pool] section to delete payload"
+            })),
+        ));
+    }
     let slot = s.registry.lookup(&ih).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
