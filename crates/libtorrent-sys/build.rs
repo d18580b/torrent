@@ -51,8 +51,9 @@ fn main() {
     sanity_check_submodules(&boost_src, &lt_src);
     ensure_compilers();
 
-    let boost_install = build_boost(&boost_src);
-    let lt_install = build_libtorrent(&lt_src, &boost_install);
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+    let boost_install = build_boost(&boost_src, &out_dir.join("boost"));
+    let lt_install = build_libtorrent(&lt_src, &out_dir.join("libtorrent"), &boost_install);
     compile_shim(&manifest_dir, &lt_install, &boost_install);
     run_bindgen(&manifest_dir);
     emit_link_directives(&lt_install, &boost_install);
@@ -140,9 +141,18 @@ fn sanity_check_submodules(boost: &Path, lt: &Path) {
     }
 }
 
-fn build_boost(src: &Path) -> PathBuf {
+/// Install Boost's headers into `dst`.
+///
+/// `dst` must differ from libtorrent's install prefix. cmake-rs puts its build
+/// tree at `<out_dir>/build` and wipes it whenever the `CMAKE_HOME_DIRECTORY`
+/// recorded in `CMakeCache.txt` names a different source dir (see
+/// `cmake::Config::maybe_clear`). Both projects defaulting to `OUT_DIR` meant
+/// each configure deleted the other's build tree, so neither was ever
+/// incremental.
+fn build_boost(src: &Path, dst: &Path) -> PathBuf {
     eprintln!("libtorrent-sys: configuring Boost from {}", src.display());
     let dst = cmake::Config::new(src)
+        .out_dir(dst)
         .profile("Release")
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("BUILD_TESTING", "OFF")
@@ -163,13 +173,16 @@ fn build_boost(src: &Path) -> PathBuf {
     dst
 }
 
-fn build_libtorrent(src: &Path, boost_install: &Path) -> PathBuf {
+/// Build and install libtorrent statically into `dst`. See [`build_boost`] for
+/// why `dst` must not be shared with the Boost install prefix.
+fn build_libtorrent(src: &Path, dst: &Path, boost_install: &Path) -> PathBuf {
     eprintln!(
         "libtorrent-sys: configuring libtorrent from {}",
         src.display()
     );
     let mut cfg = cmake::Config::new(src);
-    cfg.profile("Release")
+    cfg.out_dir(dst)
+        .profile("Release")
         .define("BUILD_SHARED_LIBS", "OFF")
         .define("CMAKE_POSITION_INDEPENDENT_CODE", "ON")
         .define("CMAKE_CXX_STANDARD", "17")
@@ -202,7 +215,10 @@ fn build_libtorrent(src: &Path, boost_install: &Path) -> PathBuf {
 }
 
 fn find_boost_cmake_dir(install: &Path) -> Option<PathBuf> {
-    let cmake_root = install.join("lib").join("cmake");
+    // `pick_libdir`, not a hard-coded `lib`: on Fedora and other multilib
+    // distros cmake installs into `lib64`, so hard-coding `lib` made this
+    // return None on every such host.
+    let cmake_root = pick_libdir(install).join("cmake");
     if !cmake_root.exists() {
         return None;
     }
