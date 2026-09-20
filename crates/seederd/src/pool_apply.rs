@@ -279,27 +279,67 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Delete a file, re-checking at the last moment that nothing claims it.
+/// Delete a file, re-proving at the last moment that nothing is using it.
+///
+/// "Unclaimed" is a statement about the index, and the index is a snapshot.
+/// Three things have to hold, because an irreversible operation should not
+/// rest on any one of them:
+///
+/// 1. No torrent claims the file *now*, not when the plan was drafted.
+/// 2. The index is a complete account — no torrent has been loaded since the
+///    last scan that the matcher has never placed. Claims are written only by
+///    the matcher, so a torrent added through `POST /torrents` with a
+///    `save_path` inside a managed root has none, and its actively-seeding
+///    payload would enumerate as an orphan.
+/// 3. The file on disk is still the file that was indexed. A `(size, mtime,
+///    inode)` match is the same evidence `drift` trusts; anything else means
+///    the bytes changed after the scan decided they were expendable.
 fn delete_file(pool: &PoolService, path: &Path) -> Result<(), String> {
-    // The plan may have been drafted minutes or days ago and a torrent could
-    // have been adopted over these bytes since. Deleting is irreversible, so
-    // the claim check is repeated here rather than trusted from planning time.
-    let still_orphan = pool.with_store(|s| {
-        for (root_id, root) in pool.roots() {
-            if let Ok(rel) = path.strip_prefix(root) {
-                let rel = rel.to_string_lossy().replace('\\', "/");
-                return s.is_orphan(*root_id, &rel).unwrap_or(false);
-            }
-        }
-        // Outside every managed root: not ours to delete.
-        false
-    });
-    if !still_orphan {
+    let stale = pool.unindexed_adds();
+    if stale > 0 {
         return Err(format!(
-            "{} is now claimed by a torrent, or is outside every managed root",
+            "{stale} torrent(s) have been loaded since the last scan, so the index cannot \
+             prove what is unclaimed; run `pool scan` (or POST /api/pool/scan) first",
+        ));
+    }
+
+    let Some((root_id, rel)) = pool.roots().iter().find_map(|(id, root)| {
+        path.strip_prefix(root)
+            .ok()
+            .map(|r| (*id, r.to_string_lossy().replace('\\', "/")))
+    }) else {
+        return Err(format!("{} is outside every managed root", path.display(),));
+    };
+
+    let indexed = pool
+        .with_store(|s| {
+            let orphan = s.is_orphan(root_id, &rel)?;
+            let row = s.file(root_id, &rel)?;
+            Ok::<_, seederd_pool::model::PoolError>((orphan, row))
+        })
+        .map_err(|e| e.to_string())?;
+    let (still_orphan, Some(row)) = indexed else {
+        return Err(format!(
+            "{} is not in the index; deleting it was never sanctioned",
+            path.display(),
+        ));
+    };
+    if !still_orphan {
+        return Err(format!("{} is now claimed by a torrent", path.display(),));
+    }
+
+    let md =
+        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+    if !md.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if seederd_pool::file_stamp(&md) != (row.size, row.mtime_ns, row.ino) {
+        return Err(format!(
+            "{} changed since the scan that called it unclaimed; rescan before deleting",
             path.display(),
         ));
     }
+
     std::fs::remove_file(path).map_err(|e| format!("unlink {}: {e}", path.display()))?;
     Ok(())
 }
@@ -450,4 +490,89 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::config::Config;
+
+    /// A `PoolService` over a real index in `dir`, with mutations allowed.
+    fn service(dir: &Path, allow_mutations: bool) -> Arc<PoolService> {
+        let cfg = Config::minimal_for_tests(dir, allow_mutations);
+        PoolService::open(&cfg).unwrap().unwrap()
+    }
+
+    fn write(dir: &Path, rel: &str, len: usize) -> PathBuf {
+        let p = dir.join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, vec![7u8; len]).unwrap();
+        p
+    }
+
+    #[test]
+    fn deleting_refuses_while_the_index_is_missing_a_loaded_torrent() {
+        // The exact shape of the hazard: a torrent added through the API has
+        // no claim rows until the matcher runs, so its payload reads as an
+        // orphan. Deleting on that verdict erases data a session is serving.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = write(&root, "movies/feature.bin", 64);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        // Unclaimed by anything the index knows: deletion is allowed.
+        assert!(delete_file(&pool, &victim).is_ok());
+        assert!(!victim.exists());
+
+        let victim = write(&root, "movies/feature.bin", 64);
+        pool.scan().unwrap();
+        pool.note_torrent_loaded("ff00000000000000000000000000000000000000");
+        let e = delete_file(&pool, &victim).unwrap_err();
+        assert!(e.contains("since the last scan"), "got {e}");
+        assert!(victim.exists(), "payload was deleted against a stale index");
+    }
+
+    #[test]
+    fn deleting_refuses_a_file_that_changed_since_the_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let f = write(&root, "misc/notes.bin", 32);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+
+        // Rewrite it: the scan's verdict was about bytes that no longer exist.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&f, vec![9u8; 48]).unwrap();
+
+        let e = delete_file(&pool, &f).unwrap_err();
+        assert!(e.contains("changed since the scan"), "got {e}");
+        assert!(f.exists());
+    }
+
+    #[test]
+    fn deleting_refuses_a_path_the_index_has_never_seen() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+
+        let sneaked = write(&root, "after/the/scan.bin", 8);
+        let e = delete_file(&pool, &sneaked).unwrap_err();
+        assert!(e.contains("never sanctioned"), "got {e}");
+        assert!(sneaked.exists());
+
+        let outside = dir.path().join("elsewhere.bin");
+        std::fs::write(&outside, b"x").unwrap();
+        let e = delete_file(&pool, &outside).unwrap_err();
+        assert!(e.contains("outside every managed root"), "got {e}");
+        assert!(outside.exists());
+    }
 }

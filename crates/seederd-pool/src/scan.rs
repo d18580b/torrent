@@ -215,6 +215,17 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// The `(size, mtime, inode)` triple the index records for a file.
+///
+/// Public because anything comparing live metadata against the index — drift
+/// detection, and the last-moment check before an irreversible delete — has to
+/// compute it the same way the scanner did. Two copies of this encoding that
+/// disagree would either miss a change or reject every unchanged file.
+pub fn file_stamp(m: &std::fs::Metadata) -> (u64, i64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (m.len(), mtime_ns(m), m.ino())
+}
+
 fn mtime_ns(m: &std::fs::Metadata) -> i64 {
     use std::os::unix::fs::MetadataExt;
     m.mtime()

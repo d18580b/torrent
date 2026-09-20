@@ -350,6 +350,39 @@ impl ConfigDiff {
     }
 }
 
+impl Config {
+    /// A minimal single-session config with `[pool]` rooted at `dir/pool`.
+    ///
+    /// Test-only, and deliberately built from the real types rather than from
+    /// TOML, so a required field added to `Config` breaks this at compile time
+    /// instead of leaving the tests exercising a shape the daemon never sees.
+    #[cfg(test)]
+    pub fn minimal_for_tests(dir: &Path, allow_mutations: bool) -> Self {
+        let mut cfg: Config = toml::from_str(&format!(
+            r#"
+listen_interfaces = "0.0.0.0:6881"
+default_save_path = "{d}/data"
+resume_dir = "{d}/resume"
+torrent_dir = "{d}/torrents"
+http_listen = "127.0.0.1:8080"
+"#,
+            d = dir.display(),
+        ))
+        .expect("minimal config parses");
+        cfg.pool = Some(PoolConfig {
+            roots: vec![dir.join("pool")],
+            library_dir: dir.join("library"),
+            db_path: Some(dir.join("pool.db")),
+            max_concurrent_verify: 1,
+            import_legacy_registry: false,
+            allow_mutations,
+        });
+        std::fs::create_dir_all(dir.join("pool")).unwrap();
+        std::fs::create_dir_all(dir.join("library")).unwrap();
+        cfg
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::tempdir;
