@@ -80,6 +80,26 @@ pub fn apply(
         .with_store(|s| s.plan_steps(plan_id))
         .map_err(|e| e.to_string())?;
 
+    // Deleting rests on "the index is a complete account of what is
+    // protected". Establish that once, before any step runs, rather than
+    // trusting a counter: derived from the live session state, it is correct
+    // across a restart and cannot drift.
+    if steps.iter().any(|s| s.op == ops::DELETE_FILE) {
+        let loaded: Vec<String> = state.infohashes().iter().map(|ih| ih.to_hex()).collect();
+        let unindexed = pool
+            .with_store(|st| st.loaded_without_claims(&loaded))
+            .map_err(|e| e.to_string())?;
+        if !unindexed.is_empty() {
+            return Err(format!(
+                "{} loaded torrent(s) have no claims in the index, so it cannot prove what \
+                 is unclaimed — the first is {}. Run `pool scan` (or POST /api/pool/scan) \
+                 and rebuild this plan.",
+                unindexed.len(),
+                unindexed[0],
+            ));
+        }
+    }
+
     if let Some(stuck) = steps.iter().find(|s| s.status == step_status::IN_PROGRESS) {
         // Written before the attempt and cleared by the outcome, so finding
         // one here means a previous run died mid-step. Whether it happened is
@@ -369,23 +389,13 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
 /// rest on any one of them:
 ///
 /// 1. No torrent claims the file *now*, not when the plan was drafted.
-/// 2. The index is a complete account — no torrent has been loaded since the
-///    last scan that the matcher has never placed. Claims are written only by
-///    the matcher, so a torrent added through `POST /torrents` with a
-///    `save_path` inside a managed root has none, and its actively-seeding
-///    payload would enumerate as an orphan.
+/// 2. The index is a complete account of what is protected — checked once per
+///    apply in [`apply`], since it is a property of the whole plan rather than
+///    of one file.
 /// 3. The file on disk is still the file that was indexed. A `(size, mtime,
 ///    inode)` match is the same evidence `drift` trusts; anything else means
 ///    the bytes changed after the scan decided they were expendable.
 fn delete_file(pool: &PoolService, path: &Path) -> Result<(), String> {
-    let stale = pool.unindexed_adds();
-    if stale > 0 {
-        return Err(format!(
-            "{stale} torrent(s) have been loaded since the last scan, so the index cannot \
-             prove what is unclaimed; run `pool scan` (or POST /api/pool/scan) first",
-        ));
-    }
-
     let Some((root_id, rel)) = pool.roots().iter().find_map(|(id, root)| {
         path.strip_prefix(root)
             .ok()
@@ -601,27 +611,32 @@ mod tests {
     }
 
     #[test]
-    fn deleting_refuses_while_the_index_is_missing_a_loaded_torrent() {
-        // The exact shape of the hazard: a torrent added through the API has
-        // no claim rows until the matcher runs, so its payload reads as an
-        // orphan. Deleting on that verdict erases data a session is serving.
+    fn an_unindexed_loaded_torrent_makes_the_index_incomplete() {
+        // The precondition `apply` checks before any delete step: a torrent the
+        // daemon is serving that the matcher has never placed contributes no
+        // claim rows, so its payload reads as an orphan. Derived from live
+        // state rather than counted as torrents are added, so it survives a
+        // restart — a counter would reset to zero while the hazard persisted.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("pool");
         std::fs::create_dir_all(&root).unwrap();
-        let victim = write(&root, "movies/feature.bin", 64);
+        write(&root, "movies/feature.bin", 64);
 
         let pool = service(dir.path(), true);
         pool.scan().unwrap();
-        // Unclaimed by anything the index knows: deletion is allowed.
-        assert!(delete_file(&pool, &victim).is_ok());
-        assert!(!victim.exists());
 
-        let victim = write(&root, "movies/feature.bin", 64);
-        pool.scan().unwrap();
-        pool.note_torrent_loaded("ff00000000000000000000000000000000000000");
-        let e = delete_file(&pool, &victim).unwrap_err();
-        assert!(e.contains("since the last scan"), "got {e}");
-        assert!(victim.exists(), "payload was deleted against a stale index");
+        // Nothing loaded: the index accounts for everything it knows.
+        assert!(pool
+            .with_store(|st| st.loaded_without_claims(&[]))
+            .unwrap()
+            .is_empty());
+
+        // A torrent loaded through the API has no claims until a rescan.
+        let ghost = "ff00000000000000000000000000000000000000".to_string();
+        let unindexed = pool
+            .with_store(|st| st.loaded_without_claims(std::slice::from_ref(&ghost)))
+            .unwrap();
+        assert_eq!(unindexed, vec![ghost]);
     }
 
     #[test]

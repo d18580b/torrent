@@ -282,8 +282,10 @@ On a scratch pool, not your real one.
    lost beyond the last 30-minute sweep.
 3. **A delete is refused against a stale index.** Add a torrent through the API
    with a `save_path` inside a managed root, then try a `delete_orphans` plan
-   over that path. It must refuse: claims are written by the matcher, so the
-   index cannot prove anything about a torrent it has not placed.
+   over that path. It must refuse, naming the torrent: claims are written by
+   the matcher, so the index cannot prove anything about a torrent it has not
+   placed. This is derived from live session state, so restarting the daemon
+   does not clear it — only a rescan does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
    /api/pool/plans` and `DELETE /torrents/:hash?delete_files=true` both 403.
 5. **Multi-slot: pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
