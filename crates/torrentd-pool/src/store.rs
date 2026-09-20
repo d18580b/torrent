@@ -236,8 +236,22 @@ impl PoolStore {
             })
         })?;
         self.tx_depth = depth + 1;
-        let out = f(self);
+        // Catch an unwind from `f`. Without this a panic anywhere inside a
+        // transaction leaves the connection mid-transaction with `tx_depth`
+        // one too high: the rollback never runs, every later `in_transaction`
+        // takes the savepoint branch believing it is nested, and the open
+        // write transaction keeps SQLite's write lock for the life of the
+        // process. Axum installs no panic layer, so an HTTP handler is enough
+        // to get there. Roll back, restore the depth, then re-raise.
+        let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.tx_depth = depth;
+        let out = match out {
+            Ok(v) => v,
+            Err(panic) => {
+                let _ = self.conn.execute_batch(&rollback);
+                std::panic::resume_unwind(panic);
+            }
+        };
         match out {
             Ok(v) => {
                 self.conn

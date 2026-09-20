@@ -1279,3 +1279,38 @@ fn a_destination_behind_a_symlink_is_refused() {
     )
     .is_ok());
 }
+
+#[test]
+fn a_panic_inside_a_transaction_does_not_wedge_the_connection() {
+    // Axum installs no panic layer, so a panicking HTTP handler can unwind out
+    // of a transaction. Without a rollback on that path the connection stays
+    // mid-transaction holding SQLite's write lock for the life of the process,
+    // and the depth counter makes every later transaction believe it is
+    // nested. Both are silent until the next scan hangs.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "x1", "T", None, &[("T/a.bin", 128)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: Result<(), torrentd_pool::model::PoolError> = store.in_transaction(|st| {
+            st.clear_all_claims()?;
+            panic!("handler exploded");
+        });
+    }));
+    assert!(
+        panicked.is_err(),
+        "the panic should propagate to the caller"
+    );
+
+    // Rolled back: the claim survived, so nothing reads as an orphan.
+    assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+    // And the store still works — depth was restored and the lock released.
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+}
