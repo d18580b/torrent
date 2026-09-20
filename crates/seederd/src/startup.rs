@@ -96,15 +96,28 @@ pub async fn boot(
         Mode::MultiSlot
     };
 
-    // Resume store — single root for both modes; FsResumeStore partitions
-    // by slot id internally.
-    let resume_store: Arc<dyn ResumeStore> = Arc::new(FsResumeStore::new(cfg.resume_dir.clone()));
+    // Resume store — rooted at the top-level `resume_dir` and partitioned by
+    // slot id, except where a `[[slot]]` names its own directory. Those keys
+    // were validated for uniqueness and then ignored, so files landed under
+    // the derived path and only matched the configured one by coincidence.
+    let resume_store: Arc<dyn ResumeStore> = Arc::new(
+        cfg.slot
+            .iter()
+            .fold(FsResumeStore::new(cfg.resume_dir.clone()), |st, slot| {
+                st.with_slot_dir(slot.id.clone(), slot.resume_dir.clone())
+            }),
+    );
 
     // Torrent store — same per-slot partitioning as the resume store; holds
     // the raw .torrent files for the startup inventory scan, magnet-metadata
     // persistence, and removal cleanup (PRD §6 / §Session Management).
-    let torrent_store: Arc<dyn TorrentStore> =
-        Arc::new(FsTorrentStore::new(cfg.torrent_dir.clone()));
+    let torrent_store: Arc<dyn TorrentStore> = Arc::new(
+        cfg.slot
+            .iter()
+            .fold(FsTorrentStore::new(cfg.torrent_dir.clone()), |st, slot| {
+                st.with_slot_dir(slot.id.clone(), slot.torrent_dir.clone())
+            }),
+    );
 
     // Assignment registry.
     let registry = Arc::new(
