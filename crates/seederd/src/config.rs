@@ -182,15 +182,50 @@ impl Config {
             if pool.roots.is_empty() {
                 anyhow::bail!("[pool] is configured but `roots` is empty");
             }
-            // Nested roots would index the same bytes twice and report every
-            // torrent over them as an overlap.
-            for (i, a) in pool.roots.iter().enumerate() {
-                for b in pool.roots.iter().skip(i + 1) {
+            // Nested roots index the same bytes twice under two root ids.
+            // Claims land under exactly one of them, so `orphan_files` reports
+            // the very same protected payload as unclaimed under the other —
+            // and that is what a delete plan acts on. Compare resolved paths,
+            // so a symlinked or non-normalised alias cannot slip past.
+            let resolved: Vec<PathBuf> = pool
+                .roots
+                .iter()
+                .map(|r| r.canonicalize().unwrap_or_else(|_| r.clone()))
+                .collect();
+            for (i, a) in resolved.iter().enumerate() {
+                for b in resolved.iter().skip(i + 1) {
                     if a.starts_with(b) || b.starts_with(a) {
                         anyhow::bail!(
                             "[pool] roots must not nest: {} and {}",
                             a.display(),
                             b.display(),
+                        );
+                    }
+                }
+            }
+
+            // The daemon's own state must not sit inside a managed root.
+            // Nothing in the library claims those files, so they are orphans by
+            // definition — and `delete_orphans` over the root would erase the
+            // torrent library, the resume store, or the index itself.
+            let state: [(&str, &Path); 6] = [
+                ("resume_dir", &self.resume_dir),
+                ("torrent_dir", &self.torrent_dir),
+                ("[pool] library_dir", &pool.library_dir),
+                ("[pool] db_path", &self.pool_db_path()),
+                ("registry_path", &self.registry_path()),
+                ("session_state_path", &self.session_state_path()),
+            ];
+            for (name, path) in state {
+                let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+                for root in &resolved {
+                    if path.starts_with(root) {
+                        anyhow::bail!(
+                            "{name} ({}) is inside the managed root {} — no torrent claims \
+                             those files, so they would be reported as orphans and could be \
+                             deleted; move it outside every root",
+                            path.display(),
+                            root.display(),
                         );
                     }
                 }
@@ -440,6 +475,63 @@ connections_limit = 10000
         let on = body + "allow_mutations = true\n";
         let p = write_cfg(dir.path(), &on);
         assert!(Config::load(&p).unwrap().pool.unwrap().allow_mutations);
+    }
+
+    #[test]
+    fn daemon_state_inside_a_managed_root_is_rejected() {
+        // Nothing in the library claims the torrent library or the resume
+        // store, so under a managed root they are orphans by definition and
+        // `delete_orphans` over that root would erase them.
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let body = format!(
+            r#"
+listen_interfaces = "0.0.0.0:6881"
+default_save_path = "{r}"
+resume_dir = "{r}/resume"
+torrent_dir = "{d}/torrents"
+http_listen = "127.0.0.1:8080"
+
+[pool]
+roots = ["{r}"]
+library_dir = "{d}/library"
+"#,
+            r = root.display(),
+            d = dir.path().display(),
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("resume_dir"), "got: {msg}");
+        assert!(msg.contains("inside the managed root"), "got: {msg}");
+    }
+
+    #[test]
+    fn roots_that_nest_through_a_symlink_are_rejected() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("pool");
+        std::fs::create_dir_all(real.join("inner")).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let body = format!(
+            r#"
+listen_interfaces = "0.0.0.0:6881"
+default_save_path = "{d}/data"
+resume_dir = "{d}/resume"
+torrent_dir = "{d}/torrents"
+http_listen = "127.0.0.1:8080"
+
+[pool]
+roots = ["{r}", "{a}/inner"]
+library_dir = "{d}/library"
+"#,
+            d = dir.path().display(),
+            r = real.display(),
+            a = alias.display(),
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("must not nest"), "got: {msg}");
     }
 
     #[test]
