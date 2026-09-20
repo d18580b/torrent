@@ -6,19 +6,32 @@
 //      happens FIRST and unconditionally: wrapper.h reaches only the two C
 //      shim headers, which include nothing but <stddef.h>/<stdint.h>, so
 //      bindgen reads no libtorrent or Boost header and costs ~1s.
-//   2. Sanity-check that vendor/libtorrent and vendor/boost submodules are
-//      initialized; print a clear error otherwise.
-//   3. CMake-install Boost into OUT_DIR/boost (headers only — libtorrent
-//      v2.0.12 + Boost ≥ 1.69 needs only Boost::headers).
-//   4. CMake-install libtorrent into OUT_DIR/libtorrent, statically.
-//   5. Compile shim/libtorrent_shim.cpp via cc::Build, with the same
-//      C++ standard and ABI flags libtorrent was built with.
-//   6. Emit cargo link directives in the order Linux's static linker
-//      requires: shim → libtorrent → OpenSSL → pthread → stdc++.
+//   2. Provision `<cache>/lt-<key>`: CMake-install Boost headers into
+//      `boost/` (libtorrent v2.0.12 + Boost >= 1.69 needs only
+//      Boost::headers) and static libtorrent into `libtorrent/`.
+//   3. Provision `<cache>/shim-<key>`: compile shim/libtorrent_shim.cpp via
+//      cc::Build with the same C++ standard and ABI flags libtorrent used.
+//   4. Emit cargo link directives in the order Linux's static linker
+//      requires: shim -> libtorrent -> OpenSSL -> pthread -> stdc++.
 //
-// When the `bundled` feature is OFF, steps 2-6 are skipped but step 1 still
+// When the `bundled` feature is OFF, steps 2-4 are skipped but step 1 still
 // runs, so the generated bindings stay complete — used for system-package
 // consumers and for editor LSP runs that only want a check-pass.
+//
+// Steps 2 and 3 write to a content-addressed prefix OUTSIDE OUT_DIR — by
+// default `$XDG_CACHE_HOME/torrentd/native` — rather than into the build
+// directory cargo hands us. Keeping it in OUT_DIR meant every cargo profile
+// and feature permutation rebuilt libtorrent from scratch (measured: 16 build
+// directories and 7.5 GB in one working copy) and that CI could not reuse a
+// build across jobs, because a fresh checkout's mtimes defeat cargo's
+// rerun-if-changed and ninja's own staleness check alike. Addressing by
+// content instead of by location fixes both at once.
+//
+// Environment:
+//   LIBTORRENT_SYS_CACHE_DIR      relocate the prefix root
+//   LIBTORRENT_SYS_PREFIX         use an existing libtorrent+Boost install
+//                                 and skip step 2 entirely
+//   LIBTORRENT_SYS_FORCE_REBUILD  ignore both stamps and rebuild
 
 use std::env;
 use std::path::Path;
@@ -33,6 +46,22 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/libtorrent_shim.h");
     println!("cargo:rerun-if-changed=shim/alert_union.h");
     println!("cargo:rerun-if-changed=shim/libtorrent_shim.cpp");
+    // Two small files, not `vendor/**`: cargo walks a rerun-if-changed
+    // directory recursively, and walking 634 MB of Boost on every build is
+    // exactly what this cache exists to avoid. A libtorrent or Boost version
+    // bump nearly always touches one of these; LIBTORRENT_SYS_FORCE_REBUILD
+    // covers the case where it does not.
+    println!("cargo:rerun-if-changed=../../vendor/libtorrent/CMakeLists.txt");
+    println!("cargo:rerun-if-changed=../../vendor/boost/CMakeLists.txt");
+    for var in [
+        "LIBTORRENT_SYS_CACHE_DIR",
+        "LIBTORRENT_SYS_PREFIX",
+        "LIBTORRENT_SYS_FORCE_REBUILD",
+        "CC",
+        "CXX",
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+    }
 
     let manifest_dir =
         PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
@@ -56,16 +85,68 @@ fn main() {
         return;
     }
 
-    let boost_src = manifest_dir.join(BOOST_DIR);
-    let lt_src = manifest_dir.join(LIBTORRENT_DIR);
-
-    sanity_check_submodules(&boost_src, &lt_src);
     ensure_compilers();
 
-    let boost_install = build_boost(&boost_src, &out_dir.join("boost"));
-    let lt_install = build_libtorrent(&lt_src, &out_dir.join("libtorrent"), &boost_install);
-    compile_shim(&manifest_dir, &lt_install, &boost_install);
-    emit_link_directives(&lt_install, &boost_install);
+    let workspace = manifest_dir.join("..").join("..");
+    let cxx_id = compiler_id();
+    let root = cache_root();
+
+    // Tier A: Boost headers + static libtorrent. The expensive one, and the
+    // one a vendor bump invalidates.
+    let (lt_install, boost_install, tier_a_id) = match env::var_os("LIBTORRENT_SYS_PREFIX") {
+        Some(p) => {
+            let p = PathBuf::from(p);
+            eprintln!(
+                "libtorrent-sys: using externally provided prefix {}",
+                p.display()
+            );
+            let id = format!("external:{}", p.display());
+            (p.clone(), p, id)
+        }
+        None => {
+            let key = key_libtorrent(&manifest_dir, &workspace, &cxx_id);
+            let detail = format!(
+                "libtorrent={}\nboost={}\ncxx={}\nopenssl={}\ntarget={}",
+                vendor_id(&workspace, VENDOR_LIBTORRENT, LIBTORRENT_MARKERS),
+                vendor_id(&workspace, VENDOR_BOOST, BOOST_MARKERS),
+                cxx_id,
+                openssl_version(),
+                env::var("TARGET").unwrap_or_default(),
+            );
+            let prefix = ensure_prefix(&root, "lt", &key, &detail, |dst| {
+                let boost_src = manifest_dir.join(BOOST_DIR);
+                let lt_src = manifest_dir.join(LIBTORRENT_DIR);
+                // Checked here rather than in main: on a cache hit the vendor
+                // submodules are legitimately absent, and this exits(1).
+                sanity_check_submodules(&boost_src, &lt_src);
+                let boost_install = build_boost(&boost_src, &dst.join("boost"));
+                build_libtorrent(&lt_src, &dst.join("libtorrent"), &boost_install);
+                // The cmake build trees are ~76 MB of the 193 MB and are never
+                // read again once the install step has run.
+                let _ = std::fs::remove_dir_all(dst.join("boost").join("build"));
+                let _ = std::fs::remove_dir_all(dst.join("libtorrent").join("build"));
+            });
+            let id = prefix
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            (prefix.join("libtorrent"), prefix.join("boost"), id)
+        }
+    };
+
+    // Tier B: the shim, ~4 MB. Split out so editing libtorrent_shim.cpp costs
+    // seconds instead of a full libtorrent rebuild. Keyed on tier A's identity,
+    // so a vendor bump invalidates this too.
+    let shim_key = key_shim(&manifest_dir, &cxx_id, &tier_a_id);
+    let shim_detail = format!("libtorrent-prefix={tier_a_id}\ncxx={cxx_id}");
+    let shim_prefix = ensure_prefix(&root, "shim", &shim_key, &shim_detail, |dst| {
+        compile_shim(&manifest_dir, &lt_install, &boost_install, dst);
+        // cc leaves object files and its flag-probe binaries behind.
+        prune_to(dst, &["liblibtorrent_shim.a"]);
+    });
+
+    emit_link_directives(&lt_install, &boost_install, &shim_prefix);
 }
 
 /// Some hosts (e.g. distroless / Homebrew on Linux) don't ship a `c++`
@@ -240,10 +321,20 @@ fn find_boost_cmake_dir(install: &Path) -> Option<PathBuf> {
     None
 }
 
-fn compile_shim(manifest_dir: &Path, lt_install: &Path, boost_install: &Path) {
+fn compile_shim(manifest_dir: &Path, lt_install: &Path, boost_install: &Path, dst: &Path) {
     eprintln!("libtorrent-sys: compiling C shim");
     let mut build = cc::Build::new();
     build
+        .out_dir(dst)
+        // cc would otherwise emit a link-search for its own out_dir, which is
+        // the staging directory about to be renamed away. Every link directive
+        // comes from emit_link_directives instead.
+        .cargo_metadata(false)
+        // Pinned rather than inherited from cargo's OPT_LEVEL/DEBUG, so one
+        // cached shim serves the dev, test, release and bench profiles alike.
+        // libtorrent itself is always built Release.
+        .opt_level(2)
+        .debug(true)
         .cpp(true)
         .flag("-std=c++17")
         .flag_if_supported("-Wno-deprecated-declarations")
@@ -290,9 +381,13 @@ fn run_bindgen(manifest_dir: &Path, out_dir: &Path) {
         .expect("bindgen: write bindings.rs");
 }
 
-fn emit_link_directives(lt_install: &Path, boost_install: &Path) {
-    // shim is already linked by cc::Build via its own `compile()`. We just
-    // need to add libtorrent + OpenSSL + pthread + stdc++ in the right order.
+fn emit_link_directives(lt_install: &Path, boost_install: &Path, shim_prefix: &Path) {
+    // Cargo preserves emission order and Linux's static linker resolves left
+    // to right, so the order here is the link order: shim first (it references
+    // libtorrent), then libtorrent, then its own dependencies.
+    println!("cargo:rustc-link-search=native={}", shim_prefix.display());
+    println!("cargo:rustc-link-lib=static=libtorrent_shim");
+
     let lt_lib = pick_libdir(lt_install);
     println!("cargo:rustc-link-search=native={}", lt_lib.display());
     println!("cargo:rustc-link-lib=static=torrent-rasterbar");
@@ -328,16 +423,11 @@ fn emit_link_directives(lt_install: &Path, boost_install: &Path) {
 /// trick to locate the runtime that pairs with the active C++ compiler.
 fn locate_libstdcxx_dir() -> Option<PathBuf> {
     let cxx = env::var("CXX").unwrap_or_else(|_| "c++".to_string());
-    let out = std::process::Command::new(&cxx)
-        .arg("-print-file-name=libstdc++.so")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let path = String::from_utf8(out.stdout).ok()?;
-    let trimmed = path.trim();
-    if trimmed.is_empty() || trimmed == "libstdc++.so" {
+    // Via `probe`, which tolerates a launcher prefix such as
+    // CXX="sccache g++". Running the whole string as one program name made
+    // this return None on any host that uses one.
+    let trimmed = probe(&cxx, &["-print-file-name=libstdc++.so"])?;
+    if trimmed == "libstdc++.so" {
         return None;
     }
     let p = PathBuf::from(trimmed);
@@ -355,5 +445,335 @@ fn pick_libdir(install: &Path) -> PathBuf {
         lib64
     } else {
         install.join("lib")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared native prefix
+//
+// The native build lands in a content-addressed directory outside OUT_DIR, so
+// one build serves every cargo profile, feature set, git worktree and (via one
+// actions/cache entry) every CI job. `.stamp` is the sole source of truth for
+// whether a prefix is usable: it is written last, so its presence means the
+// tree beside it is complete, and its first line is the key it was built for.
+// ---------------------------------------------------------------------------
+
+const STAMP: &str = ".stamp";
+const VENDOR_LIBTORRENT: &str = "vendor/libtorrent";
+const VENDOR_BOOST: &str = "vendor/boost";
+const LIBTORRENT_MARKERS: &[&str] = &["CMakeLists.txt", "include/libtorrent/version.hpp"];
+const BOOST_MARKERS: &[&str] = &["CMakeLists.txt", "libs/config/include/boost/version.hpp"];
+
+/// Where the content-addressed prefixes live.
+///
+/// Outside `target/` on purpose: it has to survive `cargo clean`, be shared
+/// between git worktrees, and resolve to the same place in CI as it does on a
+/// developer's machine.
+fn cache_root() -> PathBuf {
+    if let Some(dir) = non_empty_var("LIBTORRENT_SYS_CACHE_DIR") {
+        return PathBuf::from(dir);
+    }
+    if let Some(dir) = non_empty_var("XDG_CACHE_HOME") {
+        return PathBuf::from(dir).join("torrentd").join("native");
+    }
+    if let Some(home) = non_empty_var("HOME") {
+        return PathBuf::from(home)
+            .join(".cache")
+            .join("torrentd")
+            .join("native");
+    }
+    // No HOME (some sandboxes and container builds). Still correct, just not
+    // shared with anything.
+    PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("native")
+}
+
+fn non_empty_var(key: &str) -> Option<std::ffi::OsString> {
+    env::var_os(key).filter(|v| !v.is_empty())
+}
+
+/// Provision `root/<name>-<key>` exactly once, and return it.
+///
+/// `populate` writes into a staging directory that is renamed into place
+/// atomically, so a concurrent reader never observes a partial tree. The lock
+/// is an optimisation on top of that: it stops two processes doing the same
+/// six-minute build, but correctness does not depend on it.
+fn ensure_prefix<F>(root: &Path, name: &str, key: &str, detail: &str, populate: F) -> PathBuf
+where
+    F: FnOnce(&Path),
+{
+    let prefix = root.join(format!("{name}-{key}"));
+    let stamp = prefix.join(STAMP);
+
+    // Without this, deleting the cache root while target/ is still warm would
+    // leave cargo convinced the script need not re-run, and hand rustc -L
+    // paths that no longer exist. Cargo treats a missing rerun-if-changed path
+    // as dirty.
+    println!("cargo:rerun-if-changed={}", stamp.display());
+
+    let forced = env::var_os("LIBTORRENT_SYS_FORCE_REBUILD").is_some();
+    if !forced && stamp_matches(&stamp, key) {
+        eprintln!("libtorrent-sys: cache hit {name}-{key}");
+        return prefix;
+    }
+
+    std::fs::create_dir_all(root)
+        .unwrap_or_else(|e| panic!("libtorrent-sys: create {}: {e}", root.display()));
+
+    let lock_path = root.join(format!("{name}-{key}.lock"));
+    let lock = std::fs::File::create(&lock_path)
+        .unwrap_or_else(|e| panic!("libtorrent-sys: create {}: {e}", lock_path.display()));
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            // rust-analyzer and a terminal build race constantly. Say so
+            // rather than appearing to hang for six minutes.
+            println!(
+                "cargo:warning=libtorrent-sys: waiting for a concurrent native build ({name})"
+            );
+            let _ = lock.lock();
+        }
+        // A filesystem without flock. Atomic rename still keeps this correct;
+        // at worst the work is duplicated.
+        Err(std::fs::TryLockError::Error(_)) => {}
+    }
+
+    // Whoever held the lock may have built exactly what we need.
+    if !forced && stamp_matches(&stamp, key) {
+        eprintln!("libtorrent-sys: cache hit {name}-{key} (built concurrently)");
+        return prefix;
+    }
+    if forced {
+        let _ = std::fs::remove_dir_all(&prefix);
+    }
+
+    eprintln!("libtorrent-sys: building {name}-{key}");
+    let staging = tempfile::Builder::new()
+        .prefix(".tmp")
+        .tempdir_in(root)
+        .unwrap_or_else(|e| panic!("libtorrent-sys: staging dir in {}: {e}", root.display()));
+    populate(staging.path());
+
+    // Last write in the staging tree: a matching .stamp means complete.
+    let body = format!("{key}\n{detail}\n");
+    std::fs::write(staging.path().join(STAMP), body)
+        .unwrap_or_else(|e| panic!("libtorrent-sys: write stamp: {e}"));
+
+    // keep() must precede the rename, or TempDir::drop would try to delete a
+    // path that has already moved.
+    let staged = staging.keep();
+    match std::fs::rename(&staged, &prefix) {
+        Ok(()) => {}
+        // Lost the race to a process without flock: rename onto a non-empty
+        // directory is ENOTEMPTY. Their tree is as good as ours.
+        Err(_) if stamp_matches(&stamp, key) => {
+            let _ = std::fs::remove_dir_all(&staged);
+        }
+        Err(e) => panic!(
+            "libtorrent-sys: publish {} -> {}: {e}",
+            staged.display(),
+            prefix.display()
+        ),
+    }
+    prefix
+}
+
+fn stamp_matches(stamp: &Path, key: &str) -> bool {
+    std::fs::read_to_string(stamp)
+        .map(|s| s.lines().next() == Some(key))
+        .unwrap_or(false)
+}
+
+/// Delete everything in `dir` except `keep` and the stamp.
+fn prune_to(dir: &Path, keep: &[&str]) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name == STAMP || keep.contains(&name.as_ref()) {
+            continue;
+        }
+        let path = entry.path();
+        let _ = if path.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
+/// Identify a vendored submodule without walking it.
+fn vendor_id(workspace: &Path, rel: &str, markers: &[&str]) -> String {
+    let submodule = workspace.join(rel);
+
+    // 1. What is actually checked out. First on purpose: it is the only mode
+    //    that notices a developer who ran `git checkout v2.0.14` inside the
+    //    submodule but has not committed the bump yet.
+    if let Some(sha) = git(&submodule, &["rev-parse", "HEAD"]) {
+        return sha;
+    }
+    // 2. The committed gitlink, readable straight out of the superproject tree
+    //    with the submodule absent — which is how a CI job keys the cache
+    //    before deciding whether to clone 634 MB of Boost. Identical to mode 1
+    //    on a clean tree, so the two interoperate.
+    if let Some(sha) = git(workspace, &["rev-parse", &format!("HEAD:{rel}")]) {
+        return sha;
+    }
+    // 3. No git at all: the container build, where .dockerignore excludes
+    //    .git/. Hash a fixed marker list instead, tagged so it can never be
+    //    confused with a commit SHA. A mid-branch bump touching neither marker
+    //    would be missed here; LIBTORRENT_SYS_FORCE_REBUILD is the remedy.
+    let mut key = Key::new();
+    key.str("files");
+    for marker in markers {
+        key.file(&submodule.join(marker));
+    }
+    format!("files:{}", key.hex())
+}
+
+fn git(dir: &Path, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// The compiler's identity, as far as ABI compatibility is concerned.
+///
+/// `-dumpmachine`/`-dumpversion`, deliberately not `--version`: the latter
+/// embeds distro packaging strings that churn on rebuilds which change nothing
+/// about the generated code.
+///
+/// The command string itself is deliberately *not* part of the identity. A
+/// launcher prefix (`CXX="sccache g++"`) does not change the generated code, so
+/// toggling one must not orphan an otherwise usable prefix.
+fn compiler_id() -> String {
+    let cxx = env::var("CXX").unwrap_or_else(|_| "c++".to_string());
+    match (
+        probe(&cxx, &["-dumpmachine"]),
+        probe(&cxx, &["-dumpversion"]),
+    ) {
+        (Some(machine), Some(version)) => format!("{machine} {version}"),
+        // Falling back silently would drop the compiler out of the cache key
+        // altogether, so a toolchain upgrade would quietly reuse incompatible
+        // objects. Say so instead.
+        _ => {
+            println!(
+                "cargo:warning=libtorrent-sys: could not probe the C++ compiler ({cxx}); \
+                 the native cache key cannot distinguish toolchains. Run with \
+                 LIBTORRENT_SYS_FORCE_REBUILD=1 after changing compilers."
+            );
+            format!("unprobed:{cxx}")
+        }
+    }
+}
+
+/// libtorrent compiles against OpenSSL's headers with `encryption=ON`, so a
+/// major bump underneath a cached archive is a real staleness vector.
+fn openssl_version() -> String {
+    probe("pkg-config", &["--modversion", "openssl"]).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Run `command` (which may carry a launcher prefix, as cc-rs and cmake-rs both
+/// allow) with `args`, and return its trimmed stdout.
+fn probe(command: &str, args: &[&str]) -> Option<String> {
+    let mut words = command.split_whitespace();
+    let program = words.next()?;
+    let out = std::process::Command::new(program)
+        .args(words)
+        .args(args)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+/// Key inputs for the Boost + libtorrent prefix.
+fn key_libtorrent(manifest_dir: &Path, workspace: &Path, cxx_id: &str) -> String {
+    let mut key = Key::new();
+    key.str("libtorrent-sys/lt/v1");
+    key.str(&env::var("TARGET").unwrap_or_default());
+    key.str(&vendor_id(workspace, VENDOR_LIBTORRENT, LIBTORRENT_MARKERS));
+    key.str(&vendor_id(workspace, VENDOR_BOOST, BOOST_MARKERS));
+    key.str(cxx_id);
+    key.str(&openssl_version());
+    // Hashing the script that produces the cmake flags, rather than
+    // enumerating the ~25 define() calls, is what keeps this from rotting:
+    // there is no list for anyone to forget to update. It over-invalidates on
+    // a comment edit, which is cheap because old prefixes are kept.
+    key.file(&manifest_dir.join("build.rs"));
+    key.file(&manifest_dir.join("Cargo.toml"));
+    key.hex()
+}
+
+/// Key inputs for the shim archive.
+fn key_shim(manifest_dir: &Path, cxx_id: &str, tier_a_id: &str) -> String {
+    let mut key = Key::new();
+    key.str("libtorrent-sys/shim/v1");
+    key.str(&env::var("TARGET").unwrap_or_default());
+    key.str(cxx_id);
+    // Ties the shim to the exact libtorrent it was compiled against.
+    key.str(tier_a_id);
+    key.file(&manifest_dir.join("build.rs"));
+    key.file(&manifest_dir.join("Cargo.toml"));
+    for rel in [
+        "wrapper.h",
+        "shim/libtorrent_shim.h",
+        "shim/alert_union.h",
+        "shim/libtorrent_shim.cpp",
+    ] {
+        key.file(&manifest_dir.join(rel));
+    }
+    key.hex()
+}
+
+/// Length-delimited SHA-256 accumulator, truncated to 96 bits so directory
+/// names stay readable.
+struct Key(sha2::Sha256);
+
+impl Key {
+    fn new() -> Self {
+        use sha2::Digest;
+        Key(sha2::Sha256::new())
+    }
+
+    fn str(&mut self, value: &str) -> &mut Self {
+        use sha2::Digest;
+        self.0.update((value.len() as u64).to_le_bytes());
+        self.0.update(value.as_bytes());
+        self
+    }
+
+    fn file(&mut self, path: &Path) -> &mut Self {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                use sha2::Digest;
+                self.0.update((bytes.len() as u64).to_le_bytes());
+                self.0.update(&bytes);
+            }
+            // A missing input is itself a distinguishing fact, not a reason to
+            // collide with the present case.
+            Err(_) => {
+                self.str("<absent>");
+            }
+        }
+        self
+    }
+
+    fn hex(&self) -> String {
+        use sha2::Digest;
+        let digest = self.0.clone().finalize();
+        digest[..12].iter().map(|b| format!("{b:02x}")).collect()
     }
 }

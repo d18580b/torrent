@@ -33,6 +33,10 @@ shim-tests = []
 cc = "1.1"
 cmake = "0.1"
 bindgen = "0.70"
+# Both are already in the workspace lockfile via other dependents, so keying
+# and staging the native cache compiles nothing new.
+sha2 = "0.10"
+tempfile = "3"
 
 [lints]
 workspace = true
