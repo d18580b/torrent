@@ -1,5 +1,8 @@
 //! `/torrents` and `/torrents/:infohash` endpoints.
 
+use std::path::Path as FsPath;
+use std::path::PathBuf;
+
 use axum::extract::FromRequest;
 use axum::extract::Multipart;
 use axum::extract::Path;
@@ -27,6 +30,13 @@ const MAX_PAGE_SIZE: usize = 1000;
 /// Upper bound on a `POST /torrents` body (JSON or a multipart `.torrent`
 /// upload). Also installed as the router's `DefaultBodyLimit`.
 pub(crate) const MAX_BODY_BYTES: usize = 50 * 1024 * 1024;
+
+/// Upper bound on a `.torrent` read from the daemon's own filesystem.
+///
+/// A torrent file is metadata: even a multi-terabyte v1 torrent with 16 KiB
+/// pieces is a few hundred MiB of piece hashes, and anything past this is not
+/// a torrent worth parsing.
+const MAX_TORRENT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Resolved add source, carrying the bytes/uri needed to (a) compute the
 /// info-hash up front and (b) build the engine params after the registry
@@ -160,12 +170,12 @@ pub async fn add(
     let (slot_id_opt, save_path_opt, source) = if is_multipart {
         parse_multipart(req, &s).await?
     } else {
-        parse_json(req).await?
+        parse_json(req, &s).await?
     };
     do_add(&s, slot_id_opt, save_path_opt, source).await
 }
 
-async fn parse_json(req: Request) -> Result<AddParse, AddError> {
+async fn parse_json(req: Request, state: &AppState) -> Result<AddParse, AddError> {
     let bytes = axum::body::to_bytes(req.into_body(), MAX_BODY_BYTES)
         .await
         .map_err(|e| {
@@ -183,13 +193,7 @@ async fn parse_json(req: Request) -> Result<AddParse, AddError> {
     let source = if let Some(uri) = r.magnet {
         AddSource::Magnet(uri)
     } else if let Some(path) = r.torrent_path {
-        let bytes = std::fs::read(&path).map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("read torrent file: {e}")})),
-            )
-        })?;
-        AddSource::File(bytes)
+        AddSource::File(read_local_torrent(state, FsPath::new(&path))?)
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -197,6 +201,48 @@ async fn parse_json(req: Request) -> Result<AddParse, AddError> {
         ));
     };
     Ok((r.slot_id, r.save_path, source))
+}
+
+/// Read a `.torrent` the caller named by path on the daemon's own filesystem.
+///
+/// `torrent_path` used to be handed straight to `std::fs::read` with the OS
+/// error echoed back, which made it an existence-and-permission oracle for
+/// every path the daemon can reach, and an unbounded read — `/dev/zero` or a
+/// large sparse file would allocate until the OOM killer arrived. The 50 MiB
+/// body limit does not apply, because the bytes never cross the HTTP boundary.
+///
+/// It is confined to the directories the daemon already owns: the torrent
+/// store, the pool's torrent library, and the managed roots. That covers what
+/// the feature is for — pointing at a file the daemon put there, or at a
+/// library being migrated — without turning the route into a file reader.
+fn read_local_torrent(state: &AppState, path: &FsPath) -> Result<Vec<u8>, AddError> {
+    let refused = |msg: &str| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+    };
+
+    let allowed: Vec<PathBuf> = state.local_torrent_dirs();
+    if !allowed
+        .iter()
+        .any(|d| seederd_pool::plan::contains(d, path))
+    {
+        // Deliberately does not say whether the file exists.
+        return Err(refused(
+            "torrent_path must be inside the daemon's torrent directory, the pool library, \
+             or a managed root",
+        ));
+    }
+
+    let md = std::fs::symlink_metadata(path).map_err(|_| refused("no such .torrent"))?;
+    if !md.is_file() {
+        return Err(refused("torrent_path is not a regular file"));
+    }
+    if md.len() > MAX_TORRENT_FILE_BYTES {
+        return Err(refused("`.torrent` file is implausibly large"));
+    }
+    std::fs::read(path).map_err(|_| refused("could not read that .torrent"))
 }
 
 async fn parse_multipart(req: Request, state: &AppState) -> Result<AddParse, AddError> {
@@ -269,8 +315,32 @@ async fn do_add(
         return Err(vpn_down());
     }
 
-    let save_path =
-        save_path_opt.unwrap_or_else(|| s.default_save_path.to_string_lossy().into_owned());
+    // An unconstrained save_path points libtorrent at any directory the daemon
+    // can write, including inside a managed root — where the payload would
+    // have no claim rows until the next scan and would read as an orphan.
+    let save_path = match save_path_opt {
+        None => s.default_save_path.to_string_lossy().into_owned(),
+        Some(p) => {
+            let candidate = FsPath::new(&p);
+            let permitted = std::iter::once(s.default_save_path.clone())
+                .chain(s.pool.iter().flat_map(|pool| {
+                    pool.roots()
+                        .iter()
+                        .map(|(_, r)| r.clone())
+                        .collect::<Vec<_>>()
+                }))
+                .any(|d| seederd_pool::plan::contains(&d, candidate));
+            if !permitted {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "save_path must be inside default_save_path or a managed root"
+                    })),
+                ));
+            }
+            p
+        }
+    };
     let flags = TorrentFlags::SEED_MODE
         | if !slot_id.is_default() {
             TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
@@ -567,6 +637,23 @@ pub async fn set_file_priority(
     Path(infohash): Path<String>,
     Json(body): Json<FilePriorityBody>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // libtorrent's download_priority is 0..=7; anything else reached the shim
+    // unvalidated. Reject here rather than letting an arbitrary byte cross the
+    // FFI boundary and be interpreted however libtorrent happens to.
+    if body.priority > 7 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "priority must be 0..=7 (0 = skip, 1 = low, 4 = normal, 7 = high)"
+            })),
+        ));
+    }
+    if body.file_idx < 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "file_idx must not be negative"})),
+        ));
+    }
     let (st, engine) = lookup_engine(&s, &infohash)?;
     engine
         .set_file_priority(st.handle, body.file_idx, body.priority)
@@ -650,6 +737,7 @@ mod tests {
                     .unwrap_or(0),
             )),
             default_save_path: dir.to_path_buf(),
+            torrent_dir: dir.to_path_buf(),
             mode: Mode::Single,
         }
     }
@@ -664,6 +752,36 @@ mod tests {
         assert_eq!(r.magnet.as_deref(), Some("magnet:?x"));
         assert_eq!(r.slot_id.as_deref(), Some("acct_a"));
         assert!(r.torrent_path.is_none());
+    }
+
+    #[test]
+    fn a_torrent_path_outside_the_daemons_directories_is_refused() {
+        // Unconstrained, this route was an existence-and-permission oracle for
+        // the whole filesystem and an unbounded read into the bencode parser.
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_state(dir.path());
+
+        let outside = dir.path().join("..").join("etc-shadow-ish");
+        let err = read_local_torrent(&app, &outside).unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        let msg = err.1 .0["error"].as_str().unwrap().to_string();
+        assert!(msg.contains("must be inside"), "got {msg}");
+        // The refusal must not disclose whether the path exists.
+        assert!(!msg.contains("No such file"), "got {msg}");
+    }
+
+    #[test]
+    fn an_oversized_local_torrent_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_state(dir.path());
+        // `test_state` points torrent_dir at `dir`, so this is inside it.
+        let big = dir.path().join("huge.torrent");
+        let f = std::fs::File::create(&big).unwrap();
+        f.set_len(MAX_TORRENT_FILE_BYTES + 1).unwrap();
+
+        let err = read_local_torrent(&app, &big).unwrap_err();
+        let msg = err.1 .0["error"].as_str().unwrap().to_string();
+        assert!(msg.contains("implausibly large"), "got {msg}");
     }
 
     #[test]

@@ -584,6 +584,7 @@ impl DaemonHandle {
             pool,
             alert_heartbeat: alert_loop.heartbeat(),
             default_save_path: cfg.default_save_path.clone(),
+            torrent_dir: cfg.torrent_dir.clone(),
             mode: if cfg.slot.is_empty() {
                 Mode::Single
             } else {
