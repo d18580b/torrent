@@ -60,6 +60,14 @@ impl Placement {
 /// makes an orphaned file look protected — the one error that could get data
 /// deleted later.
 pub fn match_all(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
+    // One transaction for the whole rebuild. Between `clear_all_claims` and the
+    // last `replace_claims` the claim table does not describe the pool, and a
+    // claim table that does not describe the pool is a delete plan that
+    // enumerates every file in every root as an orphan.
+    store.in_transaction(match_all_inner)
+}
+
+fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
     let roots = store.roots()?;
     let torrents = store.torrents()?;
     let mut stats = MatchStats::default();

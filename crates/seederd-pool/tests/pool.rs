@@ -1077,3 +1077,52 @@ fn an_index_from_a_newer_build_is_refused_rather_than_guessed_at() {
         "got {e:?}",
     );
 }
+
+#[test]
+fn clearing_claims_outside_a_transaction_is_refused() {
+    // The guard behind the worst failure mode this index has: an empty claim
+    // table means every indexed file reads as an orphan, and a delete plan
+    // built in that window enumerates the entire pool.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "x1", "T", None, &[("T/a.bin", 128)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    assert!(store.clear_all_claims().is_err());
+    // The claim survived, so the file is still protected.
+    assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+}
+
+#[test]
+fn a_rematch_never_publishes_an_empty_claim_table() {
+    // `match_all` clears every claim before rebuilding. Inside one transaction
+    // that intermediate state is never observable; the assertion here is that
+    // a *failed* rematch rolls back to the previous claims rather than leaving
+    // the pool looking unprotected.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "x1", "T", None, &[("T/a.bin", 128)]);
+    seederd_pool::match_all(&mut store).unwrap();
+    assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+
+    let err: Result<(), seederd_pool::model::PoolError> = store.in_transaction(|st| {
+        st.clear_all_claims()?;
+        // Abort partway, exactly as an I/O error mid-rebuild would.
+        Err(seederd_pool::model::PoolError::ClaimsClearedOutsideTransaction)
+    });
+    assert!(err.is_err());
+    assert!(
+        store.orphan_files(root_id, "").unwrap().is_empty(),
+        "a rolled-back rematch left the pool looking unclaimed",
+    );
+}

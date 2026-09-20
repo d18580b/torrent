@@ -116,27 +116,34 @@ impl PoolService {
     }
 
     /// Full re-index: walk every root, read the library, re-match.
+    ///
+    /// The whole sequence is one transaction. A reader concurrent with a scan
+    /// sees the previous index in full rather than a partially rebuilt one —
+    /// which matters because "this file is claimed by no torrent" is the
+    /// predicate the delete path trusts.
     pub fn scan(&self) -> anyhow::Result<ScanSummary> {
         let mut store = self.store.lock();
-        let mut summary = ScanSummary::default();
-        for (_, path) in &self.roots {
-            let s = seederd_pool::scan_root(&mut store, path)
-                .with_context(|| format!("scan root {}", path.display()))?;
-            summary.files += s.files_indexed;
-            summary.bytes += s.bytes_indexed;
-            summary.errors += s.errors;
-        }
-        let lib = seederd_pool::scan_library(&mut store, &self.library_dir)
-            .with_context(|| format!("scan library {}", self.library_dir.display()))?;
-        summary.torrents = lib.torrents_indexed;
-        summary.errors += lib.errors;
+        store.in_transaction(|store| {
+            let mut summary = ScanSummary::default();
+            for (_, path) in &self.roots {
+                let s = seederd_pool::scan_root(store, path)
+                    .with_context(|| format!("scan root {}", path.display()))?;
+                summary.files += s.files_indexed;
+                summary.bytes += s.bytes_indexed;
+                summary.errors += s.errors;
+            }
+            let lib = seederd_pool::scan_library(store, &self.library_dir)
+                .with_context(|| format!("scan library {}", self.library_dir.display()))?;
+            summary.torrents = lib.torrents_indexed;
+            summary.errors += lib.errors;
 
-        let m = seederd_pool::match_all(&mut store)?;
-        summary.matched = m.matched;
-        summary.partial = m.partial;
-        summary.missing = m.missing;
-        summary.overlap = m.overlap;
-        Ok(summary)
+            let m = seederd_pool::match_all(store)?;
+            summary.matched = m.matched;
+            summary.partial = m.partial;
+            summary.missing = m.missing;
+            summary.overlap = m.overlap;
+            Ok(summary)
+        })
     }
 }
 
