@@ -7,14 +7,14 @@
 //!   - 30-second tick: `post_session_stats` per slot.
 //!   - 30-minute tick: scan the state map for torrents flagged
 //!     `needs_save_resume` and call `save_resume_data` with
-//!     `ONLY_IF_MODIFIED` (PRD §6).
+//!     `ONLY_IF_MODIFIED`.
 //!   - Retry timer: torrents in upload-mode have a `RetryState`; when
 //!     `next_attempt <= now` we call `engine.resume_torrent(handle)` and
 //!     schedule the next attempt with exponential backoff.
 //!   - Shutdown: on signal, fire `save_resume_data` for every torrent
 //!     concurrently, then loop draining alerts until
 //!     `pending_resume_count == 0` or the global 30-second deadline
-//!     expires (PRD §Session Management).
+//!     expires.
 //!   - Liveness: every iteration stamps a wall-clock heartbeat that
 //!     `GET /healthz` reads. A wedged or panicked loop makes the daemon
 //!     report unready instead of quietly serving a stale state map.
@@ -127,7 +127,7 @@ impl AlertLoopBuilder {
         }
     }
 
-    /// Treat `listen_failed_alert` as fatal (PRD §Error Handling: fatal in
+    /// Treat `listen_failed_alert` as fatal (Handling: fatal in
     /// single-session mode; in multi-slot mode only the affected slot is
     /// marked failed and the daemon keeps running).
     pub fn fatal_listen_failure(mut self, yes: bool) -> Self {
@@ -348,7 +348,7 @@ fn run(
         let was_empty = drained.is_empty();
         let mut fatal = false;
         for (slot, alert) in drained {
-            // PRD §Error Handling: a listen socket that fails in
+            // Handling: a listen socket that fails in
             // single-session mode is fatal — there is no other session to
             // carry the load, so seeding silently stops. Note it, finish
             // dispatching the batch (so the failure is logged and counted),

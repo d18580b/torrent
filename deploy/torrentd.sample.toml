@@ -1,7 +1,7 @@
 # Sample torrentd configuration file.
 #
 # Copy to /etc/torrentd/torrentd.toml and edit. Unknown keys are a fatal
-# startup error — please reference PRD.md for the full set of options.
+# startup error. Every key is documented in docs/running.md.
 
 # ---------------------------------------------------------------------------
 # Single-session example

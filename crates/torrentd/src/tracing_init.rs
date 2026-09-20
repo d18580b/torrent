@@ -1,12 +1,11 @@
 //! Structured-logging bring-up.
 //!
-//! Per PRD §Logging: JSON lines on stdout, RFC3339 timestamps,
+//! Per JSON lines on stdout, RFC3339 timestamps,
 //! `level`/`msg` always present, plus span fields flat at the top.
 //! Filter level seeded from config + overridden by RUST_LOG if set.
 //!
 //! The global filter is wrapped in a `reload::Layer` so SIGHUP can swap the
-//! log level at runtime without restarting the daemon (PRD §Session
-//! Management: `log_level` is reloadable).
+//! log level at runtime without restarting the daemon (//! Management: `log_level` is reloadable).
 
 use tracing_subscriber::filter::EnvFilter;
 use tracing_subscriber::fmt::time::ChronoUtc;

@@ -36,7 +36,7 @@ pub struct AppState {
     /// Alert-loop liveness stamp (Unix millis at its last iteration). Read by
     /// `/healthz` so a wedged loop makes the daemon report unready.
     pub alert_heartbeat: Arc<AtomicU64>,
-    /// Save path used when `POST /torrents` omits `save_path` (PRD).
+    /// Save path used when `POST /torrents` omits `save_path`.
     pub default_save_path: PathBuf,
     /// Root of the `.torrent` store on disk. Used to confine a caller-supplied
     /// `torrent_path` to directories the daemon already owns.

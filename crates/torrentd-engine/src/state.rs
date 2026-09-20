@@ -1,7 +1,7 @@
 //! Engine-side state map.
 //!
 //! One entry per torrent — keyed by infohash for the cross-slot uniqueness
-//! invariant (PRD Safety Rule 3). Each entry tracks the slot the torrent
+//! invariant. Each entry tracks the slot the torrent
 //! belongs to, its libtorrent state, and timer / counter state used by
 //! the alert handlers and the shutdown coordinator.
 
@@ -17,7 +17,7 @@ use crate::slot::SlotId;
 
 /// Lifecycle phases the daemon tracks for a torrent. Mostly mirrors
 /// libtorrent's `torrent_status::state_t` but adds an explicit
-/// `UploadMode` bit because torrentd's PRD distinguishes that case.
+/// `UploadMode` bit because torrentd's the spec distinguishes that case.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TorrentPhase {
     /// libtorrent is hashing pieces; the torrent isn't seeding yet.
@@ -51,7 +51,7 @@ impl TorrentPhase {
     }
 }
 
-/// Retry schedule for upload-mode exit. PRD: 60→120→240→…→3600s.
+/// Retry schedule for upload-mode exit. the spec: 60→120→240→…→3600s.
 #[derive(Clone, Debug)]
 pub struct RetryState {
     pub next_attempt: Instant,
@@ -215,7 +215,7 @@ impl StateMap {
     }
 
     /// All torrent handles currently assigned to `slot` — for slot-wide
-    /// pause/resume and VPN-down handling (PRD §Multi-Account).
+    /// pause/resume and VPN-down handling.
     pub fn handles_for_slot(&self, slot: &SlotId) -> Vec<TorrentHandle> {
         self.inner
             .iter()

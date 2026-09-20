@@ -240,7 +240,7 @@ int         lt_torrent_set_file_priority(lt_session* s, lt_handle h,
 /* Compute the best (v1, or v2-truncated) info-hash of a .torrent buffer
  * without adding it to any session. Writes 20 bytes to out20. Used to
  * enforce registry uniqueness before the session sees the torrent
- * (PRD Safety Rule 4). Returns LT_OK / LT_ERR (err_out populated). */
+ *. Returns LT_OK / LT_ERR (err_out populated). */
 int         lt_torrent_info_hash(const uint8_t* data, size_t len,
                                  uint8_t* out20, char* err_out, int err_len);
 
@@ -299,7 +299,7 @@ void        lt_torrent_meta_free(struct lt_torrent_meta* m);
 /* Return 1 if any tracker URL host in the .torrent buffer matches (equals or
  * is a subdomain of) one of the comma-separated `domains_csv`, 0 if none
  * match, LT_ERR on parse error. Misconfiguration guard for slot assignment
- * (PRD §Torrent-to-Slot Assignment). */
+ *. */
 int         lt_torrent_tracker_host_matches(const uint8_t* data, size_t len,
                                             const char* domains_csv,
                                             char* err_out, int err_len);

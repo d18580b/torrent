@@ -1,6 +1,6 @@
 //! Listener-side handlers: ListenFailed, ListenSucceeded.
 //!
-//! ListenFailed in single-session mode is fatal (PRD §Error Handling);
+//! ListenFailed in single-session mode is fatal;
 //! the alert loop sets the `listen_failure_fatal` flag on the state map
 //! via `MetricsSink` so the daemon can flush logs and exit non-zero. In
 //! multi-slot mode the affected slot is marked failed but the daemon

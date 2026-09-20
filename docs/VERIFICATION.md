@@ -96,9 +96,9 @@ What each Layer-3 test asserts:
 Expected Layer-4 ballpark (numbers vary by host):
 
 ```
-alert-throughput: … = 58121693/s            # PRD target >= 100k/s
+alert-throughput: … = 58121693/s            # the spec target >= 100k/s
 startup-time: ingested 10000 torrents in 0.41s (24178/s)
-memory-scaling: final RSS = … ; 24 KB/torrent over baseline (PRD target <200)
+memory-scaling: final RSS = … ; 24 KB/torrent over baseline
 ```
 
 `memory-scaling` adds **real seeding torrents** with libtorrent's no-op disk
@@ -161,7 +161,7 @@ curl -s -o/dev/null -w '%{http_code}\n' -X POST http://$HTTP/torrents/$IH/upload
 curl -s -o/dev/null -w '%{http_code}\n' -X POST http://$HTTP/torrents/$IH/pause
 curl -s -o/dev/null -w '%{http_code}\n' -X POST http://$HTTP/torrents/$IH/resume
 
-# duplicate add is rejected (PRD Safety Rule 3) — 409
+# duplicate add is rejected — 409
 curl -s -o/dev/null -w '%{http_code}\n' -X POST http://$HTTP/torrents -H 'Content-Type: application/json' -d "{\"magnet\":\"$MAG\"}"
 
 # file priority needs metadata, so target the uploaded .torrent (204):
@@ -178,7 +178,7 @@ curl -s -o/dev/null -w '%{http_code}\n' -X DELETE "http://$HTTP/torrents/$IH?del
 curl -fsS http://$HTTP/metrics | grep '^torrentd_libtorrent_'
 # torrentd_libtorrent_net_sent_bytes{slot_id="default"} …
 # torrentd_libtorrent_peers_connected{slot_id="default"} …
-# torrentd_libtorrent_num_seeding_torrents{slot_id="default"} …   (13 gauges, PRD §8)
+# torrentd_libtorrent_num_seeding_torrents{slot_id="default"} …   (13 gauges, )
 ```
 
 ---
@@ -250,7 +250,7 @@ curl -s localhost:8080/healthz            # ok:true again
 ```bash
 # Fatal listen failure (single-session mode). Occupy the listen port first so
 # libtorrent's bind fails, then confirm the daemon exits non-zero instead of
-# idling with no listener (PRD §Error Handling).
+# idling with no listener.
 nc -l 6881 &
 torrentd --config "$WORK/torrentd.toml"; echo "exit=$?"     # exit=70
 # …"message":"listen socket failed in single-session mode; shutting down"…
@@ -459,7 +459,7 @@ curl -fsS http://127.0.0.1:8080/metrics | grep 'slot_vpn_tunnel_up{slot_id="acco
 
 Expected on tunnel loss: the slot's torrents are **paused**, the slot reports
 `vpn_down`, `slot_vpn_tunnel_up` drops to `0`, and **there is no auto-restart** —
-an operator must intervene (PRD multi-account safety rule). seeding continues
+an operator must intervene. seeding continues
 unaffected on the other slot.
 
 A fenced slot also **refuses API mutations** that would un-quarantine it — the

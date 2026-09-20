@@ -1,7 +1,7 @@
 //! Error handlers: TorrentError, FileError, HashFailed.
 //!
 //! These set the relevant phase on the state map, increment metrics, and
-//! (for FileError) schedule the upload-mode retry timer per PRD §Error
+//! (for FileError) schedule the upload-mode retry timer
 //! Handling. The retry execution itself happens in `alert_loop::tick`.
 
 use libtorrent_safe::Alert;

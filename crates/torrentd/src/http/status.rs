@@ -11,7 +11,7 @@ pub struct StatusResponse {
     torrents_total: usize,
     seeding: usize,
     paused: usize,
-    /// Torrents libtorrent is hashing. One of the four states the PRD names,
+    /// Torrents libtorrent is hashing. One of the four states the spec names,
     /// and the one that explains why a freshly adopted pool is not seeding yet.
     checking: usize,
     upload_mode: usize,

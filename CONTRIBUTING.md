@@ -1,7 +1,8 @@
 # Contributing to torrentd
 
 `torrentd` is a headless petabyte-scale torrent seeding daemon. The full architecture and
-non-goals are spelled out in [`PRD.md`](./PRD.md). Read it before starting.
+non-goals are spelled out in [`README.md`](./README.md) and
+[`docs/running.md`](./docs/running.md). Read them before starting.
 
 ## Development environment
 
@@ -12,7 +13,7 @@ Linux x86_64 only. Verified on:
 - Fedora 43 (kernel 6.18+), GCC 14
 - Ubuntu 24.04, GCC 13
 
-The binary is not supported on Windows or macOS — see PRD §Non-goals.
+The binary is not supported on Windows or macOS.
 
 ### System prerequisites
 
@@ -123,7 +124,7 @@ cargo test -p libtorrent-sys --features shim-tests  # Layer 2 shim FFI tests (Li
 ```
 
 Integration tests that spin up real libtorrent sessions are gated behind `--ignored`
-and run as a separate CI job — see PRD §Validation Strategy.
+and run as a separate CI job Strategy.
 
 For a full hands-on walkthrough — the Layer 1–4 test ladder plus a manual
 single-node smoke and the multi-slot / VPN path — see

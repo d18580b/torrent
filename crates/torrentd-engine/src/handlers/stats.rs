@@ -1,15 +1,15 @@
 //! `SessionStats` handler — maps libtorrent's session-wide counters
-//! (PRD §8) onto Prometheus gauges.
+//! onto Prometheus gauges.
 //!
 //! libtorrent delivers `session_stats_alert` as a flat array of `i64`
 //! counters indexed by a build-stable metric id. We resolve the ids for the
-//! metrics the PRD calls out once (via
+//! metrics the spec calls out once (via
 //! `libtorrent_safe::session_stats_metric_index`) and cache them. Every
 //! counter is exported as a **gauge carrying libtorrent's absolute value**:
 //! the monotonic ones (e.g. `net.sent_bytes`) are handled by PromQL `rate()`
 //! at query time, the instantaneous ones (e.g. `peer.num_peers_connected`)
 //! read directly. Every gauge gains a `slot_id` label so multi-slot mode
-//! disambiguates sessions (PRD §Monitoring Extensions).
+//! disambiguates sessions.
 
 use std::sync::OnceLock;
 
@@ -44,7 +44,7 @@ pub struct StatsMetrics {
 }
 
 impl StatsMetrics {
-    /// Resolve every PRD §8 metric against the linked libtorrent build.
+    /// Resolve every metric against the linked libtorrent build.
     pub fn resolve() -> Self {
         let mut resolved = Vec::with_capacity(SESSION_METRICS.len());
         for (suffix, lt_name) in SESSION_METRICS {

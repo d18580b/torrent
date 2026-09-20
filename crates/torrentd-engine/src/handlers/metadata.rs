@@ -2,7 +2,7 @@
 //!
 //! Magnet adds arrive without a `.torrent` file; once libtorrent fetches the
 //! metadata we persist it so the startup inventory scan can re-add the torrent
-//! if its resume file is ever lost (PRD §6 / §Session Management).
+//! if its resume file is ever lost.
 
 use libtorrent_safe::Alert;
 use tracing::debug;

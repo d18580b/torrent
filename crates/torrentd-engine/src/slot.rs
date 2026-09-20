@@ -142,7 +142,7 @@ impl<'de> Deserialize<'de> for SlotId {
 // ---------------------------------------------------------------------------
 
 /// Per-slot configuration, mirroring the `[[slot]]` table in the daemon's
-/// config file (PRD §Multi-Account "Configuration Format"). Validation
+/// config file. Validation
 /// (uniqueness rules etc.) is handled by `SlotConfig::validate_set`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -227,7 +227,7 @@ impl SlotConfig {
     }
 
     /// Validate the global uniqueness invariants across all slots.
-    /// Should be called at startup (PRD §Multi-Account constraints) and
+    /// Should be called at startup and
     /// on SIGHUP for the new config.
     pub fn validate_set(slots: &[SlotConfig]) -> Result<(), SlotConfigError> {
         let mut seen_id = std::collections::HashSet::new();
@@ -309,7 +309,7 @@ pub enum SlotStatus {
     /// VPN bring-up failed at startup; engine never constructed.
     Failed,
     /// VPN tunnel went down mid-session; all torrents in this slot are
-    /// paused awaiting operator intervention (PRD: no auto-restart).
+    /// paused awaiting operator intervention.
     VpnDown,
 }
 

@@ -5,7 +5,7 @@
 //! or the handshake has gone stale (a tunnel that keeps its address but has
 //! silently died), the monitor immediately pauses every torrent in that slot,
 //! marks the slot `VpnDown`, and emits metrics — but does **not** restart the
-//! session (PRD Safety Rule: automatic restart risks a window where traffic
+//! session (the spec Safety Rule: automatic restart risks a window where traffic
 //! routes over the bare interface; the operator must intervene).
 
 use std::net::IpAddr;
@@ -96,7 +96,7 @@ pub async fn run(
             let slot_id = e.id().clone();
             let health = e.health();
             // Once a slot is down it stays down until the operator restarts
-            // the daemon — no auto-recovery (PRD Safety Rule).
+            // the daemon — no auto-recovery.
             if health.status == SlotStatus::VpnDown {
                 continue;
             }

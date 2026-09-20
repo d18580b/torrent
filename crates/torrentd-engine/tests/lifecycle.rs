@@ -1,4 +1,4 @@
-//! Layer 3 integration scenarios (PRD Validation §Layer 3) — deterministic,
+//! Layer 3 integration scenarios — deterministic,
 //! single-session, real libtorrent + real disk, no network.
 //!
 //! Each test drives a real `libtorrent_safe::Session` and asserts on the raw

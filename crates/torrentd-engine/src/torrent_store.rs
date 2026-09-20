@@ -2,13 +2,13 @@
 //!
 //! Mirrors [`crate::resume_store`] but for the raw `.torrent` metadata. The
 //! daemon writes `<base>/<slot_id>/<infohash_hex>.torrent` whenever a torrent
-//! is added from a buffer / file (PRD §Session Management) so the startup
+//! is added from a buffer / file so the startup
 //! inventory scan can re-add it if its resume file is ever lost, and the
 //! `metadata_received` handler writes the fetched metadata for magnet adds.
 //!
 //! Like the resume store, single-session mode (`SlotId::DEFAULT`) keeps files
 //! directly under `base`; multi-slot mode partitions by slot id so torrents
-//! are never co-mingled (PRD §Multi-Account).
+//! are never co-mingled.
 
 use std::fs;
 use std::io::Write;
@@ -136,7 +136,7 @@ impl TorrentStore for FsTorrentStore {
         let tmp_path = dir.join(format!("{}.torrent.tmp", ih.to_hex()));
 
         // Atomic write: temp file → fsync(file) → rename, same as the resume
-        // store (PRD §6 — a partial write must leave the previous file intact).
+        // store.
         {
             let mut f = fs::OpenOptions::new()
                 .write(true)
