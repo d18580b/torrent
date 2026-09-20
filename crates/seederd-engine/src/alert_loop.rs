@@ -65,6 +65,10 @@ pub enum ShutdownReason {
     Sigterm,
     Sigint,
     ListenFailed,
+    /// A handler panicked. The loop is the only consumer of the alert queue
+    /// and the only writer to the state map, so its death stops seeding,
+    /// resume saves and status updates — with nothing else noticing.
+    LoopPanicked,
     Test,
 }
 
@@ -154,21 +158,42 @@ impl AlertLoopBuilder {
                     let span = info_span!(parent: parent, "alert_loop");
                     let _enter = span.enter();
                     info!(target: "seederd_engine::alert_loop", "alert loop started");
-                    run(
-                        rx,
-                        source,
-                        state,
-                        resume,
-                        torrents,
-                        metrics,
-                        clock,
-                        LoopHooks {
-                            heartbeat,
-                            listen_failed,
-                            fatal_listen_failure,
-                            on_fatal,
-                        },
-                    );
+                    let on_fatal_panic = on_fatal.clone();
+                    // A panic here unwinds only this thread. `main` would keep
+                    // running: HTTP still answering, metrics still scraping,
+                    // the state map frozen, no alert ever dispatched again and
+                    // no resume data ever written again. Catch it and take the
+                    // process down so the supervisor restarts it.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run(
+                            rx,
+                            source,
+                            state,
+                            resume,
+                            torrents,
+                            metrics,
+                            clock,
+                            LoopHooks {
+                                heartbeat,
+                                listen_failed,
+                                fatal_listen_failure,
+                                on_fatal,
+                            },
+                        );
+                    }));
+                    if outcome.is_err() {
+                        error!(
+                            target: "seederd_engine::alert_loop",
+                            op = "alert_loop",
+                            error.kind = "alert_loop_panic",
+                            "alert loop panicked; seeding has stopped and resume data will \
+                             no longer be written",
+                        );
+                        if let Some(cb) = &on_fatal_panic {
+                            cb(ShutdownReason::LoopPanicked);
+                        }
+                        return;
+                    }
                     info!(target: "seederd_engine::alert_loop", "alert loop exited");
                 }
             })
@@ -740,6 +765,53 @@ mod tests {
         );
         handle.join().expect("loop thread panicked");
         assert_eq!(*seen.lock(), vec![ShutdownReason::ListenFailed]);
+    }
+
+    /// A metrics sink that panics, to drive a genuine panic through a handler.
+    #[derive(Debug)]
+    struct PanickingSink;
+
+    impl crate::metrics::MetricsSink for PanickingSink {
+        fn inc_counter(&self, _n: &str, _l: &[(&str, &str)]) {
+            panic!("metrics sink exploded");
+        }
+        fn set_gauge(&self, _n: &str, _v: f64, _l: &[(&str, &str)]) {}
+    }
+
+    #[test]
+    fn a_panicking_handler_takes_the_process_down() {
+        // The loop is the only consumer of the alert queue and the only writer
+        // to the state map. A panic that unwinds just this thread leaves the
+        // daemon serving HTTP and metrics with a frozen state map, never
+        // dispatching another alert and never writing resume data again —
+        // while the systemd watchdog, an independent task, keeps reporting
+        // healthy. It has to become a process-level fatal.
+        let engine = Arc::new(MockEngine::new());
+        engine.push_alert(add_torrent_alert(1, 1));
+
+        let seen: Arc<parking_lot::Mutex<Vec<ShutdownReason>>> = Arc::default();
+        let handle = AlertLoopBuilder::new(
+            Arc::new(SingleSessionSource::new(engine)),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            Arc::new(PanickingSink),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .on_fatal({
+            let seen = Arc::clone(&seen);
+            Arc::new(move |r| seen.lock().push(r)) as FatalCallback
+        })
+        .spawn();
+
+        assert!(
+            wait_for(|| !seen.lock().is_empty()),
+            "a panicking handler did not raise a fatal shutdown",
+        );
+        assert_eq!(*seen.lock(), vec![ShutdownReason::LoopPanicked]);
+        // The thread is gone either way; joining must not itself panic the
+        // test, which is what `catch_unwind` buys.
+        handle.join().expect("panic should not escape the thread");
     }
 
     #[test]
