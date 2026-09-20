@@ -46,6 +46,17 @@ description = "Type-check and bundle the web client"
 dir = "web"
 run = ["npm ci", "npm run build"]
 
+[tasks.screenshot]
+description = "Screenshot the pool browser against a mocked API (docs/img/pool.png)"
+dir = "web"
+run = [
+  "npm ci",
+  "npm run build",
+  # Chromium only; the default `npx playwright install` pulls three browsers.
+  "npx --yes playwright install --with-deps chromium",
+  "npm run screenshot",
+]
+
 [tasks.check]
 description = "Formatting + clippy"
 depends = ["fmt", "lint"]

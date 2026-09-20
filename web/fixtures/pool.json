@@ -1,0 +1,178 @@
+{
+  "/api/status": {
+    "torrents_total": 184,
+    "seeding": 176,
+    "paused": 0,
+    "checking": 6,
+    "upload_mode": 0,
+    "errored": 2,
+    "upload_rate_total": 118403112,
+    "download_rate_total": 0,
+    "peers_total": 1043,
+    "pending_resume_count": 0,
+    "slot_count": 1
+  },
+  "/api/pool": {
+    "roots": [
+      {
+        "bytes_total": 157840066566,
+        "bytes_adopted": 129600638154,
+        "bytes_matched": 20615843020,
+        "bytes_orphan": 7623585391,
+        "files_total": 202,
+        "files_orphan": 22,
+        "root_id": 1,
+        "path": "/data/torrents"
+      }
+    ],
+    "library_dir": "/var/lib/torrentd/library",
+    "torrents": 184,
+    "files": 202,
+    "states": {
+      "adopted": 171,
+      "matched": 9,
+      "partial": 1,
+      "overlap": 2,
+      "missing": 1
+    },
+    "verify_queue_depth": 4,
+    "verify_in_flight": 2
+  },
+  "/api/pool/tree": {
+    "bytes_total": 157840066566,
+    "bytes_adopted": 129600638154,
+    "bytes_matched": 20615843020,
+    "bytes_orphan": 7623585391,
+    "files_total": 202,
+    "files_orphan": 22,
+    "root_id": 1,
+    "path": "",
+    "entries": [
+      {
+        "bytes_total": 44667659878,
+        "bytes_adopted": 44667659878,
+        "bytes_matched": 0,
+        "bytes_orphan": 0,
+        "files_total": 52,
+        "files_orphan": 0,
+        "name": "debian",
+        "path": "debian",
+        "is_dir": true,
+        "states": [
+          "adopted"
+        ]
+      },
+      {
+        "bytes_total": 35648228556,
+        "bytes_adopted": 35648228556,
+        "bytes_matched": 0,
+        "bytes_orphan": 0,
+        "files_total": 38,
+        "files_orphan": 0,
+        "name": "ubuntu",
+        "path": "ubuntu",
+        "is_dir": true,
+        "states": [
+          "adopted"
+        ]
+      },
+      {
+        "bytes_total": 31031138713,
+        "bytes_adopted": 22978075033,
+        "bytes_matched": 8053063680,
+        "bytes_orphan": 0,
+        "files_total": 31,
+        "files_orphan": 0,
+        "name": "fedora",
+        "path": "fedora",
+        "is_dir": true,
+        "states": [
+          "adopted",
+          "matched"
+        ]
+      },
+      {
+        "bytes_total": 15784004812,
+        "bytes_adopted": 15784004812,
+        "bytes_matched": 0,
+        "bytes_orphan": 0,
+        "files_total": 24,
+        "files_orphan": 0,
+        "name": "arch",
+        "path": "arch",
+        "is_dir": true,
+        "states": [
+          "adopted"
+        ]
+      },
+      {
+        "bytes_total": 12133282611,
+        "bytes_adopted": 0,
+        "bytes_matched": 12133282611,
+        "bytes_orphan": 0,
+        "files_total": 18,
+        "files_orphan": 0,
+        "name": "nixos",
+        "path": "nixos",
+        "is_dir": true,
+        "states": [
+          "matched"
+        ]
+      },
+      {
+        "bytes_total": 10522669875,
+        "bytes_adopted": 10522669875,
+        "bytes_matched": 0,
+        "bytes_orphan": 0,
+        "files_total": 12,
+        "files_orphan": 0,
+        "name": "opensuse",
+        "path": "opensuse",
+        "is_dir": true,
+        "states": [
+          "adopted",
+          "overlap"
+        ]
+      },
+      {
+        "bytes_total": 1181116006,
+        "bytes_adopted": 0,
+        "bytes_matched": 429496729,
+        "bytes_orphan": 751619276,
+        "files_total": 9,
+        "files_orphan": 4,
+        "name": "alpine",
+        "path": "alpine",
+        "is_dir": true,
+        "states": [
+          "partial"
+        ]
+      },
+      {
+        "bytes_total": 6871947673,
+        "bytes_adopted": 0,
+        "bytes_matched": 0,
+        "bytes_orphan": 6871947673,
+        "files_total": 17,
+        "files_orphan": 17,
+        "name": "incoming",
+        "path": "incoming",
+        "is_dir": true,
+        "states": []
+      },
+      {
+        "bytes_total": 18442,
+        "bytes_adopted": 0,
+        "bytes_matched": 0,
+        "bytes_orphan": 18442,
+        "files_total": 1,
+        "files_orphan": 1,
+        "name": "CHECKSUMS.txt",
+        "path": "CHECKSUMS.txt",
+        "is_dir": false,
+        "states": []
+      }
+    ],
+    "truncated": false
+  }
+}
