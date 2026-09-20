@@ -61,8 +61,24 @@ run = [
 description = "Formatting + clippy"
 depends = ["fmt", "lint"]
 
+# The native prefix deliberately does NOT get its path from a [env] entry here:
+# a bare `cargo build` outside mise has to resolve the same directory, so both
+# sides independently expand ${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native.
+[tasks.native]
+description = "Provision the shared libtorrent/Boost prefix (first run: 5-15 min)"
+run = [
+  "git submodule update --init --recursive --depth 1",
+  "cargo build -p libtorrent-sys",
+  "ls -d ${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native/*/",
+]
+
+[tasks.native-clean]
+description = "Delete every cached native prefix (~115 MB per pinned version)"
+run = "rm -rf ${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native"
+
 [tasks.setup]
-description = "One-time dev setup: nightly rustfmt toolchain + activate git hooks"
+description = "One-time dev setup: native prefix, nightly rustfmt toolchain, git hooks"
+depends = ["native"]
 run = [
   "rustup toolchain install nightly --profile minimal --component rustfmt",
   "hk install",
