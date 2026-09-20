@@ -2,10 +2,67 @@
 //!
 //! `SlotId` is the cheap-to-clone key used in StateMap, registry, and
 //! every `(slot_id, alert)` pair. `SlotConfig` is the operator-supplied
-//! shape parsed from TOML (PRD §Multi-Account `[[slot]]`); validation
-//! cross-checks lives here so SIGHUP reload and startup share one path.
-//! `Slot` bundles the config with the runtime engine so the daemon's
-//! HTTP handlers can answer `/slots/{slot_id}` queries.
+//! shape parsed from TOML; validation cross-checks live here so SIGHUP
+//! reload and startup share one path. `Slot` bundles the config with the
+//! runtime engine so the daemon's HTTP handlers can answer
+//! `/slots/{slot_id}` queries.
+//!
+//! # Why a slot is a whole separate session
+//!
+//! libtorrent identifies a torrent solely by info-hash. One `lt::session`
+//! cannot hold two entries with the same info-hash however much their tracker
+//! URLs differ — a duplicate add either errors or hands back the existing
+//! handle with the second torrent's tracker URL ignored. Two accounts on one
+//! private tracker will routinely share content, which means identical
+//! info-hashes with different passkeys in the announce URLs. Multiplexing
+//! accounts inside one session is therefore not a design choice that was
+//! rejected; it is impossible. The isolation boundary is a session per slot.
+//!
+//! # Safety rules
+//!
+//! Private trackers ban for cross-contamination between accounts, and the ban
+//! is permanent. These are hard constraints with no configuration option to
+//! disable them. Each has a test; each is here rather than in a design
+//! document because the next person to touch this file is the one who needs
+//! to read them.
+//!
+//! 1. **No bare-IP fallback.** If a slot's tunnel does not come up, that
+//!    slot's session is never constructed. The daemon does not fall back to
+//!    the host's public IP. The slot is recorded failed and reported; the
+//!    others proceed.
+//! 2. **No cross-slot announce.** `outgoing_interfaces` is pinned to the
+//!    tunnel IP, so libtorrent binds outgoing connections to it at the socket
+//!    level. If the tunnel drops, subsequent attempts fail at `bind()` rather
+//!    than falling out over the bare interface.
+//! 3. **Global info-hash uniqueness.** An add is refused with 409 if the
+//!    info-hash is loaded in *any* slot, not just the target. The same torrent
+//!    seeding under two accounts is visible to the tracker as one info-hash
+//!    announcing from two IPs it can associate with one operator.
+//! 4. **The assignment registry is consulted before every load.** At API add,
+//!    at the startup scan, and at resume load. The session layer never
+//!    receives a torrent whose slot has not been verified.
+//! 5. **PEX is always disabled.** `disable_pex` is set unconditionally on
+//!    every torrent in every slot, including on resume load. libtorrent does
+//!    refuse to instantiate the PEX plugin for torrents carrying the `private`
+//!    flag — but that relies on the torrent's own metadata being correct, and
+//!    this guard is what catches a non-private torrent added to a slot by
+//!    mistake.
+//! 6. **DHT is always disabled** on slot sessions. BEP 42 derives part of a
+//!    DHT node ID from the external IP, so even with separate IPs a slot
+//!    running DHT leaves a correlatable node ID in other peers' routing
+//!    tables. There is no config key that can turn it on.
+//! 7. **SIGHUP cannot change identity-critical fields.** The tunnel
+//!    interface, listen port, peer fingerprint, user agent and per-slot
+//!    directories are what a tracker sees as an account's identity. Changes
+//!    are detected, warned about, and ignored; applying them means a restart.
+//! 8. **Listen ports are unique across slots.** The port is announced, so two
+//!    slots sharing one would be correlatable by a tracker operator even from
+//!    different IPs. Enforced for static slots; gateway-assigned NAT-PMP ports
+//!    are unique by construction.
+//!
+//! `allowed_tracker_domains` is *not* in this list. It is a misconfiguration
+//! guard against loading one slot's `.torrent` into another, checked at add
+//! time — not an egress control, and not a security boundary.
 
 use std::fmt;
 use std::path::PathBuf;

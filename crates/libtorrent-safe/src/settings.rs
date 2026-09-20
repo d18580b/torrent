@@ -137,9 +137,65 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// Construct a Settings struct holding the PRD §5 server overrides on top
-    /// of libtorrent's `high_performance_seed()` preset. Fields not set here
-    /// inherit the preset's value.
+    /// The server overrides layered on libtorrent's `high_performance_seed()`
+    /// preset. Fields not set here inherit the preset.
+    ///
+    /// The preset is the right base: it already tunes disk I/O, buffer sizes
+    /// and peer limits for seeding, which `default_settings()` does not. Each
+    /// override below exists for a reason specific to running tens of
+    /// thousands of torrents on one server, and each is easy to get wrong by
+    /// "tidying" it, so the reasons live here rather than in a design
+    /// document:
+    ///
+    /// * `connections_limit` (preset 8000) — scales with the hardware;
+    ///   operator-configurable.
+    /// * `file_pool_size` (preset 500) — the open-file-descriptor cache. A
+    ///   pool of many small files thrashes a 500-entry cache.
+    /// * `max_peerlist_size` (settings default 3000, not set by the preset) —
+    ///   cutting it to 1000 is roughly a 67% reduction in per-torrent peer-list
+    ///   memory, which at 100k torrents is the difference that matters.
+    /// * `max_paused_peerlist_size` (default 1000) — a paused torrent needs
+    ///   almost no peer list at all.
+    /// * `enable_upnp` / `enable_natpmp` — off. A server has static port
+    ///   forwarding; session-wide NAT traversal is not wanted. (Slots that
+    ///   negotiate a port do it explicitly over NAT-PMP against the tunnel
+    ///   gateway, which is a different mechanism from this setting.)
+    /// * `enable_lsd` — off by default; local peer discovery is noise on a
+    ///   server and is forbidden outright for private slots.
+    /// * `no_atime_storage` — keep the preset's `true`. Otherwise every read
+    ///   of every piece writes an atime, which on a seeding box is a
+    ///   continuous write load for no benefit.
+    /// * `announce_to_all_trackers` — false. Announcing to every tracker in a
+    ///   tier multiplies tracker load by the tier size for no gain.
+    /// * `announce_to_all_tiers` — **false, overriding the preset's true.**
+    ///   At 10k+ torrents, announcing to every tier is the single largest
+    ///   source of outbound announce traffic; the first working tier is
+    ///   sufficient.
+    /// * `prefer_udp_trackers` — keep `true`; UDP announces are far cheaper
+    ///   per torrent at this scale.
+    /// * `max_concurrent_http_announces` (preset 50) — 200, so that a restart
+    ///   with 10k+ torrents converges on its trackers in minutes rather than
+    ///   tens of minutes.
+    /// * `aio_threads` — tune to the disk subsystem; operator-configurable.
+    /// * `alert_queue_size` — 10000. libtorrent **silently drops alerts** when
+    ///   this is exceeded, with no backpressure of any kind, and a dropped
+    ///   `save_resume_data_alert` is resume data never written. This is the
+    ///   headroom the dedicated poll thread is sized against.
+    ///
+    /// Deliberately *not* set here, and worth knowing why:
+    ///
+    /// * `active_limit` / `active_seeds` — kept at the preset's values, but
+    ///   they only govern libtorrent's auto-manager queue, and no torrent is
+    ///   added `auto_managed`. They are no-ops unless that changes.
+    /// * `unchoke_slots_limit` — the preset is already unlimited.
+    /// * `upload_rate_limit` — the preset's 0 (unlimited) is the default;
+    ///   operator-configurable.
+    /// * `seed_choking_algorithm` — the preset's round-robin is what a seeder
+    ///   wants (fair distribution across peers rather than favouring the
+    ///   fastest), so it is inherited rather than restated.
+    ///
+    /// This function is the single writer of these defaults: startup and
+    /// SIGHUP both go through it, so the two cannot drift.
     pub fn server_seed_overrides() -> Self {
         Self {
             connections_limit: Some(10_000),
