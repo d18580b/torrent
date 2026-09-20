@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # The default branch is `master`. This said `main`, so no push to the
+    # default branch has ever run CI — every check has come from the
+    # pull_request trigger, leaving post-merge `master` unverified.
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -228,6 +231,20 @@ jobs:
       # no Node whatsoever, which is what anyone running the headless daemon
       # gets with `--no-default-features`.
       - run: cargo build -p seederd --no-default-features
+
+  container:
+    name: container image builds
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      # Nothing built deploy/Containerfile, which is why it was able to sit
+      # broken: no Node in the builder stage while `web-ui` is a default
+      # feature, so crates/seederd/build.rs panicked rather than degrading.
+      - name: Build the image
+        run: podman build -f deploy/Containerfile -t seederd:ci .
 
   web:
     name: web client
