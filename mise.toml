@@ -69,16 +69,19 @@ description = "Provision the shared libtorrent/Boost prefix (first run: 5-15 min
 run = [
   "git submodule update --init --recursive --depth 1",
   "cargo build -p libtorrent-sys",
-  "ls -d ${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native/*/",
+  # Honours LIBTORRENT_SYS_CACHE_DIR, which build.rs checks before XDG, and
+  # tolerates the glob not matching rather than failing a 15-minute task.
+  'ls -d "${LIBTORRENT_SYS_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native}"/*/ || true',
 ]
 
 [tasks.native-clean]
 description = "Delete every cached native prefix (~115 MB per pinned version)"
-run = "rm -rf ${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native"
+run = 'rm -rf "${LIBTORRENT_SYS_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native}"'
 
+# Deliberately does NOT depend on `native`: installing the git hooks should not
+# cost a 15-minute, 1.5 GB provision for someone who only wants the hooks.
 [tasks.setup]
-description = "One-time dev setup: native prefix, nightly rustfmt toolchain, git hooks"
-depends = ["native"]
+description = "One-time dev setup: nightly rustfmt toolchain + activate git hooks"
 run = [
   "rustup toolchain install nightly --profile minimal --component rustfmt",
   "hk install",

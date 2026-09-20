@@ -57,8 +57,10 @@ The submodules are needed only to build the native prefix described in §3.
 Once that exists they can be absent.
 
 `.gitmodules` pins libtorrent to v2.0.14 and Boost to 1.83.0 by commit, and
-names immutable tags rather than branches — so `git submodule update --remote`
-cannot silently move a pin to a branch tip.
+names the immutable tag `v2.0.14` for libtorrent rather than a branch. The
+Boost entry has no `branch` at all, so `git submodule update --remote` would
+still move it to boostorg/boost's default branch. Don't run it unless you mean
+to re-pin.
 
 ## 3. Build
 

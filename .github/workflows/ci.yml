@@ -71,12 +71,13 @@ jobs:
       - uses: cargo-bins/cargo-binstall@main
       - uses: jdx/mise-action@v2
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-
 
@@ -131,12 +132,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.90
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: cargo-shimtests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-shimtests-${{ runner.os }}-
 
@@ -166,12 +168,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.90
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: cargo-integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-integration-${{ runner.os }}-
 
@@ -201,12 +204,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@1.90
 
-      - name: Cache cargo registry
+      - name: Cache cargo registry + target
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            target
           key: cargo-daemononly-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-daemononly-${{ runner.os }}-
 

@@ -26,7 +26,7 @@ gone stale.
 ## Quick start
 
 ```bash
-mise run native                                     # submodules + libtorrent, 5–15 min, once
+mise install && mise run native                     # submodules + libtorrent, 5–15 min, once
 cargo build --workspace --release
 ./target/release/torrentd --config /etc/torrentd/torrentd.toml
 ```
