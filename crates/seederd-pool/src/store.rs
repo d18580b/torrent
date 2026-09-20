@@ -938,6 +938,45 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Files under `(root_id, prefix)` that `infohash` does **not** claim.
+    ///
+    /// A relocate moves a whole directory, so the only way that is safe is if
+    /// the directory holds nothing but this torrent's payload. Anything else
+    /// under there — another torrent's files, or unclaimed bytes — would be
+    /// dragged along by the rename without appearing anywhere in the plan.
+    ///
+    /// Returns at most `limit` paths; the caller only needs enough to name one
+    /// in the refusal.
+    pub fn foreign_files_under(
+        &self,
+        root_id: i64,
+        prefix: &str,
+        infohash: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, PoolError> {
+        let like = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_end_matches('/'))
+        };
+        let upper = prefix_upper_bound(&like);
+        let mut st = self.conn.prepare(
+            "SELECT f.rel_path FROM file f
+             WHERE f.root_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3
+               AND NOT EXISTS (
+                 SELECT 1 FROM claim c
+                 WHERE c.root_id = f.root_id AND c.rel_path = f.rel_path
+                   AND c.infohash = ?4
+               )
+             ORDER BY f.rel_path
+             LIMIT ?5",
+        )?;
+        let rows = st.query_map(params![root_id, like, upper, infohash, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     /// Whether one specific file is claimed by no torrent.
     ///
     /// The single-file form of [`PoolStore::orphan_files`], for the last-moment

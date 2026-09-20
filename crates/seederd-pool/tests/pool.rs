@@ -822,13 +822,17 @@ fn relocating_onto_existing_files_is_refused() {
     // letting a person look at it.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    write_file(root, "T/a.bin", 128);
+    // The payload sits in a subdirectory, not directly under the root: a
+    // torrent matched at the root is refused earlier and for a different
+    // reason (see `relocating_from_the_root_itself_is_refused`), which would
+    // mask the destination check this test exists for.
+    write_file(root, "src/T/a.bin", 128);
     write_file(root, "dest/T/a.bin", 999);
 
     let mut store = PoolStore::open_in_memory().unwrap();
     let root_id = store.upsert_root(root).unwrap();
     seederd_pool::scan_root(&mut store, root).unwrap();
-    add_torrent(&mut store, "x1", "T", None, &[("T/a.bin", 128)]);
+    add_torrent(&mut store, "x1", "T", Some("src"), &[("T/a.bin", 128)]);
     seederd_pool::match_all(&mut store).unwrap();
 
     let e = build_plan(
@@ -843,6 +847,103 @@ fn relocating_onto_existing_files_is_refused() {
     )
     .unwrap_err();
     assert!(e.contains("already contains"), "got {e}");
+}
+
+#[test]
+fn relocating_from_the_root_itself_is_refused() {
+    // The matcher admits the root as a placement candidate, so a torrent whose
+    // files sit directly under a root records an empty base. A relocate step is
+    // a directory rename, so honouring that would rename the managed root:
+    // every other torrent in it, and everything that is not a torrent at all.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "T/a.bin", 128);
+    write_file(root, "Unrelated/big.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "x1", "T", None, &[("T/a.bin", 128)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let e = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "x1".into(),
+            dest_root_id: root_id,
+            dest_rel: "archive".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(e.contains("matched at the root itself"), "got {e}");
+    // And the bystander is still there, which is the whole point.
+    assert!(root.join("Unrelated/big.bin").exists());
+}
+
+#[test]
+fn relocating_a_shared_base_directory_is_refused() {
+    // Two torrents under one base: renaming that directory for one of them
+    // takes the other's payload along, and nothing in the plan would say so.
+    // File-level `overlap` does not catch this — the torrents claim disjoint
+    // files.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "Shows/A/a.bin", 128);
+    write_file(root, "Shows/B/b.bin", 256);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "x1", "A", Some("Shows"), &[("A/a.bin", 128)]);
+    add_torrent(&mut store, "x2", "B", Some("Shows"), &[("B/b.bin", 256)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let e = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "x1".into(),
+            dest_root_id: root_id,
+            dest_rel: "archive".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(
+        e.contains("not exclusively this torrent's payload"),
+        "got {e}"
+    );
+}
+
+#[test]
+fn relocating_a_base_holding_unclaimed_files_is_refused() {
+    // Same hazard, without a second torrent: a rename would silently carry
+    // bytes no torrent protects, which then appear to have vanished.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "src/T/a.bin", 128);
+    write_file(root, "src/notes.txt", 12);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    seederd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "x1", "T", Some("src"), &[("T/a.bin", 128)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let e = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "x1".into(),
+            dest_root_id: root_id,
+            dest_rel: "archive".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(e.contains("notes.txt"), "got {e}");
 }
 
 #[test]
