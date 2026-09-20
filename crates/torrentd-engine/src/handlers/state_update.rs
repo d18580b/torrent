@@ -29,14 +29,23 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     //   2=downloading_metadata, 3=downloading, 4=finished,
                     //   5=seeding, 6=allocating, 7=checking_resume_data
                     //
-                    // The paused bit is checked first and wins. libtorrent
-                    // keeps reporting `seeding` for a paused torrent — pausing
-                    // stops the transfers, it does not change the state enum —
-                    // so mapping on `state` alone meant `TorrentPhase::Paused`
-                    // was never assigned by anything, and `/status` reported a
-                    // permanent zero however many torrents were paused. That
-                    // includes every torrent in a slot the VPN monitor fenced,
-                    // which is exactly when an operator looks.
+                    // The paused bit wins over the state enum, because
+                    // libtorrent keeps reporting `seeding` for a paused
+                    // torrent: pausing stops the transfers, it does not change
+                    // `state`. Mapping on the enum alone is why
+                    // `TorrentPhase::Paused` was never assigned by anything
+                    // and `/status` reported a permanent zero however many
+                    // torrents were paused — including a whole slot the VPN
+                    // monitor had fenced, which is exactly when someone looks.
+                    //
+                    // `Errored` / `UploadMode` are deliberately *not* pinned
+                    // above this. They are cleared by a healthy `seeding`
+                    // update, which is how a torrent that recovered from a
+                    // disk error leaves upload_mode; making them sticky would
+                    // strand it there. While a torrent is both paused and in
+                    // upload_mode, paused shows — the state an operator acts
+                    // on first — and if the disk error is still there when it
+                    // resumes, the alert fires again.
                     let flags = TorrentFlags::from_bits_truncate(s.flags);
                     let phase = if flags.contains(TorrentFlags::PAUSED) {
                         TorrentPhase::Paused
