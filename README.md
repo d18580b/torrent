@@ -26,10 +26,16 @@ gone stale.
 ## Quick start
 
 ```bash
-git submodule update --init --recursive --depth 1   # vendored libtorrent + Boost, ~1.5 GB
-cargo build --workspace --release                   # first build is 5–15 min
+mise run native                                     # submodules + libtorrent, 5–15 min, once
+cargo build --workspace --release
 ./target/release/torrentd --config /etc/torrentd/torrentd.toml
 ```
+
+`mise run native` fetches the vendored submodules (~1.5 GB) and builds Boost
+and libtorrent into `~/.cache/torrentd/native`. That prefix is keyed by
+content, so it survives `cargo clean`, is shared across git worktrees, and is
+reused by every cargo profile — you pay for it once per pinned version, not
+once per build directory.
 
 Node is a build dependency by default — the web client is compiled into the
 binary. `cargo build -p torrentd --no-default-features` gives you the headless
