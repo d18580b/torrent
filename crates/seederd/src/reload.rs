@@ -46,6 +46,15 @@ pub async fn run(
                 "SIGHUP: change to non-reloadable field requires daemon restart; ignored",
             );
         }
+        // Safety Rule 7: identity-critical slot fields cannot change under a
+        // live session, and the operator has to be told rather than left
+        // believing a reload took.
+        for sc in &diff.slot_changes {
+            warn!(
+                changed_field = %sc,
+                "SIGHUP: slot identity change requires daemon restart; ignored",
+            );
+        }
         if let Some(level) = diff.log_level {
             match log_handle.set_level(level) {
                 Ok(()) => info!(new_log_level = level.as_str(), "SIGHUP: log level applied"),

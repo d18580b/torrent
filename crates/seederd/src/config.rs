@@ -175,6 +175,31 @@ impl Config {
         if !self.slot.is_empty() {
             SlotConfig::validate_set(&self.slot).context("[[slot]] validation failed")?;
         }
+        // Range-check the numeric overrides. These are handed to libtorrent as
+        // ints; a zero connection limit or aio_threads silently produces a
+        // daemon that cannot seed, and there is no reason to find that out
+        // from a metrics graph rather than at startup.
+        let range = |name: &str, v: Option<u32>, lo: u32, hi: u32| -> anyhow::Result<()> {
+            if let Some(v) = v {
+                if v < lo || v > hi {
+                    anyhow::bail!("{name} = {v} is out of range ({lo}..={hi})");
+                }
+            }
+            Ok(())
+        };
+        range("connections_limit", self.connections_limit, 1, 1_000_000)?;
+        range("file_pool_size", self.file_pool_size, 1, 1_000_000)?;
+        range("aio_threads", self.aio_threads, 1, 1024)?;
+        range(
+            "max_concurrent_http_announces",
+            self.max_concurrent_http_announces,
+            1,
+            100_000,
+        )?;
+        // upload_rate_limit is a byte/sec cap where 0 means unlimited, so 0 is
+        // valid and only the absurd upper end is worth rejecting.
+        range("upload_rate_limit", self.upload_rate_limit, 0, u32::MAX)?;
+
         if let Some(auth) = &self.auth {
             auth.validate()?;
         }
@@ -279,6 +304,7 @@ impl Config {
         if old.session_state_path != new.session_state_path {
             d.non_reloadable_changes.push("session_state_path");
         }
+        d.slot_changes = diff_slots(&old.slot, &new.slot);
         d
     }
 
@@ -347,6 +373,59 @@ impl Config {
 }
 
 /// Result of `Config::diff`. Reloadable fields are populated with the
+/// Report `[[slot]]` changes that a reload cannot apply.
+///
+/// Every field here is identity-critical: the tunnel a session is bound to,
+/// the port it announces, the peer fingerprint and user agent a tracker sees,
+/// and where its resume and torrent files live. Changing any of them means a
+/// different account identity to the tracker, which is a restart — not
+/// something to swap under a live session. Adding or removing slots is
+/// likewise a restart, since the slot set is fixed when sessions are built.
+fn diff_slots(old: &[SlotConfig], new: &[SlotConfig]) -> Vec<String> {
+    use std::collections::BTreeMap;
+    let index = |v: &[SlotConfig]| -> BTreeMap<String, SlotConfig> {
+        v.iter()
+            .map(|s| (s.id.as_str().to_string(), s.clone()))
+            .collect()
+    };
+    let (o, n) = (index(old), index(new));
+    let mut out = Vec::new();
+
+    for id in n.keys() {
+        if !o.contains_key(id) {
+            out.push(format!("{id}: added (the slot set is fixed at startup)"));
+        }
+    }
+    for (id, a) in &o {
+        let Some(b) = n.get(id) else {
+            out.push(format!("{id}: removed (the slot set is fixed at startup)"));
+            continue;
+        };
+        let mut field = |name: &str, changed: bool| {
+            if changed {
+                out.push(format!("{id}.{name}"));
+            }
+        };
+        field("vpn_profile", a.vpn_profile != b.vpn_profile);
+        field("vpn_type", a.vpn_type != b.vpn_type);
+        field("vpn_interface", a.vpn_interface != b.vpn_interface);
+        field("listen_port", a.listen_port != b.listen_port);
+        field(
+            "peer_fingerprint_hex",
+            a.peer_fingerprint_hex != b.peer_fingerprint_hex,
+        );
+        field("user_agent", a.user_agent != b.user_agent);
+        field("resume_dir", a.resume_dir != b.resume_dir);
+        field("torrent_dir", a.torrent_dir != b.torrent_dir);
+        field("port_forward", a.port_forward != b.port_forward);
+        field(
+            "port_forward_gateway",
+            a.port_forward_gateway != b.port_forward_gateway,
+        );
+    }
+    out
+}
+
 /// new value; `non_reloadable_changes` lists the names that differ but
 /// can't be applied without restart.
 #[derive(Debug, Default)]
@@ -358,6 +437,12 @@ pub struct ConfigDiff {
     pub enable_lsd: Option<bool>,
     pub log_level: Option<LogLevel>,
     pub non_reloadable_changes: Vec<&'static str>,
+    /// Per-slot identity fields that changed and were ignored, as
+    /// `"<slot_id>.<field>"`. Safety Rule 7 requires a warning for these and
+    /// `Config::diff` used to skip `[[slot]]` entirely, so changing a slot's
+    /// VPN interface, port, fingerprint, user agent or directories on SIGHUP
+    /// was swallowed in silence.
+    pub slot_changes: Vec<String>,
 }
 
 impl ConfigDiff {
@@ -382,6 +467,7 @@ impl ConfigDiff {
             && self.enable_lsd.is_none()
             && self.log_level.is_none()
             && self.non_reloadable_changes.is_empty()
+            && self.slot_changes.is_empty()
     }
 }
 
@@ -532,6 +618,16 @@ library_dir = "{d}/library"
         let p = write_cfg(dir.path(), &body);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("must not nest"), "got: {msg}");
+    }
+
+    #[test]
+    fn out_of_range_numbers_are_rejected_at_startup() {
+        let dir = tempdir().unwrap();
+        let bad = SINGLE_SESSION.to_string() + "\naio_threads = 0\n";
+        let p = write_cfg(dir.path(), &bad);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("aio_threads"), "got: {msg}");
+        assert!(msg.contains("out of range"), "got: {msg}");
     }
 
     #[test]

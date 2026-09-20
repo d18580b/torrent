@@ -60,14 +60,34 @@ pub enum TorrentStoreError {
 #[derive(Debug)]
 pub struct FsTorrentStore {
     base: PathBuf,
+    /// Explicit directory for a slot, from its `[[slot]]` config.
+    ///
+    /// Without this the layout is always `<base>/<slot_id>`, and a slot that
+    /// configured a directory elsewhere had it validated for uniqueness and
+    /// then silently ignored — the files landed somewhere the operator had not
+    /// asked for, and matched only by coincidence when the configured path
+    /// happened to equal the derived one.
+    overrides: std::collections::HashMap<SlotId, PathBuf>,
 }
 
 impl FsTorrentStore {
     pub fn new(base: impl Into<PathBuf>) -> Self {
-        Self { base: base.into() }
+        Self {
+            base: base.into(),
+            overrides: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Pin `slot` to an explicit directory rather than the derived one.
+    pub fn with_slot_dir(mut self, slot: SlotId, dir: impl Into<PathBuf>) -> Self {
+        self.overrides.insert(slot, dir.into());
+        self
     }
 
     fn dir_for(&self, slot: &SlotId) -> PathBuf {
+        if let Some(dir) = self.overrides.get(slot) {
+            return dir.clone();
+        }
         if slot.is_default() {
             self.base.clone()
         } else {
