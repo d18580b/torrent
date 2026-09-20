@@ -121,6 +121,32 @@ fn build_relocate(
         )));
     };
 
+    // The matcher admits the root itself as a placement candidate, so a torrent
+    // whose files sit directly under a root records an empty base. A relocate
+    // from there would rename the managed root — every torrent in it, plus
+    // everything that is not a torrent at all.
+    if src_base.trim_matches('/').is_empty() {
+        return Ok(Err(Refused(
+            "this torrent is matched at the root itself, so there is no directory to move \
+             that is not the whole root; move it into a subdirectory first"
+                .into(),
+        )));
+    }
+
+    // A move step is a directory rename, so anything else living under that
+    // directory travels with it without ever appearing in the plan. Refuse
+    // unless the directory holds this torrent's payload and nothing else.
+    let foreign = store.foreign_files_under(src_root_id, &src_base, infohash, 3)?;
+    if !foreign.is_empty() {
+        return Ok(Err(Refused(format!(
+            "{} is not exclusively this torrent's payload — it also holds {}{}; \
+             moving it would take those too",
+            src_base,
+            foreign.join(", "),
+            if foreign.len() == 3 { " and more" } else { "" },
+        ))));
+    }
+
     let dest_rel = dest_rel.trim_matches('/');
     // `src_base` is the matcher's own record so it is already root-relative;
     // `dest_rel` is caller-supplied and is the one that must be checked.

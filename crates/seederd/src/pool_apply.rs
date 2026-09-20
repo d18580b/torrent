@@ -23,6 +23,7 @@ use seederd_pool::model::ops;
 use seederd_pool::model::plan_status;
 use seederd_pool::model::step_status;
 use seederd_pool::model::PlanStepRow;
+use seederd_pool::AdoptionState;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -157,8 +158,13 @@ fn move_torrent(
     // The infohash is recovered from the claim rather than carried in the step,
     // so a resumed apply re-resolves against the current index instead of a
     // stale copy.
-    let infohash = torrent_at(pool, Path::new(&step.src))
-        .ok_or("cannot resolve which torrent lives at the source path")?;
+    let infohash = torrent_at(pool, Path::new(&step.src))?;
+
+    // Every refusal the planner made has to hold now, not when the plan was
+    // drafted. A rescan or a `POST /api/pool/drift` between the two can turn a
+    // relocatable torrent into an overlapping or drifted one, and the whole
+    // point of those states is that moving the payload breaks something.
+    recheck_relocatable(pool, &infohash, Path::new(&step.src))?;
 
     let hash = libtorrent_safe::InfoHash::from_hex(&infohash).ok_or("bad infohash")?;
     let Some(st) = state.get(&hash) else {
@@ -301,9 +307,19 @@ fn under_a_managed_root(pool: &PoolService, path: &Path) -> bool {
 /// Resolved from the index at apply time rather than carried in the step, so a
 /// plan resumed after a restart re-binds to the current state of the world
 /// instead of a snapshot that may no longer hold.
-fn torrent_at(pool: &PoolService, dir: &Path) -> Option<String> {
+///
+/// Refuses when more than one torrent answers to the same base directory.
+/// Returning the first match would bind the move to an arbitrary torrent — not
+/// necessarily the one the plan was built for — and then move the directory
+/// out from under all the others.
+fn torrent_at(pool: &PoolService, dir: &Path) -> Result<String, String> {
+    let mut found: Vec<String> = Vec::new();
     pool.with_store(|store| {
-        for t in store.torrents().ok()? {
+        let torrents = match store.torrents() {
+            Ok(t) => t,
+            Err(e) => return Err(e.to_string()),
+        };
+        for t in torrents {
             let Ok(Some((root_id, base))) = store.adoption_base(&t.infohash) else {
                 continue;
             };
@@ -317,10 +333,67 @@ fn torrent_at(pool: &PoolService, dir: &Path) -> Option<String> {
                 root.join(base)
             };
             if full == dir {
-                return Some(t.infohash);
+                found.push(t.infohash);
+                if found.len() > 1 {
+                    break;
+                }
             }
         }
-        None
+        Ok(())
+    })?;
+    match found.len() {
+        0 => Err(format!(
+            "no torrent in the library is based at {}",
+            dir.display(),
+        )),
+        1 => Ok(found.remove(0)),
+        _ => Err(format!(
+            "more than one torrent is based at {}; refusing to guess which one this plan meant",
+            dir.display(),
+        )),
+    }
+}
+
+/// Re-run the planner's relocate refusals against the index as it is now.
+fn recheck_relocatable(pool: &PoolService, infohash: &str, src: &Path) -> Result<(), String> {
+    pool.with_store(|store| {
+        match store.adoption_state(infohash).map_err(|e| e.to_string())? {
+            Some(AdoptionState::Adopted) | Some(AdoptionState::Matched) => {}
+            Some(AdoptionState::Overlap) => {
+                return Err(
+                    "another torrent now claims these files; moving them would break it".into(),
+                )
+            }
+            Some(AdoptionState::Drifted) => {
+                return Err("payload changed since the plan was built; rescan and verify".into())
+            }
+            other => {
+                return Err(format!(
+                    "torrent is now {}, not relocatable",
+                    other.map(|s| s.as_str()).unwrap_or("unknown"),
+                ))
+            }
+        }
+
+        // The source is a directory rename, so it still has to hold this
+        // torrent's payload and nothing else.
+        let Some((root_id, base)) = store.adoption_base(infohash).map_err(|e| e.to_string())? else {
+            return Err("no source location recorded".into());
+        };
+        if base.trim_matches('/').is_empty() {
+            return Err("torrent is matched at the root itself; refusing to move a whole root".into());
+        }
+        let foreign = store
+            .foreign_files_under(root_id, &base, infohash, 3)
+            .map_err(|e| e.to_string())?;
+        if !foreign.is_empty() {
+            return Err(format!(
+                "{} now holds files this torrent does not claim ({}); moving it would take those too",
+                src.display(),
+                foreign.join(", "),
+            ));
+        }
+        Ok(())
     })
 }
 
