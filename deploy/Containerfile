@@ -4,7 +4,7 @@
 # Compiles vendored Boost + libtorrent + the shim + the daemon.
 # Stage 2 (runtime): Fedora minimal + just OpenSSL + ca-certificates.
 
-FROM fedora:43 AS builder
+FROM registry.fedoraproject.org/fedora:43 AS builder
 
 # nodejs/npm are build-time dependencies: the `web-ui` feature is on by
 # default and crates/torrentd/build.rs shells out to `npm` to build the
@@ -31,7 +31,9 @@ RUN cargo build --release --workspace --bin torrentd
 
 # ---- runtime --------------------------------------------------------------
 
-FROM fedora:43-minimal
+# `fedora-minimal:43`, not `fedora:43-minimal` — the latter is not a tag that
+# exists in any registry, so the runtime stage could never be pulled.
+FROM registry.fedoraproject.org/fedora-minimal:43
 
 # curl: used by HEALTHCHECK below. procps-ng: `pkill`, which the OpenVPN
 # teardown path shells out to — a hard runtime dependency for vpn_type =
