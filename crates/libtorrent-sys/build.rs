@@ -2,20 +2,23 @@
 //
 // Sequence per the plan (T07–T13):
 //
-//   1. Sanity-check that vendor/libtorrent and vendor/boost submodules are
+//   1. Run bindgen against wrapper.h to produce $OUT_DIR/bindings.rs. This
+//      happens FIRST and unconditionally: wrapper.h reaches only the two C
+//      shim headers, which include nothing but <stddef.h>/<stdint.h>, so
+//      bindgen reads no libtorrent or Boost header and costs ~1s.
+//   2. Sanity-check that vendor/libtorrent and vendor/boost submodules are
 //      initialized; print a clear error otherwise.
-//   2. CMake-install Boost into OUT_DIR/boost (headers only — libtorrent
+//   3. CMake-install Boost into OUT_DIR/boost (headers only — libtorrent
 //      v2.0.12 + Boost ≥ 1.69 needs only Boost::headers).
-//   3. CMake-install libtorrent into OUT_DIR/libtorrent, statically.
-//   4. Compile shim/libtorrent_shim.cpp via cc::Build, with the same
+//   4. CMake-install libtorrent into OUT_DIR/libtorrent, statically.
+//   5. Compile shim/libtorrent_shim.cpp via cc::Build, with the same
 //      C++ standard and ABI flags libtorrent was built with.
-//   5. Run bindgen against wrapper.h to produce $OUT_DIR/bindings.rs.
 //   6. Emit cargo link directives in the order Linux's static linker
 //      requires: shim → libtorrent → OpenSSL → pthread → stdc++.
 //
-// When the `bundled` feature is OFF the entire pipeline is skipped — used
-// for future system-package consumers and for editor LSP runs that only
-// want a check-pass.
+// When the `bundled` feature is OFF, steps 2-6 are skipped but step 1 still
+// runs, so the generated bindings stay complete — used for system-package
+// consumers and for editor LSP runs that only want a check-pass.
 
 use std::env;
 use std::path::Path;
@@ -31,31 +34,37 @@ fn main() {
     println!("cargo:rerun-if-changed=shim/alert_union.h");
     println!("cargo:rerun-if-changed=shim/libtorrent_shim.cpp");
 
+    let manifest_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
+
+    // Unconditional, and deliberately not cached. wrapper.h includes only
+    // shim/alert_union.h and shim/libtorrent_shim.h, which in turn include
+    // nothing but <stddef.h> and <stdint.h> — bindgen never reads a libtorrent
+    // or Boost header, so it costs ~1s and does not depend on the native build
+    // at all. Regenerating it from source on every run is also what guarantees
+    // bindings.rs can never go stale against the shim headers it describes,
+    // which matters because run_bindgen sets layout_tests(false) and so would
+    // not catch a struct-layout drift.
+    run_bindgen(&manifest_dir, &out_dir);
+
     if env::var_os("CARGO_FEATURE_BUNDLED").is_none() {
         println!(
             "cargo:warning=libtorrent-sys: `bundled` feature disabled; \
                   no native build performed. Provide libtorrent + shim symbols externally."
         );
-        // Emit an empty bindings.rs so src/lib.rs still includes a valid file.
-        let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-        std::fs::write(out_dir.join("bindings.rs"), "// bundled feature disabled\n")
-            .expect("write empty bindings.rs");
         return;
     }
 
-    let manifest_dir =
-        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let boost_src = manifest_dir.join(BOOST_DIR);
     let lt_src = manifest_dir.join(LIBTORRENT_DIR);
 
     sanity_check_submodules(&boost_src, &lt_src);
     ensure_compilers();
 
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let boost_install = build_boost(&boost_src, &out_dir.join("boost"));
     let lt_install = build_libtorrent(&lt_src, &out_dir.join("libtorrent"), &boost_install);
     compile_shim(&manifest_dir, &lt_install, &boost_install);
-    run_bindgen(&manifest_dir);
     emit_link_directives(&lt_install, &boost_install);
 }
 
@@ -260,9 +269,8 @@ fn compile_shim(manifest_dir: &Path, lt_install: &Path, boost_install: &Path) {
     build.compile("libtorrent_shim");
 }
 
-fn run_bindgen(manifest_dir: &Path) {
+fn run_bindgen(manifest_dir: &Path, out_dir: &Path) {
     eprintln!("libtorrent-sys: running bindgen");
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
     let bindings = bindgen::Builder::default()
         .header(manifest_dir.join("wrapper.h").to_string_lossy())
         .clang_arg(format!("-I{}", manifest_dir.join("shim").display()))
