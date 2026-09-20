@@ -38,6 +38,9 @@ pub struct AppState {
     pub alert_heartbeat: Arc<AtomicU64>,
     /// Save path used when `POST /torrents` omits `save_path` (PRD).
     pub default_save_path: PathBuf,
+    /// Root of the `.torrent` store on disk. Used to confine a caller-supplied
+    /// `torrent_path` to directories the daemon already owns.
+    pub torrent_dir: PathBuf,
     /// One of `single` | `multi-slot`. Used by routes that decide
     /// whether `slot_id` is required on POST /torrents.
     pub mode: Mode,
@@ -48,6 +51,20 @@ impl AppState {
     /// torrents the monitor has fenced (paused, awaiting operator restart).
     /// Always false in single-session mode (no slots, no tunnel). Callers use
     /// this to refuse mutations that would un-quarantine a fenced slot.
+    /// Directories a caller-supplied `torrent_path` may point into.
+    ///
+    /// The daemon's own torrent store, the pool's `.torrent` library, and the
+    /// managed roots — the places a `.torrent` the daemon is meant to load
+    /// actually lives. Anything else and the route is a filesystem reader.
+    pub fn local_torrent_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.torrent_dir.clone()];
+        if let Some(pool) = self.pool.as_ref() {
+            dirs.push(pool.library_dir().to_path_buf());
+            dirs.extend(pool.roots().iter().map(|(_, p)| p.clone()));
+        }
+        dirs
+    }
+
     pub fn slot_vpn_down(&self, slot_id: &SlotId) -> bool {
         self.slots
             .as_ref()
@@ -97,6 +114,7 @@ pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
                 .unwrap_or(0),
         )),
         default_save_path: std::env::temp_dir(),
+        torrent_dir: std::env::temp_dir(),
         mode,
     }
 }
