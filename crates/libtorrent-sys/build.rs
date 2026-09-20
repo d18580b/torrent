@@ -7,7 +7,7 @@
 //      shim headers, which include nothing but <stddef.h>/<stdint.h>, so
 //      bindgen reads no libtorrent or Boost header and costs ~1s.
 //   2. Provision `<cache>/lt-<key>`: CMake-install Boost headers into
-//      `boost/` (libtorrent v2.0.12 + Boost >= 1.69 needs only
+//      `boost/` (libtorrent v2.0.14 + Boost >= 1.69 needs only
 //      Boost::headers) and static libtorrent into `libtorrent/`.
 //   3. Provision `<cache>/shim-<key>`: compile shim/libtorrent_shim.cpp via
 //      cc::Build with the same C++ standard and ABI flags libtorrent used.
