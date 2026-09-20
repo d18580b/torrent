@@ -60,7 +60,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             message,
         } => {
             let _enter = ctx.span.enter();
-            // PRD: resume_data_not_modified is the silent path — libtorrent
+            // the spec: resume_data_not_modified is the silent path — libtorrent
             // signals the resume buffer is unchanged since the last save, so
             // we just decrement and move on.
             if !*not_modified {

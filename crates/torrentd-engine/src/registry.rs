@@ -1,6 +1,6 @@
 //! Torrent → slot assignment registry.
 //!
-//! PRD Safety Rule 3 — global info-hash uniqueness — lives here. Every
+//! Safety Rule 3 — global info-hash uniqueness — lives here. Every
 //! torrent the daemon loads (via API add, startup resume scan, or
 //! startup torrent dir scan) is first looked up here. Two outcomes:
 //!
@@ -105,7 +105,7 @@ impl AssignmentRegistry {
     }
 
     /// Atomically assign an infohash to a slot. Conflict iff the infohash
-    /// is already mapped to *any* slot (PRD Safety Rule 3).
+    /// is already mapped to *any* slot.
     pub fn assign(&self, ih: InfoHash, slot: SlotId) -> Result<(), RegistryError> {
         {
             let mut g = self.inner.write();

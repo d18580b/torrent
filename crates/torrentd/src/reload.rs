@@ -1,6 +1,6 @@
 //! SIGHUP reload pump.
 //!
-//! Reloadable fields per PRD §Session Management: connections_limit,
+//! Reloadable fields Management: connections_limit,
 //! upload_rate_limit, max_concurrent_http_announces, aio_threads,
 //! enable_lsd, log_level. Everything else triggers a `warn` and is
 //! ignored.

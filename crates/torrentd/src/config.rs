@@ -1,10 +1,10 @@
 //! TOML configuration parser.
 //!
 //! `serde(deny_unknown_fields)` everywhere — typos in setting names
-//! produce fatal startup errors with the offending key (PRD: "Unknown
+//! produce fatal startup errors with the offending key (the spec: "Unknown
 //! keys cause a fatal startup error"). `Config::diff` separates fields
 //! that can be hot-reloaded via SIGHUP from those requiring a full
-//! restart (PRD §Session Management).
+//! restart.
 
 use std::fs;
 use std::net::SocketAddr;
@@ -59,7 +59,7 @@ pub struct Config {
     #[serde(default)]
     pub session_state_path: Option<PathBuf>,
 
-    // libtorrent settings overrides (PRD §5).
+    // libtorrent settings overrides.
     #[serde(default)]
     pub connections_limit: Option<u32>,
     #[serde(default)]
@@ -282,7 +282,7 @@ impl Config {
             d.log_level = Some(new.log_level);
         }
 
-        // Identity-critical / non-reloadable fields (PRD): listen_interfaces,
+        // Identity-critical / non-reloadable fields: listen_interfaces,
         // resume_dir, torrent_dir, peer_fingerprint, user_agent. Any change
         // to these is reported in `non_reloadable_changes` so SIGHUP can
         // log+ignore.
@@ -308,7 +308,7 @@ impl Config {
         d
     }
 
-    /// Compose libtorrent settings from the PRD high_performance_seed
+    /// Compose libtorrent settings from the spec high_performance_seed
     /// preset overrides plus the operator's overrides in this Config.
     pub fn libtorrent_settings(&self) -> libtorrent_safe::Settings {
         let mut s = libtorrent_safe::Settings::server_seed_overrides();

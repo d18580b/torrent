@@ -14,7 +14,7 @@ Restart=on-failure
 RestartSec=5s
 WatchdogSec=60s
 
-# Resource limits per PRD §Target Environment.
+# Resource limits Environment.
 LimitNOFILE=65536
 TasksMax=8192
 

@@ -40,7 +40,7 @@ const MAX_TORRENT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Resolved add source, carrying the bytes/uri needed to (a) compute the
 /// info-hash up front and (b) build the engine params after the registry
-/// reservation succeeds (PRD Safety Rule 4).
+/// reservation succeeds.
 enum AddSource {
     Magnet(String),
     File(Vec<u8>),
@@ -155,7 +155,7 @@ type AddParse = (Option<String>, Option<String>, AddSource);
 type AddError = (StatusCode, Json<serde_json::Value>);
 
 /// `POST /torrents` accepts either a JSON body (`{magnet}` / `{torrent_path}`)
-/// or a multipart upload carrying the `.torrent` file (PRD HTTP API). Dispatch
+/// or a multipart upload carrying the `.torrent` file. Dispatch
 /// on Content-Type, normalize to `(slot_id, save_path, AddSource)`, then run
 /// one shared add path.
 pub async fn add(
@@ -348,7 +348,7 @@ async fn do_add(
             TorrentFlags::empty()
         };
 
-    // Compute the info-hash WITHOUT touching any session: PRD Safety Rule 4
+    // Compute the info-hash WITHOUT touching any session: Safety Rule 4
     // (the session never receives an unverified torrent) and Rule 3 (global
     // info-hash uniqueness across slots).
     let infohash = match &source {
@@ -364,8 +364,8 @@ async fn do_add(
 
     // Misconfiguration guard (multi-slot): a .torrent must announce to one of
     // the slot's allowed tracker domains. Catches uploading the wrong slot's
-    // .torrent into another slot (PRD §Torrent-to-Slot Assignment). Only
-    // checked for file adds against a configured, non-empty allow-list.
+    // .torrent into another slot. Only checked for file adds against a
+    // configured, non-empty allow-list.
     if let AddSource::File(bytes) = &source {
         let domains = s
             .slots
@@ -398,7 +398,7 @@ async fn do_add(
         }
     }
 
-    // Reject duplicates before the session sees the torrent (PRD: 409 if the
+    // Reject duplicates before the session sees the torrent (the spec: 409 if the
     // info-hash is already loaded in any slot).
     if s.registry.lookup(&infohash).is_some() {
         s.metrics.inc_counter(
@@ -451,7 +451,7 @@ async fn do_add(
     }
 
     // Persist the .torrent so the startup inventory scan can recover it if
-    // resume data is ever lost (PRD §Session Management).
+    // resume data is ever lost.
     if let Some(bytes) = torrent_bytes {
         if let Err(e) = s.torrents.write(&slot_id, &infohash, &bytes) {
             tracing::warn!(

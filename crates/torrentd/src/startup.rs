@@ -110,7 +110,7 @@ pub async fn boot(
 
     // Torrent store — same per-slot partitioning as the resume store; holds
     // the raw .torrent files for the startup inventory scan, magnet-metadata
-    // persistence, and removal cleanup (PRD §6 / §Session Management).
+    // persistence, and removal cleanup.
     let torrent_store: Arc<dyn TorrentStore> = Arc::new(
         cfg.slot
             .iter()
@@ -134,8 +134,8 @@ pub async fn boot(
     let mut slot_registry: Option<Arc<SlotRegistry>> = None;
     let source: Arc<dyn AlertSource> = match mode {
         Mode::Single => {
-            // Restore the DHT routing table + session state across restarts
-            // (PRD §Session Management). DHT is enabled only in single-session
+            // Restore the DHT routing table + session state across restarts.
+            // DHT is enabled only in single-session
             // mode, so this is the only path that loads/saves session state.
             let settings = cfg.libtorrent_settings();
             let session = match load_session_state(&cfg.session_state_path()) {
@@ -167,7 +167,7 @@ pub async fn boot(
                 }};
             }
             for s in &cfg.slot {
-                // 1) Bring the VPN up first. PRD Safety Rule 1: if it
+                // 1) Bring the VPN up first. Safety Rule 1: if it
                 //    fails, the slot's lt::session is never constructed
                 //    — no bare-IP fallback.
                 let vpn = vpn::for_type(s.vpn_type);
@@ -333,7 +333,7 @@ pub async fn boot(
             .engine_for(&slot)
             .ok_or_else(|| anyhow::anyhow!("no engine for slot {}", slot))?;
         for (ih, data) in entries {
-            // Cross-check the registry; PRD aborts the slot on mismatch.
+            // Cross-check the registry; the spec aborts the slot on mismatch.
             // Single-session always uses SlotId::DEFAULT, so the check
             // mainly guards multi-slot mode.
             if let Some(existing) = registry.lookup(&ih) {
@@ -422,7 +422,7 @@ pub async fn boot(
     }
 
     // Torrent-dir scan: add any .torrent whose info-hash has no resume file
-    // (resume always wins; PRD §6 startup inventory). After this the torrent
+    // (resume always wins; startup inventory). After this the torrent
     // dir is not re-scanned — new torrents arrive only via the API.
     let scan_save_path = cfg.default_save_path.to_string_lossy().into_owned();
     for slot in source.slots() {
@@ -498,7 +498,7 @@ pub async fn boot(
         metrics_for_loop,
         clock,
     )
-    // PRD §Error Handling: `listen_failed` is fatal in single-session mode
+    // Handling: `listen_failed` is fatal in single-session mode
     // (nothing else is listening, so seeding just stops silently). In
     // multi-slot mode the per-slot handler marks that slot failed and the
     // remaining slots carry on.
@@ -720,7 +720,7 @@ impl DaemonHandle {
         }
 
         // Persist DHT/session state for the next start (single-session mode;
-        // slots run with enable_dht=false and skip this per PRD). The session
+        // slots run with enable_dht=false and skip this). The session
         // is still alive here — only dropped when `source` goes out of scope.
         if cfg.slot.is_empty() {
             if let Some(engine) = source.engine_for(&SlotId::default_single()) {

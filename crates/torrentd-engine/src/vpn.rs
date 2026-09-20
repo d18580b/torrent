@@ -46,7 +46,7 @@ pub enum VpnError {
 
 pub trait VpnManager: Send + Sync + std::fmt::Debug {
     /// Bring the tunnel up and return its assigned IP. Blocks (with an
-    /// internal timeout — PRD §VPN says 30s) until either an IP is
+    /// internal timeout — says 30s) until either an IP is
     /// observed or the timeout elapses.
     fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, VpnError>;
 

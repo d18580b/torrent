@@ -149,7 +149,7 @@ jobs:
             target/debug/build/libtorrent-sys-*/out
           key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
 
-      # Layer 2 (PRD Validation §): struct marshalling, exception isolation,
+      # Layer 2: struct marshalling, exception isolation,
       # null-handle safety, and buffer ownership across the C ABI boundary.
       - run: cargo test -p libtorrent-sys --features shim-tests
 
@@ -188,7 +188,7 @@ jobs:
             target/debug/build/libtorrent-sys-*/out
           key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
 
-      # Layer 3 (PRD Validation §): real daemon + libtorrent, driven over HTTP.
+      # Layer 3: real daemon + libtorrent, driven over HTTP.
       - run: cargo test -p torrentd-engine --test lifecycle -- --ignored
       - run: cargo test -p torrentd --test daemon -- --ignored
 

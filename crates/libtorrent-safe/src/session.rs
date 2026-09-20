@@ -427,7 +427,7 @@ impl Session {
 
 /// Compute the info-hash of a `.torrent` buffer without adding it to a
 /// session — used to enforce registry uniqueness before any session sees the
-/// torrent (PRD Safety Rule 4).
+/// torrent.
 pub fn info_hash_from_torrent(bytes: &[u8]) -> Result<InfoHash> {
     if bytes.is_empty() {
         return Err(Error::InvalidInput("empty .torrent buffer"));
@@ -472,7 +472,7 @@ pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
 
 /// Check whether any tracker host in a `.torrent` buffer matches one of
 /// `domains` (exact or subdomain). Misconfiguration guard for slot assignment
-/// (PRD §Torrent-to-Slot Assignment). Returns `Ok(false)` for an empty buffer
+///. Returns `Ok(false)` for an empty buffer
 /// or empty domain list.
 pub fn torrent_tracker_host_matches(bytes: &[u8], domains: &[String]) -> Result<bool> {
     if bytes.is_empty() || domains.is_empty() {

@@ -75,7 +75,7 @@ impl VpnManager for OpenvpnManager {
 
     fn bring_down(&self, iface: &str) {
         // OpenVPN: best-effort kill of any process whose --dev matches.
-        // The PRD scopes torrentd to leaving credential / process management
+        // The the spec scopes torrentd to leaving credential / process management
         // to the operator; this just attempts a graceful shutdown via a
         // pkill-by-name with the interface as a hint.
         let _ = Command::new("pkill")

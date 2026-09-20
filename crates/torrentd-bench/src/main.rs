@@ -1,17 +1,18 @@
-//! torrentd-bench — Layer 4 load / soak harness (PRD Validation §Layer 4).
+//! torrentd-bench — Layer 4 load / soak harness.
 //!
 //! Subcommands:
 //!   - `alert-throughput`: drive the in-memory state map at high rate and
-//!     report updates/sec — verifies the alert-dispatch hot path keeps up
-//!     (PRD target: >=100k/s). Pure Rust, no libtorrent.
+//!     report updates/sec — verifies the alert-dispatch hot path keeps up.
+//!
+//! Pure Rust, no libtorrent.
 //!   - `memory-scaling`: add N real *seeding* torrents to a libtorrent session
 //!     built with the no-op disk backend (`_disabled_disk_io`) and report
-//!     resident-set size per torrent (PRD target: <200 KB/torrent). Using real
+//!     resident-set size per torrent. Using real
 //!     added torrents (not metadata-pending magnets) means RSS reflects
 //!     libtorrent's true per-torrent structures; the no-op disk backend lets us
 //!     reach 50K seeds without provisioning any payload on disk.
 //!   - `startup-time`: time how long a real session takes to ingest N
-//!     torrents (PRD startup targets).
+//!     torrents.
 //!
 //! Run e.g.: `cargo run --release -p torrentd-bench -- alert-throughput`
 
@@ -107,7 +108,7 @@ fn alert_throughput(torrents: usize, rounds: usize) {
         "alert-throughput: {applied} state-map updates over {torrents} torrents in {dt:.3}s = {rate:.0}/s"
     );
     if rate < 100_000.0 {
-        eprintln!("WARNING: below PRD target of 100k/s");
+        eprintln!("WARNING: below the 100k alerts/s target");
     }
 }
 
@@ -191,11 +192,9 @@ fn memory_scaling(count: usize) {
     } else {
         0.0
     };
-    println!(
-        "memory-scaling: final RSS = {rss} KB; {per:.0} KB/torrent over baseline (PRD target <200)"
-    );
+    println!("memory-scaling: final RSS = {rss} KB; {per:.0} KB/torrent over baseline");
     if per > 200.0 {
-        eprintln!("WARNING: above PRD target of 200 KB/torrent");
+        eprintln!("WARNING: above the 200 KB/torrent target");
     }
 }
 

@@ -1,4 +1,4 @@
-//! Layer 3 daemon integration test (PRD Validation §Layer 3).
+//! Layer 3 daemon integration test.
 //!
 //! Spawns the real `torrentd` binary against a real libtorrent session and
 //! drives the HTTP control plane end-to-end: add, list, duplicate-409,
@@ -129,7 +129,7 @@ fn daemon_end_to_end() {
     assert!(body.contains(ih), "list should contain the torrent: {body}");
 
     let (code, _) = http(HTTP, "POST", "/torrents", Some(&payload));
-    assert_eq!(code, 409, "duplicate add must be 409 (PRD Safety Rule 3)");
+    assert_eq!(code, 409, "duplicate add must be 409");
 
     let (code, metrics) = http(HTTP, "GET", "/metrics", None);
     assert_eq!(code, 200);
@@ -152,7 +152,7 @@ fn daemon_end_to_end() {
 /// Graceful shutdown must stay graceful under load: with many torrents added,
 /// a SIGTERM still drains and exits within the timeout and persists session
 /// state. Guards against a shutdown coordinator that hangs as torrent count
-/// grows (PRD Validation §Layer 3).
+/// grows.
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn daemon_graceful_shutdown_under_load() {

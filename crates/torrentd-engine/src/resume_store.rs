@@ -2,8 +2,8 @@
 //!
 //! `FsResumeStore` writes one bencoded file per info-hash under
 //! `<base_dir>/<slot_id>/<infohash_hex>.resume`. Writes go via temp file +
-//! `fsync` + `rename` for atomicity (PRD §6 — a partial write must leave
-//! the previous resume file intact).
+//! `fsync` + `rename` for atomicity: a partial write must leave the
+//! previous resume file intact.
 //!
 //! `MemoryResumeStore` keeps everything in a `DashMap` keyed by
 //! `(slot, infohash)`. Used by Layer 1 unit tests so we don't hit the
@@ -80,7 +80,7 @@ impl FsResumeStore {
         }
         // SlotId::DEFAULT lives directly under base for single-session mode;
         // otherwise we partition by slot id so multi-slot mode never
-        // co-mingles resume files (PRD Multi-Account Resume Data Isolation).
+        // co-mingles resume files.
         if slot.is_default() {
             self.base.clone()
         } else {

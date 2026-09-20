@@ -1,7 +1,7 @@
 //! `MockEngine` — drives every Layer 1 unit test that needs a
 //! `TorrentEngine` without touching libtorrent.
 //!
-//! Capabilities (matching PRD §3.3):
+//! Capabilities (matching ):
 //!   - Pre-loaded alert queue: `push_alert(...)`.
 //!   - Call recorder: every trait method records a `RecordedCall` so
 //!     tests assert "this op was called with these args".

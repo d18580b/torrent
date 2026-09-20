@@ -1,6 +1,6 @@
 //! `torrentd` — headless petabyte-scale torrent seeding daemon.
 //!
-//! See PRD.md for the full spec. This binary wires together the
+//! This binary wires together the
 //! torrentd-engine layer (TorrentEngine, alert loop, registry) with
 //! configuration, signals, an axum HTTP control plane, and the VPN /
 //! netlink integration. The CLI takes one argument: `--config <path>`.
