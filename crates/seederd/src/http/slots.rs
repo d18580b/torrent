@@ -28,6 +28,9 @@ pub struct SlotSummary {
     /// slots, else the configured static port.
     forwarded_port: Option<u16>,
     user_agent: String,
+    /// Why the slot has no session. Only set when `status` is `failed`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure_reason: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -57,6 +60,7 @@ fn summary_of(s: &AppState, e: &SlotEntry) -> SlotSummary {
         port_forward: e.config.port_forward.as_str().to_string(),
         forwarded_port,
         user_agent: e.config.user_agent.clone(),
+        failure_reason: None,
     }
 }
 
@@ -79,11 +83,31 @@ fn slot_vpn_down() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Summarise a slot that never got a session.
+///
+/// Reported rather than omitted: a slot whose tunnel failed used to vanish
+/// from this list entirely, so the operator saw a short list with no
+/// indication that an account was missing.
+fn summary_of_failed(f: &crate::slot_registry::FailedSlot) -> SlotSummary {
+    SlotSummary {
+        slot_id: f.config.id.as_str().to_string(),
+        status: SlotStatus::Failed.as_str().to_string(),
+        tunnel_ip: None,
+        torrent_count: 0,
+        listen_port: f.config.listen_port,
+        port_forward: f.config.port_forward.as_str().to_string(),
+        forwarded_port: None,
+        user_agent: f.config.user_agent.clone(),
+        failure_reason: Some(f.reason.clone()),
+    }
+}
+
 pub async fn list(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<SlotSummary>>, (StatusCode, Json<serde_json::Value>)> {
     let slots = s.slots.as_ref().ok_or_else(not_configured)?;
-    let out = slots.iter().map(|e| summary_of(&s, e)).collect();
+    let mut out: Vec<SlotSummary> = slots.iter().map(|e| summary_of(&s, e)).collect();
+    out.extend(slots.failed().iter().map(summary_of_failed));
     Ok(Json(out))
 }
 
@@ -93,7 +117,20 @@ pub async fn get(
 ) -> Result<Json<SlotDetail>, (StatusCode, Json<serde_json::Value>)> {
     let slots = s.slots.as_ref().ok_or_else(not_configured)?;
     let slot_id = SlotId::new(id);
-    let e = slots.get(&slot_id).ok_or_else(no_such_slot)?;
+    let Some(e) = slots.get(&slot_id) else {
+        // A configured slot that failed to come up is still a slot; answering
+        // 404 would be indistinguishable from a typo in the id.
+        if let Some(f) = slots.failed_slot(&slot_id) {
+            return Ok(Json(SlotDetail {
+                summary: summary_of_failed(f),
+                vpn_interface: f.config.vpn_interface.clone(),
+                allowed_tracker_domains: f.config.allowed_tracker_domains.clone(),
+                paused_for_vpn: 0,
+                port_forward_ok: false,
+            }));
+        }
+        return Err(no_such_slot());
+    };
     let h = e.health();
     Ok(Json(SlotDetail {
         summary: summary_of(&s, e),

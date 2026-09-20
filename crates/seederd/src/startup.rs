@@ -151,6 +151,21 @@ pub async fn boot(
         }
         Mode::MultiSlot => {
             let mut slot_entries: Vec<SlotEntry> = Vec::new();
+            // Safety Rule 1: a slot whose tunnel does not come up never gets a
+            // session, and the others carry on. It still has to be *reported*
+            // as failed — skipping it outright made it vanish from `/slots`,
+            // so an operator wondering why an account was quiet found no trace
+            // of it anywhere but the startup log.
+            let mut failed_slots: Vec<crate::slot_registry::FailedSlot> = Vec::new();
+            macro_rules! fail_slot {
+                ($cfg:expr, $reason:expr) => {{
+                    failed_slots.push(crate::slot_registry::FailedSlot {
+                        config: $cfg.clone(),
+                        reason: $reason,
+                    });
+                    continue;
+                }};
+            }
             for s in &cfg.slot {
                 // 1) Bring the VPN up first. PRD Safety Rule 1: if it
                 //    fails, the slot's lt::session is never constructed
@@ -164,7 +179,7 @@ pub async fn boot(
                             error.cause = %e,
                             "VPN bring-up failed; slot disabled (no bare-IP fallback)",
                         );
-                        continue;
+                        fail_slot!(s, format!("VPN bring-up failed: {e}"));
                     }
                 };
 
@@ -183,7 +198,7 @@ pub async fn boot(
                             // validate_set should have caught this; be defensive.
                             error!(slot_id = %s.id, "static slot missing listen_port; slot disabled");
                             vpn.bring_down(&s.vpn_interface);
-                            continue;
+                            fail_slot!(s, "static slot has no listen_port".to_string());
                         }
                     },
                     PortForwardMode::Natpmp => {
@@ -193,7 +208,7 @@ pub async fn boot(
                             Err(e) => {
                                 error!(slot_id = %s.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; slot disabled");
                                 vpn.bring_down(&s.vpn_interface);
-                                continue;
+                                fail_slot!(s, format!("invalid port_forward_gateway: {e}"));
                             }
                         };
                         let req = PortMapRequest {
@@ -210,7 +225,7 @@ pub async fn boot(
                             Err(e) => {
                                 error!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; slot disabled (no bare-IP fallback)");
                                 vpn.bring_down(&s.vpn_interface);
-                                continue;
+                                fail_slot!(s, format!("NAT-PMP negotiation failed: {e}"));
                             }
                         }
                     }
@@ -252,6 +267,10 @@ pub async fn boot(
                             "slot engine construction failed; tearing down VPN",
                         );
                         vpn.bring_down(&s.vpn_interface);
+                        failed_slots.push(crate::slot_registry::FailedSlot {
+                            config: s.clone(),
+                            reason: format!("session construction failed: {e}"),
+                        });
                     }
                 }
             }
@@ -262,7 +281,9 @@ pub async fn boot(
                 .iter()
                 .map(|e| (e.config.id.clone(), e.engine.clone()))
                 .collect();
-            slot_registry = Some(Arc::new(SlotRegistry::new(slot_entries)));
+            slot_registry = Some(Arc::new(
+                SlotRegistry::new(slot_entries).with_failed(failed_slots),
+            ));
             Arc::new(MultiSlotSource::new(source_entries))
         }
     };
