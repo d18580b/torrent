@@ -83,6 +83,19 @@ impl RetryState {
     }
 }
 
+/// Where an asynchronous `move_storage` has got to.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum StorageMove {
+    /// Dispatched to libtorrent; no alert yet.
+    Pending,
+    /// `storage_moved_alert`: the session now serves from `path`.
+    Moved { path: String },
+    /// `storage_moved_failed_alert`. The torrent keeps seeding from its
+    /// original location — libtorrent only commits the new save path on
+    /// success — so this is recoverable, but the plan must not continue.
+    Failed { message: String },
+}
+
 #[derive(Clone, Debug)]
 pub struct TorrentState {
     pub handle: TorrentHandle,
@@ -104,6 +117,15 @@ pub struct TorrentState {
     pub progress: f32,
     pub is_finished: bool,
     pub is_seeding: bool,
+    /// Outcome of the most recent `move_storage`, or `None` if none was ever
+    /// requested.
+    ///
+    /// `move_storage` returns as soon as libtorrent has queued the move; the
+    /// verdict arrives later as `storage_moved_alert` or
+    /// `storage_moved_failed_alert`. Without somewhere to record it, a
+    /// relocation has no way to tell a completed move from a failed one, and
+    /// reports the failure as success.
+    pub storage_move: Option<StorageMove>,
     /// When libtorrent last reported that it finished hashing this torrent
     /// (`torrent_checked_alert`).
     ///
@@ -133,6 +155,7 @@ impl TorrentState {
             is_finished: false,
             is_seeding: false,
             checked_at: None,
+            storage_move: None,
         }
     }
 }

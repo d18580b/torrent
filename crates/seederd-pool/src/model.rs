@@ -222,6 +222,10 @@ pub mod plan_status {
 
 pub mod step_status {
     pub const PENDING: &str = "pending";
+    /// Written *before* the action is attempted, and cleared by its outcome.
+    /// A crash leaves this behind, which is how a resumed apply tells "never
+    /// started" from "started, verdict unknown" — the second needs a human.
+    pub const IN_PROGRESS: &str = "in_progress";
     pub const DONE: &str = "done";
     pub const FAILED: &str = "failed";
     pub const SKIPPED: &str = "skipped";

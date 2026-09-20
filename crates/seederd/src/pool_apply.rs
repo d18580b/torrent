@@ -19,6 +19,7 @@ use std::sync::Arc;
 use seederd_engine::AlertSource;
 use seederd_engine::MoveFlags;
 use seederd_engine::StateMap;
+use seederd_engine::StorageMove;
 use seederd_pool::model::ops;
 use seederd_pool::model::plan_status;
 use seederd_pool::model::step_status;
@@ -79,6 +80,17 @@ pub fn apply(
         .with_store(|s| s.plan_steps(plan_id))
         .map_err(|e| e.to_string())?;
 
+    if let Some(stuck) = steps.iter().find(|s| s.status == step_status::IN_PROGRESS) {
+        // Written before the attempt and cleared by the outcome, so finding
+        // one here means a previous run died mid-step. Whether it happened is
+        // unknown, and both re-running and skipping it can destroy data.
+        return Err(format!(
+            "step {} ({}) was interrupted and its outcome is unknown; inspect {} before \
+             resuming this plan",
+            stuck.seq, stuck.op, stuck.src,
+        ));
+    }
+
     let mut out = ApplyOutcome {
         plan_id,
         done: 0,
@@ -92,6 +104,12 @@ pub fn apply(
             out.skipped += 1;
             continue;
         }
+        // Written before the action, so a crash leaves `in_progress` behind.
+        // Steps were inserted `pending` up front and only updated afterwards,
+        // which made "never started" and "started, outcome unknown"
+        // indistinguishable to the resume path.
+        let _ = pool
+            .with_store(|s| s.set_step_status(plan_id, step.seq, step_status::IN_PROGRESS, None));
         let result = match step.op.as_str() {
             ops::MOVE_TORRENT => move_torrent(pool, source, state, &step),
             ops::MOVE_FILE => move_file(
@@ -190,6 +208,7 @@ fn move_torrent(
     // place rather than overwriting. The planner already refused on a
     // pre-existing destination, so this is a second line of defence against a
     // race between planning and applying.
+    state.update(&hash, |s| s.storage_move = Some(StorageMove::Pending));
     engine
         .move_storage(st.handle, dst, MoveFlags::DontReplace)
         .map_err(|e| e.to_string())?;
@@ -198,9 +217,59 @@ fn move_torrent(
         target: "seederd::pool::apply",
         infohash = %infohash,
         dst = %dst,
-        "move_storage requested; libtorrent owns the move",
+        "move_storage requested; waiting for libtorrent's verdict",
     );
-    Ok(())
+
+    // `move_storage` returns as soon as the move is queued. Treating that as
+    // success reported a *failed* move as a completed plan step, and the
+    // resume path then never retried it because the step said done.
+    await_storage_move(state, &hash, dst)
+}
+
+/// How long to wait for `storage_moved_alert` before giving up on a verdict.
+///
+/// A move inside one filesystem is a rename and lands almost immediately;
+/// across filesystems libtorrent copies, which is bounded by the payload size.
+/// Timing out is not a failure — it means the verdict is still unknown, which
+/// is reported as such rather than guessed either way.
+const STORAGE_MOVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+const STORAGE_MOVE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Block until libtorrent reports the move done, failed, or the deadline runs
+/// out.
+fn await_storage_move(
+    state: &StateMap,
+    hash: &libtorrent_safe::InfoHash,
+    dst: &str,
+) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + STORAGE_MOVE_DEADLINE;
+    loop {
+        match state.get(hash).and_then(|s| s.storage_move) {
+            Some(StorageMove::Moved { path }) => {
+                info!(
+                    target: "seederd::pool::apply",
+                    infohash = %hash,
+                    save_path = %path,
+                    "storage move confirmed",
+                );
+                return Ok(());
+            }
+            Some(StorageMove::Failed { message }) => {
+                return Err(format!(
+                    "libtorrent could not move the payload to {dst}: {message}"
+                ));
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "libtorrent has not reported the move to {dst} after {}s; the torrent is \
+                 still served from its old location and the step is left unfinished",
+                STORAGE_MOVE_DEADLINE.as_secs(),
+            ));
+        }
+        std::thread::sleep(STORAGE_MOVE_POLL);
+    }
 }
 
 /// Move a directory tree seederd owns outright.
@@ -250,8 +319,13 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
     let src_len = std::fs::metadata(src)
         .map_err(|e| format!("stat {}: {e}", src.display()))?
         .len();
-    std::fs::copy(src, dst)
-        .map_err(|e| format!("copy {} → {}: {e}", src.display(), dst.display()))?;
+    if let Err(e) = std::fs::copy(src, dst) {
+        // A partial destination would make every retry fail on "destination
+        // already exists", wedging the plan on its own debris. The source is
+        // untouched, so removing the fragment is safe.
+        let _ = std::fs::remove_file(dst);
+        return Err(format!("copy {} → {}: {e}", src.display(), dst.display()));
+    }
     {
         use std::io::Write;
         let f = std::fs::OpenOptions::new()
@@ -274,6 +348,15 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
             "copy verification failed: {} is {dst_len} bytes, source is {src_len}",
             dst.display(),
         ));
+    }
+    // Fsync the destination *directory* too. Without it the file's data is on
+    // disk but its directory entry may not be, so a crash after the unlink
+    // below leaves neither copy reachable.
+    if let Some(parent) = dst.parent() {
+        if let Ok(d) = std::fs::File::open(parent) {
+            d.sync_all()
+                .map_err(|e| format!("fsync {}: {e}", parent.display()))?;
+        }
     }
     std::fs::remove_file(src).map_err(|e| format!("unlink {}: {e}", src.display()))?;
     Ok(())

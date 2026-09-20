@@ -11,6 +11,7 @@ use tracing::error;
 use tracing::info;
 
 use crate::handlers::HandlerCtx;
+use crate::state::StorageMove;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
@@ -38,6 +39,12 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         Alert::StorageMoved { hdr, path } => {
             let _enter = ctx.span.enter();
             let Some(ih) = hdr.infohash else { return };
+            // Record the verdict: a relocation plan cannot otherwise tell a
+            // completed move from one that failed, and marking the step done
+            // on dispatch reports both as success.
+            ctx.state.update(&ih, |st| {
+                st.storage_move = Some(StorageMove::Moved { path: path.clone() })
+            });
             info!(
                 target: "seederd_engine::handler::storage",
                 infohash = %ih,
@@ -58,7 +65,14 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             let infohash = hdr.infohash.map(|i| i.to_hex()).unwrap_or_default();
             // The torrent keeps seeding from its original location: libtorrent
             // only commits the new save_path on success. A relocation plan
-            // treats this as a failed step and stops rather than continuing.
+            // reads this and stops rather than continuing.
+            if let Some(ih) = hdr.infohash {
+                ctx.state.update(&ih, |st| {
+                    st.storage_move = Some(StorageMove::Failed {
+                        message: message.clone(),
+                    })
+                });
+            }
             error!(
                 target: "seederd_engine::handler::storage",
                 infohash = %infohash,
