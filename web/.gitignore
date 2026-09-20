@@ -1,5 +1,5 @@
 node_modules/
-# Built by crates/seederd/build.rs and embedded in the binary. A release
+# Built by crates/torrentd/build.rs and embedded in the binary. A release
 # tarball may ship a prebuilt copy; a source checkout builds its own.
 dist/
 

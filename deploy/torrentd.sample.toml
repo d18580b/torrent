@@ -1,0 +1,156 @@
+# Sample torrentd configuration file.
+#
+# Copy to /etc/torrentd/torrentd.toml and edit. Unknown keys are a fatal
+# startup error — please reference PRD.md for the full set of options.
+
+# ---------------------------------------------------------------------------
+# Single-session example
+# ---------------------------------------------------------------------------
+listen_interfaces = "0.0.0.0:6881,[::]:6881"
+default_save_path = "/data/torrents"
+resume_dir        = "/var/lib/torrentd/resume"
+torrent_dir       = "/var/lib/torrentd/torrents"
+http_listen       = "127.0.0.1:8080"
+log_level         = "info"   # error | warn | info | debug (reloadable on SIGHUP)
+
+# Optional daemon paths (defaults derived from resume_dir's parent):
+#   - DHT/session state, persisted across restarts (single-session mode only).
+#   - torrent -> slot assignment registry.
+# session_state_path = "/var/lib/torrentd/session_state.dat"
+# registry_path      = "/var/lib/torrentd/slot_assignments.json"
+
+# libtorrent settings overrides (applied on top of high_performance_seed
+# preset). All optional; omit any to use the preset's default.
+connections_limit             = 10000
+file_pool_size                = 1000
+enable_lsd                    = false
+aio_threads                   = 8
+max_concurrent_http_announces = 200
+upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
+
+# Optional session identity. Set both to disguise the client to peers
+# and trackers. Non-reloadable (changing requires daemon restart).
+# peer_fingerprint = "-LT20C0-"
+# user_agent       = "libtorrent/2.0"
+
+# ---------------------------------------------------------------------------
+# Authentication (optional)
+# ---------------------------------------------------------------------------
+# Omit this section entirely to keep the original posture: no authentication,
+# bound to loopback, access control delegated to a reverse proxy.
+#
+# Generate the values — never write a password or token here by hand:
+#   torrentd --config /etc/torrentd/torrentd.toml hash-password
+#   torrentd --config /etc/torrentd/torrentd.toml new-token --name ci --scopes read
+#
+# The token is printed once and is not stored; only its SHA-256 goes below, so
+# a leaked config file cannot be replayed as a credential.
+#
+# Scopes: read (safe methods), write (anything that mutates), metrics
+# (/metrics and nothing else — keeps a scrape credential out of the API).
+#
+# [auth]
+# password_hash    = "$argon2id$v=19$m=19456,t=2,p=1$...$..."
+# session_ttl_secs = 43200
+#
+# [[auth.token]]
+# name   = "prometheus"
+# sha256 = "0870bd54c89de51c..."
+# scopes = ["metrics"]
+
+# ---------------------------------------------------------------------------
+# Managed pool (optional)
+# ---------------------------------------------------------------------------
+# Point torrentd at the directories it should own and at a directory of
+# `.torrent` files to match them against. It indexes both and reports, per
+# path, what is adopted, matched, partial, missing, orphaned, or claimed by
+# two torrents at once — which is what makes a multi-terabyte library legible.
+#
+# Migrating from another client is not a special mode: set `library_dir` to
+# that client's state directory and scan. qBittorrent's BT_backup holds both
+# `<hash>.torrent` and `<hash>.fastresume`, and the sidecars are read for their
+# save-path, category and tag hints.
+#
+# Copy BT_backup somewhere scratch first rather than pointing at the live
+# profile. Scanning only reads, but there is no reason to have the other
+# client's state directory open at all.
+#
+#   torrentd --config /etc/torrentd/torrentd.toml pool scan
+#   torrentd --config /etc/torrentd/torrentd.toml pool status
+#   torrentd --config /etc/torrentd/torrentd.toml pool orphans
+#
+# [pool]
+# roots       = ["/data/torrents"]        # must not nest
+# library_dir = "/var/lib/torrentd/library"
+# db_path     = "/var/lib/torrentd/pool.db"   # default: alongside resume_dir
+# import_legacy_registry = true              # fold slot_assignments.json in
+
+# ---------------------------------------------------------------------------
+# Multi-slot example — uncomment and adjust the [[slot]] tables below.
+# Presence of any [[slot]] entry switches the daemon into multi-slot
+# mode; in that case POST /torrents requires `slot_id`.
+# ---------------------------------------------------------------------------
+
+# Liveness: max age (seconds) of a WireGuard tunnel's latest handshake before
+# the health monitor declares the slot down and pauses it. Catches a tunnel
+# that keeps its IP but has silently stopped handshaking. Default 180.
+# vpn_handshake_max_age_secs = 180
+
+# Defence-in-depth kill switch (multi-slot only). When true, torrentd installs a
+# fail-closed nftables table (`torrentd_ks`) that confines the daemon's own
+# egress to loopback + the slots' tunnel interfaces — so if a tunnel drops, the
+# kernel drops the traffic regardless of libtorrent's socket bind or the 30s
+# monitor. Requires CAP_NET_ADMIN, the `nft` binary, and that torrentd runs as a
+# dedicated user (the packaged systemd unit uses User=torrentd). Also forces
+# tracker DNS through the tunnel. Removed cleanly on SIGTERM.
+# network_kill_switch = false
+
+# [[slot]]
+# id                       = "account_a"
+# vpn_profile              = "/etc/wireguard/wg-acct-a.conf"
+# vpn_type                 = "wireguard"
+# vpn_interface            = "wg-acct-a"
+# listen_port              = 6881
+# peer_fingerprint_hex     = "a1b2c3d4e5f60718"
+# user_agent               = "qBittorrent/5.0.3"
+# resume_dir               = "/var/lib/torrentd/resume/account_a"
+# torrent_dir              = "/var/lib/torrentd/torrents/account_a"
+# allowed_tracker_domains  = ["tracker.example.com"]
+# upload_rate_limit        = 0
+
+# [[slot]]
+# id                       = "account_b"
+# vpn_profile              = "/etc/wireguard/wg-acct-b.conf"
+# vpn_type                 = "wireguard"
+# vpn_interface            = "wg-acct-b"
+# listen_port              = 6882
+# peer_fingerprint_hex     = "9f8e7d6c5b4a3210"
+# user_agent               = "Transmission/4.0.6"
+# resume_dir               = "/var/lib/torrentd/resume/account_b"
+# torrent_dir              = "/var/lib/torrentd/torrents/account_b"
+# allowed_tracker_domains  = ["tracker.example.com"]
+# upload_rate_limit        = 0
+
+# ---------------------------------------------------------------------------
+# Dynamic port forwarding (ProtonVPN / PIA-style ephemeral ports)
+# ---------------------------------------------------------------------------
+# Providers like ProtonVPN don't give you a static forwarded port — it is
+# negotiated at runtime over NAT-PMP against the tunnel gateway, is ephemeral,
+# and its ~60s lease is renewed continuously. Set `port_forward = "natpmp"`;
+# `listen_port` is then ignored (omit it) and the negotiated port is bound and
+# surfaced via `GET /slots/<id>` (`forwarded_port`) plus the `slot_forwarded_port`
+# / `slot_port_forward_up` metrics.
+#
+# [[slot]]
+# id                       = "proton_a"
+# vpn_profile              = "/etc/wireguard/proton-a.conf"
+# vpn_type                 = "wireguard"
+# vpn_interface            = "proton-a"
+# port_forward             = "natpmp"
+# port_forward_gateway     = "10.2.0.1"   # ProtonVPN WireGuard gateway (default)
+# peer_fingerprint_hex     = "3c2d1e0f4a5b6c7d"
+# user_agent               = "qBittorrent/5.0.3"
+# resume_dir               = "/var/lib/torrentd/resume/proton_a"
+# torrent_dir              = "/var/lib/torrentd/torrents/proton_a"
+# allowed_tracker_domains  = ["tracker.example.com"]
+# upload_rate_limit        = 0

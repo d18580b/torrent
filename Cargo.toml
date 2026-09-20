@@ -3,10 +3,10 @@ resolver = "2"
 members = [
     "crates/libtorrent-sys",
     "crates/libtorrent-safe",
-    "crates/seederd-engine",
-    "crates/seederd-pool",
-    "crates/seederd",
-    "crates/seederd-bench",
+    "crates/torrentd-engine",
+    "crates/torrentd-pool",
+    "crates/torrentd",
+    "crates/torrentd-bench",
 ]
 
 [workspace.package]
@@ -80,8 +80,8 @@ once_cell = "1"
 # Internal crates
 libtorrent-sys = { path = "crates/libtorrent-sys" }
 libtorrent-safe = { path = "crates/libtorrent-safe" }
-seederd-engine = { path = "crates/seederd-engine" }
-seederd-pool = { path = "crates/seederd-pool" }
+torrentd-engine = { path = "crates/torrentd-engine" }
+torrentd-pool = { path = "crates/torrentd-pool" }
 
 [profile.release]
 lto = "thin"

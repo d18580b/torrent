@@ -4,7 +4,7 @@
 *.pdb
 
 # Cargo lock for libraries (kept in repo for the binary; libraries excluded)
-# We keep Cargo.lock at the workspace root because seederd ships a binary.
+# We keep Cargo.lock at the workspace root because torrentd ships a binary.
 
 # Editor
 .vscode/

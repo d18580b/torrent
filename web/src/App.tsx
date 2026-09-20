@@ -76,7 +76,7 @@ export function App() {
   return (
     <div className="app">
       <nav className="side">
-        <h1>seederd</h1>
+        <h1>torrentd</h1>
         <p className="sub">managed pool</p>
         <button aria-current={view === 'pool' ? 'page' : undefined} onClick={() => setView('pool')}>
           Pool

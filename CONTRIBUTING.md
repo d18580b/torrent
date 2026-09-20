@@ -1,6 +1,6 @@
-# Contributing to seederd
+# Contributing to torrentd
 
-`seederd` is a headless petabyte-scale torrent seeding daemon. The full architecture and
+`torrentd` is a headless petabyte-scale torrent seeding daemon. The full architecture and
 non-goals are spelled out in [`PRD.md`](./PRD.md). Read it before starting.
 
 ## Development environment

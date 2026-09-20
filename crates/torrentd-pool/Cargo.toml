@@ -1,0 +1,33 @@
+[package]
+name = "torrentd-pool"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Managed-root filesystem index, torrent library, and adoption matching for torrentd."
+publish = false
+
+[dependencies]
+libtorrent-safe = { workspace = true }
+
+# Index store. `bundled` compiles SQLite from source, which this workspace
+# already pays for many times over with Boost + libtorrent.
+rusqlite = { workspace = true }
+
+# Parallel filesystem walk — a managed root can hold millions of files.
+jwalk = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The migration test hand-builds a v1 index to prove the upgrade path.
+rusqlite = { workspace = true }
+
+[lints]
+workspace = true

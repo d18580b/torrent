@@ -3,7 +3,7 @@
 //! Every entry point in this crate is `unsafe`-free for downstream callers.
 //! The crate is deliberately thin: it owns the C++ session lifetime, marshals
 //! payloads, and converts shim error codes into typed `Result`s. No business
-//! logic — that lives in `seederd-engine`.
+//! logic — that lives in `torrentd-engine`.
 
 #![warn(missing_debug_implementations)]
 #![deny(unsafe_op_in_unsafe_fn)]

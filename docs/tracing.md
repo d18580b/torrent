@@ -1,6 +1,6 @@
 # Tracing & observability conventions
 
-`seederd` emits **structured JSON** to stdout (one event per line) via
+`torrentd` emits **structured JSON** to stdout (one event per line) via
 `tracing` + `tracing-subscriber`. Every span carries a small set of
 field names with **no synonyms** — both human operators and Loki/ELK
 queries assume the names below.
@@ -25,7 +25,7 @@ breaks our log queries.
 | `slot_id`                   | string | The slot the event belongs to. `default` in single-session mode.           |
 | `infohash`                  | string | Lowercase hex, 40 chars. **Never** spelled `info_hash`.                    |
 | `op`                        | string | One of: `add`, `remove`, `pause`, `resume`, `save_resume`, `apply_settings`, `pop_alerts`. |
-| `alert_type`                | string | Lowercase enum-name from `seederd_engine::AlertKind` (e.g. `add_torrent`). |
+| `alert_type`                | string | Lowercase enum-name from `torrentd_engine::AlertKind` (e.g. `add_torrent`). |
 | `pending_resume_count`      | u64    | Outstanding `save_resume_data` calls.                                      |
 | `vpn_iface`                 | string | The VPN interface name, e.g. `wg-acct-a`.                                  |
 | `tunnel_ip`                 | string | The tunnel's current IPv4.                                                 |
@@ -58,7 +58,7 @@ breaks our log queries.
 | `debug` | Per-alert, per-tick detail. Forwards `torrent_log` / `log` alerts from libtorrent. |
 
 `info` is the default; the `RUST_LOG` env var overrides per crate
-(e.g. `RUST_LOG=info,seederd_engine::handler::resume=debug`).
+(e.g. `RUST_LOG=info,torrentd_engine::handler::resume=debug`).
 
 ## CI lint
 

@@ -1,0 +1,64 @@
+//! CLI argument parsing.
+
+use std::path::PathBuf;
+
+use clap::Parser;
+use clap::Subcommand;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "torrentd",
+    version,
+    about = "Headless petabyte-scale torrent seeding daemon",
+    long_about = "See PRD.md and the sample config in deploy/torrentd.sample.toml."
+)]
+pub struct Cli {
+    /// Path to the daemon's TOML configuration file.
+    #[arg(short, long, value_name = "PATH")]
+    pub config: PathBuf,
+
+    /// Validate the config file and exit. Useful for systemd
+    /// `ExecStartPre=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config`.
+    #[arg(long)]
+    pub check_config: bool,
+
+    /// Optional subcommand. Omit it to run the daemon.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Inspect and maintain the managed-pool index.
+    Pool {
+        #[command(subcommand)]
+        cmd: PoolCmd,
+    },
+    /// Hash a password for the `[auth] password_hash` config key.
+    HashPassword,
+    /// Generate an API token and the hash to record in the config.
+    NewToken {
+        /// Label for the token, so a leaked one is identifiable from logs.
+        #[arg(long)]
+        name: String,
+        /// One or more of: read, write, metrics.
+        #[arg(long, value_delimiter = ',', default_value = "read")]
+        scopes: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PoolCmd {
+    /// Walk the managed roots, read the torrent library, and match them.
+    Scan,
+    /// Summarise the existing index without touching the filesystem.
+    Status,
+    /// Re-stat claimed files and report what changed since the last scan.
+    Check,
+    /// Show bytes on disk that no torrent in the library claims.
+    Orphans {
+        /// Maximum entries to list per root.
+        #[arg(long, default_value_t = 40)]
+        limit: usize,
+    },
+}
