@@ -7,6 +7,17 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// Linux-only, stated as a compile error rather than left to chance. The crate
+// already fails to build elsewhere, because `sd_notify` uses
+// `std::os::linux::net::SocketAddrExt` — but that surfaces as an opaque
+// unresolved-import error deep in a dependency rather than as the answer to
+// "does this run on my Mac?".
+#[cfg(not(target_os = "linux"))]
+compile_error!(
+    "torrentd is Linux-only: it depends on sd_notify, netlink-style interface \
+     lookups, and nftables. There is no macOS or Windows port."
+);
+
 mod app_state;
 mod auth;
 mod cli;
