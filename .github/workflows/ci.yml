@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # The default branch is `master`. This said `main`, so no push to the
+    # default branch has ever run CI — every check has come from the
+    # pull_request trigger, leaving post-merge `master` unverified.
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -146,7 +149,7 @@ jobs:
             target/debug/build/libtorrent-sys-*/out
           key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
 
-      # Layer 2 (PRD Validation §): struct marshalling, exception isolation,
+      # Layer 2: struct marshalling, exception isolation,
       # null-handle safety, and buffer ownership across the C ABI boundary.
       - run: cargo test -p libtorrent-sys --features shim-tests
 
@@ -185,9 +188,9 @@ jobs:
             target/debug/build/libtorrent-sys-*/out
           key: native-${{ runner.os }}-${{ hashFiles('vendor/libtorrent/**', 'vendor/boost/CMakeLists.txt', 'crates/libtorrent-sys/build.rs', 'crates/libtorrent-sys/shim/**', 'crates/libtorrent-sys/wrapper.h') }}
 
-      # Layer 3 (PRD Validation §): real daemon + libtorrent, driven over HTTP.
-      - run: cargo test -p seederd-engine --test lifecycle -- --ignored
-      - run: cargo test -p seederd --test daemon -- --ignored
+      # Layer 3: real daemon + libtorrent, driven over HTTP.
+      - run: cargo test -p torrentd-engine --test lifecycle -- --ignored
+      - run: cargo test -p torrentd --test daemon -- --ignored
 
   daemon-only:
     name: daemon without the web UI
@@ -227,7 +230,21 @@ jobs:
       # No actions/setup-node here on purpose: this must build on a host with
       # no Node whatsoever, which is what anyone running the headless daemon
       # gets with `--no-default-features`.
-      - run: cargo build -p seederd --no-default-features
+      - run: cargo build -p torrentd --no-default-features
+
+  container:
+    name: container image builds
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+      # Nothing built deploy/Containerfile, which is why it was able to sit
+      # broken: no Node in the builder stage while `web-ui` is a default
+      # feature, so crates/torrentd/build.rs panicked rather than degrading.
+      - name: Build the image
+        run: podman build -f deploy/Containerfile -t torrentd:ci .
 
   web:
     name: web client

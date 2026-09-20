@@ -1,4 +1,4 @@
-//! Layer 2 shim FFI tests (PRD Validation Strategy §Layer 2).
+//! Layer 2 shim FFI tests.
 //!
 //! Run with: `cargo test -p libtorrent-sys --features shim-tests`
 //!

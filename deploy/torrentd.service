@@ -1,0 +1,48 @@
+[Unit]
+Description=torrentd — headless torrent seeding daemon
+Documentation=https://github.com/d18580b/torrent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config
+ExecStart=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+Restart=on-failure
+RestartSec=5s
+WatchdogSec=60s
+
+# Resource limits Environment.
+LimitNOFILE=65536
+TasksMax=8192
+
+# Sandboxing.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+# State + data dirs the daemon may write.
+ReadWritePaths=/var/lib/torrentd /data/torrents
+StateDirectory=torrentd
+StateDirectoryMode=0750
+
+# WireGuard / tunnel control. Multi-slot mode needs NET_ADMIN; remove
+# both lines if you only run single-session mode.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+User=torrentd
+Group=torrentd
+
+[Install]
+WantedBy=multi-user.target

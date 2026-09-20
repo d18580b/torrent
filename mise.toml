@@ -1,4 +1,4 @@
-# Developer tooling for the seederd workspace.
+# Developer tooling for the torrentd workspace.
 #
 # Single source of truth for the fmt / lint / test commands: `hk` git hooks and
 # CI both call `mise run <task>` so the commands live in exactly one place.
@@ -45,6 +45,17 @@ run = "cargo test --workspace"
 description = "Type-check and bundle the web client"
 dir = "web"
 run = ["npm ci", "npm run build"]
+
+[tasks.screenshot]
+description = "Screenshot the pool browser against a mocked API (docs/img/pool.png)"
+dir = "web"
+run = [
+  "npm ci",
+  "npm run build",
+  # Chromium only; the default `npx playwright install` pulls three browsers.
+  "npx --yes playwright install --with-deps chromium",
+  "npm run screenshot",
+]
 
 [tasks.check]
 description = "Formatting + clippy"

@@ -1,5 +1,5 @@
 /*
- * libtorrent_shim.h — minimal C ABI over libtorrent-rasterbar for seederd.
+ * libtorrent_shim.h — minimal C ABI over libtorrent-rasterbar for torrentd.
  *
  * Pure C header. No C++ types, no inheritance, no exceptions cross this boundary.
  * The implementation in libtorrent_shim.cpp wraps every public function in
@@ -73,6 +73,14 @@ typedef uintptr_t lt_handle;
  * in alert_union.h because both that header and the metadata structs below
  * need them, and alert_union.h is the one that includes this file. */
 #define LT_PATH_MAX 1024
+
+/* Upper bound on the file count `lt_torrent_metadata` will materialise.
+ *
+ * Each entry carries a fixed LT_PATH_MAX buffer, so the array costs ~1 KiB per
+ * file whatever the paths actually are. 250k files is far past any real
+ * torrent (a 100 TiB release is thousands, not millions) and caps the
+ * allocation at ~256 MiB. */
+#define LT_MAX_TORRENT_FILES 250000u
 #define LT_MSG_MAX  2048
 #define LT_NAME_MAX 64
 #define LT_ADDR_MAX 64
@@ -232,7 +240,7 @@ int         lt_torrent_set_file_priority(lt_session* s, lt_handle h,
 /* Compute the best (v1, or v2-truncated) info-hash of a .torrent buffer
  * without adding it to any session. Writes 20 bytes to out20. Used to
  * enforce registry uniqueness before the session sees the torrent
- * (PRD Safety Rule 4). Returns LT_OK / LT_ERR (err_out populated). */
+ *. Returns LT_OK / LT_ERR (err_out populated). */
 int         lt_torrent_info_hash(const uint8_t* data, size_t len,
                                  uint8_t* out20, char* err_out, int err_len);
 
@@ -291,7 +299,7 @@ void        lt_torrent_meta_free(struct lt_torrent_meta* m);
 /* Return 1 if any tracker URL host in the .torrent buffer matches (equals or
  * is a subdomain of) one of the comma-separated `domains_csv`, 0 if none
  * match, LT_ERR on parse error. Misconfiguration guard for slot assignment
- * (PRD §Torrent-to-Slot Assignment). */
+ *. */
 int         lt_torrent_tracker_host_matches(const uint8_t* data, size_t len,
                                             const char* domains_csv,
                                             char* err_out, int err_len);
