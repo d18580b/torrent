@@ -34,6 +34,7 @@ pub use alert_loop::AlertLoopBuilder;
 pub use alert_loop::AlertLoopHandle;
 pub use alert_loop::FatalCallback;
 pub use alert_loop::ShutdownReason;
+pub use alert_loop::SlotFenced;
 pub use clock::Clock;
 pub use clock::MockClock;
 pub use clock::SystemClock;
