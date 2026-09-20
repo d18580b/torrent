@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use seederd_engine::AddParams;
 use seederd_engine::AlertSource;
 use seederd_engine::SlotId;
+use seederd_engine::SlotStatus;
 use seederd_engine::StateMap;
 use seederd_engine::TorrentFlags;
 use seederd_engine::TorrentPhase;
@@ -282,6 +283,7 @@ pub async fn run_verify_queue(
     source: Arc<dyn AlertSource>,
     state: Arc<StateMap>,
     metrics: Arc<crate::metrics_sink::PromSink>,
+    slots: Option<Arc<crate::slot_registry::SlotRegistry>>,
     mut shutdown: tokio::sync::broadcast::Receiver<seederd_engine::ShutdownReason>,
 ) {
     use seederd_engine::MetricsSink;
@@ -351,6 +353,25 @@ pub async fn run_verify_queue(
             let Some(item) = q.pending.lock().pop_front() else {
                 break;
             };
+            // `POST /api/pool/adopt` checks the slot's tunnel before queueing,
+            // but the queue drains over minutes or hours and the tunnel can
+            // drop in between. Admitting then would add torrents to a fenced
+            // slot — the one thing fencing exists to prevent. Put it back and
+            // wait for the operator.
+            if slots
+                .as_ref()
+                .and_then(|sr| sr.get(&item.slot))
+                .is_some_and(|e| e.health().status == SlotStatus::VpnDown)
+            {
+                warn!(
+                    target: "seederd::pool",
+                    slot_id = %item.slot,
+                    infohash = %item.infohash,
+                    "verify held: slot is fenced (vpn_down)",
+                );
+                q.pending.lock().push_back(item);
+                break;
+            }
             let Some(engine) = source.engine_for(&item.slot) else {
                 warn!(target: "seederd::pool", slot_id = %item.slot, "no engine for slot; dropping verify");
                 continue;

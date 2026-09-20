@@ -96,7 +96,11 @@ pub fn nft_available() -> bool {
 pub fn enable(tunnels: &[String]) -> io::Result<u32> {
     let uid = current_uid()?;
     let ruleset = render_ruleset(uid, tunnels);
-    let _ = disable(); // idempotent: clear a stale table before reloading.
+    // Clear a stale table before reloading. `nft -f -` merges into an existing
+    // table rather than replacing it, so a delete that silently failed would
+    // leave a previous run's rules in force alongside the new ones — with the
+    // old run's tunnel interfaces still accepted.
+    disable()?;
     apply(&ruleset)?;
     info!(
         target: "seederd::vpn::killswitch",
@@ -107,15 +111,32 @@ pub fn enable(tunnels: &[String]) -> io::Result<u32> {
     Ok(uid)
 }
 
-/// Remove the kill-switch table. Best-effort and idempotent — a missing table
-/// is treated as success so shutdown never fails on it.
+/// Remove the kill-switch table.
+///
+/// A missing table is success — shutdown must never fail on it, and the
+/// startup pre-clear runs against a table that usually is not there. Any other
+/// non-zero exit is reported: `nft` merges into an existing table rather than
+/// replacing it, so a stale table that failed to delete would silently survive
+/// alongside the new rules. Previously only a failure to *spawn* `nft` was
+/// noticed, and a non-zero exit looked identical to success.
 pub fn disable() -> io::Result<()> {
-    Command::new("nft")
+    let out = Command::new("nft")
         .args(["delete", "table", "inet", TABLE])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    Ok(())
+        .stderr(Stdio::piped())
+        .output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr);
+    if err.contains("No such file or directory") || err.contains("does not exist") {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "nft delete table exited {}: {}",
+        out.status,
+        err.trim(),
+    )))
 }
 
 /// Feed a ruleset to `nft -f -`.

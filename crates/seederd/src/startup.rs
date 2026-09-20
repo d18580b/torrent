@@ -26,6 +26,7 @@ use seederd_engine::ResumeStore;
 use seederd_engine::ShutdownReason;
 use seederd_engine::SingleSessionSource;
 use seederd_engine::SlotId;
+use seederd_engine::SlotStatus;
 use seederd_engine::StateMap;
 use seederd_engine::SystemClock;
 use seederd_engine::TorrentEngine;
@@ -269,10 +270,21 @@ pub async fn boot(
                 metrics.set_gauge("kill_switch_active", 1.0, &[]);
                 info!(uid, "network kill switch active");
             }
-            None => warn!(
-                "network_kill_switch set but no slots configured; \
-                 ignoring (single-session mode has no tunnel to protect)",
-            ),
+            None => {
+                // Fail closed, like every other path here. The operator set
+                // this flag precisely because they do not want traffic on the
+                // bare IP; warning and continuing gives them exactly that,
+                // with nothing but a startup log line to say so. Single-session
+                // mode has no tunnel to confine egress to, so the honest answer
+                // is that the config is contradictory.
+                anyhow::bail!(
+                    "network_kill_switch = true but no [[slot]] entries are configured. \
+                     The kill switch confines the daemon's egress to its slots' tunnel \
+                     interfaces, and single-session mode has none — it would seed from \
+                     the bare IP with no backstop. Configure slots, or unset \
+                     network_kill_switch.",
+                );
+            }
         }
     }
 
@@ -437,6 +449,18 @@ pub async fn boot(
             let _ = tx.send(reason);
         }) as seederd_engine::FatalCallback
     })
+    // The engine resumes torrents on its own upload-mode retry schedule and
+    // has no concept of a tunnel, so it has to be told which slots the VPN
+    // monitor has fenced.
+    .slot_fenced({
+        let slots = slot_registry.clone();
+        Arc::new(move |id: &seederd_engine::SlotId| {
+            slots
+                .as_ref()
+                .and_then(|sr| sr.get(id))
+                .is_some_and(|e| e.health().status == SlotStatus::VpnDown)
+        }) as seederd_engine::SlotFenced
+    })
     .spawn();
 
     Ok(DaemonHandle {
@@ -518,6 +542,7 @@ impl DaemonHandle {
                 source.clone(),
                 state.clone(),
                 metrics.clone(),
+                slot_registry.clone(),
                 shutdown_tx.subscribe(),
             ));
         }

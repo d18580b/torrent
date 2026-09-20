@@ -35,6 +35,7 @@ use crossbeam_channel::Sender;
 use libtorrent_safe::Alert;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::TorrentHandle;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::info_span;
@@ -84,11 +85,19 @@ pub struct AlertLoopBuilder {
     clock: Arc<dyn Clock>,
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
+    slot_fenced: Option<SlotFenced>,
 }
 
 /// Invoked once, from the loop thread, when a fatal condition is detected —
 /// seederd wires this to the shutdown broadcast so the HTTP server unwinds.
 pub type FatalCallback = Arc<dyn Fn(ShutdownReason) + Send + Sync>;
+
+/// "Is this slot fenced?" — supplied by the daemon, which owns VPN health.
+///
+/// The engine has no concept of a tunnel, but it does resume torrents on its
+/// own schedule, and resuming one in a slot the VPN monitor has fenced
+/// un-quarantines it behind the operator's back.
+pub type SlotFenced = Arc<dyn Fn(&SlotId) -> bool + Send + Sync>;
 
 impl std::fmt::Debug for AlertLoopBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -114,6 +123,7 @@ impl AlertLoopBuilder {
             clock,
             fatal_listen_failure: false,
             on_fatal: None,
+            slot_fenced: None,
         }
     }
 
@@ -127,6 +137,13 @@ impl AlertLoopBuilder {
 
     /// Callback fired when the loop decides to self-terminate, before it
     /// begins the resume-data drain.
+    /// Supply the fenced-slot predicate. Without one, no slot is ever fenced,
+    /// which is correct for single-session mode and for tests.
+    pub fn slot_fenced(mut self, f: SlotFenced) -> Self {
+        self.slot_fenced = Some(f);
+        self
+    }
+
     pub fn on_fatal(mut self, f: FatalCallback) -> Self {
         self.on_fatal = Some(f);
         self
@@ -154,6 +171,7 @@ impl AlertLoopBuilder {
                 let listen_failed = Arc::clone(&listen_failed);
                 let fatal_listen_failure = self.fatal_listen_failure;
                 let on_fatal = self.on_fatal.clone();
+                let slot_fenced = self.slot_fenced.clone();
                 move || {
                     let span = info_span!(parent: parent, "alert_loop");
                     let _enter = span.enter();
@@ -178,6 +196,7 @@ impl AlertLoopBuilder {
                                 listen_failed,
                                 fatal_listen_failure,
                                 on_fatal,
+                                slot_fenced,
                             },
                         );
                     }));
@@ -285,6 +304,7 @@ struct LoopHooks {
     listen_failed: Arc<AtomicBool>,
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
+    slot_fenced: Option<SlotFenced>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -378,7 +398,14 @@ fn run(
         }
 
         // 4) Retry timer.
-        execute_due_retries(&source, &state, &metrics, &clock, now);
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &clock,
+            hooks.slot_fenced.as_ref(),
+            now,
+        );
 
         // 5) Sleep if there's nothing to do.
         if was_empty {
@@ -481,6 +508,7 @@ fn execute_due_retries(
     state: &Arc<StateMap>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
+    slot_fenced: Option<&SlotFenced>,
     now: Instant,
 ) {
     let due = state.retries_due(now);
@@ -491,6 +519,19 @@ fn execute_due_retries(
         let Some(st) = state.get(&handle.infohash) else {
             continue;
         };
+        // The VPN monitor pauses every torrent in a slot whose tunnel went
+        // down and refuses to restart it without an operator. Resuming one on
+        // the upload-mode retry timer would un-quarantine it individually,
+        // which is the thing fencing exists to prevent.
+        if slot_fenced.is_some_and(|f| f(&st.slot_id)) {
+            debug!(
+                target: "seederd_engine::alert_loop",
+                slot_id = %st.slot_id,
+                infohash = %handle.infohash,
+                "retry skipped: slot is fenced",
+            );
+            continue;
+        }
         let Some(engine) = source.engine_for(&st.slot_id) else {
             continue;
         };
@@ -776,6 +817,48 @@ mod tests {
             panic!("metrics sink exploded");
         }
         fn set_gauge(&self, _n: &str, _v: f64, _l: &[(&str, &str)]) {}
+    }
+
+    #[test]
+    fn a_fenced_slot_is_not_resumed_by_the_retry_timer() {
+        // The VPN monitor pauses every torrent in a slot whose tunnel dropped
+        // and deliberately does not restart it. The upload-mode retry timer
+        // ran on its own schedule with no notion of that, so it un-quarantined
+        // torrents one at a time — putting traffic back on a slot the operator
+        // was told to go look at.
+        // Auto-echo the resume saves, so the shutdown drain settles instead of
+        // sitting out its full 30s deadline on a mock that never replies.
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        engine.push_alert(add_torrent_alert(3, 3));
+        let handle = builder_with(Arc::clone(&engine))
+            .slot_fenced(Arc::new(|_: &SlotId| true) as SlotFenced)
+            .spawn();
+
+        let ih = InfoHash([3u8; 20]);
+        assert!(
+            wait_for(|| handle.state().get(&ih).is_some()),
+            "the add alert was never dispatched",
+        );
+
+        // Make a retry due immediately, as `file_error` -> upload_mode does.
+        handle.state().update(&ih, |s| {
+            s.retry = Some(crate::state::RetryState::first(
+                std::time::Instant::now() - Duration::from_secs(3600),
+            ));
+        });
+
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !engine
+                .calls()
+                .iter()
+                .any(|c| matches!(c, crate::mock::RecordedCall::ResumeTorrent(_))),
+            "a fenced slot's torrent was resumed: {:?}",
+            engine.calls(),
+        );
+
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread panicked");
     }
 
     #[test]
