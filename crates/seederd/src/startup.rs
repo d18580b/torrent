@@ -50,6 +50,14 @@ use crate::slot_registry::SlotEntry;
 use crate::slot_registry::SlotRegistry;
 use crate::vpn;
 
+/// How stale the alert loop's heartbeat may be before the watchdog ping is
+/// withheld.
+///
+/// Matches `/healthz`'s bound: both are asking the same question, and a
+/// daemon that reports 503 to a load balancer while telling systemd it is
+/// healthy is the worst of both answers.
+const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::from_secs(15);
+
 pub struct DaemonHandle {
     cfg: Config,
     /// The `--config` path exactly as parsed by clap. Threaded through rather
@@ -565,10 +573,30 @@ impl DaemonHandle {
                 "systemd watchdog enabled"
             );
             let mut wd_shutdown = shutdown_tx.subscribe();
+            let wd_heartbeat = alert_loop.heartbeat();
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = tokio::time::sleep(interval) => sd_notify::watchdog(),
+                        _ = tokio::time::sleep(interval) => {
+                            // Ping only while the alert loop is still making
+                            // progress. This task is independent of that
+                            // thread, so an unconditional ping tells systemd
+                            // the daemon is healthy for as long as the process
+                            // is alive — including when the loop has died and
+                            // seeding, resume saves and status updates have all
+                            // stopped. `/healthz` reports that correctly, and
+                            // nothing reads `/healthz`.
+                            let age = seederd_engine::heartbeat_age(&wd_heartbeat);
+                            if age > WATCHDOG_MAX_HEARTBEAT_AGE {
+                                error!(
+                                    heartbeat_age_secs = age.as_secs(),
+                                    "alert loop is not making progress; withholding the \
+                                     systemd watchdog ping so the unit is restarted",
+                                );
+                            } else {
+                                sd_notify::watchdog();
+                            }
+                        }
                         _ = wd_shutdown.recv() => return,
                     }
                 }
