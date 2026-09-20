@@ -131,6 +131,18 @@ pub struct PoolConfig {
     /// The JSON is left on disk; existing in-index assignments always win.
     #[serde(default = "PoolConfig::default_true")]
     pub import_legacy_registry: bool,
+
+    /// Allow the daemon to move, relocate and delete files inside the managed
+    /// roots.
+    ///
+    /// Off by default, and deliberately so. Indexing, matching, adoption and
+    /// reporting are all read-only and need nothing here; the plan/apply
+    /// machinery is the only part that can destroy data, and an operator who
+    /// has not decided to reorganise their pool should not be one malformed
+    /// request away from it. Turning this on does not disable any of the
+    /// refusals — it only stops the whole surface returning 403.
+    #[serde(default)]
+    pub allow_mutations: bool,
 }
 
 impl PoolConfig {
@@ -377,6 +389,24 @@ connections_limit = 10000
         let err = Config::load(&p).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("unknown_setting"), "got: {msg}");
+    }
+
+    #[test]
+    fn pool_mutations_are_off_unless_asked_for() {
+        // The daemon can move and delete inside its managed roots. An operator
+        // who only wanted an index should never be one request away from that,
+        // so the default has to stay false — asserted here because a stray
+        // `#[serde(default = "...true")]` would be silent otherwise.
+        let dir = tempdir().unwrap();
+        let body = SINGLE_SESSION.to_string()
+            + "\n[pool]\nroots = [\"/data/torrents\"]\nlibrary_dir = \"/var/lib/seederd/library\"\n";
+        let p = write_cfg(dir.path(), &body);
+        let cfg = Config::load(&p).unwrap();
+        assert!(!cfg.pool.as_ref().unwrap().allow_mutations);
+
+        let on = body + "allow_mutations = true\n";
+        let p = write_cfg(dir.path(), &on);
+        assert!(Config::load(&p).unwrap().pool.unwrap().allow_mutations);
     }
 
     #[test]

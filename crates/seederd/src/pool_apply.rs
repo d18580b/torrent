@@ -331,6 +331,17 @@ fn libc_exdev() -> i32 {
 
 /// Re-drive any plan a crash left mid-apply.
 pub fn resume_unfinished(pool: &PoolService, source: &Arc<dyn AlertSource>, state: &StateMap) {
+    if !pool.allow_mutations() {
+        // Mutations were turned off between the interrupted apply and this
+        // boot. Re-driving anyway would destroy data the operator has since
+        // said they do not want the daemon touching; leave the plan `applying`
+        // so it is still visible and can be resumed deliberately.
+        warn!(
+            target: "seederd::pool::apply",
+            "pool mutations are disabled; not resuming interrupted plans",
+        );
+        return;
+    }
     let unfinished = match pool.with_store(|s| s.unfinished_plans()) {
         Ok(p) => p,
         Err(e) => {

@@ -619,12 +619,28 @@ pub struct PlanView {
     confirm_token: Option<String>,
 }
 
+/// 403 for every mutation entry point when `[pool] allow_mutations` is unset.
+///
+/// Planning is read-only and could in principle be allowed — but a plan that
+/// can never be applied is a trap, and refusing at the point the operator asks
+/// is the clearer signal.
+fn mutations_disabled() -> ApiError {
+    err(
+        StatusCode::FORBIDDEN,
+        "pool mutations are disabled; set `allow_mutations = true` in the [pool] \
+         section of the config to move, relocate or delete inside a managed root",
+    )
+}
+
 /// Compute a plan. Touches nothing on disk.
 pub async fn create_plan(
     State(s): State<AppState>,
     Json(req): Json<CreatePlanRequest>,
 ) -> Result<(StatusCode, Json<PlanView>), ApiError> {
     let pool = s.pool.as_ref().ok_or_else(no_pool)?;
+    if !pool.allow_mutations() {
+        return Err(mutations_disabled());
+    }
     let kind = req.spec.kind();
 
     let built = pool
@@ -703,6 +719,9 @@ pub async fn apply_plan(
     body: Option<Json<ApplyRequest>>,
 ) -> Result<Json<crate::pool_apply::ApplyOutcome>, ApiError> {
     let pool = s.pool.clone().ok_or_else(no_pool)?;
+    if !pool.allow_mutations() {
+        return Err(mutations_disabled());
+    }
     let view = plan_view(&s, id)?;
 
     // Deleting data takes a second, deliberate call carrying a value only the
