@@ -338,12 +338,38 @@ pub async fn boot(
             if torrent.is_none() {
                 missing_metadata += 1;
             }
+            // Resume data carries the flags it was saved with, which is why
+            // this path does not re-assert SEED_MODE. Two of them must not be
+            // inherited, though:
+            //
+            // * PAUSED is cleared. The VPN monitor pauses every torrent in a
+            //   slot when its tunnel drops; if the 30-minute resume sweep or
+            //   the shutdown drain runs in that window, every torrent is
+            //   persisted paused and comes back paused on the next start —
+            //   with /healthz green and nothing saying why the pool went quiet.
+            //   Pausing is a runtime quarantine, not a property of the torrent.
+            // * The private-slot guards are re-asserted. Safety Rule 5 says
+            //   disable_pex is set unconditionally on every torrent in every
+            //   slot, but resume data written before the flag existed — or by
+            //   any other path — would come back without it. These are
+            //   belt-and-braces against the torrent's own `private` bit, and
+            //   belt-and-braces that lapse on restart are neither.
+            let (flags_set, flags_clear) = if slot.is_default() {
+                (TorrentFlags::empty(), TorrentFlags::PAUSED)
+            } else {
+                (
+                    TorrentFlags::DISABLE_PEX
+                        | TorrentFlags::DISABLE_DHT
+                        | TorrentFlags::DISABLE_LSD,
+                    TorrentFlags::PAUSED,
+                )
+            };
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: data.into_inner(),
                 torrent,
                 save_path: None,
-                flags_set: TorrentFlags::empty(),
-                flags_clear: TorrentFlags::empty(),
+                flags_set,
+                flags_clear,
             }) {
                 warn!(slot_id = %slot, infohash = %ih, error.cause = %e, "resume add failed");
             }
@@ -715,5 +741,15 @@ fn save_session_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)?;
+    // Fsync the directory too. Without it the rename may not survive a crash,
+    // which loses the DHT routing table and the session's listen state. The
+    // resume store, the torrent store and the assignment registry all do this;
+    // this was the one atomic-write site that claimed the guarantee in its
+    // comment without providing it.
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = std::fs::File::open(dir) {
+            d.sync_all()?;
+        }
+    }
     Ok(())
 }
