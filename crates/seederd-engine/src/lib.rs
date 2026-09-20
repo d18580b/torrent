@@ -78,6 +78,7 @@ pub use source::MultiSlotSource;
 pub use source::SingleSessionSource;
 pub use state::RetryState;
 pub use state::StateMap;
+pub use state::StorageMove;
 pub use state::TorrentPhase;
 pub use state::TorrentState;
 pub use torrent_store::FsTorrentStore;
