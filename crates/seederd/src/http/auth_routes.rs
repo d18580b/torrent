@@ -38,7 +38,24 @@ pub async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> 
             .into_response();
     };
 
+    // Argon2id costs ~50 ms of CPU on purpose. Unthrottled, an unauthenticated
+    // caller can spend the whole machine's CPU on password verification.
+    if let Some(wait) = auth.throttle.retry_after() {
+        warn!(
+            target: "seederd::auth",
+            retry_after_secs = wait.as_secs(),
+            "login throttled after repeated failures",
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", wait.as_secs().max(1).to_string())],
+            Json(serde_json::json!({"error": "too many failed attempts; try again shortly"})),
+        )
+            .into_response();
+    }
+
     if !auth.verify_password(&req.password) {
+        auth.throttle.note_failure();
         // No detail about which part was wrong, and no username to enumerate.
         warn!(target: "seederd::auth", "failed login attempt");
         return (
@@ -47,6 +64,7 @@ pub async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> 
         )
             .into_response();
     }
+    auth.throttle.note_success();
 
     let id = auth.sessions.create();
     let ttl = auth.config.session_ttl_secs;

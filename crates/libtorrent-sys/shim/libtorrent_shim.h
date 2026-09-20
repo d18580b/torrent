@@ -73,6 +73,14 @@ typedef uintptr_t lt_handle;
  * in alert_union.h because both that header and the metadata structs below
  * need them, and alert_union.h is the one that includes this file. */
 #define LT_PATH_MAX 1024
+
+/* Upper bound on the file count `lt_torrent_metadata` will materialise.
+ *
+ * Each entry carries a fixed LT_PATH_MAX buffer, so the array costs ~1 KiB per
+ * file whatever the paths actually are. 250k files is far past any real
+ * torrent (a 100 TiB release is thousands, not millions) and caps the
+ * allocation at ~256 MiB. */
+#define LT_MAX_TORRENT_FILES 250000u
 #define LT_MSG_MAX  2048
 #define LT_NAME_MAX 64
 #define LT_ADDR_MAX 64

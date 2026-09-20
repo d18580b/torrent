@@ -966,6 +966,15 @@ extern "C" int lt_torrent_metadata(const uint8_t* data, size_t len,
 
     lt::file_storage const& fs = ti.files();
     auto const n = static_cast<std::size_t>(fs.num_files());
+    // Every entry embeds a fixed LT_PATH_MAX path buffer, so this array is
+    // ~1 KiB per file regardless of the real path lengths. A crafted .torrent
+    // of a few MiB can declare ~1.5M files and demand ~1.6 GB here, and the
+    // pool's library scan parses whatever `.torrent` is dropped in
+    // `library_dir`. Refuse implausible manifests instead of allocating.
+    if (n > LT_MAX_TORRENT_FILES) {
+        set_err(err_out, err_len, "torrent declares an implausible number of files");
+        return LT_ERR;
+    }
     if (n > 0) {
         auto* arr = static_cast<lt_torrent_meta_file*>(
             std::calloc(n, sizeof(lt_torrent_meta_file)));
