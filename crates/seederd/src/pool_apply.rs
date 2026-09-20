@@ -346,10 +346,15 @@ fn delete_file(pool: &PoolService, path: &Path) -> Result<(), String> {
 
 /// Whether `path` lies inside one of the configured managed roots.
 ///
-/// Purely lexical, matching the planner: `Path::starts_with` compares whole
-/// components, so `/data/pool2` is correctly not inside `/data/pool`.
+/// Shares the planner's check, which follows the symlinks that exist rather
+/// than comparing components lexically. The lexical form let a symlinked
+/// directory inside a root carry a destination onto another volume while still
+/// looking contained, and this is the last gate before `move_storage` or
+/// `create_dir_all` acts on it.
 fn under_a_managed_root(pool: &PoolService, path: &Path) -> bool {
-    pool.roots().iter().any(|(_, root)| path.starts_with(root))
+    pool.roots()
+        .iter()
+        .any(|(_, root)| seederd_pool::plan::contains(root, path))
 }
 
 /// Which torrent's payload sits at `dir`.

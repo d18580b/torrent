@@ -1227,3 +1227,52 @@ fn a_rematch_never_publishes_an_empty_claim_table() {
         "a rolled-back rematch left the pool looking unclaimed",
     );
 }
+
+#[test]
+fn a_destination_behind_a_symlink_is_refused() {
+    // `Path::starts_with` is lexical, so `root/tv/x` looks contained even when
+    // `root/tv` points at another volume. Media pools symlink into other
+    // volumes routinely, and the executor would happily `create_dir_all` and
+    // move payload through one.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pool");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("tv")).unwrap();
+
+    write_file(&root, "src/T/a.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    seederd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "x1", "T", Some("src"), &[("T/a.bin", 128)]);
+    seederd_pool::match_all(&mut store).unwrap();
+
+    let e = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "x1".into(),
+            dest_root_id: root_id,
+            dest_rel: "tv/archive".into(),
+        },
+        root_id,
+        &root,
+    )
+    .unwrap_err();
+    assert!(e.contains("outside the managed root"), "got {e}");
+
+    // A destination that stays inside is still accepted, so the check is not
+    // simply refusing everything.
+    assert!(build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "x1".into(),
+            dest_root_id: root_id,
+            dest_rel: "archive/T".into(),
+        },
+        root_id,
+        &root,
+    )
+    .is_ok());
+}

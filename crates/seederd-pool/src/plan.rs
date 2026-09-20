@@ -232,11 +232,12 @@ fn build_delete_orphans(
 /// parents anywhere on the disk — so containment is enforced here, at the only
 /// point where a caller-supplied path becomes a plan step.
 ///
-/// The check is lexical on purpose. Resolving symlinks would make the verdict
-/// depend on filesystem state that can change between planning and applying,
-/// and a plan whose safety expires is worse than one that is merely strict.
-/// [`crate::plan`]'s counterpart in the executor re-checks containment against
-/// the configured roots before acting.
+/// The lexical pass rejects traversal (`..`, absolute components). It is not
+/// sufficient on its own: `Path::starts_with` compares components, so
+/// `root/tv/x` is lexically inside `root` even when `root/tv` is a symlink to
+/// another volume — and media pools routinely symlink into other volumes.
+/// [`contains`] therefore follows the links that actually exist, and the
+/// executor re-runs the same check before acting.
 fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, Refused> {
     let rel = rel.trim_matches('/');
     if rel.is_empty() {
@@ -255,7 +256,51 @@ fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, Refused> {
             }
         }
     }
-    Ok(root.join(rel))
+    let joined = root.join(rel);
+    if !contains(root, &joined) {
+        return Err(Refused(format!(
+            "{rel:?} resolves outside the managed root once symlinks are followed",
+        )));
+    }
+    Ok(joined)
+}
+
+/// Whether `candidate` really lies inside `root`, following symlinks.
+///
+/// A plan destination usually does not exist yet, so the deepest ancestor that
+/// *does* exist is canonicalized and the remaining components are appended
+/// lexically. That is the most that can be established without creating
+/// anything, and it closes the case the purely lexical check misses: a
+/// symlinked directory inside the root pointing somewhere else entirely.
+///
+/// When the root itself does not exist there is no symlink to follow, so the
+/// lexical comparison is the whole answer and is used as-is. That keeps a root
+/// on a filesystem that is not mounted yet from being reported as an escape —
+/// a confusing verdict for an unrelated problem. The case this exists to catch
+/// is a symlink *inside* a root, and there the root necessarily exists.
+pub fn contains(root: &Path, candidate: &Path) -> bool {
+    let Ok(root_real) = root.canonicalize() else {
+        return candidate.starts_with(root);
+    };
+    // The destination usually does not exist yet: canonicalize the deepest
+    // ancestor that does, then re-append the rest lexically.
+    let mut existing = candidate;
+    let mut trailing = PathBuf::new();
+    loop {
+        if existing.exists() {
+            break;
+        }
+        let (Some(parent), Some(name)) = (existing.parent(), existing.file_name()) else {
+            return candidate.starts_with(root);
+        };
+        trailing = Path::new(name).join(&trailing);
+        existing = parent;
+    }
+    let Ok(mut real) = existing.canonicalize() else {
+        return candidate.starts_with(root);
+    };
+    real.push(&trailing);
+    real.starts_with(&root_real)
 }
 
 /// A stable token the caller must echo back to apply a destructive plan.
