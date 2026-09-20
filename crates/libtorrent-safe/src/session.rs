@@ -561,6 +561,6 @@ fn path_to_string(p: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     // Real session tests require the C++ build to succeed; covered by the
-    // integration tests in `crates/seederd/tests`. Pure unit tests live in
+    // integration tests in `crates/torrentd/tests`. Pure unit tests live in
     // settings.rs and handle.rs where they don't need libtorrent.
 }

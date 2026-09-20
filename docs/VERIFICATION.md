@@ -1,11 +1,11 @@
-# Verifying seederd end-to-end
+# Verifying torrentd end-to-end
 
-This is a hands-on runbook for confirming a seederd build actually works — both
+This is a hands-on runbook for confirming a torrentd build actually works — both
 automated (the Layer 1–4 test ladder) and manual (a single-node smoke you can
 watch, plus the multi-slot / VPN path). Every command below has been run as
 written; expected output is shown inline.
 
-`seederd` is **seeding-only** and **Linux-only**. It never downloads payload
+`torrentd` is **seeding-only** and **Linux-only**. It never downloads payload
 (only magnet *metadata*), creates no torrents, and has no UI — so "working"
 means: it accepts torrents over the HTTP control plane, seeds them, exposes
 metrics, reloads log level on SIGHUP, and persists resume + session state on a
@@ -27,7 +27,7 @@ graceful SIGTERM.
   native in-process client, so there's no extra binary or capability beyond the
   `CAP_NET_ADMIN` already needed for VPN bring-up.
 - For the optional network kill switch (§6b) only: the `nft` binary
-  (`nftables`) and running seederd as a dedicated user. Everything else in this
+  (`nftables`) and running torrentd as a dedicated user. Everything else in this
   runbook works without it.
 
 ---
@@ -57,12 +57,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Also covers, deterministically (no VPN/root needed):
 #   • NAT-PMP wire-format encode/decode incl. gateway epoch, a loopback
 #     fake-gateway socket test, UDP/TCP divergence → release, and lease
-#     teardown (seederd::vpn::natpmp)
+#     teardown (torrentd::vpn::natpmp)
 #   • renew → live-rebind + gateway-reboot (epoch regression) decision via
-#     MockForwarder + MockEngine (seederd_engine::port_forward)
+#     MockForwarder + MockEngine (torrentd_engine::port_forward)
 #   • VPN health verdict incl. stale-handshake liveness
-#     (seederd::vpn_monitor::evaluate)
-#   • fail-closed kill-switch ruleset rendering (seederd::vpn::killswitch)
+#     (torrentd::vpn_monitor::evaluate)
+#   • fail-closed kill-switch ruleset rendering (torrentd::vpn::killswitch)
 #   • the vpn_down HTTP guard: resume/add on a fenced slot → 409
 #   • slot-config validation: static needs listen_port, natpmp may omit it
 cargo test --workspace
@@ -74,13 +74,13 @@ cargo test --workspace
 cargo test -p libtorrent-sys --features shim-tests
 
 # Layer 3 — integration, real libtorrent + real disk (gated by --ignored)
-cargo test -p seederd-engine --test lifecycle -- --ignored
-cargo test -p seederd        --test daemon    -- --ignored
+cargo test -p torrentd-engine --test lifecycle -- --ignored
+cargo test -p torrentd        --test daemon    -- --ignored
 
 # Layer 4 — load / scaling harness (release build recommended)
-cargo run --release -p seederd-bench -- alert-throughput
-cargo run --release -p seederd-bench -- startup-time   --count 10000
-cargo run --release -p seederd-bench -- memory-scaling --count 50000
+cargo run --release -p torrentd-bench -- alert-throughput
+cargo run --release -p torrentd-bench -- startup-time   --count 10000
+cargo run --release -p torrentd-bench -- memory-scaling --count 50000
 ```
 
 What each Layer-3 test asserts:
@@ -135,7 +135,7 @@ log_level         = "info"
 enable_lsd        = false
 EOF
 
-cargo run -q -p seederd -- --config "$WORK/cfg.toml" >"$WORK/daemon.log" 2>&1 &
+cargo run -q -p torrentd -- --config "$WORK/cfg.toml" >"$WORK/daemon.log" 2>&1 &
 PID=$!
 until curl -fsS "http://$HTTP/healthz" >/dev/null 2>&1; do sleep 0.2; done
 ```
@@ -168,17 +168,17 @@ curl -s -o/dev/null -w '%{http_code}\n' -X POST http://$HTTP/torrents -H 'Conten
 TIH=$(curl -fsS http://$HTTP/torrents | python3 -c 'import sys,json;print([t["infohash"] for t in json.load(sys.stdin)["items"] if t["infohash"]!="'"$IH"'"][0])')
 curl -s -o/dev/null -w '%{http_code}\n' -X POST http://$HTTP/torrents/$TIH/file-priority -H 'Content-Type: application/json' -d '{"file_idx":0,"priority":4}'
 
-curl -fsS http://$HTTP/metrics | grep -c '^seederd_'   # > 0 daemon gauges
+curl -fsS http://$HTTP/metrics | grep -c '^torrentd_'   # > 0 daemon gauges
 curl -s -o/dev/null -w '%{http_code}\n' -X DELETE "http://$HTTP/torrents/$IH?delete_files=false"  # 204
 ```
 
 **libtorrent session gauges** are posted on a 30-second tick. After ~30 s:
 
 ```bash
-curl -fsS http://$HTTP/metrics | grep '^seederd_libtorrent_'
-# seederd_libtorrent_net_sent_bytes{slot_id="default"} …
-# seederd_libtorrent_peers_connected{slot_id="default"} …
-# seederd_libtorrent_num_seeding_torrents{slot_id="default"} …   (13 gauges, PRD §8)
+curl -fsS http://$HTTP/metrics | grep '^torrentd_libtorrent_'
+# torrentd_libtorrent_net_sent_bytes{slot_id="default"} …
+# torrentd_libtorrent_peers_connected{slot_id="default"} …
+# torrentd_libtorrent_num_seeding_torrents{slot_id="default"} …   (13 gauges, PRD §8)
 ```
 
 ---
@@ -208,7 +208,7 @@ until ! kill -0 $PID 2>/dev/null; do sleep 0.2; done
 ls "$WORK/session_state.dat"   # DHT/session state blob (single-session mode)
 ls "$WORK/resume"              # <infohash>.resume for torrents with metadata
 ls "$WORK/torrents"            # <infohash>.torrent inventory
-tail -2 "$WORK/daemon.log"     # "session state saved" then "seederd: clean exit"
+tail -2 "$WORK/daemon.log"     # "session state saved" then "torrentd: clean exit"
 ```
 
 A clean SIGTERM drains every outstanding `save_resume_data`, writes resume files
@@ -218,15 +218,15 @@ atomically (temp + fsync + rename), and persists session state before exit.
 
 ## 5a. systemd readiness, watchdog, and fatal listen failure
 
-`deploy/seederd.service` is `Type=notify` with `WatchdogSec=60s`, so the daemon
+`deploy/torrentd.service` is `Type=notify` with `WatchdogSec=60s`, so the daemon
 must speak `sd_notify(3)`. Without it systemd holds the unit in `activating`
 until `TimeoutStartSec` and then kills it — the packaged unit could never start.
 
 ```bash
 # Readiness: the unit reaches `active (running)` rather than timing out, and
 # `systemctl status` shows the STATUS= line.
-sudo systemctl start seederd
-systemctl show seederd -p ActiveState -p StatusText
+sudo systemctl start torrentd
+systemctl show torrentd -p ActiveState -p StatusText
 # ActiveState=active
 # StatusText=seeding; API on 127.0.0.1:8080
 ```
@@ -252,7 +252,7 @@ curl -s localhost:8080/healthz            # ok:true again
 # libtorrent's bind fails, then confirm the daemon exits non-zero instead of
 # idling with no listener (PRD §Error Handling).
 nc -l 6881 &
-seederd --config "$WORK/seederd.toml"; echo "exit=$?"     # exit=70
+torrentd --config "$WORK/torrentd.toml"; echo "exit=$?"     # exit=70
 # …"message":"listen socket failed in single-session mode; shutting down"…
 ```
 
@@ -269,11 +269,11 @@ copy of a real library before committing to anything.
 ```bash
 # A pool with one torrent where its name says, one whose payload was moved,
 # one whose payload is absent, and a file no torrent claims.
-seederd --config "$WORK/seederd.toml" pool scan
+torrentd --config "$WORK/torrentd.toml" pool scan
 #   matched 2   partial 0   missing 1   overlap 0
 #   total 2.8 MiB   adopted 0 B   matched 1.6 MiB   unclaimed 1.1 MiB
 
-seederd --config "$WORK/seederd.toml" pool orphans
+torrentd --config "$WORK/torrentd.toml" pool orphans
 #   loose    1.1 MiB unclaimed
 ```
 
@@ -293,17 +293,17 @@ Drift is a separate question from scanning — `scan` rewrites the index from th
 live filesystem and so can never disagree with it, while `check` compares them:
 
 ```bash
-seederd --config "$WORK/seederd.toml" pool check
+torrentd --config "$WORK/torrentd.toml" pool check
 #   no drift: every claimed file matches the indexed snapshot
 
 # Rewrite a claimed file in place at the SAME size — the case a size-only
 # check misses — then delete another.
 head -c 500000 /dev/urandom > "$WORK/data/Show.S01/ep2.mkv"
-seederd --config "$WORK/seederd.toml" pool check
+torrentd --config "$WORK/torrentd.toml" pool check
 #   1 torrent(s) drifted — 1 file(s) changed, 0 vanished
 
 rm "$WORK/data/moved/elsewhere/feature.mkv"
-seederd --config "$WORK/seederd.toml" pool check
+torrentd --config "$WORK/torrentd.toml" pool check
 #   1 torrent(s) drifted — 0 file(s) changed, 1 vanished
 ```
 
@@ -316,9 +316,9 @@ libtorrent re-hashing the payload settles that.
 ## 5c. Authentication
 
 ```bash
-seederd --config "$WORK/seederd.toml" hash-password
-seederd --config "$WORK/seederd.toml" new-token --name prometheus --scopes metrics
-seederd --config "$WORK/seederd.toml" new-token --name script --scopes read
+torrentd --config "$WORK/torrentd.toml" hash-password
+torrentd --config "$WORK/torrentd.toml" new-token --name prometheus --scopes metrics
+torrentd --config "$WORK/torrentd.toml" new-token --name script --scopes read
 ```
 
 With those in an `[auth]` section, every boundary should hold:
@@ -344,7 +344,7 @@ Session flow:
 ```bash
 curl -sX POST :8080/api/login -d '{"password":"wrong"}'    # 401
 curl -si -c jar -X POST :8080/api/login -d '{"password":"…"}'
-# set-cookie: seederd_session=…; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600
+# set-cookie: torrentd_session=…; HttpOnly; SameSite=Strict; Path=/; Max-Age=3600
 curl -s -b jar  :8080/api/torrents                          # 200
 curl -s -b jar -X POST :8080/api/logout                     # 204
 curl -s -b jar  :8080/api/torrents                          # 401 — revoked server-side
@@ -409,12 +409,12 @@ polls the tunnel IP via `ip -4 -o addr show` every 30 s.
 
 Any `[[slot]]` table switches the daemon into multi-slot mode (then `POST
 /torrents` requires `slot_id`). Minimal two-slot config (see
-`deploy/seederd.sample.toml` for all keys):
+`deploy/torrentd.sample.toml` for all keys):
 
 ```toml
 http_listen = "127.0.0.1:8080"
-resume_dir  = "/var/lib/seederd/resume"
-torrent_dir = "/var/lib/seederd/torrents"
+resume_dir  = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
 
 [[slot]]
 id            = "account_a"
@@ -502,8 +502,8 @@ port_forward         = "natpmp"
 port_forward_gateway = "10.2.0.1"   # default; override only if your gateway differs
 peer_fingerprint_hex = "3c2d1e0f4a5b6c7d"
 user_agent           = "qBittorrent/5.0.3"
-resume_dir           = "/var/lib/seederd/resume/proton_a"
-torrent_dir          = "/var/lib/seederd/torrents/proton_a"
+resume_dir           = "/var/lib/torrentd/resume/proton_a"
+torrent_dir          = "/var/lib/torrentd/torrents/proton_a"
 allowed_tracker_domains = ["tracker.example.com"]
 ```
 
@@ -533,11 +533,11 @@ curl -fsS http://127.0.0.1:8080/metrics | grep 'slot_port_forward_failures_total
 Expected: torrents **stay seeding** (NOT paused), the slot stays `active`, and
 the tunnel IP is unchanged — a lost mapping only blocks *new inbound* peers, so
 it's a warn-and-observe condition, not a privacy leak (contrast §6 tunnel loss,
-which pauses). Confirm no bare-IP leak — every seederd socket is on the tunnel
+which pauses). Confirm no bare-IP leak — every torrentd socket is on the tunnel
 IP, never the WAN IP:
 
 ```bash
-sudo ss -tunp | grep seederd
+sudo ss -tunp | grep torrentd
 ```
 
 Restore and watch it self-heal on the next cycle:
@@ -570,8 +570,8 @@ loopback fake-gateway UDP responder drives the real `NatpmpForwarder`, and
 `renew_and_rebind` is checked against `MockForwarder` + `MockEngine`:
 
 ```bash
-cargo test -p seederd            --bin seederd vpn::natpmp
-cargo test -p seederd-engine     port_forward
+cargo test -p torrentd            --bin torrentd vpn::natpmp
+cargo test -p torrentd-engine     port_forward
 ```
 
 ### 6b. Network kill switch (fail-closed nftables backstop)
@@ -579,14 +579,14 @@ cargo test -p seederd-engine     port_forward
 Opt-in defence-in-depth for multi-slot mode: independent of the source-bind and
 the 30s monitor, an nftables table confines the daemon's egress to loopback +
 the slots' tunnel interfaces, so a dropped tunnel fails closed at the kernel.
-Set `network_kill_switch = true`, run seederd as a dedicated user, and ensure
+Set `network_kill_switch = true`, run torrentd as a dedicated user, and ensure
 `nft` is installed (`--check-config` fails early if it isn't).
 
 ```bash
 # With the multi-slot daemon (from §6) running under network_kill_switch = true:
-sudo nft list ruleset | grep -A6 'table inet seederd_ks'   # the fail-closed table
-# every seederd socket rides a tunnel IP — never the WAN IP:
-sudo ss -tunp | grep seederd
+sudo nft list ruleset | grep -A6 'table inet torrentd_ks'   # the fail-closed table
+# every torrentd socket rides a tunnel IP — never the WAN IP:
+sudo ss -tunp | grep torrentd
 ```
 
 Confirm it fails closed when a tunnel disappears (the interface, and its
@@ -594,13 +594,13 @@ Confirm it fails closed when a tunnel disappears (the interface, and its
 
 ```bash
 sudo wg-quick down wg-acct-a
-# seederd's egress for that uid can no longer match a tunnel oifname → dropped.
+# torrentd's egress for that uid can no longer match a tunnel oifname → dropped.
 # No new WAN sockets appear; the §6 monitor still pauses the slot within ~30s.
-curl -fsS http://127.0.0.1:8080/metrics | grep '^seederd_kill_switch_active'   # 1 while running
+curl -fsS http://127.0.0.1:8080/metrics | grep '^torrentd_kill_switch_active'   # 1 while running
 ```
 
 A clean SIGTERM removes the table (`nft list ruleset` no longer shows
-`seederd_ks`). If the daemon is killed uncleanly, the next start replaces the
+`torrentd_ks`). If the daemon is killed uncleanly, the next start replaces the
 stale table before installing the fresh one.
 
 ---
@@ -610,14 +610,14 @@ stale table before installing the fresh one.
 - [ ] `cargo fmt --check`, `cargo clippy -D warnings`, `cargo test --workspace` all green.
 - [ ] Layer 2 shim tests pass; Layer 3 `--ignored` suites pass (5 scenarios).
 - [ ] Layer 4 memory-scaling reports `< 200 KB/torrent` at `--count 50000`.
-- [ ] Manual smoke: every endpoint returns the codes above; `seederd_libtorrent_*`
+- [ ] Manual smoke: every endpoint returns the codes above; `torrentd_libtorrent_*`
       gauges appear after ~30 s.
 - [ ] SIGHUP switches log level live; SIGTERM writes `session_state.dat` + `.resume`.
 - [ ] (If applicable) tunnel loss pauses a slot, sets `slot_vpn_tunnel_up=0`, no auto-restart.
 - [ ] (If applicable) a stale WireGuard handshake (IP intact) also fences the slot;
       `resume`/`resume-all`/`add` on a `vpn_down` slot return `409`.
 - [ ] (If applicable) with `network_kill_switch=true`, `nft list ruleset` shows
-      `seederd_ks`, `seederd_kill_switch_active=1`, and SIGTERM removes the table.
+      `torrentd_ks`, `torrentd_kill_switch_active=1`, and SIGTERM removes the table.
 - [ ] (If applicable) a natpmp slot binds a negotiated `forwarded_port` at boot;
       `slot_port_forward_up=1` and `slot_port_forward_renewals_total` climbs.
 - [ ] (If applicable) blocking NAT-PMP egress flips `port_forward_ok=false` /

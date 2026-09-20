@@ -1,4 +1,4 @@
-# seederd
+# torrentd
 
 A headless, Linux-only **torrent seeding daemon** built on libtorrent, designed
 to seed from **1,000 to 100,000+ torrents** on one host at high throughput. It is
@@ -8,7 +8,7 @@ private-tracker seeding with per-account VPN isolation.
 
 ## Scope
 
-seederd does **one** thing: seed torrents whose payload already exists on disk.
+torrentd does **one** thing: seed torrents whose payload already exists on disk.
 
 - **Seeding only** — it never downloads payload (only magnet *metadata*), creates
   no torrents, and does not verify/repair content beyond libtorrent's own hash
@@ -23,13 +23,13 @@ seederd does **one** thing: seed torrents whose payload already exists on disk.
 
 | Crate | Purpose |
 |-------|---------|
-| `seederd` | The daemon binary: config, HTTP control plane, signals, VPN + NAT-PMP integration, metrics. |
-| `seederd-engine` | `TorrentEngine` trait, the alert loop, slot/assignment registry, and provider-agnostic port-forward core (plus mock doubles). |
-| `seederd-pool` | Managed-root filesystem index, torrent library, and adoption matching (SQLite). |
+| `torrentd` | The daemon binary: config, HTTP control plane, signals, VPN + NAT-PMP integration, metrics. |
+| `torrentd-engine` | `TorrentEngine` trait, the alert loop, slot/assignment registry, and provider-agnostic port-forward core (plus mock doubles). |
+| `torrentd-pool` | Managed-root filesystem index, torrent library, and adoption matching (SQLite). |
 | `libtorrent-safe` | Safe RAII wrappers over the FFI. |
 | `libtorrent-sys` | Raw FFI bindings to libtorrent-rasterbar via a custom C shim. |
-| `seederd-bench` | Layer-4 load/soak harness (memory scaling, alert throughput, startup time). |
-| `web/` | React + TypeScript client, built by `crates/seederd/build.rs` and embedded in the binary. |
+| `torrentd-bench` | Layer-4 load/soak harness (memory scaling, alert throughput, startup time). |
+| `web/` | React + TypeScript client, built by `crates/torrentd/build.rs` and embedded in the binary. |
 
 ## Quick start
 
@@ -46,13 +46,13 @@ git submodule update --init --recursive --depth 1
 # builds are incremental.
 cargo build --workspace --release
 
-# Run against a config (see deploy/seederd.sample.toml).
-./target/release/seederd --config /etc/seederd/seederd.toml
+# Run against a config (see deploy/torrentd.sample.toml).
+./target/release/torrentd --config /etc/torrentd/torrentd.toml
 ```
 
 Signals: **SIGHUP** hot-reloads the reloadable settings (log level, rate limits,
 connection limits, …); **SIGTERM** drains resume data, persists session state,
-and exits cleanly. Validate a config without starting: `seederd --config … --check-config`.
+and exits cleanly. Validate a config without starting: `torrentd --config … --check-config`.
 
 Under systemd the daemon speaks `sd_notify(3)`: `READY=1` once the HTTP listener
 is bound, `WATCHDOG=1` at half the unit's `WatchdogSec`, and `STOPPING=1` before
@@ -101,7 +101,7 @@ Multi-slot mode additionally mounts `GET /slots`, `GET /slots/:id`,
 Seeding from a library that already exists on disk raises questions a torrent
 list cannot answer: which files are protected by a torrent, which are not, and
 which torrents point at data that moved or vanished. The optional `[pool]`
-section indexes **managed roots** (directories seederd owns) and a **torrent
+section indexes **managed roots** (directories torrentd owns) and a **torrent
 library** (a directory of `.torrent` files), matches them, and reports per path:
 
 | State | Meaning |
@@ -130,10 +130,10 @@ its state directory; for qBittorrent that is `BT_backup`, which holds both
 category and tag hints. Copy it somewhere scratch first.
 
 ```bash
-seederd --config /etc/seederd/seederd.toml pool scan      # index + match
-seederd --config /etc/seederd/seederd.toml pool status    # summarise
-seederd --config /etc/seederd/seederd.toml pool check     # what changed since the scan
-seederd --config /etc/seederd/seederd.toml pool orphans   # unclaimed bytes
+torrentd --config /etc/torrentd/torrentd.toml pool scan      # index + match
+torrentd --config /etc/torrentd/torrentd.toml pool status    # summarise
+torrentd --config /etc/torrentd/torrentd.toml pool check     # what changed since the scan
+torrentd --config /etc/torrentd/torrentd.toml pool orphans   # unclaimed bytes
 ```
 
 **Adopting** a matched torrent is tiered, so bringing a large pool online takes
@@ -154,7 +154,7 @@ curl -sX POST localhost:8080/api/pool/adopt \
 
 ### Reorganising the pool
 
-seederd can move, relocate and delete inside its managed roots, which means a
+torrentd can move, relocate and delete inside its managed roots, which means a
 mistake here destroys data. Every mutation is therefore planned, journaled and
 reversible-in-intent:
 
@@ -185,7 +185,7 @@ curl -sX POST localhost:8080/api/pool/plans/1/apply
 ## Configuration & modes
 
 One config file drives everything; unknown keys are a fatal error. See
-[`deploy/seederd.sample.toml`](deploy/seederd.sample.toml) for the annotated set.
+[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml) for the annotated set.
 
 **Single-session mode** (no `[[slot]]` tables): one libtorrent session bound to
 `listen_interfaces`, with DHT enabled and session/DHT state persisted across
@@ -265,8 +265,8 @@ nothing to guess and a fast SHA-256 is correct — Argon2 on every Prometheus
 scrape would burn ~50ms of CPU per request by design.
 
 ```bash
-seederd --config … hash-password                              # prompts twice
-seederd --config … new-token --name prometheus --scopes metrics
+torrentd --config … hash-password                              # prompts twice
+torrentd --config … new-token --name prometheus --scopes metrics
 ```
 
 The token is printed once and never stored; only its hash goes in the config,
@@ -297,9 +297,9 @@ credential is a probe that breaks during the incident it exists to detect.
 
 ## Metrics
 
-All series are namespaced `seederd_*`. Session gauges are exported per slot
+All series are namespaced `torrentd_*`. Session gauges are exported per slot
 (`slot_id` label); per-torrent series are intentionally not (unusable at 10K+
-torrents). Alongside the libtorrent session gauges (`seederd_libtorrent_*`, net
+torrents). Alongside the libtorrent session gauges (`torrentd_libtorrent_*`, net
 bytes, peers, disk queues, seeding/error counts) and daemon counters
 (`torrents_*`, `resume_*`, `alerts_dropped_total`, `torrents_checked_total`,
 `storage_moves_total`, `storage_move_failures_total`, …), multi-slot mode adds:
@@ -312,10 +312,10 @@ bytes, peers, disk queues, seeding/error counts) and daemon counters
 
 ## Deployment
 
-`deploy/` ships a hardened systemd unit (`seederd.service`, `Type=notify`,
+`deploy/` ships a hardened systemd unit (`torrentd.service`, `Type=notify`,
 `--check-config` pre-flight, `CAP_NET_ADMIN`, resource limits), a multi-stage
 `Containerfile`, and a `compose.yaml` (with `NET_ADMIN` + `/dev/net/tun` for
-multi-slot). Run seederd as its own user.
+multi-slot). Run torrentd as its own user.
 
 ## Testing
 
@@ -327,9 +327,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace                                  # Layer 1: unit + in-memory
 cargo test -p libtorrent-sys --features shim-tests      # Layer 2: FFI shim
-cargo test -p seederd-engine --test lifecycle -- --ignored   # Layer 3: real libtorrent
-cargo test -p seederd        --test daemon    -- --ignored
-cargo run --release -p seederd-bench -- memory-scaling --count 50000   # Layer 4
+cargo test -p torrentd-engine --test lifecycle -- --ignored   # Layer 3: real libtorrent
+cargo test -p torrentd        --test daemon    -- --ignored
+cargo run --release -p torrentd-bench -- memory-scaling --count 50000   # Layer 4
 ```
 
 ## Contributing & license

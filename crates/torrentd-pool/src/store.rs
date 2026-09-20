@@ -1,0 +1,1181 @@
+//! SQLite-backed pool index.
+//!
+//! A managed root can hold millions of files, which is past what the daemon's
+//! existing JSON-file conventions carry — and the web client needs to sort,
+//! filter and paginate over that set without shipping it all to the browser.
+//! One transactional file serves the file index, the torrent library, adoption
+//! state, and the torrent→slot registry that used to live in
+//! `slot_assignments.json`.
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::path::PathBuf;
+
+use rusqlite::params;
+use rusqlite::Connection;
+use rusqlite::OptionalExtension;
+use tracing::info;
+use tracing::warn;
+
+use crate::model::AdoptionState;
+use crate::model::DirRollup;
+use crate::model::PlanRow;
+use crate::model::PlanStep;
+use crate::model::PlanStepRow;
+use crate::model::PoolError;
+use crate::model::PoolFile;
+use crate::model::PoolTorrent;
+use crate::model::TorrentFileRow;
+
+/// Bumped whenever the schema changes; `migrate` walks forward from whatever
+/// the file reports. A file from the future is refused rather than guessed at.
+const SCHEMA_VERSION: i64 = 2;
+
+const SCHEMA_V1: &str = r#"
+CREATE TABLE root (
+    id       INTEGER PRIMARY KEY,
+    path     TEXT NOT NULL UNIQUE,
+    enabled  INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE file (
+    root_id    INTEGER NOT NULL REFERENCES root(id) ON DELETE CASCADE,
+    rel_path   TEXT    NOT NULL,
+    size       INTEGER NOT NULL,
+    mtime_ns   INTEGER NOT NULL,
+    ino        INTEGER NOT NULL,
+    dev        INTEGER NOT NULL,
+    v2_root    BLOB,
+    scanned_at INTEGER NOT NULL,
+    PRIMARY KEY (root_id, rel_path)
+) WITHOUT ROWID;
+
+-- Matching anchors on file size before it ever touches a path, so this index
+-- carries the candidate lookup for large libraries.
+CREATE INDEX file_by_size ON file(size);
+CREATE INDEX file_by_v2root ON file(v2_root) WHERE v2_root IS NOT NULL;
+
+CREATE TABLE torrent (
+    infohash      TEXT PRIMARY KEY,
+    infohash_v1   TEXT,
+    infohash_v2   TEXT,
+    name          TEXT    NOT NULL,
+    total_size    INTEGER NOT NULL,
+    num_files     INTEGER NOT NULL,
+    source_path   TEXT    NOT NULL,
+    fastresume_path TEXT,
+    declared_save_path TEXT,
+    category      TEXT,
+    tags          TEXT,
+    slot          TEXT,
+    added_at      INTEGER NOT NULL
+);
+
+CREATE INDEX torrent_by_slot ON torrent(slot) WHERE slot IS NOT NULL;
+
+CREATE TABLE torrent_file (
+    infohash    TEXT    NOT NULL REFERENCES torrent(infohash) ON DELETE CASCADE,
+    idx         INTEGER NOT NULL,
+    rel_path    TEXT    NOT NULL,
+    size        INTEGER NOT NULL,
+    pieces_root BLOB,
+    PRIMARY KEY (infohash, idx)
+) WITHOUT ROWID;
+
+CREATE INDEX torrent_file_by_size ON torrent_file(size);
+
+CREATE TABLE adoption (
+    infohash    TEXT PRIMARY KEY REFERENCES torrent(infohash) ON DELETE CASCADE,
+    state       TEXT    NOT NULL,
+    root_id     INTEGER REFERENCES root(id) ON DELETE SET NULL,
+    -- Directory under `root_id` that the torrent's relative paths hang off.
+    base_rel    TEXT,
+    verified_at INTEGER,
+    drift_at    INTEGER,
+    last_error  TEXT
+);
+
+CREATE INDEX adoption_by_state ON adoption(state);
+
+-- Which file each torrent claims. Written by the matcher; read to detect
+-- overlap and to compute directory rollups.
+CREATE TABLE claim (
+    root_id  INTEGER NOT NULL,
+    rel_path TEXT    NOT NULL,
+    infohash TEXT    NOT NULL REFERENCES torrent(infohash) ON DELETE CASCADE,
+    PRIMARY KEY (root_id, rel_path, infohash)
+) WITHOUT ROWID;
+
+CREATE INDEX claim_by_torrent ON claim(infohash);
+"#;
+
+/// v2 adds the mutation journal. Applied on top of v1 rather than folded into
+/// it so an index created by an earlier build migrates forward in place.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE plan (
+    id         INTEGER PRIMARY KEY,
+    kind       TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    applied_at INTEGER,
+    -- draft | applying | applied | failed | cancelled
+    status     TEXT    NOT NULL,
+    spec       TEXT    NOT NULL
+);
+
+CREATE INDEX plan_by_status ON plan(status);
+
+-- Written before each step is attempted. A crash mid-apply leaves the plan
+-- `applying` with a known last-completed step, which startup re-drives.
+CREATE TABLE plan_step (
+    plan_id INTEGER NOT NULL REFERENCES plan(id) ON DELETE CASCADE,
+    seq     INTEGER NOT NULL,
+    op      TEXT    NOT NULL,
+    src     TEXT    NOT NULL,
+    dst     TEXT,
+    -- pending | done | failed | skipped
+    status  TEXT    NOT NULL,
+    error   TEXT,
+    PRIMARY KEY (plan_id, seq)
+) WITHOUT ROWID;
+"#;
+
+pub struct PoolStore {
+    conn: Connection,
+    /// Nesting depth for [`PoolStore::in_transaction`]; 0 means autocommit.
+    tx_depth: u32,
+}
+
+impl std::fmt::Debug for PoolStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PoolStore").finish_non_exhaustive()
+    }
+}
+
+impl PoolStore {
+    /// Open (creating if needed) the pool database at `path`.
+    pub fn open(path: &Path) -> Result<Self, PoolError> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let conn = Connection::open(path)?;
+        Self::from_conn(conn)
+    }
+
+    /// In-memory store, for tests.
+    pub fn open_in_memory() -> Result<Self, PoolError> {
+        Self::from_conn(Connection::open_in_memory()?)
+    }
+
+    fn from_conn(conn: Connection) -> Result<Self, PoolError> {
+        // WAL keeps the scanner's long write transactions from blocking the
+        // HTTP layer's reads: a reader sees the pre-transaction snapshot for
+        // the whole duration of a rescan rather than a half-rebuilt index.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // FULL, not NORMAL. The file index really is reconstructible by
+        // rescanning — but the `plan` / `plan_step` mutation journal lives in
+        // this same database and is not. Under NORMAL a power loss can lose the
+        // last commits, which would resurrect a completed destructive step as
+        // `pending` and re-drive it at startup. An fsync per commit is cheap
+        // next to that.
+        conn.pragma_update(None, "synchronous", "FULL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        // A scan takes the database's write lock for its whole duration (see
+        // `in_transaction`). A second writer — the CLI `pool scan` racing the
+        // daemon — must fail fast with SQLITE_BUSY so the caller can say so,
+        // not block for hours.
+        conn.busy_timeout(std::time::Duration::from_millis(0))?;
+        let store = Self { conn, tx_depth: 0 };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    /// Run `f` with the whole store inside one write transaction.
+    ///
+    /// Every multi-statement rebuild must go through this. The claim table is
+    /// what proves a file is protected, and a rebuild that clears it outside a
+    /// transaction makes every file in every root read as an orphan until the
+    /// rebuild finishes — which is long enough for a concurrent delete plan to
+    /// enumerate the entire pool. `BEGIN IMMEDIATE` also takes SQLite's own
+    /// cross-process write lock, so a second scanner (the CLI racing the
+    /// daemon) is refused rather than interleaved.
+    ///
+    /// Re-entrant: a nested call becomes a savepoint, so callers can compose
+    /// without knowing whether they are already inside one.
+    pub fn in_transaction<T, E>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, E>,
+    ) -> Result<T, E>
+    where
+        E: From<PoolError>,
+    {
+        let depth = self.tx_depth;
+        let (begin, commit, rollback) = if depth == 0 {
+            (
+                "BEGIN IMMEDIATE".to_string(),
+                "COMMIT".to_string(),
+                "ROLLBACK".to_string(),
+            )
+        } else {
+            let name = format!("pool_tx_{depth}");
+            (
+                format!("SAVEPOINT {name}"),
+                format!("RELEASE {name}"),
+                format!("ROLLBACK TO {name}; RELEASE {name}"),
+            )
+        };
+        self.conn.execute_batch(&begin).map_err(|e| {
+            E::from({
+                if matches!(
+                    e.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) {
+                    PoolError::Busy
+                } else {
+                    PoolError::Sqlite(e)
+                }
+            })
+        })?;
+        self.tx_depth = depth + 1;
+        let out = f(self);
+        self.tx_depth = depth;
+        match out {
+            Ok(v) => {
+                self.conn
+                    .execute_batch(&commit)
+                    .map_err(|e| E::from(PoolError::Sqlite(e)))?;
+                Ok(v)
+            }
+            Err(e) => {
+                // Report the original failure; a rollback that itself fails
+                // means the connection is already unusable either way.
+                let _ = self.conn.execute_batch(&rollback);
+                Err(e)
+            }
+        }
+    }
+
+    fn migrate(&self) -> Result<(), PoolError> {
+        let found: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if found > SCHEMA_VERSION {
+            return Err(PoolError::SchemaVersion {
+                found,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        if found < 1 {
+            self.conn.execute_batch(SCHEMA_V1)?;
+        }
+        if found < 2 {
+            self.conn.execute_batch(SCHEMA_V2)?;
+        }
+        if found != SCHEMA_VERSION {
+            self.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            info!(
+                target: "torrentd_pool::store",
+                from_version = found,
+                to_version = SCHEMA_VERSION,
+                "pool schema migrated",
+            );
+        }
+        Ok(())
+    }
+
+    // -- roots -------------------------------------------------------------
+
+    /// Register a managed root, returning its id. Idempotent.
+    pub fn upsert_root(&self, path: &Path) -> Result<i64, PoolError> {
+        let p = path.to_string_lossy();
+        self.conn.execute(
+            "INSERT INTO root(path, enabled) VALUES (?1, 1)
+             ON CONFLICT(path) DO UPDATE SET enabled = 1",
+            params![p],
+        )?;
+        let id: i64 =
+            self.conn
+                .query_row("SELECT id FROM root WHERE path = ?1", params![p], |r| {
+                    r.get(0)
+                })?;
+        Ok(id)
+    }
+
+    pub fn roots(&self) -> Result<Vec<(i64, PathBuf)>, PoolError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT id, path FROM root WHERE enabled = 1 ORDER BY path")?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, PathBuf::from(r.get::<_, String>(1)?)))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn root_id(&self, path: &Path) -> Result<i64, PoolError> {
+        self.conn
+            .query_row(
+                "SELECT id FROM root WHERE path = ?1",
+                params![path.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| PoolError::UnknownRoot(path.to_path_buf()))
+    }
+
+    // -- files -------------------------------------------------------------
+
+    /// Replace the file index for one root, inside a single transaction.
+    ///
+    /// Taken whole rather than incrementally because a partial index is worse
+    /// than a stale one: the matcher would read absent files as deleted and
+    /// mark healthy torrents `Missing`.
+    pub fn replace_root_files(
+        &mut self,
+        root_id: i64,
+        files: &[PoolFile],
+        scanned_at: i64,
+    ) -> Result<(), PoolError> {
+        let tx = self.conn.savepoint()?;
+        tx.execute("DELETE FROM file WHERE root_id = ?1", params![root_id])?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO file(root_id, rel_path, size, mtime_ns, ino, dev, v2_root, scanned_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )?;
+            for f in files {
+                ins.execute(params![
+                    root_id,
+                    f.rel_path,
+                    f.size as i64,
+                    f.mtime_ns,
+                    f.ino as i64,
+                    f.dev as i64,
+                    f.v2_root.map(|r| r.to_vec()),
+                    scanned_at,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn file(&self, root_id: i64, rel_path: &str) -> Result<Option<PoolFile>, PoolError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT root_id, rel_path, size, mtime_ns, ino, dev, v2_root
+                 FROM file WHERE root_id = ?1 AND rel_path = ?2",
+                params![root_id, rel_path],
+                row_to_file,
+            )
+            .optional()?)
+    }
+
+    pub fn file_count(&self) -> Result<u64, PoolError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM file", [], |r| r.get::<_, i64>(0))? as u64)
+    }
+
+    /// Every file in a root whose size matches, used as the matcher's anchor
+    /// lookup. Returns `(rel_path, size)`.
+    pub fn files_with_size(&self, root_id: i64, size: u64) -> Result<Vec<String>, PoolError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT rel_path FROM file WHERE root_id = ?1 AND size = ?2")?;
+        let rows = st.query_map(params![root_id, size as i64], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Look a file up by its v2 merkle root — content-addressed, so it finds
+    /// the file wherever it now lives.
+    pub fn file_by_v2_root(
+        &self,
+        root_id: i64,
+        v2_root: &[u8; 32],
+    ) -> Result<Option<String>, PoolError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT rel_path FROM file WHERE root_id = ?1 AND v2_root = ?2",
+                params![root_id, v2_root.to_vec()],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    pub fn set_file_v2_root(
+        &self,
+        root_id: i64,
+        rel_path: &str,
+        v2_root: &[u8; 32],
+    ) -> Result<(), PoolError> {
+        self.conn.execute(
+            "UPDATE file SET v2_root = ?3 WHERE root_id = ?1 AND rel_path = ?2",
+            params![root_id, rel_path, v2_root.to_vec()],
+        )?;
+        Ok(())
+    }
+
+    // -- torrents ----------------------------------------------------------
+
+    pub fn upsert_torrent(&self, t: &PoolTorrent, added_at: i64) -> Result<(), PoolError> {
+        self.conn.execute(
+            "INSERT INTO torrent(infohash, infohash_v1, infohash_v2, name, total_size,
+                                 num_files, source_path, fastresume_path, declared_save_path,
+                                 category, tags, slot, added_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+             ON CONFLICT(infohash) DO UPDATE SET
+                infohash_v1        = excluded.infohash_v1,
+                infohash_v2        = excluded.infohash_v2,
+                name               = excluded.name,
+                total_size         = excluded.total_size,
+                num_files          = excluded.num_files,
+                source_path        = excluded.source_path,
+                fastresume_path    = excluded.fastresume_path,
+                declared_save_path = excluded.declared_save_path,
+                category           = excluded.category,
+                tags               = excluded.tags,
+                -- A rescan must never clear an assignment the daemon made.
+                slot               = COALESCE(excluded.slot, torrent.slot)",
+            params![
+                t.infohash,
+                t.infohash_v1,
+                t.infohash_v2,
+                t.name,
+                t.total_size as i64,
+                t.num_files as i64,
+                t.source_path.to_string_lossy(),
+                t.fastresume_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned()),
+                t.declared_save_path,
+                t.category,
+                if t.tags.is_empty() {
+                    None
+                } else {
+                    Some(t.tags.join(","))
+                },
+                t.slot,
+                added_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn replace_torrent_files(
+        &mut self,
+        infohash: &str,
+        files: &[TorrentFileRow],
+    ) -> Result<(), PoolError> {
+        let tx = self.conn.savepoint()?;
+        Self::replace_torrent_files_tx(&tx, infohash, files)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn replace_torrent_files_tx(
+        tx: &Connection,
+        infohash: &str,
+        files: &[TorrentFileRow],
+    ) -> Result<(), PoolError> {
+        tx.execute(
+            "DELETE FROM torrent_file WHERE infohash = ?1",
+            params![infohash],
+        )?;
+        let mut ins = tx.prepare(
+            "INSERT INTO torrent_file(infohash, idx, rel_path, size, pieces_root)
+             VALUES (?1,?2,?3,?4,?5)",
+        )?;
+        for f in files {
+            ins.execute(params![
+                infohash,
+                f.idx,
+                f.rel_path,
+                f.size as i64,
+                f.pieces_root.map(|r| r.to_vec()),
+            ])?;
+        }
+        Ok(())
+    }
+
+    pub fn torrent(&self, infohash: &str) -> Result<Option<PoolTorrent>, PoolError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT infohash, infohash_v1, infohash_v2, name, total_size, num_files,
+                        source_path, fastresume_path, declared_save_path, category, tags, slot
+                 FROM torrent WHERE infohash = ?1",
+                params![infohash],
+                row_to_torrent,
+            )
+            .optional()?)
+    }
+
+    pub fn torrents(&self) -> Result<Vec<PoolTorrent>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT infohash, infohash_v1, infohash_v2, name, total_size, num_files,
+                    source_path, fastresume_path, declared_save_path, category, tags, slot
+             FROM torrent ORDER BY infohash",
+        )?;
+        let rows = st.query_map([], row_to_torrent)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn torrent_files(&self, infohash: &str) -> Result<Vec<TorrentFileRow>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT infohash, idx, rel_path, size, pieces_root
+             FROM torrent_file WHERE infohash = ?1 ORDER BY idx",
+        )?;
+        let rows = st.query_map(params![infohash], |r| {
+            Ok(TorrentFileRow {
+                infohash: r.get(0)?,
+                idx: r.get(1)?,
+                rel_path: r.get(2)?,
+                size: r.get::<_, i64>(3)? as u64,
+                pieces_root: r.get::<_, Option<Vec<u8>>>(4)?.and_then(to_root32),
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn torrent_count(&self) -> Result<u64, PoolError> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM torrent", [], |r| r.get::<_, i64>(0))?
+            as u64)
+    }
+
+    // -- slot assignment (absorbs slot_assignments.json) --------------------
+
+    pub fn slot_of(&self, infohash: &str) -> Result<Option<String>, PoolError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT slot FROM torrent WHERE infohash = ?1",
+                params![infohash],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    pub fn set_slot(&self, infohash: &str, slot: Option<&str>) -> Result<(), PoolError> {
+        self.conn.execute(
+            "UPDATE torrent SET slot = ?2 WHERE infohash = ?1",
+            params![infohash, slot],
+        )?;
+        Ok(())
+    }
+
+    /// Fold a legacy `slot_assignments.json` in. Existing assignments win, so
+    /// re-running is safe and the JSON can stay on disk as a backup.
+    pub fn import_legacy_registry(
+        &mut self,
+        assignments: &HashMap<String, String>,
+    ) -> Result<usize, PoolError> {
+        let tx = self.conn.savepoint()?;
+        let mut n = 0usize;
+        {
+            let mut up =
+                tx.prepare("UPDATE torrent SET slot = ?2 WHERE infohash = ?1 AND slot IS NULL")?;
+            for (ih, slot) in assignments {
+                n += up.execute(params![ih, slot])?;
+            }
+        }
+        tx.commit()?;
+        if n > 0 {
+            info!(
+                target: "torrentd_pool::store",
+                torrent_count = n,
+                "imported legacy slot assignments",
+            );
+        }
+        let unknown = assignments.len().saturating_sub(n);
+        if unknown > 0 {
+            // Torrents assigned to a slot but absent from the library: the
+            // operator's `.torrent` files and their registry disagree.
+            warn!(
+                target: "torrentd_pool::store",
+                torrent_count = unknown,
+                "legacy assignments with no matching torrent in the library",
+            );
+        }
+        Ok(n)
+    }
+
+    // -- adoption + claims -------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_adoption(
+        &self,
+        infohash: &str,
+        state: AdoptionState,
+        root_id: Option<i64>,
+        base_rel: Option<&str>,
+        verified_at: Option<i64>,
+        drift_at: Option<i64>,
+        last_error: Option<&str>,
+    ) -> Result<(), PoolError> {
+        self.conn.execute(
+            "INSERT INTO adoption(infohash, state, root_id, base_rel, verified_at, drift_at, last_error)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(infohash) DO UPDATE SET
+                state = excluded.state, root_id = excluded.root_id,
+                base_rel = excluded.base_rel, verified_at = excluded.verified_at,
+                drift_at = excluded.drift_at, last_error = excluded.last_error",
+            params![infohash, state.as_str(), root_id, base_rel, verified_at, drift_at, last_error],
+        )?;
+        Ok(())
+    }
+
+    pub fn adoption_state(&self, infohash: &str) -> Result<Option<AdoptionState>, PoolError> {
+        let s: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM adoption WHERE infohash = ?1",
+                params![infohash],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(s.and_then(|s| AdoptionState::parse(&s)))
+    }
+
+    /// `(base_rel, root_id)` recorded for a matched/adopted torrent.
+    pub fn adoption_base(&self, infohash: &str) -> Result<Option<(i64, String)>, PoolError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT root_id, base_rel FROM adoption
+                 WHERE infohash = ?1 AND root_id IS NOT NULL AND base_rel IS NOT NULL",
+                params![infohash],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn counts_by_state(&self) -> Result<HashMap<AdoptionState, u64>, PoolError> {
+        let mut st = self
+            .conn
+            .prepare("SELECT state, COUNT(*) FROM adoption GROUP BY state")?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        let mut out = HashMap::new();
+        for row in rows {
+            let (s, n) = row?;
+            if let Some(state) = AdoptionState::parse(&s) {
+                out.insert(state, n);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Record exactly which files a torrent claims, replacing any prior set.
+    pub fn replace_claims(
+        &mut self,
+        infohash: &str,
+        claims: &[(i64, String)],
+    ) -> Result<(), PoolError> {
+        let tx = self.conn.savepoint()?;
+        tx.execute("DELETE FROM claim WHERE infohash = ?1", params![infohash])?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT OR IGNORE INTO claim(root_id, rel_path, infohash) VALUES (?1,?2,?3)",
+            )?;
+            for (root_id, rel) in claims {
+                ins.execute(params![root_id, rel, infohash])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop every claim row.
+    ///
+    /// Only meaningful inside [`PoolStore::in_transaction`] — on its own it
+    /// publishes an empty claim table, under which every indexed file reads as
+    /// an orphan. Refuses rather than trusting the caller.
+    pub fn clear_all_claims(&self) -> Result<(), PoolError> {
+        if self.tx_depth == 0 {
+            return Err(PoolError::ClaimsClearedOutsideTransaction);
+        }
+        self.conn.execute("DELETE FROM claim", [])?;
+        Ok(())
+    }
+
+    /// Every torrent that shares at least one file with another torrent.
+    ///
+    /// This is the check that gates destructive operations: two torrents over
+    /// the same bytes means moving or deleting for one silently breaks the
+    /// other.
+    pub fn overlapping_torrents(&self) -> Result<Vec<String>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT c.infohash FROM claim c
+             WHERE EXISTS (
+                SELECT 1 FROM claim o
+                WHERE o.root_id = c.root_id AND o.rel_path = c.rel_path
+                  AND o.infohash <> c.infohash
+             )",
+        )?;
+        let rows = st.query_map([], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    // -- plans ---------------------------------------------------------------
+
+    pub fn create_plan(&self, kind: &str, spec: &str, created_at: i64) -> Result<i64, PoolError> {
+        self.conn.execute(
+            "INSERT INTO plan(kind, created_at, status, spec) VALUES (?1,?2,'draft',?3)",
+            params![kind, created_at, spec],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    pub fn add_plan_steps(&mut self, plan_id: i64, steps: &[PlanStep]) -> Result<(), PoolError> {
+        let tx = self.conn.savepoint()?;
+        {
+            let mut ins = tx.prepare(
+                "INSERT INTO plan_step(plan_id, seq, op, src, dst, status, error)
+                 VALUES (?1,?2,?3,?4,?5,'pending',NULL)",
+            )?;
+            for (i, st) in steps.iter().enumerate() {
+                ins.execute(params![plan_id, i as i64, st.op, st.src, st.dst])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn plan(&self, id: i64) -> Result<Option<PlanRow>, PoolError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, kind, created_at, applied_at, status, spec FROM plan WHERE id = ?1",
+                params![id],
+                |r| {
+                    Ok(PlanRow {
+                        id: r.get(0)?,
+                        kind: r.get(1)?,
+                        created_at: r.get(2)?,
+                        applied_at: r.get(3)?,
+                        status: r.get(4)?,
+                        spec: r.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub fn plans(&self) -> Result<Vec<PlanRow>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT id, kind, created_at, applied_at, status, spec FROM plan ORDER BY id DESC",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(PlanRow {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                created_at: r.get(2)?,
+                applied_at: r.get(3)?,
+                status: r.get(4)?,
+                spec: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Plans left mid-apply by a crash or a kill, in id order so the oldest is
+    /// resumed first.
+    pub fn unfinished_plans(&self) -> Result<Vec<PlanRow>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT id, kind, created_at, applied_at, status, spec
+             FROM plan WHERE status = 'applying' ORDER BY id",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(PlanRow {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                created_at: r.get(2)?,
+                applied_at: r.get(3)?,
+                status: r.get(4)?,
+                spec: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn set_plan_status(
+        &self,
+        id: i64,
+        status: &str,
+        applied_at: Option<i64>,
+    ) -> Result<(), PoolError> {
+        self.conn.execute(
+            "UPDATE plan SET status = ?2, applied_at = COALESCE(?3, applied_at) WHERE id = ?1",
+            params![id, status, applied_at],
+        )?;
+        Ok(())
+    }
+
+    /// Atomically take ownership of a plan for applying.
+    ///
+    /// Returns `true` if this caller now owns it. Two concurrent
+    /// `POST /plans/:id/apply` requests otherwise both read the steps as
+    /// `pending` and both execute them — the second one racing the first over
+    /// the same files. A conditional `UPDATE` in one statement makes exactly
+    /// one of them win.
+    ///
+    /// `applying` is deliberately not an applicable status: a plan already
+    /// mid-apply is either genuinely running, or was interrupted and belongs to
+    /// the startup re-drive.
+    pub fn claim_plan_for_apply(&self, id: i64) -> Result<bool, PoolError> {
+        let changed = self.conn.execute(
+            "UPDATE plan SET status = ?2 WHERE id = ?1 AND status IN (?3, ?4)",
+            params![
+                id,
+                crate::model::plan_status::APPLYING,
+                crate::model::plan_status::DRAFT,
+                crate::model::plan_status::FAILED,
+            ],
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Restore a plan the startup re-drive owns, so it can be claimed again.
+    pub fn release_interrupted_plan(&self, id: i64) -> Result<(), PoolError> {
+        self.conn.execute(
+            "UPDATE plan SET status = ?2 WHERE id = ?1 AND status = ?3",
+            params![
+                id,
+                crate::model::plan_status::FAILED,
+                crate::model::plan_status::APPLYING,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Discard a plan and its steps.
+    ///
+    /// One transaction: two bare `DELETE`s leave orphaned `plan_step` rows if
+    /// the process dies between them.
+    pub fn delete_plan(&mut self, id: i64) -> Result<(), PoolError> {
+        let tx = self.conn.savepoint()?;
+        tx.execute("DELETE FROM plan_step WHERE plan_id = ?1", params![id])?;
+        tx.execute("DELETE FROM plan WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn plan_steps(&self, plan_id: i64) -> Result<Vec<PlanStepRow>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT seq, op, src, dst, status, error FROM plan_step
+             WHERE plan_id = ?1 ORDER BY seq",
+        )?;
+        let rows = st.query_map(params![plan_id], |r| {
+            Ok(PlanStepRow {
+                seq: r.get(0)?,
+                op: r.get(1)?,
+                src: r.get(2)?,
+                dst: r.get(3)?,
+                status: r.get(4)?,
+                error: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn set_step_status(
+        &self,
+        plan_id: i64,
+        seq: i64,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<(), PoolError> {
+        self.conn.execute(
+            "UPDATE plan_step SET status = ?3, error = ?4 WHERE plan_id = ?1 AND seq = ?2",
+            params![plan_id, seq, status, error],
+        )?;
+        Ok(())
+    }
+
+    // -- rollups -----------------------------------------------------------
+
+    /// Byte accounting for everything under `prefix` in `root_id`.
+    ///
+    /// Adopted/matched bytes are attributed via `claim`, so a file counts as
+    /// protected only if some torrent actually references it.
+    pub fn rollup(&self, root_id: i64, prefix: &str) -> Result<DirRollup, PoolError> {
+        // `prefix` is a directory path; "" means the whole root. GLOB-free
+        // prefix match via range comparison keeps the index usable.
+        let like = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_end_matches('/'))
+        };
+        let upper = prefix_upper_bound(&like);
+
+        let (bytes_total, files_total): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(size),0), COUNT(*) FROM file
+             WHERE root_id = ?1 AND rel_path >= ?2 AND rel_path < ?3",
+            params![root_id, like, upper],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+
+        let (bytes_adopted, bytes_matched): (i64, i64) = self.conn.query_row(
+            "SELECT
+               COALESCE(SUM(CASE WHEN a.state = 'adopted' THEN f.size ELSE 0 END),0),
+               COALESCE(SUM(CASE WHEN a.state = 'matched' THEN f.size ELSE 0 END),0)
+             FROM file f
+             JOIN claim c ON c.root_id = f.root_id AND c.rel_path = f.rel_path
+             JOIN adoption a ON a.infohash = c.infohash
+             WHERE f.root_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3",
+            params![root_id, like, upper],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+
+        let (bytes_orphan, files_orphan): (i64, i64) = self.conn.query_row(
+            "SELECT COALESCE(SUM(f.size),0), COUNT(*) FROM file f
+             WHERE f.root_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3
+               AND NOT EXISTS (
+                 SELECT 1 FROM claim c
+                 WHERE c.root_id = f.root_id AND c.rel_path = f.rel_path
+               )",
+            params![root_id, like, upper],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+
+        Ok(DirRollup {
+            bytes_total: bytes_total as u64,
+            bytes_adopted: bytes_adopted as u64,
+            bytes_matched: bytes_matched as u64,
+            bytes_orphan: bytes_orphan as u64,
+            files_total: files_total as u64,
+            files_orphan: files_orphan as u64,
+        })
+    }
+
+    /// Every file under `prefix` that no torrent claims.
+    ///
+    /// This is the only query a delete plan is allowed to build from: a file is
+    /// a deletion candidate solely because nothing in the library references
+    /// it, never because it merely looks unused.
+    pub fn orphan_files(&self, root_id: i64, prefix: &str) -> Result<Vec<String>, PoolError> {
+        let like = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_end_matches('/'))
+        };
+        let upper = prefix_upper_bound(&like);
+        let mut st = self.conn.prepare(
+            "SELECT f.rel_path FROM file f
+             WHERE f.root_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3
+               AND NOT EXISTS (
+                 SELECT 1 FROM claim c
+                 WHERE c.root_id = f.root_id AND c.rel_path = f.rel_path
+               )
+             ORDER BY f.rel_path",
+        )?;
+        let rows = st.query_map(params![root_id, like, upper], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Files under `(root_id, prefix)` that `infohash` does **not** claim.
+    ///
+    /// A relocate moves a whole directory, so the only way that is safe is if
+    /// the directory holds nothing but this torrent's payload. Anything else
+    /// under there — another torrent's files, or unclaimed bytes — would be
+    /// dragged along by the rename without appearing anywhere in the plan.
+    ///
+    /// Returns at most `limit` paths; the caller only needs enough to name one
+    /// in the refusal.
+    pub fn foreign_files_under(
+        &self,
+        root_id: i64,
+        prefix: &str,
+        infohash: &str,
+        limit: usize,
+    ) -> Result<Vec<String>, PoolError> {
+        let like = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_end_matches('/'))
+        };
+        let upper = prefix_upper_bound(&like);
+        let mut st = self.conn.prepare(
+            "SELECT f.rel_path FROM file f
+             WHERE f.root_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3
+               AND NOT EXISTS (
+                 SELECT 1 FROM claim c
+                 WHERE c.root_id = f.root_id AND c.rel_path = f.rel_path
+                   AND c.infohash = ?4
+               )
+             ORDER BY f.rel_path
+             LIMIT ?5",
+        )?;
+        let rows = st.query_map(params![root_id, like, upper, infohash, limit as i64], |r| {
+            r.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether one specific file is claimed by no torrent.
+    ///
+    /// The single-file form of [`PoolStore::orphan_files`], for the last-moment
+    /// re-check before an irreversible delete. Listing every orphan in the root
+    /// and scanning it would be O(pool) per file.
+    pub fn is_orphan(&self, root_id: i64, rel_path: &str) -> Result<bool, PoolError> {
+        let claimed: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM claim WHERE root_id = ?1 AND rel_path = ?2
+             )",
+            params![root_id, rel_path],
+            |r| r.get(0),
+        )?;
+        if claimed != 0 {
+            return Ok(false);
+        }
+        // A path the index has never seen is not an orphan either — it is
+        // outside the pool's knowledge, and deleting it was never sanctioned.
+        let known: i64 = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM file WHERE root_id = ?1 AND rel_path = ?2)",
+            params![root_id, rel_path],
+            |r| r.get(0),
+        )?;
+        Ok(known != 0)
+    }
+
+    /// Distinct adoption states of every torrent claiming a file under
+    /// `prefix`.
+    ///
+    /// Lets the tree view colour a directory in one query instead of one per
+    /// row, which matters when a page has 500 entries.
+    pub fn states_under(
+        &self,
+        root_id: i64,
+        prefix: &str,
+    ) -> Result<Vec<AdoptionState>, PoolError> {
+        let like = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_end_matches('/'))
+        };
+        let upper = prefix_upper_bound(&like);
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT a.state
+             FROM claim c
+             JOIN adoption a ON a.infohash = c.infohash
+             WHERE c.root_id = ?1
+               AND ((?2 = '' ) OR (c.rel_path >= ?2 AND c.rel_path < ?3) OR c.rel_path = ?4)",
+        )?;
+        // The trailing `= ?4` clause catches the case where `prefix` names a
+        // file rather than a directory, which has no '/'-terminated children.
+        let rows = st.query_map(
+            params![root_id, like, upper, prefix.trim_matches('/')],
+            |r| r.get::<_, String>(0),
+        )?;
+        let mut out: Vec<AdoptionState> = rows
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter_map(|s| AdoptionState::parse(&s))
+            .collect();
+        out.sort_by_key(|s| s.as_str());
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Immediate children of `prefix` — directories and files — for the tree
+    /// browser. Directories are inferred from paths, not stored.
+    pub fn children(&self, root_id: i64, prefix: &str) -> Result<Vec<(String, bool)>, PoolError> {
+        let like = if prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", prefix.trim_end_matches('/'))
+        };
+        let upper = prefix_upper_bound(&like);
+        let mut st = self.conn.prepare(
+            "SELECT rel_path FROM file
+             WHERE root_id = ?1 AND rel_path >= ?2 AND rel_path < ?3",
+        )?;
+        let rows = st.query_map(params![root_id, like, upper], |r| r.get::<_, String>(0))?;
+
+        let mut seen: HashMap<String, bool> = HashMap::new();
+        for row in rows {
+            let full = row?;
+            let rest = &full[like.len()..];
+            match rest.split_once('/') {
+                Some((dir, _)) => {
+                    seen.insert(format!("{like}{dir}"), true);
+                }
+                None => {
+                    seen.insert(full, false);
+                }
+            }
+        }
+        let mut out: Vec<(String, bool)> = seen.into_iter().collect();
+        // Directories first, then lexicographic — the order a file browser
+        // wants, computed here so the client doesn't re-sort a large page.
+        out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        Ok(out)
+    }
+}
+
+/// Exclusive upper bound for a `>= prefix AND < upper` range scan.
+///
+/// Incrementing the last byte is what turns a prefix match into an index range
+/// scan; `LIKE 'prefix%'` would not use the primary key on a multi-million-row
+/// table. An all-`0xff` tail has no successor, so fall back to an open range.
+fn prefix_upper_bound(prefix: &str) -> String {
+    if prefix.is_empty() {
+        // Sorts after any realistic path; `< upper` then matches everything.
+        return "\u{10FFFF}".to_string();
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    while let Some(last) = bytes.pop() {
+        if last < 0xff {
+            bytes.push(last + 1);
+            return String::from_utf8_lossy(&bytes).into_owned();
+        }
+    }
+    "\u{10FFFF}".to_string()
+}
+
+fn to_root32(v: Vec<u8>) -> Option<[u8; 32]> {
+    <[u8; 32]>::try_from(v.as_slice()).ok()
+}
+
+fn row_to_file(r: &rusqlite::Row<'_>) -> rusqlite::Result<PoolFile> {
+    Ok(PoolFile {
+        root_id: r.get(0)?,
+        rel_path: r.get(1)?,
+        size: r.get::<_, i64>(2)? as u64,
+        mtime_ns: r.get(3)?,
+        ino: r.get::<_, i64>(4)? as u64,
+        dev: r.get::<_, i64>(5)? as u64,
+        v2_root: r.get::<_, Option<Vec<u8>>>(6)?.and_then(to_root32),
+    })
+}
+
+fn row_to_torrent(r: &rusqlite::Row<'_>) -> rusqlite::Result<PoolTorrent> {
+    let tags: Option<String> = r.get(10)?;
+    Ok(PoolTorrent {
+        infohash: r.get(0)?,
+        infohash_v1: r.get(1)?,
+        infohash_v2: r.get(2)?,
+        name: r.get(3)?,
+        total_size: r.get::<_, i64>(4)? as u64,
+        num_files: r.get::<_, i64>(5)? as usize,
+        source_path: PathBuf::from(r.get::<_, String>(6)?),
+        fastresume_path: r.get::<_, Option<String>>(7)?.map(PathBuf::from),
+        declared_save_path: r.get(8)?,
+        category: r.get(9)?,
+        tags: tags
+            .map(|t| {
+                t.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        slot: r.get(11)?,
+    })
+}

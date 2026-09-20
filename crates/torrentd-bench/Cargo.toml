@@ -1,0 +1,21 @@
+[package]
+name = "torrentd-bench"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Layer 4 soak / load harness for torrentd (memory scaling, alert throughput, startup time)."
+publish = false
+
+[[bin]]
+name = "torrentd-bench"
+path = "src/main.rs"
+
+[dependencies]
+clap = { workspace = true }
+torrentd-engine = { path = "../torrentd-engine" }
+libtorrent-safe = { path = "../libtorrent-safe" }
+
+[lints]
+workspace = true

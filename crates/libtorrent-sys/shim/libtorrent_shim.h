@@ -1,5 +1,5 @@
 /*
- * libtorrent_shim.h — minimal C ABI over libtorrent-rasterbar for seederd.
+ * libtorrent_shim.h — minimal C ABI over libtorrent-rasterbar for torrentd.
  *
  * Pure C header. No C++ types, no inheritance, no exceptions cross this boundary.
  * The implementation in libtorrent_shim.cpp wraps every public function in

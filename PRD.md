@@ -258,8 +258,8 @@ TOML format. Path specified via `--config <path>` CLI argument (required).
 # Single-session mode (no [[slot]] entries)
 listen_interfaces = "0.0.0.0:6881,[::]:6881"
 default_save_path = "/data/torrents"
-resume_dir = "/var/lib/seederd/resume"
-torrent_dir = "/var/lib/seederd/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
 http_listen = "127.0.0.1:8080"
 log_level = "info"                          # error | warn | info | debug
 
@@ -492,8 +492,8 @@ vpn_interface = "wg-acct-a"                    # expected tunnel interface name 
 listen_port = 6881                             # must be unique across all slots
 peer_fingerprint_hex = "a1b2c3d4e5f60718"      # 16 hex chars (8 bytes); generated once at setup
 user_agent = "qBittorrent/5.0.3"              # must match what this account registered with
-resume_dir = "/var/lib/seederd/resume/account_a"
-torrent_dir = "/var/lib/seederd/torrents/account_a"
+resume_dir = "/var/lib/torrentd/resume/account_a"
+torrent_dir = "/var/lib/torrentd/torrents/account_a"
 allowed_tracker_domains = ["tracker.example.com"]
 upload_rate_limit = 0                          # bytes/sec; 0 = unlimited
 
@@ -505,8 +505,8 @@ vpn_interface = "wg-acct-b"
 listen_port = 6882                             # different from account_a
 peer_fingerprint_hex = "9f8e7d6c5b4a3210"      # different from account_a
 user_agent = "Transmission/4.0.6"
-resume_dir = "/var/lib/seederd/resume/account_b"
-torrent_dir = "/var/lib/seederd/torrents/account_b"
+resume_dir = "/var/lib/torrentd/resume/account_b"
+torrent_dir = "/var/lib/torrentd/torrents/account_b"
 allowed_tracker_domains = ["tracker.example.com"]
 upload_rate_limit = 0
 ```

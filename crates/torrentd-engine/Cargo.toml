@@ -1,0 +1,44 @@
+[package]
+name = "torrentd-engine"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "TorrentEngine trait, real + mock implementations, and orchestration for torrentd."
+publish = false
+
+[dependencies]
+libtorrent-safe = { workspace = true }
+
+# Async / concurrency
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Errors
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Serialization (for AssignmentRegistry JSON)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Misc
+bytes = { workspace = true }
+hex = { workspace = true }
+once_cell = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# Layer 3 integration fixtures: real SHA-1 piece hashes for generated .torrents.
+sha1 = { workspace = true }
+
+[lints]
+workspace = true

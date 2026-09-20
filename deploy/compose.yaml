@@ -1,9 +1,9 @@
 services:
-  seederd:
+  torrentd:
     build:
       context: ..
       dockerfile: deploy/Containerfile
-    image: seederd:latest
+    image: torrentd:latest
     restart: unless-stopped
     # Multi-slot mode brings up its own WireGuard tunnels (and, with
     # network_kill_switch = true, installs an nftables table). Single-session
@@ -25,13 +25,13 @@ services:
       - "127.0.0.1:8080:8080"   # HTTP API — bind to localhost; front
                                 # with reverse proxy for remote access.
     volumes:
-      - ./seederd.toml:/etc/seederd/seederd.toml:ro
-      - seederd-resume:/var/lib/seederd/resume
-      - seederd-torrents:/var/lib/seederd/torrents
+      - ./torrentd.toml:/etc/torrentd/torrentd.toml:ro
+      - torrentd-resume:/var/lib/torrentd/resume
+      - torrentd-torrents:/var/lib/torrentd/torrents
       - /etc/wireguard:/etc/wireguard:ro
-      # Operator places the actual data here; seederd reads only.
+      # Operator places the actual data here; torrentd reads only.
       - /data/torrents:/data/torrents:ro
 
 volumes:
-  seederd-resume:
-  seederd-torrents:
+  torrentd-resume:
+  torrentd-torrents:

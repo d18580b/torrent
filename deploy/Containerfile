@@ -1,4 +1,4 @@
-# Multi-stage Containerfile for seederd.
+# Multi-stage Containerfile for torrentd.
 #
 # Stage 1 (builder): Fedora with gcc/cmake/openssl-dev + Rust via rustup.
 # Compiles vendored Boost + libtorrent + the shim + the daemon.
@@ -7,7 +7,7 @@
 FROM fedora:43 AS builder
 
 # nodejs/npm are build-time dependencies: the `web-ui` feature is on by
-# default and crates/seederd/build.rs shells out to `npm` to build the
+# default and crates/torrentd/build.rs shells out to `npm` to build the
 # embedded client. Without them the build does not degrade — it panics.
 RUN dnf install -y \
         gcc-c++ make cmake ninja-build pkgconf-pkg-config \
@@ -27,7 +27,7 @@ COPY . /src
 
 # `cargo build --release` will re-read rust-toolchain.toml and download
 # the matching channel automatically.
-RUN cargo build --release --workspace --bin seederd
+RUN cargo build --release --workspace --bin torrentd
 
 # ---- runtime --------------------------------------------------------------
 
@@ -40,15 +40,15 @@ RUN microdnf install -y \
         openssl ca-certificates curl iproute wireguard-tools nftables procps-ng \
     && microdnf clean all
 
-COPY --from=builder /src/target/release/seederd /usr/local/bin/seederd
-COPY deploy/seederd.sample.toml /etc/seederd/seederd.toml.sample
+COPY --from=builder /src/target/release/torrentd /usr/local/bin/torrentd
+COPY deploy/torrentd.sample.toml /etc/torrentd/torrentd.toml.sample
 
 # State directories (persisted via a volume mount in compose.yaml).
 # Owned by the unprivileged uid the container runs as, not root: these are
 # created 0755 root-owned otherwise, and the daemon then cannot write its own
 # resume data unless a volume mount happens to mask them.
-RUN mkdir -p /var/lib/seederd/resume /var/lib/seederd/torrents /data/torrents \
-    && chown -R 1000:1000 /var/lib/seederd /data/torrents
+RUN mkdir -p /var/lib/torrentd/resume /var/lib/torrentd/torrents /data/torrents \
+    && chown -R 1000:1000 /var/lib/torrentd /data/torrents
 
 EXPOSE 6881/tcp 6881/udp 8080/tcp
 
@@ -60,4 +60,4 @@ USER 1000:1000
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -fsS http://localhost:8080/healthz || exit 1
 
-ENTRYPOINT ["/usr/local/bin/seederd", "--config", "/etc/seederd/seederd.toml"]
+ENTRYPOINT ["/usr/local/bin/torrentd", "--config", "/etc/torrentd/torrentd.toml"]
