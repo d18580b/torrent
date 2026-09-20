@@ -217,6 +217,12 @@ pub struct VerifyQueue {
     limit: usize,
     completed: AtomicU64,
     failed: AtomicU64,
+    /// Totals as of the last metrics tick, so the exporter can emit the delta.
+    /// `completed`/`failed` are running totals, but a Prometheus counter is
+    /// incremented, never set — publishing them with `set_gauge` produced a
+    /// `_total` series that `rate()` and `increase()` read as a gauge.
+    exported_completed: AtomicU64,
+    exported_failed: AtomicU64,
 }
 
 #[derive(Clone, Debug)]
@@ -235,6 +241,8 @@ impl VerifyQueue {
             limit: limit.max(1),
             completed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
+            exported_completed: AtomicU64::new(0),
+            exported_failed: AtomicU64::new(0),
         }
     }
 
@@ -250,12 +258,17 @@ impl VerifyQueue {
         self.in_flight.lock().len()
     }
 
-    pub fn completed(&self) -> u64 {
-        self.completed.load(Ordering::Relaxed)
+    /// Increments since the last call, for counter export.
+    fn take_export_deltas(&self) -> (u64, u64) {
+        let done = self.completed.load(Ordering::Relaxed);
+        let failed = self.failed.load(Ordering::Relaxed);
+        let d = done.saturating_sub(self.exported_completed.swap(done, Ordering::Relaxed));
+        let f = failed.saturating_sub(self.exported_failed.swap(failed, Ordering::Relaxed));
+        (d, f)
     }
 
-    pub fn failed(&self) -> u64 {
-        self.failed.load(Ordering::Relaxed)
+    pub fn completed(&self) -> u64 {
+        self.completed.load(Ordering::Relaxed)
     }
 }
 
@@ -385,8 +398,15 @@ pub async fn run_verify_queue(
 
         metrics.set_gauge("pool_verify_queue_depth", q.depth() as f64, &[]);
         metrics.set_gauge("pool_verify_in_flight", q.in_flight() as f64, &[]);
-        metrics.set_gauge("pool_verify_completed_total", q.completed() as f64, &[]);
-        metrics.set_gauge("pool_verify_failed_total", q.failed() as f64, &[]);
+        // Counters take the increment since the last tick; the queue holds the
+        // running total, and `set_gauge` on a `_total` name is not a counter.
+        let (done, failed) = q.take_export_deltas();
+        if done > 0 {
+            metrics.add_counter("pool_verify_completed_total", done, &[]);
+        }
+        if failed > 0 {
+            metrics.add_counter("pool_verify_failed_total", failed, &[]);
+        }
     }
 }
 
