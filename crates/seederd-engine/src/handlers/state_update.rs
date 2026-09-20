@@ -1,6 +1,7 @@
 //! `StateUpdate` and `TorrentFinished` handlers.
 
 use libtorrent_safe::Alert;
+use libtorrent_safe::TorrentFlags;
 use tracing::info;
 
 use crate::handlers::HandlerCtx;
@@ -27,16 +28,33 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     //   0=queued_for_checking (deprecated), 1=checking_files,
                     //   2=downloading_metadata, 3=downloading, 4=finished,
                     //   5=seeding, 6=allocating, 7=checking_resume_data
-                    let phase = match s.state {
-                        1 | 7 => TorrentPhase::Checking,
-                        4 | 5 => {
-                            if s.is_seeding {
-                                TorrentPhase::Seeding
-                            } else {
-                                TorrentPhase::Idle
+                    //
+                    // The paused bit is checked first and wins. libtorrent
+                    // keeps reporting `seeding` for a paused torrent — pausing
+                    // stops the transfers, it does not change the state enum —
+                    // so mapping on `state` alone meant `TorrentPhase::Paused`
+                    // was never assigned by anything, and `/status` reported a
+                    // permanent zero however many torrents were paused. That
+                    // includes every torrent in a slot the VPN monitor fenced,
+                    // which is exactly when an operator looks.
+                    let flags = TorrentFlags::from_bits_truncate(s.flags);
+                    let phase = if flags.contains(TorrentFlags::PAUSED) {
+                        TorrentPhase::Paused
+                    } else {
+                        match s.state {
+                            1 | 7 => TorrentPhase::Checking,
+                            4 | 5 => {
+                                if s.is_seeding {
+                                    TorrentPhase::Seeding
+                                } else {
+                                    TorrentPhase::Idle
+                                }
                             }
+                            // Preserve the current phase; other states are not
+                            // seeder-relevant. `UploadMode` and `Errored` are
+                            // set by the error handler and must survive here.
+                            _ => st.phase,
                         }
-                        _ => st.phase, // preserve current; other states aren't seeder-relevant
                     };
                     if st.phase != phase {
                         st.phase = phase;

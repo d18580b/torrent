@@ -86,6 +86,24 @@ impl std::fmt::Debug for SlotEntry {
 #[derive(Debug)]
 pub struct SlotRegistry {
     entries: Vec<SlotEntry>,
+    /// Slots that never got a session, with the reason.
+    ///
+    /// Safety Rule 1 says a slot whose tunnel fails to come up is "marked
+    /// failed and logged" while the others proceed. The logging happened; the
+    /// marking did not — the slot was skipped entirely, so it disappeared from
+    /// `/slots` rather than appearing there as failed. An operator checking
+    /// why an account is quiet saw no trace of it at all.
+    ///
+    /// These carry no engine because none was ever constructed, which is the
+    /// whole point of the rule.
+    failed: Vec<FailedSlot>,
+}
+
+/// A slot that could not be brought up.
+#[derive(Clone, Debug)]
+pub struct FailedSlot {
+    pub config: SlotConfig,
+    pub reason: String,
 }
 
 /// Build a static WireGuard slot entry with the given id and status, for tests
@@ -128,7 +146,25 @@ pub(crate) fn test_entry(id: &str, status: SlotStatus) -> SlotEntry {
 
 impl SlotRegistry {
     pub fn new(entries: Vec<SlotEntry>) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            failed: Vec::new(),
+        }
+    }
+
+    pub fn with_failed(mut self, failed: Vec<FailedSlot>) -> Self {
+        self.failed = failed;
+        self
+    }
+
+    /// Slots that never got a session, in config order.
+    pub fn failed(&self) -> &[FailedSlot] {
+        &self.failed
+    }
+
+    /// Whether `id` names a slot that failed to come up.
+    pub fn failed_slot(&self, id: &SlotId) -> Option<&FailedSlot> {
+        self.failed.iter().find(|f| &f.config.id == id)
     }
 
     pub fn get(&self, id: &SlotId) -> Option<&SlotEntry> {
