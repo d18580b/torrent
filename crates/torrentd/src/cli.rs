@@ -86,6 +86,14 @@ pub enum VpnCmd {
         /// anything can leave through it.
         #[arg(long, value_name = "IP:PORT")]
         egress: Option<std::net::SocketAddr>,
+        /// Judge the kill-switch checks against this uid rather than this
+        /// process's own. The daemon runs as its own user (the packaged unit
+        /// uses `User=torrentd`) while `--bring-up` needs root, so the uid
+        /// running this check is routinely not the uid the ruleset would
+        /// confine. When the two differ the kill-switch checks report
+        /// `unknown` rather than a verdict about the wrong process.
+        #[arg(long, value_name = "UID")]
+        as_uid: Option<u32>,
     },
 }
 
