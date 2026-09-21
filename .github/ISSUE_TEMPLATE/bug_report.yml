@@ -37,8 +37,11 @@ body:
     id: libtorrent-sha
     attributes:
       label: libtorrent submodule SHA
-      description: "Output of `git -C vendor/libtorrent rev-parse HEAD`."
-      placeholder: "0123456789abcdef0123456789abcdef01234567"
+      description: >-
+        Output of `git submodule status vendor/libtorrent`. Paste the whole line,
+        including any leading `-` or `+` — it says whether the submodule is
+        checked out and whether it matches the pin.
+      placeholder: "-0123456789abcdef0123456789abcdef01234567 vendor/libtorrent"
     validations:
       required: true
 
