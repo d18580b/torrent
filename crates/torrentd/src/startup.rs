@@ -701,14 +701,16 @@ pub async fn boot(
         metrics_for_loop,
         clock,
     )
-    // `listen_failed` is fatal in single-session mode
-    // (nothing else is listening, so seeding just stops silently). In
-    // multi-profile mode the per-profile handler marks that profile failed and the
-    // remaining profiles carry on.
-    // A listen failure is fatal only where the daemon has one
-    // profile: with several, the others keep serving and the failure is
-    // reported per profile rather than taking everything down.
-    .fatal_listen_failure(cfg.profile.len() == 1)
+    // A listen failure is fatal only where it stops the daemon listening at
+    // all: with a second session still up, the others keep serving and the
+    // failure is reported per profile rather than taking everything down.
+    //
+    // Keyed on the sessions that actually came up, not on `cfg.profile.len()`.
+    // A daemon configured with two profiles but reduced to one by a bring-up
+    // failure has exactly the same exposure as one configured with one — and
+    // keying on the configured count treated that survivor's listen failure as
+    // non-fatal, leaving a daemon that is up, healthy and listening on nothing.
+    .fatal_listen_failure(profile_registry.iter().count() == 1)
     .on_fatal({
         let tx = shutdown_tx.clone();
         Arc::new(move |reason| {
