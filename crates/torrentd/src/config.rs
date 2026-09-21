@@ -913,29 +913,51 @@ impl Config {
     /// Test-only, and deliberately built from the real types rather than from
     /// TOML, so a required field added to `Config` breaks this at compile time
     /// instead of leaving the tests exercising a shape the daemon never sees.
+    ///
+    /// It was `toml::from_str` until the authentication posture became a
+    /// required statement, and the promised compile break did not happen. The
+    /// helper went on building a config with no `[auth]` and no opt-out —
+    /// exactly the shape `Config::validate` now refuses — and its callers
+    /// build `AppState`/`PoolService` from it without ever validating, so the
+    /// seam meant to catch that was the one asserting it already had. Every
+    /// field is listed below with no `..Default::default()`, which is what
+    /// makes the paragraph above true rather than aspirational.
+    ///
+    /// The posture stated is the opt-out on a loopback bind: the shape
+    /// `deploy/torrentd.sample.toml` ships, and the one these tests mean.
     #[cfg(test)]
     pub fn minimal_for_tests(dir: &Path, allow_mutations: bool) -> Self {
-        let mut cfg: Config = toml::from_str(&format!(
-            r#"
-default_save_path = "{d}/data"
-resume_dir = "{d}/resume"
-torrent_dir = "{d}/torrents"
-http_listen = "127.0.0.1:8080"
-"#,
-            d = dir.display(),
-        ))
-        .expect("minimal config parses");
-        cfg.pool = Some(PoolConfig {
-            roots: vec![dir.join("pool")],
-            library_dir: dir.join("library"),
-            db_path: Some(dir.join("pool.db")),
-            max_concurrent_verify: 1,
-            import_legacy_registry: false,
-            allow_mutations,
-        });
         std::fs::create_dir_all(dir.join("pool")).unwrap();
         std::fs::create_dir_all(dir.join("library")).unwrap();
-        cfg
+        Config {
+            default_save_path: dir.join("data"),
+            resume_dir: dir.join("resume"),
+            torrent_dir: dir.join("torrents"),
+            http_listen: Self::default_http_listen(),
+            allow_unauthenticated: true,
+            log_level: Self::default_log_level(),
+            registry_path: None,
+            connections_limit: None,
+            file_pool_size: None,
+            enable_lsd: None,
+            aio_threads: None,
+            max_concurrent_http_announces: None,
+            upload_rate_limit: None,
+            peer_fingerprint: None,
+            user_agent: None,
+            vpn_handshake_max_age_secs: Self::default_handshake_max_age(),
+            network_kill_switch: false,
+            profile: vec![],
+            auth: None,
+            pool: Some(PoolConfig {
+                roots: vec![dir.join("pool")],
+                library_dir: dir.join("library"),
+                db_path: Some(dir.join("pool.db")),
+                max_concurrent_verify: 1,
+                import_legacy_registry: false,
+                allow_mutations,
+            }),
+        }
     }
 }
 
@@ -1915,6 +1937,24 @@ library_dir = "{d}/library"
         let d = Config::diff(&old, &new);
         assert_eq!(d.connections_limit, Some(20000));
         assert_eq!(d.non_reloadable_changes, vec!["torrent_dir"]);
+    }
+
+    #[test]
+    fn the_shared_test_fixture_states_a_posture() {
+        // The property: the config the HTTP and pool test modules build their
+        // `AppState`/`PoolService` from is a shape the daemon would start
+        // from, at least as far as the posture goes. It stated none — no
+        // `[auth]`, no opt-out — which is the one shape `--check-config`
+        // refuses outright, so every handler test using it exercised the
+        // serving path against a configuration the daemon refuses to serve.
+        //
+        // The fixture has no `[[profile]]`, so `validate()` as a whole is not
+        // what it can satisfy; the posture is, and the posture is what this
+        // change made a required statement.
+        let dir = tempdir().unwrap();
+        let cfg = Config::minimal_for_tests(dir.path(), false);
+        cfg.validate_auth_posture()
+            .expect("the shared fixture must state a posture the daemon accepts");
     }
 
     #[test]
