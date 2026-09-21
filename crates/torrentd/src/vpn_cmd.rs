@@ -28,9 +28,11 @@
 //! startup uses.
 //!
 //! `--bring-up` opts into raising tunnels, which is the one thing here that
-//! changes the machine. It lowers again **only** what it raised: an interface
-//! that already existed when the command started belongs to something else —
-//! usually a running daemon — and is reported, checked, and left alone.
+//! changes the machine. It lowers again **only** what it raised, and it takes
+//! that from the interface rather than from the flag it set on the way in: an
+//! interface absent before the call and present after was raised here, and
+//! anything else — an interface that already existed, usually a running
+//! daemon's — is reported, checked, and left alone.
 //!
 //! The exit status carries three values, because a `mise` task or a systemd
 //! `ExecStartPre` reads the status and never the report: `0` clean, `1` for any
@@ -223,6 +225,13 @@ pub trait CheckHost {
     /// object behind it could still destroy the daemon's forward. The client
     /// [`RealHost::probe_forwarder`] hands back is the variant that cannot.
     fn forwarder(&self) -> Arc<dyn PortForwarder>;
+
+    /// Read a sysctl, or `None` if it could not be read.
+    ///
+    /// Behind the trait because `conf/<iface>/rp_filter` only exists once the
+    /// interface does, so *when* it is read decides what it says — and
+    /// `--bring-up` exists precisely to make an interface that was not there.
+    fn read_sysctl(&self, path: &str) -> Option<String>;
 }
 
 /// `CheckHost` against the actual machine.
@@ -256,6 +265,10 @@ impl CheckHost for RealHost {
 
     fn forwarder(&self) -> Arc<dyn PortForwarder> {
         Arc::new(Self::probe_forwarder())
+    }
+
+    fn read_sysctl(&self, path: &str) -> Option<String> {
+        std::fs::read_to_string(path).ok()
     }
 }
 
@@ -388,6 +401,18 @@ fn nft_check(ruleset: &str) -> std::io::Result<std::process::Output> {
 }
 
 /// Checks that are about the host, not any one slot.
+///
+/// `iproute2` and `nftables` are here because they genuinely are host-wide: a
+/// missing binary is missing for every slot, and neither answer changes with
+/// `--slot`. `rp_filter` is **not** here, even though it reads a sysctl:
+/// `conf/<iface>/rp_filter` is per slot by construction, so judging it here
+/// scoped a check to interfaces the operator had excluded — a run narrowed to
+/// one healthy slot exited 2 because of another slot's interface — and ran it
+/// before `--bring-up` had raised anything, so the sysctl for the interface
+/// the command was about to create did not exist yet. It also put two checks
+/// named `rp_filter` in the same `host` array, which the `--json` contract
+/// cannot express to a consumer keying by name. It lives in
+/// [`slot_checks`] instead.
 fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
     let mut out = Vec::new();
 
@@ -399,20 +424,6 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
             "`ip` is not executable; every tunnel IP lookup in the daemon shells out to it",
         )
     });
-
-    // rp_filter in strict mode drops the replies to a source-bound socket, so
-    // a multi-slot daemon looks like a tunnel that connects and carries no
-    // traffic. docs/running.md calls for 2 (loose). Judged per interface,
-    // because that is how the kernel judges it.
-    let read_sysctl = |p: &str| std::fs::read_to_string(p).ok();
-    let all = read_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter");
-    let mut ifaces: Vec<&str> = cfg.slot.iter().map(|s| s.vpn_interface.as_str()).collect();
-    ifaces.sort_unstable();
-    ifaces.dedup();
-    for iface in ifaces {
-        let per = read_sysctl(&format!("/proc/sys/net/ipv4/conf/{iface}/rp_filter"));
-        out.push(judge_rp_filter(iface, all.as_deref(), per.as_deref()));
-    }
 
     if cfg.network_kill_switch {
         out.push(if vpn::killswitch::nft_available() {
@@ -649,10 +660,23 @@ fn slot_checks(
     //    check and never lowered. That also leaves the flag useful for the
     //    case it exists for — a crash-orphaned interface is still raised and
     //    still checked.
+    //
+    //    Which of the two happened is taken from the **interface**, re-probed
+    //    after `bring_up` returns, and not from the arm it returned on. Both
+    //    arms lie in one direction each. `bring_up` can return `Err` having
+    //    already started something: `OpenvpnManager` runs `openvpn --daemon`,
+    //    which forks and exits 0, and then times out in its own address poll;
+    //    `WireguardManager` runs `wg-quick up`, which succeeds, and then times
+    //    out the same way. Returning early on `Err` without looking left a
+    //    process or an interface this command created standing, unreported and
+    //    permanent — a re-run then sees the interface and reports `skip`. And
+    //    `Ok` is not evidence of a raise, because the adoption path returns
+    //    `Ok` for an interface `wg-quick up` refused.
     let manager = host.manager(slot.vpn_type, &cfg.state_dir());
+    let existed_before = bring_up && host.interface_exists(iface);
     let mut raised_here = false;
     if bring_up {
-        if host.interface_exists(iface) {
+        if existed_before {
             checks.push(Check::skip(
                 "bring_up",
                 format!(
@@ -661,13 +685,29 @@ fn slot_checks(
                 ),
             ));
         } else {
-            match manager.bring_up(&slot.vpn_profile()) {
+            let outcome = manager.bring_up(&slot.vpn_profile());
+            raised_here = host.interface_exists(iface);
+            match outcome {
                 Ok(ip) => {
-                    raised_here = true;
                     checks.push(Check::pass("bring_up", format!("tunnel came up on {ip}")));
                 }
                 Err(e) => {
-                    checks.push(Check::fail("bring_up", format!("{e}")));
+                    let aftermath = if raised_here {
+                        format!(
+                            "; {iface} is there even so, so this command raised it and is \
+                             lowering it again"
+                        )
+                    } else {
+                        format!(
+                            "; no {iface} appeared, but a manager that daemonises (openvpn \
+                             forks and exits 0 before its own address poll) may have left a \
+                             process running that this command cannot see to stop"
+                        )
+                    };
+                    checks.push(Check::fail("bring_up", format!("{e}{aftermath}")));
+                    if raised_here {
+                        checks.push(teardown(host, manager.as_ref(), iface));
+                    }
                     return SlotReport {
                         slot_id: slot.id.as_str().to_string(),
                         vpn_type: vpn_type_str(slot.vpn_type),
@@ -677,6 +717,21 @@ fn slot_checks(
             }
         }
     }
+
+    // 3b. rp_filter, for this slot's interface, after the bring-up step.
+    //
+    //     Strict reverse-path filtering drops the replies to a source-bound
+    //     socket, so a multi-slot daemon looks like a tunnel that connects and
+    //     carries no traffic. docs/running.md calls for 2 (loose). Judged per
+    //     interface, because that is how the kernel judges it — and therefore
+    //     judged *here* rather than in `host_checks`, because a per-slot
+    //     property in the unscoped host block ignores `--slot`, and because
+    //     `/proc/sys/net/ipv4/conf/<iface>/rp_filter` does not exist until the
+    //     interface does. Reading it before `--bring-up` raised the tunnel
+    //     reported `unknown` for the one interface the run was about.
+    let all = host.read_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter");
+    let per = host.read_sysctl(&format!("/proc/sys/net/ipv4/conf/{iface}/rp_filter"));
+    checks.push(judge_rp_filter(iface, all.as_deref(), per.as_deref()));
 
     // 4. The address the daemon would bind every socket in this slot to.
     let tunnel_ip = match host.first_ipv4(iface) {
@@ -834,36 +889,42 @@ fn slot_checks(
         });
     }
 
-    // 8. Lower only what step 3 raised. An adopted interface is left exactly
-    //    as it was found, and produces no `bring_down` line at all.
-    //
-    //    `VpnManager::bring_down` returns `()` and, per its own contract,
-    //    swallows its errors to the log — so reporting a pass straight after
-    //    calling it reported the one host mutation this command advertises
-    //    without ever looking at it. `wg-quick down` can fail: the interface
-    //    is busy, the profile moved, `wg-quick` is not on this uid's PATH.
-    //    Look at the address instead.
+    // 8. Lower what step 3 was observed to have raised — absent before the
+    //    call, present after it. An interface that was already there is left
+    //    exactly as it was found, and produces no `bring_down` line at all.
     if raised_here {
-        manager.bring_down(iface);
-        checks.push(match host.first_ipv4(iface) {
-            Err(_) => Check::pass(
-                "bring_down",
-                format!("{iface} no longer has an address; the host is as it was found"),
-            ),
-            Ok(ip) => Check::fail(
-                "bring_down",
-                format!(
-                    "{iface} still has {ip} after bring_down: this command raised the tunnel \
-                     and could not lower it again, so the host has been left changed"
-                ),
-            ),
-        });
+        checks.push(teardown(host, manager.as_ref(), iface));
     }
 
     SlotReport {
         slot_id: slot.id.as_str().to_string(),
         vpn_type: vpn_type_str(slot.vpn_type),
         checks,
+    }
+}
+
+/// Lower an interface this command raised, and report whether it went down.
+///
+/// `VpnManager::bring_down` returns `()` and, per its own contract, swallows
+/// its errors to the log — so reporting a pass straight after calling it
+/// reported the one host mutation this command advertises without ever looking
+/// at it. `wg-quick down` can fail: the interface is busy, the profile moved,
+/// `wg-quick` is not on this uid's PATH. Look at the address instead, and say
+/// plainly when the host has been left changed.
+fn teardown(host: &dyn CheckHost, manager: &dyn VpnManager, iface: &str) -> Check {
+    manager.bring_down(iface);
+    match host.first_ipv4(iface) {
+        Err(_) => Check::pass(
+            "bring_down",
+            format!("{iface} no longer has an address; the host is as it was found"),
+        ),
+        Ok(ip) => Check::fail(
+            "bring_down",
+            format!(
+                "{iface} still has {ip} after bring_down: this command raised the tunnel and \
+                 could not lower it again, so the host has been left changed"
+            ),
+        ),
     }
 }
 
@@ -965,7 +1026,17 @@ mod tests {
     #[derive(Debug)]
     struct FakeHost {
         existing: Vec<String>,
+        /// Scripted answers for `interface_exists`, consumed in call order,
+        /// for the case where the interface changes under the command — which
+        /// is the whole of what `--bring-up` does. Empty means "answer from
+        /// `existing`".
+        exists_seq: Mutex<Vec<bool>>,
         addrs: Mutex<Vec<(String, Option<Ipv4Addr>)>>,
+        sysctls: Mutex<Vec<(String, String)>>,
+        /// Every host interaction, in the order it happened, so *when* a
+        /// sysctl was read relative to the raise is assertable. Shared with
+        /// [`RecordingVpn`] so the raise lands in the same sequence.
+        events: Arc<Mutex<Vec<String>>>,
         vpn: MockVpn,
         fwd: MockForwarder,
     }
@@ -974,7 +1045,10 @@ mod tests {
         fn new() -> Self {
             Self {
                 existing: Vec::new(),
+                exists_seq: Mutex::new(Vec::new()),
                 addrs: Mutex::new(Vec::new()),
+                sysctls: Mutex::new(Vec::new()),
+                events: Arc::new(Mutex::new(Vec::new())),
                 vpn: MockVpn::new(),
                 fwd: MockForwarder::new(),
             }
@@ -984,6 +1058,31 @@ mod tests {
         fn with_existing(mut self, iface: &str) -> Self {
             self.existing.push(iface.to_string());
             self
+        }
+
+        /// Script `interface_exists` call by call.
+        fn with_exists_seq(self, seq: impl IntoIterator<Item = bool>) -> Self {
+            *self.exists_seq.lock().unwrap() = seq.into_iter().collect();
+            self
+        }
+
+        /// Script a sysctl's contents. Anything not scripted reads as absent,
+        /// which is what `/proc/sys/net/ipv4/conf/<iface>/rp_filter` does for
+        /// an interface that is not there.
+        fn with_sysctl(self, path: &str, value: &str) -> Self {
+            self.sysctls
+                .lock()
+                .unwrap()
+                .push((path.to_string(), value.to_string()));
+            self
+        }
+
+        fn events(&self) -> Vec<String> {
+            self.events.lock().unwrap().clone()
+        }
+
+        fn record(&self, what: String) {
+            self.events.lock().unwrap().push(what);
         }
 
         /// Script what `first_ipv4(iface)` returns, call by call, so the
@@ -1001,7 +1100,23 @@ mod tests {
 
     impl CheckHost for FakeHost {
         fn interface_exists(&self, iface: &str) -> bool {
-            self.existing.iter().any(|i| i == iface)
+            self.record(format!("interface_exists {iface}"));
+            let mut g = self.exists_seq.lock().unwrap();
+            if g.is_empty() {
+                self.existing.iter().any(|i| i == iface)
+            } else {
+                g.remove(0)
+            }
+        }
+
+        fn read_sysctl(&self, path: &str) -> Option<String> {
+            self.record(format!("read_sysctl {path}"));
+            self.sysctls
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, v)| v.clone())
         }
 
         fn first_ipv4(&self, iface: &str) -> std::io::Result<Ipv4Addr> {
@@ -1021,11 +1136,49 @@ mod tests {
         }
 
         fn manager(&self, _t: VpnType, _run_dir: &Path) -> Arc<dyn VpnManager> {
-            Arc::new(self.vpn.clone())
+            Arc::new(RecordingVpn {
+                inner: self.vpn.clone(),
+                events: self.events.clone(),
+            })
         }
 
         fn forwarder(&self) -> Arc<dyn PortForwarder> {
             Arc::new(self.fwd.clone())
+        }
+    }
+
+    /// `MockVpn` with its calls recorded into `FakeHost`'s event log, so the
+    /// order of a raise against a host read is assertable. `MockVpn` keeps its
+    /// own `bring_up_calls`/`bring_down_calls` — those answer *whether*; this
+    /// answers *when*.
+    #[derive(Debug)]
+    struct RecordingVpn {
+        inner: MockVpn,
+        events: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl VpnManager for RecordingVpn {
+        fn bring_up(
+            &self,
+            profile: &torrentd_engine::VpnProfile,
+        ) -> Result<IpAddr, torrentd_engine::VpnError> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("bring_up {}", profile.interface));
+            self.inner.bring_up(profile)
+        }
+
+        fn current_ip(&self, iface: &str) -> Result<IpAddr, torrentd_engine::VpnError> {
+            self.inner.current_ip(iface)
+        }
+
+        fn bring_down(&self, iface: &str) {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("bring_down {iface}"));
+            self.inner.bring_down(iface);
         }
     }
 
@@ -1105,8 +1258,12 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
         // The complement of the above, and the case the flag exists for: a
         // crash-orphaned or never-raised interface is raised, checked, and put
         // back the way it was found.
+        //
+        // Absent on the probe before the call, present on the re-probe after
+        // it: that pair, and not the arm `bring_up` returned on, is what makes
+        // it this command's to lower.
         let cfg = cfg_with_slot("");
-        let host = FakeHost::new().with_addrs([
+        let host = FakeHost::new().with_exists_seq([false, true]).with_addrs([
             ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
             ("wg-acct-a", None),
         ]);
@@ -1146,7 +1303,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
         // down` failed — and the operator has to be told the host was left
         // changed, on the one mutation this command advertises.
         let cfg = cfg_with_slot("");
-        let host = FakeHost::new().with_addrs([
+        let host = FakeHost::new().with_exists_seq([false, true]).with_addrs([
             ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
             ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
         ]);
@@ -1169,7 +1326,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
     #[test]
     fn a_bring_down_that_worked_is_reported_only_once_the_address_is_gone() {
         let cfg = cfg_with_slot("");
-        let host = FakeHost::new().with_addrs([
+        let host = FakeHost::new().with_exists_seq([false, true]).with_addrs([
             ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
             ("wg-acct-a", None),
         ]);
@@ -1645,6 +1802,174 @@ http_listen = "127.0.0.1:8080"
         let cfg = cfg_with_slot("");
         let e = check(&cfg, Some("acct_b"), false, false, None, None).unwrap_err();
         assert!(format!("{e:#}").contains("acct_b"), "got {e:#}");
+    }
+
+    #[test]
+    fn rp_filter_is_judged_for_the_slot_and_only_after_it_has_been_raised() {
+        // F4, reopened. `conf/<iface>/rp_filter` is per slot by construction,
+        // so judging it in the unscoped host block ignored `--slot` — a run
+        // narrowed to one healthy slot exited 2 because of an interface the
+        // operator had excluded — and ran it before `--bring-up` had raised
+        // anything, so the sysctl for the interface the command was about to
+        // create did not exist and the check reported `unknown` about the one
+        // interface the run was for.
+        //
+        // The kernel is modelled honestly here: the per-interface sysctl is
+        // scripted, and the assertion is on the *order* of the read against
+        // the raise, so moving the read back into `host_checks` fails this
+        // rather than merely relocating a passing test.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new()
+            .with_exists_seq([false, true])
+            .with_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter", "0")
+            .with_sysctl("/proc/sys/net/ipv4/conf/wg-acct-a/rp_filter", "2")
+            .with_addrs([
+                ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
+                ("wg-acct-a", None),
+            ]);
+        host.vpn
+            .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+
+        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+
+        let rp = find(&r.checks, "rp_filter").expect("the slot carries its own rp_filter line");
+        assert_eq!(rp.verdict, Verdict::Pass, "detail: {}", rp.detail);
+        assert!(
+            rp.detail.contains("wg-acct-a") && rp.detail.contains("effective 2"),
+            "the interface that binds is named: {}",
+            rp.detail,
+        );
+
+        let events = host.events();
+        let raised = events
+            .iter()
+            .position(|e| e == "bring_up wg-acct-a")
+            .expect("the interface was raised");
+        let read = events
+            .iter()
+            .position(|e| e == "read_sysctl /proc/sys/net/ipv4/conf/wg-acct-a/rp_filter")
+            .expect("its rp_filter was read");
+        assert!(
+            raised < read,
+            "the sysctl has to be read after the raise, or it reads as absent for the one \
+             interface the run is about: {events:?}",
+        );
+    }
+
+    #[test]
+    fn the_host_block_carries_no_per_slot_check_and_no_duplicate_name() {
+        // The other half of the same finding: a per-slot sysctl in the
+        // unscoped host block emitted one `Check` per configured interface,
+        // all named `rp_filter`, so `host[]` in the `--json` contract carried
+        // duplicate `name` values and a consumer keying by name silently kept
+        // one of them.
+        let cfg = cfg_with_slot("");
+        let host = host_checks(&cfg, None);
+        assert!(
+            find(&host, "rp_filter").is_none(),
+            "rp_filter is per slot and belongs to the slot: {:?}",
+            host.iter().map(|c| c.name).collect::<Vec<_>>(),
+        );
+        let mut names: Vec<&str> = host.iter().map(|c| c.name).collect();
+        let before = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            before,
+            "a consumer keying host[] by name has to get every check: {names:?}",
+        );
+    }
+
+    #[test]
+    fn a_bring_up_that_failed_after_raising_the_interface_lowers_it_again() {
+        // F1(A), reopened. `bring_up` can return `Err` having already started
+        // something: `OpenvpnManager` runs `openvpn --daemon`, which forks and
+        // exits 0, and then times out in its own address poll; `wg-quick up`
+        // succeeds and the IPv4 poll times out the same way. Returning on the
+        // `Err` arm before `raised_here` was set left an interface — and, for
+        // openvpn, a process writing its pid file where the daemon's teardown
+        // reads it — standing forever, with nothing in the report about it.
+        // Re-running then found the interface present and reported `skip`, so
+        // the leak was permanent.
+        //
+        // Absent before, present after, so it is this command's to lower,
+        // whatever arm `bring_up` came back on.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new()
+            .with_exists_seq([false, true])
+            .with_addrs([("wg-acct-a", None)]);
+        // No `set_ip`, so MockVpn::bring_up returns BringUpTimeout — the exact
+        // error both real managers produce after they have already started
+        // something.
+
+        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+
+        let bu = find(&r.checks, "bring_up").expect("a bring_up line");
+        assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
+        assert!(
+            bu.detail.contains("lowering it again"),
+            "the operator is told what is being done about it: {}",
+            bu.detail,
+        );
+        assert_eq!(
+            host.vpn.bring_down_calls(),
+            vec!["wg-acct-a"],
+            "an interface this command raised is lowered even when the raise reported failure",
+        );
+        assert!(
+            find(&r.checks, "bring_down").is_some(),
+            "and the teardown is reported, not assumed",
+        );
+    }
+
+    #[test]
+    fn a_bring_up_that_failed_and_left_nothing_standing_says_what_it_cannot_see() {
+        // The complement: nothing appeared, so there is nothing to lower and
+        // no teardown is issued. The report still says what the command was
+        // unable to establish, because a manager that daemonises can have left
+        // a process behind that no interface probe can see.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new().with_exists_seq([false, false]);
+
+        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+
+        assert!(host.vpn.bring_down_calls().is_empty());
+        assert!(find(&r.checks, "bring_down").is_none());
+        let bu = find(&r.checks, "bring_up").expect("a bring_up line");
+        assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
+        assert!(
+            bu.detail.contains("may have left a process running"),
+            "the one thing it cannot observe is named: {}",
+            bu.detail,
+        );
+    }
+
+    #[test]
+    fn a_successful_bring_up_that_adopted_rather_than_created_is_not_lowered() {
+        // F1(B)'s shape from the other side: `Ok` is not evidence of a raise,
+        // because `wg-quick up` refuses an interface that already exists and
+        // the adoption path returns `Ok(ip)` for it. The re-probe is what
+        // decides, so an interface that is *not* there after the call is not
+        // lowered on the strength of an `Ok`.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new()
+            .with_exists_seq([false, false])
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+        host.vpn
+            .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+
+        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+
+        assert_eq!(
+            find(&r.checks, "bring_up").map(|c| c.verdict),
+            Some(Verdict::Pass),
+        );
+        assert!(
+            host.vpn.bring_down_calls().is_empty(),
+            "nothing was observed to appear, so nothing is torn down: {:?}",
+            host.vpn.bring_down_calls(),
+        );
     }
 
     #[test]
