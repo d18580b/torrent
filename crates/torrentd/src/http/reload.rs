@@ -8,6 +8,12 @@
 //! disagree the moment anyone used one, and nothing would record which had
 //! won.
 //!
+//! Two of those keys do not reach every session, and this list read as though
+//! they did: `enable_lsd` is withheld from every `network = "vpn"` profile
+//! (Safety Rule 6 admits no config key there, so a reload cannot be the
+//! exception), and `upload_rate_limit` is withheld from a profile that sets
+//! its own. See `reload.rs` and `ConfigDiff::to_settings_patch_for`.
+//!
 //! So a client can ask the daemon to re-read its configuration; it cannot tell
 //! the daemon what its configuration is. The file stays the single source of
 //! truth, and an operator who wants a change edits it and calls this.
