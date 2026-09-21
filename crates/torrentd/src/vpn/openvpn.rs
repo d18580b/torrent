@@ -343,4 +343,116 @@ mod tests {
         m.bring_down("tun0");
         assert!(m.pid_file("tun0").exists());
     }
+
+    /// The repository root, for the two operator-facing files below.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    }
+
+    /// The package the operator-facing record names for `kill` is the package
+    /// that actually provides the binary [`OpenvpnManager::signal`] spawns.
+    ///
+    /// `signal` runs `Command::new("kill")`. `Command` spawns no shell, so the
+    /// shell builtin is unreachable and `/usr/bin/kill` has to be installed as
+    /// a file. On the image `deploy/Containerfile` itself pins —
+    /// `registry.fedoraproject.org/fedora-minimal:43` — `rpm -qf /usr/bin/kill`
+    /// prints `util-linux-core`; `procps-ng` ships `pgrep` and `pkill` and no
+    /// `kill` at all.
+    ///
+    /// Naming `procps-ng` in the prerequisite table is not cosmetic.
+    /// `docs/running.md` §1 introduces that table as the binaries that are
+    /// "easy to miss because nothing checks for them at startup", so an
+    /// operator provisioning a host installs exactly what it names. Without
+    /// `/usr/bin/kill`, `signal` returns `false`, `bring_down` returns
+    /// *before* removing the pid file, and the openvpn process and its routes
+    /// survive the shutdown — the headline defect this pull request exists to
+    /// fix, restored by its own runbook.
+    ///
+    /// The image itself was never broken, because `util-linux-core` is
+    /// already in the base; nothing recorded that, which is how the table
+    /// came to be wrong and stayed wrong. Name `procps-ng` at either site
+    /// again and this fails.
+    #[test]
+    fn the_documented_package_is_the_one_that_provides_the_kill_binary() {
+        let root = repo_root();
+        let runbook = std::fs::read_to_string(root.join("docs/running.md"))
+            .expect("the runbook this daemon ships with");
+        let row = runbook
+            .lines()
+            .find(|l| l.contains("`openvpn`, `kill`"))
+            .expect("the prerequisite table still has a row for the teardown's binaries");
+        assert!(
+            row.contains("util-linux"),
+            "the prerequisite row for `kill` must name the package that provides \
+             /usr/bin/kill; got: {row}",
+        );
+        assert!(
+            !row.contains("`procps-ng` /"),
+            "procps-ng provides pgrep and pkill and no kill, so naming it as the \
+             package for `kill` sends an operator to install the wrong one; got: {row}",
+        );
+
+        let containerfile = std::fs::read_to_string(root.join("deploy/Containerfile"))
+            .expect("the image this change ships");
+        let install = containerfile
+            .lines()
+            .find(|l| l.contains("openssl ca-certificates curl"))
+            .expect("the runtime stage still installs its package set");
+        assert!(
+            !install.contains("procps-ng"),
+            "nothing in this repository invokes pkill or pgrep since the \
+             pattern-based teardown went, so procps-ng would be installed for \
+             nothing; got: {install}",
+        );
+        assert!(
+            containerfile.contains("util-linux"),
+            "the image must record where /usr/bin/kill comes from, or it keeps \
+             working by inheritance from its base with nothing saying so — which \
+             is what let the runbook name the wrong package for two rounds",
+        );
+    }
+
+    /// The premise the two corrected sites rest on: no source in this
+    /// repository still calls a binary `procps-ng` is the package for.
+    ///
+    /// Re-introduce a `pkill` or `pgrep` call site and this fails, which is
+    /// the signal that the package has to come back into the image with it.
+    #[test]
+    fn no_source_invokes_the_binaries_procps_ng_provides() {
+        let mut offenders = Vec::new();
+        let mut stack = vec![repo_root().join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for tool in ["pkill", "pgrep"] {
+                    if text.contains(&format!("Command::new(\"{tool}\")")) {
+                        offenders.push(format!("{} invokes {tool}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "procps-ng was dropped from the image because nothing calls its \
+             binaries; these do: {offenders:?}",
+        );
+    }
 }
