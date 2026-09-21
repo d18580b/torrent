@@ -37,8 +37,14 @@ export function Pool() {
     queryFn: () => api.get<ProfileSummary[]>('/api/profiles'),
   })
 
+  // `/api/profiles` lists live profiles in configured order and then the ones
+  // that failed to come up, so `data[0]` is an `active` profile only when at
+  // least one came up. A failed profile carries no session, and adopting into
+  // one answers 409 — so default to, and offer, only the active ones.
+  const adoptable = (profiles.data ?? []).filter((p) => p.status === 'active')
+
   const activeRoot = rootId ?? overview.data?.roots[0]?.root_id ?? null
-  const activeProfile = profileId ?? profiles.data?.[0]?.profile_id ?? null
+  const activeProfile = profileId ?? adoptable[0]?.profile_id ?? null
 
   const tree = useQuery({
     queryKey: ['pool', 'tree', activeRoot, path],
@@ -114,9 +120,9 @@ export function Pool() {
             <select
               value={activeProfile ?? ''}
               onChange={(e) => setProfileId(e.target.value)}
-              disabled={!profiles.data || profiles.data.length === 0}
+              disabled={adoptable.length === 0}
             >
-              {(profiles.data ?? []).map((p) => (
+              {adoptable.map((p) => (
                 <option key={p.profile_id} value={p.profile_id}>{p.profile_id}</option>
               ))}
             </select>
