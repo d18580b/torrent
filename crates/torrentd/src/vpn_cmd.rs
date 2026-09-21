@@ -322,6 +322,23 @@ pub trait CheckHost {
     /// interface does, so *when* it is read decides what it says — and
     /// `--bring-up` exists precisely to make an interface that was not there.
     fn read_sysctl(&self, path: &str) -> Option<String>;
+
+    /// Whether an executable answers `probe_arg` with a zero status.
+    fn tool_available(&self, bin: &str, probe_arg: &str) -> bool;
+
+    /// This process's effective uid, or why it could not be read.
+    fn current_uid(&self) -> Result<u32, String>;
+
+    /// Whether this process holds `CAP_NET_ADMIN`.
+    fn has_cap_net_admin(&self) -> bool;
+
+    /// Dry-run a ruleset through `nft --check --file -`.
+    ///
+    /// Behind the trait because the two classes its stderr distinguishes —
+    /// a parse rejection and a netlink cache failure — are what
+    /// [`judge_nft_check`] classifies on, and a test that shells out to the
+    /// real `nft` asserts whatever this machine happens to answer.
+    fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output>;
 }
 
 /// `CheckHost` against the actual machine.
@@ -359,6 +376,22 @@ impl CheckHost for RealHost {
 
     fn read_sysctl(&self, path: &str) -> Option<String> {
         std::fs::read_to_string(path).ok()
+    }
+
+    fn tool_available(&self, bin: &str, probe_arg: &str) -> bool {
+        tool_available(bin, probe_arg)
+    }
+
+    fn current_uid(&self) -> Result<u32, String> {
+        vpn::killswitch::current_uid().map_err(|e| e.to_string())
+    }
+
+    fn has_cap_net_admin(&self) -> bool {
+        has_cap_net_admin()
+    }
+
+    fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output> {
+        nft_check(ruleset)
     }
 }
 
@@ -567,11 +600,12 @@ fn judge_nft_check(
 /// `probe` is [`vpn::wireguard_handshake_age`]'s result with its reason
 /// reduced to the string that type already publishes. `privileged` is whether
 /// this process holds `CAP_NET_ADMIN`, which is what `wg show <iface>
-/// latest-handshakes` needs: refused *without* it establishes nothing about
-/// this host and is bounded by the capability, while refused *with* it is a
-/// real gap — the interface is not a WireGuard interface, or `wg` cannot read
-/// it for some other reason.
+/// latest-handshakes` needs.
+///
+/// Refused *without* it establishes nothing about this host and is bounded by
+/// the capability, while refused *with* it is a real gap.
 fn judge_handshake(
+    iface: &str,
     probe: Result<Option<Duration>, &str>,
     max: Duration,
     privileged: bool,
@@ -600,9 +634,11 @@ fn judge_handshake(
         ),
         Err("refused") if !privileged => Check::unknown_without_capability(
             "handshake",
-            "`wg show <iface> latest-handshakes` was refused and this process does not hold \
-             CAP_NET_ADMIN, which it needs; the daemon has it and would run this probe. Run \
-             as the daemon's user with that capability to settle it",
+            format!(
+                "`wg show {iface} latest-handshakes` was refused and this process does not \
+                 hold CAP_NET_ADMIN, which it needs; the daemon has it and would run this \
+                 probe. Run as the daemon's user with that capability to settle it"
+            ),
         ),
         Err(why) => Check::unknown(
             "handshake",
@@ -642,10 +678,16 @@ fn nft_check(ruleset: &str) -> std::io::Result<std::process::Output> {
 /// named `rp_filter` in the same `host` array, which the `--json` contract
 /// cannot express to a consumer keying by name. It lives in
 /// [`slot_checks`] instead.
-fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
+///
+/// Every host touch goes through `host` for the same reason [`slot_checks`]'s
+/// do: the classification this function performs — which `nft --check` failure
+/// is a rejection of the ruleset and which is a capability gap — is branch
+/// logic, and a test that shells out to the real `ip` and `nft` asserts
+/// whatever the machine it runs on happens to answer.
+fn host_checks(cfg: &Config, as_uid: Option<u32>, host: &dyn CheckHost) -> Vec<Check> {
     let mut out = Vec::new();
 
-    out.push(if tool_available("ip", "-V") {
+    out.push(if host.tool_available("ip", "-V") {
         Check::pass("iproute2", "`ip` is available")
     } else {
         Check::fail(
@@ -655,7 +697,7 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
     });
 
     if cfg.network_kill_switch {
-        out.push(if vpn::killswitch::nft_available() {
+        out.push(if host.tool_available("nft", "--version") {
             Check::pass("nftables", "`nft` is available")
         } else {
             Check::fail(
@@ -664,7 +706,7 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
             )
         });
 
-        let invoker = vpn::killswitch::current_uid().map_err(|e| e.to_string());
+        let invoker = host.current_uid();
         out.push(judge_kill_switch_uid(as_uid, invoker.clone()));
 
         // The ruleset boot would install, dry-run rather than asserted.
@@ -687,7 +729,12 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
                 let tunnels: Vec<String> =
                     cfg.slot.iter().map(|s| s.vpn_interface.clone()).collect();
                 let ruleset = vpn::killswitch::render_ruleset(uid, &tunnels);
-                judge_nft_check(nft_check(&ruleset), has_cap_net_admin(), uid, &ruleset)
+                judge_nft_check(
+                    host.nft_check(&ruleset),
+                    host.has_cap_net_admin(),
+                    uid,
+                    &ruleset,
+                )
             }
         });
     } else {
@@ -949,7 +996,7 @@ fn slot_checks(
         VpnType::Wireguard => {
             let max = Duration::from_secs(cfg.vpn_handshake_max_age_secs);
             let probe = vpn::wireguard_handshake_age(iface).map_err(|why| why.as_str());
-            checks.push(judge_handshake(probe, max, has_cap_net_admin()));
+            checks.push(judge_handshake(iface, probe, max, host.has_cap_net_admin()));
         }
         VpnType::Openvpn => {
             checks.push(Check::skip(
@@ -1124,7 +1171,7 @@ pub fn check(
 
     let host = RealHost;
     let report = Report {
-        host: host_checks(cfg, as_uid),
+        host: host_checks(cfg, as_uid, &host),
         slots: selected
             .into_iter()
             .map(|s| slot_checks(cfg, s, bring_up, egress, &host))
@@ -1214,6 +1261,17 @@ mod tests {
         events: Arc<Mutex<Vec<String>>>,
         vpn: MockVpn,
         fwd: MockForwarder,
+        /// Binaries `tool_available` should answer `false` for. Everything
+        /// else is present, which is the ordinary host.
+        missing_tools: Vec<String>,
+        /// What `current_uid` answers.
+        uid: Result<u32, String>,
+        /// What `has_cap_net_admin` answers. `false` is the invocation
+        /// `docs/running.md` recommends.
+        privileged: bool,
+        /// Scripted `nft --check` outcomes as `(exit code, stderr)`, consumed
+        /// in call order. Empty means "accepted".
+        nft: Mutex<Vec<(i32, String)>>,
     }
 
     impl FakeHost {
@@ -1226,7 +1284,23 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
                 vpn: MockVpn::new(),
                 fwd: MockForwarder::new(),
+                missing_tools: Vec::new(),
+                uid: Ok(2000),
+                privileged: false,
+                nft: Mutex::new(Vec::new()),
             }
+        }
+
+        /// This process's effective uid, as `current_uid` reports it.
+        fn with_uid(mut self, uid: u32) -> Self {
+            self.uid = Ok(uid);
+            self
+        }
+
+        /// Script `nft --check`, call by call, as `(exit code, stderr)`.
+        fn with_nft(self, seq: impl IntoIterator<Item = (i32, &'static str)>) -> Self {
+            *self.nft.lock().unwrap() = seq.into_iter().map(|(c, e)| (c, e.to_string())).collect();
+            self
         }
 
         /// `iface` is already present on the host before the command runs.
@@ -1319,6 +1393,39 @@ mod tests {
 
         fn forwarder(&self) -> Arc<dyn PortForwarder> {
             Arc::new(self.fwd.clone())
+        }
+
+        fn tool_available(&self, bin: &str, probe_arg: &str) -> bool {
+            self.record(format!("tool_available {bin} {probe_arg}"));
+            !self.missing_tools.iter().any(|b| b == bin)
+        }
+
+        fn current_uid(&self) -> Result<u32, String> {
+            self.uid.clone()
+        }
+
+        fn has_cap_net_admin(&self) -> bool {
+            self.privileged
+        }
+
+        fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output> {
+            self.record(format!("nft_check {ruleset}"));
+            let mut g = self.nft.lock().unwrap();
+            if g.is_empty() {
+                return Ok(nft_out(0, ""));
+            }
+            let (code, stderr) = g.remove(0);
+            Ok(nft_out(code, &stderr))
+        }
+    }
+
+    /// Build a finished `nft --check` `Output` with `code` and `stderr`.
+    fn nft_out(code: i32, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
         }
     }
 
@@ -2137,8 +2244,12 @@ http_listen = "127.0.0.1:8080"
         // all named `rp_filter`, so `host[]` in the `--json` contract carried
         // duplicate `name` values and a consumer keying by name silently kept
         // one of them.
+        //
+        // Run against a `CheckHost` double rather than the real `ip` and
+        // `nft`: what this asserts is the shape of the block, which must not
+        // depend on what happens to be installed on the machine running it.
         let cfg = cfg_with_slot("");
-        let host = host_checks(&cfg, None);
+        let host = host_checks(&cfg, None, &FakeHost::new());
         assert!(
             find(&host, "rp_filter").is_none(),
             "rp_filter is per slot and belongs to the slot: {:?}",
@@ -2152,6 +2263,63 @@ http_listen = "127.0.0.1:8080"
             names.len(),
             before,
             "a consumer keying host[] by name has to get every check: {names:?}",
+        );
+    }
+
+    #[test]
+    fn the_host_block_is_built_from_the_check_host_and_not_from_this_machine() {
+        // D34. `host_checks` was the one unit outside the `CheckHost` seam, so
+        // its only test shelled out to the real `ip` and `nft` and asserted
+        // whatever the machine answered — which is no constraint at all on the
+        // two classifications this block now performs.
+        //
+        // Every host touch is scripted here, and the block's names and
+        // verdicts follow the script rather than the host.
+        let mut cfg = cfg_with_slot("");
+        cfg.network_kill_switch = true;
+        let host = FakeHost::new().with_uid(998).with_nft([(
+            1,
+            "netlink: Error: cache initialization failed: Operation not permitted",
+        )]);
+
+        let checks = host_checks(&cfg, None, &host);
+
+        let names: Vec<&str> = checks.iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "iproute2",
+                "nftables",
+                "kill_switch_uid",
+                "kill_switch_ruleset"
+            ],
+            "the host block's shape is the contract `host[]` publishes",
+        );
+        assert!(
+            !names.contains(&"rp_filter"),
+            "no per-slot check belongs in the unscoped host block: {names:?}",
+        );
+
+        // The scripted uid is the one judged, and the scripted `nft` outcome
+        // is the one classified — neither came from this machine.
+        let uid = find(&checks, "kill_switch_uid").expect("the uid check is reported");
+        assert_eq!(uid.verdict, Verdict::Pass, "detail: {}", uid.detail);
+        assert!(uid.detail.contains("998"), "detail: {}", uid.detail);
+        let ruleset = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
+        assert_eq!(
+            ruleset.verdict,
+            Verdict::Unknown,
+            "detail: {}",
+            ruleset.detail
+        );
+        assert!(ruleset.needs_capability, "detail: {}", ruleset.detail);
+
+        // And the calls went through the seam rather than round it.
+        let events = host.events();
+        assert!(
+            events.iter().any(|e| e.starts_with("tool_available ip"))
+                && events.iter().any(|e| e.starts_with("nft_check")),
+            "host_checks reaches the host only through CheckHost: {events:?}",
         );
     }
 
@@ -2336,17 +2504,8 @@ http_listen = "127.0.0.1:8080"
 
     #[test]
     fn nft_check_is_classified_by_the_capability_before_the_error_text() {
-        // F13. The difference between exit 1 and exit 2 rested on nftables'
-        // error wording: `err.contains("Operation not permitted")`. A build,
-        // locale or version whose message differs reported "`nft --check`
-        // rejected the ruleset boot would install" — asserting the boot would
-        // abort when nothing about the ruleset had been established — and the
-        // converse downgraded a genuine rejection whose text happened to carry
-        // the phrase.
-        //
-        // Unprivileged, with a message this code has never seen: still
-        // capability-bound, because without CAP_NET_ADMIN `nft` cannot reach
-        // the kernel to validate anything.
+        // F13. Unprivileged, with a message this code has never seen: still
+        // capability-bound.
         let c = judge_nft_check(
             nft_output(1, "netlink: konnte Cache nicht initialisieren"),
             false,
@@ -2428,9 +2587,10 @@ http_listen = "127.0.0.1:8080"
     fn a_handshake_probe_refused_for_want_of_a_capability_is_told_apart_from_one_that_failed() {
         let max = Duration::from_secs(180);
 
-        // Refused without CAP_NET_ADMIN: the capability the daemon has and
-        // this shell does not. Reported, and not counted against the status.
-        let c = judge_handshake(Err("refused"), max, false);
+        // Refused without CAP_NET_ADMIN on an interface the kernel confirms
+        // *is* a WireGuard device: the capability the daemon has and this
+        // shell does not. Reported, and not counted against the status.
+        let c = judge_handshake("wg-acct-a", Err("refused"), max, false);
         assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
         assert!(c.needs_capability, "detail: {}", c.detail);
         assert!(
@@ -2439,29 +2599,29 @@ http_listen = "127.0.0.1:8080"
             c.detail,
         );
 
-        // Refused *with* the capability is a real gap — not a WireGuard
-        // interface, or `wg` cannot read it — and still colours the status.
-        let c = judge_handshake(Err("refused"), max, true);
+        // Refused *with* the capability is a real gap — `wg` cannot read it —
+        // and still colours the status.
+        let c = judge_handshake("wg-acct-a", Err("refused"), max, true);
         assert_eq!(c.verdict, Verdict::Unknown);
         assert!(!c.needs_capability, "detail: {}", c.detail);
 
         // A missing `wg` is not a capability problem at any privilege.
         for privileged in [true, false] {
-            let c = judge_handshake(Err("no_tool"), max, privileged);
+            let c = judge_handshake("wg-acct-a", Err("no_tool"), max, privileged);
             assert_eq!(c.verdict, Verdict::Unknown);
             assert!(!c.needs_capability, "detail: {}", c.detail);
         }
 
         // And the verdicts that do not turn on privilege at all.
         assert_eq!(
-            judge_handshake(Ok(Some(Duration::from_secs(30))), max, false).verdict,
+            judge_handshake("wg-acct-a", Ok(Some(Duration::from_secs(30))), max, false).verdict,
             Verdict::Pass,
         );
         assert_eq!(
-            judge_handshake(Ok(Some(Duration::from_secs(300))), max, true).verdict,
+            judge_handshake("wg-acct-a", Ok(Some(Duration::from_secs(300))), max, true).verdict,
             Verdict::Fail,
         );
-        let c = judge_handshake(Ok(None), max, true);
+        let c = judge_handshake("wg-acct-a", Ok(None), max, true);
         assert_eq!(c.verdict, Verdict::Unknown);
         assert!(
             !c.needs_capability,
