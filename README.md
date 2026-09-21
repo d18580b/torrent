@@ -11,17 +11,37 @@ which torrents point at data that moved or vanished.
 
 ![The pool browser: a filesystem tree annotated with what is protected](docs/img/pool.png)
 
-## What it does, and refuses to do
+## Features
 
-It seeds torrents whose payload already exists on disk. It never downloads
-payload — only magnet *metadata* — creates no torrents, and is Linux x86-64
-only. There is no RSS, no sequential streaming, no multi-instance
-coordination, and no auto-discovery: you tell it what to load.
+- [x] **Seeds torrents whose payload already exists on disk**, at library scale
+- [x] **Never downloads payload.** Every add carries libtorrent's `upload_mode`
+      — "will not make any piece requests" — so the guarantee survives magnets,
+      hash failures and rechecks. Magnet *metadata* still arrives.
+- [x] **Understands the pool, not just the torrents** — which bytes on disk a
+      torrent protects, which nothing protects, and which torrents point at
+      data that moved or vanished
+- [x] **Moves and deletes files inside the directories you give it**, planned,
+      journaled and re-checked at apply time. Off unless you turn it on.
+- [x] **Profiles**: one libtorrent session each, with its own network posture,
+      identity and directories. No implicit profile, no default one.
+- [x] **VPN-bound profiles** for multi-account private-tracker seeding —
+      source-bound sockets, DHT/PEX/LSD off, tunnel health monitoring, an
+      opt-in nftables kill switch, and NAT-PMP port forwarding
+- [x] **Verifiable in isolation**: `torrentd vpn check` exercises a real tunnel
+      with no torrents, no tracker and no session
+- [x] **Secure by default**: it will not start unauthenticated without being
+      told to, and never at all on a routable address
+- [x] **Reverse-proxy native**: correct behind a cache, never terminates TLS
+- [x] HTTP API, JSON logs, Prometheus metrics, and an embedded web client
+- [ ] **Downloading torrents.** Deliberately absent today; every piece of the
+      machinery exists except the policy, and enabling it is a decision about
+      what this daemon is, not a missing feature
+- [ ] **OpenAPI 3.1 description** of the HTTP API, replacing the table below
+- [ ] **Grafana dashboard and alert rules** shipped in `deploy/`
+- [ ] **Sequential streaming, RSS, torrent creation, auto-discovery,
+      multi-instance coordination.** Not planned. You tell it what to load.
 
-It can also **move and delete files inside the directories you give it**. That
-is off unless you turn it on (`[pool] allow_mutations`), and even then every
-mutation is planned, journaled, and refused if anything about the plan has
-gone stale.
+Linux x86-64 only.
 
 ## Quick start
 
@@ -31,15 +51,11 @@ cargo build --workspace --release
 ./target/release/torrentd --config /etc/torrentd/torrentd.toml
 ```
 
-`mise run native` fetches the vendored submodules (~1.5 GB) and builds Boost
-and libtorrent into `~/.cache/torrentd/native`. That prefix is keyed by
-content, so it survives `cargo clean`, is shared across git worktrees, and is
-reused by every cargo profile — you pay for it once per pinned version, not
-once per build directory.
-
-Node is a build dependency by default — the web client is compiled into the
-binary. `cargo build -p torrentd --no-default-features` gives you the headless
-daemon with no Node at all.
+`mise run native` fetches the vendored submodules and builds Boost and
+libtorrent into a content-addressed prefix outside `target/`, so you pay for
+it once per pinned version rather than once per build directory.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest, including how to build
+without Node.
 
 **For a real deployment, follow [`docs/running.md`](docs/running.md).** It has
 the parts that are easy to get wrong: the service user, which directories must
@@ -71,10 +87,10 @@ and on drift. A v2 torrent's per-file merkle root identifies a file wherever
 it moved; v1 torrents have no per-file digest, so they match on `(path, size)`
 and are confirmed only by verification.
 
-**Migrating from another client is just the first scan.** Point `library_dir`
-at its state directory — for qBittorrent, `BT_backup`, whose `.fastresume`
-sidecars supply save-path, category and tag hints. Copy it somewhere scratch
-first.
+**Migrating from another client is just the first scan** — point
+`library_dir` at its state directory. The details are in
+[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml) next to the key
+you set.
 
 ```bash
 torrentd --config … pool scan      # index + match
@@ -115,29 +131,46 @@ Requires `allow_mutations = true`. A mistake here destroys data, so:
 ## HTTP API
 
 Everything is served under `/api/…`. `/healthz` and `/metrics` stay at the
-root, where probes and scrapes conventionally look.
+root, where probes and scrapes conventionally look. Safe methods need the
+`read` scope and everything else needs `write`, derived from the method rather
+than listed per route — so a new route cannot be added without a gate.
 
-| Method & path | Purpose |
-| --- | --- |
-| `GET /healthz` | Liveness. 503 until a session is up, and again if the alert loop stops advancing. Never authenticated. |
-| `GET /status` | Counts by state, aggregate rates, peers. |
-| `GET /torrents` | List. `?after=<infohash>&limit=<n>` (default 100, max 1000), returns `{"items":[…],"next_cursor":…}`. |
-| `POST /torrents` | Add `{"magnet":…}` / `{"torrent_path":…}`, or a multipart `.torrent`. 409 on a duplicate info-hash. Body capped at 50 MiB. |
-| `GET`/`DELETE` `/torrents/:infohash` | One torrent; `?delete_files=true` requires a `[pool]` section with `allow_mutations`. |
-| `POST /torrents/:infohash/pause` \| `/resume` | Pause or resume one torrent. |
-| `POST /torrents/:infohash/upload-limit` | `{"bytes_per_sec":…}`, 0 = unlimited. |
-| `POST /torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 4 normal, 7 high). |
-| `POST /api/login` \| `/api/logout` | Session cookie in, revocation out. |
-| `GET /api/events` | SSE change stream. |
-| `GET /metrics` | Prometheus text format. |
+| Method & path | Scope | Purpose |
+| --- | --- | --- |
+| `GET /healthz` | **none** | Liveness. 503 before a session is up, if the alert loop stops advancing, or if every profile is fenced. |
+| `GET /metrics` | `metrics` | Prometheus text format. |
+| `POST /api/login` \| `/api/logout` | **none** | Session cookie in, revocation out. 409 if the daemon runs unauthenticated. |
+| `GET /api/status` | read | Counts by phase, aggregate rates, peers. |
+| `GET /api/events` | read | SSE change stream — a bare tick; the client refetches. |
+| `POST /api/reload` | write | Re-read the config file, as SIGHUP does. |
+| `GET /api/torrents` | read | `?after=<infohash>&limit=<n>` (default 100, max 1000) → `{"items":[…],"next_cursor":…}`. |
+| `POST /api/torrents` | write | `{"profile_id":…}` plus `{"magnet":…}`, `{"torrent_path":…}`, or a multipart `.torrent` in a field named `torrent`. 409 on a duplicate info-hash. |
+| `GET`/`DELETE` `/api/torrents/:infohash` | read/write | `?delete_files=true` requires `[pool] allow_mutations`. |
+| `POST /api/torrents/:infohash/pause` \| `/resume` | write | `resume` is 409 while the profile is fenced. |
+| `POST /api/torrents/:infohash/upload-limit` | write | `{"bytes_per_sec":…}`, 0 = unlimited. |
+| `POST /api/torrents/:infohash/file-priority` | write | `{"file_idx":…,"priority":…}`, priority 0–7. |
+| `GET /api/profiles`, `/profiles/:id`, `/profiles/:id/torrents` | read | |
+| `POST /api/profiles/:id/pause-all` \| `/resume-all` | write | `resume-all` is 409 while fenced. |
 
 With `[pool]` configured: `GET /api/pool`, `/pool/tree`, `/pool/torrents`,
 `/pool/orphans`, `/pool/drift`; `POST /api/pool/scan`, `/pool/adopt`,
 `/pool/verify`; and the plan surface `GET`/`POST /api/pool/plans`,
-`GET`/`DELETE /api/pool/plans/:id`, `POST /api/pool/plans/:id/apply`.
+`GET`/`DELETE /api/pool/plans/:id`, `POST /api/pool/plans/:id/apply`. Of
+these, only creating and applying a plan are gated on `allow_mutations`.
 
-Profile routes: `GET /api/profiles`, `/profiles/:id`, `/profiles/:id/torrents`,
-and `POST /api/profiles/:id/pause-all` \| `/resume-all`.
+**Input is confined, not just size-capped.** The 50 MiB body limit is the
+least of it: `torrent_path` reads from the daemon's own filesystem and is
+restricted to `torrent_dir`, the pool library and the managed roots, with a
+64 MiB cap and errors that do not disclose whether a path exists. `save_path`
+must be inside `default_save_path` or a managed root, so an add cannot drop
+payload into a managed tree where the matcher would read it as an orphan.
+
+**Configuration is not settable at runtime, deliberately.** Several keys are
+reloadable — `log_level`, `upload_rate_limit`, `connections_limit`,
+`aio_threads`, `enable_lsd`, `max_concurrent_http_announces` — and every one
+belongs to the TOML file. `POST /api/reload` asks the daemon to re-read that
+file; nothing lets a client set a value, because then the file and the running
+daemon could disagree with nothing recording which had won.
 
 ## Profiles
 
@@ -182,29 +215,32 @@ Verify a tunnel before trusting it, with no torrents involved:
 torrentd --config … vpn check          # add --bring-up to raise the tunnels
 ```
 
-## Security posture (vpn profiles)
+## Security posture
 
 Private trackers ban permanently for cross-contamination between accounts, so
-the isolation is layered — and honest about its limits.
+a `vpn` profile's isolation is layered:
 
-- **Per-profile tunnel binding** — listen and outgoing sockets are source-bound
-  to the tunnel IP, never `0.0.0.0`, and private profiles disable DHT, PEX and
-  LSD so seeding is tracker-only.
-- **Health monitor** — every 30s it checks the tunnel IP and, for WireGuard,
-  the latest-handshake age. On loss, IP change or a stale handshake it pauses
-  the profile's torrents and **fences** it: no auto-restart, and `add`/`resume`
-  return 409 until an operator intervenes.
-- **Network kill switch** (opt-in, `network_kill_switch = true`) — a
-  fail-closed nftables table confining the daemon's egress to loopback and the
-  tunnel interfaces, so a dropped tunnel fails closed at the kernel regardless
-  of socket binds or poll timing. Needs `CAP_NET_ADMIN` and a dedicated user.
-
-`allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds,
-not an egress control. Public content that wants DHT belongs in a
-`network = "host"` profile.
+- **Tunnel binding** — listen and outgoing sockets are source-bound to the
+  tunnel address, never `0.0.0.0`, and DHT, PEX and LSD are off with no key to
+  turn them on, so seeding is tracker-only.
+- **Health monitor** — every 30s it checks the tunnel address and, for
+  WireGuard, the latest-handshake age. On loss, change, or a stale handshake it
+  pauses that profile's torrents and **fences** it: no auto-restart, and
+  `add`/`resume` return 409 until an operator intervenes.
+- **Kill switch** (opt-in) — a fail-closed nftables table confining the
+  daemon's egress to loopback and its tunnel interfaces, so a dropped tunnel
+  fails closed at the kernel regardless of socket binds or poll timing.
 
 The eight rules this is built on, and why each exists, are documented on the
-`torrentd-engine::profile` module.
+`torrentd-engine::profile` module — where the code that enforces them is. The
+operational side of each knob, including what the kill switch costs and what
+it needs, is in [`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml),
+which is the file an operator actually edits.
+
+`allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds —
+it catches loading one account's torrent into another — not an egress control,
+and it is empty by default. Public content that wants DHT belongs in a
+`network = "host"` profile.
 
 ## Authentication
 
@@ -273,13 +309,23 @@ cookie when the original request was over TLS.
 
 ## Metrics
 
-All series are namespaced `torrentd_*`. Session gauges carry a `profile_id`
-label; per-torrent series are deliberately absent (unusable at 10K+ torrents —
-the HTTP API serves per-torrent status on demand). Alongside the libtorrent
-gauges (`torrentd_libtorrent_*`) there are daemon counters for torrent
-lifecycle, resume writes, disk and hash errors, dropped alerts, storage moves
-and pool verification; a vpn profile adds tunnel and port-forward health, and
-`kill_switch_active`.
+`GET /metrics`, Prometheus text format, everything namespaced `torrentd_*` and
+gated behind its own `metrics` scope so a scrape credential can never reach the
+control plane.
+
+Per-session series carry a `profile_id` label. Per-*torrent* series are
+deliberately absent — they are unusable at 10K+ torrents, and the HTTP API
+serves per-torrent status on demand.
+
+Alongside the libtorrent gauges (`torrentd_libtorrent_*`) there are daemon
+counters for torrent lifecycle, resume writes, disk and hash errors, dropped
+alerts, storage moves and pool verification; a `vpn` profile adds tunnel
+health, handshake age, port-forward state and `kill_switch_active`.
+
+> A shipped Grafana dashboard and alert rules are planned rather than present.
+> Until then, note that series register on first emission, so anything not yet
+> emitted reads as "no data" rather than zero — the per-profile VPN series are
+> seeded at their baseline for exactly this reason, and most others are not.
 
 ## Deployment
 
@@ -290,13 +336,22 @@ pre-flight, resource limits), a multi-stage `Containerfile`, and a
 
 ## Testing
 
+Every command lives in [`mise.toml`](mise.toml), which is what CI runs.
+
 ```bash
-mise run check                                          # fmt + clippy
-mise run test                                           # unit + in-memory
-cargo test -p libtorrent-sys --features shim-tests      # FFI shim
-cargo test -p torrentd-engine --test lifecycle -- --ignored   # real libtorrent
-cargo test -p torrentd        --test daemon    -- --ignored
-cargo run --release -p torrentd-bench -- memory-scaling --count 50000
+mise run check           # fmt + clippy, warnings denied
+mise run test            # unit + in-memory; no libtorrent, no disk, no network
+mise run test-shim       # Layer 2: the C ABI boundary
+mise run test-lifecycle  # Layer 3: real libtorrent against real disk
+mise run test-daemon     # Layer 3: spawns the binary, drives it over HTTP
+mise run test-all        # all of the above
+mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
+```
+
+Against a real VPN, with no torrents and no tracker involved:
+
+```bash
+mise run vpn-check /etc/torrentd/torrentd.toml
 ```
 
 ## Contributing & license

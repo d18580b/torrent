@@ -152,9 +152,13 @@ jobs:
           key: cargo-shimtests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-shimtests-${{ runner.os }}-
 
+      # mise provides the test tasks; without it these jobs would be a second
+      # copy of the commands mise.toml already owns.
+      - uses: jdx/mise-action@v2
+
       # Layer 2: struct marshalling, exception isolation,
       # null-handle safety, and buffer ownership across the C ABI boundary.
-      - run: cargo test -p libtorrent-sys --features shim-tests
+      - run: mise run test-shim
 
   integration:
     name: daemon integration (Layer 3)
@@ -188,9 +192,13 @@ jobs:
           key: cargo-integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-integration-${{ runner.os }}-
 
+      # mise provides the test tasks; without it these jobs would be a second
+      # copy of the commands mise.toml already owns.
+      - uses: jdx/mise-action@v2
+
       # Layer 3: real daemon + libtorrent, driven over HTTP.
-      - run: cargo test -p torrentd-engine --test lifecycle -- --ignored
-      - run: cargo test -p torrentd --test daemon -- --ignored
+      - run: mise run test-lifecycle
+      - run: mise run test-daemon
 
   daemon-only:
     name: daemon without the web UI
