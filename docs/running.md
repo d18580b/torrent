@@ -40,6 +40,14 @@ runtime and are easy to miss because nothing checks for them at startup:
 
 Single-session mode needs none of them.
 
+**The shipped container image is WireGuard-only.** `deploy/Containerfile`'s
+runtime layer installs `iproute`, `wireguard-tools` and `nftables` and no
+`openvpn`, so a slot configured `vpn_type = "openvpn"` cannot come up in it —
+bring-up fails, the slot is fenced, and with no other slot the daemon exits.
+Run that configuration on a host, or add `openvpn` to the runtime stage
+yourself. The image also carries no `ps`, `pkill` or `pgrep`: the daemon calls
+none of them, so a `podman exec` into it has no process-inspection tool.
+
 ## 2. Submodules
 
 libtorrent and Boost are vendored as git submodules and compiled from source.

@@ -49,23 +49,34 @@ RUN --mount=type=cache,target=/root/.cache/torrentd,sharing=locked \
 # exists in any registry, so the runtime stage could never be pulled.
 FROM registry.fedoraproject.org/fedora-minimal:43
 
+# **This runtime layer is WireGuard-only.** No `openvpn` binary is installed
+# and none ever has been, so a slot configured `vpn_type = "openvpn"` cannot
+# come up in this image: bring-up fails, the slot is fenced, and with no other
+# slot the daemon exits. Install `openvpn` here, or run that configuration on
+# a host, if you need it. `ip`, `wg`, `wg-quick` and `nft` are the whole of
+# what the daemon shells out to in this image.
+#
 # curl: used by HEALTHCHECK below.
 #
-# `/usr/bin/kill` is the OpenVPN teardown's hard runtime dependency for
-# vpn_type = "openvpn": it shells out to `kill` against a pid it has verified
-# against /proc/<pid>/cmdline, and `Command` spawns no shell, so the builtin
-# is not reachable. That binary comes from **util-linux** — `util-linux-core`
-# on this base image, where `rpm -qf /usr/bin/kill` prints
-# util-linux-core-2.41.5-1.fc43 — and it is already in fedora-minimal, so
-# nothing is installed for it here. It is named because the image working by
-# inheritance rather than by declaration is what let the runbook name the
-# wrong package for two rounds.
+# `/usr/bin/kill` is the **daemon's** hard runtime dependency for
+# vpn_type = "openvpn": the OpenVPN teardown shells out to `kill` against a pid
+# it has verified against /proc/<pid>/cmdline, and `Command` spawns no shell,
+# so the builtin is not reachable. That is a statement about the daemon and
+# about the hosts that run that configuration — not about this image, which
+# does not. It is recorded here because the binary comes from **util-linux** —
+# `util-linux-core` on this base image, where `rpm -qf /usr/bin/kill` prints
+# util-linux-core-2.41.5-1.fc43 — and is already in fedora-minimal, so nothing
+# is installed for it here. An image working by inheritance rather than by
+# declaration is what let the runbook name the wrong package for two rounds.
 #
 # `procps-ng` is **not** it: that package ships `pgrep` and `pkill` and no
 # `kill`. It was installed here for the earlier pattern-based `pkill`
 # teardown, which a recycled pid made unsafe; that call site is gone, no
 # source in this repository invokes `pkill` or `pgrep`, so the package is
-# not installed either.
+# not installed either. Note what that also means: this image carries no
+# process-inspection tool at all — no `ps`, `pkill` or `pgrep` — for an
+# operator who `podman exec`s into it. The daemon needs none of them; an
+# operator who does wants a debug image.
 RUN microdnf install -y \
         openssl ca-certificates curl iproute wireguard-tools nftables \
     && microdnf clean all
