@@ -35,6 +35,7 @@ mod slot_registry;
 mod startup;
 mod tracing_init;
 mod vpn;
+mod vpn_cmd;
 mod vpn_monitor;
 
 use anyhow::Context;
@@ -128,6 +129,14 @@ fn main() -> anyhow::Result<()> {
                 PoolCmd::Status => pool_cmd::status(&cfg),
                 PoolCmd::Check => pool_cmd::check(&cfg),
                 PoolCmd::Orphans { limit } => pool_cmd::orphans(&cfg, limit),
+            },
+            Command::Vpn { cmd } => match cmd {
+                cli::VpnCmd::Check {
+                    slot,
+                    json,
+                    bring_up,
+                    egress,
+                } => vpn_cmd::check(&cfg, slot.as_deref(), json, bring_up, egress),
             },
             Command::HashPassword => hash_password_cmd(),
             Command::NewToken { name, scopes } => new_token_cmd(&name, &scopes),
