@@ -58,7 +58,7 @@ body:
     id: logs
     attributes:
       label: JSON log output
-      description: >-
+      description: |
         The daemon's JSON log around the failure, taken from the **running**
         service: `journalctl -u torrentd` (add `-o cat` for the raw JSON lines).
         If it reproduces, raise the verbosity in place — set `log_level = "debug"`
@@ -67,11 +67,16 @@ body:
         start a second `torrentd` to collect a log: it would contend with the
         running one for the same tunnels, kill-switch table, resume directory and
         pool index. Redact tracker URLs, passkeys and API tokens before pasting.
+
+        A line looks like this:
+
+        `{"timestamp":"2026-09-21T09:14:02.881234567+00:00","level":"ERROR","message":"failed to persist resume data","infohash":"0123456789abcdef0123456789abcdef01234567", …}`
+
+        That is an excerpt, not a whole line — the formatter emits more keys than
+        these, and which ones it emits changes with the code. Paste the real lines
+        whole.
       render: text
       placeholder: |
         {"timestamp":"2026-09-21T09:14:02.881234567+00:00","level":"ERROR","message":"failed to persist resume data","infohash":"0123456789abcdef0123456789abcdef01234567", …}
-
-        An excerpt, not a whole line — the formatter emits more keys than these,
-        and which ones it emits changes with the code. Paste the real lines whole.
     validations:
       required: true
