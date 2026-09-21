@@ -203,27 +203,44 @@ pub struct Auth {
 pub struct LoginThrottle {
     /// The fallback, for requests whose client cannot be established.
     global: Mutex<ThrottleState>,
-    /// Per client. Bounded, and swept of expired entries on insert, so a
-    /// rotating source cannot grow it without limit.
+    /// Per client. Bounded, and swept of entries idle beyond the penalty
+    /// window on insert, so a rotating source cannot grow it without limit.
     per_client: Mutex<HashMap<IpAddr, ThrottleState>>,
     max_burst: u32,
     penalty: Duration,
 }
 
-/// Cap on distinct clients tracked at once. An attacker rotating addresses
-/// evicts their own entries long before this matters; a real deployment has a
-/// handful of operators.
+/// Cap on distinct clients tracked at once. A real deployment has a handful of
+/// operators; a source rotating addresses reaches this cap, and from there the
+/// sweep reclaims whatever has gone idle and the global bucket covers whoever
+/// the sweep could not make room for.
 const MAX_TRACKED_CLIENTS: usize = 1024;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ThrottleState {
     failures: u32,
     locked_until: Option<Instant>,
+    /// When this entry was last read or written. Liveness has to be a time
+    /// question: `failures` never decays, so an entry that has one is live
+    /// forever, and every entry the throttle creates has one from its first
+    /// call.
+    last_seen: Instant,
+}
+
+impl Default for ThrottleState {
+    fn default() -> Self {
+        Self {
+            failures: 0,
+            locked_until: None,
+            last_seen: Instant::now(),
+        }
+    }
 }
 
 impl ThrottleState {
     /// How long the caller must wait, or `None` if an attempt is allowed.
     fn retry_after(&mut self) -> Option<Duration> {
+        self.last_seen = Instant::now();
         match self.locked_until {
             Some(until) if Instant::now() < until => Some(until - Instant::now()),
             Some(_) => {
@@ -237,15 +254,23 @@ impl ThrottleState {
     }
 
     fn note_failure(&mut self, max_burst: u32, penalty: Duration) {
+        self.last_seen = Instant::now();
         self.failures = self.failures.saturating_add(1);
         if self.failures >= max_burst {
             self.locked_until = Some(Instant::now() + penalty);
         }
     }
 
-    /// Whether this entry is worth keeping.
-    fn is_live(&self) -> bool {
-        self.failures > 0 || self.locked_until.is_some_and(|u| u > Instant::now())
+    /// Whether this entry is worth keeping: it is still locking someone out,
+    /// or it has been touched within `idle`.
+    ///
+    /// Not `failures > 0`. Nothing decays `failures`, and `note_failure`
+    /// increments it on the first call, so that disjunct is true for every
+    /// entry the throttle ever creates and the sweep can never reclaim
+    /// anything — least of all in the case it exists for, a source that
+    /// rotates addresses and by definition never revisits a key.
+    fn is_live(&self, idle: Duration) -> bool {
+        self.locked_until.is_some_and(|u| u > Instant::now()) || self.last_seen.elapsed() < idle
     }
 }
 
@@ -256,6 +281,16 @@ impl LoginThrottle {
             per_client: Mutex::new(HashMap::new()),
             max_burst: 5,
             penalty: Duration::from_secs(30),
+        }
+    }
+
+    /// The same throttle with a shorter penalty, so a test can observe the
+    /// idle sweep without sleeping for the production window.
+    #[cfg(test)]
+    fn with_penalty(penalty: Duration) -> Self {
+        Self {
+            penalty,
+            ..Self::new()
         }
     }
 
@@ -294,7 +329,7 @@ impl LoginThrottle {
         };
         let mut g = self.per_client.lock();
         if g.len() >= MAX_TRACKED_CLIENTS && !g.contains_key(&ip) {
-            g.retain(|_, st| st.is_live());
+            g.retain(|_, st| st.is_live(self.penalty));
             // Still full of live entries: fall back to the global bucket
             // rather than letting the map grow, since an attack that fills it
             // is exactly when throttling has to keep working.
@@ -604,6 +639,27 @@ mod tests {
         assert!(
             t.per_client.lock().len() <= MAX_TRACKED_CLIENTS,
             "tracked clients must stay bounded",
+        );
+    }
+
+    #[test]
+    fn the_sweep_reclaims_a_client_that_never_came_back() {
+        // The sweep exists for the rotating source, and the rotating source is
+        // exactly the caller it could never reclaim while liveness was
+        // `failures > 0`: every entry it creates has `failures == 1`, nothing
+        // decays it, and rotating means never revisiting a key to reset it.
+        let t = LoginThrottle::with_penalty(Duration::from_millis(10));
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        assert_eq!(t.per_client.lock().len(), MAX_TRACKED_CLIENTS);
+
+        std::thread::sleep(Duration::from_millis(40));
+        // The next unknown client is what triggers a sweep on insert.
+        t.note_failure(ip(1));
+        assert!(
+            t.per_client.lock().len() < MAX_TRACKED_CLIENTS,
+            "an entry idle beyond the penalty window must be evictable",
         );
     }
 
