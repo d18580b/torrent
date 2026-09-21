@@ -20,6 +20,10 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 # control is the reverse proxy's job. Delete this line and configure [auth]
 # before exposing the API anywhere — a non-loopback bind without [auth] is
 # refused outright.
+#
+# Read once, at startup, like [auth] and http_listen: editing any of the three
+# takes effect on restart, not on SIGHUP. A reload after such an edit warns
+# "requires daemon restart; ignored" and changes nothing.
 allow_unauthenticated = true
 
 # `resume_dir` and `torrent_dir` are roots: each profile gets its own

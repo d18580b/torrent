@@ -341,10 +341,10 @@ impl Config {
             d.log_level = Some(new.log_level);
         }
 
-        // Identity-critical / non-reloadable fields:
-        // resume_dir, torrent_dir, peer_fingerprint, user_agent. Any change
-        // to these is reported in `non_reloadable_changes` so SIGHUP can
-        // log+ignore.
+        // Identity-critical / non-reloadable fields. Every one of them is
+        // reported in `non_reloadable_changes` so SIGHUP can log+ignore; a
+        // key that is neither applied nor mentioned leaves the operator
+        // believing a reload took.
         if old.resume_dir != new.resume_dir {
             d.non_reloadable_changes.push("resume_dir");
         }
@@ -363,6 +363,24 @@ impl Config {
         }
         if old.user_agent != new.user_agent {
             d.non_reloadable_changes.push("user_agent");
+        }
+        // The authentication posture and the bind address are settled at boot:
+        // `AppState.auth` is built once in `startup::boot` and the listener is
+        // bound once, so neither can follow a running daemon's config. They
+        // are reported here for the same reason as everything above, and one
+        // more: these three were the only non-reloadable keys `diff` did not
+        // look at, so an operator who added `[auth]` and reloaded got
+        // `SIGHUP: config unchanged` from the journal and `202 Accepted` from
+        // `POST /api/reload` while the daemon went on authenticating nothing.
+        // Silence there reads as confirmation, which is worse than no signal.
+        if old.auth != new.auth {
+            d.non_reloadable_changes.push("auth");
+        }
+        if old.allow_unauthenticated != new.allow_unauthenticated {
+            d.non_reloadable_changes.push("allow_unauthenticated");
+        }
+        if old.http_listen != new.http_listen {
+            d.non_reloadable_changes.push("http_listen");
         }
         d.profile_changes = diff_profiles(&old.profile, &new.profile);
         d
@@ -642,6 +660,52 @@ listen_interfaces = "0.0.0.0:6881"
         let d = Config::diff(&a, &b);
         assert!(
             d.non_reloadable_changes.contains(&"file_pool_size"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+    }
+
+    #[test]
+    fn an_auth_only_edit_is_reported_rather_than_called_unchanged() {
+        // The property: a config edit that changes nothing but the
+        // authentication posture is a *change*, and `diff` must say so. If it
+        // does not, `ConfigDiff::is_empty` is true and `reload::run` logs
+        // `SIGHUP: config unchanged` — positive confirmation that a reload
+        // took, to an operator whose daemon is still authenticating nothing.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+
+        let mut with_auth = a.clone();
+        with_auth.auth = Some(crate::auth::AuthConfig {
+            password_hash: crate::auth::hash_password("hunter2").unwrap(),
+            session_ttl_secs: 43_200,
+            token: vec![],
+        });
+        with_auth.allow_unauthenticated = false;
+        let d = Config::diff(&a, &with_auth);
+        assert!(
+            !d.is_empty(),
+            "an auth-only edit must not look like an unchanged config",
+        );
+        assert!(
+            d.non_reloadable_changes.contains(&"auth"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+        assert!(
+            d.non_reloadable_changes.contains(&"allow_unauthenticated"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+
+        // The bind address is settled once, at `TcpListener::bind`, and is
+        // half of the posture the refusal in `validate_auth_posture` judges.
+        let mut moved = a.clone();
+        moved.http_listen = SocketAddr::from(([127, 0, 0, 1], 9090));
+        let d = Config::diff(&a, &moved);
+        assert!(!d.is_empty());
+        assert!(
+            d.non_reloadable_changes.contains(&"http_listen"),
             "got {:?}",
             d.non_reloadable_changes,
         );
