@@ -127,11 +127,32 @@ impl BootCleanup {
 
     /// Bring one tunnel down now and stop tracking it — for a slot that failed
     /// after its tunnel came up, whose tunnel must go even if boot succeeds.
+    ///
+    /// Blocking, and deliberately so: the teardown shells out and then waits
+    /// for the process to go. Every `async` caller puts the returned job on
+    /// `spawn_blocking` rather than calling this.
     fn take_down(&mut self, iface: &str) {
-        if let Some(i) = self.tunnels.iter().position(|(_, n)| n == iface) {
-            let (t, name) = self.tunnels.remove(i);
-            (self.vpn_for)(t, &self.run_dir).bring_down(&name);
+        if let Some(job) = self.take_down_job(iface) {
+            job();
         }
+    }
+
+    /// Stop tracking `iface` and hand back its teardown as a job, or `None`
+    /// if it was not tracked.
+    ///
+    /// `OpenvpnManager::bring_down` signals the process and then polls for it
+    /// to exit — up to `TERM_GRACE + KILL_GRACE`, seven seconds, per tunnel.
+    /// On a runtime worker that is seven seconds in which nothing else
+    /// scheduled on that thread runs, and on the shutdown path it is seven
+    /// seconds per slot. This series already moved bring-up, the NAT-PMP
+    /// exchange and the monitor probes onto `spawn_blocking` for exactly that
+    /// reason; the job shape is what lets the teardown go the same way.
+    fn take_down_job(&mut self, iface: &str) -> Option<Box<dyn FnOnce() + Send + 'static>> {
+        let i = self.tunnels.iter().position(|(_, n)| n == iface)?;
+        let (t, name) = self.tunnels.remove(i);
+        let vpn_for = Arc::clone(&self.vpn_for);
+        let run_dir = self.run_dir.clone();
+        Some(Box::new(move || vpn_for(t, &run_dir).bring_down(&name)))
     }
 
     /// Stop tracking `iface` without bringing it down — for an interface this
@@ -193,7 +214,13 @@ impl BootCleanup {
                 );
                 self.forget_tunnel(&iface);
             }
-            Err(_) => self.take_down(&iface),
+            Err(_) => {
+                if let Some(job) = self.take_down_job(&iface) {
+                    tokio::task::spawn_blocking(job)
+                        .await
+                        .context("vpn teardown task")?;
+                }
+            }
         }
         Ok(brought_up)
     }
@@ -204,6 +231,15 @@ impl BootCleanup {
 }
 
 impl Drop for BootCleanup {
+    /// The one teardown that stays on whatever thread it lands on.
+    ///
+    /// `drop` cannot await, so an OpenVPN tunnel's bounded exit wait — up to
+    /// `TERM_GRACE + KILL_GRACE` per tunnel — runs here on the worker that
+    /// happens to drop the guard, where every other teardown path in this
+    /// file hands the job to `spawn_blocking`. That is a forced move rather
+    /// than an oversight: this runs only on a boot that has already failed
+    /// and is on its way to exiting, so the worker it holds has nothing left
+    /// to serve.
     fn drop(&mut self) {
         if !self.armed {
             return;
@@ -518,7 +554,13 @@ pub async fn boot(
                             error.cause = %e,
                             "slot engine construction failed; tearing down VPN",
                         );
-                        cleanup.take_down(&s.vpn_interface);
+                        // Off the worker, like the bring-up above it: the
+                        // same bounded exit wait, reached by a second path.
+                        if let Some(job) = cleanup.take_down_job(&s.vpn_interface) {
+                            tokio::task::spawn_blocking(job)
+                                .await
+                                .context("vpn teardown task")?;
+                        }
                         failed_slots.push(crate::slot_registry::FailedSlot {
                             config: s.clone(),
                             reason: format!("session construction failed: {e}"),
@@ -1039,7 +1081,19 @@ impl DaemonHandle {
             let run_dir = cfg.state_dir();
             for entry in slots.iter() {
                 let vpn = crate::vpn::for_type(entry.config.vpn_type, &run_dir);
-                vpn.bring_down(&entry.config.vpn_interface);
+                // On a blocking thread: an OpenVPN teardown signals and then
+                // waits for the process to exit, up to seven seconds, and N
+                // slots would otherwise hold a runtime worker for 7N of them
+                // while the rest of the shutdown queues behind it.
+                let iface = entry.config.vpn_interface.clone();
+                if let Err(e) = tokio::task::spawn_blocking(move || vpn.bring_down(&iface)).await {
+                    warn!(
+                        vpn_iface = %entry.config.vpn_interface,
+                        error.cause = %e,
+                        "tunnel teardown task failed",
+                    );
+                    continue;
+                }
                 info!(
                     slot_id = %entry.config.id,
                     vpn_iface = %entry.config.vpn_interface,
