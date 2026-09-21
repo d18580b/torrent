@@ -9,6 +9,7 @@ use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
+use torrentd_engine::ResumeStore;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentStore;
 
@@ -27,6 +28,15 @@ pub struct AppState {
     /// Raw `.torrent` file store; the add path persists uploads here so the
     /// startup inventory scan can re-add them if resume data is lost.
     pub torrents: Arc<dyn TorrentStore>,
+    /// Resume-data store.
+    ///
+    /// Only the delete path needs it here. An engine-backed removal gets both
+    /// stores cleaned for free through `TorrentRemoved` ->
+    /// `handlers/add.rs`; the branch that clears a registry entry for a
+    /// profile with no session has no such alert, and without this the files
+    /// stayed on disk and the startup scan re-assigned the info-hash at the
+    /// next boot.
+    pub resume: Arc<dyn ResumeStore>,
     pub metrics: Arc<PromSink>,
     /// Authentication. `None` when no `[auth]` section is configured, in which
     /// case the daemon keeps its original posture: access control belongs to
@@ -164,6 +174,7 @@ pub(crate) fn build_test_state_with_sessions(
         profiles,
         state: Arc::new(StateMap::new()),
         torrents: Arc::new(MemoryTorrentStore::new()),
+        resume: Arc::new(torrentd_engine::MemoryResumeStore::new()),
         metrics: Arc::new(PromSink::new()),
         auth: None,
         pool: None,
