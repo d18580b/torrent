@@ -27,8 +27,8 @@ which torrents point at data that moved or vanished.
 - [x] **VPN-bound profiles** for multi-account private-tracker seeding —
       source-bound sockets, DHT/PEX/LSD off, tunnel health monitoring, an
       opt-in nftables kill switch, and NAT-PMP port forwarding
-- [x] **Verifiable in isolation**: `torrentd vpn check` exercises a real tunnel
-      with no torrents, no tracker and no session
+- [x] **Verifiable in isolation**: `torrentd --config … vpn check` exercises a
+      real tunnel with no torrents, no tracker and no session
 - [x] **Secure by default**: it will not start unauthenticated without being
       told to, and never at all on a routable address
 - [x] **Reverse-proxy native**: correct behind a cache, never terminates TLS
@@ -54,8 +54,10 @@ cargo build --workspace --release
 `mise run native` fetches the vendored submodules and builds Boost and
 libtorrent into a content-addressed prefix outside `target/`, so you pay for
 it once per pinned version rather than once per build directory.
-[`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest, including how to build
-without Node.
+[`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest of the developer setup. Node
+is a build dependency of the default feature set and the build panics without
+it; **§3 of [`docs/running.md`](docs/running.md#3-build) has how to build
+without it.**
 
 **For a real deployment, follow [`docs/running.md`](docs/running.md).** It has
 the parts that are easy to get wrong: the service user, which directories must
@@ -133,7 +135,12 @@ Requires `allow_mutations = true`. A mistake here destroys data, so:
 Everything is served under `/api/…`. `/healthz` and `/metrics` stay at the
 root, where probes and scrapes conventionally look. Safe methods need the
 `read` scope and everything else needs `write`, derived from the method rather
-than listed per route — so a new route cannot be added without a gate.
+than listed per route — so a route added under `/api` cannot be added without
+a gate. Three routes are mounted on the root router outside both middleware
+layers — `/healthz`, `/api/login` and `/api/logout`, the rows below carrying
+scope **none**. A route added at that level is ungated, and the method-derived
+scoping does not catch it. (`/metrics` also sits at the root, but under its
+own `metrics`-scope layer.)
 
 | Method & path | Scope | Purpose |
 | --- | --- | --- |
@@ -144,7 +151,7 @@ than listed per route — so a new route cannot be added without a gate.
 | `GET /api/events` | read | SSE change stream — a bare tick; the client refetches. |
 | `POST /api/reload` | write | Re-read the config file, as SIGHUP does. |
 | `GET /api/torrents` | read | `?after=<infohash>&limit=<n>` (default 100, max 1000) → `{"items":[…],"next_cursor":…}`. |
-| `POST /api/torrents` | write | `{"profile_id":…}` plus `{"magnet":…}`, `{"torrent_path":…}`, or a multipart `.torrent` in a field named `torrent`. 409 on a duplicate info-hash. |
+| `POST /api/torrents` | write | `{"profile_id":…}` plus `{"magnet":…}`, `{"torrent_path":…}`, or a multipart `.torrent` in a field named `torrent`. `save_path` is optional and defaults to `default_save_path`. 409 on a duplicate info-hash. |
 | `GET`/`DELETE` `/api/torrents/:infohash` | read/write | `?delete_files=true` requires `[pool] allow_mutations`. |
 | `POST /api/torrents/:infohash/pause` \| `/resume` | write | `resume` is 409 while the profile is fenced. |
 | `POST /api/torrents/:infohash/upload-limit` | write | `{"bytes_per_sec":…}`, 0 = unlimited. |
