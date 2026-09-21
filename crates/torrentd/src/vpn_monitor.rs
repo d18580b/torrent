@@ -66,17 +66,15 @@ fn evaluate(
     }
 }
 
-pub async fn run(
-    slots: Arc<SlotRegistry>,
-    state: Arc<StateMap>,
-    metrics: Arc<PromSink>,
-    handshake_max_age: Duration,
-    mut shutdown: broadcast::Receiver<ShutdownReason>,
-) {
-    // Slots start healthy (their session was constructed on a confirmed IP).
-    // Pre-register every per-slot series at its baseline so `rate()`/alerting
-    // queries resolve from a cold start instead of reading "no data" until the
-    // first tunnel event ever occurs.
+/// Pre-register every per-slot series at its baseline, so `rate()`/alerting
+/// queries resolve from a cold start instead of reading "no data" until the
+/// first tunnel event ever occurs.
+///
+/// Split out of [`run`] because the failed-slot half below is the whole of a
+/// finding and `run`'s own poll loop is not reachable by a test.
+fn seed_baselines(slots: &SlotRegistry, metrics: &PromSink) {
+    // A slot that got a session starts healthy — it was constructed on a
+    // confirmed IP.
     for e in slots.iter() {
         let labels = [("slot_id", e.id().as_str())];
         metrics.set_gauge("slot_vpn_tunnel_up", 1.0, &labels);
@@ -90,7 +88,7 @@ pub async fn run(
         // `slot_vpn_handshake_probe_ok == 0` should read "no" from a cold
         // start rather than "no data" for the first POLL_INTERVAL — and for
         // the whole run on a slot that is fenced before the first probe, the
-        // `continue` above running before the probe does.
+        // `continue` in the poll loop running before the probe does.
         if e.config.vpn_type == VpnType::Wireguard {
             metrics.set_gauge("slot_vpn_handshake_probe_ok", 1.0, &labels);
         }
@@ -102,6 +100,39 @@ pub async fn run(
             );
         }
     }
+
+    // And a slot whose tunnel never came up at boot carries `0`.
+    //
+    // `iter()` is `entries` and excludes `failed`, so every `set_gauge` above
+    // skips such a slot and it had no `slot_vpn_tunnel_up` series for the
+    // life of the process — while `/healthz` counts it in `slots_fenced` and
+    // `healthz.rs`'s own comment points the operator at this metric as the
+    // per-slot signal to alert on. An operator alerting on
+    // `slot_vpn_tunnel_up == 0` saw nothing at all for the one account that
+    // was dark.
+    //
+    // `0` here is a measured fact rather than a pinned constant: the tunnel
+    // demonstrably did not come up. Nothing else is seeded for these slots —
+    // a slot with no session has no torrents, so any
+    // `slot_torrents_paused_vpn_down` value would assert a count nothing
+    // measured, and the poll loop never visits them to correct it.
+    for f in slots.failed() {
+        metrics.set_gauge(
+            "slot_vpn_tunnel_up",
+            0.0,
+            &[("slot_id", f.config.id.as_str())],
+        );
+    }
+}
+
+pub async fn run(
+    slots: Arc<SlotRegistry>,
+    state: Arc<StateMap>,
+    metrics: Arc<PromSink>,
+    handshake_max_age: Duration,
+    mut shutdown: broadcast::Receiver<ShutdownReason>,
+) {
+    seed_baselines(&slots, &metrics);
 
     loop {
         tokio::select! {
@@ -279,6 +310,50 @@ mod tests {
         assert_eq!(
             evaluate(ip(3), ip(2), Some(Duration::from_secs(999)), MAX),
             Err(DownReason::IpLostOrChanged)
+        );
+    }
+
+    /// The slot the baseline block used to miss, for exactly the metric it
+    /// matters for.
+    ///
+    /// `/healthz` counts a boot-failed slot in `slots_fenced`, and
+    /// `healthz.rs`'s comment points the operator at `slot_vpn_tunnel_up` as
+    /// the per-slot signal to alert on. `slots.iter()` excludes `failed`, so
+    /// such a slot had no series at all: an operator alerting on
+    /// `slot_vpn_tunnel_up == 0` saw nothing whatsoever for the one account
+    /// that was dark, while the readiness probe said one was.
+    ///
+    /// Drop the failed-slot seed loop and this fails.
+    #[test]
+    fn a_slot_that_never_came_up_at_boot_carries_a_tunnel_down_series() {
+        use crate::slot_registry::test_entry;
+        use crate::slot_registry::test_failed_slot;
+
+        let slots = SlotRegistry::new(vec![
+            test_entry("account_a", SlotStatus::Active),
+            test_entry("account_b", SlotStatus::Active),
+        ])
+        .with_failed(vec![test_failed_slot("account_c")]);
+        let metrics = PromSink::new();
+
+        seed_baselines(&slots, &metrics);
+
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        assert!(
+            exported.contains("torrentd_slot_vpn_tunnel_up{slot_id=\"account_c\"} 0"),
+            "the account that is dark has to be readable as 0, not as \
+             no data; got:\n{exported}",
+        );
+        assert!(
+            exported.contains("torrentd_slot_vpn_tunnel_up{slot_id=\"account_a\"} 1"),
+            "and the slots that did come up still baseline at 1; got:\n{exported}",
+        );
+        // Decision 5's rule: an absent series is honest, a pinned one is not.
+        // A slot with no session has no torrents to pause, so nothing else is
+        // asserted about it.
+        assert!(
+            !exported.contains("torrents_paused_vpn_down{slot_id=\"account_c\"}"),
+            "a slot with no session has no paused count to report; got:\n{exported}",
         );
     }
 }
