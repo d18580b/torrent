@@ -124,7 +124,24 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
 ///
 /// Refuses uid 0 outright — see [`refusal_for_uid`].
 pub fn enable(tunnels: &[String]) -> io::Result<u32> {
-    let uid = current_uid()?;
+    enable_for_uid(current_uid()?, tunnels, apply)
+}
+
+/// `enable`, with the uid and the `nft` call handed in.
+///
+/// Making `refusal_for_uid` pure was half a fix: it left the guard *reachable*
+/// by a test and the **call site** still unreachable by any of them, so
+/// deleting `enable`'s `if let Some(refusal)` line left the whole suite green
+/// while a host running the daemon as root installed `meta skuid 0 counter
+/// drop` and lost every root-owned socket on the machine. `enable` itself
+/// cannot be tested — it reads the process's real uid and shells out to `nft`
+/// — so the control flow the guard sits in lives here, where a test can drive
+/// uid 0 through it and watch `apply` not be called.
+pub(crate) fn enable_for_uid(
+    uid: u32,
+    tunnels: &[String],
+    apply: impl Fn(&str) -> io::Result<()>,
+) -> io::Result<u32> {
     if let Some(refusal) = refusal_for_uid(uid) {
         return Err(refusal);
     }
@@ -204,16 +221,32 @@ mod tests {
 
     #[test]
     fn enable_refuses_to_install_a_ruleset_as_root() {
-        // The guard `enable` actually consults. Delete it and this fails,
-        // which is the whole point: the test that used to carry this name
-        // asserted on `render_ruleset`, a function the guard does not touch,
-        // so removing the guard left the suite green while the change it
-        // prevents takes a host off the network.
-        let e = refusal_for_uid(0).expect("uid 0 must be refused");
+        // Driven through `enable`'s own control flow, not around it: delete
+        // the `if let Some(refusal)` line and this fails, in any environment.
+        // Asserting on `refusal_for_uid` alone -- which is what this test did
+        // -- left the call site reachable by nothing, so the guard could be
+        // deleted with the suite still green while a host running the daemon
+        // as root lost every root-owned socket on it.
+        let called = std::cell::Cell::new(false);
+        let e = enable_for_uid(0, &["wg-a".to_string()], |_| {
+            called.set(true);
+            Ok(())
+        })
+        .expect_err("uid 0 must be refused");
         assert!(
             e.to_string().contains("non-root user"),
             "the refusal has to say what to do instead; got {e}",
         );
+        assert!(
+            !called.get(),
+            "the refusal comes before anything is handed to nft",
+        );
+    }
+
+    #[test]
+    fn the_refusal_is_the_predicate_the_guard_consults() {
+        let e = refusal_for_uid(0).expect("uid 0 must be refused");
+        assert!(e.to_string().contains("non-root user"), "got {e}");
     }
 
     #[test]
