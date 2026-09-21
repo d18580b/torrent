@@ -49,19 +49,19 @@ detail lives there, so this file does not have to be kept in step with a
 behaviour it only points at.
 
 - **Authentication** — described in
-  [`README.md` § *Authentication*](README.md#authentication) and
-  [`docs/running.md` § *6. Authentication (optional)*](docs/running.md#6-authentication-optional).
+  [`README.md` § *Authentication*](README.md#authentication) and in
+  [`docs/running.md`](docs/running.md), § *6*, on authentication.
   Anything that bypasses authentication once it *is* configured — session
   handling, scope enforcement, token or password verification — is in scope.
 
 - **The network kill switch** — described in
-  [`README.md` § *Security posture (multi-slot)*](README.md#security-posture-multi-slot)
-  and [`docs/running.md` § *4. Service user, binary, directories*](docs/running.md#4-service-user-binary-directories).
+  [`README.md`](README.md), § *Security posture*, and in
+  [`docs/running.md` § *4. Service user, binary, directories*](docs/running.md#4-service-user-binary-directories).
   Anything that leaks egress past it, or that turns `CAP_NET_ADMIN` into a
   wider capability than the table it installs, is in scope.
 
 - **Per-slot isolation** — described in
-  [`README.md` § *Security posture (multi-slot)*](README.md#security-posture-multi-slot).
+  [`README.md`](README.md), § *Security posture*.
   This exists to stop cross-contamination between private tracker accounts.
   Anything that makes one slot announce from another's address, that defeats
   the source binding or the fencing, or that lets one info-hash live in two
