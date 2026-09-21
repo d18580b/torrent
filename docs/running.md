@@ -228,10 +228,19 @@ the pool index. It prints which file it read and how many entries it took.
 `[pool]` section, the first open on this build renames the index's
 torrent→account column from `slot` to `profile`. A build predating this change
 cannot open the result. Before that step the daemon copies the database aside
-as `<db_path>.pre-v3.bak` — restore that file to roll back. Keep it until you
-are sure: it is the only copy of the `plan`/`plan_step` mutation journal, which
-a rescan does not reconstruct. The migration is applied in one transaction, so
-a failure part way through leaves the index exactly as it was.
+as `<db_path>.pre-v3.bak`; restoring that file is how you go back to a build
+that predates this change. Keep it until you are sure: it is the only copy of
+the `plan`/`plan_step` mutation journal, which a rescan does not reconstruct.
+The migration is applied in one transaction, so a failure part way through
+leaves the index exactly as it was.
+
+If you ran one of this change's own pre-release builds, you may hold a
+`pool.db` that reports schema version 2 but already carries the `profile`
+column. This build recognises that one file, stamps the version to match the
+schema it already has, and runs no migration on it — nothing moves and the
+journal is kept. Restoring `<db_path>.pre-v3.bak` is **not** the remedy for
+that file: the copy is taken from the database as it stands, so it has the same
+contents.
 
 **3. Point each profile at its files, or move them.** Resume and `.torrent`
 files used to live directly under `resume_dir` and `torrent_dir`; they now live

@@ -1325,63 +1325,104 @@ fn a_v3_step_that_fails_leaves_the_version_and_the_schema_agreeing() {
     );
 }
 
+/// Build the file `b28a778` left behind: v3's schema under v2's version.
+///
+/// That build folded the slot→profile rename into `SCHEMA_V1` at
+/// `SCHEMA_VERSION = 2`, so the file it writes reports 2 and already carries
+/// `profile`. Nothing else produces this shape.
+fn build_b28a778_index(db: &std::path::Path) {
+    build_v1_index(db);
+    apply_v2_journal(db);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.execute_batch(
+        "ALTER TABLE torrent RENAME COLUMN slot TO profile;
+         DROP INDEX torrent_by_slot;
+         CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
+         INSERT INTO plan(id, kind, created_at, status, spec)
+             VALUES (1, 'delete', 0, 'applied', '{}');
+         INSERT INTO plan_step(plan_id, seq, op, src, status)
+             VALUES (1, 0, 'unlink', '/pool/a.bin', 'done');",
+    )
+    .unwrap();
+}
+
 #[test]
-fn a_database_v3_cannot_migrate_is_recoverable_from_the_backup() {
-    // The file an earlier build of this branch produced: it folded the rename
-    // into v1 at `SCHEMA_VERSION = 2`, so it writes a `user_version = 2` file
-    // that already carries `profile`. v3 cannot apply to it — there is no
-    // `slot` column to rename — and no version-keyed migration can make it,
-    // so the answer has to be one that does not need to know who ran that
-    // build: the operator keeps the `plan` / `plan_step` journal, which this
-    // crate documents as not reconstructible by rescanning.
+fn a_b28a778_index_opens_and_keeps_its_journal() {
+    // The file an earlier build of this branch produced: `user_version = 2`
+    // over a schema that already *is* v3. No version-keyed step can reach it —
+    // there is no `slot` column to rename — so every open re-ran v3 and failed
+    // with `no such column: "slot"`, permanently, on a database `startup.rs`
+    // opens with `?` under `Restart=on-failure`.
+    //
+    // The copy-aside did not answer it: `.pre-v3.bak` is a `VACUUM INTO` of
+    // the already-broken file, so the rollback both operator-facing texts
+    // described restored the same unopenable database. The version is stamped
+    // to match the schema instead, which is a `PRAGMA` and no DDL.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pool.db");
+    build_b28a778_index(&db);
 
-    build_v1_index(&db);
-    apply_v2_journal(&db);
-    {
-        let c = rusqlite::Connection::open(&db).unwrap();
-        // Exactly what that build left behind.
-        c.execute_batch(
-            "ALTER TABLE torrent RENAME COLUMN slot TO profile;
-             DROP INDEX torrent_by_slot;
-             CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
-             INSERT INTO plan(id, kind, created_at, status, spec)
-                 VALUES (1, 'delete', 0, 'applied', '{}');
-             INSERT INTO plan_step(plan_id, seq, op, src, status)
-                 VALUES (1, 0, 'unlink', '/pool/a.bin', 'done');",
-        )
-        .unwrap();
-    }
+    let store = PoolStore::open(&db).expect("the one shape that is recognised rather than stepped");
+    drop(store);
 
-    let err = PoolStore::open(&db).expect_err("v3 cannot apply to this file");
+    assert_eq!(
+        user_version(&db),
+        3,
+        "the version must now agree with the schema the file already had",
+    );
+    let cols = torrent_columns(&db);
     assert!(
-        format!("{err}").contains("slot"),
-        "the failure names the column it could not find, got: {err}",
+        cols.iter().any(|c| c == "profile") && !cols.iter().any(|c| c == "slot"),
+        "and no DDL ran, so the columns are untouched, got {cols:?}",
     );
 
-    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
-    assert!(
-        backup.exists(),
-        "the copy aside is what makes this state recoverable at all",
-    );
-
-    // The backup is a complete database — not just the bytes at `path`, which
-    // in WAL mode are not by themselves one — and it still holds the journal.
-    let c = rusqlite::Connection::open(&backup).unwrap();
+    // The whole point of not telling the operator to delete the file: the
+    // mutation journal this crate documents as not reconstructible by
+    // rescanning is still there, in the live database rather than in a backup.
+    let c = rusqlite::Connection::open(&db).unwrap();
     let steps: i64 = c
         .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(steps, 1, "the mutation journal survived");
+    assert_eq!(steps, 1, "the mutation journal survived the repair");
     let torrents: i64 = c
         .query_row("SELECT count(*) FROM torrent", [], |r| r.get(0))
         .unwrap();
     assert_eq!(torrents, 1);
+    drop(c);
 
-    // A second failed open does not overwrite the copy with a later state.
-    let before = std::fs::metadata(&backup).unwrap().len();
-    let _ = PoolStore::open(&db);
-    assert_eq!(std::fs::metadata(&backup).unwrap().len(), before);
+    // Nothing destructive happened, so nothing was copied aside. A stray
+    // `.pre-v3.bak` here would read as a failed migration.
+    assert!(
+        !PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+        "a PRAGMA is not a destructive step and needs no copy",
+    );
+
+    // And it opens again, which is what "recoverable" has to mean.
+    PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+}
+
+#[test]
+fn a_genuine_v2_index_is_still_migrated_by_the_version_keyed_step() {
+    // The recognition is bounded to one shape and must not swallow the
+    // ordinary upgrade. A real v2 file has `slot` and no `profile`, so it
+    // cannot match, and it takes the DDL path with its backup.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    PoolStore::open(&db).expect("a genuine v2 index migrates forward");
+
+    assert_eq!(user_version(&db), 3);
+    let cols = torrent_columns(&db);
+    assert!(
+        cols.iter().any(|c| c == "profile") && !cols.iter().any(|c| c == "slot"),
+        "the rename really ran, got {cols:?}",
+    );
+    assert!(
+        PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+        "the destructive path still copies the database aside first",
+    );
 }
 
 #[test]
