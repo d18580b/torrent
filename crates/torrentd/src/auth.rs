@@ -18,6 +18,7 @@
 //! client discards it.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -183,66 +184,128 @@ pub struct Auth {
 /// password is the one credential here a human chose, so it is also the only
 /// one worth guessing.
 ///
-/// Deliberately global rather than per-IP: there is one password, the daemon
-/// sits behind a reverse proxy where the peer address is usually the proxy,
-/// and a per-IP bucket keyed on a spoofable header is worse than none. The
-/// cost is that an attacker can lock the operator out of the login form for
-/// the backoff window — an inconvenience against a CPU exhaustion that takes
-/// the whole daemon down.
+/// Buckets are keyed per client where the client can be *established*, and
+/// share one global bucket where it cannot. The distinction matters because
+/// of what the alternatives cost:
+///
+/// * A global bucket alone means anyone who can reach the port can lock the
+///   operator out of the login form indefinitely, by failing five times every
+///   thirty seconds forever. That was the accepted trade-off while no client
+///   address was knowable.
+/// * A per-IP bucket keyed on a header anyone can set is worse than none: an
+///   attacker simply varies the header and is never throttled.
+///
+/// So a per-IP bucket is used exactly when the address came from the socket
+/// or from a proxy in `trusted_proxies`, and the global bucket otherwise —
+/// which, with no trusted proxies configured, is the whole of the previous
+/// behaviour.
 #[derive(Debug)]
 pub struct LoginThrottle {
-    state: parking_lot::Mutex<ThrottleState>,
+    /// The fallback, for requests whose client cannot be established.
+    global: Mutex<ThrottleState>,
+    /// Per client. Bounded, and swept of expired entries on insert, so a
+    /// rotating source cannot grow it without limit.
+    per_client: Mutex<HashMap<IpAddr, ThrottleState>>,
     max_burst: u32,
     penalty: Duration,
 }
 
-#[derive(Debug)]
+/// Cap on distinct clients tracked at once. An attacker rotating addresses
+/// evicts their own entries long before this matters; a real deployment has a
+/// handful of operators.
+const MAX_TRACKED_CLIENTS: usize = 1024;
+
+#[derive(Debug, Default)]
 struct ThrottleState {
     failures: u32,
     locked_until: Option<Instant>,
 }
 
-impl LoginThrottle {
-    pub fn new() -> Self {
-        Self {
-            state: parking_lot::Mutex::new(ThrottleState {
-                failures: 0,
-                locked_until: None,
-            }),
-            max_burst: 5,
-            penalty: Duration::from_secs(30),
-        }
-    }
-
+impl ThrottleState {
     /// How long the caller must wait, or `None` if an attempt is allowed.
-    pub fn retry_after(&self) -> Option<Duration> {
-        let mut st = self.state.lock();
-        match st.locked_until {
+    fn retry_after(&mut self) -> Option<Duration> {
+        match self.locked_until {
             Some(until) if Instant::now() < until => Some(until - Instant::now()),
             Some(_) => {
                 // Window elapsed: allow another burst.
-                st.locked_until = None;
-                st.failures = 0;
+                self.locked_until = None;
+                self.failures = 0;
                 None
             }
             None => None,
         }
     }
 
-    /// Record a failed attempt, locking out once the burst is spent.
-    pub fn note_failure(&self) {
-        let mut st = self.state.lock();
-        st.failures = st.failures.saturating_add(1);
-        if st.failures >= self.max_burst {
-            st.locked_until = Some(Instant::now() + self.penalty);
+    fn note_failure(&mut self, max_burst: u32, penalty: Duration) {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= max_burst {
+            self.locked_until = Some(Instant::now() + penalty);
         }
     }
 
+    /// Whether this entry is worth keeping.
+    fn is_live(&self) -> bool {
+        self.failures > 0 || self.locked_until.is_some_and(|u| u > Instant::now())
+    }
+}
+
+impl LoginThrottle {
+    pub fn new() -> Self {
+        Self {
+            global: Mutex::new(ThrottleState::default()),
+            per_client: Mutex::new(HashMap::new()),
+            max_burst: 5,
+            penalty: Duration::from_secs(30),
+        }
+    }
+
+    /// How long `client` must wait, or `None` if an attempt is allowed.
+    pub fn retry_after(&self, client: Option<IpAddr>) -> Option<Duration> {
+        match client {
+            None => self.global.lock().retry_after(),
+            Some(ip) => self
+                .per_client
+                .lock()
+                .get_mut(&ip)
+                .and_then(ThrottleState::retry_after),
+        }
+    }
+
+    /// Record a failed attempt, locking out once the burst is spent.
+    pub fn note_failure(&self, client: Option<IpAddr>) {
+        let Some(ip) = client else {
+            self.global
+                .lock()
+                .note_failure(self.max_burst, self.penalty);
+            return;
+        };
+        let mut g = self.per_client.lock();
+        if g.len() >= MAX_TRACKED_CLIENTS && !g.contains_key(&ip) {
+            g.retain(|_, st| st.is_live());
+            // Still full of live entries: fall back to the global bucket
+            // rather than letting the map grow, since an attack that fills it
+            // is exactly when throttling has to keep working.
+            if g.len() >= MAX_TRACKED_CLIENTS {
+                drop(g);
+                self.global
+                    .lock()
+                    .note_failure(self.max_burst, self.penalty);
+                return;
+            }
+        }
+        g.entry(ip)
+            .or_default()
+            .note_failure(self.max_burst, self.penalty);
+    }
+
     /// A success clears the record; the credential was not being guessed.
-    pub fn note_success(&self) {
-        let mut st = self.state.lock();
-        st.failures = 0;
-        st.locked_until = None;
+    pub fn note_success(&self, client: Option<IpAddr>) {
+        match client {
+            None => *self.global.lock() = ThrottleState::default(),
+            Some(ip) => {
+                self.per_client.lock().remove(&ip);
+            }
+        }
     }
 }
 
@@ -462,23 +525,86 @@ mod tests {
         // Argon2id is deliberately ~50ms of CPU, so an unthrottled login route
         // is a free CPU-exhaustion lever for an unauthenticated caller.
         let t = LoginThrottle::new();
-        assert!(t.retry_after().is_none());
+        assert!(t.retry_after(None).is_none());
         for _ in 0..4 {
-            t.note_failure();
-            assert!(t.retry_after().is_none(), "locked out too early");
+            t.note_failure(None);
+            assert!(t.retry_after(None).is_none(), "locked out too early");
         }
-        t.note_failure();
-        assert!(t.retry_after().is_some(), "burst was not capped");
+        t.note_failure(None);
+        assert!(t.retry_after(None).is_some(), "burst was not capped");
     }
 
     #[test]
     fn a_successful_login_clears_the_throttle() {
         let t = LoginThrottle::new();
         for _ in 0..5 {
-            t.note_failure();
+            t.note_failure(None);
         }
-        assert!(t.retry_after().is_some());
-        t.note_success();
-        assert!(t.retry_after().is_none());
+        assert!(t.retry_after(None).is_some());
+        t.note_success(None);
+        assert!(t.retry_after(None).is_none());
+    }
+
+    fn ip(n: u8) -> Option<IpAddr> {
+        Some(IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, n)))
+    }
+
+    #[test]
+    fn one_clients_failures_do_not_lock_out_another() {
+        // The reason to key per client at all: with a single global bucket,
+        // anyone who can reach the port can keep the operator out of the login
+        // form indefinitely by failing five times every thirty seconds.
+        let t = LoginThrottle::new();
+        for _ in 0..5 {
+            t.note_failure(ip(1));
+        }
+        assert!(t.retry_after(ip(1)).is_some(), "the offender is locked out");
+        assert!(
+            t.retry_after(ip(2)).is_none(),
+            "an unrelated client must still be able to log in",
+        );
+    }
+
+    #[test]
+    fn an_unidentifiable_client_falls_back_to_the_shared_bucket() {
+        // With no trusted proxy configured and no peer address, there is
+        // nothing to key on — and a throttle that cannot key is still better
+        // than none, because the CPU cost it exists to bound is real.
+        let t = LoginThrottle::new();
+        for _ in 0..5 {
+            t.note_failure(None);
+        }
+        assert!(t.retry_after(None).is_some());
+        assert!(
+            t.retry_after(ip(1)).is_none(),
+            "the shared bucket must not leak into an identified client",
+        );
+    }
+
+    #[test]
+    fn a_rotating_client_cannot_grow_the_map_without_bound() {
+        let t = LoginThrottle::new();
+        for n in 0..(MAX_TRACKED_CLIENTS + 64) {
+            let a = std::net::Ipv4Addr::from(n as u32);
+            t.note_failure(Some(IpAddr::V4(a)));
+        }
+        assert!(
+            t.per_client.lock().len() <= MAX_TRACKED_CLIENTS,
+            "tracked clients must stay bounded",
+        );
+    }
+
+    #[test]
+    fn success_clears_only_that_client() {
+        let t = LoginThrottle::new();
+        for _ in 0..5 {
+            t.note_failure(ip(1));
+        }
+        for _ in 0..5 {
+            t.note_failure(ip(2));
+        }
+        t.note_success(ip(1));
+        assert!(t.retry_after(ip(1)).is_none());
+        assert!(t.retry_after(ip(2)).is_some());
     }
 }
