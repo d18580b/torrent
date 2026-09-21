@@ -134,6 +134,12 @@ impl BootCleanup {
         }
     }
 
+    /// Stop tracking `iface` without bringing it down — for an interface this
+    /// boot turned out not to own.
+    fn forget_tunnel(&mut self, iface: &str) {
+        self.tunnels.retain(|(_, n)| n != iface);
+    }
+
     /// Bring a slot's tunnel up, recording it **before** the attempt.
     ///
     /// `bring_up` spawns the tunnel and only then polls up to 30 seconds for
@@ -153,6 +159,15 @@ impl BootCleanup {
     /// that was never raised is a logged no-op, which is the conservative
     /// direction.
     ///
+    /// With one exception, and it is the reason `VpnError::ForeignInterface`
+    /// exists: a bring-up that failed *because* an interface of that name
+    /// already exists and belongs to something else. Recording before the
+    /// attempt turned that case into `wg-quick down <iface>` on a tunnel the
+    /// WireGuard manager had just refused to adopt, taking its routes and
+    /// rules with it — the daemon destroying a stranger's tunnel over a name
+    /// collision. Nothing of ours is running there, so it is forgotten
+    /// rather than torn down, and the drop guard does not see it either.
+    ///
     /// The bring-up itself runs on `spawn_blocking`: it shells out and polls,
     /// and on a runtime worker that is 30 seconds per slot during which
     /// nothing else — including the signal handler that is supposed to
@@ -168,8 +183,17 @@ impl BootCleanup {
         let brought_up = tokio::task::spawn_blocking(move || vpn.bring_up(&profile))
             .await
             .context("vpn bring-up task")?;
-        if brought_up.is_err() {
-            self.take_down(&iface);
+        match &brought_up {
+            Ok(_) => {}
+            Err(torrentd_engine::VpnError::ForeignInterface { .. }) => {
+                warn!(
+                    vpn_iface = %iface,
+                    "an interface of this name is already up and is not this slot's; \
+                     leaving it alone",
+                );
+                self.forget_tunnel(&iface);
+            }
+            Err(_) => self.take_down(&iface),
         }
         Ok(brought_up)
     }
@@ -1109,6 +1133,40 @@ mod tests {
         // And it is no longer tracked, so the drop guard does not try again.
         drop(cleanup);
         assert_eq!(vpn.bring_down_calls(), vec!["wg-a".to_string()]);
+    }
+
+    /// The exception to "record it before the attempt": an interface of that
+    /// name that is already up and is **not** this slot's.
+    ///
+    /// `wg-quick up` refuses a name that exists, adoption then finds a
+    /// different public key and refuses it too — and the teardown-on-failure
+    /// arm ran `wg-quick down` on it anyway, removing a tunnel this daemon
+    /// did not raise along with its routes and its rules. Nothing of ours is
+    /// running there, so neither this arm nor the drop guard may touch it.
+    #[tokio::test]
+    async fn a_bring_up_refused_by_a_foreign_interface_leaves_it_standing() {
+        let vpn = MockVpn::new();
+        vpn.set_foreign("wg-a");
+        let mut cleanup = cleanup_with(vpn.clone());
+        let r = cleanup
+            .bring_up_tracked(Arc::new(vpn.clone()), VpnType::Wireguard, profile("wg-a"))
+            .await
+            .expect("the bring-up task itself did not fail");
+        assert!(
+            matches!(r, Err(torrentd_engine::VpnError::ForeignInterface { .. })),
+            "the manager refuses an interface it cannot vouch for; got {r:?}",
+        );
+        assert!(
+            vpn.bring_down_calls().is_empty(),
+            "a tunnel this boot did not raise is not this boot's to tear down",
+        );
+        // And it was never tracked, so the drop guard does not take it down
+        // when boot goes on to fail for want of that slot either.
+        drop(cleanup);
+        assert!(
+            vpn.bring_down_calls().is_empty(),
+            "nor is it the drop guard's",
+        );
     }
 
     /// The other half of the same repair: a tunnel that came up is left

@@ -189,9 +189,18 @@ impl WireguardManager {
     /// decides safety; an existence probe adds a syscall path, and matching
     /// the message adds a second thing to keep in step with a tool this
     /// daemon does not own.
-    fn adoptable(&self, profile: &VpnProfile) -> Option<IpAddr> {
-        let live = interface_public_key(&profile.interface)?;
-        let expected = profile_public_key(&profile.config_path)?;
+    ///
+    /// The refusal is reported as [`Adoption::Foreign`] rather than folded
+    /// into "not adoptable", because the caller's teardown-on-failure path
+    /// would otherwise run `wg-quick down <iface>` on the very interface this
+    /// function has just declined to touch.
+    fn adoptable(&self, profile: &VpnProfile) -> Adoption {
+        let (Some(live), Some(expected)) = (
+            interface_public_key(&profile.interface),
+            profile_public_key(&profile.config_path),
+        ) else {
+            return Adoption::No;
+        };
         if live != expected {
             warn!(
                 target: "torrentd::vpn::wireguard",
@@ -199,12 +208,33 @@ impl WireguardManager {
                 "an interface of this name exists but carries a different public key; \
                  refusing to adopt it",
             );
-            return None;
+            return Adoption::Foreign;
         }
-        super::ip_lookup::first_ipv4(&profile.interface)
-            .ok()
-            .map(IpAddr::V4)
+        match super::ip_lookup::first_ipv4(&profile.interface) {
+            Ok(ip) => Adoption::Adopt(IpAddr::V4(ip)),
+            Err(_) => Adoption::No,
+        }
     }
+}
+
+/// What `adoptable` found on the host.
+///
+/// `Foreign` is separate from `No` because the two call for opposite
+/// handling. `No` is an ordinary bring-up failure, and whatever `wg-quick up`
+/// may have half-created is this daemon's to remove. `Foreign` is an
+/// interface the daemon has just refused to adopt *because it is not ours* —
+/// so tearing it down would destroy someone else's tunnel, its routes and its
+/// rules, on the strength of a name collision. The caller
+/// (`BootCleanup::bring_up_tracked`) is what acts on the distinction.
+#[derive(Debug)]
+enum Adoption {
+    /// Safe to adopt: the live interface carries this profile's key and has
+    /// an address.
+    Adopt(IpAddr),
+    /// An interface of this name exists and carries a different public key.
+    Foreign,
+    /// Nothing to adopt: no such interface, no readable key, or no address.
+    No,
 }
 
 impl VpnManager for WireguardManager {
@@ -231,18 +261,29 @@ impl VpnManager for WireguardManager {
             // Adopt it instead, but only when it is genuinely the same tunnel:
             // a live WireGuard interface of that name, carrying the public key
             // this profile configures. A name collision with someone else's
-            // tunnel is not adopted.
-            if let Some(ip) = self.adoptable(profile) {
-                warn!(
-                    target: "torrentd::vpn::wireguard",
-                    vpn_iface = %profile.interface,
-                    tunnel_ip = %ip,
-                    "wg-quick up refused; adopting the existing tunnel of the same \
-                     public key (left by an unclean shutdown)",
-                );
-                return Ok(ip);
+            // tunnel is not adopted -- and it is reported as its own error,
+            // because refusing to adopt an interface and then tearing it down
+            // are the same act from the host's point of view.
+            match self.adoptable(profile) {
+                Adoption::Adopt(ip) => {
+                    warn!(
+                        target: "torrentd::vpn::wireguard",
+                        vpn_iface = %profile.interface,
+                        tunnel_ip = %ip,
+                        "wg-quick up refused; adopting the existing tunnel of the same \
+                         public key (left by an unclean shutdown)",
+                    );
+                    return Ok(ip);
+                }
+                Adoption::Foreign => {
+                    return Err(VpnError::ForeignInterface {
+                        iface: profile.interface.clone(),
+                    })
+                }
+                Adoption::No => {
+                    return Err(VpnError::Spawn(format!("wg-quick up exited with {status}")))
+                }
             }
-            return Err(VpnError::Spawn(format!("wg-quick up exited with {status}")));
         }
 
         let deadline = Instant::now() + BRING_UP_TIMEOUT;
