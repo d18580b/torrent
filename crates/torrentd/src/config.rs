@@ -444,7 +444,7 @@ impl Config {
         )
     }
 
-    /// Refuse two profiles that would share, or nest, a store directory.
+    /// Refuse two profiles that would share a store directory.
     ///
     /// `validate_set` de-duplicates only the *explicit* overrides against each
     /// other and cannot see a derived path, so an override set to another
@@ -453,11 +453,24 @@ impl Config {
     /// info-hash it finds there and seeds another account's torrents under its
     /// own fingerprint, user agent and tunnel address.
     ///
-    /// Containment is refused as well as equality: `load_all` filters on the
-    /// file name alone, so a profile pointed at a directory that *contains*
-    /// another's loads that profile's state as its own. An override of the
-    /// top-level root itself is exactly that shape, and the upgrade note tells
-    /// operators to hand-write these overrides.
+    /// **Equality only.** This rule also refused *containment*, on the stated
+    /// ground that "`load_all` filters on the file name alone, so a profile
+    /// pointed at a directory that contains another's loads that profile's
+    /// state as its own". That is not true of either store:
+    /// `FsResumeStore::load_all` and `FsTorrentStore::load_all` both walk one
+    /// level with `fs::read_dir` and skip any entry whose name does not end in
+    /// `.resume` / `.torrent`, which a sibling `<id>/` directory never does. A
+    /// contained profile's files sit in a subdirectory the outer profile's
+    /// scan does not descend into, so containment costs nothing.
+    ///
+    /// It was not free, though: the documented upgrade is to point the
+    /// pre-profiles profile's `resume_dir` and `torrent_dir` at the old roots
+    /// (`docs/running.md` step 3, and `deploy/torrentd.sample.toml` says an
+    /// override is "also how you point a profile at directories from a
+    /// pre-profiles deployment"). Every other profile's derived
+    /// `<base>/<id>` is inside those roots, so a deployment adding its second
+    /// account — the whole subject of this change — was refused for following
+    /// the two places that tell it what to write.
     fn validate_effective_store_dirs(&self) -> Result<(), ProfileConfigError> {
         let dirs: Vec<(&str, PathBuf, PathBuf)> = self
             .profile
@@ -478,20 +491,6 @@ impl Config {
                         return Err(match key {
                             "resume_dir" => ProfileConfigError::DuplicateResumeDir(a.clone()),
                             _ => ProfileConfigError::DuplicateTorrentDir(a.clone()),
-                        });
-                    }
-                    if a.starts_with(b) {
-                        return Err(ProfileConfigError::NestedProfileDir {
-                            key,
-                            outer: b.clone(),
-                            inner: a.clone(),
-                        });
-                    }
-                    if b.starts_with(a) {
-                        return Err(ProfileConfigError::NestedProfileDir {
-                            key,
-                            outer: a.clone(),
-                            inner: b.clone(),
                         });
                     }
                 }
@@ -1080,18 +1079,68 @@ listen_interfaces = "0.0.0.0:6882"
     }
 
     #[test]
-    fn an_override_containing_another_profiles_resume_dir_is_refused() {
-        // Containment, not equality. `load_all` filters on the file name
-        // alone, so a profile pointed at the top-level root loads every other
-        // profile's `<base>/<id>` state as its own — and the root is the
-        // easiest value to write here by accident, because it is the one the
-        // upgrade note tells operators their files are currently under.
-        let msg = refusal(&two_host_profiles(
-            r#"resume_dir = "/var/lib/torrentd/resume""#,
-            "",
-        ));
-        assert!(msg.contains("resume_dir"), "got: {msg}");
-        assert!(msg.contains("lies inside"), "got: {msg}");
+    fn an_override_containing_another_profiles_resume_dir_is_accepted() {
+        // C47, first half. This is the documented upgrade: `docs/running.md`
+        // step 3 tells an operator to point the pre-profiles profile's
+        // `resume_dir` at the old root, and every other profile's derived
+        // `<base>/<id>` is inside that root by construction. Refusing
+        // containment made that configuration unwritable for any deployment
+        // with more than one profile — which is every deployment this change
+        // exists for.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(
+            dir.path(),
+            &two_host_profiles(r#"resume_dir = "/var/lib/torrentd/resume""#, ""),
+        );
+        Config::load(&p).expect(
+            "an outer resume_dir containing an inner one is the documented upgrade, and \
+             neither store descends into a subdirectory",
+        );
+    }
+
+    #[test]
+    fn a_contained_profiles_files_are_invisible_to_the_outer_profiles_load_all() {
+        // C47, second half — the property the refusal claimed to protect,
+        // pinned rather than assumed. The refusal asserted that "both
+        // profiles' sessions would read one store" because "`load_all`
+        // filters on the file name alone". Both stores walk exactly one level
+        // with `fs::read_dir` and keep only names ending in `.resume`, so the
+        // inner profile's directory — whose name is its id — is skipped, and
+        // the file inside it is never reached.
+        //
+        // Without this, dropping the containment rule rests on reading the
+        // stores correctly today and nothing notices when that stops being
+        // true.
+        use torrentd_engine::FsResumeStore;
+        use torrentd_engine::ProfileId;
+        use torrentd_engine::ResumeStore;
+
+        let dir = tempdir().unwrap();
+        let outer_dir = dir.path().join("resume");
+        let inner_dir = outer_dir.join("acct_a");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+
+        let outer_ih = "aa".repeat(20);
+        let inner_ih = "bb".repeat(20);
+        std::fs::write(outer_dir.join(format!("{outer_ih}.resume")), b"outer").unwrap();
+        std::fs::write(inner_dir.join(format!("{inner_ih}.resume")), b"inner").unwrap();
+
+        // `default` overrides to the outer root; `acct_a` derives
+        // `<outer>/acct_a` — exactly the contained pair above.
+        let store = FsResumeStore::new(outer_dir.clone())
+            .with_profile_dir(ProfileId::new("default"), outer_dir.clone());
+
+        let outer = store.load_all(&ProfileId::new("default")).unwrap();
+        assert_eq!(
+            outer.len(),
+            1,
+            "the outer profile must load only its own file, got {outer:?}",
+        );
+        assert_eq!(outer[0].0.to_hex(), outer_ih);
+
+        let inner = store.load_all(&ProfileId::new("acct_a")).unwrap();
+        assert_eq!(inner.len(), 1, "and the inner profile loads only its own");
+        assert_eq!(inner[0].0.to_hex(), inner_ih);
     }
 
     #[test]
