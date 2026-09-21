@@ -14,6 +14,11 @@
 //! window `boot` used to leave open between installing the listener and
 //! subscribing the receiver that outlives boot — therefore left a daemon that
 //! could not be stopped or reloaded by any signal again, only SIGKILLed.
+//!
+//! Surviving the shutdown is for SIGTERM and SIGINT. **SIGHUP is latched
+//! off** once a shutdown has been reported: a reload arriving during the
+//! drain re-reads the config and applies settings to sessions that are being
+//! torn down.
 
 use std::future::Future;
 
@@ -80,8 +85,14 @@ impl SignalStream for mpsc::Receiver<()> {
 ///
 /// A shutdown is reported and the loop **continues**: the process stays off
 /// the default disposition for the whole of its life, so the only listener
-/// that can act on a second SIGTERM, or on any SIGHUP after the first
-/// SIGTERM, is this one.
+/// that can act on a second SIGTERM is this one.
+///
+/// Reload does not survive it. Once a shutdown has been reported the
+/// dispatcher stops forwarding SIGHUP, because a reload arriving while the
+/// daemon drains calls `apply_settings` on sessions that are being torn down
+/// — work racing the drain whose outcome nobody is left to observe. Keeping
+/// the loop alive is about not losing a second SIGTERM, not about staying
+/// configurable on the way out.
 async fn dispatch<T, I, H>(
     shutdown_tx: broadcast::Sender<ShutdownReason>,
     reload_tx: mpsc::Sender<()>,
@@ -93,19 +104,26 @@ async fn dispatch<T, I, H>(
     I: SignalStream,
     H: SignalStream,
 {
+    let mut shutting_down = false;
     loop {
         tokio::select! {
             Some(()) = term.next() => {
                 info!("received SIGTERM");
+                shutting_down = true;
                 let _ = shutdown_tx.send(ShutdownReason::Sigterm);
             }
             Some(()) = int_.next() => {
                 info!("received SIGINT");
+                shutting_down = true;
                 let _ = shutdown_tx.send(ShutdownReason::Sigint);
             }
             Some(()) = hup.next() => {
-                info!("received SIGHUP");
-                let _ = reload_tx.send(()).await;
+                if shutting_down {
+                    warn!("received SIGHUP while shutting down; ignoring it");
+                } else {
+                    info!("received SIGHUP");
+                    let _ = reload_tx.send(()).await;
+                }
             }
             else => break,
         }
@@ -159,17 +177,16 @@ mod tests {
     /// It used to `break` after the first `shutdown_tx.send`, ending the task.
     /// With `boot`'s signal window open, that first send could land in a
     /// receiver nobody read again — and there was then nothing left to catch
-    /// the operator's second SIGTERM, or any SIGHUP, for the rest of the
-    /// process's life. Both follow-ups below fail against the `break`: the
-    /// task's senders drop with it, so `recv` returns closed/`None` rather
-    /// than hanging.
+    /// the operator's second SIGTERM for the rest of the process's life. Both
+    /// follow-ups below fail against the `break`: the task's senders drop
+    /// with it, so `recv` returns closed/`None` rather than hanging.
     #[tokio::test]
     async fn the_listener_keeps_serving_after_it_reports_a_shutdown() {
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel(8);
-        let (reload_tx, mut reload_rx) = mpsc::channel(8);
+        let (reload_tx, _reload_rx) = mpsc::channel(8);
         let (term_tx, term) = mpsc::channel(8);
         let (int_tx, int_) = mpsc::channel(8);
-        let (hup_tx, hup) = mpsc::channel(8);
+        let (_hup_tx, hup) = mpsc::channel(8);
         tokio::spawn(dispatch(shutdown_tx, reload_tx, term, int_, hup));
 
         term_tx.send(()).await.unwrap();
@@ -179,14 +196,8 @@ mod tests {
         );
 
         // Deliberately not `unwrap`ed: against the `break` the listener is
-        // already gone and these sends fail, and the assertion below is the
-        // more useful failure to read.
-        let _ = hup_tx.send(()).await;
-        assert!(
-            reload_rx.recv().await.is_some(),
-            "SIGHUP still reaches the reload pump after a shutdown was reported",
-        );
-
+        // already gone and these sends fail, and the assertions below are the
+        // more useful failures to read.
         let _ = term_tx.send(()).await;
         assert!(
             matches!(shutdown_rx.recv().await, Ok(ShutdownReason::Sigterm)),
@@ -198,6 +209,46 @@ mod tests {
         assert!(
             matches!(shutdown_rx.recv().await, Ok(ShutdownReason::Sigint)),
             "and so is SIGINT",
+        );
+    }
+
+    /// Reload is the one thing the loop does *not* keep serving.
+    ///
+    /// A SIGHUP arriving while the daemon drains reloads the config and calls
+    /// `apply_settings` on sessions that are being torn down. Nothing
+    /// observes the result and it races the drain, so once a shutdown has
+    /// been reported the dispatcher drops SIGHUP on the floor.
+    #[tokio::test]
+    async fn sighup_stops_being_honoured_once_a_shutdown_is_reported() {
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(8);
+        let (reload_tx, mut reload_rx) = mpsc::channel(8);
+        let (term_tx, term) = mpsc::channel(8);
+        let (_int_tx, int_) = mpsc::channel(8);
+        // Capacity one, so the second send returns only once the dispatcher
+        // has taken the first out of the buffer: that is what makes "the
+        // reload was dropped" an observation rather than a race with it.
+        let (hup_tx, hup) = mpsc::channel(1);
+        tokio::spawn(dispatch(shutdown_tx, reload_tx, term, int_, hup));
+
+        // Before the shutdown, SIGHUP reloads.
+        hup_tx.send(()).await.unwrap();
+        assert!(
+            reload_rx.recv().await.is_some(),
+            "SIGHUP reloads a daemon that is still running",
+        );
+
+        term_tx.send(()).await.unwrap();
+        assert!(matches!(
+            shutdown_rx.recv().await,
+            Ok(ShutdownReason::Sigterm)
+        ));
+
+        let _ = hup_tx.send(()).await;
+        let _ = hup_tx.send(()).await;
+        assert!(
+            reload_rx.try_recv().is_err(),
+            "a SIGHUP during the drain does not reconfigure sessions that are \
+             being torn down",
         );
     }
 
