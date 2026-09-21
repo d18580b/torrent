@@ -154,7 +154,34 @@ fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> Option<&'a str> {
         .flat_map(|v| v.split(','))
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .last()
+        .next_back()
+}
+
+/// The value of `key` in one RFC 7239 element, e.g. `proto` in
+/// `for=203.0.113.9;proto=https`. Quotes are stripped; the name is
+/// case-insensitive, as RFC 7239 §4 requires.
+fn param<'a>(element: &'a str, key: &str) -> Option<&'a str> {
+    element.split(';').find_map(|p| {
+        let (k, v) = p.split_once('=')?;
+        k.trim()
+            .eq_ignore_ascii_case(key)
+            .then(|| v.trim().trim_matches('"'))
+    })
+}
+
+/// The IP in an RFC 7239 node identifier: `1.2.3.4`, `1.2.3.4:567`,
+/// `[2001:db8::1]:567`, or an obfuscated `_hidden`/`unknown` that is not an
+/// address at all and yields `None`.
+fn node_addr(node: &str) -> Option<IpAddr> {
+    if let Some(rest) = node.strip_prefix('[') {
+        return rest.split_once(']')?.0.parse().ok();
+    }
+    // Tried before splitting on a colon, because a bare IPv6 literal is full
+    // of them.
+    if let Ok(ip) = node.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    node.split_once(':')?.0.parse().ok()
 }
 
 /// Resolve the client behind `req`.
@@ -179,20 +206,25 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
         };
     }
 
-    let ip = last_element(req, "x-forwarded-for")
-        .and_then(|s| s.parse::<IpAddr>().ok())
-        .or(Some(peer));
-
     // The last `Forwarded` element, whose parameters are its own; an earlier
     // element is another hop's, and through a proxy that appends rather than
     // strips, the earliest one is the client's.
     let forwarded = last_element(req, "forwarded");
+
+    // RFC 7239 is the standardised form, so a proxy that emits only
+    // `Forwarded` has to be able to supply the address too — otherwise its
+    // client is silently discarded in favour of the proxy's socket address.
+    // `X-Forwarded-For` is tried first because it is the near-universal one.
+    let ip = last_element(req, "x-forwarded-for")
+        .and_then(|s| s.parse::<IpAddr>().ok())
+        .or_else(|| forwarded.and_then(|f| param(f, "for")).and_then(node_addr))
+        .or(Some(peer));
+
     let secure = last_element(req, "x-forwarded-proto")
         .is_some_and(|p| p.eq_ignore_ascii_case("https"))
-        || forwarded.is_some_and(|f| {
-            f.split(';')
-                .any(|part| part.trim().eq_ignore_ascii_case("proto=https"))
-        });
+        || forwarded
+            .and_then(|f| param(f, "proto"))
+            .is_some_and(|p| p.eq_ignore_ascii_case("https"));
 
     Client { ip, secure }
 }
@@ -367,12 +399,68 @@ mod tests {
     }
 
     #[test]
-    fn rfc7239_forwarded_also_carries_the_scheme() {
+    fn rfc7239_forwarded_carries_the_scheme_and_the_client() {
         let c = resolve(
             &req("10.1.2.3", &[("forwarded", "for=198.51.100.7;proto=https")]),
             &trusted(&["10.0.0.0/8"]),
         );
         assert!(c.secure);
+        assert_eq!(
+            c.ip,
+            Some("198.51.100.7".parse().unwrap()),
+            "a proxy emitting only the standardised header must still be able \
+             to name its client",
+        );
+    }
+
+    #[test]
+    fn a_forwarded_node_may_carry_a_port_or_be_obfuscated() {
+        let case = |v: &str| {
+            resolve(
+                &req("10.1.2.3", &[("forwarded", v)]),
+                &trusted(&["10.0.0.0/8"]),
+            )
+            .ip
+        };
+        assert_eq!(
+            case("for=\"198.51.100.7:4711\""),
+            Some("198.51.100.7".parse().unwrap()),
+        );
+        assert_eq!(
+            case("for=\"[2001:db8::1]:4711\""),
+            Some("2001:db8::1".parse().unwrap()),
+        );
+        assert_eq!(
+            case("for=2001:db8::1"),
+            Some("2001:db8::1".parse().unwrap())
+        );
+        assert_eq!(
+            case("for=_hidden"),
+            Some("10.1.2.3".parse().unwrap()),
+            "an obfuscated node identifies nobody, so the peer stands",
+        );
+        assert_eq!(
+            case("for=unknown"),
+            Some("10.1.2.3".parse().unwrap()),
+            "so does an explicitly unknown one",
+        );
+    }
+
+    #[test]
+    fn x_forwarded_for_is_preferred_over_forwarded() {
+        // Both name a client; the near-universal header is the one to trust
+        // first, and the choice has to be fixed rather than incidental.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[
+                    ("x-forwarded-for", "198.51.100.7"),
+                    ("forwarded", "for=203.0.113.4"),
+                ],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(c.ip, Some("198.51.100.7".parse().unwrap()));
     }
 
     #[test]
