@@ -1097,31 +1097,61 @@ impl DaemonHandle {
         // a startup failure already tears down what it created.
         if let Some(slots) = &slot_registry {
             let run_dir = cfg.state_dir();
-            for entry in slots.iter() {
-                let vpn = crate::vpn::for_type(entry.config.vpn_type, &run_dir);
-                // On a blocking thread: an OpenVPN teardown signals and then
-                // waits for the process to exit, up to seven seconds, and N
-                // slots would otherwise hold a runtime worker for 7N of them
-                // while the rest of the shutdown queues behind it.
-                let iface = entry.config.vpn_interface.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || vpn.bring_down(&iface)).await {
-                    warn!(
-                        vpn_iface = %entry.config.vpn_interface,
-                        error.cause = %e,
-                        "tunnel teardown task failed",
-                    );
-                    continue;
-                }
-                info!(
-                    slot_id = %entry.config.id,
-                    vpn_iface = %entry.config.vpn_interface,
-                    "tunnel down",
-                );
-            }
+            let jobs: Vec<_> = slots
+                .iter()
+                .map(|entry| {
+                    let vpn = crate::vpn::for_type(entry.config.vpn_type, &run_dir);
+                    let iface = entry.config.vpn_interface.clone();
+                    (
+                        entry.config.id.clone(),
+                        entry.config.vpn_interface.clone(),
+                        move || vpn.bring_down(&iface),
+                    )
+                })
+                .collect();
+            join_teardowns(jobs).await;
         }
 
         info!("torrentd: clean exit");
         exit_code
+    }
+}
+
+/// Put every tunnel teardown in flight at once, then join them.
+///
+/// Moving the bounded exit wait to `spawn_blocking` took it off the runtime's
+/// workers and left the daemon's **wall-clock** stop time where it was:
+/// awaiting each job before spawning the next is still up to
+/// `TERM_GRACE + KILL_GRACE` — seven seconds — per OpenVPN slot, serialized,
+/// which is the `7N` this series named as the thing it was avoiding. Each
+/// tunnel is an independent interface and an independent process, so there is
+/// nothing to serialise for, and `deploy/torrentd.service` sets no
+/// `TimeoutStopSec`, which leaves systemd's default as the only bound on the
+/// drain.
+///
+/// Spawning happens in one pass and the awaits in a second, so the jobs run
+/// concurrently and the log still reads in slot order. A `JoinError` — the
+/// job panicked, or the runtime is shutting down — is warned and skipped:
+/// shutdown must not fail on a teardown, and the tunnels that did come down
+/// are still worth reporting.
+async fn join_teardowns<J>(jobs: Vec<(SlotId, String, J)>)
+where
+    J: FnOnce() + Send + 'static,
+{
+    let handles: Vec<_> = jobs
+        .into_iter()
+        .map(|(id, iface, job)| (id, iface, tokio::task::spawn_blocking(job)))
+        .collect();
+    for (id, iface, handle) in handles {
+        if let Err(e) = handle.await {
+            warn!(
+                vpn_iface = %iface,
+                error.cause = %e,
+                "tunnel teardown task failed",
+            );
+            continue;
+        }
+        info!(slot_id = %id, vpn_iface = %iface, "tunnel down");
     }
 }
 
@@ -1189,6 +1219,10 @@ mod tests {
             Arc::new(move |_t, _dir| Arc::new(vpn.clone()) as Arc<dyn torrentd_engine::VpnManager>),
         )
     }
+
+    /// A teardown as [`join_teardowns`] takes one, boxed so two closures of
+    /// different types can share one `Vec`.
+    type BoxedTeardown = (SlotId, String, Box<dyn FnOnce() + Send>);
 
     /// A `VpnManager` that records **which thread** its teardown ran on.
     ///
@@ -1377,6 +1411,72 @@ mod tests {
         assert!(
             observed.lock().expect("uncontended").is_empty(),
             "an interface this boot did not record is not brought down",
+        );
+    }
+
+    /// The graceful-shutdown drain does not scale with slot count.
+    ///
+    /// Moving the bounded exit wait onto `spawn_blocking` changed which
+    /// thread waits, not how long the daemon takes to stop: awaiting each
+    /// job before spawning the next left the wall-clock stop time at up to
+    /// seven seconds per OpenVPN slot, serialized, which is the `7N` this
+    /// series named as the thing it was avoiding. `deploy/torrentd.service`
+    /// sets no `TimeoutStopSec`, so systemd's default is the only bound.
+    ///
+    /// Six jobs of 200 ms are 1.2 s serialized and about 200 ms in flight at
+    /// once. Await each job in turn in `join_teardowns` and this fails.
+    #[tokio::test]
+    async fn every_tunnel_teardown_is_in_flight_at_once() {
+        let jobs: Vec<_> = (0..6u8)
+            .map(|i| {
+                (
+                    SlotId::new(format!("account_{i}")),
+                    format!("tun-{i}"),
+                    || std::thread::sleep(std::time::Duration::from_millis(200)),
+                )
+            })
+            .collect();
+
+        let started = std::time::Instant::now();
+        join_teardowns(jobs).await;
+        let drain = started.elapsed();
+
+        assert!(
+            drain < std::time::Duration::from_millis(600),
+            "six 200ms teardowns drained in {drain:?}; serialized they are 1.2s, \
+             and a deployment's stop time must not scale with its slot count",
+        );
+    }
+
+    /// And a teardown that panics is warned past rather than taking the rest
+    /// of the drain with it — shutdown must not fail on a tunnel.
+    #[tokio::test]
+    async fn a_teardown_that_panics_does_not_abandon_the_others() {
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let jobs: Vec<BoxedTeardown> = vec![
+            (
+                SlotId::new("account_a"),
+                "tun-a".to_string(),
+                Box::new(|| panic!("wg-quick down went wrong")),
+            ),
+            (
+                SlotId::new("account_b"),
+                "tun-b".to_string(),
+                Box::new({
+                    let done = Arc::clone(&done);
+                    move || {
+                        done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }),
+            ),
+        ];
+
+        join_teardowns(jobs).await;
+
+        assert_eq!(
+            done.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second slot's tunnel still came down",
         );
     }
 
