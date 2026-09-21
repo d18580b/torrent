@@ -176,9 +176,12 @@ payload into a managed tree where the matcher would read it as an orphan.
 **Configuration is not settable at runtime, deliberately.** Several keys are
 reloadable — `log_level`, `upload_rate_limit`, `connections_limit`,
 `aio_threads`, `enable_lsd`, `max_concurrent_http_announces` — and every one
-belongs to the TOML file. `POST /api/reload` asks the daemon to re-read that
-file; nothing lets a client set a value, because then the file and the running
-daemon could disagree with nothing recording which had won.
+belongs to the TOML file. `enable_lsd` carries one exception: it is withheld
+from every `vpn` profile on reload, because such a profile has local discovery
+forced off with no key to turn it on, and a reload may not hand one back.
+`POST /api/reload` asks the daemon to re-read that file; nothing lets a client
+set a value, because then the file and the running daemon could disagree with
+nothing recording which had won.
 
 ## Profiles
 
