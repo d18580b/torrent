@@ -128,7 +128,7 @@ pub(crate) fn test_entry(id: &str, status: SlotStatus) -> SlotEntry {
         resume_dir: PathBuf::from("/tmp/torrentd-test/resume"),
         torrent_dir: PathBuf::from("/tmp/torrentd-test/torrents"),
         allowed_tracker_domains: vec![],
-        upload_rate_limit: 0,
+        upload_rate_limit: None,
         port_forward: PortForwardMode::Static,
         port_forward_gateway: None,
     };

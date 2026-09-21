@@ -161,8 +161,21 @@ pub struct SlotConfig {
     pub torrent_dir: PathBuf,
     #[serde(default)]
     pub allowed_tracker_domains: Vec<String>,
+    /// This slot's own upload cap, in bytes/sec.
+    ///
+    /// Absent means "inherit the top-level `upload_rate_limit`"; `Some(0)`
+    /// means *explicitly unlimited*, which is what `0` means for the
+    /// identically named top-level key and everywhere else in this
+    /// configuration. A plain `u32` could express only one of those two, and
+    /// reading `0` as "inherit" — as this key briefly did — left no way to
+    /// state that one slot is uncapped under a global cap while the key name
+    /// meant two opposite things one table apart.
+    ///
+    /// Applied at boot. A change to it is **not** reloadable, but it is
+    /// reported on SIGHUP (`Config::diff`), and a top-level reload is
+    /// withheld from any slot that sets it.
     #[serde(default)]
-    pub upload_rate_limit: u32,
+    pub upload_rate_limit: Option<u32>,
     /// How this slot's listening port is chosen (default: static).
     #[serde(default)]
     pub port_forward: PortForwardMode,
@@ -396,7 +409,7 @@ mod tests {
             resume_dir: PathBuf::from(format!("/var/lib/torrentd/resume/{id}")),
             torrent_dir: PathBuf::from(format!("/var/lib/torrentd/torrents/{id}")),
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
             port_forward: PortForwardMode::Static,
             port_forward_gateway: None,
         }
