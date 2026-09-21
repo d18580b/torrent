@@ -104,10 +104,27 @@ fn new_token_cmd(name: &str, scopes: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Load the config with the validation this invocation actually needs.
+///
+/// The daemon and `--check-config` get the full check, authentication posture
+/// included: one is about to serve, and the other exists to answer "would it".
+/// An operator subcommand gets everything but the posture — it constructs no
+/// session and binds nothing, and holding it to a check about serving is what
+/// made `hash-password` unreachable from the very configs the refusal sends an
+/// operator to it to fix.
+fn load_config(cli: &Cli) -> anyhow::Result<config::Config> {
+    let is_operator_tool = cli.command.is_some() && !cli.check_config;
+    let loaded = if is_operator_tool {
+        config::Config::load_for_operator_tool(&cli.config)
+    } else {
+        config::Config::load(&cli.config)
+    };
+    loaded.with_context(|| format!("failed to load config from {}", cli.config.display()))
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let cfg = config::Config::load(&cli.config)
-        .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
+    let cfg = load_config(&cli)?;
 
     if cli.check_config {
         // The kill switch shells out to `nft`; fail the pre-flight check now
@@ -167,4 +184,87 @@ fn main() -> anyhow::Result<()> {
     // unreachable
     info!("torrentd: clean exit");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The config an existing non-loopback deployment is holding on upgrade:
+    /// no `[auth]`, no opt-out, and a bind it cannot move — a container
+    /// publishes `127.0.0.1:8080:8080` to a daemon bound `0.0.0.0` inside the
+    /// namespace, so a loopback bind there is a dead port.
+    fn non_loopback_without_auth(dir: &std::path::Path) -> std::path::PathBuf {
+        let p = dir.join("torrentd.toml");
+        std::fs::write(
+            &p,
+            "default_save_path = \"/data/torrents\"\n\
+             resume_dir = \"/var/lib/torrentd/resume\"\n\
+             torrent_dir = \"/var/lib/torrentd/torrents\"\n\
+             http_listen = \"0.0.0.0:8080\"\n\
+             \n\
+             [[profile]]\n\
+             id = \"public\"\n\
+             network = \"host\"\n\
+             listen_interfaces = \"0.0.0.0:6881\"\n",
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn hash_password_runs_from_the_config_the_refusal_sends_you_to_fix() {
+        // The property: the way out of the refusal has to be reachable from
+        // the configuration being refused. `hash-password` constructs no
+        // session and binds nothing, so the posture check must not stand in
+        // front of it — otherwise the only documented migration has no first
+        // step for any deployment whose bind is not loopback.
+        let dir = tempfile::tempdir().unwrap();
+        let p = non_loopback_without_auth(dir.path());
+
+        for argv in [
+            vec!["torrentd", "--config", p.to_str().unwrap(), "hash-password"],
+            vec![
+                "torrentd",
+                "--config",
+                p.to_str().unwrap(),
+                "new-token",
+                "--name",
+                "ci",
+            ],
+        ] {
+            let cli = Cli::parse_from(argv.clone());
+            assert!(
+                load_config(&cli).is_ok(),
+                "{argv:?} must load: it serves nothing",
+            );
+        }
+    }
+
+    #[test]
+    fn the_daemon_and_check_config_still_get_the_posture_check() {
+        // The exemption is for subcommands only. Widening it to the daemon
+        // would remove the refusal this whole change exists to make, and
+        // widening it to `--check-config` would make the pre-flight answer a
+        // different question from the startup it is a pre-flight for.
+        let dir = tempfile::tempdir().unwrap();
+        let p = non_loopback_without_auth(dir.path());
+
+        for argv in [
+            vec!["torrentd", "--config", p.to_str().unwrap()],
+            vec![
+                "torrentd",
+                "--config",
+                p.to_str().unwrap(),
+                "--check-config",
+            ],
+        ] {
+            let cli = Cli::parse_from(argv.clone());
+            let msg = format!("{:#}", load_config(&cli).unwrap_err());
+            assert!(
+                msg.contains("allow_unauthenticated"),
+                "{argv:?} must be refused; got: {msg}",
+            );
+        }
+    }
 }

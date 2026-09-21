@@ -182,16 +182,41 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let bytes = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        let cfg = Self::parse(path)?;
         cfg.validate()?;
         Ok(cfg)
     }
 
+    /// Load for an operator subcommand — `hash-password`, `new-token`,
+    /// `pool …`, `vpn check` — which validates everything except the
+    /// authentication posture.
+    ///
+    /// Those subcommands construct no session, bind no socket and serve no
+    /// request, so the posture check is judging something they do not do. It
+    /// still has to be judged for them, though, because the only documented
+    /// way onto `[auth]` runs through `hash-password`: a deployment whose
+    /// `http_listen` is not loopback — every container deployment, since the
+    /// published port cannot reach a loopback bind inside the namespace —
+    /// cannot write `allow_unauthenticated = true` to get past the refusal,
+    /// because the opt-out on a routable address is itself refused. With the
+    /// check in front of the subcommand there is no first step: the only way
+    /// out is to flip `http_listen` to loopback, generate, write `[auth]`, and
+    /// flip it back, which is four edits for a bootstrap and is documented
+    /// nowhere.
+    pub fn load_for_operator_tool(path: &Path) -> anyhow::Result<Self> {
+        let cfg = Self::parse(path)?;
+        cfg.validate_without_auth_posture()?;
+        Ok(cfg)
+    }
+
+    fn parse(path: &Path) -> anyhow::Result<Self> {
+        let bytes = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        toml::from_str(&bytes).with_context(|| format!("parse {}", path.display()))
+    }
+
     /// Refuse a configuration that authenticates nothing without saying so.
     ///
-    /// Two separate refusals, because they fail for different reasons:
+    /// Three separate refusals, because they fail for different reasons:
     ///
     /// * no `[auth]` and no explicit opt-out — the operator has not chosen,
     ///   and the default of "no authentication at all" is not one to arrive at
@@ -228,11 +253,24 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_inner(true)
+    }
+
+    /// Everything [`Config::validate`] checks except the authentication
+    /// posture. See [`Config::load_for_operator_tool`] for who gets this and
+    /// why.
+    pub fn validate_without_auth_posture(&self) -> anyhow::Result<()> {
+        self.validate_inner(false)
+    }
+
+    fn validate_inner(&self, check_auth_posture: bool) -> anyhow::Result<()> {
         // Unconditional: an empty set is itself a refusal now, because there
         // is no implicit profile to fall back to.
         ProfileConfig::validate_set(&self.profile).context("[[profile]] validation failed")?;
 
-        self.validate_auth_posture()?;
+        if check_auth_posture {
+            self.validate_auth_posture()?;
+        }
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
