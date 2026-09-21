@@ -826,10 +826,16 @@ fn nft_check(ruleset: &str) -> std::io::Result<std::process::Output> {
 ///
 /// Every host touch goes through `host` for the same reason [`slot_checks`]'s
 /// do: the classification this function performs — which `nft --check` failure
-/// is a rejection of the ruleset and which is a capability gap — is branch
-/// logic, and a test that shells out to the real `ip` and `nft` asserts
-/// whatever the machine it runs on happens to answer.
-fn host_checks(cfg: &Config, as_uid: Option<u32>, host: &dyn CheckHost) -> Vec<Check> {
+/// is a rejection of the ruleset, and whether an excluded slot's interface may
+/// decide a scoped run — is branch logic, and a test that shells out to the
+/// real `ip` and `nft` asserts whatever the machine it runs on happens to
+/// answer.
+fn host_checks(
+    cfg: &Config,
+    as_uid: Option<u32>,
+    only: Option<&str>,
+    host: &dyn CheckHost,
+) -> Vec<Check> {
     let mut out = Vec::new();
 
     out.push(if host.tool_available("ip", "-V") {
@@ -874,12 +880,13 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>, host: &dyn CheckHost) -> Vec<C
                 let tunnels: Vec<String> =
                     cfg.slot.iter().map(|s| s.vpn_interface.clone()).collect();
                 let ruleset = vpn::killswitch::render_ruleset(uid, &tunnels);
-                judge_nft_check(
+                let verdict = judge_nft_check(
                     host.nft_check(&ruleset),
                     host.has_cap_net_admin(),
                     uid,
                     &ruleset,
-                )
+                );
+                attribute_ruleset_rejection(verdict, cfg, only, uid, host)
             }
         });
     } else {
@@ -887,6 +894,72 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>, host: &dyn CheckHost) -> Vec<C
     }
 
     out
+}
+
+/// Keep an excluded slot's interface out of a scoped run's exit status.
+///
+/// The kill-switch table is host-wide — boot installs it whole — so the
+/// rendered ruleset lists every configured slot, and the caveat in the detail
+/// already says so. That justifies *listing* them. It does not justify letting
+/// one decide the verdict of a run the operator narrowed with `--slot`:
+/// `cli.rs` says "Check only this slot." and `docs/running.md` "Check one slot
+/// instead of every configured slot", and a rejection caused by an interface
+/// belonging to a slot that was excluded is a `fail` and an exit `1` for a
+/// slot nobody asked about.
+///
+/// Attribution is by re-rendering: the same ruleset for the selected slot's
+/// interfaces alone, dry-run the same way. If that parses while the full one
+/// did not, the rejection is the excluded slots' and this run reports it
+/// without colouring the status. If it fails too, the selected slot owns it
+/// and the verdict stands. Nothing here reads nft's message for interface
+/// names — every name is in it, including the ones that are fine.
+fn attribute_ruleset_rejection(
+    verdict: Check,
+    cfg: &Config,
+    only: Option<&str>,
+    uid: u32,
+    host: &dyn CheckHost,
+) -> Check {
+    // Only a `Fail` can colour a scoped run; the rest are already
+    // non-colouring and are left exactly as they are.
+    if verdict.verdict != Verdict::Fail {
+        return verdict;
+    }
+    let Some(id) = only else {
+        return verdict;
+    };
+    let (kept, excluded): (Vec<&SlotConfig>, Vec<&SlotConfig>) =
+        cfg.slot.iter().partition(|s| s.id.as_str() == id);
+    if excluded.is_empty() {
+        return verdict;
+    }
+    let scoped: Vec<String> = kept.iter().map(|s| s.vpn_interface.clone()).collect();
+    let scoped_ruleset = vpn::killswitch::render_ruleset(uid, &scoped);
+    let scoped_parses = match host.nft_check(&scoped_ruleset) {
+        Ok(o) => {
+            o.status.success() || !nft_rejected_the_ruleset(&String::from_utf8_lossy(&o.stderr))
+        }
+        // The probe that would attribute it did not run, so nothing is
+        // attributed and the rejection keeps the status it had.
+        Err(_) => return verdict,
+    };
+    if !scoped_parses {
+        return verdict;
+    }
+    let names: Vec<String> = excluded
+        .iter()
+        .map(|s| format!("{} (slot {})", s.vpn_interface, s.id.as_str()))
+        .collect();
+    Check::skip(
+        "kill_switch_ruleset",
+        format!(
+            "{} — but the ruleset for slot {id}'s interfaces alone is accepted, so the \
+             rejection belongs to {}, which --slot {id} excluded. It is reported and it does \
+             not decide this run's status; re-run without --slot to have it do so",
+            verdict.detail,
+            names.join(", "),
+        ),
+    )
 }
 
 /// Prove that a socket **bound to the tunnel address** can send and receive.
@@ -1322,7 +1395,7 @@ pub fn check(
 
     let host = RealHost;
     let report = Report {
-        host: host_checks(cfg, as_uid, &host),
+        host: host_checks(cfg, as_uid, only, &host),
         slots: selected
             .into_iter()
             .map(|s| slot_checks(cfg, s, bring_up, egress, &host))
@@ -1662,6 +1735,36 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
 "#
         ))
         .expect("test config parses")
+    }
+
+    /// `cfg_with_slot`'s config with a second slot, so `--slot` has something
+    /// to exclude and the kill-switch table has more than one interface in it.
+    fn cfg_with_two_slots() -> Config {
+        let mut cfg = cfg_with_slot("");
+        cfg.network_kill_switch = true;
+        let mut b = toml::from_str::<Config>(
+            r#"
+listen_interfaces = "0.0.0.0:6881"
+default_save_path = "/tmp/torrentd-test/data"
+resume_dir = "/tmp/torrentd-test/state/resume"
+torrent_dir = "/tmp/torrentd-test/torrents"
+http_listen = "127.0.0.1:8080"
+
+[[slot]]
+id                   = "acct_b"
+vpn_profile          = "/etc/wireguard/wg-acct-b.conf"
+vpn_type             = "wireguard"
+vpn_interface        = "wg-acct-b"
+listen_port          = 6882
+peer_fingerprint_hex = "b1b2c3d4e5f60718"
+user_agent           = "Transmission/4.0.5"
+resume_dir           = "/tmp/torrentd-test/state/resume/acct_b"
+torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
+"#,
+        )
+        .expect("test config parses");
+        cfg.slot.push(b.slot.remove(0));
+        cfg
     }
 
     fn find<'a>(checks: &'a [Check], name: &str) -> Option<&'a Check> {
@@ -2058,6 +2161,90 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
             "both uids are named: {}",
             c.detail,
         );
+    }
+
+    #[test]
+    fn an_excluded_slot_s_interface_does_not_decide_a_scoped_run() {
+        // C52 / F4, reopened. `rp_filter` moved into the slot when the same
+        // finding was first repaired, and `kill_switch_ruleset` kept building
+        // its interface list from `cfg.slot.iter()` — every configured slot,
+        // ignoring `--slot`. A rejection caused by an interface belonging to a
+        // slot the operator excluded was a `fail` and an exit 1 for a slot
+        // that was not being checked, against a flag whose help says "Check
+        // only this slot."
+        //
+        // The table is still rendered whole, because boot installs it whole
+        // and the caveat says so. What changes is the verdict.
+        let cfg = cfg_with_two_slots();
+        let host = FakeHost::new()
+            // The full table is rejected; the selected slot's alone is not.
+            .with_nft([
+                (
+                    1,
+                    "/dev/stdin:5:39-39: Error: syntax error, unexpected string",
+                ),
+                (0, ""),
+            ]);
+
+        let checks = host_checks(&cfg, Some(2000), Some("acct_a"), &host);
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is still reported");
+
+        assert_ne!(
+            c.verdict,
+            Verdict::Fail,
+            "an excluded slot's interface does not colour a scoped run: {}",
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("wg-acct-b") && c.detail.contains("acct_b"),
+            "the offending interface and the slot it belongs to are both named: {}",
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("syntax error"),
+            "nft's own words still reach the operator: {}",
+            c.detail,
+        );
+        let report = Report {
+            host: checks,
+            slots: Vec::new(),
+        };
+        assert_eq!(
+            report.exit_code(),
+            EXIT_OK,
+            "a run scoped to a healthy slot is clean",
+        );
+
+        // The complement: when the rejection survives scoping, it is the
+        // selected slot's and it still decides the run.
+        let host = FakeHost::new().with_nft([
+            (
+                1,
+                "/dev/stdin:5:39-39: Error: syntax error, unexpected string",
+            ),
+            (
+                1,
+                "/dev/stdin:4:39-39: Error: syntax error, unexpected string",
+            ),
+        ]);
+        let checks = host_checks(&cfg, Some(2000), Some("acct_a"), &host);
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is still reported");
+        assert_eq!(
+            c.verdict,
+            Verdict::Fail,
+            "a rejection the selected slot owns still fails: {}",
+            c.detail,
+        );
+
+        // And an unscoped run is untouched: nothing was excluded, so there is
+        // nothing to attribute elsewhere.
+        let host = FakeHost::new().with_nft([(
+            1,
+            "/dev/stdin:5:39-39: Error: syntax error, unexpected string",
+        )]);
+        let checks = host_checks(&cfg, Some(2000), None, &host);
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is still reported");
+        assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
     }
 
     #[test]
@@ -2475,7 +2662,7 @@ http_listen = "127.0.0.1:8080"
         // `nft`: what this asserts is the shape of the block, which must not
         // depend on what happens to be installed on the machine running it.
         let cfg = cfg_with_slot("");
-        let host = host_checks(&cfg, None, &FakeHost::new());
+        let host = host_checks(&cfg, None, None, &FakeHost::new());
         assert!(
             find(&host, "rp_filter").is_none(),
             "rp_filter is per slot and belongs to the slot: {:?}",
@@ -2508,7 +2695,7 @@ http_listen = "127.0.0.1:8080"
             "netlink: Error: cache initialization failed: Operation not permitted",
         )]);
 
-        let checks = host_checks(&cfg, None, &host);
+        let checks = host_checks(&cfg, None, None, &host);
 
         let names: Vec<&str> = checks.iter().map(|c| c.name).collect();
         assert_eq!(
