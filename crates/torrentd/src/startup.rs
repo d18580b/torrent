@@ -273,7 +273,18 @@ pub async fn boot(
                     anyhow::bail!("shutdown requested during slot bring-up");
                 }
                 let vpn = vpn::for_type(s.vpn_type, &run_dir);
-                let tunnel_ip = match vpn.bring_up(&s.vpn_profile()) {
+                // `bring_up` shells out and polls for up to 30 seconds. On a
+                // runtime worker that is 30 seconds per slot during which
+                // nothing else — including the signal handler that is supposed
+                // to interrupt exactly this — gets to run on that thread.
+                let brought_up = {
+                    let vpn = vpn.clone();
+                    let profile = s.vpn_profile();
+                    tokio::task::spawn_blocking(move || vpn.bring_up(&profile))
+                        .await
+                        .context("vpn bring-up task")?
+                };
+                let tunnel_ip = match brought_up {
                     Ok(ip) => {
                         cleanup.note_tunnel(s.vpn_type, &s.vpn_interface);
                         ip

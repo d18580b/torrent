@@ -109,14 +109,34 @@ pub async fn run(
                 continue;
             }
 
-            let current: Option<IpAddr> = vpn::first_ipv4(&e.config.vpn_interface)
-                .ok()
-                .map(IpAddr::V4);
+            // Both probes shell out. Two processes per slot per tick is
+            // cheap, but it is still blocking work and it belongs off the
+            // runtime's worker threads.
+            let iface = e.config.vpn_interface.clone();
+            let is_wg = e.config.vpn_type == VpnType::Wireguard;
+            let probe = tokio::task::spawn_blocking(move || {
+                let ip = vpn::first_ipv4(&iface).ok().map(IpAddr::V4);
+                let hs = is_wg.then(|| vpn::wireguard_handshake_age(&iface));
+                (ip, hs)
+            })
+            .await;
+            let (current, handshake_probe) = match probe {
+                Ok(v) => v,
+                Err(e) => {
+                    error!(
+                        target: "torrentd::vpn_monitor",
+                        slot_id = %slot_id,
+                        error.cause = %e,
+                        "tunnel probe task failed; skipping this tick",
+                    );
+                    continue;
+                }
+            };
             // Handshake liveness applies to WireGuard only; OpenVPN keeps the
             // IP-presence check (no cheap equivalent probe).
             let labels = [("slot_id", slot_id.as_str())];
-            let handshake_age = if e.config.vpn_type == VpnType::Wireguard {
-                match vpn::wireguard_handshake_age(&e.config.vpn_interface) {
+            let handshake_age = if let Some(probe) = handshake_probe {
+                match probe {
                     Ok(age) => {
                         metrics.set_gauge("slot_vpn_handshake_probe_ok", 1.0, &labels);
                         age
