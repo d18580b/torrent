@@ -25,13 +25,14 @@ pub use wireguard::WireguardManager;
 /// Build the matching real implementation for a `VpnType`.
 ///
 /// `run_dir` is where a manager may keep the small amount of state it needs to
-/// find again in a *later* process — today only OpenVPN's pid file. It has to
-/// be passed in rather than derived: tearing a tunnel down builds a fresh
-/// manager, so anything held in memory by the one that brought the tunnel up
-/// is gone by then.
+/// find again in a *later* process: OpenVPN's pid file, and WireGuard's record
+/// of the interfaces this boot raised. It has to be passed in rather than
+/// derived: tearing a tunnel down builds a fresh manager, so anything held in
+/// memory by the one that brought the tunnel up is gone by then — which is
+/// also why the WireGuard record is a file and not a field.
 pub fn for_type(t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager> {
     match t {
-        VpnType::Wireguard => Arc::new(WireguardManager::new()),
+        VpnType::Wireguard => Arc::new(WireguardManager::new(run_dir.to_path_buf())),
         VpnType::Openvpn => Arc::new(OpenvpnManager::new(run_dir.to_path_buf())),
     }
 }
