@@ -41,24 +41,36 @@
 //! 4. **The assignment registry is consulted before every load.** At API add,
 //!    at the startup scan, and at resume load. The session layer never
 //!    receives a torrent whose profile has not been verified.
-//! 5. **PEX is always disabled.** `disable_pex` is set unconditionally on
-//!    every torrent in every profile, including on resume load. libtorrent does
-//!    refuse to instantiate the PEX plugin for torrents carrying the `private`
-//!    flag — but that relies on the torrent's own metadata being correct, and
-//!    this guard is what catches a non-private torrent added to a profile by
-//!    mistake.
-//! 6. **DHT is always disabled** on profile sessions. BEP 42 derives part of a
-//!    DHT node ID from the external IP, so even with separate IPs a profile
-//!    running DHT leaves a correlatable node ID in other peers' routing
-//!    tables. There is no config key that can turn it on.
+//! 5. **PEX and LSD are always disabled on a `vpn` profile.** `disable_pex`
+//!    and `disable_lsd` are set unconditionally on every torrent in every
+//!    tunnelled profile, including on resume load, and no config key reaches
+//!    them. libtorrent does refuse to instantiate the PEX plugin for torrents
+//!    carrying the `private` flag — but that relies on the torrent's own
+//!    metadata being correct, and this guard is what catches a non-private
+//!    torrent added to a tunnelled profile by mistake. A `host` profile keeps
+//!    both: it announces from the host's own address, so peer exchange and
+//!    local discovery reveal nothing the posture has not already conceded.
+//! 6. **DHT is always disabled on a `vpn` profile.** BEP 42 derives part of a
+//!    DHT node ID from the external IP, so even with separate IPs a tunnelled
+//!    profile running DHT leaves a correlatable node ID in other peers'
+//!    routing tables. There is no config key that can turn it on there:
+//!    `dht` exists only on `ProfileNetwork::Host`, and it is off unless
+//!    written.
+//!
+//!    Rules 5 and 6 bind to the posture, not to the profile's name. The guard
+//!    is composed in one place — `policy::discovery_guards` — for all four add
+//!    paths, because it used to be spelled per path against whether the id
+//!    happened to be `default`, which a config could satisfy by accident.
 //! 7. **SIGHUP cannot change identity-critical fields.** The tunnel
 //!    interface, listen port, peer fingerprint, user agent and per-profile
 //!    directories are what a tracker sees as an account's identity. Changes
 //!    are detected, warned about, and ignored; applying them means a restart.
 //! 8. **Listen ports are unique across profiles.** The port is announced, so two
 //!    profiles sharing one would be correlatable by a tracker operator even from
-//!    different IPs. Enforced for static profiles; gateway-assigned NAT-PMP ports
-//!    are unique by construction.
+//!    different IPs. Enforced for every profile that names its own port — a
+//!    `vpn` profile's static `listen_port`, and every port a `host` profile's
+//!    `listen_interfaces` binds. Gateway-assigned NAT-PMP ports are unique by
+//!    construction and are the one case nothing here checks.
 //!
 //! `allowed_tracker_domains` is *not* in this list. It is a misconfiguration
 //! guard against loading one profile's `.torrent` into another, checked at add
