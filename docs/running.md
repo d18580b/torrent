@@ -257,9 +257,13 @@ curl -s localhost:8080/status | jq        # counts by state, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
 
-`slots` is the number of **configured** slots — the same denominator in every
-response, so `slots_fenced / slots` reads as one fraction whether the daemon is
-healthy or not. In single-session mode it is always `1`.
+`slots` is the number of **configured** slots — including any whose tunnel
+never came up at boot. It is the same denominator in every response, so
+`slots_fenced / slots` reads as one fraction whether the daemon is healthy or
+not. A slot that failed at boot counts in `slots_fenced` too: it has no session
+at all, which is worse than a fenced one, and a denominator that quietly shrank
+by the slots you have lost would report `0/2` on the morning one of three
+accounts is dark. In single-session mode it is always `1`.
 
 `/healthz` returns 503 with one of three reasons:
 
@@ -267,7 +271,7 @@ healthy or not. In single-session mode it is always `1`.
 | --- | --- |
 | `no_sessions` | No session is up yet. |
 | `alert_loop_stalled` | The alert loop stopped advancing for 15 seconds. |
-| `all_slots_fenced` | Every configured slot's tunnel is down and its torrents are paused. Some-but-not-all fenced stays **200** — the remaining slots are still serving — with the count in `slots_fenced`. |
+| `all_slots_fenced` | Every configured slot is out of service: its tunnel is down and its torrents are paused, or it never came up at boot. Some-but-not-all stays **200** — the remaining slots are still serving — with the count in `slots_fenced`. |
 
 Confirm settings actually applied rather than trusting the config parsed:
 
