@@ -387,6 +387,16 @@ impl Config {
     /// single shared file would have them overwriting each other's routing
     /// table. This replaces the top-level `session_state_path` key, which
     /// could only ever have described one session.
+    ///
+    /// A pre-profiles `session_state.dat` beside this one is **not** migrated,
+    /// while the assignment registry in the same directory is — the asymmetry
+    /// is deliberate. The registry cannot be reconstructed: losing it loses
+    /// which torrent belonged to which account, which is the property the
+    /// engine's Safety Rules exist to protect. A DHT routing table rebuilds
+    /// from the bootstrap nodes within minutes, and picking a profile to
+    /// inherit one would seed that profile's session with another's peer
+    /// history. The upgrade note in `docs/running.md` tells the operator to
+    /// delete the orphan.
     pub fn session_state_path(&self, profile: &ProfileId) -> PathBuf {
         self.state_dir()
             .join(format!("session_state-{}.dat", profile.as_str()))
