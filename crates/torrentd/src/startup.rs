@@ -235,7 +235,17 @@ impl Drop for BootCleanup {
 /// served indefinitely and only SIGKILL ended it, skipping the resume drain
 /// and the tunnel teardown this boot path exists to guarantee.
 ///
-/// Returned as a pair so the two subscriptions cannot drift apart again.
+/// Returned as a pair so the two subscriptions cannot drift apart again, and
+/// **called before `signals::run`**, which is the rest of the property.
+/// `signals::run` spawns its listener and returns without an await point, and
+/// the runtime is multi-threaded, so the spawned task can install all three
+/// handlers, take a SIGTERM and send on another worker before the next two
+/// instructions of `boot` execute. A send with no live receiver is not
+/// buffered for a later `subscribe()` — `broadcast::Sender::send` returns the
+/// value back in its error and writes nothing to the ring — so a send landing
+/// in that window is lost outright, and with the listener looping nothing
+/// re-reports it. Below the call the guarantee is probabilistic; above it,
+/// where the sender already exists and is all this needs, it is structural.
 fn boot_shutdown_receivers(
     tx: &broadcast::Sender<ShutdownReason>,
 ) -> (
@@ -296,14 +306,16 @@ pub async fn boot(
     let channels = SignalChannels::new();
     let (reload_tx, reload_rx) = mpsc::channel::<()>(8);
     let channels = SignalChannels::from_parts(channels.shutdown_tx, reload_tx);
+    let shutdown_tx = channels.shutdown_tx.clone();
+    // Both shutdown receivers, taken here rather than 400 lines apart — the
+    // one the slot loop polls during bring-up, and the one that outlives boot
+    // and the HTTP server's graceful shutdown waits on — and taken *before*
+    // the listener that can send to them exists. See
+    // `boot_shutdown_receivers` for what subscribing the second one late cost
+    // and why the order of these two lines is the whole property.
+    let (mut boot_shutdown, shutdown_rx) = boot_shutdown_receivers(&shutdown_tx);
     // Drop the receiver returned by signals::run; we wired our own pair.
     let _ = signals::run(channels.clone(), 8).await;
-    let shutdown_tx = channels.shutdown_tx;
-    // Both shutdown receivers, taken here rather than 400 lines apart: the
-    // one the slot loop polls during bring-up, and the one that outlives boot
-    // and the HTTP server's graceful shutdown waits on. See
-    // `boot_shutdown_receivers` for what subscribing the second one late cost.
-    let (mut boot_shutdown, shutdown_rx) = boot_shutdown_receivers(&shutdown_tx);
 
     // Undoes what boot has raised, for every exit that is not a successful
     // one. Tunnels and the kill-switch table outlive the process, so a `?`
