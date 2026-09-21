@@ -204,15 +204,25 @@ key.
 
 **2. Give a profile the id your registry already uses, or clear the entries.**
 The assignment registry — which torrent belongs to which account — is migrated
-automatically: `slot_assignments.json` is read once and rewritten as
-`profile_assignments.json`, with the old file left intact for a rollback. The
-migration is *verbatim*, so every entry still names the id that deployment used,
-which on a single-session deployment is `default`.
+automatically: `slot_assignments.json` is read once and written straight back
+out as `profile_assignments.json`, on that first boot and before anything else
+reads it, with the old file left intact for a rollback. The migration is
+*verbatim*, so every entry still names the id that deployment used, which on a
+single-session deployment is `default`.
 
 Nothing reconciles those ids with your `[[profile]]` tables, so the daemon
-refuses to start until they agree, listing the ids it does not recognise. Either
-name one of your profiles `default` — `default` is a legal profile id — or
-delete those entries from `profile_assignments.json` and re-add the torrents.
+refuses to start until they agree, listing the ids it does not recognise and
+naming the file it read them from. Either name one of your profiles `default` —
+`default` is a legal profile id — or delete those entries from
+`profile_assignments.json` and re-add the torrents. Edit
+`profile_assignments.json`, not `slot_assignments.json`: the old file is kept
+only so a rollback has something to go back to, and the daemon does not read it
+again.
+
+`torrentd pool scan` reads the same registry, and reads the old file too where
+that is the only one present — so running the scan before the daemon's first
+boot, which is the order this section uses, still folds your assignments into
+the pool index. It prints which file it read and how many entries it took.
 
 **3. Point each profile at its files, or move them.** Resume and `.torrent`
 files used to live directly under `resume_dir` and `torrent_dir`; they now live
@@ -304,6 +314,24 @@ a deployment with no `vpn` profile; they are only needed to manage tunnels.
 **Signals:** `SIGHUP` reloads log level, rate limits and connection limits.
 `SIGTERM` drains resume data (30s budget), persists session state, brings
 tunnels down, and exits.
+
+`POST /api/reload` does what `SIGHUP` does, over HTTP, for a caller that has no
+way to signal the process — a container without `kill`, or the web client.
+
+```bash
+curl -sS -X POST localhost:8080/api/reload
+```
+
+| Status | Meaning |
+| --- | --- |
+| `202` | Accepted. The reload runs asynchronously; watch the journal for its result. |
+| `429` | A reload is already in flight. Retry. |
+| `503` | The daemon is shutting down, or was built without the reload channel wired up. |
+
+It needs a token with the `write` scope (or a logged-in session) where `[auth]`
+is configured; `read` and `metrics` tokens are refused. It reloads exactly what
+`SIGHUP` reloads, and reports the same Safety Rule 7 warning for a
+`[[profile]]` field that changed and cannot be applied without a restart.
 
 ## 9. First-run checks
 

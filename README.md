@@ -129,6 +129,7 @@ root, where probes and scrapes conventionally look. Default bind
 | `POST /api/torrents/:infohash/upload-limit` | `{"bytes_per_sec":…}`, 0 = unlimited. |
 | `POST /api/torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 4 normal, 7 high). |
 | `POST /api/login` \| `/api/logout` | Session cookie in, revocation out. |
+| `POST /api/reload` | Re-read the config file, as SIGHUP does. 202 accepted, 429 if a reload is already running, 503 if the daemon is shutting down or was built without the reload channel. Needs a `write` token. |
 | `GET /api/events` | SSE change stream. |
 | `GET /metrics` | Prometheus text format. |
 
@@ -139,6 +140,14 @@ With `[pool]` configured: `GET /api/pool`, `/pool/tree`, `/pool/torrents`,
 
 Profile routes: `GET /api/profiles`, `/profiles/:id`, `/profiles/:id/torrents`,
 and `POST /api/profiles/:id/pause-all` \| `/resume-all`.
+
+`GET /api/profiles` lists **live profiles in the order their `[[profile]]`
+tables appear in the config file, then the profiles that failed to come up**,
+in config order among themselves. That order is the contract; it is not a
+substitute for reading `status`, since the first entry is an `active` profile
+only when at least one came up. A client choosing a profile to act on filters
+on `status == "active"` — a failed profile has no session, and every route that
+needs one answers 409 naming the failure reason.
 
 ## Profiles
 
