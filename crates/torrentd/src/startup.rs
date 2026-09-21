@@ -206,13 +206,24 @@ impl BootCleanup {
     /// direction.
     ///
     /// With one exception, and it is the reason `VpnError::ForeignInterface`
-    /// exists: a bring-up that failed *because* an interface of that name
-    /// already exists and belongs to something else. Recording before the
-    /// attempt turned that case into `wg-quick down <iface>` on a tunnel the
-    /// WireGuard manager had just refused to adopt, taking its routes and
-    /// rules with it — the daemon destroying a stranger's tunnel over a name
-    /// collision. Nothing of ours is running there, so it is forgotten
-    /// rather than torn down, and the drop guard does not see it either.
+    /// exists: a bring-up that failed over an interface of that name that was
+    /// **already standing when the attempt started**. Recording before the
+    /// attempt turned that case into `wg-quick down <iface>` on a tunnel this
+    /// boot did not raise, taking its routes and rules with it — the daemon
+    /// destroying a stranger's tunnel over a name collision. Nothing of ours
+    /// is running there, so it is forgotten rather than torn down, and the
+    /// drop guard does not see it either.
+    ///
+    /// That exception is decided by `bring_up`, not here, and it is wider than
+    /// the key-based refusal it started as. A raised-interface record for a
+    /// link that some other tunnel has since taken the name of makes
+    /// `ownership` answer `Ours` on the record alone; the link then has no
+    /// address this boot can use, `adoptable` returns `Adoption::No`, and
+    /// before this the `Err(_)` arm below tore it down. Every non-adoption
+    /// over a link that was standing beforehand is now `ForeignInterface`, so
+    /// the only failures that reach the teardown arm are the ones where the
+    /// name was free when this attempt began and whatever is standing there is
+    /// this attempt's own residue.
     ///
     /// The bring-up itself runs on `spawn_blocking`: it shells out and polls,
     /// and on a runtime worker that is 30 seconds per slot during which
@@ -383,6 +394,18 @@ pub async fn boot(
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
+
+    // Discard raised-interface records whose interface is no longer standing,
+    // before anything can consult one.
+    //
+    // A record says "no link of this name was standing when *some* boot called
+    // `bring_up`". Nothing in the process is told when a link later goes away,
+    // so a record for an interface an operator removed by hand — the one
+    // remedy the runbook names for a stuck tunnel — stays armed inside the
+    // same host boot, and claims whatever next takes the name. This is the
+    // only place that can drop it: the record outlives the process that wrote
+    // it, so the process that finds it spent is a later one entirely.
+    crate::vpn::sweep_raised_records(&run_dir);
 
     // Signals, installed before anything that can block or fail.
     //
@@ -1324,6 +1347,13 @@ mod tests {
     /// arm ran `wg-quick down` on it anyway, removing a tunnel this daemon
     /// did not raise along with its routes and its rules. Nothing of ours is
     /// running there, so neither this arm nor the drop guard may touch it.
+    ///
+    /// This is the arm, and it is now reached by every non-adoption over a
+    /// link that was standing before the attempt began — not only the
+    /// key-based refusal it started as. `wireguard.rs`'s `refusal` decides
+    /// which failures arrive here and which reach the `Err(_)` catch-all
+    /// below; see `a_link_that_was_standing_before_the_attempt_is_never_torn_down`
+    /// for that half.
     #[tokio::test]
     async fn a_bring_up_refused_by_a_foreign_interface_leaves_it_standing() {
         let vpn = MockVpn::new();
