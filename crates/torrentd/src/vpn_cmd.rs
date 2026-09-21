@@ -543,11 +543,47 @@ fn ruleset_subject(as_uid: Option<u32>, invoker: Result<u32, String>) -> Option<
 
 /// The verdict `nft --check --file -` implies for a rendered ruleset.
 ///
+/// Classified on **what `nft` reported**, not on who asked. nftables parses
+/// its input before it touches netlink, so the two failures are distinguishable
+/// from an unprivileged shell: a ruleset this build cannot parse prints a
+/// parser diagnostic and no netlink error, while one that parses prints
+/// `netlink: Error: cache initialization failed: Operation not permitted` and
+/// nothing else. A parse diagnostic is therefore a **rejection of the
+/// ruleset** whatever the invoker's capability mask says — the boot would
+/// abort at `killswitch::enable` on exactly that input.
+///
+/// Classifying on the mask instead short-circuited every failure on the one
+/// invocation `docs/running.md` recommends — an operator shell, which does not
+/// hold `CAP_NET_ADMIN` — into the capability class, which
+/// [`Report::incomplete`] excludes from the status. A configuration whose kill
+/// switch cannot install exited `0`.
+///
 /// `privileged` is whether this process holds `CAP_NET_ADMIN`; see
-/// [`has_cap_net_admin`]. Without it `nft` cannot initialise its netlink cache
-/// and so establishes nothing about the ruleset, which is `unknown` bounded by
-/// a capability rather than a rejection. The stderr substrings stay as a
-/// fallback for the case where the capability mask could not be read.
+/// [`has_cap_net_admin`]. It is kept as corroboration in the detail text, not
+/// as the discriminator.
+/// Whether nft's stderr is a **rejection of the ruleset**.
+///
+/// nftables prefixes every netlink failure with `netlink:`. Any other `Error:`
+/// line came out of the parser or the rule evaluator, both of which run before
+/// netlink is touched and need no capability at all — so it is a rejection
+/// whatever mask the invoker holds. An unprivileged run against a ruleset that
+/// does not parse prints *both* lines, which is why this is asked first.
+fn nft_rejected_the_ruleset(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .map(str::trim)
+        .any(|l| l.contains("Error:") && !l.starts_with("netlink:"))
+}
+
+/// Whether nft's stderr says it could not reach the kernel.
+fn nft_reported_netlink_failure(stderr: &str) -> bool {
+    stderr.lines().map(str::trim).any(|l| {
+        l.starts_with("netlink:")
+            || l.contains("Operation not permitted")
+            || l.contains("Permission denied")
+    })
+}
+
 fn judge_nft_check(
     outcome: std::io::Result<std::process::Output>,
     privileged: bool,
@@ -571,15 +607,19 @@ fn judge_nft_check(
         ),
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            let refused_for_want_of_capability = !privileged
-                || err.contains("Operation not permitted")
-                || err.contains("Permission denied");
-            if refused_for_want_of_capability {
+            if nft_reported_netlink_failure(&err) && !nft_rejected_the_ruleset(&err) {
+                let mask = if privileged {
+                    "this process does hold CAP_NET_ADMIN, so the refusal is not a plain \
+                     capability gap"
+                } else {
+                    "this process does not hold CAP_NET_ADMIN, which is what nft needs to \
+                     reach the kernel"
+                };
                 Check::unknown_without_capability(
                     "kill_switch_ruleset",
                     format!(
-                        "`nft --check` needs CAP_NET_ADMIN and did not get it ({err}), so the \
-                         ruleset for uid {uid} was not validated. {caveat}"
+                        "the ruleset for uid {uid} parses, but `nft --check` could not \
+                         validate it against this kernel ({err}); {mask}. {caveat}"
                     ),
                 )
             } else {
@@ -2503,9 +2543,24 @@ http_listen = "127.0.0.1:8080"
     }
 
     #[test]
-    fn nft_check_is_classified_by_the_capability_before_the_error_text() {
-        // F13. Unprivileged, with a message this code has never seen: still
-        // capability-bound.
+    fn nft_check_is_classified_by_what_nft_reported_not_by_who_asked() {
+        // F13, reopened. This test used to assert the opposite — that the
+        // capability mask classifies before the error text does — and that
+        // premise is refuted by execution: as an unprivileged uid with an
+        // empty `CapEff`, an invalid ruleset prints a parser diagnostic and a
+        // valid one prints only `netlink: Error: cache initialization failed`.
+        // nftables parses before it touches netlink, so the two classes are
+        // distinguishable without the capability.
+        //
+        // Classifying on the mask made `!privileged` short-circuit every
+        // failure into the capability class on the one invocation
+        // `docs/running.md` recommends, and since that class does not colour
+        // the status, a configuration whose boot would abort at
+        // `killswitch::enable` exited 0.
+        //
+        // Unprivileged, and nft reports it could not reach the kernel — in a
+        // wording this code has never seen. Capability-bound: the ruleset
+        // parsed.
         let c = judge_nft_check(
             nft_output(1, "netlink: konnte Cache nicht initialisieren"),
             false,
@@ -2514,6 +2569,39 @@ http_listen = "127.0.0.1:8080"
         );
         assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
         assert!(c.needs_capability, "detail: {}", c.detail);
+
+        // Unprivileged, and nft rejected the ruleset. This is the arm the
+        // removed behaviour got wrong, and it is what the command actually
+        // sees: an unprivileged run against a ruleset that does not parse
+        // prints the parser's diagnostic *and* the netlink one, because nft
+        // carries on to the kernel after reporting the parse failure.
+        let c = judge_nft_check(
+            nft_output(
+                1,
+                "/dev/stdin:5:39-39: Error: syntax error, unexpected string, expecting \
+                 comma or '}'\n\t\tmeta skuid 2000 oifname { \"lo\", \"wg\"x\" } accept\n\t\t \
+                 ^\nnetlink: Error: cache initialization failed: Operation not permitted",
+            ),
+            false,
+            2000,
+            "table inet torrentd {}",
+        );
+        assert_eq!(
+            c.verdict,
+            Verdict::Fail,
+            "a ruleset nft will not parse is a rejection whoever asked: {}",
+            c.detail,
+        );
+        assert!(
+            !c.needs_capability,
+            "a rejection is not an unknown, so it colours the status: {}",
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("syntax error"),
+            "nft's own words reach the operator: {}",
+            c.detail,
+        );
 
         // Privileged and rejected: a real failure, and it keeps the exit code.
         let c = judge_nft_check(
@@ -2529,8 +2617,9 @@ http_listen = "127.0.0.1:8080"
             c.detail,
         );
 
-        // The substring stays as a fallback for the case where the capability
-        // mask could not be read at all and `privileged` defaulted to true.
+        // Privileged and nft still could not reach the kernel: the mask is
+        // corroboration, not the discriminator, so what nft reported decides
+        // this one too.
         let c = judge_nft_check(
             nft_output(
                 1,
