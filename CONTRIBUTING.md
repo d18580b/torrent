@@ -183,7 +183,7 @@ Every test command is a mise task, and CI runs the same tasks:
 
 | Task | Layer |
 | --- | --- |
-| `mise run test` | unit + in-memory; no libtorrent, no disk, no network |
+| `mise run test` | unit + in-memory; no libtorrent, no network |
 | `mise run test-shim` | Layer 2, the C ABI boundary. Needs the `vendor/libtorrent` submodule for its `.torrent` fixtures. |
 | `mise run test-lifecycle` | Layer 3, real libtorrent against real disk. No network. |
 | `mise run test-daemon` | Layer 3, spawns the built binary and drives it over HTTP |

@@ -390,7 +390,7 @@ Every command lives in [`mise.toml`](mise.toml), which is what CI runs.
 
 ```bash
 mise run check           # fmt + clippy, warnings denied
-mise run test            # unit + in-memory; no libtorrent, no disk, no network
+mise run test            # unit + in-memory; no libtorrent, no network
 mise run test-shim       # Layer 2: the C ABI boundary
 mise run test-lifecycle  # Layer 3: real libtorrent against real disk
 mise run test-daemon     # Layer 3: spawns the binary, drives it over HTTP
