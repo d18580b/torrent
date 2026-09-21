@@ -207,6 +207,10 @@ pub enum SlotConfigError {
     DefaultFingerprintForbidden,
     #[error("peer_fingerprint_hex {0:?} is not 16 hex chars")]
     BadFingerprintLength(String),
+    #[error(
+        "slot id {0:?} is reserved for the single-session slot and cannot name a configured slot"
+    )]
+    ReservedId(String),
 }
 
 impl SlotConfig {
@@ -239,6 +243,14 @@ impl SlotConfig {
         let mut seen_torrent = std::collections::HashSet::new();
 
         for s in slots {
+            // `default` is the id the single-session slot carries, and
+            // `SlotId::is_default` is what every per-torrent privacy guard
+            // branches on. A configured slot allowed to take that name would
+            // be a private, VPN-bound slot that silently seeds with PEX, DHT
+            // and LSD left on — Safety Rules 5 and 6 defeated by a string.
+            if s.id.is_default() {
+                return Err(SlotConfigError::ReservedId(s.id.as_str().to_string()));
+            }
             if !seen_id.insert(s.id.as_str().to_string()) {
                 return Err(SlotConfigError::DuplicateId(s.id.as_str().to_string()));
             }
@@ -356,6 +368,17 @@ mod tests {
             port_forward: PortForwardMode::Static,
             port_forward_gateway: None,
         }
+    }
+
+    #[test]
+    fn reserved_default_id_is_refused() {
+        // A configured slot named `default` reads as the single-session slot
+        // to `is_default`, which every per-torrent privacy guard branches on.
+        let s = cfg("default", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0");
+        assert!(matches!(
+            SlotConfig::validate_set(&[s]),
+            Err(SlotConfigError::ReservedId(id)) if id == "default"
+        ));
     }
 
     #[test]
