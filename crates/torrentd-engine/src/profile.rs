@@ -579,6 +579,28 @@ impl ProfileConfig {
         hex.eq_ignore_ascii_case("2d4c54323043302d")
     }
 
+    /// The distinct ports a libtorrent `listen_interfaces` string binds.
+    ///
+    /// The format is a comma-separated list of `<ip>:<port>` with an optional
+    /// device suffix and optional `s`/`l` flags — `"0.0.0.0:6881,[::]:6881"`,
+    /// `"eth0:6881s"`. The address may itself contain colons (`[::]`), so the
+    /// port is read from the last one. A set, not a list: one profile naming
+    /// the same port on v4 and v6 is the ordinary case and is not a collision.
+    ///
+    /// An entry whose port cannot be read is skipped rather than refused.
+    /// libtorrent owns this grammar; refusing a string this function merely
+    /// failed to parse would reject configurations the session accepts.
+    fn listen_ports(listen_interfaces: &str) -> std::collections::BTreeSet<u16> {
+        listen_interfaces
+            .split(',')
+            .filter_map(|entry| {
+                let (_, tail) = entry.trim().rsplit_once(':')?;
+                let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+
     /// `[A-Za-z0-9_-]{1,64}`.
     ///
     /// Deliberately narrower than what a filesystem accepts. The set excludes
@@ -649,6 +671,20 @@ impl ProfileConfig {
                         return Err(ProfileConfigError::EmptyListenInterfaces(
                             p.id.as_str().to_string(),
                         ));
+                    }
+                    // Safety Rule 8. Its enforcement clause names static VPN
+                    // profiles, but its rationale — an announced port
+                    // correlating two profiles — applies verbatim to two host
+                    // profiles, and a host profile is now something an
+                    // operator configures, more than once. Unenforced,
+                    // `--check-config` prints `config OK`, one session binds,
+                    // the other's `listen_failed` is warned and swallowed, and
+                    // `/healthz` reports 200 with `profiles_fenced: 0` while a
+                    // profile accepts no incoming connections at all.
+                    for port in Self::listen_ports(listen_interfaces) {
+                        if !seen_port.insert(port) {
+                            return Err(ProfileConfigError::DuplicatePort(port));
+                        }
                     }
                 }
                 ProfileNetwork::Vpn {
@@ -899,6 +935,64 @@ mod tests {
             host("public2", "0.0.0.0:6882", false),
         ];
         ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    #[test]
+    fn two_host_profiles_may_not_share_a_listen_port() {
+        // Safety Rule 8, for the posture this model introduces. Unenforced,
+        // `--check-config` prints `config OK` and one of the two sessions
+        // accepts no incoming connections while `/healthz` answers 200.
+        let profiles = vec![
+            host("public", "0.0.0.0:6881", false),
+            host("public2", "0.0.0.0:6881", false),
+        ];
+        assert!(matches!(
+            ProfileConfig::validate_set(&profiles),
+            Err(ProfileConfigError::DuplicatePort(6881))
+        ));
+    }
+
+    #[test]
+    fn a_host_profile_may_not_take_a_vpn_profiles_static_port() {
+        // The port is what a tracker sees; which posture announced it makes no
+        // difference to the correlation.
+        let profiles = vec![
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            host("public", "0.0.0.0:6881", false),
+        ];
+        assert!(matches!(
+            ProfileConfig::validate_set(&profiles),
+            Err(ProfileConfigError::DuplicatePort(6881))
+        ));
+    }
+
+    #[test]
+    fn one_host_profile_may_bind_the_same_port_on_v4_and_v6() {
+        // The ordinary case, and not a collision: the rule is about two
+        // profiles, not two addresses of one.
+        let profiles = vec![
+            host("public", "0.0.0.0:6881,[::]:6881", false),
+            host("public2", "0.0.0.0:6882,[::]:6882", false),
+        ];
+        ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    #[test]
+    fn listen_ports_reads_every_shape_libtorrent_accepts() {
+        let ports = |s| {
+            ProfileConfig::listen_ports(s)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ports("0.0.0.0:6881"), vec![6881]);
+        assert_eq!(ports("0.0.0.0:6881,[::]:6881"), vec![6881]);
+        assert_eq!(ports("0.0.0.0:6881, [::]:6882"), vec![6881, 6882]);
+        // Device name instead of an address, and the ssl/local flag suffixes.
+        assert_eq!(ports("eth0:6881s"), vec![6881]);
+        assert_eq!(ports("eth0:6881l,[::]:6882s"), vec![6881, 6882]);
+        // Unreadable entries are skipped, not guessed at: libtorrent owns this
+        // grammar and a parse failure here must not refuse a valid config.
+        assert!(ports("nonsense").is_empty());
     }
 
     #[test]
