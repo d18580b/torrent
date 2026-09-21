@@ -20,6 +20,10 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 # control is the reverse proxy's job. Delete this line and configure [auth]
 # before exposing the API anywhere — a non-loopback bind without [auth] is
 # refused outright.
+#
+# Read once, at startup, like [auth] and http_listen: editing any of the three
+# takes effect on restart, not on SIGHUP. A reload after such an edit warns
+# "requires daemon restart; ignored" and changes nothing.
 allow_unauthenticated = true
 
 # Peers whose X-Forwarded-For / X-Forwarded-Proto headers are believed, as IPs
@@ -236,9 +240,12 @@ dht               = true
 #   torrentd --config /etc/torrentd/torrentd.toml hash-password
 #   torrentd --config /etc/torrentd/torrentd.toml new-token --name ci --scopes read
 #
-# Bootstrapping order: `--config` is validated before any subcommand runs, so
-# write this file *without* `[auth]` first, generate the values, then add the
-# section.
+# Bootstrapping order: `--config` is read before any subcommand runs, so this
+# file has to exist and parse first — but the subcommands are exempt from the
+# authentication posture check, because they construct no session and bind
+# nothing. So write this file without `[auth]` and with whatever `http_listen`
+# the deployment needs, generate the values, then add the section. In a
+# container: `compose run --rm torrentd hash-password`. See docs/running.md §6.
 #
 # The token is printed once and is not stored; only its SHA-256 goes below, so
 # a leaked config file cannot be replayed as a credential. The password gets

@@ -41,24 +41,36 @@
 //! 4. **The assignment registry is consulted before every load.** At API add,
 //!    at the startup scan, and at resume load. The session layer never
 //!    receives a torrent whose profile has not been verified.
-//! 5. **PEX is always disabled.** `disable_pex` is set unconditionally on
-//!    every torrent in every profile, including on resume load. libtorrent does
-//!    refuse to instantiate the PEX plugin for torrents carrying the `private`
-//!    flag — but that relies on the torrent's own metadata being correct, and
-//!    this guard is what catches a non-private torrent added to a profile by
-//!    mistake.
-//! 6. **DHT is always disabled** on profile sessions. BEP 42 derives part of a
-//!    DHT node ID from the external IP, so even with separate IPs a profile
-//!    running DHT leaves a correlatable node ID in other peers' routing
-//!    tables. There is no config key that can turn it on.
+//! 5. **PEX and LSD are always disabled on a `vpn` profile.** `disable_pex`
+//!    and `disable_lsd` are set unconditionally on every torrent in every
+//!    tunnelled profile, including on resume load, and no config key reaches
+//!    them. libtorrent does refuse to instantiate the PEX plugin for torrents
+//!    carrying the `private` flag — but that relies on the torrent's own
+//!    metadata being correct, and this guard is what catches a non-private
+//!    torrent added to a tunnelled profile by mistake. A `host` profile keeps
+//!    both: it announces from the host's own address, so peer exchange and
+//!    local discovery reveal nothing the posture has not already conceded.
+//! 6. **DHT is always disabled on a `vpn` profile.** BEP 42 derives part of a
+//!    DHT node ID from the external IP, so even with separate IPs a tunnelled
+//!    profile running DHT leaves a correlatable node ID in other peers'
+//!    routing tables. There is no config key that can turn it on there:
+//!    `dht` exists only on `ProfileNetwork::Host`, and it is off unless
+//!    written.
+//!
+//!    Rules 5 and 6 bind to the posture, not to the profile's name. The guard
+//!    is composed in one place — `policy::discovery_guards` — for all four add
+//!    paths, because it used to be spelled per path against whether the id
+//!    happened to be `default`, which a config could satisfy by accident.
 //! 7. **SIGHUP cannot change identity-critical fields.** The tunnel
 //!    interface, listen port, peer fingerprint, user agent and per-profile
 //!    directories are what a tracker sees as an account's identity. Changes
 //!    are detected, warned about, and ignored; applying them means a restart.
 //! 8. **Listen ports are unique across profiles.** The port is announced, so two
 //!    profiles sharing one would be correlatable by a tracker operator even from
-//!    different IPs. Enforced for static profiles; gateway-assigned NAT-PMP ports
-//!    are unique by construction.
+//!    different IPs. Enforced for every profile that names its own port — a
+//!    `vpn` profile's static `listen_port`, and every port a `host` profile's
+//!    `listen_interfaces` binds. Gateway-assigned NAT-PMP ports are unique by
+//!    construction and are the one case nothing here checks.
 //!
 //! `allowed_tracker_domains` is *not* in this list. It is a misconfiguration
 //! guard against loading one profile's `.torrent` into another, checked at add
@@ -343,8 +355,16 @@ impl TryFrom<RawProfile> for ProfileConfig {
     }
 }
 
-impl From<&ProfileConfig> for RawProfile {
-    fn from(c: &ProfileConfig) -> Self {
+impl ProfileConfig {
+    /// The flat TOML shape this profile deserialized from.
+    ///
+    /// Private, and reachable only through `Serialize` below. It shipped as a
+    /// public `From<&ProfileConfig> for RawProfile` with no caller at all:
+    /// `/api/profiles` builds its own wire structs, and nothing serializes a
+    /// `Config`. A public conversion direction nobody exercises is how a
+    /// serializer and a deserializer stop agreeing without anything saying so.
+    fn to_raw(&self) -> RawProfile {
+        let c = self;
         let mut raw = RawProfile {
             id: c.id.clone(),
             network: NetworkKind::Host,
@@ -401,7 +421,7 @@ impl<'de> Deserialize<'de> for ProfileConfig {
 
 impl Serialize for ProfileConfig {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        RawProfile::from(self).serialize(s)
+        self.to_raw().serialize(s)
     }
 }
 
@@ -502,6 +522,14 @@ pub fn bind_endpoint(ip: std::net::IpAddr, port: u16) -> String {
 pub enum ProfileConfigError {
     #[error("profile id {0:?} appears more than once")]
     DuplicateId(String),
+    #[error(
+        "profile id {0:?} is not usable: an id may be 1-64 characters of \
+         [A-Za-z0-9_-] only. The id is a path component in three places \
+         (<resume_dir>/<id>, <torrent_dir>/<id>, session_state-<id>.dat) and a \
+         URL path segment, so anything else either escapes those directories or \
+         cannot be addressed."
+    )]
+    BadId(String),
     #[error("listen_port {0} appears more than once")]
     DuplicatePort(u16),
     #[error("profile {0:?} uses port_forward = \"static\" but has no listen_port")]
@@ -571,13 +599,61 @@ impl ProfileConfig {
         hex.eq_ignore_ascii_case("2d4c54323043302d")
     }
 
+    /// The distinct ports a libtorrent `listen_interfaces` string binds.
+    ///
+    /// The format is a comma-separated list of `<ip>:<port>` with an optional
+    /// device suffix and optional `s`/`l` flags — `"0.0.0.0:6881,[::]:6881"`,
+    /// `"eth0:6881s"`. The address may itself contain colons (`[::]`), so the
+    /// port is read from the last one. A set, not a list: one profile naming
+    /// the same port on v4 and v6 is the ordinary case and is not a collision.
+    ///
+    /// An entry whose port cannot be read is skipped rather than refused.
+    /// libtorrent owns this grammar; refusing a string this function merely
+    /// failed to parse would reject configurations the session accepts.
+    fn listen_ports(listen_interfaces: &str) -> std::collections::BTreeSet<u16> {
+        listen_interfaces
+            .split(',')
+            .filter_map(|entry| {
+                let (_, tail) = entry.trim().rsplit_once(':')?;
+                let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+                digits.parse().ok()
+            })
+            .collect()
+    }
+
+    /// `[A-Za-z0-9_-]{1,64}`.
+    ///
+    /// Deliberately narrower than what a filesystem accepts. The set excludes
+    /// `.`, so `.` and `..` are unrepresentable without a special case, and
+    /// excludes `/` and `\`, so an id is always exactly one path component. It
+    /// is also URL-safe unescaped, which is what `/api/profiles/<id>` needs.
+    /// The 64-character bound keeps `session_state-<id>.dat` inside a
+    /// filename-length limit on every platform the daemon targets.
+    fn is_valid_id(id: &str) -> bool {
+        !id.is_empty()
+            && id.len() <= 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }
+
     /// Validate the whole configured set.
     ///
-    /// Called at startup and on SIGHUP. Most rules here are uniqueness rules,
-    /// and they apply to VPN profiles specifically: two accounts on one
-    /// tracker are distinguishable only by the things this enforces are
-    /// distinct. Host profiles share one identity because they *are* one host,
-    /// so requiring them to differ would be theatre.
+    /// Called at startup and on SIGHUP. Most rules here are uniqueness rules:
+    /// two accounts on one tracker are distinguishable only by the things this
+    /// enforces are distinct.
+    ///
+    /// Requiredness and uniqueness are separate questions, and they have
+    /// different answers. A host profile may *omit* `peer_fingerprint_hex` and
+    /// `user_agent` — it is the host, and two host profiles are one host, so
+    /// requiring them to differ would be theatre. But a value a host profile
+    /// does set must still be distinct from every other profile's, because a
+    /// fingerprint shared with a tunnelled profile puts one peer-id prefix on
+    /// the wire from both the tunnel address and the host's real address,
+    /// which is exactly the cross-account correlation these rules exist to
+    /// prevent. So requiredness is checked per posture, below; the length, the
+    /// libtorrent-default ban and the uniqueness inserts run for any profile
+    /// that sets the field, whatever its posture.
     pub fn validate_set(profiles: &[ProfileConfig]) -> Result<(), ProfileConfigError> {
         if profiles.is_empty() {
             return Err(ProfileConfigError::NoProfiles);
@@ -592,6 +668,17 @@ impl ProfileConfig {
         let mut seen_torrent = std::collections::HashSet::new();
 
         for p in profiles {
+            // The id is not just a label. It is a path component in
+            // `<resume_dir>/<id>`, `<torrent_dir>/<id>` and
+            // `session_state-<id>.dat`, and a segment of `/api/profiles/<id>`.
+            // `PathBuf::join` with an absolute id replaces the base outright,
+            // so `id = "/etc"` would write resume data to `/etc`, and
+            // `id = "../.."` escapes upward. Constrain the id itself rather
+            // than sanitising at three filesystem call sites and a URL, each
+            // one a place to forget.
+            if !Self::is_valid_id(p.id.as_str()) {
+                return Err(ProfileConfigError::BadId(p.id.as_str().to_string()));
+            }
             if !seen_id.insert(p.id.as_str().to_string()) {
                 return Err(ProfileConfigError::DuplicateId(p.id.as_str().to_string()));
             }
@@ -604,6 +691,20 @@ impl ProfileConfig {
                         return Err(ProfileConfigError::EmptyListenInterfaces(
                             p.id.as_str().to_string(),
                         ));
+                    }
+                    // Safety Rule 8. Its enforcement clause names static VPN
+                    // profiles, but its rationale — an announced port
+                    // correlating two profiles — applies verbatim to two host
+                    // profiles, and a host profile is now something an
+                    // operator configures, more than once. Unenforced,
+                    // `--check-config` prints `config OK`, one session binds,
+                    // the other's `listen_failed` is warned and swallowed, and
+                    // `/healthz` reports 200 with `profiles_fenced: 0` while a
+                    // profile accepts no incoming connections at all.
+                    for port in Self::listen_ports(listen_interfaces) {
+                        if !seen_port.insert(port) {
+                            return Err(ProfileConfigError::DuplicatePort(port));
+                        }
                     }
                 }
                 ProfileNetwork::Vpn {
@@ -656,31 +757,49 @@ impl ProfileConfig {
                         }
                     }
 
-                    // Identity, required here and only here.
-                    let fp = p.peer_fingerprint_hex.as_deref().ok_or_else(|| {
-                        ProfileConfigError::MissingIdentity {
+                    // Identity is *required* here and only here. A tunnelled
+                    // profile with no fingerprint of its own announces under
+                    // the default one, which ties it to every other default
+                    // client the tracker sees.
+                    if p.peer_fingerprint_hex.is_none() {
+                        return Err(ProfileConfigError::MissingIdentity {
                             profile: p.id.as_str().to_string(),
                             field: "peer_fingerprint_hex",
-                        }
-                    })?;
-                    if fp.len() != 16 {
-                        return Err(ProfileConfigError::BadFingerprintLength(fp.to_string()));
+                        });
                     }
-                    if Self::is_libtorrent_default_fingerprint(fp) {
-                        return Err(ProfileConfigError::DefaultFingerprintForbidden);
-                    }
-                    if !seen_fp.insert(fp.to_string()) {
-                        return Err(ProfileConfigError::DuplicateFingerprint(fp.to_string()));
-                    }
-                    let ua = p.user_agent.as_deref().ok_or_else(|| {
-                        ProfileConfigError::MissingIdentity {
+                    if p.user_agent.is_none() {
+                        return Err(ProfileConfigError::MissingIdentity {
                             profile: p.id.as_str().to_string(),
                             field: "user_agent",
-                        }
-                    })?;
-                    if !seen_ua.insert(ua.to_string()) {
-                        return Err(ProfileConfigError::DuplicateUserAgent(ua.to_string()));
+                        });
                     }
+                }
+            }
+
+            // Identity, for any profile that set one.
+            //
+            // Outside the match on purpose. `startup.rs` applies
+            // `peer_fingerprint_hex` to every session with no posture guard,
+            // so a host profile that copies a VPN profile's table and edits
+            // only `id`, `network` and `listen_interfaces` — which is how the
+            // second profile in a config usually gets written — puts the same
+            // 8-byte peer-id prefix on the wire from the tunnel and from the
+            // host's real address. Keeping these checks inside the `Vpn` arm
+            // made that configuration validate clean.
+            if let Some(fp) = p.peer_fingerprint_hex.as_deref() {
+                if fp.len() != 16 {
+                    return Err(ProfileConfigError::BadFingerprintLength(fp.to_string()));
+                }
+                if Self::is_libtorrent_default_fingerprint(fp) {
+                    return Err(ProfileConfigError::DefaultFingerprintForbidden);
+                }
+                if !seen_fp.insert(fp.to_string()) {
+                    return Err(ProfileConfigError::DuplicateFingerprint(fp.to_string()));
+                }
+            }
+            if let Some(ua) = p.user_agent.as_deref() {
+                if !seen_ua.insert(ua.to_string()) {
+                    return Err(ProfileConfigError::DuplicateUserAgent(ua.to_string()));
                 }
             }
 
@@ -836,6 +955,220 @@ mod tests {
             host("public2", "0.0.0.0:6882", false),
         ];
         ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    #[test]
+    fn a_profile_survives_a_serialize_deserialize_round_trip() {
+        // `Config` derives `Serialize`, which is what keeps this direction
+        // compiled; nothing in the daemon calls it. Untested, the serializer
+        // and the deserializer can drift apart silently — a field added to one
+        // and not the other costs nothing until something finally does
+        // serialize a config.
+        for original in [
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            host("public", "0.0.0.0:6881,[::]:6881", true),
+            host("public2", "0.0.0.0:6882", false),
+        ] {
+            let wire = serde_json::to_string(&original).expect("serialize");
+            let back: ProfileConfig = serde_json::from_str(&wire).expect("deserialize");
+            assert_eq!(back, original, "round trip lost something:\n{wire}");
+        }
+    }
+
+    #[test]
+    fn two_host_profiles_may_not_share_a_listen_port() {
+        // Safety Rule 8, for the posture this model introduces. Unenforced,
+        // `--check-config` prints `config OK` and one of the two sessions
+        // accepts no incoming connections while `/healthz` answers 200.
+        let profiles = vec![
+            host("public", "0.0.0.0:6881", false),
+            host("public2", "0.0.0.0:6881", false),
+        ];
+        assert!(matches!(
+            ProfileConfig::validate_set(&profiles),
+            Err(ProfileConfigError::DuplicatePort(6881))
+        ));
+    }
+
+    #[test]
+    fn a_host_profile_may_not_take_a_vpn_profiles_static_port() {
+        // The port is what a tracker sees; which posture announced it makes no
+        // difference to the correlation.
+        let profiles = vec![
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            host("public", "0.0.0.0:6881", false),
+        ];
+        assert!(matches!(
+            ProfileConfig::validate_set(&profiles),
+            Err(ProfileConfigError::DuplicatePort(6881))
+        ));
+    }
+
+    #[test]
+    fn one_host_profile_may_bind_the_same_port_on_v4_and_v6() {
+        // The ordinary case, and not a collision: the rule is about two
+        // profiles, not two addresses of one.
+        let profiles = vec![
+            host("public", "0.0.0.0:6881,[::]:6881", false),
+            host("public2", "0.0.0.0:6882,[::]:6882", false),
+        ];
+        ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    #[test]
+    fn listen_ports_reads_every_shape_libtorrent_accepts() {
+        let ports = |s| {
+            ProfileConfig::listen_ports(s)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ports("0.0.0.0:6881"), vec![6881]);
+        assert_eq!(ports("0.0.0.0:6881,[::]:6881"), vec![6881]);
+        assert_eq!(ports("0.0.0.0:6881, [::]:6882"), vec![6881, 6882]);
+        // Device name instead of an address, and the ssl/local flag suffixes.
+        assert_eq!(ports("eth0:6881s"), vec![6881]);
+        assert_eq!(ports("eth0:6881l,[::]:6882s"), vec![6881, 6882]);
+        // Unreadable entries are skipped, not guessed at: libtorrent owns this
+        // grammar and a parse failure here must not refuse a valid config.
+        assert!(ports("nonsense").is_empty());
+    }
+
+    #[test]
+    fn a_profile_id_that_escapes_its_directory_is_refused() {
+        // The id lands in `<resume_dir>/<id>`, `<torrent_dir>/<id>` and
+        // `session_state-<id>.dat`. `PathBuf::join` with an absolute path
+        // replaces the base outright, so an unconstrained id writes resume
+        // data wherever it says.
+        for bad in ["/etc", "../..", "a/b", "has space", "dot.dot", "", "a\\b"] {
+            let mut p = host("placeholder", "0.0.0.0:6881", false);
+            p.id = ProfileId::new(bad);
+            assert!(
+                matches!(
+                    ProfileConfig::validate_set(&[p]),
+                    Err(ProfileConfigError::BadId(_))
+                ),
+                "id {bad:?} was accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_id_longer_than_64_characters_is_refused() {
+        let mut p = host("placeholder", "0.0.0.0:6881", false);
+        p.id = ProfileId::new("a".repeat(65));
+        assert!(matches!(
+            ProfileConfig::validate_set(&[p]),
+            Err(ProfileConfigError::BadId(_))
+        ));
+    }
+
+    #[test]
+    fn ordinary_profile_ids_are_accepted() {
+        // Including `default`: #12 banned that name because it collided with
+        // the implicit single-session slot, and this model deletes that
+        // concept, so the collision the ban protected against is gone. It is
+        // also the one id that lets a migrated registry resolve without
+        // hand-editing.
+        for good in ["default", "acct_a", "acct-b", "Public2", &"a".repeat(64)] {
+            let mut p = host("placeholder", "0.0.0.0:6881", false);
+            p.id = ProfileId::new(good);
+            assert!(
+                ProfileConfig::validate_set(&[p]).is_ok(),
+                "id {good:?} was refused",
+            );
+        }
+    }
+
+    #[test]
+    fn a_host_profile_may_not_wear_a_vpn_profiles_identity() {
+        // The configuration this is written from: the operator writes the VPN
+        // profile, copies the table to make the public one, and edits `id`,
+        // `network` and `listen_interfaces`. The fingerprint and user agent
+        // come along. `startup.rs` applies `peer_fingerprint_hex` to every
+        // session with no posture guard, so the private tracker then sees one
+        // peer-id prefix announcing from the tunnel address and from the
+        // host's real address — the cross-account correlation whose stated
+        // consequence is a permanent ban.
+        //
+        // With the uniqueness inserts inside the `Vpn` arm, this validates
+        // clean.
+        let mut public = host("public", "0.0.0.0:6882", false);
+        public.peer_fingerprint_hex = Some("a1b2c3d4e5f60718".to_string());
+        let profiles = vec![
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            public,
+        ];
+        assert!(matches!(
+            ProfileConfig::validate_set(&profiles),
+            Err(ProfileConfigError::DuplicateFingerprint(_))
+        ));
+    }
+
+    #[test]
+    fn a_host_profile_may_not_wear_a_vpn_profiles_user_agent() {
+        let mut public = host("public", "0.0.0.0:6882", false);
+        public.user_agent = Some("qB/5.0".to_string());
+        let profiles = vec![
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            public,
+        ];
+        assert!(matches!(
+            ProfileConfig::validate_set(&profiles),
+            Err(ProfileConfigError::DuplicateUserAgent(_))
+        ));
+    }
+
+    #[test]
+    fn a_host_profiles_fingerprint_is_length_checked_like_any_other() {
+        // A fingerprint that is not 8 bytes is not a fingerprint, and the
+        // posture that set it makes no difference to that.
+        let mut public = host("public", "0.0.0.0:6881", false);
+        public.peer_fingerprint_hex = Some("abc".to_string());
+        assert!(matches!(
+            ProfileConfig::validate_set(&[public]),
+            Err(ProfileConfigError::BadFingerprintLength(_))
+        ));
+    }
+
+    #[test]
+    fn a_host_profile_may_not_announce_the_libtorrent_default_fingerprint() {
+        // Setting the default explicitly is worse than leaving it unset: it
+        // reads as a deliberate identity while being the one every unmodified
+        // client already wears.
+        let mut public = host("public", "0.0.0.0:6881", false);
+        public.peer_fingerprint_hex = Some("2d4c54323043302d".to_string());
+        assert!(matches!(
+            ProfileConfig::validate_set(&[public]),
+            Err(ProfileConfigError::DefaultFingerprintForbidden)
+        ));
+    }
+
+    #[test]
+    fn a_host_profile_that_sets_no_identity_is_still_accepted() {
+        // Uniqueness applies to a value that is set; requiredness stays
+        // VPN-only. Two host profiles are one host, and a config that names
+        // neither field has to keep validating.
+        let profiles = vec![
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            host("public", "0.0.0.0:6882", false),
+            host("public2", "0.0.0.0:6883", false),
+        ];
+        ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    #[test]
+    fn a_vpn_profile_missing_only_its_fingerprint_is_refused() {
+        // The `peer_fingerprint_hex` arm of `MissingIdentity`; only the
+        // `user_agent` arm was reached before.
+        let mut p = cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a");
+        p.peer_fingerprint_hex = None;
+        assert!(matches!(
+            ProfileConfig::validate_set(&[p]),
+            Err(ProfileConfigError::MissingIdentity {
+                field: "peer_fingerprint_hex",
+                ..
+            })
+        ));
     }
 
     #[test]

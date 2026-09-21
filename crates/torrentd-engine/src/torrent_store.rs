@@ -6,9 +6,10 @@
 //! inventory scan can re-add it if its resume file is ever lost, and the
 //! `metadata_received` handler writes the fetched metadata for magnet adds.
 //!
-//! Like the resume store, single-session mode (`ProfileId::DEFAULT`) keeps files
-//! directly under `base`; multi-profile mode partitions by profile id so torrents
-//! are never co-mingled.
+//! Like the resume store, this always partitions by profile id — there is no
+//! count of profiles at which files go directly under `base`, because a
+//! deployment with one profile is a deployment with n = 1, not a mode of its
+//! own. Two profiles' torrents are therefore never co-mingled.
 
 use std::fs;
 use std::io::Write;
