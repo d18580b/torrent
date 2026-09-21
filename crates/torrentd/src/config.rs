@@ -348,6 +348,31 @@ impl Config {
         s
     }
 
+    /// The one boot refusal that is a pure function of the config file.
+    ///
+    /// `startup::boot` refuses `network_kill_switch = true` with no tunnel to
+    /// confine egress to, and `--check-config` — which
+    /// `deploy/torrentd.service` runs as its `ExecStartPre`, so that a bad
+    /// configuration fails before `ExecStart` rather than under
+    /// `Restart=on-failure` — did not. The configuration that reaches it, a
+    /// set of profiles with zero tunnels, is new in this change.
+    ///
+    /// Kept separate from [`Config::validate`] because it is a boot rule
+    /// rather than a well-formedness rule: `vpn check` and the `pool`
+    /// subcommands load the same file and have no business refusing it.
+    pub fn check_boot_rules(&self) -> anyhow::Result<()> {
+        if self.network_kill_switch && !self.profile.iter().any(|p| p.is_vpn()) {
+            anyhow::bail!(
+                "network_kill_switch = true but no profile uses network = \"vpn\". \
+                 The kill switch confines the daemon's egress to its profiles' tunnel \
+                 interfaces; with no tunnel there is nothing to confine it to, and \
+                 every profile would keep seeding from the host's own address with no \
+                 backstop. Configure a vpn profile, or unset network_kill_switch.",
+            );
+        }
+        Ok(())
+    }
+
     /// A profile's effective `peer_fingerprint_hex` and `user_agent` — its own
     /// values, or the top-level defaults it inherits where it sets none.
     ///
@@ -1256,6 +1281,141 @@ listen_interfaces = "0.0.0.0:6882"
         let p = write_cfg(dir.path(), &body);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("vpn_interface"), "got: {msg}");
+    }
+
+    #[test]
+    fn dht_false_on_a_vpn_profile_is_refused_like_every_other_wrong_posture_key() {
+        // `dht` was a `#[serde(default)] bool`, so `dht = false` was
+        // indistinguishable from absent and slipped through — alone among the
+        // wrong-posture keys, every other one being an `Option` rejected on
+        // presence. It reads to an operator as a setting that took, on the
+        // posture where Safety Rule 6 says no key can reach it at all.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
+             vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
+             vpn_interface = \"wg0\"\nlisten_port = 6891\n\
+             peer_fingerprint_hex = \"a1b2c3d4e5f60718\"\nuser_agent = \"ua-a\"\n\
+             dht = false\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("dht"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_listen_port_under_natpmp_is_refused_rather_than_ignored() {
+        // The gateway assigns the port at runtime and renews its lease, so
+        // nothing binds the configured one and Safety Rule 8 never enters it
+        // into the uniqueness set — and `/api/profiles` then reports it back
+        // under a field documented as `null` for natpmp profiles. Accepting
+        // and ignoring a key is the shape every other rule in this conversion
+        // exists to refuse.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
+             vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
+             vpn_interface = \"wg0\"\nport_forward = \"natpmp\"\nlisten_port = 6891\n\
+             peer_fingerprint_hex = \"a1b2c3d4e5f60718\"\nuser_agent = \"ua-a\"\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(
+            msg.contains("listen_port") && msg.contains("natpmp"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_natpmp_profile_without_a_listen_port_is_accepted() {
+        // The shape the rule above exists to leave alone.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
+             vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
+             vpn_interface = \"wg0\"\nport_forward = \"natpmp\"\n\
+             peer_fingerprint_hex = \"a1b2c3d4e5f60718\"\nuser_agent = \"ua-a\"\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        Config::load(&p).expect("a natpmp profile names no port; that is the point");
+    }
+
+    #[test]
+    fn a_profile_id_that_is_not_a_path_component_is_refused_at_deserialization() {
+        // The charset rule as a property of the *type*, not of having called
+        // `validate_set`. The config file is not the only door a `ProfileId`
+        // comes through: `profile_assignments.json` deserializes straight into
+        // one and never passes the validator, so a hand-edited registry
+        // naming `../..` reached `dir_for` and was joined onto a path with
+        // nothing in between. Deserializing the bare value is that door.
+        for bad in ["../..", "/etc", "a/b", "acct.a", "", &"x".repeat(65)] {
+            let err = serde_json::from_value::<ProfileId>(serde_json::json!(bad))
+                .err()
+                .unwrap_or_else(|| panic!("id {bad:?} was accepted by Deserialize"));
+            assert!(
+                err.to_string().contains("[A-Za-z0-9_-]"),
+                "id {bad:?} gave: {err}",
+            );
+        }
+        for good in ["default", "acct_a", "acct-b", "Public2", &"a".repeat(64)] {
+            serde_json::from_value::<ProfileId>(serde_json::json!(good))
+                .unwrap_or_else(|e| panic!("id {good:?} was refused: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_registry_file_naming_an_escaping_profile_id_does_not_load() {
+        // The file the rule above exists for. `AssignmentRegistry` maps its
+        // JSON values straight into `ProfileId`.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("profile_assignments.json");
+        fs::write(
+            &path,
+            r#"{"0101010101010101010101010101010101010101":"../../etc"}"#,
+        )
+        .unwrap();
+        assert!(
+            torrentd_engine::AssignmentRegistry::load(&path).is_err(),
+            "a registry naming an id that escapes its directory must not load",
+        );
+    }
+
+    #[test]
+    fn check_config_refuses_a_kill_switch_with_no_tunnel_to_confine_egress_to() {
+        // `deploy/torrentd.service` runs `--check-config` as its
+        // `ExecStartPre` so a bad configuration fails before `ExecStart`
+        // rather than under `Restart=on-failure`. This refusal is a pure
+        // function of the file and `boot` makes it anyway, so the pre-flight
+        // has no reason not to.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
+        let cfg = Config::load(&p).expect("it parses and validates; it does not boot");
+        let msg = format!("{:#}", cfg.check_boot_rules().unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch") && msg.contains("vpn"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_kill_switch_with_a_vpn_profile_passes_the_pre_flight() {
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\nnetwork_kill_switch = true\n\n[[profile]]\nid = \"acct_a\"\n\
+             network = \"vpn\"\nvpn_type = \"wireguard\"\n\
+             vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
+             listen_port = 6891\npeer_fingerprint_hex = \"a1b2c3d4e5f60718\"\n\
+             user_agent = \"ua-a\"\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        Config::load(&p).unwrap().check_boot_rules().unwrap();
+    }
+
+    #[test]
+    fn the_default_config_has_no_boot_rule_to_break() {
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &single_session());
+        Config::load(&p).unwrap().check_boot_rules().unwrap();
     }
 
     #[test]

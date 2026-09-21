@@ -12,6 +12,15 @@
 //! `{ "<infohash_hex>": "<profile_id>" }`. Writes are atomic (temp file +
 //! fsync + rename) — a partial write must leave the previous registry
 //! file intact.
+//!
+//! # This file is the authority
+//!
+//! Two artefacts persist a torrent→profile mapping: this one, and the pool
+//! index's `torrent.profile` column. **This one wins.** It is what the resume
+//! scan writes and what the daemon refuses to boot against when it disagrees
+//! with the configured profiles; the index's column is a cache of it, written
+//! by `pool scan`, which an operator may never run. Where they disagree the
+//! scan warns naming both values rather than silently preferring one.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -123,7 +132,16 @@ impl AssignmentRegistry {
     fn load_inner(path: PathBuf, source: PathBuf) -> Result<Self, RegistryError> {
         let map: HashMap<InfoHash, ProfileId> = match fs::read(&source) {
             Ok(bytes) if !bytes.is_empty() => {
-                let raw: HashMap<String, String> = serde_json::from_slice(&bytes)?;
+                // Deserialize the value as a `ProfileId`, not as a `String`
+                // converted afterwards. This file is the other door untrusted
+                // text comes through, and `ProfileId`'s `Deserialize` is what
+                // enforces the charset rule — a hand-edited id like `../..`
+                // otherwise reached `dir_for` and was joined onto a path with
+                // nothing in between. A bad id fails the load rather than
+                // being skipped: the map cannot be reconstructed, so dropping
+                // an entry quietly loses which torrent belonged to which
+                // account.
+                let raw: HashMap<String, ProfileId> = serde_json::from_slice(&bytes)?;
                 let mut out = HashMap::with_capacity(raw.len());
                 for (k, v) in raw {
                     let Some(ih) = InfoHash::from_hex(&k) else {
@@ -134,7 +152,7 @@ impl AssignmentRegistry {
                         );
                         continue;
                     };
-                    out.insert(ih, ProfileId::new(v));
+                    out.insert(ih, v);
                 }
                 out
             }

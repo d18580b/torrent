@@ -1494,6 +1494,31 @@ peer_fingerprint_hex = "a1b2c3d4e5f60718"
 user_agent           = "qBittorrent/5.0.3"
 "#;
 
+    /// The same profile with a gateway-assigned port.
+    ///
+    /// Written out rather than appended to [`cfg_with_profile`], which sets a
+    /// static `listen_port`: a `listen_port` under `port_forward = "natpmp"`
+    /// is refused now, because the gateway assigns the port at runtime and
+    /// nothing binds the configured one.
+    fn cfg_with_natpmp_profile(extra: &str) -> Config {
+        cfg_with_tables(&format!(
+            r#"
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg-acct-a.conf"
+vpn_interface        = "wg-acct-a"
+port_forward         = "natpmp"
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+resume_dir           = "/tmp/torrentd-test/state/resume/acct_a"
+torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
+{extra}
+"#
+        ))
+    }
+
     fn find<'a>(checks: &'a [Check], name: &str) -> Option<&'a Check> {
         checks.iter().find(|c| c.name == name)
     }
@@ -1716,8 +1741,7 @@ user_agent           = "qBittorrent/5.0.3"
         // contract, asserted below, is that the lease is left to lapse: the
         // previous wording said the mapping had been "released again", so this
         // assertion fails against the behaviour it replaced.
-        let cfg =
-            cfg_with_profile("port_forward = \"natpmp\"\nport_forward_gateway = \"10.2.0.1\"");
+        let cfg = cfg_with_natpmp_profile("port_forward_gateway = \"10.2.0.1\"");
         let host = FakeHost::new().with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
         host.fwd.push_ok(51413);
 
@@ -1756,7 +1780,7 @@ user_agent           = "qBittorrent/5.0.3"
         // address there is nothing to negotiate from and nothing to report but
         // a skip. Checked here because it is the arm that keeps the mapping
         // call off a host that has no tunnel at all.
-        let cfg = cfg_with_profile("port_forward = \"natpmp\"");
+        let cfg = cfg_with_natpmp_profile("");
         let host = FakeHost::new();
 
         let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
