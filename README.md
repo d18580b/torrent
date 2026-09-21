@@ -115,18 +115,19 @@ Requires `allow_mutations = true`. A mistake here destroys data, so:
 ## HTTP API
 
 Everything is served under `/api/…`. `/healthz` and `/metrics` stay at the
-root, where probes and scrapes conventionally look.
+root, where probes and scrapes conventionally look. Default bind
+`127.0.0.1:8080`.
 
 | Method & path | Purpose |
 | --- | --- |
 | `GET /healthz` | Liveness. 503 until a session is up, and again if the alert loop stops advancing. Never authenticated. |
-| `GET /status` | Counts by state, aggregate rates, peers. |
-| `GET /torrents` | List. `?after=<infohash>&limit=<n>` (default 100, max 1000), returns `{"items":[…],"next_cursor":…}`. |
-| `POST /torrents` | Add `{"magnet":…}` / `{"torrent_path":…}`, or a multipart `.torrent`. 409 on a duplicate info-hash. Body capped at 50 MiB. |
-| `GET`/`DELETE` `/torrents/:infohash` | One torrent; `?delete_files=true` requires a `[pool]` section with `allow_mutations`. |
-| `POST /torrents/:infohash/pause` \| `/resume` | Pause or resume one torrent. |
-| `POST /torrents/:infohash/upload-limit` | `{"bytes_per_sec":…}`, 0 = unlimited. |
-| `POST /torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 4 normal, 7 high). |
+| `GET /api/status` | Counts by state, aggregate rates, peers. |
+| `GET /api/torrents` | List. `?after=<infohash>&limit=<n>` (default 100, max 1000), returns `{"items":[…],"next_cursor":…}`. |
+| `POST /api/torrents` | Add `{"magnet":…,"profile_id":…}` / `{"torrent_path":…,"profile_id":…}`, or a multipart `.torrent`. 409 on a duplicate info-hash. Body capped at 50 MiB. |
+| `GET`/`DELETE` `/api/torrents/:infohash` | One torrent; `?delete_files=true` requires a `[pool]` section with `allow_mutations`. |
+| `POST /api/torrents/:infohash/pause` \| `/resume` | Pause or resume one torrent. |
+| `POST /api/torrents/:infohash/upload-limit` | `{"bytes_per_sec":…}`, 0 = unlimited. |
+| `POST /api/torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 4 normal, 7 high). |
 | `POST /api/login` \| `/api/logout` | Session cookie in, revocation out. |
 | `GET /api/events` | SSE change stream. |
 | `GET /metrics` | Prometheus text format. |

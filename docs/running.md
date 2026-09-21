@@ -190,12 +190,54 @@ the daemon's own state), `library_dir` (required), `db_path`
 moving and deleting files inside your roots; the index, matching, adoption and
 reporting are all read-only without it.
 
-> **Upgrading from a pre-profiles deployment.** Resume and `.torrent` files
-> used to live directly under `resume_dir` and `torrent_dir`; they now live in
-> a per-profile subdirectory. Point your profile's own `resume_dir` and
-> `torrent_dir` at the old paths, or move the files — otherwise the daemon
-> finds nothing and re-hashes the library. The assignment registry is migrated
-> automatically: its old file is read once and rewritten under the new name.
+### Upgrading from a pre-profiles deployment
+
+Four things changed at once, and three of them will stop an upgraded daemon
+serving your library. Do all of this before you start it.
+
+**1. Remove the two top-level keys that no longer exist.** `session_state_path`
+and top-level `listen_interfaces` are gone. `Config` rejects unknown keys, so an
+existing config file is now a fatal startup error naming whichever it reaches
+first. `listen_interfaces` moved onto each `network = "host"` profile; session
+state moved to `session_state-<profile_id>.dat` beside the old file and needs no
+key.
+
+**2. Give a profile the id your registry already uses, or clear the entries.**
+The assignment registry — which torrent belongs to which account — is migrated
+automatically: `slot_assignments.json` is read once and rewritten as
+`profile_assignments.json`, with the old file left intact for a rollback. The
+migration is *verbatim*, so every entry still names the id that deployment used,
+which on a single-session deployment is `default`.
+
+Nothing reconciles those ids with your `[[profile]]` tables, so the daemon
+refuses to start until they agree, listing the ids it does not recognise. Either
+name one of your profiles `default` — `default` is a legal profile id — or
+delete those entries from `profile_assignments.json` and re-add the torrents.
+
+**3. Point each profile at its files, or move them.** Resume and `.torrent`
+files used to live directly under `resume_dir` and `torrent_dir`; they now live
+in a per-profile subdirectory, `<resume_dir>/<profile_id>` and
+`<torrent_dir>/<profile_id>`. Set that profile's own `resume_dir` and
+`torrent_dir` to the old paths, or move the files into the subdirectory.
+
+Skipping this does **not** cost you a re-hash — it costs you the library. The
+torrent-directory inventory scan is partitioned exactly like the resume store,
+so it finds nothing either: the daemon comes up healthy, `GET /api/torrents`
+lists every torrent at `phase: "unknown"`, and nothing seeds.
+
+**4. Delete the orphaned `session_state.dat`.** It is not migrated. A DHT
+routing table regenerates from the bootstrap nodes within minutes, and choosing
+which profile inherits one is a guess with a privacy cost — it would seed one
+profile's session with another's peer history. The assignment registry is
+migrated precisely because it is the one artefact that *cannot* be
+reconstructed.
+
+Metrics were renamed with it: every `slot_*` series is now `profile_*`, and the
+`slot_id` label is `profile_id`. There is no alias and no dual-emission period,
+so any dashboard or alert rule built on the old names stops firing silently
+rather than erroring. `/healthz`'s path is unchanged; its response keys
+`slots` / `slots_fenced` / `all_slots_fenced` are now `profiles` /
+`profiles_fenced` / `all_profiles_fenced`.
 
 Validate without starting anything:
 
@@ -264,7 +306,7 @@ tunnels down, and exits.
 
 ```bash
 curl -s localhost:8080/healthz            # {"ok":true,"profiles":1,"heartbeat_age_secs":0}
-curl -s localhost:8080/status | jq        # counts by state, rates, peers
+curl -s localhost:8080/api/status | jq    # counts by state, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
 
@@ -278,7 +320,7 @@ Confirm settings actually applied rather than trusting the config parsed:
 curl -s localhost:8080/metrics | grep torrentd_libtorrent_
 ```
 
-Then add one torrent and watch it reach `seeding` in `/status`.
+Then add one torrent and watch it reach `seeding` in `/api/status`.
 
 ## 10. Migrating a pool from another client
 
@@ -304,7 +346,17 @@ always dry-run first:
 ```bash
 curl -sX POST localhost:8080/api/pool/adopt \
      -H 'content-type: application/json' \
-     -d '{"root_id":1,"path":"movies","dry_run":true}'
+     -d '{"root_id":1,"path":"movies","profile_id":"acct_a","dry_run":true}'
+```
+
+`profile_id` is required: adoption hands every matched torrent to one
+profile's session, and the daemon will not pick one for you. Drop `dry_run`
+to adopt for real:
+
+```bash
+curl -sX POST localhost:8080/api/pool/adopt \
+     -H 'content-type: application/json' \
+     -d '{"root_id":1,"path":"movies","profile_id":"acct_a"}'
 ```
 
 ## 11. Drills worth doing once, before you trust it
@@ -323,8 +375,8 @@ On a scratch pool, not your real one.
    not placed. This is derived from live session state, so restarting the
    daemon does not clear it — only a rescan does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
-   /api/pool/plans` and `DELETE /torrents/:hash?delete_files=true` both 403.
-5. **Multi-profile: pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
+   /api/pool/plans` and `DELETE /api/torrents/:hash?delete_files=true` both 403.
+5. **Pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
    profile should pause its torrents, report `vpn_down`, and refuse adds and
    resumes with 409 until you restart the daemon. It must not restart itself.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
@@ -342,4 +394,4 @@ On a scratch pool, not your real one.
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
 | Adds fail with 409 and `vpn_down` | The profile is fenced. An operator restart is required by design. |
 | Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
-| Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `/profiles`, then `POST /profiles/<id>/resume-all`. |
+| Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `/api/profiles`, then `POST /api/profiles/<id>/resume-all`. |
