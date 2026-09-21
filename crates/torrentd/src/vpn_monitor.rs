@@ -114,26 +114,31 @@ fn seed_baselines(slots: &SlotRegistry, metrics: &PromSink) {
     // `0` here is a measured fact rather than a pinned constant: the tunnel
     // demonstrably did not come up.
     //
-    // `slot_vpn_handshake_probe_ok` goes with it, for a WireGuard slot and on
-    // the same ground. It is seeded at `1` above for every *live* WireGuard
-    // slot, so leaving it absent here gives a dashboard computing probe-ok
-    // over the configured set a denominator that moves — the shape decision
-    // 18 exists to prevent one endpoint over, where `/healthz`'s `slots`
-    // stopped meaning two different things. And there is nothing pinned about
-    // the value: a tunnel that never came up cannot have handshaked, so `0`
-    // is measured exactly as `slot_vpn_tunnel_up = 0` is.
+    // `slot_vpn_handshake_probe_ok` does **not** go with it, and the
+    // denominator argument does not need it to.
     //
-    // `slot_torrents_paused_vpn_down` still is not seeded, and the difference
-    // is the point. A slot with no session has no torrents, so any value there
-    // would assert a *count* nothing measured; the poll loop never visits
-    // these slots to correct it. An absent series is honest, a pinned one is
-    // not — and the probe gauge is not pinned.
+    // That series has one meaning, given at `:196` and `:199-204` and stated
+    // to the operator at `:88-92`: the probe ran and answered. A `0` there is
+    // a host-tooling fault — `wireguard-tools` missing, or `wg` unprivileged —
+    // which is the silence this series exists to end. Seeding the same `0` for
+    // a slot that failed to boot for some unrelated reason gives the value a
+    // second, incompatible meaning, and the alert `:88-92` names in the
+    // operator's own terms then fires pointing at a package that is installed.
+    //
+    // The denominator is already served: `slot_vpn_tunnel_up = 0` on the line
+    // above is present for every configured slot, live or failed, and it says
+    // the true thing about this one. A dashboard computing over the configured
+    // set has a set that does not move.
+    //
+    // `slot_torrents_paused_vpn_down` is not seeded either, for the same
+    // family of reason. A slot with no session has no torrents, so any value
+    // there would assert a *count* nothing measured; the poll loop never
+    // visits these slots to correct it. An absent series is honest, a pinned
+    // one is not, and a series pinned to a value that already means something
+    // else is worse than either.
     for f in slots.failed() {
         let labels = [("slot_id", f.config.id.as_str())];
         metrics.set_gauge("slot_vpn_tunnel_up", 0.0, &labels);
-        if f.config.vpn_type == VpnType::Wireguard {
-            metrics.set_gauge("slot_vpn_handshake_probe_ok", 0.0, &labels);
-        }
     }
 }
 
@@ -372,21 +377,30 @@ mod tests {
     /// The other series a boot-failed WireGuard slot has to carry, and the
     /// one it must not.
     ///
-    /// `slot_vpn_handshake_probe_ok` is seeded at `1` for every *live*
-    /// WireGuard slot, so a boot-failed one having no series at all leaves a
-    /// dashboard computing probe-ok across the configured set with a moving
-    /// denominator — the shape decision 18 exists to prevent one endpoint
-    /// over. The value is measured, not pinned: a tunnel that never came up
-    /// cannot have handshaked.
+    /// `slot_vpn_handshake_probe_ok` keeps one meaning, and the boot-failed
+    /// slot's denominator is carried by the series that can say the true
+    /// thing.
     ///
-    /// And it stays WireGuard-only on the failed side exactly as on the live
-    /// side: there is no handshake to probe on an OpenVPN slot, so a constant
-    /// there would assert a health signal nothing measures.
+    /// `:88-92` states the series' purpose in the operator's own terms — "an
+    /// alert on `slot_vpn_handshake_probe_ok == 0` should read 'no' from a
+    /// cold start" — and `:199-204` defines that `0` as a **host-tooling**
+    /// fault: `wireguard-tools` absent, or `wg` unprivileged. Seeding the same
+    /// `0` for a slot that failed to boot for an unrelated reason — a
+    /// `ForeignInterface` refusal, an engine-construction failure — fires that
+    /// alert at a package which is installed.
     ///
-    /// Drop the probe gauge from the failed-slot seed and the first assertion
-    /// fails; seed it unconditionally and the third does.
+    /// The denominator decision 37 argued for is still there:
+    /// `slot_vpn_tunnel_up` is present for every configured slot, live or
+    /// failed, so nothing computed across the configured set has a moving
+    /// denominator. And the OpenVPN side is unchanged on both halves: there is
+    /// no handshake to probe on an OpenVPN slot, so no constant is asserted
+    /// for one.
+    ///
+    /// Seed `probe_ok` for a boot-failed slot again and the first assertion
+    /// fails; drop `slot_vpn_tunnel_up` from the failed seed and the second
+    /// does.
     #[test]
-    fn a_boot_failed_wireguard_slot_carries_the_probe_series_it_cannot_satisfy() {
+    fn a_boot_failed_slot_carries_the_denominator_and_not_the_probe_series() {
         use torrentd_engine::VpnType;
 
         use crate::slot_registry::test_entry;
@@ -403,14 +417,20 @@ mod tests {
 
         let exported = String::from_utf8(metrics.render()).expect("utf-8");
         assert!(
-            exported.contains("torrentd_slot_vpn_handshake_probe_ok{slot_id=\"account_c\"} 0"),
-            "a WireGuard tunnel that never came up demonstrably never \
-             handshaked, and the series must say so rather than be absent \
-             from a set the live slots are in; got:\n{exported}",
+            !exported.contains("handshake_probe_ok{slot_id=\"account_c\"}"),
+            "`probe_ok = 0` means the probe could not run on this host; a \
+             WireGuard slot that never booted is not that, and an operator \
+             alerting on the series would be sent to a package that is \
+             installed; got:\n{exported}",
+        );
+        assert!(
+            exported.contains("torrentd_slot_vpn_tunnel_up{slot_id=\"account_c\"} 0"),
+            "and the denominator is carried by the series that can say the \
+             true thing about a slot whose tunnel never came up; got:\n{exported}",
         );
         assert!(
             exported.contains("torrentd_slot_vpn_handshake_probe_ok{slot_id=\"account_a\"} 1"),
-            "and a live WireGuard slot still baselines at 1; got:\n{exported}",
+            "a live WireGuard slot still baselines at 1; got:\n{exported}",
         );
         assert!(
             !exported.contains("handshake_probe_ok{slot_id=\"account_d\"}"),
