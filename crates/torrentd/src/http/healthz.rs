@@ -54,28 +54,39 @@ pub async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
     // serving, and taking the daemon out of rotation would stop them too. The
     // count is reported either way, and `torrentd_slot_vpn_tunnel_up` is the
     // per-slot signal to alert on.
-    let fenced = s.fenced_slots().map(|(f, _)| f).unwrap_or(0);
-    if let Some((fenced, total)) = s.fenced_slots() {
-        if total > 0 && fenced == total {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "reason": "all_slots_fenced",
-                    "slots": total,
-                    "slots_fenced": fenced,
-                    "heartbeat_age_secs": age.as_secs(),
-                })),
-            )
-                .into_response();
-        }
+    //
+    // `slots` counts **configured** slots in both responses, and
+    // `slots_fenced` is counted over the same registry, so the two read as a
+    // coherent fraction. Reporting live sessions in the 200 body and
+    // configured slots in the 503 body — as this briefly did — gave a
+    // dashboard parsing `slots` one meaning when healthy and the other when
+    // fenced, and they diverge precisely during an incident: a *failed* slot
+    // is configured but has no session, so the live count shrinks exactly
+    // when the probe is being read. Single-session mode has no registry, and
+    // there its one session is the configured set.
+    //
+    // Computed once. It walks the registry twice per call, and the previous
+    // shape called it twice and then shadowed the first binding.
+    let (fenced, slots) = s.fenced_slots().unwrap_or((0, n_slots));
+    if slots > 0 && fenced == slots {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "reason": "all_slots_fenced",
+                "slots": slots,
+                "slots_fenced": fenced,
+                "heartbeat_age_secs": age.as_secs(),
+            })),
+        )
+            .into_response();
     }
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
-            "slots": n_slots,
+            "slots": slots,
             "slots_fenced": fenced,
             "heartbeat_age_secs": age.as_secs(),
         })),
@@ -99,6 +110,15 @@ mod tests {
             .unwrap()
             .as_millis() as u64;
         now.saturating_sub(d.as_millis() as u64)
+    }
+
+    /// The probe's *body*, not just its status. A load balancer reads the
+    /// status; the operator's dashboard and runbook read these keys.
+    async fn body(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("healthz bodies are small");
+        serde_json::from_slice(&bytes).expect("healthz answers JSON")
     }
 
     #[tokio::test]
@@ -128,6 +148,10 @@ mod tests {
             .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
         let resp = healthz(State(s)).await.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let b = body(resp).await;
+        assert_eq!(b["reason"], "all_slots_fenced");
+        assert_eq!(b["slots"], 2, "configured slots");
+        assert_eq!(b["slots_fenced"], 2);
     }
 
     #[tokio::test]
@@ -148,6 +172,29 @@ mod tests {
             .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
         let resp = healthz(State(s)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+        // `slots` is the configured count in *both* responses, so `fenced /
+        // slots` is a fraction of one denominator wherever it is read. The
+        // source's live-session count is a different number during an
+        // incident, and this is the response that was reporting it.
+        let b = body(resp).await;
+        assert_eq!(b["ok"], true);
+        assert_eq!(b["slots"], 2, "configured slots, not live sessions");
+        assert_eq!(b["slots_fenced"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_single_session_reports_its_one_slot_unfenced() {
+        // No registry here, so `fenced_slots()` is `None` and the response
+        // falls back to the session count — single-session mode has no
+        // tunnel to lose, and its one session *is* the configured set.
+        let s = build_test_state(None);
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        let resp = healthz(State(s)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = body(resp).await;
+        assert_eq!(b["slots"], 1);
+        assert_eq!(b["slots_fenced"], 0);
     }
 
     #[tokio::test]
