@@ -58,12 +58,16 @@ pub enum VpnCmd {
     /// each one separately.
     ///
     /// Observe-only unless `--bring-up` is given: it reads interfaces and `wg`
-    /// state, and a NAT-PMP slot's mapping is negotiated with the same short
-    /// lease the daemon uses and then left to expire rather than deleted —
-    /// NAT-PMP's delete removes every mapping the tunnel address holds, which
-    /// would include a running daemon's. No libtorrent session is constructed
-    /// and no tracker is contacted, so this is safe to run against real
-    /// credentials, and safe to run while the daemon is up.
+    /// state, makes no host change, and deletes nothing. A NAT-PMP slot's
+    /// mapping is negotiated with the same short lease the daemon uses and
+    /// left to expire — NAT-PMP's delete removes every mapping the tunnel
+    /// address holds, which would include a running daemon's, so the client
+    /// used here issues none on any branch. No libtorrent session is
+    /// constructed and no tracker is contacted, so this is safe to run against
+    /// real credentials. Against a live daemon its one interaction is that
+    /// NAT-PMP request, from the same client identity the daemon uses; whether
+    /// a gateway coalesces it with the daemon's existing mapping or answers
+    /// with a second one is gateway-dependent and is not tested here.
     ///
     /// Exit status: 0 when every check passed, 1 when any check failed, and 2
     /// when nothing failed but at least one check could not be performed. A

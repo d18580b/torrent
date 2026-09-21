@@ -14,10 +14,18 @@
 //! missing `iproute2` or `nft` behind a thirty-second tunnel bring-up would
 //! cost an operator the thing this command is for.
 //!
-//! Observe-only by default. Nothing in the default path mutates host state:
-//! it reads interfaces, reads `wg` output, and — for a NAT-PMP slot — asks the
-//! gateway for a mapping with a short lease and lets that lease lapse. That
-//! changes no state the daemon depends on.
+//! Observe-only by default, stated precisely: the default path makes **no
+//! host change** and **deletes nothing**. It reads interfaces, reads `wg`
+//! output, and — for a NAT-PMP slot — asks the gateway for a mapping with the
+//! daemon's own short lease and lets that lease lapse. Its one interaction
+//! with a running daemon is that NAT-PMP request, sent from the same client
+//! identity the daemon uses; whether a gateway coalesces it with the mapping
+//! the daemon already holds or answers with a second one is gateway-dependent,
+//! and nothing here tests it. What is guaranteed is that no delete is issued
+//! on any branch — including the one inside `NatpmpForwarder::map` where the
+//! gateway answers UDP on a different port from TCP, which is why the check
+//! negotiates with [`RealHost::probe_forwarder`] and not with the client
+//! startup uses.
 //!
 //! `--bring-up` opts into raising tunnels, which is the one thing here that
 //! changes the machine. It lowers again **only** what it raised: an interface
@@ -204,18 +212,32 @@ pub trait CheckHost {
     /// The tunnel manager for a slot's VPN type.
     fn manager(&self, t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager>;
 
-    /// A NAT-PMP client configured the way startup configures its own.
+    /// A NAT-PMP client with startup's retransmit budget that deletes nothing.
     ///
     /// The return type is the whole port-forward surface these checks can
-    /// reach, and `PortForwarder` carries `map` and nothing else. Releasing a
-    /// mapping is therefore not expressible here — which is the point of the
-    /// trait rather than an accident of it.
+    /// reach, and `PortForwarder` carries `map` and nothing else, so no
+    /// release is expressible *here*. That is necessary and it is not
+    /// sufficient: `NatpmpForwarder::map` contains its own wildcard delete on
+    /// the branch where the gateway answers UDP on a different port from TCP,
+    /// so narrowing the parameter's type constrained the call site while the
+    /// object behind it could still destroy the daemon's forward. The client
+    /// [`RealHost::probe_forwarder`] hands back is the variant that cannot.
     fn forwarder(&self) -> Arc<dyn PortForwarder>;
 }
 
 /// `CheckHost` against the actual machine.
 #[derive(Debug, Clone, Copy)]
 pub struct RealHost;
+
+impl RealHost {
+    /// The NAT-PMP client this command negotiates with.
+    ///
+    /// Named rather than inlined so the one property that matters about it —
+    /// that it deletes nothing — is assertable without a gateway.
+    pub fn probe_forwarder() -> vpn::NatpmpForwarder {
+        vpn::NatpmpForwarder::for_probe()
+    }
+}
 
 impl CheckHost for RealHost {
     fn interface_exists(&self, iface: &str) -> bool {
@@ -233,7 +255,7 @@ impl CheckHost for RealHost {
     }
 
     fn forwarder(&self) -> Arc<dyn PortForwarder> {
-        Arc::new(vpn::NatpmpForwarder::for_startup())
+        Arc::new(Self::probe_forwarder())
     }
 }
 
@@ -734,11 +756,19 @@ fn slot_checks(
     //    renewal churns the listen sockets and leaves a stale port advertised
     //    to trackers until the next reannounce.
     //
-    //    Asking for the same short lease the daemon asks for costs nothing and
-    //    is safe for the opposite reason: this is the same NAT-PMP client
-    //    identity, so the gateway may legitimately answer with the port the
-    //    daemon already holds, and that is a refreshed lease rather than a
-    //    destroyed mapping.
+    //    Removing the release from this call site was necessary and it was not
+    //    sufficient: `NatpmpForwarder::map` issues the same wildcard delete
+    //    itself when the gateway answers UDP on a different port from TCP. So
+    //    the client here is `RealHost::probe_forwarder`, the variant that
+    //    deletes on no branch at all; the property has to hold for the object
+    //    called, not for the type of the parameter it arrives as.
+    //
+    //    Asking for the same short lease the daemon asks for costs nothing.
+    //    What it does at a live gateway is *not* claimed here: this is the
+    //    same NAT-PMP client identity, so the gateway may coalesce the request
+    //    with the mapping the daemon already holds, or it may hand out a
+    //    second one. Which of those happens is gateway behaviour that nothing
+    //    in this repository tests.
     match slot.port_forward {
         PortForwardMode::Static => {
             checks.push(Check::skip(
@@ -1615,6 +1645,33 @@ http_listen = "127.0.0.1:8080"
         let cfg = cfg_with_slot("");
         let e = check(&cfg, Some("acct_b"), false, false, None, None).unwrap_err();
         assert!(format!("{e:#}").contains("acct_b"), "got {e:#}");
+    }
+
+    #[test]
+    fn the_client_the_check_negotiates_with_cannot_delete_on_any_branch() {
+        // F2, reopened. Removing the release from the call site and narrowing
+        // the trait to `map` made a release inexpressible *through the
+        // parameter*; it did not make one impossible, because
+        // `NatpmpForwarder::map` issues the RFC 6886 wildcard delete itself
+        // when the gateway answers UDP on a different port from TCP. The
+        // socket that delete goes out on is bound to the tunnel address — the
+        // running daemon's NAT-PMP identity — so the flagless, documented-as-
+        // safe path could still destroy the daemon's live UDP forward.
+        //
+        // The property therefore has to hold for the object the command
+        // calls. `natpmp.rs` asserts the branch behaviour against a loopback
+        // gateway; this asserts that the check picks that client.
+        assert!(
+            !RealHost::probe_forwarder().deletes_divergent_udp(),
+            "the pre-flight must negotiate with a client that deletes nothing",
+        );
+        // And that it is still the one-shot budget, not the renewal one: the
+        // check asks startup's question and deserves startup's retransmits.
+        assert!(
+            RealHost::probe_forwarder().deletes_divergent_udp()
+                != vpn::NatpmpForwarder::for_startup().deletes_divergent_udp(),
+            "the daemon's own client is unchanged and still tidies its orphan",
+        );
     }
 
     #[test]
