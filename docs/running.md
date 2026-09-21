@@ -137,12 +137,13 @@ typo is caught rather than ignored.
 | `default_save_path` | Where payload lives. Must exist (§4). |
 | `resume_dir` | Root of the resume store. Each profile gets a subdirectory named after its id. |
 | `torrent_dir` | Root of the `.torrent` store, same partitioning. |
-| `http_listen` | e.g. `"127.0.0.1:8080"` |
+| `allow_unauthenticated` | `true` to state that access control belongs to something in front. Required **unless** `[auth]` is configured, and refused alongside it — the daemon will not start having been told neither, and will not start having been told both. §6. |
 
 **Optional, with the defaults actually used:**
 
 | Key | Default |
 | --- | --- |
+| `http_listen` | `127.0.0.1:8080`. A non-loopback value requires `[auth]` — §6. |
 | `log_level` | `info` |
 | `registry_path` | `<resume_dir>/../profile_assignments.json` |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
