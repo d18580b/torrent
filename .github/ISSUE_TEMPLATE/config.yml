@@ -3,3 +3,9 @@
 # work that no template specifies. Disabling blank issues would make that work
 # unfileable through the chooser.
 blank_issues_enabled: true
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/milkyisles/torrent/blob/master/SECURITY.md
+    about: >-
+      Do not use the bug form. Read SECURITY.md and follow the reporting
+      instructions there.
