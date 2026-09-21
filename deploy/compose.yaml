@@ -5,10 +5,10 @@ services:
       dockerfile: deploy/Containerfile
     image: torrentd:latest
     restart: unless-stopped
-    # Multi-profile mode brings up its own WireGuard tunnels (and, with
-    # network_kill_switch = true, installs an nftables table). Single-session
-    # mode doesn't need NET_ADMIN; remove the cap_add + devices stanzas
-    # in that case.
+    # A `vpn` profile brings up its own WireGuard tunnel (and, with
+    # network_kill_switch = true, installs an nftables table). A deployment
+    # whose profiles are all `network = "host"` needs neither: remove the
+    # cap_add + devices stanzas in that case.
     cap_add:
       - NET_ADMIN
     devices:

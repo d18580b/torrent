@@ -1,10 +1,11 @@
-//! `AlertSource` — the seam between single-session and multi-profile mode.
+//! `AlertSource` — the seam between the alert loop and the per-profile engines.
 //!
 //! The alert loop and handlers always see `(profile_id, alert)` pairs and
-//! resolve their target engine via `AlertSource::engine_for(profile)`. The
-//! single-session impl reports a single profile, `ProfileId::DEFAULT`. The
-//! multi-profile impl iterates a `Vec<(ProfileId, Arc<dyn TorrentEngine>)>` and
-//! drains each in turn. Handler logic is identical in both modes.
+//! resolve their target engine via `AlertSource::engine_for(profile)`.
+//! `ProfileSource` iterates a `Vec<(ProfileId, Arc<dyn TorrentEngine>)>` and
+//! drains each in turn. There is one implementation and one shape: a daemon
+//! with a single profile is that vector with one entry, and handler logic does
+//! not branch on how many there are.
 
 use std::sync::Arc;
 
