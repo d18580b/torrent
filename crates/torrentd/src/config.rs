@@ -15,6 +15,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 use torrentd_engine::ProfileConfig;
+use torrentd_engine::ProfileConfigError;
 use torrentd_engine::ProfileId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -176,6 +177,10 @@ impl Config {
         // Unconditional: an empty set is itself a refusal now, because there
         // is no implicit profile to fall back to.
         ProfileConfig::validate_set(&self.profile).context("[[profile]] validation failed")?;
+        self.validate_effective_identities()
+            .context("[[profile]] validation failed")?;
+        self.validate_effective_store_dirs()
+            .context("[[profile]] validation failed")?;
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -341,6 +346,133 @@ impl Config {
             s.handshake_client_version = Some(v.clone());
         }
         s
+    }
+
+    /// A profile's effective `peer_fingerprint_hex` and `user_agent` — its own
+    /// values, or the top-level defaults it inherits where it sets none.
+    ///
+    /// `libtorrent_settings()` seeds every session from the top-level keys and
+    /// `startup.rs` overrides only where the profile set its own, so this pair
+    /// is what actually goes on the wire.
+    fn effective_identity<'a>(
+        &'a self,
+        p: &'a ProfileConfig,
+    ) -> (Option<&'a str>, Option<&'a str>) {
+        (
+            p.peer_fingerprint_hex
+                .as_deref()
+                .or(self.peer_fingerprint.as_deref()),
+            p.user_agent.as_deref().or(self.user_agent.as_deref()),
+        )
+    }
+
+    /// Refuse two profiles that would announce one identity.
+    ///
+    /// `ProfileConfig::validate_set` sees only what a `[[profile]]` spells out,
+    /// so it closes the copy-paste spelling and not the inherited one: a host
+    /// profile that declares neither key — the documented way to use a
+    /// top-level default — inherits the same 8-byte peer-id prefix and client
+    /// string as a vpn profile that declares them explicitly, and both
+    /// sessions put them on the wire, one from the tunnel address and one from
+    /// the machine's real address. That is the cross-account correlation
+    /// `torrentd_engine::profile`'s Safety Rules 2-4 exist to prevent, and its
+    /// stated consequence is a permanent tracker ban.
+    ///
+    /// Both keys reach one `libtorrent_safe::Settings` field in one encoding,
+    /// so the collision is expressible however it is spelled.
+    fn validate_effective_identities(&self) -> Result<(), ProfileConfigError> {
+        let mut seen_fp: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let mut seen_ua: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for p in &self.profile {
+            let (fp, ua) = self.effective_identity(p);
+            if let Some(fp) = fp {
+                if seen_fp.insert(fp, p.id.as_str()).is_some() {
+                    return Err(ProfileConfigError::DuplicateFingerprint(fp.to_string()));
+                }
+            }
+            if let Some(ua) = ua {
+                if seen_ua.insert(ua, p.id.as_str()).is_some() {
+                    return Err(ProfileConfigError::DuplicateUserAgent(ua.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A profile's effective resume and `.torrent` directories — its own
+    /// overrides, or the `<base>/<id>` the two stores derive.
+    ///
+    /// Mirrors `FsResumeStore::dir_for` and `FsTorrentStore::dir_for`, which is
+    /// what `startup.rs` assembles from exactly these two fields.
+    fn effective_store_dirs(&self, p: &ProfileConfig) -> (PathBuf, PathBuf) {
+        let resolve = |explicit: Option<&PathBuf>, base: &Path| -> PathBuf {
+            let raw = explicit
+                .cloned()
+                .unwrap_or_else(|| base.join(p.id.as_str()));
+            // On a first run the directory may not exist yet, so fall back to
+            // the literal value and let startup create it.
+            raw.canonicalize().unwrap_or(raw)
+        };
+        (
+            resolve(p.resume_dir.as_ref(), &self.resume_dir),
+            resolve(p.torrent_dir.as_ref(), &self.torrent_dir),
+        )
+    }
+
+    /// Refuse two profiles that would share, or nest, a store directory.
+    ///
+    /// `validate_set` de-duplicates only the *explicit* overrides against each
+    /// other and cannot see a derived path, so an override set to another
+    /// profile's `<base>/<id>` validated clean and two sessions then read one
+    /// store. On a fresh registry the first-declared profile claims every
+    /// info-hash it finds there and seeds another account's torrents under its
+    /// own fingerprint, user agent and tunnel address.
+    ///
+    /// Containment is refused as well as equality: `load_all` filters on the
+    /// file name alone, so a profile pointed at a directory that *contains*
+    /// another's loads that profile's state as its own. An override of the
+    /// top-level root itself is exactly that shape, and the upgrade note tells
+    /// operators to hand-write these overrides.
+    fn validate_effective_store_dirs(&self) -> Result<(), ProfileConfigError> {
+        let dirs: Vec<(&str, PathBuf, PathBuf)> = self
+            .profile
+            .iter()
+            .map(|p| {
+                let (r, t) = self.effective_store_dirs(p);
+                (p.id.as_str(), r, t)
+            })
+            .collect();
+
+        for (i, (_, a_resume, a_torrent)) in dirs.iter().enumerate() {
+            for (_, b_resume, b_torrent) in dirs.iter().skip(i + 1) {
+                for (key, a, b) in [
+                    ("resume_dir", a_resume, b_resume),
+                    ("torrent_dir", a_torrent, b_torrent),
+                ] {
+                    if a == b {
+                        return Err(match key {
+                            "resume_dir" => ProfileConfigError::DuplicateResumeDir(a.clone()),
+                            _ => ProfileConfigError::DuplicateTorrentDir(a.clone()),
+                        });
+                    }
+                    if a.starts_with(b) {
+                        return Err(ProfileConfigError::NestedProfileDir {
+                            key,
+                            outer: b.clone(),
+                            inner: a.clone(),
+                        });
+                    }
+                    if b.starts_with(a) {
+                        return Err(ProfileConfigError::NestedProfileDir {
+                            key,
+                            outer: a.clone(),
+                            inner: b.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Where the assignment registry should be persisted.
@@ -655,6 +787,269 @@ listen_interfaces = "0.0.0.0:6881"
             None,
             "a tunnelled profile must not receive it",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Effective identity — the uniqueness rule `validate_set` cannot decide.
+    // -----------------------------------------------------------------
+
+    /// Top-level keys, then a vpn profile, then a host profile.
+    ///
+    /// `top` lands in the daemon-wide block; `host_extra` inside the host
+    /// profile's table. The ports are distinct so Safety Rule 8 does not fire
+    /// first and mask what is being asserted.
+    fn vpn_plus_host(top: &str, host_extra: &str) -> String {
+        format!(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+{top}
+
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg0.conf"
+vpn_interface        = "wg0"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6882"
+{host_extra}
+"#
+        )
+    }
+
+    fn refusal(body: &str) -> String {
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), body);
+        let err = Config::load(&p).expect_err("this configuration must be refused");
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn a_host_profile_may_not_wear_a_vpn_profiles_identity() {
+        // The configuration this is written from: the operator writes the VPN
+        // profile, copies the table to make the public one, and edits `id`,
+        // `network` and `listen_interfaces`. The fingerprint and user agent
+        // come along. `startup.rs` applies `peer_fingerprint_hex` to every
+        // session with no posture guard, so the private tracker then sees one
+        // peer-id prefix announcing from the tunnel address and from the
+        // host's real address — the cross-account correlation whose stated
+        // consequence is a permanent ban.
+        let msg = refusal(&vpn_plus_host(
+            "",
+            r#"peer_fingerprint_hex = "a1b2c3d4e5f60718""#,
+        ));
+        assert!(
+            msg.contains("peer_fingerprint_hex") && msg.contains("a1b2c3d4e5f60718"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_host_profile_may_not_wear_a_vpn_profiles_user_agent() {
+        let msg = refusal(&vpn_plus_host("", r#"user_agent = "qBittorrent/5.0.3""#));
+        assert!(
+            msg.contains("user_agent") && msg.contains("qBittorrent/5.0.3"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn two_profiles_may_not_share_a_fingerprint() {
+        let dir = tempdir().unwrap();
+        let body = format!(
+            r#"{TOP_LEVEL}
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg0.conf"
+vpn_interface        = "wg0"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "ua-a"
+
+[[profile]]
+id                   = "acct_b"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg1.conf"
+vpn_interface        = "wg1"
+listen_port          = 6882
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "ua-b"
+"#
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("peer_fingerprint_hex"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_host_profile_inheriting_the_top_level_identity_collides_with_a_vpn_profile() {
+        // F4, reopened. The host profile sets *neither* identity key — the
+        // documented way to use a top-level default (`docs/running.md`) — and
+        // the vpn profile spells out the same two values. Nothing in
+        // `[[profile]]` looks duplicated, so `validate_set` returns `Ok` and
+        // `--check-config` printed `config OK`; but `libtorrent_settings()`
+        // seeds every session from the top-level keys and `startup.rs`
+        // overrides only where a profile set its own, so both sessions put one
+        // 8-byte peer-id prefix and one client string on the wire — one from
+        // the tunnel address, one from the machine's real address.
+        let msg = refusal(&vpn_plus_host(
+            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+user_agent = "qBittorrent/5.0.3""#,
+            "",
+        ));
+        assert!(
+            msg.contains("peer_fingerprint_hex") && msg.contains("a1b2c3d4e5f60718"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_top_level_user_agent_inherited_by_two_profiles_is_refused() {
+        // The user-agent half of the same mechanism, reached on its own: the
+        // vpn profile spells out its own fingerprint but takes the top-level
+        // user agent, and so does the host profile.
+        let msg = refusal(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+user_agent = "qBittorrent/5.0.3"
+
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg0.conf"
+vpn_interface        = "wg0"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6882"
+"#,
+        );
+        assert!(msg.contains("user_agent"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_top_level_identity_with_exactly_one_profile_is_still_accepted() {
+        // The configuration the top-level default exists for. Refusing the
+        // keys outright would close F4 too, and break this.
+        let dir = tempdir().unwrap();
+        let body = with_top_level(
+            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+user_agent = "qBittorrent/5.0.3""#,
+        );
+        let p = write_cfg(dir.path(), &body);
+        Config::load(&p).expect("one profile inheriting the top-level identity is legal");
+    }
+
+    // -----------------------------------------------------------------
+    // Effective store directories.
+    // -----------------------------------------------------------------
+
+    /// Two host profiles with `extra_a` / `extra_b` appended to their tables.
+    fn two_host_profiles(extra_a: &str, extra_b: &str) -> String {
+        format!(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+
+[[profile]]
+id                = "acct_a"
+network           = "host"
+listen_interfaces = "0.0.0.0:6881"
+{extra_a}
+
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6882"
+{extra_b}
+"#
+        )
+    }
+
+    #[test]
+    fn an_override_equal_to_another_profiles_derived_resume_dir_is_refused() {
+        // F15. `acct_a` names `<base>/public` explicitly; `public` sets no
+        // override, so `FsResumeStore::dir_for` derives exactly that path for
+        // it. `validate_set` de-duplicates only the explicit overrides against
+        // each other and cannot see a derived path, so this validated clean
+        // and both sessions then read one store — and on a fresh registry the
+        // first-declared profile claims every info-hash it finds there.
+        let msg = refusal(&two_host_profiles(
+            r#"resume_dir = "/var/lib/torrentd/resume/public""#,
+            "",
+        ));
+        assert!(
+            msg.contains("resume_dir") && msg.contains("/var/lib/torrentd/resume/public"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn an_override_equal_to_another_profiles_derived_torrent_dir_is_refused() {
+        let msg = refusal(&two_host_profiles(
+            r#"torrent_dir = "/var/lib/torrentd/torrents/public""#,
+            "",
+        ));
+        assert!(
+            msg.contains("torrent_dir") && msg.contains("/var/lib/torrentd/torrents/public"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn two_explicit_overrides_naming_one_resume_dir_are_refused() {
+        let msg = refusal(&two_host_profiles(
+            r#"resume_dir = "/srv/shared""#,
+            r#"resume_dir = "/srv/shared""#,
+        ));
+        assert!(msg.contains("resume_dir"), "got: {msg}");
+    }
+
+    #[test]
+    fn an_override_containing_another_profiles_resume_dir_is_refused() {
+        // Containment, not equality. `load_all` filters on the file name
+        // alone, so a profile pointed at the top-level root loads every other
+        // profile's `<base>/<id>` state as its own — and the root is the
+        // easiest value to write here by accident, because it is the one the
+        // upgrade note tells operators their files are currently under.
+        let msg = refusal(&two_host_profiles(
+            r#"resume_dir = "/var/lib/torrentd/resume""#,
+            "",
+        ));
+        assert!(msg.contains("resume_dir"), "got: {msg}");
+        assert!(msg.contains("lies inside"), "got: {msg}");
+    }
+
+    #[test]
+    fn distinct_derived_store_directories_are_accepted() {
+        // The ordinary case, so the new rule cannot pass by refusing
+        // everything: neither profile overrides anything and the derived
+        // `<base>/<id>` paths differ by construction.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &two_host_profiles("", ""));
+        Config::load(&p).expect("derived per-profile directories are distinct");
     }
 
     #[test]
