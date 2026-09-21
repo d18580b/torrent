@@ -25,8 +25,13 @@ Thumbs.db
 # Resume data / runtime artifacts
 *.resume
 *.resume.tmp
+profile_assignments.json
+# The pre-profiles names. A daemon that read one of these leaves it on disk
+# rather than deleting it, so a tree that ran an older build still has them.
 slot_assignments.json
 session_state.dat
+# Session state is per profile now: `session_state-<profile_id>.dat`.
+session_state-*.dat
 # Pool index (SQLite, WAL mode) — a `pool scan` against a repo-local config
 # drops all three of these in the tree.
 *.db
