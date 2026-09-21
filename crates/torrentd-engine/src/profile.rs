@@ -595,10 +595,16 @@ pub enum ProfileConfigError {
     MissingListenPort(String),
     #[error("vpn_interface {0:?} appears more than once")]
     DuplicateInterface(String),
-    #[error("peer_fingerprint_hex {0:?} appears more than once")]
-    DuplicateFingerprint(String),
-    #[error("user_agent {0:?} appears more than once")]
-    DuplicateUserAgent(String),
+    /// Two profiles announce one peer-id prefix.
+    ///
+    /// `key` is the key the *operator wrote*, which is not always the one this
+    /// field is called. A profile that declares nothing takes the top-level
+    /// `peer_fingerprint`, and naming `peer_fingerprint_hex` at it sent the
+    /// operator hunting a key that appears nowhere in their file.
+    #[error("{key} {value:?} appears more than once")]
+    DuplicateFingerprint { key: &'static str, value: String },
+    #[error("{key} {value:?} appears more than once")]
+    DuplicateUserAgent { key: &'static str, value: String },
     #[error("resume_dir {0:?} appears more than once (after symlink resolution)")]
     DuplicateResumeDir(PathBuf),
     #[error("torrent_dir {0:?} appears more than once (after symlink resolution)")]

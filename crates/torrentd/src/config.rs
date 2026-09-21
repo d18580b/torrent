@@ -405,23 +405,78 @@ impl Config {
     ///
     /// Both keys reach one `libtorrent_safe::Settings` field in one encoding,
     /// so the collision is expressible however it is spelled.
+    ///
+    /// **A pair that both inherit the top-level default is exempt.** The
+    /// collision this guards is one profile inheriting while another declares,
+    /// across postures — that is the shape where an operator cannot see from
+    /// the file that two sessions share an identity. Two profiles that both
+    /// write nothing are using the key exactly as the sample documents it
+    /// ("Default peer identity for profiles that do not set their own"), and
+    /// refusing them contradicts the recorded answer to "require identity
+    /// fields on host profiles too?" — No, because two host profiles are one
+    /// host and requiring them to differ would be theatre. Before the check
+    /// moved to *effective* values only explicit ones entered the sets, so
+    /// two omitting profiles could not collide; the exemption restores that.
+    ///
+    /// The error names the key the operator actually wrote. When the value
+    /// came from the top level that is `peer_fingerprint`, not
+    /// `peer_fingerprint_hex` — a key that appears nowhere in their file.
     fn validate_effective_identities(&self) -> Result<(), ProfileConfigError> {
         let mut seen_fp: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         let mut seen_ua: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for p in &self.profile {
             let (fp, ua) = self.effective_identity(p);
             if let Some(fp) = fp {
-                if seen_fp.insert(fp, p.id.as_str()).is_some() {
-                    return Err(ProfileConfigError::DuplicateFingerprint(fp.to_string()));
+                // Inherited by this profile *and* by the one already holding
+                // the value: both wrote nothing, so there is nothing to
+                // distinguish and nothing hidden.
+                let inherited = p.peer_fingerprint_hex.is_none();
+                match seen_fp.insert(fp, p.id.as_str()) {
+                    Some(prev) if inherited && self.inherits_fingerprint(prev) => {}
+                    Some(_) => {
+                        return Err(ProfileConfigError::DuplicateFingerprint {
+                            key: if inherited {
+                                "peer_fingerprint"
+                            } else {
+                                "peer_fingerprint_hex"
+                            },
+                            value: fp.to_string(),
+                        })
+                    }
+                    None => {}
                 }
             }
             if let Some(ua) = ua {
-                if seen_ua.insert(ua, p.id.as_str()).is_some() {
-                    return Err(ProfileConfigError::DuplicateUserAgent(ua.to_string()));
+                let inherited = p.user_agent.is_none();
+                match seen_ua.insert(ua, p.id.as_str()) {
+                    Some(prev) if inherited && self.inherits_user_agent(prev) => {}
+                    Some(_) => {
+                        return Err(ProfileConfigError::DuplicateUserAgent {
+                            key: "user_agent",
+                            value: ua.to_string(),
+                        })
+                    }
+                    None => {}
                 }
             }
         }
         Ok(())
+    }
+
+    /// Whether the profile named `id` declares no `peer_fingerprint_hex`.
+    fn inherits_fingerprint(&self, id: &str) -> bool {
+        self.profile
+            .iter()
+            .find(|p| p.id.as_str() == id)
+            .is_some_and(|p| p.peer_fingerprint_hex.is_none())
+    }
+
+    /// Whether the profile named `id` declares no `user_agent`.
+    fn inherits_user_agent(&self, id: &str) -> bool {
+        self.profile
+            .iter()
+            .find(|p| p.id.as_str() == id)
+            .is_some_and(|p| p.user_agent.is_none())
     }
 
     /// A profile's effective resume and `.torrent` directories — its own
@@ -961,7 +1016,13 @@ user_agent = "qBittorrent/5.0.3""#,
             "",
         ));
         assert!(
-            msg.contains("peer_fingerprint_hex") && msg.contains("a1b2c3d4e5f60718"),
+            msg.contains("a1b2c3d4e5f60718"),
+            "the colliding value is named, got: {msg}",
+        );
+        // The key named is the one the *inheriting* profile would have to
+        // change — `peer_fingerprint`, which is what this operator wrote.
+        assert!(
+            msg.contains("peer_fingerprint") && !msg.contains("peer_fingerprint_hex"),
             "got: {msg}",
         );
     }
@@ -996,6 +1057,75 @@ listen_interfaces = "0.0.0.0:6882"
 "#,
         );
         assert!(msg.contains("user_agent"), "got: {msg}");
+    }
+
+    #[test]
+    fn two_host_profiles_both_inheriting_the_top_level_identity_are_accepted() {
+        // C48. Two host profiles are one host, so requiring them to differ is
+        // theatre — the recorded answer to "require identity fields on host
+        // profiles too?" is No, and `validate_set`'s own doc says the same.
+        //
+        // Checking *effective* values put them in one set by construction:
+        // neither writes a key, so both take the top-level default and the
+        // pair collided. The operator's only remedies were to delete the
+        // top-level keys the sample documents as "Default peer identity for
+        // profiles that do not set their own", or to give the pair the
+        // distinct values the record calls theatre.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+peer_fingerprint = "-XX1234-"
+user_agent = "libtorrent/2.0"
+{}
+"#,
+            two_host_profiles("", "")
+                .split_once("http_listen = \"127.0.0.1:8080\"")
+                .unwrap()
+                .1
+        );
+        let p = write_cfg(dir.path(), &body);
+        Config::load(&p).expect(
+            "two host profiles that both write nothing are using the top-level default \
+             exactly as it is documented",
+        );
+    }
+
+    #[test]
+    fn the_exemption_does_not_reach_a_profile_that_declares_the_value() {
+        // The collision the rule guards is one profile inheriting while
+        // another declares — the shape where the file does not show that two
+        // sessions share an identity. The exemption must not swallow it.
+        let msg = refusal(&vpn_plus_host(
+            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+user_agent = "qBittorrent/5.0.3""#,
+            "",
+        ));
+        assert!(msg.contains("a1b2c3d4e5f60718"), "got: {msg}");
+    }
+
+    #[test]
+    fn an_inherited_collision_names_the_key_the_operator_wrote() {
+        // The message named `peer_fingerprint_hex` — a key that appears
+        // nowhere in a file whose author wrote `peer_fingerprint` at the top
+        // level — so it described a line the operator could not find.
+        let msg = refusal(&vpn_plus_host(
+            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+user_agent = "qBittorrent/5.0.3""#,
+            "",
+        ));
+        assert!(
+            !msg.contains("peer_fingerprint_hex"),
+            "naming peer_fingerprint_hex sends the operator to a key that appears nowhere \
+             in this file, got: {msg}",
+        );
+        assert!(
+            msg.contains("peer_fingerprint"),
+            "and the key it does name is the one they wrote, got: {msg}",
+        );
     }
 
     #[test]
