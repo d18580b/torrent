@@ -256,12 +256,31 @@ impl Config {
                 listen = self.http_listen,
             );
         }
-        if !self.http_listen.ip().is_loopback() {
+        // Unwrap `::ffff:127.0.0.1` before asking. `IpAddr::is_loopback`
+        // delegates to `Ipv6Addr::is_loopback`, which is true only of `::1`,
+        // so an IPv4-mapped loopback bind — reachable from the host and
+        // nowhere else — was refused by a message asserting it is "reachable
+        // from the network". The refusal errs closed either way; a false
+        // statement in a refusal is worth one line to remove rather than one
+        // line to excuse.
+        let listen_ip = match self.http_listen.ip() {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+            v4 => v4,
+        };
+        if !listen_ip.is_loopback() {
             anyhow::bail!(
                 "allow_unauthenticated = true with http_listen = {listen}, which is not a \
                  loopback address. That is an unauthenticated API that mutates state, \
                  reachable from the network. Bind to 127.0.0.1 and put a reverse proxy in \
-                 front, or configure [auth].",
+                 front, or configure [auth].\n\
+                 \nThis judges the address as configured, and nothing else: a bind that is \
+                 routable only inside a network namespace is still refused, because the \
+                 configured address is all `--check-config` has to go on and a namespace is \
+                 not something the daemon can verify it is in. A container that must bind \
+                 0.0.0.0 configures [auth] — `compose run --rm torrentd hash-password` \
+                 generates the values without starting a listener.",
                 listen = self.http_listen,
             );
         }
@@ -869,6 +888,33 @@ listen_interfaces = "0.0.0.0:6881"
         let p = write_cfg(dir.path(), &body);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("loopback"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_loopback_bind_is_loopback_however_it_is_spelled() {
+        // `IpAddr::is_loopback` is false for `::ffff:127.0.0.1`, so the
+        // literal test refused an address reachable only from the host — and
+        // told the operator it was "reachable from the network".
+        let dir = tempdir().unwrap();
+        for form in ["[::1]:8080", "[::ffff:127.0.0.1]:8080"] {
+            let body = single_session().replace("127.0.0.1:8080", form);
+            let p = write_cfg(dir.path(), &body);
+            assert!(
+                Config::load(&p).is_ok(),
+                "{form} is loopback and must be accepted",
+            );
+        }
+        // Unwrapping must not soften the check it is inside: the wildcard
+        // binds stay refused in both families.
+        for form in ["[::]:8080", "0.0.0.0:8080"] {
+            let body = single_session().replace("127.0.0.1:8080", form);
+            let p = write_cfg(dir.path(), &body);
+            let msg = format!("{:#}", Config::load(&p).unwrap_err());
+            assert!(
+                msg.contains("loopback"),
+                "{form} must be refused; got: {msg}"
+            );
+        }
     }
 
     #[test]
