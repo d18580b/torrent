@@ -99,16 +99,15 @@ jobs:
           # Common typo: info_hash in a Rust tracing field name.
           # Scoped to *.rs so we don't flag legitimate C++ includes of
           # libtorrent's real header (<libtorrent/info_hash.hpp>) in the shim.
-          if grep -RnE --include='*.rs' '\bprofile_id\b' crates/ >/dev/null; then :; fi
+          if grep -RnE --include='*.rs' '\binfo_hash\b' crates/; then
+            echo "::error::Field name must be 'infohash' (no underscore)."
+            exit 1
+          fi
           # The log field is `profile_id`. `slot_id` was its name before
           # profiles replaced slots, and a stray one silently splits every log
           # query in two.
           if grep -RnE --include='*.rs' '\bslot_id\b' crates/; then
             echo "::error::use profile_id, not slot_id"
-            exit 1
-          fi
-          if grep -RnE --include='*.rs' '\binfo_hash\b' crates/; then
-            echo "::error::Field name must be 'infohash' (no underscore)."
             exit 1
           fi
           # Free-standing log lines that emit `infohash =` outside an

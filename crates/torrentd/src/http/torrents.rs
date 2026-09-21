@@ -505,12 +505,42 @@ pub async fn remove(
             Json(serde_json::json!({"error": "not_found"})),
         )
     })?;
-    let engine = s.source.engine_for(&profile).ok_or_else(|| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "engine missing"})),
-        )
-    })?;
+    let Some(engine) = s.source.engine_for(&profile) else {
+        // The profile the registry names has no live session — it failed to
+        // come up, and Safety Rule 1 left the rest of the daemon running. No
+        // session holds this torrent, so there is nothing to remove from one;
+        // what is left is the registry entry, and that entry is what makes
+        // `POST /api/torrents` answer 409 for this info-hash. Clearing it is
+        // the whole of the work. Answering 500 "engine missing" instead —
+        // before ever reaching the `remove` below — left an operator no way
+        // to clear it but hand-editing `profile_assignments.json`.
+        if q.delete_files {
+            // Refuse rather than report success for a deletion that cannot
+            // happen: the payload is reachable only through the session.
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "profile {profile} has no running session, so its payload cannot be \
+                         deleted; retry without `delete_files` to clear the assignment alone"
+                    )
+                })),
+            ));
+        }
+        s.registry.remove(&ih).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("{e}")})),
+            )
+        })?;
+        tracing::warn!(
+            target: "torrentd::http",
+            infohash = %ih,
+            profile_id = %profile,
+            "cleared an assignment whose profile has no running session",
+        );
+        return Ok(StatusCode::NO_CONTENT);
+    };
     let st = s.state.get(&ih).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -718,6 +748,87 @@ mod tests {
 
     const MAGNET: &str = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101";
     const MAGNET_HEX: &str = "0101010101010101010101010101010101010101";
+
+    /// The state a profile that failed to come up leaves behind: the registry
+    /// names it, `source` has no engine for it.
+    fn state_with_a_stale_assignment(dir: &std::path::Path, ih: InfoHash) -> AppState {
+        let app = test_state(dir);
+        app.registry
+            .assign(ih, ProfileId::new("gone"))
+            .expect("assign");
+        assert!(
+            app.source.engine_for(&ProfileId::new("gone")).is_none(),
+            "fixture is wrong: `gone` must have no engine",
+        );
+        app
+    }
+
+    #[tokio::test]
+    async fn deleting_a_torrent_whose_profile_has_no_session_clears_the_assignment() {
+        // Without this, `remove` answers 500 "engine missing" and never
+        // reaches the `registry.remove` below it, so the entry stays. That
+        // entry is what makes a re-add answer 409, which leaves the operator
+        // with an info-hash that cannot be loaded, cannot be re-added and
+        // cannot be deleted — clearable only by hand-editing
+        // `profile_assignments.json`.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+        let app = state_with_a_stale_assignment(dir.path(), ih);
+
+        let code = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery {
+                delete_files: false,
+            }),
+        )
+        .await
+        .expect("delete must succeed");
+
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        assert!(
+            app.registry.lookup(&ih).is_none(),
+            "the assignment survived the delete",
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_stale_assignment_refuses_to_pretend_it_deleted_the_payload() {
+        // The payload is reachable only through the session, and there is no
+        // session. Reporting 204 for a `delete_files` request would claim a
+        // deletion that did not happen.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+        let mut app = state_with_a_stale_assignment(dir.path(), ih);
+        // A pool that permits mutations, so the guard above this branch lets
+        // the request through and it is *this* branch under test.
+        app.pool = crate::pool_service::PoolService::open(
+            &crate::config::Config::minimal_for_tests(dir.path(), true),
+        )
+        .unwrap();
+        assert!(
+            app.pool.as_ref().is_some_and(|p| p.allow_mutations()),
+            "fixture is wrong: the mutation guard must not be what refuses",
+        );
+
+        let err = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery { delete_files: true }),
+        )
+        .await
+        .expect_err("must not report a deletion it cannot perform");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let msg = err.1 .0["error"].as_str().unwrap().to_string();
+        assert!(msg.contains("no running session"), "got {msg}");
+        assert!(msg.contains("delete_files"), "got {msg}");
+        // And the entry is still there to clear with a plain delete.
+        assert!(
+            app.registry.lookup(&ih).is_some(),
+            "entry was cleared anyway"
+        );
+    }
 
     #[test]
     fn add_request_parses_magnet_and_profile() {

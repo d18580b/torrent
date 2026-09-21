@@ -38,7 +38,7 @@ runtime and are easy to miss because nothing checks for them at startup:
 | `openvpn`, `pkill` | `openvpn`, `procps-ng` | OpenVPN profiles. `pkill` is how teardown stops the process. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
 
-Single-session mode needs none of them.
+A deployment whose profiles are all `network = "host"` needs none of them.
 
 ## 2. Submodules
 
@@ -191,12 +191,54 @@ the daemon's own state), `library_dir` (required), `db_path`
 moving and deleting files inside your roots; the index, matching, adoption and
 reporting are all read-only without it.
 
-> **Upgrading from a pre-profiles deployment.** Resume and `.torrent` files
-> used to live directly under `resume_dir` and `torrent_dir`; they now live in
-> a per-profile subdirectory. Point your profile's own `resume_dir` and
-> `torrent_dir` at the old paths, or move the files — otherwise the daemon
-> finds nothing and re-hashes the library. The assignment registry is migrated
-> automatically: its old file is read once and rewritten under the new name.
+### Upgrading from a pre-profiles deployment
+
+Four things changed at once, and three of them will stop an upgraded daemon
+serving your library. Do all of this before you start it.
+
+**1. Remove the two top-level keys that no longer exist.** `session_state_path`
+and top-level `listen_interfaces` are gone. `Config` rejects unknown keys, so an
+existing config file is now a fatal startup error naming whichever it reaches
+first. `listen_interfaces` moved onto each `network = "host"` profile; session
+state moved to `session_state-<profile_id>.dat` beside the old file and needs no
+key.
+
+**2. Give a profile the id your registry already uses, or clear the entries.**
+The assignment registry — which torrent belongs to which account — is migrated
+automatically: `slot_assignments.json` is read once and rewritten as
+`profile_assignments.json`, with the old file left intact for a rollback. The
+migration is *verbatim*, so every entry still names the id that deployment used,
+which on a single-session deployment is `default`.
+
+Nothing reconciles those ids with your `[[profile]]` tables, so the daemon
+refuses to start until they agree, listing the ids it does not recognise. Either
+name one of your profiles `default` — `default` is a legal profile id — or
+delete those entries from `profile_assignments.json` and re-add the torrents.
+
+**3. Point each profile at its files, or move them.** Resume and `.torrent`
+files used to live directly under `resume_dir` and `torrent_dir`; they now live
+in a per-profile subdirectory, `<resume_dir>/<profile_id>` and
+`<torrent_dir>/<profile_id>`. Set that profile's own `resume_dir` and
+`torrent_dir` to the old paths, or move the files into the subdirectory.
+
+Skipping this does **not** cost you a re-hash — it costs you the library. The
+torrent-directory inventory scan is partitioned exactly like the resume store,
+so it finds nothing either: the daemon comes up healthy, `GET /api/torrents`
+lists every torrent at `phase: "unknown"`, and nothing seeds.
+
+**4. Delete the orphaned `session_state.dat`.** It is not migrated. A DHT
+routing table regenerates from the bootstrap nodes within minutes, and choosing
+which profile inherits one is a guess with a privacy cost — it would seed one
+profile's session with another's peer history. The assignment registry is
+migrated precisely because it is the one artefact that *cannot* be
+reconstructed.
+
+Metrics were renamed with it: every `slot_*` series is now `profile_*`, and the
+`slot_id` label is `profile_id`. There is no alias and no dual-emission period,
+so any dashboard or alert rule built on the old names stops firing silently
+rather than erroring. `/healthz`'s path is unchanged; its response keys
+`slots` / `slots_fenced` / `all_slots_fenced` are now `profiles` /
+`profiles_fenced` / `all_profiles_fenced`.
 
 Validate without starting anything:
 
@@ -297,7 +339,10 @@ The daemon sets none of these itself.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on
-  bare metal.
+  bare metal. The kernel uses `max(conf/all, conf/<iface>)` per interface, so
+  `all = 2` is sufficient on its own — but `all = 0` is *not* safe, because a
+  tunnel interface created later inherits `conf/default` and may come up
+  strict. `vpn check` reports both values and the effective mode.
 
 ## 8. Start it
 
@@ -326,7 +371,7 @@ tunnels down, and exits.
 
 ```bash
 curl -s localhost:8080/healthz            # {"ok":true,"profiles":1,"heartbeat_age_secs":0}
-curl -s localhost:8080/status | jq        # counts by state, rates, peers
+curl -s localhost:8080/api/status | jq    # counts by state, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
 
@@ -340,7 +385,68 @@ Confirm settings actually applied rather than trusting the config parsed:
 curl -s localhost:8080/metrics | grep torrentd_libtorrent_
 ```
 
-Then add one torrent and watch it reach `seeding` in `/status`.
+Then add one torrent and watch it reach `seeding` in `/api/status`.
+
+### Checking the VPN on its own
+
+`vpn check` runs the VPN pre-flight without constructing a session, so "does
+my VPN configuration work" can be answered before "does my seeding setup
+work".
+
+```bash
+torrentd --config /etc/torrentd/torrentd.toml vpn check
+torrentd --config /etc/torrentd/torrentd.toml vpn check --profile acct_a --json
+torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
+```
+
+| Flag | What it adds |
+| --- | --- |
+| `--profile ID` | Check one profile instead of every configured profile. |
+| `--json` | Emit the report as JSON instead of the human table. |
+| `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
+| `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host. |
+| `--as-uid UID` | Judge the kill-switch checks against the uid the daemon runs as. Default: this process's own. |
+
+Exit status: `0` clean, `1` any check failed, `2` nothing failed but at least
+one check could not be performed — an unreadable sysctl, a `wg show` refused
+for want of permission. A caller that treats only `0` as success gets the
+strict reading; one that accepts `0` and `2` gets "nothing is known to be
+broken".
+
+**Safe to run against a live daemon.** Nothing in the default path changes
+state the daemon depends on: the NAT-PMP check asks the gateway for a mapping
+with the daemon's own short lease and lets that lease expire rather than
+deleting it, because NAT-PMP's delete removes *every* mapping the tunnel
+address holds — including the daemon's. `--bring-up` skips an interface that
+already exists and never lowers one it did not raise, for the same reason:
+`wg-quick down` on a live profile's tunnel fences that profile until the
+daemon is restarted.
+
+**Run it as the daemon's user** where you can. The kill-switch checks describe
+one uid; with `sudo` (which `--bring-up` usually needs) pass `--as-uid` so
+they describe the daemon's rather than root's, or they will report `unknown`.
+
+**What a pass establishes**, for a WireGuard profile with
+`port_forward = "natpmp"`: the tunnel config is readable; `wg` and `wg-quick`
+run;
+the interface holds an IPv4 address; the latest handshake is inside
+`vpn_handshake_max_age_secs`; the gateway hands out a forwarded port when
+asked over the tunnel; the effective `rp_filter` for that interface is not
+strict; and, with the kill switch on, that `nft --check` accepts the ruleset
+boot would install for the uid given.
+
+**What it does not.** It does not establish that any port is reachable from
+the public internet — there is no inbound test — nor that the port a session
+ends up announcing is the one tested, since boot negotiates its own. It takes
+one sample of the handshake and one negotiation: a profile whose first
+negotiation succeeds and whose renewals all fail passes. And with `--egress`
+it proves a round trip from the tunnel address, not the identity of the exit.
+
+To check the exit address itself, ask something that reports it:
+
+```bash
+curl --interface wg-acct-a -s https://api.ipify.org; echo
+```
 
 ## 10. Migrating a pool from another client
 
@@ -366,7 +472,17 @@ always dry-run first:
 ```bash
 curl -sX POST localhost:8080/api/pool/adopt \
      -H 'content-type: application/json' \
-     -d '{"root_id":1,"path":"movies","dry_run":true}'
+     -d '{"root_id":1,"path":"movies","profile_id":"acct_a","dry_run":true}'
+```
+
+`profile_id` is required: adoption hands every matched torrent to one
+profile's session, and the daemon will not pick one for you. Drop `dry_run`
+to adopt for real:
+
+```bash
+curl -sX POST localhost:8080/api/pool/adopt \
+     -H 'content-type: application/json' \
+     -d '{"root_id":1,"path":"movies","profile_id":"acct_a"}'
 ```
 
 ## 11. Drills worth doing once, before you trust it
@@ -385,8 +501,8 @@ On a scratch pool, not your real one.
    not placed. This is derived from live session state, so restarting the
    daemon does not clear it — only a rescan does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
-   /api/pool/plans` and `DELETE /torrents/:hash?delete_files=true` both 403.
-5. **Multi-profile: pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
+   /api/pool/plans` and `DELETE /api/torrents/:hash?delete_files=true` both 403.
+5. **Pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
    profile should pause its torrents, report `vpn_down`, and refuse adds and
    resumes with 409 until you restart the daemon. It must not restart itself.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
@@ -404,4 +520,4 @@ On a scratch pool, not your real one.
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
 | Adds fail with 409 and `vpn_down` | The profile is fenced. An operator restart is required by design. |
 | Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
-| Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `/profiles`, then `POST /profiles/<id>/resume-all`. |
+| Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `/api/profiles`, then `POST /api/profiles/<id>/resume-all`. |
