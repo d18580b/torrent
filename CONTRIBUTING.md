@@ -72,10 +72,25 @@ Everyday tasks:
 | `mise run check`   | fmt + lint                                               |
 | `mise run native`  | Provision the shared libtorrent prefix (see Build)       |
 | `mise run native-clean` | Delete every cached native prefix                   |
+| `mise run vpn-check <config> [-- <flags>]` | Verify a real VPN configuration (see below) |
 
 Formatting requires **nightly rustfmt** (`imports_granularity`/`group_imports` are
 unstable); `mise run setup` installs it and the `fmt` tasks invoke `cargo +nightly fmt`.
 Everything else builds/lints/tests on the pinned stable toolchain.
+
+`vpn-check` is deliberately outside every `test` task: it needs a real host
+with real tunnels and is meaningless in CI. It takes a config path and
+forwards any trailing flags to `torrentd … vpn check`, and it exits with that
+subcommand's status — `0` clean, `1` any failure, `2` nothing failed but
+something could not be checked.
+
+```bash
+mise run vpn-check /etc/torrentd/torrentd.toml
+mise run vpn-check /etc/torrentd/torrentd.toml -- --bring-up --json
+```
+
+See [docs/running.md](docs/running.md#checking-the-vpn-on-its-own) for what a
+pass does and does not establish.
 
 ### Git hooks
 
