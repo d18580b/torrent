@@ -186,7 +186,7 @@ fields have **one** spelling each, because log queries depend on it:
 
 | Field | Notes |
 | --- | --- |
-| `profile_id` | `default` in single-session mode. |
+| `profile_id` | The `id` of a configured `[[profile]]`. Always present — every torrent belongs to exactly one profile, and there is no implicit one. |
 | `infohash` | Lowercase hex, 40 chars. **Never** `info_hash` — CI fails on that spelling anywhere in `crates/`. |
 | `op` | The engine operation: `add_torrent`, `remove_torrent`, `pause_torrent`, `resume_torrent`, `save_resume_data`, `set_upload_limit`, `set_file_priority`, `force_recheck`, `move_storage`, `apply_settings`. |
 | `alert_type` | Lowercase `AlertKind`, e.g. `add_torrent`. |

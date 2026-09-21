@@ -38,7 +38,7 @@ runtime and are easy to miss because nothing checks for them at startup:
 | `openvpn`, `pkill` | `openvpn`, `procps-ng` | OpenVPN profiles. `pkill` is how teardown stops the process. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
 
-Single-session mode needs none of them.
+A deployment whose profiles are all `network = "host"` needs none of them.
 
 ## 2. Submodules
 

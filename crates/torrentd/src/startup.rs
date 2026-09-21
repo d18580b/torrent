@@ -1,9 +1,10 @@
 //! Startup orchestrator: build the engine(s), wire the alert loop, bind
 //! the HTTP server, install signal handlers, and run until shutdown.
 //!
-//! The single-session and multi-profile paths converge at the AlertSource
-//! trait — both produce an `Arc<dyn AlertSource>` that the rest of the
-//! daemon consumes uniformly.
+//! There is one path, not two: every profile becomes a session, and the set
+//! of them becomes one `Arc<dyn AlertSource>` that the rest of the daemon
+//! consumes uniformly. A deployment with a single profile is that set with
+//! n = 1.
 
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -523,9 +524,9 @@ pub async fn boot(
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
         for (ih, data) in entries {
-            // Cross-check the registry; the spec aborts the profile on mismatch.
-            // Single-session always uses ProfileId::DEFAULT, so the check
-            // mainly guards multi-profile mode.
+            // Cross-check the registry; the spec aborts the profile on
+            // mismatch. A resume file under one profile's directory that the
+            // registry assigns to another is the operator's to reconcile.
             if let Some(existing) = registry.lookup(&ih) {
                 if existing != profile {
                     warn!(
