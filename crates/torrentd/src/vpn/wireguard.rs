@@ -111,6 +111,18 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
     Ok(Some(Duration::from_secs(now - latest)))
 }
 
+/// Whether a link of this name exists on the host, read from sysfs rather
+/// than shelled out for.
+///
+/// [`interface_public_key`] cannot answer this. It returns `None` for a link
+/// that is not a WireGuard device, for a host with no usable `wg`, and for no
+/// link at all, alike — and the teardown exemption turns on telling the first
+/// two from the third. `/sys/class/net/<iface>` is the kernel's own list of
+/// links, it needs no privilege, and it spawns nothing.
+fn interface_exists(iface: &str) -> bool {
+    Path::new("/sys/class/net").join(iface).exists()
+}
+
 /// The public key WireGuard reports for a live interface, or `None` if the
 /// interface does not exist or `wg` cannot be run.
 fn interface_public_key(iface: &str) -> Option<String> {
@@ -184,36 +196,106 @@ impl WireguardManager {
     /// checking the rest would cost buy only a faster diagnosis of it.
     ///
     /// Adoption is likewise attempted on **any** non-zero `wg-quick up` exit
-    /// rather than on a probe for the interface first, or on matching
-    /// wg-quick's own "already exists" message. The public-key gate is what
-    /// decides safety; an existence probe adds a syscall path, and matching
-    /// the message adds a second thing to keep in step with a tool this
-    /// daemon does not own.
+    /// rather than on matching wg-quick's own "already exists" message, which
+    /// would be a second thing to keep in step with a tool this daemon does
+    /// not own. The public-key gate is what decides whether the tunnel may be
+    /// *adopted*.
     ///
     /// The refusal is reported as [`Adoption::Foreign`] rather than folded
     /// into "not adoptable", because the caller's teardown-on-failure path
     /// would otherwise run `wg-quick down <iface>` on the very interface this
-    /// function has just declined to touch.
+    /// function has just declined to touch. That reasoning is about ownership
+    /// and not about keys, so the exemption is decided by [`ownership`] on
+    /// "does a link of this name exist, and did this function establish that
+    /// it is ours" — see there for what turning it on the keys alone cost.
     fn adoptable(&self, profile: &VpnProfile) -> Adoption {
-        let (Some(live), Some(expected)) = (
-            interface_public_key(&profile.interface),
-            profile_public_key(&profile.config_path),
-        ) else {
-            return Adoption::No;
+        let exists = interface_exists(&profile.interface);
+        // Both key probes shell out, and neither has anything to adjudicate
+        // when there is no link of that name: `wg-quick up` fails for plenty
+        // of reasons that leave nothing behind.
+        let (live, expected) = if exists {
+            (
+                interface_public_key(&profile.interface),
+                profile_public_key(&profile.config_path),
+            )
+        } else {
+            (None, None)
         };
-        if live != expected {
-            warn!(
-                target: "torrentd::vpn::wireguard",
-                vpn_iface = %profile.interface,
-                "an interface of this name exists but carries a different public key; \
-                 refusing to adopt it",
-            );
-            return Adoption::Foreign;
+        match ownership(exists, live.as_deref(), expected.as_deref()) {
+            Ownership::Absent => Adoption::No,
+            Ownership::Unestablished => {
+                warn!(
+                    target: "torrentd::vpn::wireguard",
+                    vpn_iface = %profile.interface,
+                    live_key_read = live.is_some(),
+                    profile_key_read = expected.is_some(),
+                    "an interface of this name exists and this boot cannot establish \
+                     that it is ours; refusing to adopt it and leaving it alone",
+                );
+                Ownership::Unestablished.into()
+            }
+            Ownership::Ours => match super::ip_lookup::first_ipv4(&profile.interface) {
+                Ok(ip) => Adoption::Adopt(IpAddr::V4(ip)),
+                Err(_) => Adoption::No,
+            },
         }
-        match super::ip_lookup::first_ipv4(&profile.interface) {
-            Ok(ip) => Adoption::Adopt(IpAddr::V4(ip)),
-            Err(_) => Adoption::No,
+    }
+}
+
+/// Whose interface the one of this profile's name is, as far as this boot can
+/// establish from the host.
+///
+/// Split out from [`WireguardManager::adoptable`] and pure, because the rule
+/// is the whole of the defect and the three subprocess probes around it are
+/// what made it unreachable by a test.
+#[derive(Debug, Eq, PartialEq)]
+enum Ownership {
+    /// A link of that name exists and carries this profile's own public key.
+    /// The daemon has established that the tunnel is its own, so a failure
+    /// after this point is its own residue to remove.
+    Ours,
+    /// A link of that name exists and this boot could **not** establish that
+    /// it is its own: a different key, a key it could not read on either
+    /// side, or a link that is not a WireGuard device at all.
+    Unestablished,
+    /// No link of that name. Nothing of anyone's is standing there.
+    Absent,
+}
+
+/// `Unestablished` is the exemption, so `Foreign` is what it means to the
+/// caller.
+impl From<Ownership> for Adoption {
+    fn from(o: Ownership) -> Self {
+        match o {
+            Ownership::Unestablished => Adoption::Foreign,
+            _ => Adoption::No,
         }
+    }
+}
+
+/// Decide ownership from the three things the host was asked.
+///
+/// The condition is "a link of this name exists **and** adoption was not
+/// granted", not "both public keys were readable and they differ". Turning it
+/// on the keys made the exemption fire for exactly one of the several ways the
+/// daemon meets an interface it has not established as its own, and tore the
+/// rest down. The live case is the documented hardening pattern
+/// `PostUp = wg set %i private-key /etc/wireguard/wg-a.key`, which keeps the
+/// key out of the `.conf`: `profile_public_key` then reads no `PrivateKey`
+/// line and returns `None`, a `let ... else` fired before the comparison was
+/// ever reached, and `bring_up_tracked`'s catch-all ran `wg-quick down wg-a`
+/// on a stranger's tunnel — taking its routes and its rules with it, over a
+/// name collision. `SlotConfig::validate_set` checks the profile path's stem
+/// and its directory and never reads its contents, so that configuration is
+/// accepted and works normally. A link of that name that is not a WireGuard
+/// device at all is the same shape one probe over.
+fn ownership(exists: bool, live_key: Option<&str>, profile_key: Option<&str>) -> Ownership {
+    if !exists {
+        return Ownership::Absent;
+    }
+    match (live_key, profile_key) {
+        (Some(live), Some(expected)) if live == expected => Ownership::Ours,
+        _ => Ownership::Unestablished,
     }
 }
 
@@ -222,18 +304,21 @@ impl WireguardManager {
 /// `Foreign` is separate from `No` because the two call for opposite
 /// handling. `No` is an ordinary bring-up failure, and whatever `wg-quick up`
 /// may have half-created is this daemon's to remove. `Foreign` is an
-/// interface the daemon has just refused to adopt *because it is not ours* —
-/// so tearing it down would destroy someone else's tunnel, its routes and its
-/// rules, on the strength of a name collision. The caller
-/// (`BootCleanup::bring_up_tracked`) is what acts on the distinction.
-#[derive(Debug)]
+/// interface the daemon has just refused to adopt *because it has not
+/// established that it is ours* — so tearing it down may destroy someone
+/// else's tunnel, its routes and its rules, on the strength of a name
+/// collision. The caller (`BootCleanup::bring_up_tracked`) is what acts on
+/// the distinction.
+#[derive(Debug, Eq, PartialEq)]
 enum Adoption {
     /// Safe to adopt: the live interface carries this profile's key and has
     /// an address.
     Adopt(IpAddr),
-    /// An interface of this name exists and carries a different public key.
+    /// An interface of this name exists and this boot has not established
+    /// that it is its own — see [`Ownership::Unestablished`].
     Foreign,
-    /// Nothing to adopt: no such interface, no readable key, or no address.
+    /// Nothing to adopt: no interface of that name at all, or one this boot
+    /// established *is* its own and which has no address.
     No,
 }
 
@@ -260,10 +345,10 @@ impl VpnManager for WireguardManager {
             //
             // Adopt it instead, but only when it is genuinely the same tunnel:
             // a live WireGuard interface of that name, carrying the public key
-            // this profile configures. A name collision with someone else's
-            // tunnel is not adopted -- and it is reported as its own error,
-            // because refusing to adopt an interface and then tearing it down
-            // are the same act from the host's point of view.
+            // this profile configures. Anything else of that name that is
+            // standing there is reported as its own error, because refusing to
+            // adopt an interface and then tearing it down are the same act
+            // from the host's point of view.
             match self.adoptable(profile) {
                 Adoption::Adopt(ip) => {
                     warn!(
@@ -342,6 +427,92 @@ mod tests {
         assert!(
             matches!(r, Err(ProbeUnavailable::Refused | ProbeUnavailable::NoTool)),
             "got {r:?}",
+        );
+    }
+
+    /// The documented hardening pattern, and the whole of the reopened
+    /// finding: a profile with no `PrivateKey` line, because
+    /// `PostUp = wg set %i private-key /etc/wireguard/wg-a.key` sets it, and
+    /// an interface of that name that belongs to something else.
+    ///
+    /// `profile_public_key` reads no key, so the exemption that turned on
+    /// "both keys were readable and they differ" never fired, `bring_up`
+    /// returned `Spawn`, and the caller's catch-all ran `wg-quick down wg-a`
+    /// on a stranger's tunnel. Restore the both-keys-readable condition in
+    /// `ownership` and this fails.
+    #[test]
+    fn an_interface_whose_key_the_profile_does_not_carry_is_not_ours_to_tear_down() {
+        assert_eq!(
+            ownership(true, Some("live-key"), None),
+            Ownership::Unestablished,
+            "a key this boot could not derive does not make the interface ours",
+        );
+        assert_eq!(
+            Adoption::from(ownership(true, Some("live-key"), None)),
+            Adoption::Foreign,
+            "and `Foreign` is what exempts it from the teardown-on-failure path",
+        );
+    }
+
+    /// The secondary instance of the same class: a link of that name that is
+    /// not a WireGuard device at all, or a host where `wg` cannot be run, so
+    /// neither key reads.
+    #[test]
+    fn an_interface_that_is_not_a_wireguard_device_is_not_ours_to_tear_down() {
+        assert_eq!(
+            Adoption::from(ownership(true, None, None)),
+            Adoption::Foreign,
+        );
+        assert_eq!(
+            Adoption::from(ownership(true, None, Some("expected-key"))),
+            Adoption::Foreign,
+            "a readable profile key establishes nothing about the live link",
+        );
+    }
+
+    /// The case the narrow rule did cover, unchanged.
+    #[test]
+    fn an_interface_carrying_a_different_key_is_still_left_standing() {
+        assert_eq!(
+            ownership(true, Some("theirs"), Some("ours")),
+            Ownership::Unestablished,
+        );
+    }
+
+    /// And the two outcomes that must **not** be exempt, or the half-up
+    /// tunnel `BootCleanup` exists to remove would be left running.
+    #[test]
+    fn a_tunnel_this_boot_established_is_its_own_stays_this_boots_to_remove() {
+        assert_eq!(
+            ownership(true, Some("same"), Some("same")),
+            Ownership::Ours,
+            "matching keys are what `Adopt` requires",
+        );
+        assert_eq!(
+            Adoption::from(ownership(true, Some("same"), Some("same"))),
+            Adoption::No,
+            "an interface established as ours with no address is torn down",
+        );
+        assert_eq!(
+            ownership(false, None, None),
+            Ownership::Absent,
+            "no link of that name: whatever wg-quick half-created is ours",
+        );
+        assert_eq!(Adoption::from(ownership(false, None, None)), Adoption::No);
+    }
+
+    /// The probe the exemption needs and `interface_public_key` cannot give
+    /// it: "no such link" told apart from "a link I cannot identify".
+    #[test]
+    fn the_existence_probe_answers_from_the_kernels_own_link_list() {
+        assert!(
+            !interface_exists("torrentd-nonexistent-iface"),
+            "a name no link carries does not exist",
+        );
+        assert!(
+            interface_exists("lo"),
+            "loopback always does, and it is not a WireGuard device — which \
+             is the pair of answers the keys alone conflate",
         );
     }
 }
