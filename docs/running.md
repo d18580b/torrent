@@ -381,6 +381,21 @@ adding its own** — all three of the names in the table above, not just the two
 names leaves `Forwarded` a client-controlled input arriving from a peer this
 daemon believes.
 
+**A proxy that sets only the `X-` names must still strip `Forwarded`.** This
+is the part that is easy to skip, because such a proxy never sends
+`Forwarded` and it is tempting to conclude it has nothing to do about it. It
+does: where an `X-` name is **absent**, the client's `Forwarded` is what the
+daemon reads. Send no `X-Forwarded-Proto` and a client's `Forwarded:
+proto=https` sets `Secure` on the session cookie over a plain-HTTP request,
+which the browser will then neither store nor return — so the operator cannot
+log in. Send no `X-Forwarded-For` and a client's `for=` becomes the throttle
+key and the `client_ip` on the failed-login line.
+
+That fallback is deliberate: it is what makes a proxy emitting only the
+standardised `Forwarded` work at all, and that proxy is fully supported. The
+price is that the fallback is live in every deployment that sets only some of
+the three, and stripping the ones you do not set is what pays it.
+
 Each of these headers is a chain every hop appends to, so torrentd reads the
 *last* entry — the one the trusted proxy added — rather than the first, which
 is whatever the original client chose to send. Whether your proxy appends by
