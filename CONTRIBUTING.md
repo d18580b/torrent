@@ -104,8 +104,11 @@ mise run native     # submodules, then the one-off libtorrent build
 The Boost super-repo references ~150 sub-repos. With `--depth 1` (which `mise run native`
 uses) the total clone is roughly 1.5 GB. Without it, over 4 GB.
 
-The submodules are needed only to *provision* the native prefix described below. Once you
-have one, they can be absent — which is how CI skips the clone on all but the first job.
+The submodules are needed to *provision* the native prefix described below; once you have
+one, building does not need them, which is how CI skips the clone when the prefix cache
+hits. One exception: the shim FFI suite reads `.torrent` fixtures straight out of
+`vendor/libtorrent/test/test_torrents`, so `cargo test -p libtorrent-sys --features
+shim-tests` needs that submodule on disk regardless.
 
 ## Build
 
