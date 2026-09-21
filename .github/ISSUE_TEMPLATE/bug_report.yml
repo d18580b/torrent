@@ -94,7 +94,5 @@ body:
         these, and which ones it emits changes with the code. Paste the real lines
         whole.
       render: text
-      placeholder: |
-        {"timestamp":"2026-09-21T09:14:02.881234567+00:00","level":"ERROR","message":"failed to persist resume data","infohash":"0123456789abcdef0123456789abcdef01234567", …}
     validations:
       required: true
