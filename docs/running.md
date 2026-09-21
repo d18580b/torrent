@@ -35,7 +35,7 @@ runtime and are easy to miss because nothing checks for them at startup:
 | --- | --- | --- |
 | `ip` | `iproute2` / `iproute` | Any multi-slot deployment. Polled every 30s per slot for the tunnel IP. |
 | `wg`, `wg-quick` | `wireguard-tools` | WireGuard slots — bring-up, teardown, handshake age. |
-| `openvpn`, `kill` | `openvpn`, `procps-ng` / `procps` | OpenVPN slots. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. |
+| `openvpn`, `kill` | `openvpn`, `util-linux` (`util-linux-core` on Fedora) | OpenVPN slots. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. `kill` is spawned as a binary and not as a shell builtin, so `/usr/bin/kill` has to be on the host: that is `util-linux`, not `procps-ng`, which ships `pgrep` and `pkill` and no `kill`. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
 
 Single-session mode needs none of them.
