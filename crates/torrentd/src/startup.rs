@@ -447,10 +447,12 @@ pub async fn boot(
                 settings.outgoing_interfaces = Some(tunnel_ip.to_string());
                 // `[[slot]] upload_rate_limit` was parsed, documented in the
                 // sample config, and applied nowhere — a slot's limit silently
-                // did nothing. Zero means "inherit the top-level limit", which
-                // is what the default has always meant in practice.
-                if s.upload_rate_limit > 0 {
-                    settings.upload_rate_limit = Some(s.upload_rate_limit);
+                // did nothing. Omitted means "inherit the top-level limit";
+                // `0` means explicitly unlimited, which is what `0` means for
+                // the identically named top-level key and everywhere else in
+                // this configuration.
+                if let Some(v) = s.upload_rate_limit {
+                    settings.upload_rate_limit = Some(v);
                 }
                 settings.enable_dht = Some(false);
                 settings.enable_lsd = Some(false);

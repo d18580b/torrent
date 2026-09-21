@@ -116,7 +116,9 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # resume_dir               = "/var/lib/torrentd/resume/account_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/account_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
-# upload_rate_limit        = 0
+# upload_rate_limit        = 0    # bytes/sec for this slot; 0 = explicitly
+#                                 # unlimited. Omit the key entirely to
+#                                 # inherit the top-level upload_rate_limit.
 
 # [[slot]]
 # id                       = "account_b"
@@ -129,7 +131,9 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # resume_dir               = "/var/lib/torrentd/resume/account_b"
 # torrent_dir              = "/var/lib/torrentd/torrents/account_b"
 # allowed_tracker_domains  = ["tracker.example.com"]
-# upload_rate_limit        = 0
+# upload_rate_limit        = 0    # bytes/sec for this slot; 0 = explicitly
+#                                 # unlimited. Omit the key entirely to
+#                                 # inherit the top-level upload_rate_limit.
 
 # ---------------------------------------------------------------------------
 # Dynamic port forwarding (ProtonVPN / PIA-style ephemeral ports)
@@ -153,4 +157,6 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # resume_dir               = "/var/lib/torrentd/resume/proton_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/proton_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
-# upload_rate_limit        = 0
+# upload_rate_limit        = 0    # bytes/sec for this slot; 0 = explicitly
+#                                 # unlimited. Omit the key entirely to
+#                                 # inherit the top-level upload_rate_limit.
