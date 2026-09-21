@@ -153,7 +153,10 @@ needs one answers 409 naming the failure reason.
 
 One config file drives everything; unknown keys are a fatal error, inside
 `[[profile]]` tables too. See
-[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml).
+[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml), which documents
+every key, and
+[`deploy/torrentd.multi-account.sample.toml`](deploy/torrentd.multi-account.sample.toml),
+a complete two-account configuration with nothing commented out.
 
 A **profile** is one libtorrent session with its own network posture, identity
 and directories. At least one is required, and there is no default profile:
