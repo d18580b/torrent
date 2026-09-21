@@ -128,6 +128,25 @@ export interface ProfileSummary {
   user_agent: string
 }
 
+/// The body `POST /api/pool/adopt` requires.
+///
+/// `profile_id` is not optional: the handler rejects a request without one
+/// with 400, in every configuration. Declaring it required here is what makes
+/// omitting it a build failure rather than a button that silently 400s —
+/// which is what the adopt and preview buttons did, because the server made
+/// the field mandatory and no call site here ever sent it.
+export interface AdoptRequest {
+  profile_id: string
+  root_id?: number | null
+  path?: string
+  infohashes?: string[]
+  dry_run?: boolean
+}
+
+export function adoptPool(body: AdoptRequest): Promise<AdoptResponse> {
+  return api.post<AdoptResponse>('/api/pool/adopt', body)
+}
+
 export interface AdoptResponse {
   dry_run: boolean
   fast_path: string[]

@@ -10,7 +10,7 @@
     "download_rate_total": 0,
     "peers_total": 1043,
     "pending_resume_count": 0,
-    "slot_count": 1
+    "profile_count": 1
   },
   "/api/pool": {
     "roots": [

@@ -1,10 +1,12 @@
 //! Startup orchestrator: build the engine(s), wire the alert loop, bind
 //! the HTTP server, install signal handlers, and run until shutdown.
 //!
-//! The single-session and multi-profile paths converge at the AlertSource
-//! trait — both produce an `Arc<dyn AlertSource>` that the rest of the
-//! daemon consumes uniformly.
+//! There is one path, not two: every profile becomes a session, and the set
+//! of them becomes one `Arc<dyn AlertSource>` that the rest of the daemon
+//! consumes uniformly. A deployment with a single profile is that set with
+//! n = 1.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -219,6 +221,51 @@ pub async fn boot(
         AssignmentRegistry::load_from(cfg.registry_path(), cfg.legacy_registry_path())
             .context("load assignment registry")?,
     );
+
+    // Reconcile it against the configured profiles before anything reads it.
+    //
+    // The migration above carries a pre-profiles registry over verbatim, which
+    // means it still names that deployment's ids — `default`, on the
+    // single-session layout this release replaces. Nothing reconciles those
+    // with the `[[profile]]` tables, and nothing prunes them, so an id with no
+    // table behind it strands every torrent it holds: the resume and torrent
+    // scans are partitioned per profile and never look at the old paths, so
+    // nothing loads; re-adding answers 409 because the registry says the
+    // info-hash is taken; and `DELETE` cannot clear it either. The daemon
+    // reports itself healthy the whole time.
+    //
+    // Refusing is not the gentlest outcome, but it is the honest one: a silent
+    // total outage that answers 200 on `/healthz` is worse than a daemon that
+    // says which ids it does not recognise and what to do about them. The
+    // check runs against the *configured* set rather than the profiles that
+    // came up — a profile that failed its tunnel is Safety Rule 1's business,
+    // not this one's.
+    {
+        let configured: HashSet<ProfileId> = cfg.profile.iter().map(|p| p.id.clone()).collect();
+        let unknown = registry.unknown_profiles(&configured);
+        if !unknown.is_empty() {
+            let named = unknown
+                .iter()
+                .map(|(id, n)| format!("{id} ({n} torrent(s))"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let known = cfg
+                .profile
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "the assignment registry at {registry_path} assigns torrents to profiles that no \
+                 [[profile]] table declares: {named}. Configured profiles: {known}. Those \
+                 torrents cannot be loaded, re-added or deleted while the mismatch stands. \
+                 Either give one of the configured profiles the id the registry names — the \
+                 upgrade path from the pre-profiles layout, where every entry says `default` — \
+                 or remove those entries from {registry_path} and re-add the torrents.",
+                registry_path = cfg.registry_path().display(),
+            );
+        }
+    }
 
     // Metrics sink — created early so the startup scans can record registry
     // rejections (profile_assignment_registry_errors_total).
@@ -477,9 +524,9 @@ pub async fn boot(
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
         for (ih, data) in entries {
-            // Cross-check the registry; the spec aborts the profile on mismatch.
-            // Single-session always uses ProfileId::DEFAULT, so the check
-            // mainly guards multi-profile mode.
+            // Cross-check the registry; the spec aborts the profile on
+            // mismatch. A resume file under one profile's directory that the
+            // registry assigns to another is the operator's to reconcile.
             if let Some(existing) = registry.lookup(&ih) {
                 if existing != profile {
                     warn!(
@@ -655,14 +702,16 @@ pub async fn boot(
         metrics_for_loop,
         clock,
     )
-    // `listen_failed` is fatal in single-session mode
-    // (nothing else is listening, so seeding just stops silently). In
-    // multi-profile mode the per-profile handler marks that profile failed and the
-    // remaining profiles carry on.
-    // A listen failure is fatal only where the daemon has one
-    // profile: with several, the others keep serving and the failure is
-    // reported per profile rather than taking everything down.
-    .fatal_listen_failure(cfg.profile.len() == 1)
+    // A listen failure is fatal only where it stops the daemon listening at
+    // all: with a second session still up, the others keep serving and the
+    // failure is reported per profile rather than taking everything down.
+    //
+    // Keyed on the sessions that actually came up, not on `cfg.profile.len()`.
+    // A daemon configured with two profiles but reduced to one by a bring-up
+    // failure has exactly the same exposure as one configured with one — and
+    // keying on the configured count treated that survivor's listen failure as
+    // non-fatal, leaving a daemon that is up, healthy and listening on nothing.
+    .fatal_listen_failure(profile_registry.iter().count() == 1)
     .on_fatal({
         let tx = shutdown_tx.clone();
         Arc::new(move |reason| {

@@ -13,7 +13,9 @@
 //! fsync + rename) — a partial write must leave the previous registry
 //! file intact.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -190,6 +192,29 @@ impl AssignmentRegistry {
             .collect();
         v.sort_by(|a, b| a.1.as_str().cmp(b.1.as_str()).then(a.0 .0.cmp(&b.0 .0)));
         v
+    }
+
+    /// Profile ids this registry names that `configured` does not contain,
+    /// each with how many info-hashes it holds. Sorted, so a caller can put
+    /// them in a message without the order changing between runs.
+    ///
+    /// A registry carried over from the pre-profiles layout names the ids that
+    /// deployment used — `default` for every entry, on a single-session one —
+    /// and no `[[profile]]` table need declare any of them. Every consumer of
+    /// an entry treats a mapped info-hash as already owned and refuses to load
+    /// it again, and nothing prunes: `assign` conflicts, the API add path
+    /// answers 409, the pool's claim refuses the same way, and the startup
+    /// cross-check only ever compares against profiles that have files. An
+    /// entry naming a profile that does not exist is therefore a torrent that
+    /// nothing can load and nothing can clear.
+    pub fn unknown_profiles(&self, configured: &HashSet<ProfileId>) -> BTreeMap<String, usize> {
+        let mut out: BTreeMap<String, usize> = BTreeMap::new();
+        for profile in self.inner.read().values() {
+            if !configured.contains(profile) {
+                *out.entry(profile.as_str().to_string()).or_default() += 1;
+            }
+        }
+        out
     }
 
     /// All infohashes currently assigned to `profile`.
@@ -372,5 +397,55 @@ mod tests {
         as_a.sort_by_key(|ih| ih.0);
         assert_eq!(as_a.len(), 2);
         assert_eq!(r.for_profile(&ProfileId::new("b")).len(), 1);
+    }
+
+    #[test]
+    fn unknown_profiles_reports_every_id_no_configured_profile_declares() {
+        // What a registry migrated from the pre-profiles layout looks like:
+        // every entry names `default`, and the operator's new config declares
+        // `public`. Nothing downstream reconciles the two, so this is the only
+        // place the mismatch can be seen before it strands the library.
+        let dir = tempdir().unwrap();
+        let r = AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        r.assign(InfoHash([1u8; 20]), ProfileId::new("default"))
+            .unwrap();
+        r.assign(InfoHash([2u8; 20]), ProfileId::new("default"))
+            .unwrap();
+        r.assign(InfoHash([3u8; 20]), ProfileId::new("public"))
+            .unwrap();
+
+        let configured: HashSet<ProfileId> = [ProfileId::new("public")].into_iter().collect();
+        let unknown = r.unknown_profiles(&configured);
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown.get("default"), Some(&2));
+
+        // Declare it and nothing is unknown — the way out the refusal offers.
+        let configured: HashSet<ProfileId> = [ProfileId::new("public"), ProfileId::new("default")]
+            .into_iter()
+            .collect();
+        assert!(r.unknown_profiles(&configured).is_empty());
+    }
+
+    #[test]
+    fn a_legacy_registry_read_under_the_new_name_still_names_the_old_profile_ids() {
+        // The migration is verbatim by design, so the ids it carries over are
+        // the pre-profiles deployment's — which is exactly why the caller has
+        // to reconcile them rather than assume the rewrite fixed them.
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("slot_assignments.json");
+        fs::write(
+            &legacy,
+            br#"{"0101010101010101010101010101010101010101":"default"}"#,
+        )
+        .unwrap();
+
+        let r = AssignmentRegistry::load_from(
+            dir.path().join("profile_assignments.json"),
+            Some(legacy),
+        )
+        .unwrap();
+
+        let configured: HashSet<ProfileId> = [ProfileId::new("public")].into_iter().collect();
+        assert_eq!(r.unknown_profiles(&configured).get("default"), Some(&1));
     }
 }

@@ -1107,6 +1107,68 @@ fn plan_steps_are_journaled_before_they_run() {
     assert_eq!(steps[1].status, "pending");
 }
 
+/// Hand-build a genuine v1 index at `db`, carrying one torrent assigned to
+/// `acct_a`.
+///
+/// The column is `slot`, not `profile`, and the index is `torrent_by_slot`:
+/// that is what v1 shipped, and a fixture that spells it the new way tests a
+/// database no deployment has. The v3 migration is the only thing that turns
+/// `slot` into `profile`, so a fixture that starts out renamed cannot fail when
+/// that migration is missing.
+fn build_v1_index(db: &Path) {
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.execute_batch(
+        "CREATE TABLE root (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                            enabled INTEGER NOT NULL DEFAULT 1);
+         CREATE TABLE file (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL,
+                            size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
+                            ino INTEGER NOT NULL, dev INTEGER NOT NULL,
+                            v2_root BLOB, scanned_at INTEGER NOT NULL,
+                            PRIMARY KEY (root_id, rel_path)) WITHOUT ROWID;
+         CREATE TABLE torrent (infohash TEXT PRIMARY KEY, infohash_v1 TEXT,
+                            infohash_v2 TEXT, name TEXT NOT NULL,
+                            total_size INTEGER NOT NULL, num_files INTEGER NOT NULL,
+                            source_path TEXT NOT NULL, fastresume_path TEXT,
+                            declared_save_path TEXT, category TEXT, tags TEXT,
+                            slot TEXT, added_at INTEGER NOT NULL);
+         CREATE INDEX torrent_by_slot ON torrent(slot) WHERE slot IS NOT NULL;
+         CREATE TABLE torrent_file (infohash TEXT NOT NULL, idx INTEGER NOT NULL,
+                            rel_path TEXT NOT NULL, size INTEGER NOT NULL,
+                            pieces_root BLOB, PRIMARY KEY (infohash, idx)) WITHOUT ROWID;
+         CREATE TABLE adoption (infohash TEXT PRIMARY KEY, state TEXT NOT NULL,
+                            root_id INTEGER, base_rel TEXT, verified_at INTEGER,
+                            drift_at INTEGER, last_error TEXT);
+         CREATE TABLE claim (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL,
+                            infohash TEXT NOT NULL,
+                            PRIMARY KEY (root_id, rel_path, infohash)) WITHOUT ROWID;",
+    )
+    .unwrap();
+    c.execute(
+        "INSERT INTO torrent(infohash, name, total_size, num_files, source_path, slot, added_at)
+         VALUES ('legacy', 'Old', 1, 1, '/lib/old.torrent', 'acct_a', 0)",
+        [],
+    )
+    .unwrap();
+    c.pragma_update(None, "user_version", 1i64).unwrap();
+}
+
+/// The v2 journal tables, applied on top of a v1 index.
+fn apply_v2_journal(db: &Path) {
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.execute_batch(
+        "CREATE TABLE plan (id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+                            created_at INTEGER NOT NULL, applied_at INTEGER,
+                            status TEXT NOT NULL, spec TEXT NOT NULL);
+         CREATE INDEX plan_by_status ON plan(status);
+         CREATE TABLE plan_step (plan_id INTEGER NOT NULL REFERENCES plan(id) ON DELETE CASCADE,
+                            seq INTEGER NOT NULL, op TEXT NOT NULL, src TEXT NOT NULL,
+                            dst TEXT, status TEXT NOT NULL, error TEXT,
+                            PRIMARY KEY (plan_id, seq)) WITHOUT ROWID;",
+    )
+    .unwrap();
+    c.pragma_update(None, "user_version", 2i64).unwrap();
+}
+
 #[test]
 fn a_v1_index_migrates_forward_in_place() {
     // The upgrade path a running deployment takes: an index created before the
@@ -1114,42 +1176,7 @@ fn a_v1_index_migrates_forward_in_place() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pool.db");
 
-    {
-        // Hand-build a v1 index: the v1 tables plus user_version = 1.
-        let c = rusqlite::Connection::open(&db).unwrap();
-        c.execute_batch(
-            "CREATE TABLE root (id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
-                                enabled INTEGER NOT NULL DEFAULT 1);
-             CREATE TABLE file (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL,
-                                size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
-                                ino INTEGER NOT NULL, dev INTEGER NOT NULL,
-                                v2_root BLOB, scanned_at INTEGER NOT NULL,
-                                PRIMARY KEY (root_id, rel_path)) WITHOUT ROWID;
-             CREATE TABLE torrent (infohash TEXT PRIMARY KEY, infohash_v1 TEXT,
-                                infohash_v2 TEXT, name TEXT NOT NULL,
-                                total_size INTEGER NOT NULL, num_files INTEGER NOT NULL,
-                                source_path TEXT NOT NULL, fastresume_path TEXT,
-                                declared_save_path TEXT, category TEXT, tags TEXT,
-                                profile TEXT, added_at INTEGER NOT NULL);
-             CREATE TABLE torrent_file (infohash TEXT NOT NULL, idx INTEGER NOT NULL,
-                                rel_path TEXT NOT NULL, size INTEGER NOT NULL,
-                                pieces_root BLOB, PRIMARY KEY (infohash, idx)) WITHOUT ROWID;
-             CREATE TABLE adoption (infohash TEXT PRIMARY KEY, state TEXT NOT NULL,
-                                root_id INTEGER, base_rel TEXT, verified_at INTEGER,
-                                drift_at INTEGER, last_error TEXT);
-             CREATE TABLE claim (root_id INTEGER NOT NULL, rel_path TEXT NOT NULL,
-                                infohash TEXT NOT NULL,
-                                PRIMARY KEY (root_id, rel_path, infohash)) WITHOUT ROWID;",
-        )
-        .unwrap();
-        c.execute(
-            "INSERT INTO torrent(infohash, name, total_size, num_files, source_path, profile, added_at)
-             VALUES ('legacy', 'Old', 1, 1, '/lib/old.torrent', 'acct_a', 0)",
-            [],
-        )
-        .unwrap();
-        c.pragma_update(None, "user_version", 1i64).unwrap();
-    }
+    build_v1_index(&db);
 
     let store = PoolStore::open(&db).unwrap();
     // Pre-existing data survives…
@@ -1165,6 +1192,73 @@ fn a_v1_index_migrates_forward_in_place() {
     drop(store);
     let store = PoolStore::open(&db).unwrap();
     assert_eq!(store.torrent_count().unwrap(), 1);
+}
+
+#[test]
+fn a_v2_index_migrates_its_slot_column_to_profile() {
+    // The upgrade every deployment on the released schema takes. A v2 index
+    // has a `slot` column; every query this crate issues names `profile`. If
+    // the rename is folded into v1 instead of applied as its own version,
+    // `migrate` runs no DDL at `user_version = 2`, `open` still succeeds, the
+    // daemon boots clean — and the first pool query fails with
+    // `no such column: profile`, with nothing to recover but deleting the
+    // index and the mutation journal along with it.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    // Open must migrate rather than accept the file as current.
+    let mut store = PoolStore::open(&db).unwrap();
+
+    // The assignment survived the rename under its new name — this is the read
+    // that returns `no such column: profile` without the migration.
+    assert_eq!(
+        store.profile_of("legacy").unwrap().as_deref(),
+        Some("acct_a")
+    );
+    // Every other query that names the column works too: the whole-table read,
+    // the write, and the legacy-registry fold.
+    assert_eq!(store.torrents().unwrap().len(), 1);
+    store.set_profile("legacy", Some("acct_b")).unwrap();
+    assert_eq!(
+        store.profile_of("legacy").unwrap().as_deref(),
+        Some("acct_b")
+    );
+    add_torrent(&mut store, "fresh", "Fresh", None, &[("a.bin", 1)]);
+    let mut legacy = std::collections::HashMap::new();
+    legacy.insert("fresh".to_string(), "acct_c".to_string());
+    assert_eq!(store.import_legacy_registry(&legacy).unwrap(), 1);
+    assert_eq!(
+        store.profile_of("fresh").unwrap().as_deref(),
+        Some("acct_c")
+    );
+
+    // The index follows the column rather than keeping its v1 name over it.
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let names: Vec<String> = c
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'torrent'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "torrent_by_profile"),
+            "torrent_by_profile missing, got {names:?}",
+        );
+        assert!(
+            !names.iter().any(|n| n == "torrent_by_slot"),
+            "torrent_by_slot survived the rename, got {names:?}",
+        );
+    }
+
+    // Reopening is idempotent — the rename must not be attempted twice.
+    drop(store);
+    let store = PoolStore::open(&db).unwrap();
+    assert_eq!(store.torrent_count().unwrap(), 2);
 }
 
 #[test]

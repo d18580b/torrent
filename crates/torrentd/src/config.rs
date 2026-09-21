@@ -86,19 +86,21 @@ pub struct Config {
     pub user_agent: Option<String>,
 
     /// Max age of a WireGuard tunnel's latest handshake before the health
-    /// monitor treats the profile as down (multi-profile mode). Catches a tunnel that
+    /// monitor treats the profile as down. Catches a tunnel that
     /// keeps its IP but has silently stopped handshaking. Default 180s.
     #[serde(default = "Config::default_handshake_max_age")]
     pub vpn_handshake_max_age_secs: u64,
 
-    /// Install a fail-closed nftables kill switch (multi-profile mode) that
+    /// Install a fail-closed nftables kill switch that
     /// confines the daemon's egress to loopback + the profiles' tunnel interfaces.
     /// Off by default; requires `CAP_NET_ADMIN` and that torrentd runs as its own
     /// user. See `vpn::killswitch`.
     #[serde(default)]
     pub network_kill_switch: bool,
 
-    /// `[[profile]]` array. Empty → single-session mode.
+    /// `[[profile]]` array. Empty is refused: `ProfileConfigError::NoProfiles`.
+    /// There is no implicit profile, because the only thing an implicit one
+    /// could be is the least private posture the daemon has.
     #[serde(default)]
     pub profile: Vec<ProfileConfig>,
 
@@ -500,7 +502,7 @@ impl Config {
 
     /// The pre-rename registry file, if it is the only one present.
     ///
-    /// Renaming profiles to profiles renamed this file too, and a daemon that
+    /// Renaming slots to profiles renamed this file too, and a daemon that
     /// simply started with an empty registry would have no record of which
     /// profile owns which info-hash — which is the authority for the
     /// cross-profile uniqueness rule. It would then happily load the same
@@ -535,6 +537,16 @@ impl Config {
     /// single shared file would have them overwriting each other's routing
     /// table. This replaces the top-level `session_state_path` key, which
     /// could only ever have described one session.
+    ///
+    /// A pre-profiles `session_state.dat` beside this one is **not** migrated,
+    /// while the assignment registry in the same directory is — the asymmetry
+    /// is deliberate. The registry cannot be reconstructed: losing it loses
+    /// which torrent belonged to which account, which is the property the
+    /// engine's Safety Rules exist to protect. A DHT routing table rebuilds
+    /// from the bootstrap nodes within minutes, and picking a profile to
+    /// inherit one would seed that profile's session with another's peer
+    /// history. The upgrade note in `docs/running.md` tells the operator to
+    /// delete the orphan.
     pub fn session_state_path(&self, profile: &ProfileId) -> PathBuf {
         self.state_dir()
             .join(format!("session_state-{}.dat", profile.as_str()))
@@ -652,7 +664,7 @@ impl ConfigDiff {
 }
 
 impl Config {
-    /// A minimal single-session config with `[pool]` rooted at `dir/pool`.
+    /// A minimal one-profile config with `[pool]` rooted at `dir/pool`.
     ///
     /// Test-only, and deliberately built from the real types rather than from
     /// TOML, so a required field added to `Config` breaks this at compile time
