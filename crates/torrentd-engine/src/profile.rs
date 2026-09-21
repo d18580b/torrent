@@ -355,8 +355,16 @@ impl TryFrom<RawProfile> for ProfileConfig {
     }
 }
 
-impl From<&ProfileConfig> for RawProfile {
-    fn from(c: &ProfileConfig) -> Self {
+impl ProfileConfig {
+    /// The flat TOML shape this profile deserialized from.
+    ///
+    /// Private, and reachable only through `Serialize` below. It shipped as a
+    /// public `From<&ProfileConfig> for RawProfile` with no caller at all:
+    /// `/api/profiles` builds its own wire structs, and nothing serializes a
+    /// `Config`. A public conversion direction nobody exercises is how a
+    /// serializer and a deserializer stop agreeing without anything saying so.
+    fn to_raw(&self) -> RawProfile {
+        let c = self;
         let mut raw = RawProfile {
             id: c.id.clone(),
             network: NetworkKind::Host,
@@ -413,7 +421,7 @@ impl<'de> Deserialize<'de> for ProfileConfig {
 
 impl Serialize for ProfileConfig {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        RawProfile::from(self).serialize(s)
+        self.to_raw().serialize(s)
     }
 }
 
@@ -947,6 +955,24 @@ mod tests {
             host("public2", "0.0.0.0:6882", false),
         ];
         ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    #[test]
+    fn a_profile_survives_a_serialize_deserialize_round_trip() {
+        // `Config` derives `Serialize`, which is what keeps this direction
+        // compiled; nothing in the daemon calls it. Untested, the serializer
+        // and the deserializer can drift apart silently — a field added to one
+        // and not the other costs nothing until something finally does
+        // serialize a config.
+        for original in [
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            host("public", "0.0.0.0:6881,[::]:6881", true),
+            host("public2", "0.0.0.0:6882", false),
+        ] {
+            let wire = serde_json::to_string(&original).expect("serialize");
+            let back: ProfileConfig = serde_json::from_str(&wire).expect("deserialize");
+            assert_eq!(back, original, "round trip lost something:\n{wire}");
+        }
     }
 
     #[test]
