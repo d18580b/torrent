@@ -35,7 +35,7 @@ runtime and are easy to miss because nothing checks for them at startup:
 | --- | --- | --- |
 | `ip` | `iproute2` / `iproute` | Any multi-slot deployment. Polled every 30s per slot for the tunnel IP. |
 | `wg`, `wg-quick` | `wireguard-tools` | WireGuard slots — bring-up, teardown, handshake age. |
-| `openvpn`, `kill` | `openvpn`, `util-linux` | OpenVPN slots. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. |
+| `openvpn`, `kill` | `openvpn`, `procps-ng` / `procps` | OpenVPN slots. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
 
 Single-session mode needs none of them.
@@ -178,6 +178,14 @@ refused at startup, and by `--check-config`, rather than discovered later.
 a different stem, or in any other directory, brings up a tunnel that no
 shutdown or restart can ever take down. OpenVPN slots are unaffected —
 torrentd passes `--dev` explicitly, so their profile name carries no meaning.
+
+**Upgrading:** this rule is new, and it is a hard refusal, so a daemon that
+has been running for months with a WireGuard profile somewhere else will not
+start after the upgrade. That is deliberate — such a tunnel comes up and can
+never be torn down, which is the defect the rule exists to make unreachable —
+and it is catchable before the running daemon stops: `--check-config` refuses
+the same config, and `deploy/torrentd.service` runs it as `ExecStartPre`. Move
+the file to `/etc/wireguard/<vpn_interface>.conf` and update `vpn_profile`.
 
 **`[[slot]] upload_rate_limit`** (optional, bytes/sec) is applied to that
 slot's session at boot. **Omit it to inherit the top-level
