@@ -13,12 +13,19 @@
 //!
 //! Observe-only by default. Nothing in the default path mutates host state:
 //! it reads interfaces, reads `wg` output, and — for a NAT-PMP slot — asks the
-//! gateway for a mapping and immediately releases it again. `--bring-up` opts
-//! into raising and lowering tunnels, which is the one thing that changes the
-//! machine.
+//! gateway for a mapping with a short lease and lets that lease lapse. That
+//! changes no state the daemon depends on.
+//!
+//! `--bring-up` opts into raising tunnels, which is the one thing here that
+//! changes the machine. It lowers again **only** what it raised: an interface
+//! that already existed when the command started belongs to something else —
+//! usually a running daemon — and is reported, checked, and left alone.
 
 use std::net::IpAddr;
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
@@ -26,6 +33,7 @@ use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
 use torrentd_engine::SlotConfig;
+use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
 
 use crate::config::Config;
@@ -122,6 +130,49 @@ fn tool_available(bin: &str, probe_arg: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// The host-touching operations a slot's checks perform, behind a trait so the
+/// branch structure around them is testable without a tunnel or a gateway.
+///
+/// Two of those branches are the reason this exists rather than being inlined:
+/// whether `--bring-up` tears an interface down, and whether the NAT-PMP
+/// negotiation releases what it mapped. Both are decisions about somebody
+/// else's live daemon, and a decision that can only be exercised on a host
+/// with a real tunnel is a decision nothing can hold in place.
+pub trait CheckHost {
+    /// Whether the kernel already has this interface.
+    ///
+    /// Deliberately not `first_ipv4`: an interface that exists with no address
+    /// is still an interface this command did not create, and tearing it down
+    /// is still somebody else's outage.
+    fn interface_exists(&self, iface: &str) -> bool;
+
+    /// The address the daemon would bind every socket in this slot to.
+    fn first_ipv4(&self, iface: &str) -> std::io::Result<Ipv4Addr>;
+
+    /// The tunnel manager for a slot's VPN type.
+    fn manager(&self, t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager>;
+}
+
+/// `CheckHost` against the actual machine.
+#[derive(Debug, Clone, Copy)]
+pub struct RealHost;
+
+impl CheckHost for RealHost {
+    fn interface_exists(&self, iface: &str) -> bool {
+        // The kernel's own list. `ip link show` would answer the same question
+        // through a subprocess whose absence we already report separately.
+        Path::new("/sys/class/net").join(iface).exists()
+    }
+
+    fn first_ipv4(&self, iface: &str) -> std::io::Result<Ipv4Addr> {
+        vpn::first_ipv4(iface)
+    }
+
+    fn manager(&self, t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager> {
+        vpn::for_type(t, run_dir)
+    }
 }
 
 /// Checks that are about the host, not any one slot.
@@ -277,6 +328,7 @@ fn slot_checks(
     slot: &SlotConfig,
     bring_up: bool,
     egress: Option<SocketAddr>,
+    host: &dyn CheckHost,
 ) -> SlotReport {
     let mut checks = Vec::new();
     let iface = slot.vpn_interface.as_str();
@@ -317,24 +369,53 @@ fn slot_checks(
         }
     }
 
-    // 3. Optionally raise the tunnel, exactly as boot would.
-    let manager = vpn::for_type(slot.vpn_type, &cfg.state_dir());
+    // 3. Optionally raise the tunnel, exactly as boot would — but only if it
+    //    is not already there.
+    //
+    //    `wg-quick up` refuses an interface that already exists, and the
+    //    adoption path in `vpn::wireguard` then matches the profile's public
+    //    key and returns the address anyway. So a running daemon's tunnel used
+    //    to be reported as "came up" having been created by nothing, and the
+    //    unconditional teardown below then ran the same `wg-quick down` the
+    //    daemon's own shutdown uses. The slot went down, `vpn_monitor` fenced
+    //    it within 30s, and nothing re-raised it: a diagnostic command took a
+    //    live seeding slot out until someone restarted the daemon.
+    //
+    //    An interface that was already there is adopted for every remaining
+    //    check and never lowered. That also leaves the flag useful for the
+    //    case it exists for — a crash-orphaned interface is still raised and
+    //    still checked.
+    let manager = host.manager(slot.vpn_type, &cfg.state_dir());
+    let mut raised_here = false;
     if bring_up {
-        match manager.bring_up(&slot.vpn_profile()) {
-            Ok(ip) => checks.push(Check::pass("bring_up", format!("tunnel came up on {ip}"))),
-            Err(e) => {
-                checks.push(Check::fail("bring_up", format!("{e}")));
-                return SlotReport {
-                    slot_id: slot.id.as_str().to_string(),
-                    vpn_type: vpn_type_str(slot.vpn_type),
-                    checks,
-                };
+        if host.interface_exists(iface) {
+            checks.push(Check::skip(
+                "bring_up",
+                format!(
+                    "{iface} already exists — not raised by this command, and it will not be \
+                     taken down. Every check below runs against it as it stands."
+                ),
+            ));
+        } else {
+            match manager.bring_up(&slot.vpn_profile()) {
+                Ok(ip) => {
+                    raised_here = true;
+                    checks.push(Check::pass("bring_up", format!("tunnel came up on {ip}")));
+                }
+                Err(e) => {
+                    checks.push(Check::fail("bring_up", format!("{e}")));
+                    return SlotReport {
+                        slot_id: slot.id.as_str().to_string(),
+                        vpn_type: vpn_type_str(slot.vpn_type),
+                        checks,
+                    };
+                }
             }
         }
     }
 
     // 4. The address the daemon would bind every socket in this slot to.
-    let tunnel_ip = match vpn::first_ipv4(iface) {
+    let tunnel_ip = match host.first_ipv4(iface) {
         Ok(v4) => {
             checks.push(Check::pass("tunnel_ip", format!("{iface} has {v4}")));
             Some(IpAddr::V4(v4))
@@ -450,7 +531,9 @@ fn slot_checks(
         checks.push(egress_probe(src, dest));
     }
 
-    if bring_up {
+    // 8. Lower only what step 3 raised. An adopted interface is left exactly
+    //    as it was found, and produces no `bring_down` line at all.
+    if raised_here {
         manager.bring_down(iface);
         checks.push(Check::pass("bring_down", "tunnel taken back down"));
     }
@@ -493,11 +576,12 @@ pub fn check(
         anyhow::bail!("no slot matches {:?}", only.unwrap_or_default());
     }
 
+    let host = RealHost;
     let report = Report {
         host: host_checks(cfg),
         slots: selected
             .into_iter()
-            .map(|s| slot_checks(cfg, s, bring_up, egress))
+            .map(|s| slot_checks(cfg, s, bring_up, egress, &host))
             .collect(),
     };
 
@@ -537,7 +621,184 @@ fn print_human(report: &Report) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use torrentd_engine::MockVpn;
+
     use super::*;
+
+    /// A `CheckHost` with no host behind it: every answer is scripted, and the
+    /// tunnel manager and NAT-PMP client are the engine's recording doubles,
+    /// so what the checks *did* to them is assertable.
+    #[derive(Debug)]
+    struct FakeHost {
+        existing: Vec<String>,
+        addrs: Mutex<Vec<(String, Option<Ipv4Addr>)>>,
+        vpn: MockVpn,
+    }
+
+    impl FakeHost {
+        fn new() -> Self {
+            Self {
+                existing: Vec::new(),
+                addrs: Mutex::new(Vec::new()),
+                vpn: MockVpn::new(),
+            }
+        }
+
+        /// `iface` is already present on the host before the command runs.
+        fn with_existing(mut self, iface: &str) -> Self {
+            self.existing.push(iface.to_string());
+            self
+        }
+
+        /// Script what `first_ipv4(iface)` returns, call by call, so the
+        /// address can change across the run the way a real bring-up or
+        /// teardown changes it.
+        fn with_addrs(
+            self,
+            seq: impl IntoIterator<Item = (&'static str, Option<Ipv4Addr>)>,
+        ) -> Self {
+            *self.addrs.lock().unwrap() =
+                seq.into_iter().map(|(i, a)| (i.to_string(), a)).collect();
+            self
+        }
+    }
+
+    impl CheckHost for FakeHost {
+        fn interface_exists(&self, iface: &str) -> bool {
+            self.existing.iter().any(|i| i == iface)
+        }
+
+        fn first_ipv4(&self, iface: &str) -> std::io::Result<Ipv4Addr> {
+            let mut g = self.addrs.lock().unwrap();
+            let next = if g.is_empty() {
+                None
+            } else {
+                Some(g.remove(0))
+            };
+            match next {
+                Some((_, Some(ip))) => Ok(ip),
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no IPv4 address on {iface}"),
+                )),
+            }
+        }
+
+        fn manager(&self, _t: VpnType, _run_dir: &Path) -> Arc<dyn VpnManager> {
+            Arc::new(self.vpn.clone())
+        }
+    }
+
+    /// A multi-slot config with one WireGuard slot, built from TOML so a
+    /// required field added to `SlotConfig` breaks this rather than letting it
+    /// exercise a shape the daemon never parses.
+    fn cfg_with_slot(extra: &str) -> Config {
+        toml::from_str(&format!(
+            r#"
+listen_interfaces = "0.0.0.0:6881"
+default_save_path = "/tmp/torrentd-test/data"
+resume_dir = "/tmp/torrentd-test/state/resume"
+torrent_dir = "/tmp/torrentd-test/torrents"
+http_listen = "127.0.0.1:8080"
+
+[[slot]]
+id                   = "acct_a"
+vpn_profile          = "/etc/wireguard/wg-acct-a.conf"
+vpn_type             = "wireguard"
+vpn_interface        = "wg-acct-a"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+resume_dir           = "/tmp/torrentd-test/state/resume/acct_a"
+torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
+{extra}
+"#
+        ))
+        .expect("test config parses")
+    }
+
+    fn find<'a>(checks: &'a [Check], name: &str) -> Option<&'a Check> {
+        checks.iter().find(|c| c.name == name)
+    }
+
+    #[test]
+    fn bring_up_never_lowers_an_interface_it_did_not_raise() {
+        // F1. The daemon is up and seeding on wg-acct-a. `--bring-up` finds
+        // the interface already there, so it must adopt it: report the
+        // bring-up as `skip`, run the remaining checks, and issue no teardown
+        // at all. A `bring_down` recorded here is a live slot fenced until
+        // someone restarts the daemon.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new()
+            .with_existing("wg-acct-a")
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+
+        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+
+        assert!(
+            host.vpn.bring_down_calls().is_empty(),
+            "an adopted interface must never be brought down, got {:?}",
+            host.vpn.bring_down_calls(),
+        );
+        assert!(
+            host.vpn.bring_up_calls().is_empty(),
+            "an existing interface must not be handed to bring_up either",
+        );
+        assert!(
+            find(&r.checks, "bring_down").is_none(),
+            "an adopted interface produces no bring_down line",
+        );
+        let bu = find(&r.checks, "bring_up").expect("a bring_up line is still reported");
+        assert_eq!(bu.verdict, Verdict::Skip, "detail: {}", bu.detail);
+        assert!(
+            bu.detail.contains("wg-acct-a") && bu.detail.contains("already exists"),
+            "the operator has to be told why it was skipped: {}",
+            bu.detail,
+        );
+        // Adoption is not an early return: the rest of the slot is still
+        // checked against the interface as it stands.
+        assert!(find(&r.checks, "tunnel_ip").is_some());
+    }
+
+    #[test]
+    fn bring_up_raises_and_lowers_an_interface_that_was_not_there() {
+        // The complement of the above, and the case the flag exists for: a
+        // crash-orphaned or never-raised interface is raised, checked, and put
+        // back the way it was found.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new().with_addrs([
+            ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
+            ("wg-acct-a", None),
+        ]);
+        host.vpn
+            .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+
+        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+
+        assert_eq!(host.vpn.bring_up_calls(), vec!["wg-acct-a"]);
+        assert_eq!(host.vpn.bring_down_calls(), vec!["wg-acct-a"]);
+        assert_eq!(
+            find(&r.checks, "bring_up").map(|c| c.verdict),
+            Some(Verdict::Pass),
+        );
+    }
+
+    #[test]
+    fn without_bring_up_no_tunnel_is_touched_either_way() {
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new()
+            .with_existing("wg-acct-a")
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+
+        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+
+        assert!(host.vpn.bring_up_calls().is_empty());
+        assert!(host.vpn.bring_down_calls().is_empty());
+        assert!(find(&r.checks, "bring_up").is_none());
+        assert!(find(&r.checks, "bring_down").is_none());
+    }
 
     #[test]
     fn a_report_fails_when_any_check_fails() {
