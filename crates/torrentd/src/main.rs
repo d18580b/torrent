@@ -104,6 +104,54 @@ fn new_token_cmd(name: &str, scopes: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The subcommand's name as an operator typed it, for error messages.
+fn subcommand_name(command: &Command) -> &'static str {
+    match command {
+        Command::Pool { cmd } => match cmd {
+            PoolCmd::Scan => "pool scan",
+            PoolCmd::Status => "pool status",
+            PoolCmd::Check => "pool check",
+            PoolCmd::Orphans { .. } => "pool orphans",
+        },
+        Command::Vpn { cmd } => match cmd {
+            cli::VpnCmd::Check { .. } => "vpn check",
+        },
+        Command::HashPassword => "hash-password",
+        Command::NewToken { .. } => "new-token",
+    }
+}
+
+/// Refuse `--check-config` given together with a subcommand.
+///
+/// The two ask for different validations. `--check-config` answers "would the
+/// daemon start from this file", so it takes the full check including the
+/// authentication posture; an operator subcommand takes everything but that
+/// posture, because it constructs no session and binds nothing. One invocation
+/// cannot satisfy both, and `load_config` resolves the tie by keying the
+/// exemption on `cli.command.is_some() && !cli.check_config` — so the flag won
+/// and the subcommand was **silently discarded**. `--check-config
+/// hash-password` validated as the daemon, printed `config OK`, exited 0 and
+/// never hashed anything.
+///
+/// Running the subcommand after the check is not available: it would have to
+/// satisfy both validations at once, and a `hash-password` refused by the very
+/// config the refusal sends an operator to it to fix is the thing the
+/// exemption exists to prevent.
+fn check_config_with_subcommand(cli: &Cli) -> Option<String> {
+    if !cli.check_config {
+        return None;
+    }
+    let name = subcommand_name(cli.command.as_ref()?);
+    Some(format!(
+        "--check-config was given together with the `{name}` subcommand, and they ask for \
+         different things. --check-config answers \"would the daemon start from this file\", \
+         which includes the authentication posture; `{name}` is an operator tool, which is \
+         exempt from that check precisely so it still runs against a config the daemon \
+         refuses. One invocation cannot be both, and this one used to validate as the daemon \
+         and then discard `{name}` without running it. Run one or the other."
+    ))
+}
+
 /// Load the config with the validation this invocation actually needs.
 ///
 /// The daemon and `--check-config` get the full check, authentication posture
@@ -147,6 +195,14 @@ fn check_config(cfg: &config::Config) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Exit 2, the usage-error status, rather than 1: nothing about the
+    // configuration is wrong, the invocation is.
+    if let Some(msg) = check_config_with_subcommand(&cli) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
+    }
+
     let cfg = load_config(&cli)?;
 
     if cli.check_config {
@@ -265,6 +321,53 @@ mod tests {
             assert!(
                 load_config(&cli).is_ok(),
                 "{argv:?} must load: it serves nothing",
+            );
+        }
+    }
+
+    #[test]
+    fn check_config_beside_a_subcommand_is_refused_naming_both() {
+        // The property: an invocation that asks for two incompatible
+        // validations is refused rather than silently resolved in favour of
+        // one. `load_config` keys the operator-tool exemption on
+        // `cli.command.is_some() && !cli.check_config`, so the flag won and
+        // the subcommand was dropped: `--check-config hash-password`
+        // validated as the daemon, printed `config OK`, exited 0 and never
+        // hashed anything. A flag that swallows the subcommand beside it is
+        // worse than either behaviour it was choosing between.
+        //
+        // The message must name both, because the operator has to know which
+        // half to drop.
+        for (argv, sub) in [
+            (vec!["torrentd", "-c", "x", "--check-config", "hash-password"], "hash-password"),
+            (
+                vec!["torrentd", "-c", "x", "--check-config", "new-token", "--name", "ci"],
+                "new-token",
+            ),
+            (vec!["torrentd", "-c", "x", "--check-config", "pool", "status"], "pool status"),
+            (vec!["torrentd", "-c", "x", "--check-config", "vpn", "check"], "vpn check"),
+        ] {
+            let cli = Cli::parse_from(argv.clone());
+            let msg = check_config_with_subcommand(&cli)
+                .unwrap_or_else(|| panic!("{argv:?} must be refused"));
+            assert!(
+                msg.contains("--check-config") && msg.contains(sub),
+                "the refusal must name both halves; got: {msg}",
+            );
+        }
+
+        // Neither alone is affected: the daemon, the bare pre-flight, and an
+        // operator subcommand on its own all still run.
+        for argv in [
+            vec!["torrentd", "-c", "x"],
+            vec!["torrentd", "-c", "x", "--check-config"],
+            vec!["torrentd", "-c", "x", "hash-password"],
+            vec!["torrentd", "-c", "x", "vpn", "check", "--bring-up"],
+        ] {
+            let cli = Cli::parse_from(argv.clone());
+            assert!(
+                check_config_with_subcommand(&cli).is_none(),
+                "{argv:?} asks for one validation and must not be refused",
             );
         }
     }
