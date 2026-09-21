@@ -56,9 +56,14 @@ body:
     attributes:
       label: JSON log output
       description: >-
-        The daemon's JSON log around the failure. If it reproduces, capture it with
-        `RUST_LOG=debug` — e.g. `RUST_LOG=debug torrentd --config /etc/torrentd/torrentd.toml`.
-        Redact tracker URLs, passkeys and API tokens before pasting.
+        The daemon's JSON log around the failure, taken from the **running**
+        service: `journalctl -u torrentd` (add `-o cat` for the raw JSON lines).
+        If it reproduces, raise the verbosity in place — set `log_level = "debug"`
+        in the config and `systemctl reload torrentd`, which sends `SIGHUP`; the
+        level is swapped at runtime and no restart is needed. Please do **not**
+        start a second `torrentd` to collect a log: it would contend with the
+        running one for the same tunnels, kill-switch table, resume directory and
+        pool index. Redact tracker URLs, passkeys and API tokens before pasting.
       render: text
       placeholder: |
         {"timestamp":"2026-09-21T09:14:02.881234567+00:00","level":"ERROR","message":"failed to persist resume data","infohash":"0123456789abcdef0123456789abcdef01234567","error.kind":"resume_write","error.cause":"...","target":"torrentd_engine::handler::resume"}
