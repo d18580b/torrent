@@ -157,15 +157,23 @@ impl<'de> Deserialize<'de> for ProfileId {
         let s = String::deserialize(d)?;
         if !ProfileConfig::is_valid_id(&s) {
             return Err(serde::de::Error::custom(format!(
-                "profile id {s:?} is not usable: an id may be 1-64 characters of [A-Za-z0-9_-] \
-                 only. The id is a path component in three places (<resume_dir>/<id>, \
-                 <torrent_dir>/<id>, session_state-<id>.dat) and a URL path segment, so \
-                 anything else either escapes those directories or cannot be addressed."
+                "profile id {s:?} is not usable: {ID_CHARSET_RULE}"
             )));
         }
         Ok(ProfileId::new(s))
     }
 }
+
+/// Why an id outside `[A-Za-z0-9_-]{1,64}` cannot be used, in one sentence.
+///
+/// Shared rather than written twice. Two doors refuse an id — this module's
+/// `Deserialize`, and the pre-profiles registry conversion in
+/// [`crate::registry`], which has to say the same thing in a message built by
+/// hand. Two spellings of one rule is how the two stop agreeing.
+pub(crate) const ID_CHARSET_RULE: &str =
+    "an id may be 1-64 characters of [A-Za-z0-9_-] only. The id is a path component in three \
+     places (<resume_dir>/<id>, <torrent_dir>/<id>, session_state-<id>.dat) and a URL path \
+     segment, so anything else either escapes those directories or cannot be addressed.";
 
 // ---------------------------------------------------------------------------
 // ProfileConfig — operator-supplied (TOML)
