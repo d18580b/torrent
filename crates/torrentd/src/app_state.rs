@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use torrentd_engine::AlertSource;
 use torrentd_engine::AssignmentRegistry;
+use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
@@ -18,9 +19,10 @@ use crate::profile_registry::ProfileRegistry;
 pub struct AppState {
     pub source: Arc<dyn AlertSource>,
     pub registry: Arc<AssignmentRegistry>,
-    /// Runtime profile registry; `None` in single-session mode. Drives the
-    /// `/profiles` endpoints and the VPN health monitor.
-    pub profiles: Option<Arc<ProfileRegistry>>,
+    /// Every configured profile. Always present: a daemon without at least
+    /// one profile does not start. Drives the `/profiles` endpoints and the
+    /// VPN health monitor.
+    pub profiles: Arc<ProfileRegistry>,
     pub state: Arc<StateMap>,
     /// Raw `.torrent` file store; the add path persists uploads here so the
     /// startup inventory scan can re-add them if resume data is lost.
@@ -41,15 +43,14 @@ pub struct AppState {
     /// Root of the `.torrent` store on disk. Used to confine a caller-supplied
     /// `torrent_path` to directories the daemon already owns.
     pub torrent_dir: PathBuf,
-    /// One of `single` | `multi-profile`. Used by routes that decide
-    /// whether `profile_id` is required on POST /torrents.
-    pub mode: Mode,
+    /// Asks the reload pump to re-read the config file. `None` only in tests,
+    /// which do not run one.
+    pub reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
 }
 
 impl AppState {
     /// True when `profile_id` names a profile whose VPN tunnel is down and whose
     /// torrents the monitor has fenced (paused, awaiting operator restart).
-    /// Always false in single-session mode (no profiles, no tunnel). Callers use
     /// this to refuse mutations that would un-quarantine a fenced profile.
     /// Directories a caller-supplied `torrent_path` may point into.
     ///
@@ -67,36 +68,30 @@ impl AppState {
 
     pub fn profile_vpn_down(&self, profile_id: &ProfileId) -> bool {
         self.profiles
-            .as_ref()
-            .and_then(|sr| sr.get(profile_id))
+            .get(profile_id)
             .map(|e| e.health().status == ProfileStatus::VpnDown)
             .unwrap_or(false)
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Mode {
-    Single,
-    MultiProfile,
-}
+    /// The configuration of a live profile, or `None` if no such profile is
+    /// configured.
+    pub fn profile_config(&self, profile_id: &ProfileId) -> Option<&ProfileConfig> {
+        self.profiles.config(profile_id)
+    }
 
-/// Minimal AppState for handler/unit tests. `profiles = Some(..)` puts it in
-/// multi-profile mode; everything else is a throwaway in-memory double.
-impl AppState {
-    /// `(fenced, total)` over the configured profiles, or `None` in
-    /// single-session mode, which has no tunnel to lose.
+    /// `(fenced, total)` over the configured profiles.
     ///
-    /// Counted from the profile registry rather than from the alert source: the
+    /// Counted from the profile registry rather than the alert source: the
     /// source counts live sessions, and a profile the VPN monitor fenced still
     /// has one.
-    pub fn fenced_profiles(&self) -> Option<(usize, usize)> {
-        let sr = self.profiles.as_ref()?;
-        let total = sr.iter().len();
-        let fenced = sr
+    pub fn fenced_profiles(&self) -> (usize, usize) {
+        let total = self.profiles.iter().len();
+        let fenced = self
+            .profiles
             .iter()
             .filter(|e| e.health().status == ProfileStatus::VpnDown)
             .count();
-        Some((fenced, total))
+        (fenced, total)
     }
 }
 
@@ -105,15 +100,17 @@ pub(crate) fn build_test_state(profiles: Option<Arc<ProfileRegistry>>) -> AppSta
     use torrentd_engine::AssignmentRegistry;
     use torrentd_engine::MemoryTorrentStore;
     use torrentd_engine::MockEngine;
-    use torrentd_engine::SingleSessionSource;
+    use torrentd_engine::ProfileSource;
     use torrentd_engine::TorrentEngine;
 
     let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
-    let mode = if profiles.is_some() {
-        Mode::MultiProfile
-    } else {
-        Mode::Single
-    };
+    // Tests that do not care about profiles get one named `p`, which is what
+    // the source reports; tests that do pass their own registry.
+    let profiles = profiles.unwrap_or_else(|| {
+        Arc::new(ProfileRegistry::new(vec![
+            crate::profile_registry::test_entry("p", ProfileStatus::Active),
+        ]))
+    });
     // A distinct registry file per call. Cargo runs tests in threads of one
     // process, so a fixed name here is one file shared by every test that
     // builds a state — harmless while nothing wrote to it, and a rename race
@@ -126,7 +123,7 @@ pub(crate) fn build_test_state(profiles: Option<Arc<ProfileRegistry>>) -> AppSta
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     AppState {
-        source: Arc::new(SingleSessionSource::new(engine)),
+        source: Arc::new(ProfileSource::new(vec![(ProfileId::new("p"), engine)])),
         registry: Arc::new(AssignmentRegistry::new_empty(reg_path)),
         profiles,
         state: Arc::new(StateMap::new()),
@@ -142,7 +139,7 @@ pub(crate) fn build_test_state(profiles: Option<Arc<ProfileRegistry>>) -> AppSta
         )),
         default_save_path: std::env::temp_dir(),
         torrent_dir: std::env::temp_dir(),
-        mode,
+        reload_tx: None,
     }
 }
 
@@ -167,6 +164,6 @@ mod tests {
     #[test]
     fn profile_vpn_down_false_in_single_session() {
         let s = build_test_state(None);
-        assert!(!s.profile_vpn_down(&ProfileId::default_single()));
+        assert!(!s.profile_vpn_down(&ProfileId::new("p")));
     }
 }

@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn removed_torrent_deletes_resume_and_torrent_files() {
         let ih = InfoHash([0x77; 20]);
-        let profile = ProfileId::default_single();
+        let profile = ProfileId::new("p");
         let state = StateMap::new();
         let resume = MemoryResumeStore::new();
         let torrents = MemoryTorrentStore::new();

@@ -249,7 +249,7 @@ pub async fn run_verify_queue(
     source: Arc<dyn AlertSource>,
     state: Arc<StateMap>,
     metrics: Arc<crate::metrics_sink::PromSink>,
-    profiles: Option<Arc<crate::profile_registry::ProfileRegistry>>,
+    profiles: Arc<crate::profile_registry::ProfileRegistry>,
     mut shutdown: tokio::sync::broadcast::Receiver<torrentd_engine::ShutdownReason>,
 ) {
     use torrentd_engine::MetricsSink;
@@ -325,8 +325,7 @@ pub async fn run_verify_queue(
             // profile — the one thing fencing exists to prevent. Put it back and
             // wait for the operator.
             if profiles
-                .as_ref()
-                .and_then(|sr| sr.get(&item.profile))
+                .get(&item.profile)
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
             {
                 warn!(
@@ -358,7 +357,16 @@ pub async fn run_verify_queue(
             // No SEED_MODE: that is what makes libtorrent hash the payload
             // against the piece hashes before it will seed. The no-download
             // invariant rides along regardless — see `torrentd_engine::policy`.
-            let flags = torrentd_engine::verify_flags(&item.profile);
+            let Some(profile_cfg) = profiles.config(&item.profile) else {
+                warn!(
+                    target: "torrentd::pool",
+                    profile_id = %item.profile,
+                    "verify queue holds an item for a profile that is not live; dropping",
+                );
+                q.failed.fetch_add(1, Ordering::Relaxed);
+                continue;
+            };
+            let flags = torrentd_engine::verify_flags(profile_cfg);
             match engine.add_torrent(AddParams::File {
                 bytes,
                 save_path: item.save_path.to_string_lossy().into_owned(),
@@ -444,6 +452,7 @@ fn verify_outcome(
 pub fn execute_adopt(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
+    profiles: &crate::profile_registry::ProfileRegistry,
     infohash: &str,
     profile: ProfileId,
 ) -> Result<&'static str, String> {
@@ -481,7 +490,10 @@ pub fn execute_adopt(
             // SAVE_INFO_DICT carries no metadata; libtorrent ignores it when
             // the resume data already has an info dict.
             let torrent = std::fs::read(&torrent_path).ok();
-            let flags = torrentd_engine::seed_flags(&profile);
+            let Some(profile_cfg) = profiles.config(&profile) else {
+                return Err(format!("profile {profile} is not live"));
+            };
+            let flags = torrentd_engine::seed_flags(profile_cfg);
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: resume,
                 torrent: torrent.clone(),
@@ -575,7 +587,7 @@ mod tests {
                 id: 1,
                 infohash: InfoHash([0x11; 20]),
             },
-            ProfileId::default_single(),
+            ProfileId::new("p"),
             now,
         );
         s.phase = phase;

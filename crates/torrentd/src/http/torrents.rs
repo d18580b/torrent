@@ -21,7 +21,6 @@ use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
 
 use crate::app_state::AppState;
-use crate::app_state::Mode;
 
 const DEFAULT_PAGE_SIZE: usize = 100;
 const MAX_PAGE_SIZE: usize = 1000;
@@ -290,15 +289,15 @@ async fn do_add(
     save_path_opt: Option<String>,
     source: AddSource,
 ) -> Result<(StatusCode, Json<AddResponse>), AddError> {
-    let profile_id = match (s.mode, profile_id_opt.as_deref()) {
-        (Mode::Single, _) => ProfileId::default_single(),
-        (Mode::MultiProfile, Some(id)) => ProfileId::new(id),
-        (Mode::MultiProfile, None) => {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "profile_id required in multi-profile mode"})),
-            ))
-        }
+    // Always required. There is no default profile to fall back to — that is
+    // the point of the model: a client that does not say where a torrent goes
+    // is a client that does not know, and guessing meant guessing which
+    // account announces it.
+    let Some(profile_id) = profile_id_opt.as_deref().map(ProfileId::new) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "profile_id is required"})),
+        ));
     };
 
     let engine = s.source.engine_for(&profile_id).ok_or_else(|| {
@@ -340,7 +339,13 @@ async fn do_add(
             p
         }
     };
-    let flags = torrentd_engine::seed_flags(&profile_id);
+    let Some(profile_cfg) = s.profile_config(&profile_id) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "unknown profile_id"})),
+        ));
+    };
+    let flags = torrentd_engine::seed_flags(profile_cfg);
 
     // Compute the info-hash WITHOUT touching any session: Safety Rule 4
     // (the session never receives an unverified torrent) and Rule 3 (global
@@ -363,8 +368,7 @@ async fn do_add(
     if let AddSource::File(bytes) = &source {
         let domains = s
             .profiles
-            .as_ref()
-            .and_then(|sr| sr.get(&profile_id))
+            .get(&profile_id)
             .map(|e| e.config.allowed_tracker_domains.clone())
             .unwrap_or_default();
         if !domains.is_empty() {
@@ -698,39 +702,18 @@ fn vpn_down() -> (StatusCode, Json<serde_json::Value>) {
 mod tests {
     use std::sync::Arc;
 
-    use torrentd_engine::AlertSource;
     use torrentd_engine::AssignmentRegistry;
-    use torrentd_engine::MemoryTorrentStore;
-    use torrentd_engine::MockEngine;
-    use torrentd_engine::SingleSessionSource;
-    use torrentd_engine::StateMap;
-    use torrentd_engine::TorrentEngine;
 
     use super::*;
-    use crate::metrics_sink::PromSink;
 
+    /// The shared helper, with the two paths this module's tests care about
+    /// pointed at a temp dir.
     fn test_state(dir: &std::path::Path) -> AppState {
-        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
-        let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine));
-        AppState {
-            source,
-            registry: Arc::new(AssignmentRegistry::new_empty(dir.join("reg.json"))),
-            profiles: None,
-            state: Arc::new(StateMap::new()),
-            torrents: Arc::new(MemoryTorrentStore::new()),
-            metrics: Arc::new(PromSink::new()),
-            auth: None,
-            pool: None,
-            alert_heartbeat: Arc::new(std::sync::atomic::AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as u64)
-                    .unwrap_or(0),
-            )),
-            default_save_path: dir.to_path_buf(),
-            torrent_dir: dir.to_path_buf(),
-            mode: Mode::Single,
-        }
+        let mut app = crate::app_state::build_test_state(None);
+        app.registry = Arc::new(AssignmentRegistry::new_empty(dir.join("reg.json")));
+        app.default_save_path = dir.to_path_buf();
+        app.torrent_dir = dir.to_path_buf();
+        app
     }
 
     const MAGNET: &str = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101";
@@ -801,9 +784,14 @@ mod tests {
     async fn do_add_magnet_assigns_and_calls_engine() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_state(dir.path());
-        let (code, resp) = do_add(&app, None, None, AddSource::Magnet(MAGNET.into()))
-            .await
-            .unwrap();
+        let (code, resp) = do_add(
+            &app,
+            Some("p".into()),
+            None,
+            AddSource::Magnet(MAGNET.into()),
+        )
+        .await
+        .unwrap();
         assert_eq!(code, StatusCode::CREATED);
         assert_eq!(resp.0.infohash, MAGNET_HEX);
         assert_eq!(app.registry.len(), 1);
@@ -812,20 +800,62 @@ mod tests {
                 .lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap())
                 .unwrap()
                 .as_str(),
-            "default"
+            "p"
         );
+    }
+
+    #[tokio::test]
+    async fn an_add_without_a_profile_id_is_refused() {
+        // There is no default profile to fall back to. A client that does not
+        // say where a torrent goes is a client that does not know, and
+        // guessing meant guessing which account announces it.
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_state(dir.path());
+        let err = do_add(&app, None, None, AddSource::Magnet(MAGNET.into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1 .0["error"]
+            .as_str()
+            .unwrap()
+            .contains("profile_id is required"));
+    }
+
+    #[tokio::test]
+    async fn an_add_to_an_unknown_profile_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_state(dir.path());
+        let err = do_add(
+            &app,
+            Some("nope".into()),
+            None,
+            AddSource::Magnet(MAGNET.into()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn do_add_duplicate_is_409() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_state(dir.path());
-        let _ = do_add(&app, None, None, AddSource::Magnet(MAGNET.into()))
-            .await
-            .unwrap();
-        let err = do_add(&app, None, None, AddSource::Magnet(MAGNET.into()))
-            .await
-            .unwrap_err();
+        let _ = do_add(
+            &app,
+            Some("p".into()),
+            None,
+            AddSource::Magnet(MAGNET.into()),
+        )
+        .await
+        .unwrap();
+        let err = do_add(
+            &app,
+            Some("p".into()),
+            None,
+            AddSource::Magnet(MAGNET.into()),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.0, StatusCode::CONFLICT);
     }
 }

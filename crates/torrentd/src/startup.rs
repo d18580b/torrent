@@ -23,12 +23,12 @@ use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
 use torrentd_engine::ProfileId;
+use torrentd_engine::ProfileNetwork;
 use torrentd_engine::ProfileSource;
 use torrentd_engine::ProfileStatus;
 use torrentd_engine::RealEngine;
 use torrentd_engine::ResumeStore;
 use torrentd_engine::ShutdownReason;
-use torrentd_engine::SingleSessionSource;
 use torrentd_engine::StateMap;
 use torrentd_engine::SystemClock;
 use torrentd_engine::TorrentEngine;
@@ -39,7 +39,6 @@ use tracing::info;
 use tracing::warn;
 
 use crate::app_state::AppState;
-use crate::app_state::Mode;
 use crate::config::Config;
 use crate::http;
 use crate::metrics_sink::PromSink;
@@ -142,10 +141,12 @@ pub struct DaemonHandle {
     /// arriving during startup is buffered rather than dropped on the floor.
     shutdown_rx: broadcast::Receiver<ShutdownReason>,
     reload_rx: mpsc::Receiver<()>,
+    /// Lets `POST /api/reload` ask for the same thing SIGHUP asks for.
+    reload_tx: mpsc::Sender<()>,
     metrics: Arc<PromSink>,
     pool: Option<Arc<crate::pool_service::PoolService>>,
     registry: Arc<AssignmentRegistry>,
-    profile_registry: Option<Arc<ProfileRegistry>>,
+    profile_registry: Arc<ProfileRegistry>,
     /// Whether the nftables kill switch was installed and must be torn down on
     /// graceful shutdown.
     kill_switch_active: bool,
@@ -159,11 +160,6 @@ pub async fn boot(
     log_handle: crate::tracing_init::LogReloadHandle,
 ) -> anyhow::Result<DaemonHandle> {
     info!("starting torrentd");
-    let mode = if cfg.profile.is_empty() {
-        Mode::Single
-    } else {
-        Mode::MultiProfile
-    };
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
@@ -178,6 +174,9 @@ pub async fn boot(
     // them down.
     let channels = SignalChannels::new();
     let (reload_tx, reload_rx) = mpsc::channel::<()>(8);
+    // The HTTP surface asks for a reload the same way SIGHUP does, through
+    // this channel, so both paths converge on one implementation.
+    let reload_tx_for_api = reload_tx.clone();
     let channels = SignalChannels::from_parts(channels.shutdown_tx, reload_tx);
     // Drop the receiver returned by signals::run; we wired our own pair.
     let _ = signals::run(channels.clone(), 8).await;
@@ -196,20 +195,23 @@ pub async fn boot(
     // profile id, except where a `[[profile]]` names its own directory. Those keys
     // were validated for uniqueness and then ignored, so files landed under
     // the derived path and only matched the configured one by coincidence.
-    let resume_store: Arc<dyn ResumeStore> = Arc::new(
-        cfg.profile
-            .iter()
-            .fold(FsResumeStore::new(cfg.resume_dir.clone()), |st, profile| {
-                st.with_profile_dir(profile.id.clone(), profile.resume_dir.clone())
-            }),
-    );
+    let resume_store: Arc<dyn ResumeStore> = Arc::new(cfg.profile.iter().fold(
+        FsResumeStore::new(cfg.resume_dir.clone()),
+        |st, profile| match &profile.resume_dir {
+            Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
+            None => st,
+        },
+    ));
 
     // Torrent store — same per-profile partitioning as the resume store; holds
     // the raw .torrent files for the startup inventory scan, magnet-metadata
     // persistence, and removal cleanup.
     let torrent_store: Arc<dyn TorrentStore> = Arc::new(cfg.profile.iter().fold(
         FsTorrentStore::new(cfg.torrent_dir.clone()),
-        |st, profile| st.with_profile_dir(profile.id.clone(), profile.torrent_dir.clone()),
+        |st, profile| match &profile.torrent_dir {
+            Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
+            None => st,
+        },
     ));
 
     // Assignment registry.
@@ -222,193 +224,207 @@ pub async fn boot(
     // rejections (profile_assignment_registry_errors_total).
     let metrics = Arc::new(PromSink::new());
 
-    // Engines per profile (or one for single-session). In multi-profile mode we
-    // also build the runtime profile registry that the /profiles API and the VPN
-    // health monitor consume.
-    let mut profile_registry: Option<Arc<ProfileRegistry>> = None;
-    let source: Arc<dyn AlertSource> = match mode {
-        Mode::Single => {
-            // Restore the DHT routing table + session state across restarts.
-            // DHT is enabled only in single-session
-            // mode, so this is the only path that loads/saves session state.
-            let settings = cfg.libtorrent_settings();
-            let session = match load_session_state(&cfg.session_state_path()) {
-                Some(state) => {
-                    info!(bytes = state.len(), "restoring session state");
-                    libtorrent_safe::Session::with_state(&settings, &state)
-                        .context("construct session from saved state")?
-                }
-                None => libtorrent_safe::Session::new(&settings).context("construct session")?,
-            };
-            let engine: Arc<dyn TorrentEngine> = Arc::new(RealEngine::from_session(session));
-            Arc::new(SingleSessionSource::new(engine))
+    // One libtorrent session per configured profile. There is no other shape:
+    // a deployment with one profile is this with n = 1, not a mode of its own.
+    let mut profile_entries: Vec<ProfileEntry> = Vec::new();
+    // Safety Rule 1: a profile whose tunnel does not come up never gets a
+    // session, and the others carry on. It still has to be *reported* as
+    // failed — skipping it outright made it vanish from `/profiles`, so an
+    // operator wondering why an account was quiet found no trace of it
+    // anywhere but the startup log.
+    let mut failed_profiles: Vec<crate::profile_registry::FailedProfile> = Vec::new();
+    macro_rules! fail_profile {
+        ($cfg:expr, $reason:expr) => {{
+            failed_profiles.push(crate::profile_registry::FailedProfile {
+                config: $cfg.clone(),
+                reason: $reason,
+            });
+            continue;
+        }};
+    }
+
+    for p in &cfg.profile {
+        // A shutdown asked for during a previous profile's bring-up is
+        // honoured here rather than after every remaining tunnel is raised.
+        if boot_shutdown.try_recv().is_ok() {
+            anyhow::bail!("shutdown requested during profile bring-up");
         }
-        Mode::MultiProfile => {
-            let mut profile_entries: Vec<ProfileEntry> = Vec::new();
-            // Safety Rule 1: a profile whose tunnel does not come up never gets a
-            // session, and the others carry on. It still has to be *reported*
-            // as failed — skipping it outright made it vanish from `/profiles`,
-            // so an operator wondering why an account was quiet found no trace
-            // of it anywhere but the startup log.
-            let mut failed_profiles: Vec<crate::profile_registry::FailedProfile> = Vec::new();
-            macro_rules! fail_profile {
-                ($cfg:expr, $reason:expr) => {{
-                    failed_profiles.push(crate::profile_registry::FailedProfile {
-                        config: $cfg.clone(),
-                        reason: $reason,
-                    });
-                    continue;
-                }};
-            }
-            for s in &cfg.profile {
-                // 1) Bring the VPN up first. Safety Rule 1: if it
-                //    fails, the profile's lt::session is never constructed
-                //    — no bare-IP fallback.
-                // A shutdown asked for during a previous profile's bring-up is
-                // honoured here rather than after every remaining tunnel has
-                // been raised.
-                if boot_shutdown.try_recv().is_ok() {
-                    anyhow::bail!("shutdown requested during profile bring-up");
+
+        let mut settings = cfg.libtorrent_settings();
+        if let Some(ua) = &p.user_agent {
+            settings.user_agent = Some(ua.clone());
+            settings.handshake_client_version = Some(ua.clone());
+        }
+        if let Some(fp) = &p.peer_fingerprint_hex {
+            settings.peer_fingerprint = Some(fp.clone());
+        }
+        if p.upload_rate_limit > 0 {
+            settings.upload_rate_limit = Some(p.upload_rate_limit);
+        }
+
+        // What differs between the two postures, and nothing else: where the
+        // sockets bind, and whether discovery may run.
+        let mut tunnel_ip: Option<IpAddr> = None;
+        let mut forwarded_port: Option<u16> = None;
+        let mut forwarded_epoch: u32 = 0;
+        let mut session_state: Option<Vec<u8>> = None;
+
+        match &p.network {
+            ProfileNetwork::Host {
+                listen_interfaces,
+                dht,
+            } => {
+                settings.listen_interfaces = Some(listen_interfaces.clone());
+                settings.enable_dht = Some(*dht);
+                // DHT keeps a routing table worth restoring; without DHT there
+                // is nothing in session state worth the file.
+                if *dht {
+                    session_state = load_session_state(&cfg.session_state_path(&p.id));
+                    if let Some(bytes) = &session_state {
+                        info!(profile_id = %p.id, bytes = bytes.len(), "restoring session state");
+                    }
                 }
-                let vpn = vpn::for_type(s.vpn_type, &run_dir);
-                // `bring_up` shells out and polls for up to 30 seconds. On a
-                // runtime worker that is 30 seconds per profile during which
-                // nothing else — including the signal handler that is supposed
-                // to interrupt exactly this — gets to run on that thread.
+            }
+            ProfileNetwork::Vpn { .. } => {
+                let iface = p.vpn_interface().expect("vpn profile has an interface");
+                let vpn_type = p.vpn_type().expect("vpn profile has a type");
+                let tunnel = p.vpn_tunnel().expect("vpn profile has a tunnel");
+
+                // Bring the tunnel up first. Safety Rule 1: if it fails, this
+                // profile's session is never constructed — no bare-IP
+                // fallback. `bring_up` shells out and polls for up to 30
+                // seconds, which does not belong on a runtime worker.
                 let brought_up = {
-                    let vpn = vpn.clone();
-                    let profile = s.vpn_config();
-                    tokio::task::spawn_blocking(move || vpn.bring_up(&profile))
+                    let vpn = vpn::for_type(vpn_type, &run_dir);
+                    tokio::task::spawn_blocking(move || vpn.bring_up(&tunnel))
                         .await
                         .context("vpn bring-up task")?
                 };
-                let tunnel_ip = match brought_up {
+                let ip = match brought_up {
                     Ok(ip) => {
-                        cleanup.note_tunnel(s.vpn_type, &s.vpn_interface);
+                        cleanup.note_tunnel(vpn_type, iface);
                         ip
                     }
                     Err(e) => {
                         error!(
-                            profile_id = %s.id,
+                            profile_id = %p.id,
                             error.cause = %e,
                             "VPN bring-up failed; profile disabled (no bare-IP fallback)",
                         );
-                        fail_profile!(s, format!("VPN bring-up failed: {e}"));
+                        fail_profile!(p, format!("VPN bring-up failed: {e}"));
                     }
                 };
 
-                // 2) Determine the listening port. Static profiles bind the
-                //    operator's `listen_port`; natpmp profiles negotiate an
-                //    ephemeral forwarded port from the tunnel gateway
-                //    (ProtonVPN et al.). A startup negotiation failure disables
-                //    the profile — loud, like a VPN bring-up failure — rather than
-                //    silently seeding on an unforwarded port. Mid-session
-                //    renewal failures are the soft warn+keep-seeding path
-                //    (see port_forward_monitor).
-                let (effective_port, forwarded_port, forwarded_epoch) = match s.port_forward {
-                    PortForwardMode::Static => match s.listen_port {
-                        Some(port) => (port, None, 0),
+                // The listening port. A static profile binds the operator's
+                // `listen_port`; a natpmp profile negotiates an ephemeral one
+                // from the tunnel gateway. A startup negotiation failure
+                // disables the profile — loud, like a bring-up failure —
+                // rather than silently seeding on an unforwarded port.
+                // Mid-session renewal failures are the soft keep-seeding path
+                // (see port_forward_monitor).
+                let effective_port = match p.port_forward() {
+                    PortForwardMode::Static => match p.listen_port() {
+                        Some(port) => port,
                         None => {
-                            // validate_set should have caught this; be defensive.
-                            error!(profile_id = %s.id, "static profile missing listen_port; profile disabled");
-                            cleanup.take_down(&s.vpn_interface);
-                            fail_profile!(s, "static profile has no listen_port".to_string());
+                            // validate_set should have caught this.
+                            error!(profile_id = %p.id, "static profile missing listen_port; profile disabled");
+                            cleanup.take_down(iface);
+                            fail_profile!(p, "static profile has no listen_port".to_string());
                         }
                     },
                     PortForwardMode::Natpmp => {
-                        let gw_str = s.port_forward_gateway_or_default();
+                        let gw_str = p.port_forward_gateway_or_default();
                         let gateway: IpAddr = match gw_str.parse() {
                             Ok(ip) => ip,
                             Err(e) => {
-                                error!(profile_id = %s.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; profile disabled");
-                                cleanup.take_down(&s.vpn_interface);
-                                fail_profile!(s, format!("invalid port_forward_gateway: {e}"));
+                                error!(profile_id = %p.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; profile disabled");
+                                cleanup.take_down(iface);
+                                fail_profile!(p, format!("invalid port_forward_gateway: {e}"));
                             }
                         };
                         let req = PortMapRequest {
                             gateway,
-                            bind_ip: tunnel_ip,
+                            bind_ip: ip,
                             internal_port: 0,
                             lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
                         };
                         match vpn::NatpmpForwarder::for_startup().map(&req) {
                             Ok(m) => {
-                                info!(profile_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
-                                (m.port, Some(m.port), m.epoch)
+                                info!(profile_id = %p.id, tunnel_ip = %ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
+                                forwarded_port = Some(m.port);
+                                forwarded_epoch = m.epoch;
+                                m.port
                             }
                             Err(e) => {
-                                error!(profile_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; profile disabled (no bare-IP fallback)");
-                                cleanup.take_down(&s.vpn_interface);
-                                fail_profile!(s, format!("NAT-PMP negotiation failed: {e}"));
+                                error!(profile_id = %p.id, tunnel_ip = %ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; profile disabled (no bare-IP fallback)");
+                                cleanup.take_down(iface);
+                                fail_profile!(p, format!("NAT-PMP negotiation failed: {e}"));
                             }
                         }
                     }
                 };
 
-                // 3) Bind libtorrent to the tunnel IP + effective port only.
-                let mut settings = cfg.libtorrent_settings();
-                settings.user_agent = Some(s.user_agent.clone());
-                settings.handshake_client_version = Some(s.user_agent.clone());
-                settings.peer_fingerprint = Some(s.peer_fingerprint_hex.clone());
                 settings.listen_interfaces =
-                    Some(torrentd_engine::bind_endpoint(tunnel_ip, effective_port));
-                settings.outgoing_interfaces = Some(tunnel_ip.to_string());
-                // `[[profile]] upload_rate_limit` was parsed, documented in the
-                // sample config, and applied nowhere — a profile's limit silently
-                // did nothing. Zero means "inherit the top-level limit", which
-                // is what the default has always meant in practice.
-                if s.upload_rate_limit > 0 {
-                    settings.upload_rate_limit = Some(s.upload_rate_limit);
-                }
+                    Some(torrentd_engine::bind_endpoint(ip, effective_port));
+                settings.outgoing_interfaces = Some(ip.to_string());
+                // Not configurable, by construction: there is no key on a vpn
+                // profile that reaches these.
                 settings.enable_dht = Some(false);
                 settings.enable_lsd = Some(false);
                 settings.enable_upnp = Some(false);
                 settings.enable_natpmp = Some(false);
-
-                match RealEngine::new(&settings) {
-                    Ok(engine) => {
-                        info!(
-                            profile_id = %s.id,
-                            tunnel_ip = %tunnel_ip,
-                            listen_port = effective_port,
-                            "profile engine up",
-                        );
-                        let engine: Arc<dyn TorrentEngine> = Arc::new(engine);
-                        profile_entries.push(ProfileEntry::new(
-                            s.clone(),
-                            engine,
-                            tunnel_ip,
-                            forwarded_port,
-                            forwarded_epoch,
-                        ));
-                    }
-                    Err(e) => {
-                        error!(
-                            profile_id = %s.id,
-                            error.cause = %e,
-                            "profile engine construction failed; tearing down VPN",
-                        );
-                        cleanup.take_down(&s.vpn_interface);
-                        failed_profiles.push(crate::profile_registry::FailedProfile {
-                            config: s.clone(),
-                            reason: format!("session construction failed: {e}"),
-                        });
-                    }
-                }
+                tunnel_ip = Some(ip);
             }
-            if profile_entries.is_empty() {
-                anyhow::bail!("multi-profile mode: no profiles came up");
-            }
-            let source_entries: Vec<(ProfileId, Arc<dyn TorrentEngine>)> = profile_entries
-                .iter()
-                .map(|e| (e.config.id.clone(), e.engine.clone()))
-                .collect();
-            profile_registry = Some(Arc::new(
-                ProfileRegistry::new(profile_entries).with_failed(failed_profiles),
-            ));
-            Arc::new(ProfileSource::new(source_entries))
         }
-    };
+
+        let built = match session_state {
+            Some(state) => libtorrent_safe::Session::with_state(&settings, &state)
+                .map(RealEngine::from_session),
+            None => libtorrent_safe::Session::new(&settings).map(RealEngine::from_session),
+        };
+        match built {
+            Ok(engine) => {
+                info!(
+                    profile_id = %p.id,
+                    network = if p.is_vpn() { "vpn" } else { "host" },
+                    tunnel_ip = tunnel_ip.map(|i| i.to_string()).unwrap_or_default(),
+                    dht = p.dht_enabled(),
+                    "profile engine up",
+                );
+                profile_entries.push(ProfileEntry::new(
+                    p.clone(),
+                    Arc::new(engine),
+                    tunnel_ip,
+                    forwarded_port,
+                    forwarded_epoch,
+                ));
+            }
+            Err(e) => {
+                error!(
+                    profile_id = %p.id,
+                    error.cause = %e,
+                    "profile engine construction failed",
+                );
+                if let Some(iface) = p.vpn_interface() {
+                    cleanup.take_down(iface);
+                }
+                failed_profiles.push(crate::profile_registry::FailedProfile {
+                    config: p.clone(),
+                    reason: format!("session construction failed: {e}"),
+                });
+            }
+        }
+    }
+    if profile_entries.is_empty() {
+        anyhow::bail!("no profile came up");
+    }
+    let source_entries: Vec<(ProfileId, Arc<dyn TorrentEngine>)> = profile_entries
+        .iter()
+        .map(|e| (e.config.id.clone(), e.engine.clone()))
+        .collect();
+    let profile_registry =
+        Arc::new(ProfileRegistry::new(profile_entries).with_failed(failed_profiles));
+    let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(source_entries));
 
     // Network-layer kill switch (defence-in-depth; multi-profile + opt-in).
     // Installed once, after every profile's tunnel is up, so the ruleset covers all
@@ -422,39 +438,38 @@ pub async fn boot(
     // condition could never fire.
     metrics.set_gauge("kill_switch_active", 0.0, &[]);
     if cfg.network_kill_switch {
-        match &profile_registry {
-            Some(sr) => {
-                let tunnels: Vec<String> =
-                    sr.iter().map(|e| e.config.vpn_interface.clone()).collect();
-                let uid = vpn::killswitch::enable(&tunnels)
-                    .context("install nftables kill switch (network_kill_switch=true)")?;
-                kill_switch_active = true;
-                cleanup.note_kill_switch();
-                metrics.set_gauge("kill_switch_active", 1.0, &[]);
-                info!(uid, "network kill switch active");
-            }
-            None => {
-                // Fail closed, like every other path here. The operator set
-                // this flag precisely because they do not want traffic on the
-                // bare IP; warning and continuing gives them exactly that,
-                // with nothing but a startup log line to say so. Single-session
-                // mode has no tunnel to confine egress to, so the honest answer
-                // is that the config is contradictory.
-                anyhow::bail!(
-                    "network_kill_switch = true but no [[profile]] entries are configured. \
-                     The kill switch confines the daemon's egress to its profiles' tunnel \
-                     interfaces, and single-session mode has none — it would seed from \
-                     the bare IP with no backstop. Configure profiles, or unset \
-                     network_kill_switch.",
-                );
-            }
+        let tunnels: Vec<String> = profile_registry
+            .iter()
+            .filter_map(|e| e.config.vpn_interface().map(str::to_string))
+            .collect();
+        if tunnels.is_empty() {
+            // Fail closed, like every other path here. The operator set this
+            // flag precisely because they do not want traffic on the bare
+            // address; warning and continuing would give them exactly that,
+            // with a startup log line as the only trace.
+            anyhow::bail!(
+                "network_kill_switch = true but no profile uses network = \"vpn\". \
+                 The kill switch confines the daemon's egress to its profiles' tunnel \
+                 interfaces; with no tunnel there is nothing to confine it to, and \
+                 every profile would keep seeding from the host's own address with no \
+                 backstop. Configure a vpn profile, or unset network_kill_switch.",
+            );
         }
+        let uid = vpn::killswitch::enable(&tunnels)
+            .context("install nftables kill switch (network_kill_switch=true)")?;
+        kill_switch_active = true;
+        cleanup.note_kill_switch();
+        metrics.set_gauge("kill_switch_active", 1.0, &[]);
+        info!(uid, tunnels = ?tunnels, "network kill switch active");
     }
 
     // Resume scan: load every saved resume file per profile. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
     // won't double-add.
     for profile in source.profiles() {
+        let Some(profile_cfg) = profile_registry.config(&profile) else {
+            continue;
+        };
         let entries = resume_store.load_all(&profile).context("scan resume dir")?;
         let count = entries.len();
         let mut missing_metadata = 0usize;
@@ -529,7 +544,7 @@ pub async fn boot(
             // mistake that ends an account. A pool that comes back paused is
             // visible in `/status` and fixed with `resume-all`; a pool that
             // comes back seeding when it was told not to is not recoverable.
-            let flags_set = torrentd_engine::resume_flags_set(&profile);
+            let flags_set = torrentd_engine::resume_flags_set(profile_cfg);
             let flags_clear = TorrentFlags::empty();
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: data.into_inner(),
@@ -559,6 +574,9 @@ pub async fn boot(
     // dir is not re-scanned — new torrents arrive only via the API.
     let scan_save_path = cfg.default_save_path.to_string_lossy().into_owned();
     for profile in source.profiles() {
+        let Some(profile_cfg) = profile_registry.config(&profile) else {
+            continue;
+        };
         let entries = torrent_store
             .load_all(&profile)
             .context("scan torrent dir")?;
@@ -589,7 +607,7 @@ pub async fn boot(
                 );
                 continue;
             }
-            let flags = torrentd_engine::seed_flags(&profile);
+            let flags = torrentd_engine::seed_flags(profile_cfg);
             match engine.add_torrent(AddParams::File {
                 bytes,
                 save_path: scan_save_path.clone(),
@@ -641,7 +659,10 @@ pub async fn boot(
     // (nothing else is listening, so seeding just stops silently). In
     // multi-profile mode the per-profile handler marks that profile failed and the
     // remaining profiles carry on.
-    .fatal_listen_failure(mode == Mode::Single)
+    // A listen failure is fatal only where the daemon has one
+    // profile: with several, the others keep serving and the failure is
+    // reported per profile rather than taking everything down.
+    .fatal_listen_failure(cfg.profile.len() == 1)
     .on_fatal({
         let tx = shutdown_tx.clone();
         Arc::new(move |reason| {
@@ -655,8 +676,7 @@ pub async fn boot(
         let profiles = profile_registry.clone();
         Arc::new(move |id: &torrentd_engine::ProfileId| {
             profiles
-                .as_ref()
-                .and_then(|sr| sr.get(id))
+                .get(id)
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })
@@ -676,6 +696,7 @@ pub async fn boot(
         shutdown_tx,
         shutdown_rx,
         reload_rx,
+        reload_tx: reload_tx_for_api,
         metrics,
         pool,
         registry,
@@ -699,6 +720,7 @@ impl DaemonHandle {
             shutdown_tx,
             shutdown_rx,
             reload_rx,
+            reload_tx,
             metrics,
             pool,
             registry,
@@ -710,7 +732,8 @@ impl DaemonHandle {
 
         // VPN health monitor (multi-profile only). Spawned before AppState
         // consumes the registry/state/metrics.
-        if let Some(profiles) = profile_registry.clone() {
+        {
+            let profiles = profile_registry.clone();
             tokio::spawn(crate::vpn_monitor::run(
                 profiles.clone(),
                 state.clone(),
@@ -763,11 +786,7 @@ impl DaemonHandle {
             alert_heartbeat: alert_loop.heartbeat(),
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),
-            mode: if cfg.profile.is_empty() {
-                Mode::Single
-            } else {
-                Mode::MultiProfile
-            },
+            reload_tx: Some(reload_tx.clone()),
         };
 
         let app: Router = http::router(app_state);
@@ -780,6 +799,7 @@ impl DaemonHandle {
             config_path,
             cfg_clone,
             reload_source,
+            profile_registry.clone(),
             reload_rx,
             log_handle,
         ));
@@ -869,21 +889,27 @@ impl DaemonHandle {
             warn!(error.cause = ?e, "alert loop join panicked");
         }
 
-        // Persist DHT/session state for the next start (single-session mode;
-        // profiles run with enable_dht=false and skip this). The session
-        // is still alive here — only dropped when `source` goes out of scope.
-        if cfg.profile.is_empty() {
-            if let Some(engine) = source.engine_for(&ProfileId::default_single()) {
-                match engine.session_state() {
-                    Ok(bytes) if !bytes.is_empty() => {
-                        match save_session_state(&cfg.session_state_path(), &bytes) {
-                            Ok(()) => info!(bytes = bytes.len(), "session state saved"),
-                            Err(e) => warn!(error.cause = %e, "failed to save session state"),
+        // Persist DHT routing tables for the next start. Only a host profile
+        // with DHT enabled has one; a tunnelled profile runs with DHT off by
+        // construction and has nothing to save. The sessions are still alive
+        // here — they are dropped when `source` goes out of scope.
+        for p in cfg.profile.iter().filter(|p| p.dht_enabled()) {
+            let Some(engine) = source.engine_for(&p.id) else {
+                continue;
+            };
+            match engine.session_state() {
+                Ok(bytes) if !bytes.is_empty() => {
+                    match save_session_state(&cfg.session_state_path(&p.id), &bytes) {
+                        Ok(()) => {
+                            info!(profile_id = %p.id, bytes = bytes.len(), "session state saved")
+                        }
+                        Err(e) => {
+                            warn!(profile_id = %p.id, error.cause = %e, "failed to save session state")
                         }
                     }
-                    Ok(_) => {}
-                    Err(e) => warn!(error.cause = %e, "session_state() failed"),
                 }
+                Ok(_) => {}
+                Err(e) => warn!(profile_id = %p.id, error.cause = %e, "session_state() failed"),
             }
         }
 
@@ -903,14 +929,19 @@ impl DaemonHandle {
         // every restart accumulated interfaces and left an idle tunnel
         // connected to the provider indefinitely. Only on the graceful path —
         // a startup failure already tears down what it created.
-        if let Some(profiles) = &profile_registry {
+        {
             let run_dir = cfg.state_dir();
-            for entry in profiles.iter() {
-                let vpn = crate::vpn::for_type(entry.config.vpn_type, &run_dir);
-                vpn.bring_down(&entry.config.vpn_interface);
+            for entry in profile_registry.iter() {
+                // A host profile has no tunnel to take down.
+                let (Some(vpn_type), Some(iface)) =
+                    (entry.config.vpn_type(), entry.config.vpn_interface())
+                else {
+                    continue;
+                };
+                crate::vpn::for_type(vpn_type, &run_dir).bring_down(iface);
                 info!(
                     profile_id = %entry.config.id,
-                    vpn_iface = %entry.config.vpn_interface,
+                    vpn_iface = %iface,
                     "tunnel down",
                 );
             }

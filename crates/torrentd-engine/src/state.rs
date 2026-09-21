@@ -304,12 +304,12 @@ mod tests {
         let now = Instant::now();
         let h1 = handle(1, 1);
         let h2 = handle(2, 2);
-        let mut s1 = TorrentState::newly_added(h1, ProfileId::default_single(), now);
+        let mut s1 = TorrentState::newly_added(h1, ProfileId::new("p"), now);
         s1.retry = Some(RetryState {
             next_attempt: now - Duration::from_secs(1),
             attempts: 1,
         });
-        let mut s2 = TorrentState::newly_added(h2, ProfileId::default_single(), now);
+        let mut s2 = TorrentState::newly_added(h2, ProfileId::new("p"), now);
         s2.retry = Some(RetryState {
             next_attempt: now + Duration::from_secs(60),
             attempts: 1,

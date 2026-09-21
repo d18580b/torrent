@@ -58,6 +58,9 @@ fn wait_healthy(addr: &str) {
     panic!("daemon did not become healthy within 30s");
 }
 
+/// The profile every torrent in these tests belongs to.
+pub const PROFILE: &str = "test";
+
 /// Write a daemon config into `p` and spawn the binary against it.
 fn spawn_daemon(p: &std::path::Path, listen_port: u16, http_addr: &str) -> Child {
     for sub in ["data", "resume", "torrents"] {
@@ -67,13 +70,18 @@ fn spawn_daemon(p: &std::path::Path, listen_port: u16, http_addr: &str) -> Child
     std::fs::write(
         &cfg,
         format!(
-            "listen_interfaces = \"127.0.0.1:{listen_port}\"\n\
-             default_save_path = \"{d}/data\"\n\
+            "default_save_path = \"{d}/data\"\n\
              resume_dir = \"{d}/resume\"\n\
              torrent_dir = \"{d}/torrents\"\n\
              http_listen = \"{http_addr}\"\n\
              log_level = \"warn\"\n\
-             enable_lsd = false\n",
+             enable_lsd = false\n\
+             \n\
+             [[profile]]\n\
+             id = \"{PROFILE}\"\n\
+             network = \"host\"\n\
+             listen_interfaces = \"127.0.0.1:{listen_port}\"\n\
+             dht = true\n",
             d = p.display()
         ),
     )
@@ -117,18 +125,18 @@ fn daemon_end_to_end() {
     wait_healthy(HTTP);
 
     let magnet = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101&dn=itest";
-    let payload = format!("{{\"magnet\":\"{magnet}\"}}");
+    let payload = format!("{{\"magnet\":\"{magnet}\",\"profile_id\":\"{PROFILE}\"}}");
     let ih = "0101010101010101010101010101010101010101";
 
-    let (code, body) = http(HTTP, "POST", "/torrents", Some(&payload));
+    let (code, body) = http(HTTP, "POST", "/api/torrents", Some(&payload));
     assert_eq!(code, 201, "add should be 201: {body}");
     assert!(body.contains(ih), "add response: {body}");
 
-    let (code, body) = http(HTTP, "GET", "/torrents", None);
+    let (code, body) = http(HTTP, "GET", "/api/torrents", None);
     assert_eq!(code, 200);
     assert!(body.contains(ih), "list should contain the torrent: {body}");
 
-    let (code, _) = http(HTTP, "POST", "/torrents", Some(&payload));
+    let (code, _) = http(HTTP, "POST", "/api/torrents", Some(&payload));
     assert_eq!(code, 409, "duplicate add must be 409");
 
     let (code, metrics) = http(HTTP, "GET", "/metrics", None);
@@ -144,8 +152,8 @@ fn daemon_end_to_end() {
 
     // DHT/session state must be persisted on a graceful shutdown (Commit C).
     assert!(
-        p.join("session_state.dat").exists(),
-        "session_state.dat should be written on SIGTERM"
+        p.join(format!("session_state-{PROFILE}.dat")).exists(),
+        "a dht profile's session state should be written on SIGTERM"
     );
 }
 
@@ -167,12 +175,13 @@ fn daemon_graceful_shutdown_under_load() {
     let n = 100;
     for i in 1..=n {
         let ih = format!("{i:040x}");
-        let payload = format!("{{\"magnet\":\"magnet:?xt=urn:btih:{ih}\"}}");
-        let (code, body) = http(HTTP, "POST", "/torrents", Some(&payload));
+        let payload =
+            format!("{{\"magnet\":\"magnet:?xt=urn:btih:{ih}\",\"profile_id\":\"{PROFILE}\"}}");
+        let (code, body) = http(HTTP, "POST", "/api/torrents", Some(&payload));
         assert_eq!(code, 201, "add #{i} should be 201: {body}");
     }
 
-    let (code, body) = http(HTTP, "GET", "/status", None);
+    let (code, body) = http(HTTP, "GET", "/api/status", None);
     assert_eq!(code, 200, "status: {body}");
 
     // SIGTERM under load: must exit cleanly within the timeout.
@@ -182,7 +191,7 @@ fn daemon_graceful_shutdown_under_load() {
         "daemon did not exit within 30s of SIGTERM under {n}-torrent load"
     );
     assert!(
-        p.join("session_state.dat").exists(),
-        "session_state.dat should be written on SIGTERM"
+        p.join(format!("session_state-{PROFILE}.dat")).exists(),
+        "a dht profile's session state should be written on SIGTERM"
     );
 }

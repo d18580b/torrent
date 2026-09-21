@@ -43,7 +43,8 @@ impl ProfileEntry {
     pub fn new(
         config: ProfileConfig,
         engine: Arc<dyn TorrentEngine>,
-        tunnel_ip: IpAddr,
+        // `None` for a host profile, which has no tunnel to lose.
+        tunnel_ip: Option<IpAddr>,
         forwarded_port: Option<u16>,
         forwarded_epoch: u32,
     ) -> Self {
@@ -52,7 +53,7 @@ impl ProfileEntry {
             engine,
             health: Mutex::new(ProfileHealth {
                 status: ProfileStatus::Active,
-                tunnel_ip: Some(tunnel_ip),
+                tunnel_ip,
                 paused_for_vpn: 0,
                 forwarded_port,
                 forwarded_epoch,
@@ -110,38 +111,72 @@ pub struct FailedProfile {
 /// across the http/app_state modules.
 #[cfg(test)]
 pub(crate) fn test_entry(id: &str, status: ProfileStatus) -> ProfileEntry {
+    test_vpn_entry(id, status)
+}
+
+/// A tunnelled profile, which is what most tests about health and fencing
+/// want.
+#[cfg(test)]
+pub(crate) fn test_vpn_entry(id: &str, status: ProfileStatus) -> ProfileEntry {
     use std::net::Ipv4Addr;
     use std::path::PathBuf;
 
     use torrentd_engine::MockEngine;
     use torrentd_engine::PortForwardMode;
+    use torrentd_engine::ProfileNetwork;
     use torrentd_engine::VpnType;
 
+    let iface = format!("wg-{id}");
     let config = ProfileConfig {
         id: ProfileId::new(id),
-        vpn_config: PathBuf::from(format!("/etc/wg/{id}.conf")),
-        vpn_type: VpnType::Wireguard,
-        vpn_interface: format!("wg-{id}"),
-        listen_port: Some(6881),
-        peer_fingerprint_hex: "a1b2c3d4e5f60718".to_string(),
-        user_agent: format!("ua-{id}"),
-        resume_dir: PathBuf::from("/tmp/torrentd-test/resume"),
-        torrent_dir: PathBuf::from("/tmp/torrentd-test/torrents"),
+        network: ProfileNetwork::Vpn {
+            vpn_type: VpnType::Wireguard,
+            vpn_config: PathBuf::from(format!("/etc/wireguard/{iface}.conf")),
+            vpn_interface: iface,
+            listen_port: Some(6881),
+            port_forward: PortForwardMode::Static,
+            port_forward_gateway: None,
+        },
+        peer_fingerprint_hex: Some("a1b2c3d4e5f60718".to_string()),
+        user_agent: Some(format!("ua-{id}")),
+        resume_dir: None,
+        torrent_dir: None,
         allowed_tracker_domains: vec![],
         upload_rate_limit: 0,
-        port_forward: PortForwardMode::Static,
-        port_forward_gateway: None,
     };
     let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
     let entry = ProfileEntry::new(
         config,
         engine,
-        IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)),
+        Some(IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2))),
         None,
         0,
     );
     entry.update_health(|h| h.status = status);
     entry
+}
+
+/// A host profile, which has no tunnel and therefore no tunnel health.
+#[cfg(test)]
+pub(crate) fn test_host_entry(id: &str) -> ProfileEntry {
+    use torrentd_engine::MockEngine;
+    use torrentd_engine::ProfileNetwork;
+
+    let config = ProfileConfig {
+        id: ProfileId::new(id),
+        network: ProfileNetwork::Host {
+            listen_interfaces: "0.0.0.0:6881".to_string(),
+            dht: false,
+        },
+        peer_fingerprint_hex: None,
+        user_agent: None,
+        resume_dir: None,
+        torrent_dir: None,
+        allowed_tracker_domains: vec![],
+        upload_rate_limit: 0,
+    };
+    let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+    ProfileEntry::new(config, engine, None, None, 0)
 }
 
 impl ProfileRegistry {
@@ -165,6 +200,14 @@ impl ProfileRegistry {
     /// Whether `id` names a profile that failed to come up.
     pub fn failed_profile(&self, id: &ProfileId) -> Option<&FailedProfile> {
         self.failed.iter().find(|f| &f.config.id == id)
+    }
+
+    /// The configuration of a live profile.
+    ///
+    /// The add-time flag policy keys off the profile's declared network, so
+    /// every add path needs the config and not just the id.
+    pub fn config(&self, id: &ProfileId) -> Option<&ProfileConfig> {
+        self.get(id).map(|e| &e.config)
     }
 
     pub fn get(&self, id: &ProfileId) -> Option<&ProfileEntry> {

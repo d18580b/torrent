@@ -13,7 +13,7 @@ const VIEWS: View[] = ['pool', 'torrents', 'profiles']
 /// Hash routing, not path routing.
 ///
 /// The daemon still serves the pre-`/api` aliases for backwards compatibility,
-/// so `/pool`, `/torrents` and `/profiles` are all real API endpoints. A path-based
+/// so `/api/pool`, `/api/torrents` and `/api/profiles` are the API endpoints. A path-based
 /// client route would collide with them and get a 401 instead of the app. A
 /// fragment is never sent to the server, so `#/pool` cannot collide with
 /// anything, and views stay bookmarkable and back-button friendly.

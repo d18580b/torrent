@@ -18,7 +18,6 @@ use torrentd_pool::DirRollup;
 use tracing::info;
 
 use crate::app_state::AppState;
-use crate::app_state::Mode;
 use crate::pool_service::execute_adopt;
 
 type ApiError = (StatusCode, Json<serde_json::Value>);
@@ -330,15 +329,8 @@ pub async fn adopt(
 ) -> Result<Json<AdoptResponse>, ApiError> {
     let pool = s.pool.as_ref().ok_or_else(no_pool)?;
 
-    let profile = match (s.mode, req.profile_id.as_deref()) {
-        (Mode::Single, _) => ProfileId::default_single(),
-        (Mode::MultiProfile, Some(id)) => ProfileId::new(id),
-        (Mode::MultiProfile, None) => {
-            return Err(err(
-                StatusCode::BAD_REQUEST,
-                "profile_id required in multi-profile mode",
-            ))
-        }
+    let Some(profile) = req.profile_id.as_deref().map(ProfileId::new) else {
+        return Err(err(StatusCode::BAD_REQUEST, "profile_id is required"));
     };
     if s.source.engine_for(&profile).is_none() {
         return Err(err(StatusCode::BAD_REQUEST, "unknown profile_id"));
@@ -430,7 +422,7 @@ pub async fn adopt(
             });
             continue;
         }
-        match execute_adopt(pool, &s.source, &ih, profile.clone()) {
+        match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone()) {
             Ok(_) => bucket(&mut resp, verifies).push(ih),
             Err(reason) => {
                 release_claim(&s, &ih);

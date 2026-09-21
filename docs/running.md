@@ -33,7 +33,7 @@ runtime and are easy to miss because nothing checks for them at startup:
 
 | Binary | Package | Needed for |
 | --- | --- | --- |
-| `ip` | `iproute2` / `iproute` | Any multi-profile deployment. Polled every 30s per profile for the tunnel IP. |
+| `ip` | `iproute2` / `iproute` | Any deployment with a `vpn` profile. Polled every 30s per profile for the tunnel IP. |
 | `wg`, `wg-quick` | `wireguard-tools` | WireGuard profiles — bring-up, teardown, handshake age. |
 | `openvpn`, `pkill` | `openvpn`, `procps-ng` | OpenVPN profiles. `pkill` is how teardown stops the process. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
@@ -129,14 +129,14 @@ Copy [`deploy/torrentd.sample.toml`](../deploy/torrentd.sample.toml) to
 `/etc/torrentd/torrentd.toml`. Unknown keys are a fatal startup error, so a
 typo is caught rather than ignored.
 
-**Required** — the daemon will not start without all five:
+**Required** — the daemon will not start without all four, plus at least one
+`[[profile]]`:
 
 | Key | Meaning |
 | --- | --- |
-| `listen_interfaces` | e.g. `"0.0.0.0:6881,[::]:6881"` |
 | `default_save_path` | Where payload lives. Must exist (§4). |
-| `resume_dir` | Resume data, one bencoded file per info-hash. |
-| `torrent_dir` | `.torrent` store, for the startup inventory scan. |
+| `resume_dir` | Root of the resume store. Each profile gets a subdirectory named after its id. |
+| `torrent_dir` | Root of the `.torrent` store, same partitioning. |
 | `http_listen` | e.g. `"127.0.0.1:8080"` |
 
 **Optional, with the defaults actually used:**
@@ -145,14 +145,42 @@ typo is caught rather than ignored.
 | --- | --- |
 | `log_level` | `info` |
 | `registry_path` | `<resume_dir>/../profile_assignments.json` |
-| `session_state_path` | `<resume_dir>/../session_state.dat` |
+| `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
 | `vpn_handshake_max_age_secs` | `180` |
 | `network_kill_switch` | `false` |
-| `connections_limit`, `file_pool_size`, `enable_lsd`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
-| `peer_fingerprint`, `user_agent` | libtorrent's own |
+| `connections_limit`, `file_pool_size`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
+| `peer_fingerprint`, `user_agent` | libtorrent's own; a profile may override |
 
 Numeric overrides are range-checked at startup, so `aio_threads = 0` is refused
 rather than producing a daemon that starts and cannot seed.
+
+**`[[profile]]`** — at least one is required. There is no default profile and
+no implicit one: every profile states how it reaches the network, because the
+alternative (the host's own interfaces, with DHT on) is the least private
+posture the daemon has and should not be what you get by writing nothing.
+`POST /api/torrents` therefore always requires `profile_id`.
+
+Every profile takes `id` plus `network`, and then:
+
+| `network = "host"` | |
+| --- | --- |
+| `listen_interfaces` | **required**, e.g. `"0.0.0.0:6881,[::]:6881"` |
+| `dht` | default `false`. DHT is a public announcement of what this host holds, so it is opt-in. |
+
+| `network = "vpn"` | |
+| --- | --- |
+| `vpn_type`, `vpn_config`, `vpn_interface` | **required**. `vpn_interface` must equal `vpn_config`'s file stem — wg-quick derives one from the other in both directions. |
+| `listen_port` | required for `port_forward = "static"` (the default); omitted for `"natpmp"` |
+| `port_forward`, `port_forward_gateway` | default `static`, and `10.2.0.1` |
+| `peer_fingerprint_hex`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client. |
+
+DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
+them on.
+
+Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
+`upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
+`peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all
+be unique across profiles.
 
 **`[pool]`** (optional) — `roots` (required, must not nest and must not contain
 the daemon's own state), `library_dir` (required), `db_path`
@@ -162,13 +190,12 @@ the daemon's own state), `library_dir` (required), `db_path`
 moving and deleting files inside your roots; the index, matching, adoption and
 reporting are all read-only without it.
 
-**`[[profile]]`** (optional; any entry switches on multi-profile mode) — `id`,
-`vpn_config`, `vpn_type`, `vpn_interface`, `peer_fingerprint_hex` (16 hex
-chars, must not be libtorrent's default), `user_agent`, `resume_dir` and
-`torrent_dir` are all required. `listen_port` is required only for
-`port_forward = "static"`. `id`, `listen_port`, `vpn_interface`,
-`peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all be
-unique across profiles.
+> **Upgrading from a pre-profiles deployment.** Resume and `.torrent` files
+> used to live directly under `resume_dir` and `torrent_dir`; they now live in
+> a per-profile subdirectory. Point your profile's own `resume_dir` and
+> `torrent_dir` at the old paths, or move the files — otherwise the daemon
+> finds nothing and re-hashes the library. The assignment registry is migrated
+> automatically: its old file is read once and rewritten under the new name.
 
 Validate without starting anything:
 
@@ -208,7 +235,7 @@ The daemon sets none of these itself.
   `file_pool_size = 1000` will exhaust a default 1024-descriptor limit
   immediately. The systemd unit sets 65536 and the compose file matches; **a
   bare-metal run outside either gets nothing** and will hit `EMFILE`.
-- **`net.ipv4.conf.all.rp_filter = 2`** for multi-profile. Sockets are source-bound
+- **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on
   bare metal.
@@ -227,7 +254,7 @@ resume drain. The watchdog ping is withheld if the alert loop stops advancing,
 so a wedged daemon gets restarted rather than reported healthy.
 
 Remove `AmbientCapabilities=CAP_NET_ADMIN` and `CapabilityBoundingSet` for
-single-session mode; they are only needed to manage tunnels.
+a deployment with no `vpn` profile; they are only needed to manage tunnels.
 
 **Signals:** `SIGHUP` reloads log level, rate limits and connection limits.
 `SIGTERM` drains resume data (30s budget), persists session state, brings
@@ -302,7 +329,7 @@ On a scratch pool, not your real one.
    resumes with 409 until you restart the daemon. It must not restart itself.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
-   interfaces for the daemon's uid. Setting it in single-session mode is a
+   interfaces for the daemon's uid. Setting it with no `vpn` profile is a
    startup error, not a warning.
 
 ## Troubleshooting

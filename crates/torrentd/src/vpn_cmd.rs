@@ -182,7 +182,7 @@ fn host_checks(cfg: &Config) -> Vec<Check> {
             let tunnels: Vec<String> = cfg
                 .profile
                 .iter()
-                .map(|s| s.vpn_interface.clone())
+                .filter_map(|p| p.vpn_interface().map(str::to_string))
                 .collect();
             out.push(Check::pass(
                 "kill_switch_ruleset",
@@ -283,19 +283,28 @@ fn profile_checks(
     egress: Option<SocketAddr>,
 ) -> ProfileReport {
     let mut checks = Vec::new();
-    let iface = profile.vpn_interface.as_str();
+    let iface = profile
+        .vpn_interface()
+        .expect("only vpn profiles reach slot_checks");
+    let vpn_config = match &profile.network {
+        torrentd_engine::ProfileNetwork::Vpn { vpn_config, .. } => vpn_config.clone(),
+        torrentd_engine::ProfileNetwork::Host { .. } => unreachable!("filtered above"),
+    };
+    let vpn_type = profile
+        .vpn_type()
+        .expect("only vpn profiles reach slot_checks");
 
     // 1. The profile the daemon would hand to wg-quick / openvpn.
-    checks.push(match std::fs::metadata(&profile.vpn_config) {
+    checks.push(match std::fs::metadata(&vpn_config) {
         Ok(_) => Check::pass(
-            "profile",
-            format!("{} is readable", profile.vpn_config.display()),
+            "vpn_config",
+            format!("{} is readable", vpn_config.display()),
         ),
-        Err(e) => Check::fail("profile", format!("{}: {e}", profile.vpn_config.display())),
+        Err(e) => Check::fail("vpn_config", format!("{}: {e}", vpn_config.display())),
     });
 
     // 2. The tools that profile's type needs.
-    match profile.vpn_type {
+    match vpn_type {
         VpnType::Wireguard => {
             checks.push(if tool_available("wg", "--version") {
                 Check::pass("wireguard_tools", "`wg` is available")
@@ -322,15 +331,15 @@ fn profile_checks(
     }
 
     // 3. Optionally raise the tunnel, exactly as boot would.
-    let manager = vpn::for_type(profile.vpn_type, &cfg.state_dir());
+    let manager = vpn::for_type(vpn_type, &cfg.state_dir());
     if bring_up {
-        match manager.bring_up(&profile.vpn_config()) {
+        match manager.bring_up(&profile.vpn_tunnel().expect("vpn profile")) {
             Ok(ip) => checks.push(Check::pass("bring_up", format!("tunnel came up on {ip}"))),
             Err(e) => {
                 checks.push(Check::fail("bring_up", format!("{e}")));
                 return ProfileReport {
                     profile_id: profile.id.as_str().to_string(),
-                    vpn_type: vpn_type_str(profile.vpn_type),
+                    vpn_type: vpn_type_str(vpn_type),
                     checks,
                 };
             }
@@ -361,7 +370,7 @@ fn profile_checks(
 
     // 5. Handshake liveness — the same probe and the same threshold the health
     //    monitor applies every 30 seconds.
-    match profile.vpn_type {
+    match vpn_type {
         VpnType::Wireguard => {
             let max = Duration::from_secs(cfg.vpn_handshake_max_age_secs);
             match vpn::wireguard_handshake_age(iface) {
@@ -405,11 +414,11 @@ fn profile_checks(
 
     // 6. Port forwarding, against the real gateway. The mapping is released
     //    immediately; this is a negotiation, not a reservation.
-    match profile.port_forward {
+    match profile.port_forward() {
         PortForwardMode::Static => {
             checks.push(Check::skip(
                 "port_forward",
-                format!("static listen_port {:?}", profile.listen_port),
+                format!("static listen_port {:?}", profile.listen_port()),
             ));
         }
         PortForwardMode::Natpmp => match (
@@ -461,7 +470,7 @@ fn profile_checks(
 
     ProfileReport {
         profile_id: profile.id.as_str().to_string(),
-        vpn_type: vpn_type_str(profile.vpn_type),
+        vpn_type: vpn_type_str(vpn_type),
         checks,
     }
 }

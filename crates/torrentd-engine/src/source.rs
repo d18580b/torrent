@@ -48,44 +48,12 @@ pub trait AlertSource: Send + Sync + std::fmt::Debug {
     }
 }
 
-/// Single-session adapter — wraps one engine and reports a single profile
-/// (`ProfileId::DEFAULT`).
-#[derive(Debug)]
-pub struct SingleSessionSource {
-    engine: Arc<dyn TorrentEngine>,
-}
-
-impl SingleSessionSource {
-    pub fn new(engine: Arc<dyn TorrentEngine>) -> Self {
-        Self { engine }
-    }
-}
-
-impl AlertSource for SingleSessionSource {
-    fn drain(&self) -> Vec<(ProfileId, Alert)> {
-        let profile = ProfileId::default_single();
-        self.engine
-            .pop_alerts()
-            .into_iter()
-            .map(move |a| (profile.clone(), a))
-            .collect()
-    }
-
-    fn profiles(&self) -> Vec<ProfileId> {
-        vec![ProfileId::default_single()]
-    }
-
-    fn engine_for(&self, profile: &ProfileId) -> Option<Arc<dyn TorrentEngine>> {
-        if profile.is_default() {
-            Some(self.engine.clone())
-        } else {
-            None
-        }
-    }
-}
-
-/// Multi-profile adapter. Each entry is `(ProfileId, engine)` and `drain`
-/// iterates them in declaration order.
+/// The alert source. One entry per configured profile, `(ProfileId, engine)`;
+/// `drain` iterates them in declaration order.
+///
+/// There is exactly one implementation because there is exactly one shape: a
+/// daemon runs one session per configured profile, and a deployment with one
+/// profile is that with n = 1 rather than a mode of its own.
 #[derive(Debug)]
 pub struct ProfileSource {
     entries: Vec<(ProfileId, Arc<dyn TorrentEngine>)>,
@@ -141,13 +109,16 @@ mod tests {
     }
 
     #[test]
-    fn single_session_tags_default_profile() {
+    fn one_profile_is_just_n_equals_one() {
         let eng = Arc::new(MockEngine::new());
         eng.push_alert(finished(7));
-        let src = SingleSessionSource::new(eng);
+        let src = ProfileSource::new(vec![(
+            ProfileId::new("public"),
+            eng as Arc<dyn TorrentEngine>,
+        )]);
         let drained = src.drain();
         assert_eq!(drained.len(), 1);
-        assert!(drained[0].0.is_default());
+        assert_eq!(drained[0].0.as_str(), "public");
     }
 
     #[test]

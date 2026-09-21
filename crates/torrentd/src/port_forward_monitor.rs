@@ -47,7 +47,7 @@ pub async fn run(
     // Nothing to do unless at least one profile uses natpmp.
     if !profiles
         .iter()
-        .any(|e| e.config.port_forward == PortForwardMode::Natpmp)
+        .any(|e| e.config.port_forward() == PortForwardMode::Natpmp)
     {
         return;
     }
@@ -58,7 +58,7 @@ pub async fn run(
     // renewal/failure/change counters at 0 so `rate()`/alerting queries resolve
     // on a healthy daemon (they are otherwise absent until the first event).
     for e in profiles.iter() {
-        if e.config.port_forward != PortForwardMode::Natpmp {
+        if e.config.port_forward() != PortForwardMode::Natpmp {
             continue;
         }
         let labels = [("profile_id", e.id().as_str())];
@@ -83,7 +83,7 @@ pub async fn run(
         }
 
         for e in profiles.iter() {
-            if e.config.port_forward != PortForwardMode::Natpmp {
+            if e.config.port_forward() != PortForwardMode::Natpmp {
                 continue;
             }
             let profile_id = e.id().clone();
@@ -228,7 +228,7 @@ pub async fn run(
 /// lease. Skips profiles whose tunnel is already down (nothing reachable to tell).
 fn release_mappings(profiles: &ProfileRegistry, forwarder: &NatpmpForwarder) {
     for e in profiles.iter() {
-        if e.config.port_forward != PortForwardMode::Natpmp {
+        if e.config.port_forward() != PortForwardMode::Natpmp {
             continue;
         }
         let health = e.health();

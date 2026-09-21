@@ -695,7 +695,10 @@ mod tests {
         let engine: Arc<dyn torrentd_engine::TorrentEngine> =
             Arc::new(torrentd_engine::MockEngine::new());
         (
-            Arc::new(torrentd_engine::SingleSessionSource::new(engine)),
+            Arc::new(torrentd_engine::ProfileSource::new(vec![(
+                torrentd_engine::ProfileId::new("p"),
+                engine,
+            )])),
             StateMap::new(),
         )
     }
@@ -724,7 +727,7 @@ mod tests {
                     id: 1,
                     infohash: libtorrent_safe::InfoHash([0xff; 20]),
                 },
-                torrentd_engine::ProfileId::default_single(),
+                torrentd_engine::ProfileId::new("p"),
                 std::time::Instant::now(),
             ),
         );
