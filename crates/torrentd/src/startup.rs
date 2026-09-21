@@ -155,6 +155,18 @@ impl BootCleanup {
         Some(Box::new(move || vpn_for(t, &run_dir).bring_down(&name)))
     }
 
+    /// The manager for a tunnel of this type, built by the same factory the
+    /// teardown paths use.
+    ///
+    /// Bring-up called `crate::vpn::for_type` directly while teardown went
+    /// through the injected factory, so the manager that raised a tunnel and
+    /// the one that took it down were different objects and the seam covered
+    /// half the lifecycle — a test could drive teardown with a mock while
+    /// bring-up quietly shelled out to `wg-quick` beside it.
+    fn manager_for(&self, t: torrentd_engine::VpnType) -> Arc<dyn torrentd_engine::VpnManager> {
+        (self.vpn_for)(t, &self.run_dir)
+    }
+
     /// Stop tracking `iface` without bringing it down — for an interface this
     /// boot turned out not to own.
     fn forget_tunnel(&mut self, iface: &str) {
@@ -193,13 +205,16 @@ impl BootCleanup {
     /// and on a runtime worker that is 30 seconds per slot during which
     /// nothing else — including the signal handler that is supposed to
     /// interrupt exactly this — gets to run on that thread.
+    ///
+    /// The manager comes from the same factory the teardown uses, so the
+    /// object that raises a tunnel is the object that takes it down.
     async fn bring_up_tracked(
         &mut self,
-        vpn: Arc<dyn torrentd_engine::VpnManager>,
         t: torrentd_engine::VpnType,
         profile: torrentd_engine::VpnProfile,
     ) -> anyhow::Result<Result<IpAddr, torrentd_engine::VpnError>> {
         let iface = profile.interface.clone();
+        let vpn = self.manager_for(t);
         self.note_tunnel(t, &iface);
         let brought_up = tokio::task::spawn_blocking(move || vpn.bring_up(&profile))
             .await
@@ -443,11 +458,7 @@ pub async fn boot(
                 // half-up tunnel is the one failure path nothing else can
                 // reach. See `BootCleanup::bring_up_tracked`.
                 let brought_up = cleanup
-                    .bring_up_tracked(
-                        vpn::for_type(s.vpn_type, &run_dir),
-                        s.vpn_type,
-                        s.vpn_profile(),
-                    )
+                    .bring_up_tracked(s.vpn_type, s.vpn_profile())
                     .await?;
                 let tunnel_ip = match brought_up {
                     Ok(ip) => ip,
@@ -1187,7 +1198,7 @@ mod tests {
         // No `set_ip`, so `bring_up` fails the way the address poll does.
         let mut cleanup = cleanup_with(vpn.clone());
         let r = cleanup
-            .bring_up_tracked(Arc::new(vpn.clone()), VpnType::Wireguard, profile("wg-a"))
+            .bring_up_tracked(VpnType::Wireguard, profile("wg-a"))
             .await
             .expect("the bring-up task itself did not fail");
         assert!(r.is_err(), "the mock has no address for wg-a");
@@ -1215,7 +1226,7 @@ mod tests {
         vpn.set_foreign("wg-a");
         let mut cleanup = cleanup_with(vpn.clone());
         let r = cleanup
-            .bring_up_tracked(Arc::new(vpn.clone()), VpnType::Wireguard, profile("wg-a"))
+            .bring_up_tracked(VpnType::Wireguard, profile("wg-a"))
             .await
             .expect("the bring-up task itself did not fail");
         assert!(
@@ -1244,7 +1255,7 @@ mod tests {
         vpn.set_ip("wg-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
         let mut cleanup = cleanup_with(vpn.clone());
         let r = cleanup
-            .bring_up_tracked(Arc::new(vpn.clone()), VpnType::Wireguard, profile("wg-a"))
+            .bring_up_tracked(VpnType::Wireguard, profile("wg-a"))
             .await
             .expect("the bring-up task itself did not fail");
         assert_eq!(
@@ -1269,7 +1280,7 @@ mod tests {
         vpn.set_ip("wg-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
         let mut cleanup = cleanup_with(vpn.clone());
         let _ = cleanup
-            .bring_up_tracked(Arc::new(vpn.clone()), VpnType::Wireguard, profile("wg-a"))
+            .bring_up_tracked(VpnType::Wireguard, profile("wg-a"))
             .await;
         cleanup.disarm();
         drop(cleanup);
