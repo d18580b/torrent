@@ -223,11 +223,29 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     // RFC 7239 is the standardised form, so a proxy that emits only
     // `Forwarded` has to be able to supply the address too — otherwise its
     // client is silently discarded in favour of the proxy's socket address.
-    // `X-Forwarded-For` is tried first because it is the near-universal one.
-    let ip = last_element(req, "x-forwarded-for")
-        .and_then(|s| s.parse::<IpAddr>().ok())
-        .or_else(|| forwarded.and_then(|f| param(f, "for")).and_then(node_addr))
-        .or(Some(peer));
+    // `X-Forwarded-For` is the near-universal one, so it decides wherever it
+    // is present and `Forwarded` is read only where it is absent.
+    //
+    // Present-but-unreadable falls back to the socket peer, never to
+    // `Forwarded`. The trusted proxy wrote `X-Forwarded-For`; it did not
+    // write `Forwarded`, and treating a header it did not write as a second
+    // opinion on one it did hands the client address to whoever sent it. A
+    // proxy that *overwrites* `X-Forwarded-For` — the near-universal minimum
+    // — while forwarding `Forwarded` verbatim is exactly the configuration
+    // where that path is the only reachable one, and the address ends up in
+    // the throttle key and in `client_ip` on the failed-login line.
+    //
+    // Both arms go through `node_addr`, so they parse one grammar: the bare
+    // address, `host:port`, and a bracketed IPv6 literal are read the same on
+    // either. Otherwise the *stricter* parser is the one that falls through
+    // to the *less* trustworthy source, which is how the asymmetry bit.
+    let ip = match last_element(req, "x-forwarded-for") {
+        Some(xff) => node_addr(xff).or(Some(peer)),
+        None => forwarded
+            .and_then(|f| param(f, "for"))
+            .and_then(node_addr)
+            .or(Some(peer)),
+    };
 
     let secure = last_element(req, "x-forwarded-proto")
         .is_some_and(|p| p.eq_ignore_ascii_case("https"))
@@ -455,6 +473,75 @@ mod tests {
             Some("10.1.2.3".parse().unwrap()),
             "so does an explicitly unknown one",
         );
+    }
+
+    #[test]
+    fn an_unreadable_x_forwarded_for_falls_back_to_the_peer_not_to_forwarded() {
+        // The trusted proxy wrote `X-Forwarded-For` and did not write
+        // `Forwarded`. Reading `Forwarded` when the header the proxy *did*
+        // write fails to parse hands the client address to whoever sent it —
+        // and a proxy that overwrites `X-Forwarded-For` while forwarding
+        // `Forwarded` verbatim is the near-universal minimum, so that path is
+        // the only one an attacker needs. The address reached here is the
+        // throttle key and the `client_ip` on the failed-login line.
+        let attacker = ("forwarded", "for=203.0.113.99");
+
+        // A port-suffixed value is not unreadable. Both arms parse one
+        // grammar, so the proxy's own value is read rather than discarded.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[("x-forwarded-for", "198.51.100.7:52014"), attacker],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some("198.51.100.7".parse().unwrap()),
+            "the stricter parser must not be the one that falls through: \
+             host:port is an address on this arm too",
+        );
+
+        // Unreadable by any grammar: the socket peer stands, and the header
+        // the proxy never wrote is not consulted at all.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[("x-forwarded-for", "not-an-address"), attacker],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some("10.1.2.3".parse().unwrap()),
+            "an unreadable X-Forwarded-For stands the peer up; `Forwarded` is \
+             not a second opinion on a header the proxy did write",
+        );
+    }
+
+    #[test]
+    fn an_absent_x_forwarded_for_still_reads_forwarded() {
+        // Only the *unreadable* case changed. Where the proxy sent no
+        // `X-Forwarded-For` at all — the RFC 7239-only deployment — its
+        // `for=` still names the client, and the scheme arm is independent
+        // of the address arm.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[
+                    ("x-forwarded-proto", "https"),
+                    ("forwarded", "for=198.51.100.7"),
+                ],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some("198.51.100.7".parse().unwrap()),
+            "a proxy emitting only the standardised header must still be able \
+             to name its client",
+        );
+        assert!(c.secure);
     }
 
     #[test]
