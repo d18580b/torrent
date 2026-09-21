@@ -421,10 +421,24 @@ impl Config {
             d.log_level = Some(new.log_level);
         }
 
-        // Identity-critical / non-reloadable fields. Every one of them is
-        // reported in `non_reloadable_changes` so SIGHUP can log+ignore; a
-        // key that is neither applied nor mentioned leaves the operator
-        // believing a reload took.
+        // Identity-critical / non-reloadable fields. The rule is that a change
+        // to a key this daemon cannot apply is *reported* rather than
+        // swallowed: a key that is neither applied nor mentioned leaves the
+        // operator believing a reload took.
+        //
+        // The list below is the whole of `Config` except the six reloadable
+        // keys above and `[[profile]]`, which `diff_profiles` reports
+        // separately — so every field of the struct reaches one branch or the
+        // other, and a config file that changed can no longer produce
+        // `SIGHUP: config unchanged`.
+        //
+        // Keeping that true is a manual obligation and not a checked one:
+        // adding a field to `Config` and not to this function silently
+        // reopens the gap. Deriving the set structurally is the better end
+        // state and is a redesign of `ConfigDiff` rather than a repair to it.
+        if old.default_save_path != new.default_save_path {
+            d.non_reloadable_changes.push("default_save_path");
+        }
         if old.resume_dir != new.resume_dir {
             d.non_reloadable_changes.push("resume_dir");
         }
@@ -448,8 +462,7 @@ impl Config {
         // `AppState.auth` is built once in `startup::boot` and the listener is
         // bound once, so neither can follow a running daemon's config. They
         // are reported here for the same reason as everything above, and one
-        // more: these three were the only non-reloadable keys `diff` did not
-        // look at, so an operator who added `[auth]` and reloaded got
+        // more: an operator who added `[auth]` and reloaded got
         // `SIGHUP: config unchanged` from the journal and `202 Accepted` from
         // `POST /api/reload` while the daemon went on authenticating nothing.
         // Silence there reads as confirmation, which is worse than no signal.
@@ -461,6 +474,30 @@ impl Config {
         }
         if old.http_listen != new.http_listen {
             d.non_reloadable_changes.push("http_listen");
+        }
+        // These three arrived with the posture check, and the five below with
+        // it: eight non-reloadable keys `diff` did not look at, not three.
+        // Each is read exactly once and then never consulted again —
+        // `registry_path` and `pool` when `startup::boot` opens the registry
+        // and the pool, `vpn_handshake_max_age_secs` when the health monitor
+        // is constructed, `network_kill_switch` when `killswitch::enable`
+        // runs at boot — so none of them can follow a running daemon either.
+        //
+        // `network_kill_switch` is the one that matters: an operator who
+        // turns the fail-closed kill switch on and reloads was told the
+        // config was unchanged, and would believe a security control had
+        // taken effect that had not.
+        if old.registry_path != new.registry_path {
+            d.non_reloadable_changes.push("registry_path");
+        }
+        if old.vpn_handshake_max_age_secs != new.vpn_handshake_max_age_secs {
+            d.non_reloadable_changes.push("vpn_handshake_max_age_secs");
+        }
+        if old.network_kill_switch != new.network_kill_switch {
+            d.non_reloadable_changes.push("network_kill_switch");
+        }
+        if old.pool != new.pool {
+            d.non_reloadable_changes.push("pool");
         }
         d.profile_changes = diff_profiles(&old.profile, &new.profile);
         d
@@ -833,6 +870,29 @@ impl ConfigDiff {
             },
             ..Default::default()
         }
+    }
+
+    /// True when the patch `to_settings_patch_for` built sets nothing, so
+    /// handing it to `apply_settings` would be a no-op.
+    ///
+    /// The reload pump logs `SIGHUP: settings applied` per profile after that
+    /// call, and once the non-reloadable keys are reported the diff for an
+    /// edit that touched *only* them is no longer empty — so the pump fell
+    /// through its warnings into the settings loop and closed the reload with
+    /// a positive confirmation that nothing had been applied. A journal read
+    /// at the default `info` level shows that line last.
+    ///
+    /// This inspects the built patch rather than re-deriving the withholding
+    /// rules, so it cannot disagree with `to_settings_patch_for` about what
+    /// that function withheld. The fields listed are exactly the ones that
+    /// function can set; everything else in `Settings` comes from
+    /// `..Default::default()` and is always `None` here.
+    pub fn settings_patch_is_empty(patch: &libtorrent_safe::Settings) -> bool {
+        patch.connections_limit.is_none()
+            && patch.upload_rate_limit.is_none()
+            && patch.max_concurrent_http_announces.is_none()
+            && patch.aio_threads.is_none()
+            && patch.enable_lsd.is_none()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1855,5 +1915,112 @@ library_dir = "{d}/library"
         let d = Config::diff(&old, &new);
         assert_eq!(d.connections_limit, Some(20000));
         assert_eq!(d.non_reloadable_changes, vec!["torrent_dir"]);
+    }
+
+    #[test]
+    fn an_edit_to_any_non_reloadable_key_is_reported() {
+        // The property: a config that differs in exactly one key the daemon
+        // cannot apply is not an unchanged config, and the warning names the
+        // key that changed. Five keys reached no branch of `diff` at all, so
+        // `is_empty()` stayed true and `reload::run` answered
+        // `SIGHUP: config unchanged` to a file that plainly had. Each is
+        // exercised on its own, because a change that only *happens* to
+        // travel with a reported key is not the failure this is about.
+        //
+        // `network_kill_switch` is the one with a security consequence: an
+        // operator who turns the fail-closed kill switch on and reloads was
+        // told nothing had changed.
+        let dir = tempdir().unwrap();
+        let base = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+
+        let mut save_path = base.clone();
+        save_path.default_save_path = PathBuf::from("/data/elsewhere");
+
+        let mut registry = base.clone();
+        registry.registry_path = Some(PathBuf::from("/var/lib/torrentd/assignments.json"));
+
+        let mut handshake = base.clone();
+        handshake.vpn_handshake_max_age_secs = base.vpn_handshake_max_age_secs + 60;
+
+        let mut kill_switch = base.clone();
+        kill_switch.network_kill_switch = !base.network_kill_switch;
+
+        let mut pool = base.clone();
+        pool.pool = Some(PoolConfig {
+            roots: vec![PathBuf::from("/data/pool")],
+            library_dir: PathBuf::from("/data/library"),
+            db_path: None,
+            max_concurrent_verify: 1,
+            import_legacy_registry: false,
+            allow_mutations: false,
+        });
+
+        for (field, edited) in [
+            ("default_save_path", &save_path),
+            ("registry_path", &registry),
+            ("vpn_handshake_max_age_secs", &handshake),
+            ("network_kill_switch", &kill_switch),
+            ("pool", &pool),
+        ] {
+            let d = Config::diff(&base, edited);
+            assert!(
+                !d.is_empty(),
+                "a config differing only in {field} must not look unchanged",
+            );
+            assert!(
+                d.non_reloadable_changes.contains(&field),
+                "the warning for a changed {field} must name it; got {:?}",
+                d.non_reloadable_changes,
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_to_only_non_reloadable_keys_applies_no_settings() {
+        // The property: the reload pump's per-profile settings loop is
+        // skipped for an edit it cannot apply anything from, so such a reload
+        // does not close with `INFO SIGHUP: settings applied`.
+        //
+        // Once the non-reloadable keys are reported, `is_empty()` is false for
+        // an edit that touched only them, so the pump falls through its
+        // warnings into that loop and calls `apply_settings` with a patch that
+        // sets nothing. It succeeds, and the journal's last word on a reload
+        // that was ignored is a success line. `reload::run` guards on this
+        // predicate; nothing in the workspace drives the pump itself, so the
+        // guard is pinned here rather than through `run`.
+        let dir = tempdir().unwrap();
+        let base = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+
+        // The documented operator edit: add `[auth]`, delete the opt-out.
+        let mut with_auth = base.clone();
+        with_auth.auth = Some(crate::auth::AuthConfig {
+            password_hash: crate::auth::hash_password("hunter2").unwrap(),
+            session_ttl_secs: 43_200,
+            token: vec![],
+        });
+        with_auth.allow_unauthenticated = false;
+
+        let d = Config::diff(&base, &with_auth);
+        assert!(
+            !d.is_empty(),
+            "the edit is reported, so the diff is not empty"
+        );
+        for profile in [host_profile(), vpn_profile()] {
+            assert!(
+                ConfigDiff::settings_patch_is_empty(&d.to_settings_patch_for(&profile)),
+                "an auth-only edit has nothing to apply to profile {}",
+                profile.id,
+            );
+        }
+
+        // A reloadable key in the same edit still reaches the loop: the guard
+        // withholds a no-op call, not every call.
+        let mut also_reloadable = with_auth.clone();
+        also_reloadable.connections_limit = Some(20_000);
+        let d = Config::diff(&base, &also_reloadable);
+        assert!(
+            !ConfigDiff::settings_patch_is_empty(&d.to_settings_patch_for(&host_profile())),
+            "a changed connections_limit must still be applied",
+        );
     }
 }

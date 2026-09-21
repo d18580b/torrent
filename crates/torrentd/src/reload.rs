@@ -2,7 +2,16 @@
 //!
 //! Reloadable: `connections_limit`, `upload_rate_limit`,
 //! `max_concurrent_http_announces`, `aio_threads`, `enable_lsd`, `log_level`.
-//! Everything else triggers a `warn` and is ignored.
+//! Every other key of `Config` triggers a `warn` and is ignored, and
+//! `[[profile]]` identity changes are warned about one field at a time. There
+//! is no third class that is silently dropped — `Config::diff` reaches every
+//! field of the struct, so a config file that changed never answers
+//! `SIGHUP: config unchanged`.
+//!
+//! A reload that touched only ignored keys stops after those warnings: the
+//! per-profile settings loop is skipped when the patch it would apply sets
+//! nothing, so the journal's last word on such a reload is the warning and
+//! not `SIGHUP: settings applied`.
 //!
 //! Two of those do not reach every session, and a flat list said they did:
 //!
@@ -78,6 +87,17 @@ pub async fn run(
                 continue;
             };
             let patch = diff.to_settings_patch_for(cfg);
+            // An edit that changed only non-reloadable keys produces a
+            // non-empty diff (they are reported) and an empty patch (none of
+            // them is applicable). Applying it would succeed and log
+            // `SIGHUP: settings applied`, which is a positive confirmation
+            // immediately after the warnings saying the edit was ignored.
+            // Withholding that call is also what keeps Safety Rule 6's
+            // per-profile withholding from reading as a successful apply on a
+            // tunnelled profile whose only changed key was `enable_lsd`.
+            if crate::config::ConfigDiff::settings_patch_is_empty(&patch) {
+                continue;
+            }
             if let Some(eng) = source.engine_for(&profile) {
                 if let Err(e) = eng.apply_settings(&patch).context("apply_settings") {
                     warn!(profile_id = %profile, error.cause = %e, "SIGHUP: apply_settings failed");
