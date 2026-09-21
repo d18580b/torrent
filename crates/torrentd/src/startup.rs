@@ -350,8 +350,23 @@ pub async fn boot(
                     );
                     continue;
                 }
-            } else {
-                let _ = registry.assign(ih, slot.clone());
+            } else if let Err(e) = registry.assign(ih, slot.clone()) {
+                // Rule 4 makes the registry the gate every load passes. An
+                // assignment that failed to persist is one that disappears at
+                // the next restart, after which nothing knows this info-hash
+                // belongs to this slot — so refuse the load rather than seed a
+                // torrent the uniqueness rule can no longer see.
+                warn!(
+                    slot_id = %slot,
+                    infohash = %ih,
+                    error.cause = %e,
+                    "could not record the resume assignment; skipping this torrent",
+                );
+                metrics.inc_counter(
+                    "slot_assignment_registry_errors_total",
+                    &[("slot_id", slot.as_str())],
+                );
+                continue;
             }
             // Re-attach metadata. libtorrent writes the info dict into resume
             // data only when save_resume_data was called with SAVE_INFO_DICT
@@ -426,6 +441,23 @@ pub async fn boot(
             if registry.lookup(&ih).is_some() {
                 continue;
             }
+            // Rule 4 again: claim first, load second. Claiming afterwards
+            // left a window in which the session held a torrent the registry
+            // had never agreed to, and dropped the claim silently if it could
+            // not be written.
+            if let Err(e) = registry.assign(ih, slot.clone()) {
+                warn!(
+                    slot_id = %slot,
+                    infohash = %ih,
+                    error.cause = %e,
+                    "could not record the torrent-dir assignment; skipping this torrent",
+                );
+                metrics.inc_counter(
+                    "slot_assignment_registry_errors_total",
+                    &[("slot_id", slot.as_str())],
+                );
+                continue;
+            }
             let flags = torrentd_engine::seed_flags(&slot);
             match engine.add_torrent(AddParams::File {
                 bytes,
@@ -433,15 +465,18 @@ pub async fn boot(
                 flags,
             }) {
                 Ok(_) => {
-                    let _ = registry.assign(ih, slot.clone());
                     added += 1;
                 }
-                Err(e) => warn!(
-                    slot_id = %slot,
-                    infohash = %ih,
-                    error.cause = %e,
-                    "torrent-dir add failed",
-                ),
+                Err(e) => {
+                    // Release the claim so a later run can retry the add.
+                    let _ = registry.remove(&ih);
+                    warn!(
+                        slot_id = %slot,
+                        infohash = %ih,
+                        error.cause = %e,
+                        "torrent-dir add failed",
+                    );
+                }
             }
         }
         if added > 0 {
