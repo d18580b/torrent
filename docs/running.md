@@ -430,7 +430,7 @@ These address the daemon directly, so they are written for a deployment that
 publishes the API — the systemd path of §8, and any run bound to loopback.
 
 ```bash
-curl -s localhost:8080/healthz            # {"ok":true,"profiles":1,"profiles_fenced":0,"heartbeat_age_secs":0}
+curl -s localhost:8080/healthz            # {"heartbeat_age_secs":0,"ok":true,"profiles":1,"profiles_fenced":0}
 curl -s localhost:8080/api/status | jq    # counts by state, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
