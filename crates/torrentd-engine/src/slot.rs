@@ -274,11 +274,7 @@ pub enum SlotConfigError {
          exceed the top-level upload_rate_limit, but the value reaches libtorrent as a C int, \
          so anything above {max} would be applied as a negative rate limit"
     )]
-    UploadRateLimitOutOfRange {
-        slot: String,
-        value: u32,
-        max: u32,
-    },
+    UploadRateLimitOutOfRange { slot: String, value: u32, max: u32 },
 }
 
 impl SlotConfig {
