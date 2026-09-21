@@ -341,16 +341,20 @@ requests on the web client's assets, precompressed `.br`/`.gz` variants, and a
 
 [`deploy/Caddyfile`](../deploy/Caddyfile) and
 [`deploy/compose.yaml`](../deploy/compose.yaml) are a working pair. The
-contract is two headers:
+contract is three headers:
 
 | Header | What torrentd does with it |
 | --- | --- |
 | `X-Forwarded-For` | the client address, for the login throttle and the failed-login log line |
 | `X-Forwarded-Proto` | `https` sets `Secure` on the session cookie |
+| `Forwarded` (RFC 7239) | `for=` supplies the client address where `X-Forwarded-For` is absent; `proto=` supplies the scheme where `X-Forwarded-Proto` is absent |
 
-RFC 7239 `Forwarded` supplies both: its `for=` parameter is read as the client
-address where `X-Forwarded-For` is absent, and its `proto=` as the scheme. A
-proxy that emits only the standardised header is therefore fully supported.
+Each header is named here so that the stripping requirement below can be read
+off the list. A proxy that emits only the standardised `Forwarded` is fully
+supported: it can name its client and its scheme without sending either `X-`
+header. Where both arrive, the `X-` header decides and `Forwarded` is the
+fallback — an explicit `X-Forwarded-Proto: http` from the proxy is not
+overridden by a `proto=https` the client may have sent.
 
 **All are read only from a peer listed in `trusted_proxies`.** That key is
 empty by default, and with it empty no forwarding header is read at all — the
@@ -367,10 +371,18 @@ form. Either way the cookie loses its `Secure` attribute, and nothing becomes
 forgeable.
 
 The proxy must **strip or overwrite client-supplied forwarding headers before
-adding its own**. That is the only requirement torrentd places on it. Each of
-these headers is a chain every hop appends to, so torrentd reads the *last*
-entry — the one the trusted proxy added — rather than the first, which is
-whatever the original client chose to send. Whether your proxy appends by
+adding its own** — all three of the names in the table above, not just the two
+`X-` ones. That is the only requirement torrentd places on it, and
+[`deploy/Caddyfile`](../deploy/Caddyfile) is the worked example of meeting it:
+`header_up X-Forwarded-For {remote_host}` and `header_up X-Forwarded-Proto
+{scheme}` overwrite the first two with values Caddy computed, and `header_up
+-Forwarded` removes the third outright. A proxy that strips only the two `X-`
+names leaves `Forwarded` a client-controlled input arriving from a peer this
+daemon believes.
+
+Each of these headers is a chain every hop appends to, so torrentd reads the
+*last* entry — the one the trusted proxy added — rather than the first, which
+is whatever the original client chose to send. Whether your proxy appends by
 extending the existing field line (nginx, Caddy) or by adding a second one
 (HAProxy's `option forwardfor`) makes no difference: repeated field lines are
 joined in order first, exactly as RFC 9110 §5.2-5.3 defines them. A proxy that
