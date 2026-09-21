@@ -840,6 +840,25 @@ impl DaemonHandle {
                 .expect("validated at startup"),
         };
 
+        // What the daemon decided to believe, in the journal, once. Anything
+        // in this set can claim to be any client, and the key is read only at
+        // startup — so an operator who edits it and reloads is told the
+        // change requires a restart, and the running value can differ from
+        // the file indefinitely. Without this line there is no evidence
+        // anywhere of which value the process is actually running.
+        if cfg.trusted_proxies.is_empty() {
+            info!(
+                target: "torrentd::auth",
+                "trusted_proxies is empty: no forwarding header is read and the socket peer is the client",
+            );
+        } else {
+            info!(
+                target: "torrentd::auth",
+                trusted_proxies = %cfg.trusted_proxies.join(", "),
+                "forwarding headers are believed from these peers, and read once at startup",
+            );
+        }
+
         let app: Router = http::router(app_state);
         let http_listen = cfg.http_listen;
 
