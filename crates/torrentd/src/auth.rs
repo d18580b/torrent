@@ -48,7 +48,15 @@ pub const SESSION_COOKIE: &str = "torrentd_session";
 pub enum Scope {
     /// Read-only API access.
     Read,
-    /// Everything, including adopting and applying mutation plans.
+    /// Every unsafe method, pool adoption and mutation plans included.
+    ///
+    /// This is the authentication scope, and it is not the `[pool]
+    /// allow_mutations` switch. Holding `Write` is necessary for
+    /// `POST /api/pool/adopt`, `POST /api/pool/plans` and applying a plan;
+    /// `allow_mutations` separately gates only the two that move or delete
+    /// files inside `roots` — creating and applying a plan. Adoption records
+    /// an existing file's ownership in the index and moves nothing, so it is
+    /// deliberately outside that switch.
     Write,
     /// `/metrics` only.
     Metrics,
