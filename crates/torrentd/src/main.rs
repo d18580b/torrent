@@ -131,12 +131,19 @@ fn main() -> anyhow::Result<()> {
                 PoolCmd::Orphans { limit } => pool_cmd::orphans(&cfg, limit),
             },
             Command::Vpn { cmd } => match cmd {
+                // The only subcommand with more than two outcomes: it exits 2
+                // when nothing failed but something could not be checked, so
+                // it hands back a status rather than a `Result<()>` whose
+                // `Err` could only ever mean 1.
                 cli::VpnCmd::Check {
                     slot,
                     json,
                     bring_up,
                     egress,
-                } => vpn_cmd::check(&cfg, slot.as_deref(), json, bring_up, egress),
+                } => {
+                    let code = vpn_cmd::check(&cfg, slot.as_deref(), json, bring_up, egress)?;
+                    std::process::exit(code);
+                }
             },
             Command::HashPassword => hash_password_cmd(),
             Command::NewToken { name, scopes } => new_token_cmd(&name, &scopes),

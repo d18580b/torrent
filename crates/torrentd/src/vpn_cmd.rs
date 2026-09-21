@@ -20,6 +20,11 @@
 //! changes the machine. It lowers again **only** what it raised: an interface
 //! that already existed when the command started belongs to something else —
 //! usually a running daemon — and is reported, checked, and left alone.
+//!
+//! The exit status carries three values, because a `mise` task or a systemd
+//! `ExecStartPre` reads the status and never the report: `0` clean, `1` for any
+//! failure, `2` for "nothing failed, but at least one check could not be
+//! performed". See [`Report::exit_code`].
 
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -114,10 +119,52 @@ pub struct Report {
     pub slots: Vec<SlotReport>,
 }
 
+/// Everything was established, and everything established was good.
+pub const EXIT_OK: i32 = 0;
+/// At least one check failed.
+pub const EXIT_FAILED: i32 = 1;
+/// Nothing failed, but at least one check could not be performed.
+pub const EXIT_UNKNOWN: i32 = 2;
+
 impl Report {
     pub fn failed(&self) -> bool {
         self.host.iter().any(|c| c.verdict == Verdict::Fail)
             || self.slots.iter().any(SlotReport::failed)
+    }
+
+    fn checks(&self) -> impl Iterator<Item = &Check> {
+        self.host
+            .iter()
+            .chain(self.slots.iter().flat_map(|s| &s.checks))
+    }
+
+    /// Whether any check could not be performed at all.
+    pub fn incomplete(&self) -> bool {
+        self.checks().any(|c| c.verdict == Verdict::Unknown)
+    }
+
+    /// The exit status this report implies.
+    ///
+    /// The four-valued verdict exists so a green summary cannot quietly mean
+    /// "mostly not checked" — but the exit status is the only part of this
+    /// report a `mise` task or a systemd `ExecStartPre` ever sees, and
+    /// collapsing `unknown` into success asserted in one byte exactly what the
+    /// four values were introduced to avoid. A run where `rp_filter` is
+    /// unreadable, `wg-quick --help` exits non-zero and `wg show` is refused
+    /// for want of permission established nothing about the handshake half and
+    /// exited 0.
+    ///
+    /// `Skip` is not `Unknown`: a NAT-PMP check on a static slot did not fail
+    /// to happen, it correctly did not apply, and it does not colour the
+    /// status.
+    pub fn exit_code(&self) -> i32 {
+        if self.failed() {
+            EXIT_FAILED
+        } else if self.incomplete() {
+            EXIT_UNKNOWN
+        } else {
+            EXIT_OK
+        }
     }
 }
 
@@ -567,9 +614,28 @@ fn slot_checks(
 
     // 8. Lower only what step 3 raised. An adopted interface is left exactly
     //    as it was found, and produces no `bring_down` line at all.
+    //
+    //    `VpnManager::bring_down` returns `()` and, per its own contract,
+    //    swallows its errors to the log — so reporting a pass straight after
+    //    calling it reported the one host mutation this command advertises
+    //    without ever looking at it. `wg-quick down` can fail: the interface
+    //    is busy, the profile moved, `wg-quick` is not on this uid's PATH.
+    //    Look at the address instead.
     if raised_here {
         manager.bring_down(iface);
-        checks.push(Check::pass("bring_down", "tunnel taken back down"));
+        checks.push(match host.first_ipv4(iface) {
+            Err(_) => Check::pass(
+                "bring_down",
+                format!("{iface} no longer has an address; the host is as it was found"),
+            ),
+            Ok(ip) => Check::fail(
+                "bring_down",
+                format!(
+                    "{iface} still has {ip} after bring_down: this command raised the tunnel \
+                     and could not lower it again, so the host has been left changed"
+                ),
+            ),
+        });
     }
 
     SlotReport {
@@ -586,15 +652,17 @@ fn vpn_type_str(t: VpnType) -> &'static str {
     }
 }
 
-/// Run the checks and print them. Exits non-zero if anything failed, so this
-/// is usable as a pre-flight step in a unit or a CI job.
+/// Run the checks, print them, and return the exit status they imply — `0`
+/// clean, `1` for any failure, `2` for "nothing failed, but something could not
+/// be checked". Usable as a pre-flight step in a unit or a CI job, which is why
+/// `2` exists: those consumers read the status and not the report.
 pub fn check(
     cfg: &Config,
     only: Option<&str>,
     json: bool,
     bring_up: bool,
     egress: Option<SocketAddr>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i32> {
     if cfg.slot.is_empty() {
         anyhow::bail!(
             "no [[slot]] entries are configured, so there is no VPN to check. \
@@ -625,10 +693,16 @@ pub fn check(
         print_human(&report);
     }
 
-    if report.failed() {
-        anyhow::bail!("one or more VPN checks failed");
+    let code = report.exit_code();
+    match code {
+        EXIT_FAILED => eprintln!("one or more VPN checks failed"),
+        EXIT_UNKNOWN => eprintln!(
+            "nothing failed, but one or more checks could not be performed; \
+             exiting {EXIT_UNKNOWN}"
+        ),
+        _ => {}
     }
-    Ok(())
+    Ok(code)
 }
 
 fn symbol(v: Verdict) -> &'static str {
@@ -842,6 +916,52 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
     }
 
     #[test]
+    fn a_bring_down_that_left_the_tunnel_up_is_reported_as_a_failure() {
+        // F7. `bring_down` returns `()` and logs its errors away, so "tunnel
+        // taken back down" was printed whether or not the tunnel went down.
+        // Here the address is still there on the second lookup — `wg-quick
+        // down` failed — and the operator has to be told the host was left
+        // changed, on the one mutation this command advertises.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new().with_addrs([
+            ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
+            ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
+        ]);
+        host.vpn
+            .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+
+        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+
+        assert_eq!(host.vpn.bring_down_calls(), vec!["wg-acct-a"]);
+        let bd = find(&r.checks, "bring_down").expect("a bring_down line");
+        assert_eq!(bd.verdict, Verdict::Fail, "detail: {}", bd.detail);
+        assert!(
+            bd.detail.contains("10.2.0.2"),
+            "the address that is still there names the problem: {}",
+            bd.detail,
+        );
+        assert!(r.failed(), "and it has to reach the exit status");
+    }
+
+    #[test]
+    fn a_bring_down_that_worked_is_reported_only_once_the_address_is_gone() {
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new().with_addrs([
+            ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
+            ("wg-acct-a", None),
+        ]);
+        host.vpn
+            .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+
+        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+
+        assert_eq!(
+            find(&r.checks, "bring_down").map(|c| c.verdict),
+            Some(Verdict::Pass),
+        );
+    }
+
+    #[test]
     fn the_default_path_leaves_its_mapping_to_expire_rather_than_deleting_it() {
         // F2. The flagless path is the one documented as observe-only, and it
         // used to finish by issuing NAT-PMP's wildcard delete from the tunnel
@@ -916,6 +1036,88 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
             }],
         };
         assert!(r.failed());
+    }
+
+    #[test]
+    fn a_check_that_could_not_be_performed_does_not_exit_zero() {
+        // F6. The report distinguishes four verdicts so a green cannot quietly
+        // mean "mostly not checked", but the exit status is the only part of
+        // it a mise task or a systemd ExecStartPre reads. A run that
+        // established nothing about the handshake half used to exit 0.
+        let r = Report {
+            host: vec![Check::pass("iproute2", ""), Check::unknown("rp_filter", "")],
+            slots: vec![SlotReport {
+                slot_id: "acct_a".into(),
+                vpn_type: "wireguard",
+                checks: vec![
+                    Check::pass("tunnel_ip", ""),
+                    Check::unknown("handshake", ""),
+                ],
+            }],
+        };
+        assert!(!r.failed(), "nothing failed");
+        assert!(r.incomplete());
+        assert_eq!(r.exit_code(), EXIT_UNKNOWN);
+    }
+
+    #[test]
+    fn an_unknown_inside_a_slot_alone_is_enough_to_colour_the_status() {
+        // The host half can be entirely clean and the slot half entirely
+        // unestablished; `Report::failed` only ever looked at `Fail`, so the
+        // slot half has to be reached explicitly.
+        let r = Report {
+            host: vec![Check::pass("iproute2", "")],
+            slots: vec![SlotReport {
+                slot_id: "acct_a".into(),
+                vpn_type: "wireguard",
+                checks: vec![Check::unknown("handshake", "")],
+            }],
+        };
+        assert_eq!(r.exit_code(), EXIT_UNKNOWN);
+    }
+
+    #[test]
+    fn a_failure_outranks_an_unknown_in_the_exit_status() {
+        let r = Report {
+            host: vec![Check::unknown("rp_filter", "")],
+            slots: vec![SlotReport {
+                slot_id: "acct_a".into(),
+                vpn_type: "wireguard",
+                checks: vec![Check::fail("tunnel_ip", "")],
+            }],
+        };
+        assert_eq!(r.exit_code(), EXIT_FAILED);
+    }
+
+    #[test]
+    fn a_skip_is_not_an_unknown_and_exits_clean() {
+        // A NAT-PMP check on a static slot did not fail to happen; it
+        // correctly did not apply. Colouring the status for it would make
+        // every static deployment exit 2 forever.
+        let r = Report {
+            host: vec![Check::pass("iproute2", ""), Check::skip("kill_switch", "")],
+            slots: vec![SlotReport {
+                slot_id: "acct_a".into(),
+                vpn_type: "wireguard",
+                checks: vec![
+                    Check::pass("tunnel_ip", ""),
+                    Check::skip("port_forward", ""),
+                ],
+            }],
+        };
+        assert!(!r.incomplete());
+        assert_eq!(r.exit_code(), EXIT_OK);
+    }
+
+    #[test]
+    fn a_host_side_failure_alone_fails_the_report() {
+        // The left side of `Report::failed`'s `||`, which nothing reached.
+        let r = Report {
+            host: vec![Check::fail("iproute2", "")],
+            slots: vec![],
+        };
+        assert!(r.failed());
+        assert_eq!(r.exit_code(), EXIT_FAILED);
     }
 
     #[test]
