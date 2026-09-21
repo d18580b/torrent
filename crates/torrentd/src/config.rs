@@ -296,6 +296,13 @@ impl Config {
         if old.torrent_dir != new.torrent_dir {
             d.non_reloadable_changes.push("torrent_dir");
         }
+        if old.file_pool_size != new.file_pool_size {
+            // Not reloadable, and it used to be the one non-reloadable key
+            // that was not *reported* either: `diff` skipped it entirely, so a
+            // change was neither applied nor mentioned, unlike every other
+            // field in this list.
+            d.non_reloadable_changes.push("file_pool_size");
+        }
         if old.peer_fingerprint != new.peer_fingerprint {
             d.non_reloadable_changes.push("peer_fingerprint");
         }
@@ -539,6 +546,20 @@ http_listen = "127.0.0.1:8080"
 log_level = "info"
 connections_limit = 10000
 "#;
+
+    #[test]
+    fn a_file_pool_size_change_is_reported_rather_than_swallowed() {
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), SINGLE_SESSION)).unwrap();
+        let mut b = a.clone();
+        b.file_pool_size = Some(2048);
+        let d = Config::diff(&a, &b);
+        assert!(
+            d.non_reloadable_changes.contains(&"file_pool_size"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+    }
 
     #[test]
     fn enable_lsd_never_reaches_a_private_slot() {

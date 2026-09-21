@@ -75,7 +75,7 @@ pub use registry::RegistryError;
 pub use resume_store::FsResumeStore;
 pub use resume_store::MemoryResumeStore;
 pub use resume_store::ResumeStore;
-pub use slot::Slot;
+pub use slot::bind_endpoint;
 pub use slot::SlotConfig;
 pub use slot::SlotId;
 pub use slot::SlotStatus;

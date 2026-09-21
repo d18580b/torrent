@@ -592,6 +592,18 @@ pub async fn set_upload_limit(
     Path(infohash): Path<String>,
     Json(body): Json<UploadLimitBody>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    // The adjacent file-priority route validates its argument before it
+    // crosses the FFI boundary and this one did not, so a negative rate
+    // reached libtorrent unchecked. 0 is "unlimited"; anything below it is not
+    // a rate.
+    if body.bytes_per_sec < 0 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "bytes_per_sec must be >= 0 (0 = unlimited)"
+            })),
+        ));
+    }
     let (st, engine) = lookup_engine(&s, &infohash)?;
     engine
         .set_upload_limit(st.handle, body.bytes_per_sec)
