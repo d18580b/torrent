@@ -5,7 +5,7 @@
 //! filter and paginate over that set without shipping it all to the browser.
 //! One transactional file serves the file index, the torrent library, adoption
 //! state, and the torrent→profile registry that used to live in
-//! `profile_assignments.json`.
+//! `slot_assignments.json` (now `profile_assignments.json`).
 
 use std::collections::HashMap;
 use std::path::Path;

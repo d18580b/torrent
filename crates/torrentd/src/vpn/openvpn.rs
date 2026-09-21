@@ -89,7 +89,8 @@ impl VpnManager for OpenvpnManager {
             .arg("--daemon")
             .arg("--config")
             .arg(&profile.config_path)
-            // Authoritative, so the profile cannot disagree with the profile.
+            // Authoritative, so the OpenVPN profile file cannot disagree with
+            // the profile config.
             .arg("--dev")
             .arg(&profile.interface)
             .arg("--writepid")

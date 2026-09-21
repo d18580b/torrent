@@ -285,14 +285,14 @@ fn profile_checks(
     let mut checks = Vec::new();
     let iface = profile
         .vpn_interface()
-        .expect("only vpn profiles reach slot_checks");
+        .expect("only vpn profiles reach profile_checks");
     let vpn_config = match &profile.network {
         torrentd_engine::ProfileNetwork::Vpn { vpn_config, .. } => vpn_config.clone(),
         torrentd_engine::ProfileNetwork::Host { .. } => unreachable!("filtered above"),
     };
     let vpn_type = profile
         .vpn_type()
-        .expect("only vpn profiles reach slot_checks");
+        .expect("only vpn profiles reach profile_checks");
 
     // 1. The profile the daemon would hand to wg-quick / openvpn.
     checks.push(match std::fs::metadata(&vpn_config) {
@@ -494,7 +494,8 @@ pub fn check(
     if cfg.profile.is_empty() {
         anyhow::bail!(
             "no [[profile]] entries are configured, so there is no VPN to check. \
-             Single-session mode does not use a tunnel."
+             A daemon with no [[profile]] table cannot start either; see \
+             deploy/torrentd.sample.toml."
         );
     }
     let selected: Vec<&ProfileConfig> = cfg
