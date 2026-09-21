@@ -64,6 +64,11 @@ pub enum VpnCmd {
     /// would include a running daemon's. No libtorrent session is constructed
     /// and no tracker is contacted, so this is safe to run against real
     /// credentials, and safe to run while the daemon is up.
+    ///
+    /// Exit status: 0 when every check passed, 1 when any check failed, and 2
+    /// when nothing failed but at least one check could not be performed. A
+    /// caller that treats only 0 as success gets the strict reading; one that
+    /// accepts 0 and 2 gets "nothing is known to be broken".
     Check {
         /// Check only this slot. Default: every configured slot.
         #[arg(long, value_name = "ID")]
