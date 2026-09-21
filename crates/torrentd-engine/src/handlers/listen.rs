@@ -1,13 +1,17 @@
 //! Listener-side handlers: ListenFailed, ListenSucceeded.
 //!
-//! ListenFailed in single-session mode is fatal;
-//! the alert loop sets the `listen_failure_fatal` flag on the state map
-//! via `MetricsSink` so the daemon can flush logs and exit non-zero. In
-//! multi-profile mode the affected profile is marked failed but the daemon
-//! continues — that variant of the dispatch lives alongside profile
-//! management.
+//! A `ListenFailed` is fatal when it happens to the **only live session** —
+//! there is nothing else listening, so seeding would otherwise stop silently.
+//! The alert loop decides that (`AlertLoopBuilder::fatal_listen_failure`,
+//! keyed on the live-session count rather than on the configured profile
+//! count) and sets the `listen_failure_fatal` flag on the state map via
+//! `MetricsSink`, so the daemon can flush logs and exit non-zero.
 //!
-//! For now we log + record the metric; the torrentd binary's main loop
+//! With two or more live sessions it is not fatal: the affected profile is
+//! logged and counted here, the alert loop warns naming it, and the other
+//! sessions keep serving.
+//!
+//! This handler logs and records the metric; the torrentd binary's main loop
 //! reads the metric to decide whether to exit.
 
 use libtorrent_safe::Alert;
