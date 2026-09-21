@@ -4,8 +4,8 @@
 //! existing JSON-file conventions carry — and the web client needs to sort,
 //! filter and paginate over that set without shipping it all to the browser.
 //! One transactional file serves the file index, the torrent library, adoption
-//! state, and the torrent→slot registry that used to live in
-//! `slot_assignments.json`.
+//! state, and the torrent→profile registry that used to live in
+//! `profile_assignments.json`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -67,11 +67,11 @@ CREATE TABLE torrent (
     declared_save_path TEXT,
     category      TEXT,
     tags          TEXT,
-    slot          TEXT,
+    profile          TEXT,
     added_at      INTEGER NOT NULL
 );
 
-CREATE INDEX torrent_by_slot ON torrent(slot) WHERE slot IS NOT NULL;
+CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
 
 CREATE TABLE torrent_file (
     infohash    TEXT    NOT NULL REFERENCES torrent(infohash) ON DELETE CASCADE,
@@ -451,7 +451,7 @@ impl PoolStore {
         self.conn.execute(
             "INSERT INTO torrent(infohash, infohash_v1, infohash_v2, name, total_size,
                                  num_files, source_path, fastresume_path, declared_save_path,
-                                 category, tags, slot, added_at)
+                                 category, tags, profile, added_at)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
              ON CONFLICT(infohash) DO UPDATE SET
                 infohash_v1        = excluded.infohash_v1,
@@ -465,7 +465,7 @@ impl PoolStore {
                 category           = excluded.category,
                 tags               = excluded.tags,
                 -- A rescan must never clear an assignment the daemon made.
-                slot               = COALESCE(excluded.slot, torrent.slot)",
+                profile               = COALESCE(excluded.profile, torrent.profile)",
             params![
                 t.infohash,
                 t.infohash_v1,
@@ -484,7 +484,7 @@ impl PoolStore {
                 } else {
                     Some(t.tags.join(","))
                 },
-                t.slot,
+                t.profile,
                 added_at,
             ],
         )?;
@@ -532,7 +532,7 @@ impl PoolStore {
             .conn
             .query_row(
                 "SELECT infohash, infohash_v1, infohash_v2, name, total_size, num_files,
-                        source_path, fastresume_path, declared_save_path, category, tags, slot
+                        source_path, fastresume_path, declared_save_path, category, tags, profile
                  FROM torrent WHERE infohash = ?1",
                 params![infohash],
                 row_to_torrent,
@@ -543,7 +543,7 @@ impl PoolStore {
     pub fn torrents(&self) -> Result<Vec<PoolTorrent>, PoolError> {
         let mut st = self.conn.prepare(
             "SELECT infohash, infohash_v1, infohash_v2, name, total_size, num_files,
-                    source_path, fastresume_path, declared_save_path, category, tags, slot
+                    source_path, fastresume_path, declared_save_path, category, tags, profile
              FROM torrent ORDER BY infohash",
         )?;
         let rows = st.query_map([], row_to_torrent)?;
@@ -574,13 +574,13 @@ impl PoolStore {
             as u64)
     }
 
-    // -- slot assignment (absorbs slot_assignments.json) --------------------
+    // -- profile assignment (absorbs profile_assignments.json) --------------------
 
-    pub fn slot_of(&self, infohash: &str) -> Result<Option<String>, PoolError> {
+    pub fn profile_of(&self, infohash: &str) -> Result<Option<String>, PoolError> {
         Ok(self
             .conn
             .query_row(
-                "SELECT slot FROM torrent WHERE infohash = ?1",
+                "SELECT profile FROM torrent WHERE infohash = ?1",
                 params![infohash],
                 |r| r.get::<_, Option<String>>(0),
             )
@@ -588,15 +588,15 @@ impl PoolStore {
             .flatten())
     }
 
-    pub fn set_slot(&self, infohash: &str, slot: Option<&str>) -> Result<(), PoolError> {
+    pub fn set_profile(&self, infohash: &str, profile: Option<&str>) -> Result<(), PoolError> {
         self.conn.execute(
-            "UPDATE torrent SET slot = ?2 WHERE infohash = ?1",
-            params![infohash, slot],
+            "UPDATE torrent SET profile = ?2 WHERE infohash = ?1",
+            params![infohash, profile],
         )?;
         Ok(())
     }
 
-    /// Fold a legacy `slot_assignments.json` in. Existing assignments win, so
+    /// Fold a legacy `profile_assignments.json` in. Existing assignments win, so
     /// re-running is safe and the JSON can stay on disk as a backup.
     pub fn import_legacy_registry(
         &mut self,
@@ -605,10 +605,11 @@ impl PoolStore {
         let tx = self.conn.savepoint()?;
         let mut n = 0usize;
         {
-            let mut up =
-                tx.prepare("UPDATE torrent SET slot = ?2 WHERE infohash = ?1 AND slot IS NULL")?;
-            for (ih, slot) in assignments {
-                n += up.execute(params![ih, slot])?;
+            let mut up = tx.prepare(
+                "UPDATE torrent SET profile = ?2 WHERE infohash = ?1 AND profile IS NULL",
+            )?;
+            for (ih, profile) in assignments {
+                n += up.execute(params![ih, profile])?;
             }
         }
         tx.commit()?;
@@ -616,12 +617,12 @@ impl PoolStore {
             info!(
                 target: "torrentd_pool::store",
                 torrent_count = n,
-                "imported legacy slot assignments",
+                "imported legacy profile assignments",
             );
         }
         let unknown = assignments.len().saturating_sub(n);
         if unknown > 0 {
-            // Torrents assigned to a slot but absent from the library: the
+            // Torrents assigned to a profile but absent from the library: the
             // operator's `.torrent` files and their registry disagree.
             warn!(
                 target: "torrentd_pool::store",
@@ -1222,6 +1223,6 @@ fn row_to_torrent(r: &rusqlite::Row<'_>) -> rusqlite::Result<PoolTorrent> {
                     .collect()
             })
             .unwrap_or_default(),
-        slot: r.get(11)?,
+        profile: r.get(11)?,
     })
 }

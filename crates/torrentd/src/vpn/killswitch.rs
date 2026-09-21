@@ -1,8 +1,8 @@
 //! Network-layer VPN kill switch (nftables) — defence-in-depth backstop.
 //!
-//! Multi-slot isolation's primary guard is that every slot's libtorrent sockets
+//! Multi-profile isolation's primary guard is that every profile's libtorrent sockets
 //! are source-bound to the tunnel IP (`startup.rs`), and [`crate::vpn_monitor`]
-//! pauses a slot within ~30s of tunnel loss. Both live at the application layer:
+//! pauses a profile within ~30s of tunnel loss. Both live at the application layer:
 //! the "no bare-IP leak" guarantee ultimately rests on libtorrent honouring the
 //! bind and on the poll reacting in time.
 //!
@@ -30,7 +30,7 @@ pub const TABLE: &str = "torrentd_ks";
 /// Render the fail-closed nftables ruleset confining uid `uid`'s egress to
 /// loopback + `tunnels`. Pure (no I/O) so it can be asserted byte-for-byte in
 /// tests. Interface names are de-duplicated and sorted so the output is
-/// deterministic regardless of slot ordering.
+/// deterministic regardless of profile ordering.
 ///
 /// The chain policy stays `accept` (we must not touch other uids' traffic); we
 /// only `drop` packets owned by `uid` that don't egress loopback or a tunnel.

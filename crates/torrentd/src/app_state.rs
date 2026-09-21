@@ -6,21 +6,21 @@ use std::sync::Arc;
 
 use torrentd_engine::AlertSource;
 use torrentd_engine::AssignmentRegistry;
-use torrentd_engine::SlotId;
-use torrentd_engine::SlotStatus;
+use torrentd_engine::ProfileId;
+use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentStore;
 
 use crate::metrics_sink::PromSink;
-use crate::slot_registry::SlotRegistry;
+use crate::profile_registry::ProfileRegistry;
 
 #[derive(Clone)]
 pub struct AppState {
     pub source: Arc<dyn AlertSource>,
     pub registry: Arc<AssignmentRegistry>,
-    /// Runtime slot registry; `None` in single-session mode. Drives the
-    /// `/slots` endpoints and the VPN health monitor.
-    pub slots: Option<Arc<SlotRegistry>>,
+    /// Runtime profile registry; `None` in single-session mode. Drives the
+    /// `/profiles` endpoints and the VPN health monitor.
+    pub profiles: Option<Arc<ProfileRegistry>>,
     pub state: Arc<StateMap>,
     /// Raw `.torrent` file store; the add path persists uploads here so the
     /// startup inventory scan can re-add them if resume data is lost.
@@ -41,16 +41,16 @@ pub struct AppState {
     /// Root of the `.torrent` store on disk. Used to confine a caller-supplied
     /// `torrent_path` to directories the daemon already owns.
     pub torrent_dir: PathBuf,
-    /// One of `single` | `multi-slot`. Used by routes that decide
-    /// whether `slot_id` is required on POST /torrents.
+    /// One of `single` | `multi-profile`. Used by routes that decide
+    /// whether `profile_id` is required on POST /torrents.
     pub mode: Mode,
 }
 
 impl AppState {
-    /// True when `slot_id` names a slot whose VPN tunnel is down and whose
+    /// True when `profile_id` names a profile whose VPN tunnel is down and whose
     /// torrents the monitor has fenced (paused, awaiting operator restart).
-    /// Always false in single-session mode (no slots, no tunnel). Callers use
-    /// this to refuse mutations that would un-quarantine a fenced slot.
+    /// Always false in single-session mode (no profiles, no tunnel). Callers use
+    /// this to refuse mutations that would un-quarantine a fenced profile.
     /// Directories a caller-supplied `torrent_path` may point into.
     ///
     /// The daemon's own torrent store, the pool's `.torrent` library, and the
@@ -65,11 +65,11 @@ impl AppState {
         dirs
     }
 
-    pub fn slot_vpn_down(&self, slot_id: &SlotId) -> bool {
-        self.slots
+    pub fn profile_vpn_down(&self, profile_id: &ProfileId) -> bool {
+        self.profiles
             .as_ref()
-            .and_then(|sr| sr.get(slot_id))
-            .map(|e| e.health().status == SlotStatus::VpnDown)
+            .and_then(|sr| sr.get(profile_id))
+            .map(|e| e.health().status == ProfileStatus::VpnDown)
             .unwrap_or(false)
     }
 }
@@ -77,31 +77,31 @@ impl AppState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
     Single,
-    MultiSlot,
+    MultiProfile,
 }
 
-/// Minimal AppState for handler/unit tests. `slots = Some(..)` puts it in
-/// multi-slot mode; everything else is a throwaway in-memory double.
+/// Minimal AppState for handler/unit tests. `profiles = Some(..)` puts it in
+/// multi-profile mode; everything else is a throwaway in-memory double.
 impl AppState {
-    /// `(fenced, total)` over the configured slots, or `None` in
+    /// `(fenced, total)` over the configured profiles, or `None` in
     /// single-session mode, which has no tunnel to lose.
     ///
-    /// Counted from the slot registry rather than from the alert source: the
-    /// source counts live sessions, and a slot the VPN monitor fenced still
+    /// Counted from the profile registry rather than from the alert source: the
+    /// source counts live sessions, and a profile the VPN monitor fenced still
     /// has one.
-    pub fn fenced_slots(&self) -> Option<(usize, usize)> {
-        let sr = self.slots.as_ref()?;
+    pub fn fenced_profiles(&self) -> Option<(usize, usize)> {
+        let sr = self.profiles.as_ref()?;
         let total = sr.iter().len();
         let fenced = sr
             .iter()
-            .filter(|e| e.health().status == SlotStatus::VpnDown)
+            .filter(|e| e.health().status == ProfileStatus::VpnDown)
             .count();
         Some((fenced, total))
     }
 }
 
 #[cfg(test)]
-pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
+pub(crate) fn build_test_state(profiles: Option<Arc<ProfileRegistry>>) -> AppState {
     use torrentd_engine::AssignmentRegistry;
     use torrentd_engine::MemoryTorrentStore;
     use torrentd_engine::MockEngine;
@@ -109,8 +109,8 @@ pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
     use torrentd_engine::TorrentEngine;
 
     let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
-    let mode = if slots.is_some() {
-        Mode::MultiSlot
+    let mode = if profiles.is_some() {
+        Mode::MultiProfile
     } else {
         Mode::Single
     };
@@ -128,7 +128,7 @@ pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
     AppState {
         source: Arc::new(SingleSessionSource::new(engine)),
         registry: Arc::new(AssignmentRegistry::new_empty(reg_path)),
-        slots,
+        profiles,
         state: Arc::new(StateMap::new()),
         torrents: Arc::new(MemoryTorrentStore::new()),
         metrics: Arc::new(PromSink::new()),
@@ -149,24 +149,24 @@ pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::slot_registry::test_entry;
+    use crate::profile_registry::test_entry;
 
     #[test]
-    fn slot_vpn_down_true_only_for_vpndown_slots() {
-        let reg = Arc::new(SlotRegistry::new(vec![
-            test_entry("up", SlotStatus::Active),
-            test_entry("down", SlotStatus::VpnDown),
+    fn profile_vpn_down_true_only_for_vpndown_profiles() {
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            test_entry("up", ProfileStatus::Active),
+            test_entry("down", ProfileStatus::VpnDown),
         ]));
         let s = build_test_state(Some(reg));
-        assert!(!s.slot_vpn_down(&SlotId::new("up")));
-        assert!(s.slot_vpn_down(&SlotId::new("down")));
-        // Unknown slot → not "down" (handlers resolve it to a 404 elsewhere).
-        assert!(!s.slot_vpn_down(&SlotId::new("missing")));
+        assert!(!s.profile_vpn_down(&ProfileId::new("up")));
+        assert!(s.profile_vpn_down(&ProfileId::new("down")));
+        // Unknown profile → not "down" (handlers resolve it to a 404 elsewhere).
+        assert!(!s.profile_vpn_down(&ProfileId::new("missing")));
     }
 
     #[test]
-    fn slot_vpn_down_false_in_single_session() {
+    fn profile_vpn_down_false_in_single_session() {
         let s = build_test_state(None);
-        assert!(!s.slot_vpn_down(&SlotId::default_single()));
+        assert!(!s.profile_vpn_down(&ProfileId::default_single()));
     }
 }

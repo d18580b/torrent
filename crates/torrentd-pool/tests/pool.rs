@@ -43,7 +43,7 @@ fn add_torrent(
         declared_save_path: save_path.map(str::to_string),
         category: None,
         tags: vec![],
-        slot: None,
+        profile: None,
     };
     store.upsert_torrent(&t, 0).unwrap();
     let rows: Vec<TorrentFileRow> = files
@@ -405,7 +405,7 @@ fn legacy_registry_import_preserves_existing_assignments() {
     let mut store = PoolStore::open_in_memory().unwrap();
     add_torrent(&mut store, "9i", "A", None, &[("A/x", 1)]);
     add_torrent(&mut store, "9j", "B", None, &[("B/x", 1)]);
-    store.set_slot("9j", Some("already_set")).unwrap();
+    store.set_profile("9j", Some("already_set")).unwrap();
 
     let mut legacy = std::collections::HashMap::new();
     legacy.insert("9i".to_string(), "acct_a".to_string());
@@ -418,22 +418,22 @@ fn legacy_registry_import_preserves_existing_assignments() {
         imported, 1,
         "only the unassigned torrent should be filled in"
     );
-    assert_eq!(store.slot_of("9i").unwrap().as_deref(), Some("acct_a"));
+    assert_eq!(store.profile_of("9i").unwrap().as_deref(), Some("acct_a"));
     assert_eq!(
-        store.slot_of("9j").unwrap().as_deref(),
+        store.profile_of("9j").unwrap().as_deref(),
         Some("already_set"),
         "a live assignment must win over the legacy file",
     );
 }
 
 #[test]
-fn a_rescan_never_clears_a_slot_assignment() {
+fn a_rescan_never_clears_a_profile_assignment() {
     let mut store = PoolStore::open_in_memory().unwrap();
     add_torrent(&mut store, "9k", "A", None, &[("A/x", 1)]);
-    store.set_slot("9k", Some("acct_a")).unwrap();
-    // Re-upsert, as a library rescan does; `slot` is None on the incoming row.
+    store.set_profile("9k", Some("acct_a")).unwrap();
+    // Re-upsert, as a library rescan does; `profile` is None on the incoming row.
     add_torrent(&mut store, "9k", "A", None, &[("A/x", 1)]);
-    assert_eq!(store.slot_of("9k").unwrap().as_deref(), Some("acct_a"));
+    assert_eq!(store.profile_of("9k").unwrap().as_deref(), Some("acct_a"));
 }
 
 // ---------------------------------------------------------------------------
@@ -479,7 +479,7 @@ fn add_torrent_with_sidecar(
         declared_save_path: None,
         category: None,
         tags: vec![],
-        slot: None,
+        profile: None,
     };
     store.upsert_torrent(&t, 0).unwrap();
     let rows: Vec<TorrentFileRow> = files
@@ -1130,7 +1130,7 @@ fn a_v1_index_migrates_forward_in_place() {
                                 total_size INTEGER NOT NULL, num_files INTEGER NOT NULL,
                                 source_path TEXT NOT NULL, fastresume_path TEXT,
                                 declared_save_path TEXT, category TEXT, tags TEXT,
-                                slot TEXT, added_at INTEGER NOT NULL);
+                                profile TEXT, added_at INTEGER NOT NULL);
              CREATE TABLE torrent_file (infohash TEXT NOT NULL, idx INTEGER NOT NULL,
                                 rel_path TEXT NOT NULL, size INTEGER NOT NULL,
                                 pieces_root BLOB, PRIMARY KEY (infohash, idx)) WITHOUT ROWID;
@@ -1143,7 +1143,7 @@ fn a_v1_index_migrates_forward_in_place() {
         )
         .unwrap();
         c.execute(
-            "INSERT INTO torrent(infohash, name, total_size, num_files, source_path, slot, added_at)
+            "INSERT INTO torrent(infohash, name, total_size, num_files, source_path, profile, added_at)
              VALUES ('legacy', 'Old', 1, 1, '/lib/old.torrent', 'acct_a', 0)",
             [],
         )
@@ -1153,7 +1153,10 @@ fn a_v1_index_migrates_forward_in_place() {
 
     let store = PoolStore::open(&db).unwrap();
     // Pre-existing data survives…
-    assert_eq!(store.slot_of("legacy").unwrap().as_deref(), Some("acct_a"));
+    assert_eq!(
+        store.profile_of("legacy").unwrap().as_deref(),
+        Some("acct_a")
+    );
     // …and the journal is now usable.
     assert!(store.plans().unwrap().is_empty());
     assert!(store.unfinished_plans().unwrap().is_empty());

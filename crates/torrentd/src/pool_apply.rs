@@ -283,8 +283,8 @@ fn move_torrent(
         return move_directory(Path::new(&step.src), Path::new(dst));
     };
     let engine = source
-        .engine_for(&st.slot_id)
-        .ok_or("no engine for the torrent's slot")?;
+        .engine_for(&st.profile_id)
+        .ok_or("no engine for the torrent's profile")?;
 
     // DontReplace: if something is already at the destination, adopt it in
     // place rather than overwriting. The planner already refused on a
@@ -724,7 +724,7 @@ mod tests {
                     id: 1,
                     infohash: libtorrent_safe::InfoHash([0xff; 20]),
                 },
-                torrentd_engine::SlotId::default_single(),
+                torrentd_engine::ProfileId::default_single(),
                 std::time::Instant::now(),
             ),
         );

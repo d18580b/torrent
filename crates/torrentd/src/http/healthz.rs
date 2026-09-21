@@ -18,8 +18,8 @@ use crate::app_state::AppState;
 const MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
-    let n_slots = s.source.slots().len();
-    if n_slots == 0 {
+    let n_profiles = s.source.profiles().len();
+    if n_profiles == 0 {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"ok": false, "reason": "no_sessions"})),
@@ -43,27 +43,27 @@ pub async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
             .into_response();
     }
 
-    // A fenced slot is a slot whose tunnel the monitor found unhealthy: its
+    // A fenced profile is a profile whose tunnel the monitor found unhealthy: its
     // torrents are paused, it will not resume without an operator, and it is
-    // seeding nothing. A daemon in which *every* slot is in that state is not
+    // seeding nothing. A daemon in which *every* profile is in that state is not
     // healthy by any definition an operator would recognise, and reporting
     // `{"ok":true}` for it meant the probe was green through exactly the
     // incident it exists to catch.
     //
-    // Some-but-not-all fenced stays 200: the remaining slots are still
+    // Some-but-not-all fenced stays 200: the remaining profiles are still
     // serving, and taking the daemon out of rotation would stop them too. The
-    // count is reported either way, and `torrentd_slot_vpn_tunnel_up` is the
-    // per-slot signal to alert on.
-    let fenced = s.fenced_slots().map(|(f, _)| f).unwrap_or(0);
-    if let Some((fenced, total)) = s.fenced_slots() {
+    // count is reported either way, and `torrentd_profile_vpn_tunnel_up` is the
+    // per-profile signal to alert on.
+    let fenced = s.fenced_profiles().map(|(f, _)| f).unwrap_or(0);
+    if let Some((fenced, total)) = s.fenced_profiles() {
         if total > 0 && fenced == total {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
                     "ok": false,
-                    "reason": "all_slots_fenced",
-                    "slots": total,
-                    "slots_fenced": fenced,
+                    "reason": "all_profiles_fenced",
+                    "profiles": total,
+                    "profiles_fenced": fenced,
                     "heartbeat_age_secs": age.as_secs(),
                 })),
             )
@@ -75,8 +75,8 @@ pub async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
-            "slots": n_slots,
-            "slots_fenced": fenced,
+            "profiles": n_profiles,
+            "profiles_fenced": fenced,
             "heartbeat_age_secs": age.as_secs(),
         })),
     )
@@ -111,17 +111,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_daemon_with_every_slot_fenced_is_unready() {
+    async fn a_daemon_with_every_profile_fenced_is_unready() {
         use std::sync::Arc;
 
-        use torrentd_engine::SlotStatus;
+        use torrentd_engine::ProfileStatus;
 
-        use crate::slot_registry::test_entry;
-        use crate::slot_registry::SlotRegistry;
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
 
-        let reg = Arc::new(SlotRegistry::new(vec![
-            test_entry("a", SlotStatus::VpnDown),
-            test_entry("b", SlotStatus::VpnDown),
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            test_entry("a", ProfileStatus::VpnDown),
+            test_entry("b", ProfileStatus::VpnDown),
         ]));
         let s = build_test_state(Some(reg));
         s.alert_heartbeat
@@ -131,17 +131,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_healthy_slot_keeps_the_daemon_in_rotation() {
+    async fn one_healthy_profile_keeps_the_daemon_in_rotation() {
         use std::sync::Arc;
 
-        use torrentd_engine::SlotStatus;
+        use torrentd_engine::ProfileStatus;
 
-        use crate::slot_registry::test_entry;
-        use crate::slot_registry::SlotRegistry;
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
 
-        let reg = Arc::new(SlotRegistry::new(vec![
-            test_entry("a", SlotStatus::VpnDown),
-            test_entry("b", SlotStatus::Active),
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            test_entry("a", ProfileStatus::VpnDown),
+            test_entry("b", ProfileStatus::Active),
         ]));
         let s = build_test_state(Some(reg));
         s.alert_heartbeat

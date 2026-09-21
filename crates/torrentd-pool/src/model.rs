@@ -122,8 +122,8 @@ pub struct PoolTorrent {
     pub declared_save_path: Option<String>,
     pub category: Option<String>,
     pub tags: Vec<String>,
-    /// Which slot owns it. Absorbs the old `slot_assignments.json`.
-    pub slot: Option<String>,
+    /// Which profile owns it. Absorbs the old `profile_assignments.json`.
+    pub profile: Option<String>,
 }
 
 impl PoolTorrent {

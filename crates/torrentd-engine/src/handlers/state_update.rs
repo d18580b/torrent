@@ -35,7 +35,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     // `state`. Mapping on the enum alone is why
                     // `TorrentPhase::Paused` was never assigned by anything
                     // and `/status` reported a permanent zero however many
-                    // torrents were paused — including a whole slot the VPN
+                    // torrents were paused — including a whole profile the VPN
                     // monitor had fenced, which is exactly when someone looks.
                     //
                     // `Errored` / `UploadMode` are deliberately *not* pinned
@@ -85,7 +85,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 );
                 ctx.metrics.inc_counter(
                     "torrents_finished_total",
-                    &[("slot_id", ctx.slot_id.as_str())],
+                    &[("profile_id", ctx.profile_id.as_str())],
                 );
             }
         }
@@ -110,8 +110,8 @@ mod tests {
     use crate::metrics::MetricCall;
     use crate::metrics::RecordingSink;
     use crate::mock::MockEngine;
+    use crate::profile::ProfileId;
     use crate::resume_store::MemoryResumeStore;
-    use crate::slot::SlotId;
     use crate::state::StateMap;
     use crate::state::TorrentState;
     use crate::torrent_store::MemoryTorrentStore;
@@ -123,7 +123,7 @@ mod tests {
     fn seed_state(state: &StateMap, h: TorrentHandle) {
         state.insert(
             h.infohash,
-            TorrentState::newly_added(h, SlotId::default_single(), Instant::now()),
+            TorrentState::newly_added(h, ProfileId::default_single(), Instant::now()),
         );
     }
 
@@ -139,7 +139,7 @@ mod tests {
             metrics,
             clock: &clock,
             engine: &engine,
-            slot_id: SlotId::default_single(),
+            profile_id: ProfileId::default_single(),
             span: tracing::info_span!("test"),
         };
         handle(alert, &mut ctx);

@@ -3,8 +3,8 @@
 //!
 //!   - Drains alerts from the `AlertSource` and dispatches each through
 //!     the `handlers/` modules.
-//!   - 1-second tick: `post_torrent_updates` per slot.
-//!   - 30-second tick: `post_session_stats` per slot.
+//!   - 1-second tick: `post_torrent_updates` per profile.
+//!   - 30-second tick: `post_session_stats` per profile.
 //!   - 30-minute tick: scan the state map for torrents flagged
 //!     `needs_save_resume` and call `save_resume_data` with
 //!     `ONLY_IF_MODIFIED`.
@@ -47,8 +47,8 @@ use crate::engine::TorrentEngine;
 use crate::handlers::HandlerCtx;
 use crate::handlers::{self};
 use crate::metrics::MetricsSink;
+use crate::profile::ProfileId;
 use crate::resume_store::ResumeStore;
-use crate::slot::SlotId;
 use crate::source::AlertSource;
 use crate::state::StateMap;
 use crate::torrent_store::TorrentStore;
@@ -85,19 +85,19 @@ pub struct AlertLoopBuilder {
     clock: Arc<dyn Clock>,
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
-    slot_fenced: Option<SlotFenced>,
+    profile_fenced: Option<ProfileFenced>,
 }
 
 /// Invoked once, from the loop thread, when a fatal condition is detected —
 /// torrentd wires this to the shutdown broadcast so the HTTP server unwinds.
 pub type FatalCallback = Arc<dyn Fn(ShutdownReason) + Send + Sync>;
 
-/// "Is this slot fenced?" — supplied by the daemon, which owns VPN health.
+/// "Is this profile fenced?" — supplied by the daemon, which owns VPN health.
 ///
 /// The engine has no concept of a tunnel, but it does resume torrents on its
-/// own schedule, and resuming one in a slot the VPN monitor has fenced
+/// own schedule, and resuming one in a profile the VPN monitor has fenced
 /// un-quarantines it behind the operator's back.
-pub type SlotFenced = Arc<dyn Fn(&SlotId) -> bool + Send + Sync>;
+pub type ProfileFenced = Arc<dyn Fn(&ProfileId) -> bool + Send + Sync>;
 
 impl std::fmt::Debug for AlertLoopBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -123,23 +123,23 @@ impl AlertLoopBuilder {
             clock,
             fatal_listen_failure: false,
             on_fatal: None,
-            slot_fenced: None,
+            profile_fenced: None,
         }
     }
 
     /// Treat `listen_failed_alert` as fatal: correct in single-session mode,
     /// where nothing else is listening and seeding would just stop silently.
-    /// In multi-slot mode only the affected slot is marked failed and the
+    /// In multi-profile mode only the affected profile is marked failed and the
     /// daemon keeps running.
     pub fn fatal_listen_failure(mut self, yes: bool) -> Self {
         self.fatal_listen_failure = yes;
         self
     }
 
-    /// Supply the fenced-slot predicate. Without one, no slot is ever fenced,
+    /// Supply the fenced-profile predicate. Without one, no profile is ever fenced,
     /// which is correct for single-session mode and for tests.
-    pub fn slot_fenced(mut self, f: SlotFenced) -> Self {
-        self.slot_fenced = Some(f);
+    pub fn profile_fenced(mut self, f: ProfileFenced) -> Self {
+        self.profile_fenced = Some(f);
         self
     }
 
@@ -177,7 +177,7 @@ impl AlertLoopBuilder {
                 let panicked = Arc::clone(&panicked);
                 let fatal_listen_failure = self.fatal_listen_failure;
                 let on_fatal = self.on_fatal.clone();
-                let slot_fenced = self.slot_fenced.clone();
+                let profile_fenced = self.profile_fenced.clone();
                 move || {
                     let span = info_span!(parent: parent, "alert_loop");
                     let _enter = span.enter();
@@ -202,7 +202,7 @@ impl AlertLoopBuilder {
                                 listen_failed,
                                 fatal_listen_failure,
                                 on_fatal,
-                                slot_fenced,
+                                profile_fenced,
                             },
                         );
                     }));
@@ -323,7 +323,7 @@ struct LoopHooks {
     listen_failed: Arc<AtomicBool>,
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
-    slot_fenced: Option<SlotFenced>,
+    profile_fenced: Option<ProfileFenced>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -366,7 +366,7 @@ fn run(
         let drained = source.drain();
         let was_empty = drained.is_empty();
         let mut fatal = false;
-        for (slot, alert) in drained {
+        for (profile, alert) in drained {
             // A listen socket that fails in
             // single-session mode is fatal — there is no other session to
             // carry the load, so seeding silently stops. Note it, finish
@@ -376,7 +376,7 @@ fn run(
                 fatal = true;
             }
             dispatch_alert(
-                slot, alert, &source, &state, &resume, &torrents, &metrics, &clock,
+                profile, alert, &source, &state, &resume, &torrents, &metrics, &clock,
             );
         }
         if fatal {
@@ -422,7 +422,7 @@ fn run(
             &state,
             &metrics,
             &clock,
-            hooks.slot_fenced.as_ref(),
+            hooks.profile_fenced.as_ref(),
             now,
         );
 
@@ -435,7 +435,7 @@ fn run(
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_alert(
-    slot: SlotId,
+    profile: ProfileId,
     alert: Alert,
     source: &Arc<dyn AlertSource>,
     state: &Arc<StateMap>,
@@ -444,17 +444,17 @@ fn dispatch_alert(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
 ) {
-    let Some(engine) = source.engine_for(&slot) else {
+    let Some(engine) = source.engine_for(&profile) else {
         warn!(
             target: "torrentd_engine::alert_loop",
-            slot_id = %slot,
-            "alert for unknown slot; dropping",
+            profile_id = %profile,
+            "alert for unknown profile; dropping",
         );
         return;
     };
     let span = info_span!(
         "alert",
-        slot_id = %slot,
+        profile_id = %profile,
         alert_type = alert.kind().as_str(),
     );
     let mut ctx = HandlerCtx {
@@ -464,7 +464,7 @@ fn dispatch_alert(
         metrics: metrics.as_ref(),
         clock: clock.as_ref(),
         engine: &engine,
-        slot_id: slot,
+        profile_id: profile,
         span,
     };
 
@@ -527,7 +527,7 @@ fn execute_due_retries(
     state: &Arc<StateMap>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
-    slot_fenced: Option<&SlotFenced>,
+    profile_fenced: Option<&ProfileFenced>,
     now: Instant,
 ) {
     let due = state.retries_due(now);
@@ -538,27 +538,27 @@ fn execute_due_retries(
         let Some(st) = state.get(&handle.infohash) else {
             continue;
         };
-        // The VPN monitor pauses every torrent in a slot whose tunnel went
+        // The VPN monitor pauses every torrent in a profile whose tunnel went
         // down and refuses to restart it without an operator. Resuming one on
         // the upload-mode retry timer would un-quarantine it individually,
         // which is the thing fencing exists to prevent.
-        if slot_fenced.is_some_and(|f| f(&st.slot_id)) {
+        if profile_fenced.is_some_and(|f| f(&st.profile_id)) {
             debug!(
                 target: "torrentd_engine::alert_loop",
-                slot_id = %st.slot_id,
+                profile_id = %st.profile_id,
                 infohash = %handle.infohash,
-                "retry skipped: slot is fenced",
+                "retry skipped: profile is fenced",
             );
             continue;
         }
-        let Some(engine) = source.engine_for(&st.slot_id) else {
+        let Some(engine) = source.engine_for(&st.profile_id) else {
             continue;
         };
         match engine.resume_torrent(handle) {
             Ok(()) => {
                 info!(
                     target: "torrentd_engine::alert_loop",
-                    slot_id = %st.slot_id,
+                    profile_id = %st.profile_id,
                     infohash = %handle.infohash,
                     "retry: resumed torrent from upload_mode",
                 );
@@ -568,20 +568,20 @@ fn execute_due_retries(
                 });
                 metrics.inc_counter(
                     "upload_mode_retry_attempts_total",
-                    &[("slot_id", st.slot_id.as_str())],
+                    &[("profile_id", st.profile_id.as_str())],
                 );
             }
             Err(e) => {
                 warn!(
                     target: "torrentd_engine::alert_loop",
-                    slot_id = %st.slot_id,
+                    profile_id = %st.profile_id,
                     infohash = %handle.infohash,
                     error.cause = %e,
                     "retry resume failed",
                 );
                 metrics.inc_counter(
                     "upload_mode_retry_errors_total",
-                    &[("slot_id", st.slot_id.as_str())],
+                    &[("profile_id", st.profile_id.as_str())],
                 );
             }
         }
@@ -598,7 +598,7 @@ fn request_save(
     let Some(st) = state.get(&handle.infohash) else {
         return;
     };
-    let Some(engine) = source.engine_for(&st.slot_id) else {
+    let Some(engine) = source.engine_for(&st.profile_id) else {
         return;
     };
     state.note_resume_requested();
@@ -608,14 +608,14 @@ fn request_save(
         state.note_resume_settled();
         warn!(
             target: "torrentd_engine::alert_loop",
-            slot_id = %st.slot_id,
+            profile_id = %st.profile_id,
             infohash = %handle.infohash,
             error.cause = %e,
             "save_resume_data dispatch failed",
         );
         metrics.inc_counter(
             "resume_save_dispatch_errors_total",
-            &[("slot_id", st.slot_id.as_str())],
+            &[("profile_id", st.profile_id.as_str())],
         );
     }
 }
@@ -696,8 +696,10 @@ fn drain_once(
     clock: &Arc<dyn Clock>,
 ) {
     let alerts = source.drain();
-    for (slot, alert) in alerts {
-        dispatch_alert(slot, alert, source, state, resume, torrents, metrics, clock);
+    for (profile, alert) in alerts {
+        dispatch_alert(
+            profile, alert, source, state, resume, torrents, metrics, clock,
+        );
     }
 }
 
@@ -839,18 +841,18 @@ mod tests {
     }
 
     #[test]
-    fn a_fenced_slot_is_not_resumed_by_the_retry_timer() {
-        // The VPN monitor pauses every torrent in a slot whose tunnel dropped
+    fn a_fenced_profile_is_not_resumed_by_the_retry_timer() {
+        // The VPN monitor pauses every torrent in a profile whose tunnel dropped
         // and deliberately does not restart it. The upload-mode retry timer
         // ran on its own schedule with no notion of that, so it un-quarantined
-        // torrents one at a time — putting traffic back on a slot the operator
+        // torrents one at a time — putting traffic back on a profile the operator
         // was told to go look at.
         // Auto-echo the resume saves, so the shutdown drain settles instead of
         // sitting out its full 30s deadline on a mock that never replies.
         let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
         engine.push_alert(add_torrent_alert(3, 3));
         let handle = builder_with(Arc::clone(&engine))
-            .slot_fenced(Arc::new(|_: &SlotId| true) as SlotFenced)
+            .profile_fenced(Arc::new(|_: &ProfileId| true) as ProfileFenced)
             .spawn();
 
         let ih = InfoHash([3u8; 20]);
@@ -872,7 +874,7 @@ mod tests {
                 .calls()
                 .iter()
                 .any(|c| matches!(c, crate::mock::RecordedCall::ResumeTorrent(_))),
-            "a fenced slot's torrent was resumed: {:?}",
+            "a fenced profile's torrent was resumed: {:?}",
             engine.calls(),
         );
 
@@ -918,8 +920,8 @@ mod tests {
 
     #[test]
     fn listen_failure_is_survivable_when_not_fatal() {
-        // Multi-slot mode: the slot is marked failed by the handler, but the
-        // daemon keeps seeding the other slots.
+        // Multi-profile mode: the profile is marked failed by the handler, but the
+        // daemon keeps seeding the other profiles.
         let engine = Arc::new(MockEngine::new());
         engine.push_alert(listen_failed_alert());
         let handle = builder_with(engine).fatal_listen_failure(false).spawn();
@@ -959,7 +961,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
         dispatch_alert(
-            SlotId::default_single(),
+            ProfileId::default_single(),
             add_torrent_alert(0x42, 1),
             &source,
             &state,
@@ -995,13 +997,13 @@ mod tests {
                     id: 1,
                     infohash: InfoHash([0xAA; 20]),
                 },
-                SlotId::default_single(),
+                ProfileId::default_single(),
                 clock.now(),
             ),
         );
 
         dispatch_alert(
-            SlotId::default_single(),
+            ProfileId::default_single(),
             save_resume_alert(0xAA, 1, b"BENCODE"),
             &source,
             &state,
@@ -1029,7 +1031,7 @@ mod tests {
         state.note_resume_requested();
 
         dispatch_alert(
-            SlotId::default_single(),
+            ProfileId::default_single(),
             save_resume_failed_alert(0xBB, 1),
             &source,
             &state,
@@ -1062,11 +1064,11 @@ mod tests {
         let now = clock.now();
         state.insert(
             h1.infohash,
-            crate::state::TorrentState::newly_added(h1, SlotId::default_single(), now),
+            crate::state::TorrentState::newly_added(h1, ProfileId::default_single(), now),
         );
         state.insert(
             h2.infohash,
-            crate::state::TorrentState::newly_added(h2, SlotId::default_single(), now),
+            crate::state::TorrentState::newly_added(h2, ProfileId::default_single(), now),
         );
 
         run_shutdown(
@@ -1112,11 +1114,11 @@ mod tests {
         let now = clock.now();
         state.insert(
             h1.infohash,
-            crate::state::TorrentState::newly_added(h1, SlotId::default_single(), now),
+            crate::state::TorrentState::newly_added(h1, ProfileId::default_single(), now),
         );
         state.insert(
             h2.infohash,
-            crate::state::TorrentState::newly_added(h2, SlotId::default_single(), now),
+            crate::state::TorrentState::newly_added(h2, ProfileId::default_single(), now),
         );
 
         // Both alerts are queued before run_shutdown. The first drain
@@ -1155,7 +1157,7 @@ mod tests {
 
         state.insert(
             h.infohash,
-            crate::state::TorrentState::newly_added(h, SlotId::default_single(), clock.now()),
+            crate::state::TorrentState::newly_added(h, ProfileId::default_single(), clock.now()),
         );
 
         // No alerts queued; the engine accepts save_resume_data but the

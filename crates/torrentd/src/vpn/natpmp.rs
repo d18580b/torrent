@@ -41,7 +41,7 @@ const RESP_OPCODE_FLAG: u8 = 0x80;
 /// doubles the timeout each retry; the full 9-retry/~128s schedule would exceed
 /// our 45s renewal interval and 60s lease, so both profiles are bounded well
 /// under that. A lost *renewal* is soft (retried next tick), so it stays snappy;
-/// a lost *startup* negotiate disables the slot, so it gets the longer budget to
+/// a lost *startup* negotiate disables the profile, so it gets the longer budget to
 /// ride out a lossy boot.
 const RENEWAL_TIMEOUTS_MS: &[u64] = &[250, 500, 1000, 2000, 4000]; // ~7.75s
 const STARTUP_TIMEOUTS_MS: &[u64] = &[250, 500, 1000, 2000, 4000, 8000]; // ~15.75s
@@ -70,7 +70,7 @@ impl NatpmpForwarder {
     }
 
     /// Client for the one-shot startup negotiate (longer budget: failure here
-    /// disables the slot).
+    /// disables the profile).
     pub fn for_startup() -> Self {
         Self::with_timeouts_ms(STARTUP_TIMEOUTS_MS)
     }

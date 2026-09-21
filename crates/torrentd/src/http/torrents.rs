@@ -18,7 +18,7 @@ use libtorrent_safe::InfoHash;
 use serde::Deserialize;
 use serde::Serialize;
 use torrentd_engine::MetricsSink;
-use torrentd_engine::SlotId;
+use torrentd_engine::ProfileId;
 
 use crate::app_state::AppState;
 use crate::app_state::Mode;
@@ -54,7 +54,7 @@ pub struct ListQuery {
 #[derive(Serialize)]
 pub struct TorrentSummary {
     infohash: String,
-    slot_id: String,
+    profile_id: String,
     phase: String,
     upload_rate: i64,
     download_rate: i64,
@@ -72,12 +72,12 @@ pub struct ListResponse {
     next_cursor: Option<String>,
 }
 
-/// Build the wire summary for one torrent (registry slot + live state).
-pub(crate) fn summarize(s: &AppState, ih: &InfoHash, slot: &SlotId) -> TorrentSummary {
+/// Build the wire summary for one torrent (registry profile + live state).
+pub(crate) fn summarize(s: &AppState, ih: &InfoHash, profile: &ProfileId) -> TorrentSummary {
     let st = s.state.get(ih);
     TorrentSummary {
         infohash: ih.to_hex(),
-        slot_id: slot.as_str().to_string(),
+        profile_id: profile.as_str().to_string(),
         phase: st
             .as_ref()
             .map(|s| s.phase.as_str().to_string())
@@ -115,7 +115,7 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Json
 
     let items = all[start..end]
         .iter()
-        .map(|(ih, slot)| summarize(&s, ih, slot))
+        .map(|(ih, profile)| summarize(&s, ih, profile))
         .collect();
 
     Json(ListResponse { items, next_cursor })
@@ -126,13 +126,13 @@ pub async fn get(
     Path(infohash): Path<String>,
 ) -> Result<Json<TorrentSummary>, (StatusCode, Json<serde_json::Value>)> {
     let ih = InfoHash::from_hex(&infohash).ok_or_else(bad_infohash)?;
-    let slot = s.registry.lookup(&ih).ok_or_else(|| {
+    let profile = s.registry.lookup(&ih).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "not_found"})),
         )
     })?;
-    Ok(Json(summarize(&s, &ih, &slot)))
+    Ok(Json(summarize(&s, &ih, &profile)))
 }
 
 #[derive(Deserialize)]
@@ -141,13 +141,13 @@ pub struct AddRequest {
     pub magnet: Option<String>,
     pub torrent_path: Option<String>,
     pub save_path: Option<String>,
-    pub slot_id: Option<String>,
+    pub profile_id: Option<String>,
 }
 
 #[derive(Serialize, Debug)]
 pub struct AddResponse {
     infohash: String,
-    slot_id: String,
+    profile_id: String,
 }
 
 type AddParse = (Option<String>, Option<String>, AddSource);
@@ -155,7 +155,7 @@ type AddError = (StatusCode, Json<serde_json::Value>);
 
 /// `POST /torrents` accepts either a JSON body (`{magnet}` / `{torrent_path}`)
 /// or a multipart upload carrying the `.torrent` file. Dispatch
-/// on Content-Type, normalize to `(slot_id, save_path, AddSource)`, then run
+/// on Content-Type, normalize to `(profile_id, save_path, AddSource)`, then run
 /// one shared add path.
 pub async fn add(
     State(s): State<AppState>,
@@ -166,12 +166,12 @@ pub async fn add(
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.starts_with("multipart/form-data"));
-    let (slot_id_opt, save_path_opt, source) = if is_multipart {
+    let (profile_id_opt, save_path_opt, source) = if is_multipart {
         parse_multipart(req, &s).await?
     } else {
         parse_json(req, &s).await?
     };
-    do_add(&s, slot_id_opt, save_path_opt, source).await
+    do_add(&s, profile_id_opt, save_path_opt, source).await
 }
 
 async fn parse_json(req: Request, state: &AppState) -> Result<AddParse, AddError> {
@@ -199,7 +199,7 @@ async fn parse_json(req: Request, state: &AppState) -> Result<AddParse, AddError
             Json(serde_json::json!({"error": "magnet or torrent_path required"})),
         ));
     };
-    Ok((r.slot_id, r.save_path, source))
+    Ok((r.profile_id, r.save_path, source))
 }
 
 /// Read a `.torrent` the caller named by path on the daemon's own filesystem.
@@ -252,7 +252,7 @@ async fn parse_multipart(req: Request, state: &AppState) -> Result<AddParse, Add
         )
     })?;
     let mut torrent: Option<Vec<u8>> = None;
-    let mut slot_id: Option<String> = None;
+    let mut profile_id: Option<String> = None;
     let mut save_path: Option<String> = None;
     while let Some(field) = mp.next_field().await.map_err(|e| {
         (
@@ -270,7 +270,7 @@ async fn parse_multipart(req: Request, state: &AppState) -> Result<AddParse, Add
                 })?;
                 torrent = Some(b.to_vec());
             }
-            Some("slot_id") => slot_id = field.text().await.ok(),
+            Some("profile_id") => profile_id = field.text().await.ok(),
             Some("save_path") => save_path = field.text().await.ok(),
             _ => {}
         }
@@ -281,36 +281,36 @@ async fn parse_multipart(req: Request, state: &AppState) -> Result<AddParse, Add
             Json(serde_json::json!({"error": "multipart: missing 'torrent' file field"})),
         )
     })?;
-    Ok((slot_id, save_path, AddSource::File(torrent)))
+    Ok((profile_id, save_path, AddSource::File(torrent)))
 }
 
 async fn do_add(
     s: &AppState,
-    slot_id_opt: Option<String>,
+    profile_id_opt: Option<String>,
     save_path_opt: Option<String>,
     source: AddSource,
 ) -> Result<(StatusCode, Json<AddResponse>), AddError> {
-    let slot_id = match (s.mode, slot_id_opt.as_deref()) {
-        (Mode::Single, _) => SlotId::default_single(),
-        (Mode::MultiSlot, Some(id)) => SlotId::new(id),
-        (Mode::MultiSlot, None) => {
+    let profile_id = match (s.mode, profile_id_opt.as_deref()) {
+        (Mode::Single, _) => ProfileId::default_single(),
+        (Mode::MultiProfile, Some(id)) => ProfileId::new(id),
+        (Mode::MultiProfile, None) => {
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "slot_id required in multi-slot mode"})),
+                Json(serde_json::json!({"error": "profile_id required in multi-profile mode"})),
             ))
         }
     };
 
-    let engine = s.source.engine_for(&slot_id).ok_or_else(|| {
+    let engine = s.source.engine_for(&profile_id).ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "unknown slot_id"})),
+            Json(serde_json::json!({"error": "unknown profile_id"})),
         )
     })?;
 
-    // Don't accept new torrents into a fenced (VpnDown) slot — they would land
-    // paused and mislead the operator into thinking the slot is healthy.
-    if s.slot_vpn_down(&slot_id) {
+    // Don't accept new torrents into a fenced (VpnDown) profile — they would land
+    // paused and mislead the operator into thinking the profile is healthy.
+    if s.profile_vpn_down(&profile_id) {
         return Err(vpn_down());
     }
 
@@ -340,11 +340,11 @@ async fn do_add(
             p
         }
     };
-    let flags = torrentd_engine::seed_flags(&slot_id);
+    let flags = torrentd_engine::seed_flags(&profile_id);
 
     // Compute the info-hash WITHOUT touching any session: Safety Rule 4
     // (the session never receives an unverified torrent) and Rule 3 (global
-    // info-hash uniqueness across slots).
+    // info-hash uniqueness across profiles).
     let infohash = match &source {
         AddSource::Magnet(uri) => info_hash_from_magnet(uri),
         AddSource::File(bytes) => info_hash_from_torrent(bytes),
@@ -356,15 +356,15 @@ async fn do_add(
         )
     })?;
 
-    // Misconfiguration guard (multi-slot): a .torrent must announce to one of
-    // the slot's allowed tracker domains. Catches uploading the wrong slot's
-    // .torrent into another slot. Only checked for file adds against a
+    // Misconfiguration guard (multi-profile): a .torrent must announce to one of
+    // the profile's allowed tracker domains. Catches uploading the wrong profile's
+    // .torrent into another profile. Only checked for file adds against a
     // configured, non-empty allow-list.
     if let AddSource::File(bytes) = &source {
         let domains = s
-            .slots
+            .profiles
             .as_ref()
-            .and_then(|sr| sr.get(&slot_id))
+            .and_then(|sr| sr.get(&profile_id))
             .map(|e| e.config.allowed_tracker_domains.clone())
             .unwrap_or_default();
         if !domains.is_empty() {
@@ -372,13 +372,13 @@ async fn do_add(
                 Ok(true) => {}
                 Ok(false) => {
                     s.metrics.inc_counter(
-                        "slot_assignment_registry_errors_total",
-                        &[("slot_id", slot_id.as_str())],
+                        "profile_assignment_registry_errors_total",
+                        &[("profile_id", profile_id.as_str())],
                     );
                     return Err((
                         StatusCode::BAD_REQUEST,
                         Json(
-                            serde_json::json!({"error": "torrent does not announce to the slot's allowed_tracker_domains"}),
+                            serde_json::json!({"error": "torrent does not announce to the profile's allowed_tracker_domains"}),
                         ),
                     ));
                 }
@@ -393,11 +393,11 @@ async fn do_add(
     }
 
     // Reject duplicates before the session sees the torrent: 409 if the
-    // info-hash is already loaded in any slot.
+    // info-hash is already loaded in any profile.
     if s.registry.lookup(&infohash).is_some() {
         s.metrics.inc_counter(
-            "slot_assignment_registry_errors_total",
-            &[("slot_id", slot_id.as_str())],
+            "profile_assignment_registry_errors_total",
+            &[("profile_id", profile_id.as_str())],
         );
         return Err((
             StatusCode::CONFLICT,
@@ -405,10 +405,10 @@ async fn do_add(
         ));
     }
     // Reserve the assignment; assign() re-checks uniqueness to close any race.
-    if let Err(e) = s.registry.assign(infohash, slot_id.clone()) {
+    if let Err(e) = s.registry.assign(infohash, profile_id.clone()) {
         s.metrics.inc_counter(
-            "slot_assignment_registry_errors_total",
-            &[("slot_id", slot_id.as_str())],
+            "profile_assignment_registry_errors_total",
+            &[("profile_id", profile_id.as_str())],
         );
         return Err((
             StatusCode::CONFLICT,
@@ -447,7 +447,7 @@ async fn do_add(
     // Persist the .torrent so the startup inventory scan can recover it if
     // resume data is ever lost.
     if let Some(bytes) = torrent_bytes {
-        if let Err(e) = s.torrents.write(&slot_id, &infohash, &bytes) {
+        if let Err(e) = s.torrents.write(&profile_id, &infohash, &bytes) {
             tracing::warn!(
                 infohash = %infohash,
                 error.cause = %e,
@@ -460,7 +460,7 @@ async fn do_add(
         StatusCode::CREATED,
         Json(AddResponse {
             infohash: infohash.to_hex(),
-            slot_id: slot_id.as_str().to_string(),
+            profile_id: profile_id.as_str().to_string(),
         }),
     ))
 }
@@ -495,13 +495,13 @@ pub async fn remove(
             })),
         ));
     }
-    let slot = s.registry.lookup(&ih).ok_or_else(|| {
+    let profile = s.registry.lookup(&ih).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "not_found"})),
         )
     })?;
-    let engine = s.source.engine_for(&slot).ok_or_else(|| {
+    let engine = s.source.engine_for(&profile).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "engine missing"})),
@@ -536,7 +536,7 @@ pub async fn pause(
             Json(serde_json::json!({"error": "not_found"})),
         )
     })?;
-    let engine = s.source.engine_for(&st.slot_id).ok_or_else(|| {
+    let engine = s.source.engine_for(&st.profile_id).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "engine missing"})),
@@ -562,11 +562,11 @@ pub async fn resume(
             Json(serde_json::json!({"error": "not_found"})),
         )
     })?;
-    // Refuse to un-quarantine a torrent whose slot the VPN monitor fenced.
-    if s.slot_vpn_down(&st.slot_id) {
+    // Refuse to un-quarantine a torrent whose profile the VPN monitor fenced.
+    if s.profile_vpn_down(&st.profile_id) {
         return Err(vpn_down());
     }
-    let engine = s.source.engine_for(&st.slot_id).ok_or_else(|| {
+    let engine = s.source.engine_for(&st.profile_id).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "engine missing"})),
@@ -671,7 +671,7 @@ fn lookup_engine(
             Json(serde_json::json!({"error": "not_found"})),
         )
     })?;
-    let engine = s.source.engine_for(&st.slot_id).ok_or_else(|| {
+    let engine = s.source.engine_for(&st.profile_id).ok_or_else(|| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": "engine missing"})),
@@ -690,7 +690,7 @@ fn bad_infohash() -> (StatusCode, Json<serde_json::Value>) {
 fn vpn_down() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::CONFLICT,
-        Json(serde_json::json!({"error": "slot vpn_down; restart daemon to resume"})),
+        Json(serde_json::json!({"error": "profile vpn_down; restart daemon to resume"})),
     )
 }
 
@@ -715,7 +715,7 @@ mod tests {
         AppState {
             source,
             registry: Arc::new(AssignmentRegistry::new_empty(dir.join("reg.json"))),
-            slots: None,
+            profiles: None,
             state: Arc::new(StateMap::new()),
             torrents: Arc::new(MemoryTorrentStore::new()),
             metrics: Arc::new(PromSink::new()),
@@ -737,11 +737,11 @@ mod tests {
     const MAGNET_HEX: &str = "0101010101010101010101010101010101010101";
 
     #[test]
-    fn add_request_parses_magnet_and_slot() {
+    fn add_request_parses_magnet_and_profile() {
         let r: AddRequest =
-            serde_json::from_str(r#"{"magnet":"magnet:?x","slot_id":"acct_a"}"#).unwrap();
+            serde_json::from_str(r#"{"magnet":"magnet:?x","profile_id":"acct_a"}"#).unwrap();
         assert_eq!(r.magnet.as_deref(), Some("magnet:?x"));
-        assert_eq!(r.slot_id.as_deref(), Some("acct_a"));
+        assert_eq!(r.profile_id.as_deref(), Some("acct_a"));
         assert!(r.torrent_path.is_none());
     }
 
@@ -779,7 +779,7 @@ mod tests {
     fn torrent_summary_serializes_expected_schema() {
         let ts = TorrentSummary {
             infohash: "aa".into(),
-            slot_id: "default".into(),
+            profile_id: "default".into(),
             phase: "seeding".into(),
             upload_rate: 10,
             download_rate: 0,

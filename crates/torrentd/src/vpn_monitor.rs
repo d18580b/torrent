@@ -1,10 +1,10 @@
-//! VPN tunnel health monitor (multi-slot mode).
+//! VPN tunnel health monitor (multi-profile mode).
 //!
-//! Every 30s, re-reads each slot's tunnel interface IP and — for WireGuard —
+//! Every 30s, re-reads each profile's tunnel interface IP and — for WireGuard —
 //! the age of its latest handshake. If the interface is down, its IP changed,
 //! or the handshake has gone stale (a tunnel that keeps its address but has
-//! silently died), the monitor immediately pauses every torrent in that slot,
-//! marks the slot `VpnDown`, and emits metrics — but does **not** restart the
+//! silently died), the monitor immediately pauses every torrent in that profile,
+//! marks the profile `VpnDown`, and emits metrics — but does **not** restart the
 //! session (the spec Safety Rule: automatic restart risks a window where traffic
 //! routes over the bare interface; the operator must intervene).
 
@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use tokio::sync::broadcast;
 use torrentd_engine::MetricsSink;
+use torrentd_engine::ProfileStatus;
 use torrentd_engine::ShutdownReason;
-use torrentd_engine::SlotStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::VpnType;
 use tracing::error;
@@ -23,12 +23,12 @@ use tracing::info;
 use tracing::warn;
 
 use crate::metrics_sink::PromSink;
-use crate::slot_registry::SlotRegistry;
+use crate::profile_registry::ProfileRegistry;
 use crate::vpn;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Why the monitor decided a slot's tunnel is unhealthy.
+/// Why the monitor decided a profile's tunnel is unhealthy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DownReason {
     /// The interface lost its address or the address changed.
@@ -46,7 +46,7 @@ impl DownReason {
     }
 }
 
-/// Decide whether a slot's tunnel is still healthy. Pure (no I/O) so it is
+/// Decide whether a profile's tunnel is still healthy. Pure (no I/O) so it is
 /// unit-testable. `handshake_age` is `None` when there is no liveness signal
 /// (non-WireGuard, `wg` unavailable, or never handshaked); the verdict then
 /// rests on IP presence alone.
@@ -67,26 +67,26 @@ fn evaluate(
 }
 
 pub async fn run(
-    slots: Arc<SlotRegistry>,
+    profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
     metrics: Arc<PromSink>,
     handshake_max_age: Duration,
     mut shutdown: broadcast::Receiver<ShutdownReason>,
 ) {
-    // Slots start healthy (their session was constructed on a confirmed IP).
-    // Pre-register every per-slot series at its baseline so `rate()`/alerting
+    // Profiles start healthy (their session was constructed on a confirmed IP).
+    // Pre-register every per-profile series at its baseline so `rate()`/alerting
     // queries resolve from a cold start instead of reading "no data" until the
     // first tunnel event ever occurs.
-    for e in slots.iter() {
-        let labels = [("slot_id", e.id().as_str())];
-        metrics.set_gauge("slot_vpn_tunnel_up", 1.0, &labels);
-        metrics.set_gauge("slot_torrents_paused_vpn_down", 0.0, &labels);
-        metrics.add_counter("slot_vpn_tunnel_ip_changes_total", 0, &labels);
+    for e in profiles.iter() {
+        let labels = [("profile_id", e.id().as_str())];
+        metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
+        metrics.set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
+        metrics.add_counter("profile_vpn_tunnel_ip_changes_total", 0, &labels);
         for reason in [DownReason::IpLostOrChanged, DownReason::HandshakeStale] {
             metrics.add_counter(
-                "slot_vpn_fenced_total",
+                "profile_vpn_fenced_total",
                 0,
-                &[("slot_id", e.id().as_str()), ("reason", reason.as_str())],
+                &[("profile_id", e.id().as_str()), ("reason", reason.as_str())],
             );
         }
     }
@@ -100,16 +100,16 @@ pub async fn run(
             }
         }
 
-        for e in slots.iter() {
-            let slot_id = e.id().clone();
+        for e in profiles.iter() {
+            let profile_id = e.id().clone();
             let health = e.health();
-            // Once a slot is down it stays down until the operator restarts
+            // Once a profile is down it stays down until the operator restarts
             // the daemon — no auto-recovery.
-            if health.status == SlotStatus::VpnDown {
+            if health.status == ProfileStatus::VpnDown {
                 continue;
             }
 
-            // Both probes shell out. Two processes per slot per tick is
+            // Both probes shell out. Two processes per profile per tick is
             // cheap, but it is still blocking work and it belongs off the
             // runtime's worker threads.
             let iface = e.config.vpn_interface.clone();
@@ -125,7 +125,7 @@ pub async fn run(
                 Err(e) => {
                     error!(
                         target: "torrentd::vpn_monitor",
-                        slot_id = %slot_id,
+                        profile_id = %profile_id,
                         error.cause = %e,
                         "tunnel probe task failed; skipping this tick",
                     );
@@ -134,11 +134,11 @@ pub async fn run(
             };
             // Handshake liveness applies to WireGuard only; OpenVPN keeps the
             // IP-presence check (no cheap equivalent probe).
-            let labels = [("slot_id", slot_id.as_str())];
+            let labels = [("profile_id", profile_id.as_str())];
             let handshake_age = if let Some(probe) = handshake_probe {
                 match probe {
                     Ok(age) => {
-                        metrics.set_gauge("slot_vpn_handshake_probe_ok", 1.0, &labels);
+                        metrics.set_gauge("profile_vpn_handshake_probe_ok", 1.0, &labels);
                         age
                     }
                     Err(why) => {
@@ -146,10 +146,10 @@ pub async fn run(
                         // degrade to IP-presence alone in complete silence, so
                         // a host with wireguard-tools missing or `wg`
                         // unprivileged looked exactly like a healthy one.
-                        metrics.set_gauge("slot_vpn_handshake_probe_ok", 0.0, &labels);
+                        metrics.set_gauge("profile_vpn_handshake_probe_ok", 0.0, &labels);
                         warn!(
                             target: "torrentd::vpn_monitor",
-                            slot_id = %slot_id,
+                            profile_id = %profile_id,
                             vpn_iface = %e.config.vpn_interface,
                             reason = why.as_str(),
                             "wireguard handshake probe unavailable; \
@@ -163,52 +163,59 @@ pub async fn run(
             };
 
             if let Some(age) = handshake_age {
-                metrics.set_gauge("slot_vpn_handshake_age_seconds", age.as_secs_f64(), &labels);
+                metrics.set_gauge(
+                    "profile_vpn_handshake_age_seconds",
+                    age.as_secs_f64(),
+                    &labels,
+                );
             }
 
             let reason = match evaluate(current, health.tunnel_ip, handshake_age, handshake_max_age)
             {
                 Ok(()) => {
-                    metrics.set_gauge("slot_vpn_tunnel_up", 1.0, &labels);
+                    metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
                     continue;
                 }
                 Err(reason) => reason,
             };
 
-            // Tunnel down, IP changed, or handshake stale → pause the slot.
+            // Tunnel down, IP changed, or handshake stale → pause the profile.
             let mut paused = 0u64;
-            for h in state.handles_for_slot(&slot_id) {
+            for h in state.handles_for_profile(&profile_id) {
                 if e.engine.pause_torrent(h).is_ok() {
                     paused += 1;
                 }
             }
             e.update_health(|hh| {
-                hh.status = SlotStatus::VpnDown;
+                hh.status = ProfileStatus::VpnDown;
                 hh.tunnel_ip = current;
                 hh.paused_for_vpn = paused;
             });
 
-            metrics.set_gauge("slot_vpn_tunnel_up", 0.0, &labels);
+            metrics.set_gauge("profile_vpn_tunnel_up", 0.0, &labels);
             // Only an actual IP change increments the IP-change counter. It
             // used to be bumped for every unhealthy verdict, stale handshakes
             // included, so the series did not measure what its name says.
             if reason == DownReason::IpLostOrChanged {
-                metrics.inc_counter("slot_vpn_tunnel_ip_changes_total", &labels);
+                metrics.inc_counter("profile_vpn_tunnel_ip_changes_total", &labels);
             }
             metrics.inc_counter(
-                "slot_vpn_fenced_total",
-                &[("slot_id", slot_id.as_str()), ("reason", reason.as_str())],
+                "profile_vpn_fenced_total",
+                &[
+                    ("profile_id", profile_id.as_str()),
+                    ("reason", reason.as_str()),
+                ],
             );
-            metrics.set_gauge("slot_torrents_paused_vpn_down", paused as f64, &labels);
+            metrics.set_gauge("profile_torrents_paused_vpn_down", paused as f64, &labels);
             error!(
                 target: "torrentd::vpn_monitor",
-                slot_id = %slot_id,
+                profile_id = %profile_id,
                 vpn_iface = %e.config.vpn_interface,
                 tunnel_ip = current.map(|c| c.to_string()).unwrap_or_default(),
                 reason = reason.as_str(),
                 handshake_age_secs = handshake_age.map(|a| a.as_secs()).unwrap_or_default(),
                 torrent_count = paused,
-                "VPN tunnel unhealthy; paused all slot torrents \
+                "VPN tunnel unhealthy; paused all profile torrents \
                  (no auto-restart — operator must intervene)",
             );
         }

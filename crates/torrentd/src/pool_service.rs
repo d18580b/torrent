@@ -15,8 +15,8 @@ use anyhow::Context;
 use parking_lot::Mutex;
 use torrentd_engine::AddParams;
 use torrentd_engine::AlertSource;
-use torrentd_engine::SlotId;
-use torrentd_engine::SlotStatus;
+use torrentd_engine::ProfileId;
+use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentPhase;
@@ -197,7 +197,7 @@ pub struct PendingVerify {
     pub infohash: String,
     pub torrent_path: PathBuf,
     pub save_path: PathBuf,
-    pub slot: SlotId,
+    pub profile: ProfileId,
 }
 
 impl VerifyQueue {
@@ -249,7 +249,7 @@ pub async fn run_verify_queue(
     source: Arc<dyn AlertSource>,
     state: Arc<StateMap>,
     metrics: Arc<crate::metrics_sink::PromSink>,
-    slots: Option<Arc<crate::slot_registry::SlotRegistry>>,
+    profiles: Option<Arc<crate::profile_registry::ProfileRegistry>>,
     mut shutdown: tokio::sync::broadcast::Receiver<torrentd_engine::ShutdownReason>,
 ) {
     use torrentd_engine::MetricsSink;
@@ -319,27 +319,27 @@ pub async fn run_verify_queue(
             let Some(item) = q.pending.lock().pop_front() else {
                 break;
             };
-            // `POST /api/pool/adopt` checks the slot's tunnel before queueing,
+            // `POST /api/pool/adopt` checks the profile's tunnel before queueing,
             // but the queue drains over minutes or hours and the tunnel can
             // drop in between. Admitting then would add torrents to a fenced
-            // slot — the one thing fencing exists to prevent. Put it back and
+            // profile — the one thing fencing exists to prevent. Put it back and
             // wait for the operator.
-            if slots
+            if profiles
                 .as_ref()
-                .and_then(|sr| sr.get(&item.slot))
-                .is_some_and(|e| e.health().status == SlotStatus::VpnDown)
+                .and_then(|sr| sr.get(&item.profile))
+                .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
             {
                 warn!(
                     target: "torrentd::pool",
-                    slot_id = %item.slot,
+                    profile_id = %item.profile,
                     infohash = %item.infohash,
-                    "verify held: slot is fenced (vpn_down)",
+                    "verify held: profile is fenced (vpn_down)",
                 );
                 q.pending.lock().push_back(item);
                 break;
             }
-            let Some(engine) = source.engine_for(&item.slot) else {
-                warn!(target: "torrentd::pool", slot_id = %item.slot, "no engine for slot; dropping verify");
+            let Some(engine) = source.engine_for(&item.profile) else {
+                warn!(target: "torrentd::pool", profile_id = %item.profile, "no engine for profile; dropping verify");
                 continue;
             };
             let bytes = match std::fs::read(&item.torrent_path) {
@@ -358,7 +358,7 @@ pub async fn run_verify_queue(
             // No SEED_MODE: that is what makes libtorrent hash the payload
             // against the piece hashes before it will seed. The no-download
             // invariant rides along regardless — see `torrentd_engine::policy`.
-            let flags = torrentd_engine::verify_flags(&item.slot);
+            let flags = torrentd_engine::verify_flags(&item.profile);
             match engine.add_torrent(AddParams::File {
                 bytes,
                 save_path: item.save_path.to_string_lossy().into_owned(),
@@ -410,7 +410,7 @@ enum VerifyOutcome {
 /// check is moved to libtorrent's `downloading` state, which the phase mapping
 /// deliberately ignores, so it never becomes `Errored` and never becomes
 /// `Seeding`. Waiting on phase alone therefore waits forever, and a handful of
-/// corrupt torrents would hold every verify slot and wedge adoption for the
+/// corrupt torrents would hold every verify profile and wedge adoption for the
 /// whole pool.
 fn verify_outcome(
     entry: Option<&torrentd_engine::TorrentState>,
@@ -445,7 +445,7 @@ pub fn execute_adopt(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
     infohash: &str,
-    slot: SlotId,
+    profile: ProfileId,
 ) -> Result<&'static str, String> {
     let plan = pool
         .with_store(|s| torrentd_pool::adopt::plan(s, infohash, |id| pool.root_path_of(id)))
@@ -459,8 +459,8 @@ pub fn execute_adopt(
             save_path,
         } => {
             let engine = source
-                .engine_for(&slot)
-                .ok_or_else(|| "unknown slot_id".to_string())?;
+                .engine_for(&profile)
+                .ok_or_else(|| "unknown profile_id".to_string())?;
             let resume = match std::fs::read(&resume_path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -474,14 +474,14 @@ pub fn execute_adopt(
                         error.cause = %e,
                         "resume data unreadable; falling back to verification",
                     );
-                    return enqueue_verify(pool, infohash, torrent_path, save_path, slot);
+                    return enqueue_verify(pool, infohash, torrent_path, save_path, profile);
                 }
             };
             // The .torrent rides along because resume data written without
             // SAVE_INFO_DICT carries no metadata; libtorrent ignores it when
             // the resume data already has an info dict.
             let torrent = std::fs::read(&torrent_path).ok();
-            let flags = torrentd_engine::seed_flags(&slot);
+            let flags = torrentd_engine::seed_flags(&profile);
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: resume,
                 torrent: torrent.clone(),
@@ -500,7 +500,7 @@ pub fn execute_adopt(
                     error.cause = %e,
                     "resume add rejected; falling back to verification",
                 );
-                return enqueue_verify(pool, infohash, torrent_path, save_path, slot);
+                return enqueue_verify(pool, infohash, torrent_path, save_path, profile);
             }
 
             pool.with_store(|s| {
@@ -514,14 +514,14 @@ pub fn execute_adopt(
                     None,
                     None,
                 );
-                let _ = s.set_slot(infohash, Some(slot.as_str()));
+                let _ = s.set_profile(infohash, Some(profile.as_str()));
             });
             Ok("fast_path")
         }
         AdoptPlan::Verify {
             torrent_path,
             save_path,
-        } => enqueue_verify(pool, infohash, torrent_path, save_path, slot),
+        } => enqueue_verify(pool, infohash, torrent_path, save_path, profile),
     }
 }
 
@@ -531,16 +531,16 @@ fn enqueue_verify(
     infohash: &str,
     torrent_path: PathBuf,
     save_path: PathBuf,
-    slot: SlotId,
+    profile: ProfileId,
 ) -> Result<&'static str, String> {
     pool.with_store(|s| {
-        let _ = s.set_slot(infohash, Some(slot.as_str()));
+        let _ = s.set_profile(infohash, Some(profile.as_str()));
     });
     pool.verify_queue().enqueue(PendingVerify {
         infohash: infohash.to_string(),
         torrent_path,
         save_path,
-        slot,
+        profile,
     });
     Ok("queued_for_verification")
 }
@@ -558,7 +558,7 @@ mod tests {
     use std::time::Instant;
 
     use torrentd_engine::InfoHash;
-    use torrentd_engine::SlotId;
+    use torrentd_engine::ProfileId;
     use torrentd_engine::TorrentHandle;
     use torrentd_engine::TorrentPhase;
     use torrentd_engine::TorrentState;
@@ -575,7 +575,7 @@ mod tests {
                 id: 1,
                 infohash: InfoHash([0x11; 20]),
             },
-            SlotId::default_single(),
+            ProfileId::default_single(),
             now,
         );
         s.phase = phase;
@@ -584,13 +584,13 @@ mod tests {
     }
 
     #[test]
-    fn a_torrent_still_hashing_keeps_its_slot() {
+    fn a_torrent_still_hashing_keeps_its_profile() {
         let s = st(TorrentPhase::Checking, None);
         assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Waiting);
     }
 
     #[test]
-    fn a_torrent_absent_from_the_state_map_keeps_its_slot() {
+    fn a_torrent_absent_from_the_state_map_keeps_its_profile() {
         assert_eq!(verify_outcome(None, SETTLE), VerifyOutcome::Waiting);
     }
 
@@ -603,10 +603,10 @@ mod tests {
     /// The wedge this fix exists for. A torrent whose payload fails hashing is
     /// left in libtorrent's `downloading` state, which the phase mapping keeps
     /// as `Checking` — so it is neither `Seeding` nor `Errored`, and before the
-    /// `checked_at` arm it held a verify slot forever. Four of these were
+    /// `checked_at` arm it held a verify profile forever. Four of these were
     /// enough to stop the whole pool adopting.
     #[test]
-    fn a_torrent_that_failed_hashing_does_not_hold_its_slot_forever() {
+    fn a_torrent_that_failed_hashing_does_not_hold_its_profile_forever() {
         let s = st(TorrentPhase::Checking, Some(Duration::from_secs(60)));
         assert_eq!(
             verify_outcome(Some(&s), SETTLE),

@@ -85,7 +85,7 @@ export interface PoolTorrent {
   num_files: number
   state: string | null
   base_rel: string | null
-  slot: string | null
+  profile: string | null
   category: string | null
   tags: string[]
   has_fastresume: boolean
@@ -93,7 +93,7 @@ export interface PoolTorrent {
 
 export interface TorrentSummary {
   infohash: string
-  slot_id: string
+  profile_id: string
   phase: string
   upload_rate: number
   download_rate: number
@@ -114,11 +114,11 @@ export interface Status {
   upload_rate_total: number
   download_rate_total: number
   pending_resume_count: number
-  slot_count: number
+  profile_count: number
 }
 
-export interface SlotSummary {
-  slot_id: string
+export interface ProfileSummary {
+  profile_id: string
   status: string
   tunnel_ip: string | null
   torrent_count: number

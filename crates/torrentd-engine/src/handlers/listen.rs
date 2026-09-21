@@ -3,8 +3,8 @@
 //! ListenFailed in single-session mode is fatal;
 //! the alert loop sets the `listen_failure_fatal` flag on the state map
 //! via `MetricsSink` so the daemon can flush logs and exit non-zero. In
-//! multi-slot mode the affected slot is marked failed but the daemon
-//! continues — that variant of the dispatch lives alongside slot
+//! multi-profile mode the affected profile is marked failed but the daemon
+//! continues — that variant of the dispatch lives alongside profile
 //! management.
 //!
 //! For now we log + record the metric; the torrentd binary's main loop
@@ -39,13 +39,13 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             );
             ctx.metrics.inc_counter(
                 "listen_failures_total",
-                &[("slot_id", ctx.slot_id.as_str())],
+                &[("profile_id", ctx.profile_id.as_str())],
             );
             // Also set a gauge so the binary can poll it for fatal exit.
             ctx.metrics.set_gauge(
                 "listen_failure_active",
                 1.0,
-                &[("slot_id", ctx.slot_id.as_str())],
+                &[("profile_id", ctx.profile_id.as_str())],
             );
         }
         Alert::ListenSucceeded { endpoint, .. } => {
@@ -58,7 +58,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             ctx.metrics.set_gauge(
                 "listen_failure_active",
                 0.0,
-                &[("slot_id", ctx.slot_id.as_str())],
+                &[("profile_id", ctx.profile_id.as_str())],
             );
         }
         _ => unreachable!("listen::handle called with non-listen alert"),

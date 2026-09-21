@@ -31,7 +31,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     torrent.extend_from_slice(info_section);
     torrent.push(b'e');
 
-    match ctx.torrents.write(&ctx.slot_id, &ih, &torrent) {
+    match ctx.torrents.write(&ctx.profile_id, &ih, &torrent) {
         Ok(()) => debug!(
             target: "torrentd_engine::handler::metadata",
             infohash = %ih,
@@ -61,8 +61,8 @@ mod tests {
     use crate::engine::TorrentEngine;
     use crate::metrics::NoopSink;
     use crate::mock::MockEngine;
+    use crate::profile::ProfileId;
     use crate::resume_store::MemoryResumeStore;
-    use crate::slot::SlotId;
     use crate::state::StateMap;
     use crate::torrent_store::MemoryTorrentStore;
     use crate::torrent_store::TorrentStore;
@@ -93,13 +93,13 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
-            slot_id: SlotId::default_single(),
+            profile_id: ProfileId::default_single(),
             span: tracing::info_span!("test"),
         };
 
         handle(&alert, &mut ctx);
 
-        let saved = torrents.load_all(&SlotId::default_single()).unwrap();
+        let saved = torrents.load_all(&ProfileId::default_single()).unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].0, ih);
         // Wrapped as a minimal `.torrent`: { "info": <info_section> }.

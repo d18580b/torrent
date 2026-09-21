@@ -23,7 +23,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 ctx.state.note_resume_settled();
                 return;
             };
-            match ctx.resume.write(&ctx.slot_id, &ih, data.as_bytes()) {
+            match ctx.resume.write(&ctx.profile_id, &ih, data.as_bytes()) {
                 Ok(()) => {
                     debug!(
                         target: "torrentd_engine::handler::resume",
@@ -31,8 +31,10 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                         bytes = data.as_bytes().len(),
                         "resume data persisted",
                     );
-                    ctx.metrics
-                        .inc_counter("resume_writes_total", &[("slot_id", ctx.slot_id.as_str())]);
+                    ctx.metrics.inc_counter(
+                        "resume_writes_total",
+                        &[("profile_id", ctx.profile_id.as_str())],
+                    );
                     ctx.state.update(&ih, |st| {
                         st.needs_save_resume = false;
                     });
@@ -47,7 +49,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     );
                     ctx.metrics.inc_counter(
                         "resume_write_errors_total",
-                        &[("slot_id", ctx.slot_id.as_str())],
+                        &[("profile_id", ctx.profile_id.as_str())],
                     );
                 }
             }
@@ -74,7 +76,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 );
                 ctx.metrics.inc_counter(
                     "resume_save_failures_total",
-                    &[("slot_id", ctx.slot_id.as_str())],
+                    &[("profile_id", ctx.profile_id.as_str())],
                 );
             }
             ctx.state.note_resume_settled();

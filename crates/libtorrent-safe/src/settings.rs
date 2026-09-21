@@ -157,11 +157,11 @@ impl Settings {
     /// * `max_paused_peerlist_size` (default 1000) — a paused torrent needs
     ///   almost no peer list at all.
     /// * `enable_upnp` / `enable_natpmp` — off. A server has static port
-    ///   forwarding; session-wide NAT traversal is not wanted. (Slots that
+    ///   forwarding; session-wide NAT traversal is not wanted. (Profiles that
     ///   negotiate a port do it explicitly over NAT-PMP against the tunnel
     ///   gateway, which is a different mechanism from this setting.)
     /// * `enable_lsd` — off by default; local peer discovery is noise on a
-    ///   server and is forbidden outright for private slots.
+    ///   server and is forbidden outright for private profiles.
     /// * `no_atime_storage` — keep the preset's `true`. Otherwise every read
     ///   of every piece writes an atime, which on a seeding box is a
     ///   continuous write load for no benefit.

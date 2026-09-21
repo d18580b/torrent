@@ -12,7 +12,7 @@ use axum::Json;
 use serde::Deserialize;
 use serde::Serialize;
 use torrentd_engine::MetricsSink;
-use torrentd_engine::SlotId;
+use torrentd_engine::ProfileId;
 use torrentd_pool::AdoptionState;
 use torrentd_pool::DirRollup;
 use tracing::info;
@@ -214,7 +214,7 @@ pub struct PoolTorrentView {
     num_files: usize,
     state: Option<String>,
     base_rel: Option<String>,
-    slot: Option<String>,
+    profile: Option<String>,
     category: Option<String>,
     tags: Vec<String>,
     has_fastresume: bool,
@@ -249,7 +249,7 @@ pub async fn torrents(
                 name: t.name,
                 total_size: t.total_size,
                 num_files: t.num_files,
-                slot: t.slot,
+                profile: t.profile,
                 category: t.category,
                 tags: t.tags,
                 has_fastresume: t.fastresume_path.is_some(),
@@ -301,8 +301,8 @@ pub struct AdoptRequest {
     root_id: Option<i64>,
     #[serde(default)]
     path: Option<String>,
-    /// Required in multi-slot mode.
-    slot_id: Option<String>,
+    /// Required in multi-profile mode.
+    profile_id: Option<String>,
     /// Report what would happen and change nothing.
     #[serde(default)]
     dry_run: bool,
@@ -330,25 +330,25 @@ pub async fn adopt(
 ) -> Result<Json<AdoptResponse>, ApiError> {
     let pool = s.pool.as_ref().ok_or_else(no_pool)?;
 
-    let slot = match (s.mode, req.slot_id.as_deref()) {
-        (Mode::Single, _) => SlotId::default_single(),
-        (Mode::MultiSlot, Some(id)) => SlotId::new(id),
-        (Mode::MultiSlot, None) => {
+    let profile = match (s.mode, req.profile_id.as_deref()) {
+        (Mode::Single, _) => ProfileId::default_single(),
+        (Mode::MultiProfile, Some(id)) => ProfileId::new(id),
+        (Mode::MultiProfile, None) => {
             return Err(err(
                 StatusCode::BAD_REQUEST,
-                "slot_id required in multi-slot mode",
+                "profile_id required in multi-profile mode",
             ))
         }
     };
-    if s.source.engine_for(&slot).is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "unknown slot_id"));
+    if s.source.engine_for(&profile).is_none() {
+        return Err(err(StatusCode::BAD_REQUEST, "unknown profile_id"));
     }
-    // Adopting into a fenced slot would land every torrent paused and make the
-    // slot look healthy; same guard as POST /torrents.
-    if s.slot_vpn_down(&slot) {
+    // Adopting into a fenced profile would land every torrent paused and make the
+    // profile look healthy; same guard as POST /torrents.
+    if s.profile_vpn_down(&profile) {
         return Err(err(
             StatusCode::CONFLICT,
-            "slot vpn_down; restart daemon to resume",
+            "profile vpn_down; restart daemon to resume",
         ));
     }
 
@@ -414,23 +414,23 @@ pub async fn adopt(
         }
 
         // Safety Rules 3 and 4, in the order they are written: the registry is
-        // the authority on which slot owns an info-hash, and it is consulted
+        // the authority on which profile owns an info-hash, and it is consulted
         // *before* any session receives the torrent.
         //
         // Claiming afterwards could not enforce anything. libtorrent refuses a
-        // duplicate within one session, but a slot is a whole separate session
-        // by construction, so an info-hash already seeding in slot A was free
-        // to be adopted into slot B and start announcing from a second account
+        // duplicate within one session, but a profile is a whole separate session
+        // by construction, so an info-hash already seeding in profile A was free
+        // to be adopted into profile B and start announcing from a second account
         // — the permanent-ban case Rule 3 exists for — while the conflict was
         // recorded as a warning after the fact.
-        if let Err(reason) = claim_in_registry(&s, &ih, &slot) {
+        if let Err(reason) = claim_in_registry(&s, &ih, &profile) {
             resp.refused.push(RefusedTorrent {
                 infohash: ih,
                 reason,
             });
             continue;
         }
-        match execute_adopt(pool, &s.source, &ih, slot.clone()) {
+        match execute_adopt(pool, &s.source, &ih, profile.clone()) {
             Ok(_) => bucket(&mut resp, verifies).push(ih),
             Err(reason) => {
                 release_claim(&s, &ih);
@@ -462,28 +462,28 @@ fn bucket(resp: &mut AdoptResponse, verifies: bool) -> &mut Vec<String> {
     }
 }
 
-/// Claim `infohash` for `slot` before any session sees it.
+/// Claim `infohash` for `profile` before any session sees it.
 ///
 /// Deliberately the same shape as the claim in `POST /torrents`: an info-hash
-/// already mapped to *any* slot is a refusal rather than a warning, because the
-/// registry is the only thing that can see across slots. `assign` re-checks
+/// already mapped to *any* profile is a refusal rather than a warning, because the
+/// registry is the only thing that can see across profiles. `assign` re-checks
 /// uniqueness under its own lock, which closes the gap between the lookup and
 /// the insert.
-fn claim_in_registry(s: &AppState, infohash: &str, slot: &SlotId) -> Result<(), String> {
+fn claim_in_registry(s: &AppState, infohash: &str, profile: &ProfileId) -> Result<(), String> {
     let Some(ih) = libtorrent_safe::InfoHash::from_hex(infohash) else {
         return Err("malformed info-hash".to_string());
     };
     if let Some(existing) = s.registry.lookup(&ih) {
         s.metrics.inc_counter(
-            "slot_assignment_registry_errors_total",
-            &[("slot_id", slot.as_str())],
+            "profile_assignment_registry_errors_total",
+            &[("profile_id", profile.as_str())],
         );
-        return Err(format!("info-hash already loaded in slot {existing}"));
+        return Err(format!("info-hash already loaded in profile {existing}"));
     }
-    s.registry.assign(ih, slot.clone()).map_err(|e| {
+    s.registry.assign(ih, profile.clone()).map_err(|e| {
         s.metrics.inc_counter(
-            "slot_assignment_registry_errors_total",
-            &[("slot_id", slot.as_str())],
+            "profile_assignment_registry_errors_total",
+            &[("profile_id", profile.as_str())],
         );
         format!("{e}")
     })
@@ -546,7 +546,7 @@ pub async fn verify(
             });
             continue;
         };
-        let Some(engine) = s.source.engine_for(&st.slot_id) else {
+        let Some(engine) = s.source.engine_for(&st.profile_id) else {
             resp.skipped.push(RefusedTorrent {
                 infohash: ih,
                 reason: "engine missing".into(),
@@ -858,56 +858,62 @@ mod tests {
     const IH: &str = "0101010101010101010101010101010101010101";
 
     #[test]
-    fn adopting_an_infohash_another_slot_holds_is_refused() {
-        // Safety Rule 3. libtorrent cannot see this: a slot is a separate
-        // session, so the add into slot B would have succeeded and the same
+    fn adopting_an_infohash_another_profile_holds_is_refused() {
+        // Safety Rule 3. libtorrent cannot see this: a profile is a separate
+        // session, so the add into profile B would have succeeded and the same
         // info-hash would have started announcing from a second account. The
-        // registry is the only thing with a cross-slot view, which is why the
+        // registry is the only thing with a cross-profile view, which is why the
         // claim has to happen before the session ever sees the torrent.
         let s = build_test_state(None);
         let ih = InfoHash::from_hex(IH).unwrap();
-        s.registry.assign(ih, SlotId::new("acct_a")).unwrap();
+        s.registry.assign(ih, ProfileId::new("acct_a")).unwrap();
 
-        let err = claim_in_registry(&s, IH, &SlotId::new("acct_b")).unwrap_err();
-        assert!(err.contains("already loaded in slot acct_a"), "got {err}");
+        let err = claim_in_registry(&s, IH, &ProfileId::new("acct_b")).unwrap_err();
+        assert!(
+            err.contains("already loaded in profile acct_a"),
+            "got {err}"
+        );
     }
 
     #[test]
     fn a_free_infohash_is_claimed_before_the_add() {
         let s = build_test_state(None);
-        let slot = SlotId::new("acct_a");
-        assert!(claim_in_registry(&s, IH, &slot).is_ok());
+        let profile = ProfileId::new("acct_a");
+        assert!(claim_in_registry(&s, IH, &profile).is_ok());
 
         let ih = InfoHash::from_hex(IH).unwrap();
-        assert_eq!(s.registry.lookup(&ih), Some(slot));
+        assert_eq!(s.registry.lookup(&ih), Some(profile));
     }
 
     #[test]
-    fn re_adopting_a_torrent_this_slot_already_holds_is_refused() {
+    fn re_adopting_a_torrent_this_profile_already_holds_is_refused() {
         // Not a no-op: the session already has it, and `duplicate_is_error`
         // would reject the add anyway. Refusing here keeps the message honest
         // and means a failed add can always release its own claim safely.
         let s = build_test_state(None);
-        let slot = SlotId::new("acct_a");
-        claim_in_registry(&s, IH, &slot).unwrap();
+        let profile = ProfileId::new("acct_a");
+        claim_in_registry(&s, IH, &profile).unwrap();
 
-        let err = claim_in_registry(&s, IH, &slot).unwrap_err();
-        assert!(err.contains("already loaded in slot acct_a"), "got {err}");
+        let err = claim_in_registry(&s, IH, &profile).unwrap_err();
+        assert!(
+            err.contains("already loaded in profile acct_a"),
+            "got {err}"
+        );
     }
 
     #[test]
     fn a_released_claim_can_be_retried() {
         let s = build_test_state(None);
-        let slot = SlotId::new("acct_a");
-        claim_in_registry(&s, IH, &slot).unwrap();
+        let profile = ProfileId::new("acct_a");
+        claim_in_registry(&s, IH, &profile).unwrap();
         release_claim(&s, IH);
-        assert!(claim_in_registry(&s, IH, &slot).is_ok());
+        assert!(claim_in_registry(&s, IH, &profile).is_ok());
     }
 
     #[test]
     fn a_malformed_infohash_never_reaches_the_registry() {
         let s = build_test_state(None);
-        assert!(claim_in_registry(&s, "not-hex", &SlotId::new("acct_a")).is_err());
+        assert!(claim_in_registry(&s, "not-hex", &ProfileId::new("acct_a")).is_err());
         assert_eq!(s.registry.len(), 0);
     }
 }

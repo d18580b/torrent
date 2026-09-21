@@ -28,10 +28,10 @@ mod pool_apply;
 mod pool_cmd;
 mod pool_service;
 mod port_forward_monitor;
+mod profile_registry;
 mod reload;
 mod sd_notify;
 mod signals;
-mod slot_registry;
 mod startup;
 mod tracing_init;
 mod vpn;
@@ -132,11 +132,11 @@ fn main() -> anyhow::Result<()> {
             },
             Command::Vpn { cmd } => match cmd {
                 cli::VpnCmd::Check {
-                    slot,
+                    profile,
                     json,
                     bring_up,
                     egress,
-                } => vpn_cmd::check(&cfg, slot.as_deref(), json, bring_up, egress),
+                } => vpn_cmd::check(&cfg, profile.as_deref(), json, bring_up, egress),
             },
             Command::HashPassword => hash_password_cmd(),
             Command::NewToken { name, scopes } => new_token_cmd(&name, &scopes),
