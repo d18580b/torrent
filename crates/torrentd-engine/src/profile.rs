@@ -235,7 +235,17 @@ pub struct ProfileConfig {
     pub resume_dir: Option<PathBuf>,
     pub torrent_dir: Option<PathBuf>,
     pub allowed_tracker_domains: Vec<String>,
-    pub upload_rate_limit: u32,
+    /// Per-profile upload cap in bytes/sec, overriding the daemon-wide key.
+    ///
+    /// `Option`, not a plain `u32`, because `0` means *unlimited* — the
+    /// top-level key's own comment says so — and a plain `u32` made it mean
+    /// "unset" as well. A profile writing `upload_rate_limit = 0` to say "this
+    /// account is uncapped" was silently given the daemon-wide cap at boot and
+    /// again on every reload, with nothing logged and nothing in
+    /// `diff_profiles` to report it, because the two values compare equal.
+    /// Both shipped samples use exactly that line as the illustration of the
+    /// override.
+    pub upload_rate_limit: Option<u32>,
 }
 
 /// Which posture a `[[profile]]` declares.
@@ -302,12 +312,8 @@ struct RawProfile {
     torrent_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_tracker_domains: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    upload_rate_limit: u32,
-}
-
-fn is_zero(v: &u32) -> bool {
-    *v == 0
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upload_rate_limit: Option<u32>,
 }
 
 impl RawProfile {
@@ -978,7 +984,7 @@ mod tests {
             resume_dir: Some(PathBuf::from(format!("/var/lib/torrentd/resume/{id}"))),
             torrent_dir: Some(PathBuf::from(format!("/var/lib/torrentd/torrents/{id}"))),
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
         }
     }
 
@@ -995,7 +1001,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
         }
     }
 

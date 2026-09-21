@@ -323,8 +323,12 @@ pub async fn boot(
         if let Some(fp) = &p.peer_fingerprint_hex {
             settings.peer_fingerprint = Some(fp.clone());
         }
-        if p.upload_rate_limit > 0 {
-            settings.upload_rate_limit = Some(p.upload_rate_limit);
+        // `is_some()`, not `> 0`. `0` is a legal per-profile value meaning
+        // *unlimited* — the top-level key's own comment says so — and testing
+        // `> 0` read it as "unset" and pushed the daemon-wide cap onto a
+        // session the operator had explicitly uncapped.
+        if let Some(limit) = p.upload_rate_limit {
+            settings.upload_rate_limit = Some(limit);
         }
 
         // What differs between the two postures, and nothing else: where the
