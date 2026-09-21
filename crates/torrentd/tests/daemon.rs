@@ -75,6 +75,7 @@ fn spawn_daemon(p: &std::path::Path, listen_port: u16, http_addr: &str) -> Child
              torrent_dir = \"{d}/torrents\"\n\
              http_listen = \"{http_addr}\"\n\
              log_level = \"warn\"\n\
+             allow_unauthenticated = true\n\
              enable_lsd = false\n\
              \n\
              [[profile]]\n\

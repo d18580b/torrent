@@ -5,14 +5,14 @@ services:
       dockerfile: deploy/Containerfile
     image: torrentd:latest
     restart: unless-stopped
-    # Multi-profile mode brings up its own WireGuard tunnels (and, with
-    # network_kill_switch = true, installs an nftables table). Single-session
-    # mode doesn't need NET_ADMIN; remove the cap_add + devices stanzas
-    # in that case.
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun
+    # Only a `network = "vpn"` profile needs these: bringing up WireGuard
+    # tunnels, and installing the nftables table when
+    # network_kill_switch = true. Granted by default is granted to deployments
+    # that do not need it, so uncomment them when you add a vpn profile.
+    # cap_add:
+    #   - NET_ADMIN
+    # devices:
+    #   - /dev/net/tun
     sysctls:
       net.ipv4.conf.all.rp_filter: "2"
     ulimits:
@@ -22,13 +22,18 @@ services:
     ports:
       - "6881:6881/tcp"
       - "6881:6881/udp"
-      - "127.0.0.1:8080:8080"   # HTTP API — bind to localhost; front
-                                # with reverse proxy for remote access.
+      # The API is published to the host's loopback only. Note that the
+      # daemon must bind 0.0.0.0:8080 *inside* the container for this mapping
+      # to reach it — a config that binds 127.0.0.1 there is unreachable, and
+      # this is the one place the sample config cannot be copied verbatim.
+      # A non-loopback bind requires [auth]; the daemon refuses otherwise.
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./torrentd.toml:/etc/torrentd/torrentd.toml:ro
       - torrentd-resume:/var/lib/torrentd/resume
       - torrentd-torrents:/var/lib/torrentd/torrents
-      - /etc/wireguard:/etc/wireguard:ro
+      # Only needed by a `network = "vpn"` profile.
+      # - /etc/wireguard:/etc/wireguard:ro
       # Operator places the actual data here; torrentd reads only.
       - /data/torrents:/data/torrents:ro
 

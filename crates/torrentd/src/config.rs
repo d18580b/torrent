@@ -43,7 +43,22 @@ pub struct Config {
     pub default_save_path: PathBuf,
     pub resume_dir: PathBuf,
     pub torrent_dir: PathBuf,
+    /// Where the control API listens. Defaults to loopback, which is the only
+    /// address it is safe to expose without `[auth]`.
+    #[serde(default = "Config::default_http_listen")]
     pub http_listen: SocketAddr,
+
+    /// Permit running with no `[auth]` section.
+    ///
+    /// Without `[auth]` the daemon authenticates nothing: every route,
+    /// including every mutating one, is open to anyone who can reach the
+    /// port. That posture is legitimate — a loopback bind behind a reverse
+    /// proxy that does its own access control — but it is not something an
+    /// operator should arrive at by omission, which is what it used to be.
+    ///
+    /// So the unsafe choice stays available and has to be typed.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
 
@@ -154,6 +169,10 @@ const REGISTRY_FILE: &str = "profile_assignments.json";
 const LEGACY_REGISTRY_FILE: &str = "slot_assignments.json";
 
 impl Config {
+    fn default_http_listen() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 8080))
+    }
+
     fn default_log_level() -> LogLevel {
         LogLevel::Info
     }
@@ -170,10 +189,50 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Refuse a configuration that authenticates nothing without saying so.
+    ///
+    /// Two separate refusals, because they fail for different reasons:
+    ///
+    /// * no `[auth]` and no explicit opt-out — the operator has not chosen,
+    ///   and the default of "no authentication at all" is not one to arrive at
+    ///   by omission;
+    /// * no `[auth]` on a non-loopback bind, even *with* the opt-out — that is
+    ///   an unauthenticated mutating API on a routable address, and
+    ///   `allow_unauthenticated` is for delegating access control to something
+    ///   in front, not for having none.
+    fn validate_auth_posture(&self) -> anyhow::Result<()> {
+        if self.auth.is_some() {
+            return Ok(());
+        }
+        if !self.allow_unauthenticated {
+            anyhow::bail!(
+                "no [auth] section, and allow_unauthenticated is not set. Without [auth] the \
+                 daemon authenticates nothing: every route, including every mutating one, is \
+                 open to anyone who can reach {listen}. Either configure authentication —\n\
+                 \n    torrentd --config <path> hash-password\n\
+                 \n— or, if access control genuinely belongs to something in front of this \
+                 daemon, write `allow_unauthenticated = true` to say so deliberately.",
+                listen = self.http_listen,
+            );
+        }
+        if !self.http_listen.ip().is_loopback() {
+            anyhow::bail!(
+                "allow_unauthenticated = true with http_listen = {listen}, which is not a \
+                 loopback address. That is an unauthenticated API that mutates state, \
+                 reachable from the network. Bind to 127.0.0.1 and put a reverse proxy in \
+                 front, or configure [auth].",
+                listen = self.http_listen,
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
         // Unconditional: an empty set is itself a refusal now, because there
         // is no implicit profile to fall back to.
         ProfileConfig::validate_set(&self.profile).context("[[profile]] validation failed")?;
+
+        self.validate_auth_posture()?;
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -554,6 +613,7 @@ torrent_dir = "/var/lib/torrentd/torrents"
 http_listen = "127.0.0.1:8080"
 log_level = "info"
 connections_limit = 10000
+allow_unauthenticated = true
 "#;
 
     const ONE_HOST_PROFILE: &str = r#"
@@ -660,6 +720,63 @@ listen_interfaces = "0.0.0.0:6881"
         );
     }
 
+    /// The top-level block without the opt-out, for the auth-posture tests.
+    fn top_level_no_opt_out() -> String {
+        TOP_LEVEL.replace("allow_unauthenticated = true\n", "")
+    }
+
+    #[test]
+    fn an_unauthenticated_config_is_refused_unless_it_says_so() {
+        let dir = tempdir().unwrap();
+        let body = format!("{}{ONE_HOST_PROFILE}", top_level_no_opt_out());
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("allow_unauthenticated"), "got: {msg}");
+        assert!(msg.contains("hash-password"), "the error names the way out");
+    }
+
+    #[test]
+    fn the_opt_out_is_honoured_on_loopback() {
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &single_session());
+        assert!(Config::load(&p).is_ok());
+    }
+
+    #[test]
+    fn the_opt_out_does_not_extend_to_a_routable_address() {
+        // `allow_unauthenticated` is for delegating access control to
+        // something in front, not for having none.
+        let dir = tempdir().unwrap();
+        let body = single_session().replace("127.0.0.1:8080", "0.0.0.0:8080");
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("loopback"), "got: {msg}");
+    }
+
+    #[test]
+    fn configured_auth_needs_no_opt_out_and_may_bind_anywhere() {
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{}{ONE_HOST_PROFILE}\n[auth]\npassword_hash = \"{}\"\n",
+            top_level_no_opt_out().replace("127.0.0.1:8080", "0.0.0.0:8080"),
+            crate::auth::hash_password("hunter2").unwrap(),
+        );
+        let p = write_cfg(dir.path(), &body);
+        assert!(Config::load(&p).is_ok());
+    }
+
+    #[test]
+    fn http_listen_defaults_to_loopback() {
+        // The README claimed this default for a long time while the key was
+        // in fact required; the claim is now true.
+        let dir = tempdir().unwrap();
+        let top = TOP_LEVEL.replace("http_listen = \"127.0.0.1:8080\"\n", "");
+        let p = write_cfg(dir.path(), &format!("{top}{ONE_HOST_PROFILE}"));
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.http_listen.ip().is_loopback());
+        assert_eq!(cfg.http_listen.port(), 8080);
+    }
+
     #[test]
     fn a_config_with_no_profiles_is_refused() {
         let dir = tempdir().unwrap();
@@ -740,6 +857,7 @@ default_save_path = "{r}"
 resume_dir = "{r}/resume"
 torrent_dir = "{d}/torrents"
 http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
 
 [[profile]]
 id = "public"
@@ -772,6 +890,7 @@ default_save_path = "{d}/data"
 resume_dir = "{d}/resume"
 torrent_dir = "{d}/torrents"
 http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
 
 [[profile]]
 id = "public"

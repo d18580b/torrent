@@ -31,9 +31,15 @@ pub struct LoginResponse {
 
 pub async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
     let Some(auth) = s.auth.as_ref() else {
+        // 404 read as "no such route", which is what the shipped login form
+        // surfaced when an operator had not configured `[auth]` — a dead end
+        // with no indication of what to do. The route exists; the daemon is
+        // running in a posture where logging in is not a thing that happens.
         return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "authentication is not configured"})),
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "this daemon runs without authentication                           (allow_unauthenticated = true). There is no session to create;                           access control belongs to whatever sits in front of it.                           Configure [auth] to log in here."
+            })),
         )
             .into_response();
     };
