@@ -132,13 +132,13 @@ async fn dispatch<T, I, H>(
 
 /// Spawn the signal listener task. Holds open until all three signal streams
 /// hit EOF (effectively forever in practice).
-pub async fn run(channels: SignalChannels, reload_recv_capacity: usize) -> mpsc::Receiver<()> {
-    let (reload_pub, reload_recv) = mpsc::channel::<()>(reload_recv_capacity);
-
-    // Replace channels.reload_tx with the new one so handlers send to
-    // the receiver we return. Actually we use the caller-provided one;
-    // this fn just spawns watchers.
-    let _ = reload_pub;
+///
+/// Took a capacity and returned an `mpsc::Receiver<()>` that nothing could
+/// ever receive on: the sender half was dropped before the function returned,
+/// and `boot` discarded the receiver anyway, having wired its own reload pair
+/// and passed it in. A seam that cannot carry anything is worse than no seam
+/// in a module a reader has to trust about signal handling.
+pub async fn run(channels: SignalChannels) {
     let SignalChannels {
         shutdown_tx,
         reload_tx,
@@ -164,8 +164,6 @@ pub async fn run(channels: SignalChannels, reload_recv_capacity: usize) -> mpsc:
         let term = streams.pop().expect("three streams installed");
         dispatch(shutdown_tx, reload_tx, term, int_, hup).await;
     });
-
-    reload_recv
 }
 
 #[cfg(test)]
