@@ -154,6 +154,8 @@ jobs:
 
       # mise provides the test tasks; without it these jobs would be a second
       # copy of the commands mise.toml already owns.
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
       - uses: jdx/mise-action@v2
 
       # Layer 2: struct marshalling, exception isolation,
@@ -194,6 +196,8 @@ jobs:
 
       # mise provides the test tasks; without it these jobs would be a second
       # copy of the commands mise.toml already owns.
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
       - uses: jdx/mise-action@v2
 
       # Layer 3: real daemon + libtorrent, driven over HTTP.
