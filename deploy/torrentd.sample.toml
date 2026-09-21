@@ -207,6 +207,10 @@ dht               = true
 # back to a build that predates this change. It is the only copy of the
 # `plan` / `plan_step` mutation journal, which a rescan does not reconstruct.
 #
+# That copy is a full second copy of the index, so the first open needs free
+# space equal to the size of `pool.db`. If it cannot be written the migration
+# stops, names the backup path and the reason, and leaves the index as it was.
+#
 # A `pool.db` from one of this change's own pre-release builds can report
 # version 2 while already carrying `profile`. That one file is recognised and
 # its version stamped to match, with no migration and nothing moved; the
