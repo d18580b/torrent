@@ -301,12 +301,13 @@ torrentd --config /etc/torrentd/torrentd.toml hash-password
 torrentd --config /etc/torrentd/torrentd.toml new-token --name prometheus --scopes metrics
 ```
 
-That exemption is what makes a non-loopback deployment migratable at all. A
-container publishes `127.0.0.1:8080:8080` to a daemon bound `0.0.0.0` *inside*
-the namespace, so it cannot bind loopback and cannot write
-`allow_unauthenticated = true` either — the opt-out on a routable address is
-refused outright. Run the subcommands in a throwaway container against the
-same config the service mounts:
+That exemption is what makes a non-loopback deployment migratable at all. In
+`deploy/compose.yaml` the daemon is reached by a *sibling container* — `proxy`,
+over the compose network — so it binds `0.0.0.0` inside its namespace and a
+loopback bind there would be a dead port. Having a routable bind it cannot
+move, it cannot write `allow_unauthenticated = true` either — the opt-out on
+a routable address is refused outright. Run the subcommands in a throwaway
+container against the same config the service mounts:
 
 ```bash
 podman compose -f deploy/compose.yaml run --rm torrentd hash-password
