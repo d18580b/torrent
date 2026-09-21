@@ -85,12 +85,16 @@ fn profile_vpn_down() -> (StatusCode, Json<serde_json::Value>) {
 /// Reported rather than omitted: a profile whose tunnel failed used to vanish
 /// from this list entirely, so the operator saw a short list with no
 /// indication that an account was missing.
-fn summary_of_failed(f: &crate::profile_registry::FailedProfile) -> ProfileSummary {
+fn summary_of_failed(s: &AppState, f: &crate::profile_registry::FailedProfile) -> ProfileSummary {
     ProfileSummary {
         profile_id: f.config.id.as_str().to_string(),
         status: ProfileStatus::Failed.as_str().to_string(),
         tunnel_ip: None,
-        torrent_count: 0,
+        // From the registry, like every other profile's. Hardcoding 0 here
+        // reported no stranded torrents for the profile whose stranded
+        // torrents are exactly what the operator is hunting: the registry
+        // typically still holds its assignments, and none of them are loaded.
+        torrent_count: s.registry.for_profile(&f.config.id).len(),
         listen_port: f.config.listen_port(),
         port_forward: f.config.port_forward().as_str().to_string(),
         forwarded_port: None,
@@ -99,12 +103,24 @@ fn summary_of_failed(f: &crate::profile_registry::FailedProfile) -> ProfileSumma
     }
 }
 
+/// `GET /api/profiles`.
+///
+/// **Order is part of the contract**: live profiles first, in the order their
+/// `[[profile]]` tables appear in the config file, then the profiles that
+/// failed to come up, in config order among themselves. Configured order is
+/// what `ProfileSource`'s `Vec` already gives every other consumer and what
+/// the operator wrote; sorting by id would throw it away.
+///
+/// It is stated because something depends on it. It is not, however, a
+/// substitute for a client checking `status`: the first entry is only an
+/// `active` profile when at least one came up, so a client picking a default
+/// target filters on `status == "active"` rather than taking `[0]`.
 pub async fn list(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<ProfileSummary>>, (StatusCode, Json<serde_json::Value>)> {
     let profiles = &s.profiles;
     let mut out: Vec<ProfileSummary> = profiles.iter().map(|e| summary_of(&s, e)).collect();
-    out.extend(profiles.failed().iter().map(summary_of_failed));
+    out.extend(profiles.failed().iter().map(|f| summary_of_failed(&s, f)));
     Ok(Json(out))
 }
 
@@ -119,7 +135,7 @@ pub async fn get(
         // 404 would be indistinguishable from a typo in the id.
         if let Some(f) = profiles.failed_profile(&profile_id) {
             return Ok(Json(ProfileDetail {
-                summary: summary_of_failed(f),
+                summary: summary_of_failed(&s, f),
                 vpn_interface: f.config.vpn_interface().map(str::to_string),
                 allowed_tracker_domains: f.config.allowed_tracker_domains.clone(),
                 paused_for_vpn: 0,

@@ -300,12 +300,10 @@ async fn do_add(
         ));
     };
 
-    let engine = s.source.engine_for(&profile_id).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "unknown profile_id"})),
-        )
-    })?;
+    let engine = s
+        .source
+        .engine_for(&profile_id)
+        .ok_or_else(|| unresolved_profile(s, &profile_id))?;
 
     // Don't accept new torrents into a fenced (VpnDown) profile — they would land
     // paused and mislead the operator into thinking the profile is healthy.
@@ -340,10 +338,7 @@ async fn do_add(
         }
     };
     let Some(profile_cfg) = s.profile_config(&profile_id) else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "unknown profile_id"})),
-        ));
+        return Err(unresolved_profile(s, &profile_id));
     };
     let flags = torrentd_engine::seed_flags(profile_cfg);
 
@@ -719,6 +714,33 @@ fn bad_infohash() -> (StatusCode, Json<serde_json::Value>) {
         StatusCode::BAD_REQUEST,
         Json(serde_json::json!({"error": "invalid infohash hex"})),
     )
+}
+
+/// The answer for a `profile_id` that resolves to no engine.
+///
+/// 409 with the reason where the profile is configured and failed to come up,
+/// 400 "unknown profile_id" only where the id names nothing. A failed profile
+/// carries no engine by construction, so every `engine_for` site reached the
+/// second answer and told an operator whose tunnel had failed that their
+/// profile did not exist — the trace-less answer `profile_registry.rs` says
+/// the failed list exists to end, and `http/profiles.rs` already argues the
+/// distinction in the same words.
+fn unresolved_profile(
+    s: &AppState,
+    profile_id: &ProfileId,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match s.profile_failure_reason(profile_id) {
+        Some(reason) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("profile failed to start: {reason}"),
+            })),
+        ),
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "unknown profile_id"})),
+        ),
+    }
 }
 
 fn vpn_down() -> (StatusCode, Json<serde_json::Value>) {
