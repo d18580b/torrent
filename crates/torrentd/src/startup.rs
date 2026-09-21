@@ -295,16 +295,17 @@ impl Drop for BootCleanup {
 /// and the tunnel teardown this boot path exists to guarantee.
 ///
 /// Returned as a pair so the two subscriptions cannot drift apart again, and
-/// **called before `signals::run`**, which is the rest of the property.
-/// `signals::run` spawns its listener and returns without an await point, and
-/// the runtime is multi-threaded, so the spawned task can install all three
-/// handlers, take a SIGTERM and send on another worker before the next two
-/// instructions of `boot` execute. A send with no live receiver is not
-/// buffered for a later `subscribe()` — `broadcast::Sender::send` returns the
-/// value back in its error and writes nothing to the ring — so a send landing
-/// in that window is lost outright, and with the listener looping nothing
-/// re-reports it. Below the call the guarantee is probabilistic; above it,
-/// where the sender already exists and is all this needs, it is structural.
+/// taken **before the listener is installed**, which is the rest of the
+/// property. `signals::run` spawns its listener and returns without an await
+/// point, and the runtime is multi-threaded, so the spawned task can install
+/// all three handlers, take a SIGTERM and send on another worker before the
+/// next two instructions of `boot` execute. A send with no live receiver is
+/// not buffered for a later `subscribe()` — `broadcast::Sender::send` returns
+/// the value back in its error and writes nothing to the ring — so a send
+/// landing in that window is lost outright, and with the listener looping
+/// nothing re-reports it. After the install the guarantee is probabilistic;
+/// before it, where the sender already exists and is all this needs, it is
+/// structural.
 fn boot_shutdown_receivers(
     tx: &broadcast::Sender<ShutdownReason>,
 ) -> (
@@ -312,6 +313,34 @@ fn boot_shutdown_receivers(
     broadcast::Receiver<ShutdownReason>,
 ) {
     (tx.subscribe(), tx.subscribe())
+}
+
+/// [`boot_shutdown_receivers`], and then install the signal listener — the
+/// order being the whole of the property.
+///
+/// Taking the pair and installing the listener were two adjacent statements
+/// in `boot`, and their order was pinned by nothing: swapping them left the
+/// entire suite green while reopening the window above. `boot` has no test at
+/// any revision, and `signals::run` cannot be called from one — tokio's
+/// handlers are process-wide and are never uninstalled, so a test that
+/// installs them leaves SIGINT swallowed and Ctrl-C ignored for the rest of
+/// the `cargo test` run. Taking the install as a closure puts the order
+/// inside one function, where a test drives it with a stand-in that sends the
+/// instant it is "installed" — which is precisely the race.
+async fn boot_shutdown_receivers_before<F, Fut>(
+    tx: &broadcast::Sender<ShutdownReason>,
+    install_listener: F,
+) -> (
+    broadcast::Receiver<ShutdownReason>,
+    broadcast::Receiver<ShutdownReason>,
+)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let pair = boot_shutdown_receivers(tx);
+    install_listener().await;
+    pair
 }
 
 pub struct DaemonHandle {
@@ -369,11 +398,12 @@ pub async fn boot(
     // Both shutdown receivers, taken here rather than 400 lines apart — the
     // one the slot loop polls during bring-up, and the one that outlives boot
     // and the HTTP server's graceful shutdown waits on — and taken *before*
-    // the listener that can send to them exists. See
-    // `boot_shutdown_receivers` for what subscribing the second one late cost
-    // and why the order of these two lines is the whole property.
-    let (mut boot_shutdown, shutdown_rx) = boot_shutdown_receivers(&shutdown_tx);
-    signals::run(channels.clone()).await;
+    // the listener that can send to them is installed. See
+    // `boot_shutdown_receivers` for what subscribing the second one late
+    // cost, and `boot_shutdown_receivers_before` for why the order is not two
+    // adjacent statements here any more.
+    let (mut boot_shutdown, shutdown_rx) =
+        boot_shutdown_receivers_before(&shutdown_tx, || signals::run(channels.clone())).await;
 
     // Undoes what boot has raised, for every exit that is not a successful
     // one. Tunnels and the kill-switch table outlive the process, so a `?`
@@ -1527,6 +1557,43 @@ mod tests {
         assert!(
             subscribed_after.try_recv().is_err(),
             "a receiver subscribed after the send cannot see it",
+        );
+    }
+
+    /// The *ordering*, which the test above does not reach.
+    ///
+    /// `boot` took the pair and then installed the listener as two adjacent
+    /// statements, and nothing pinned which came first: swapping them left
+    /// the whole suite green while reopening the window that `send` with no
+    /// live receiver discards outright. The stand-in listener below sends the
+    /// instant it is installed, which is the race — `signals::run` spawns and
+    /// returns with no await point, and its task can install all three
+    /// handlers and take a SIGTERM before the next statement of `boot` runs.
+    ///
+    /// Install before taking the pair in `boot_shutdown_receivers_before` and
+    /// this fails.
+    #[tokio::test]
+    async fn the_listener_is_installed_only_once_both_receivers_exist() {
+        let (tx, first) = broadcast::channel(8);
+        // No receiver of `boot`'s owns the channel at this point, which is
+        // what makes a send in the window lost rather than merely unseen.
+        drop(first);
+
+        let sender = tx.clone();
+        let (mut boot_shutdown, mut shutdown_rx) =
+            boot_shutdown_receivers_before(&tx, || async move {
+                let _ = sender.send(ShutdownReason::Sigterm);
+            })
+            .await;
+
+        assert!(
+            boot_shutdown.try_recv().is_ok(),
+            "a SIGTERM taken the instant the listener is installed still \
+             reaches the slot loop's check",
+        );
+        assert!(
+            matches!(shutdown_rx.try_recv(), Ok(ShutdownReason::Sigterm)),
+            "and the receiver the HTTP server's graceful shutdown waits on",
         );
     }
 }
