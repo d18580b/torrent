@@ -185,7 +185,9 @@ pub struct Report {
     pub slots: Vec<SlotReport>,
 }
 
-/// Everything was established, and everything established was good.
+/// Everything established was good — excluding a check nothing this
+/// invocation could be given would settle, which is reported and does not
+/// colour the status. See [`Check::needs_capability`].
 pub const EXIT_OK: i32 = 0;
 /// At least one check failed.
 pub const EXIT_FAILED: i32 = 1;
@@ -1145,17 +1147,33 @@ fn slot_checks(
                     checks.push(Check::pass("bring_up", format!("tunnel came up on {ip}")));
                 }
                 Err(e) => {
+                    // The caveat below belongs to the manager in hand.
+                    // `openvpn --daemon` forks and exits 0 before its own
+                    // address poll, so a failure there can leave a process
+                    // standing that this command cannot see to stop;
+                    // `wg-quick up` leaves no surviving process, and printing
+                    // openvpn's mechanism for a WireGuard slot sent the
+                    // operator looking for an orphan that cannot exist — on
+                    // the one failure path where the report's precision is
+                    // the point.
                     let aftermath = if raised_here {
                         format!(
                             "; {iface} is there even so, so this command raised it and is \
                              lowering it again"
                         )
                     } else {
-                        format!(
-                            "; no {iface} appeared, but a manager that daemonises (openvpn \
-                             forks and exits 0 before its own address poll) may have left a \
-                             process running that this command cannot see to stop"
-                        )
+                        match slot.vpn_type {
+                            VpnType::Openvpn => format!(
+                                "; no {iface} appeared, but openvpn daemonises (it forks and \
+                                 exits 0 before its own address poll) so it may have left a \
+                                 process running that this command cannot see to stop"
+                            ),
+                            VpnType::Wireguard => format!(
+                                "; no {iface} appeared, and `wg-quick up` leaves no process \
+                                 behind, so there is nothing running for this command to \
+                                 have missed"
+                            ),
+                        }
                     };
                     checks.push(Check::fail("bring_up", format!("{e}{aftermath}")));
                     if raised_here {
@@ -2781,9 +2799,14 @@ http_listen = "127.0.0.1:8080"
     #[test]
     fn a_bring_up_that_failed_and_left_nothing_standing_says_what_it_cannot_see() {
         // The complement: nothing appeared, so there is nothing to lower and
-        // no teardown is issued. The report still says what the command was
-        // unable to establish, because a manager that daemonises can have left
-        // a process behind that no interface probe can see.
+        // no teardown is issued. What the report says it cannot see depends on
+        // the manager that was asked.
+        //
+        // F17. The caveat was unconditional, so a WireGuard slot's failure was
+        // explained with openvpn's daemonising and the operator was sent
+        // looking for an orphaned process that cannot exist. `openvpn
+        // --daemon` forks and exits 0 before its own address poll and can
+        // leave one; `wg-quick up` cannot.
         let cfg = cfg_with_slot("");
         let host = FakeHost::new().with_exists_seq([false, false]);
 
@@ -2794,8 +2817,29 @@ http_listen = "127.0.0.1:8080"
         let bu = find(&r.checks, "bring_up").expect("a bring_up line");
         assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
         assert!(
-            bu.detail.contains("may have left a process running"),
-            "the one thing it cannot observe is named: {}",
+            !bu.detail.contains("may have left a process running"),
+            "wg-quick leaves no process, so the report must not suggest one: {}",
+            bu.detail,
+        );
+        assert!(
+            bu.detail.contains("leaves no process behind"),
+            "the operator is told what was and was not left standing: {}",
+            bu.detail,
+        );
+
+        // The openvpn slot, where the caveat is true and belongs.
+        let mut cfg = cfg_with_slot("");
+        cfg.slot[0].vpn_type = VpnType::Openvpn;
+        let host = FakeHost::new().with_exists_seq([false, false]);
+
+        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+
+        let bu = find(&r.checks, "bring_up").expect("a bring_up line");
+        assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
+        assert!(
+            bu.detail.contains("may have left a process running")
+                && bu.detail.contains("openvpn daemonises"),
+            "the one thing it cannot observe is named, for the manager that can do it: {}",
             bu.detail,
         );
     }
