@@ -211,7 +211,10 @@ The daemon sets none of these itself.
 - **`net.ipv4.conf.all.rp_filter = 2`** for multi-slot. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on
-  bare metal.
+  bare metal. The kernel uses `max(conf/all, conf/<iface>)` per interface, so
+  `all = 2` is sufficient on its own — but `all = 0` is *not* safe, because a
+  tunnel interface created later inherits `conf/default` and may come up
+  strict. `vpn check` reports both values and the effective mode.
 
 ## 8. Start it
 
@@ -252,6 +255,66 @@ curl -s localhost:8080/metrics | grep torrentd_libtorrent_
 ```
 
 Then add one torrent and watch it reach `seeding` in `/status`.
+
+### Checking the VPN on its own
+
+`vpn check` runs the VPN pre-flight without constructing a session, so "does
+my VPN configuration work" can be answered before "does my seeding setup
+work".
+
+```bash
+torrentd --config /etc/torrentd/torrentd.toml vpn check
+torrentd --config /etc/torrentd/torrentd.toml vpn check --slot acct_a --json
+torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
+```
+
+| Flag | What it adds |
+| --- | --- |
+| `--slot ID` | Check one slot instead of every configured slot. |
+| `--json` | Emit the report as JSON instead of the human table. |
+| `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
+| `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host. |
+| `--as-uid UID` | Judge the kill-switch checks against the uid the daemon runs as. Default: this process's own. |
+
+Exit status: `0` clean, `1` any check failed, `2` nothing failed but at least
+one check could not be performed — an unreadable sysctl, a `wg show` refused
+for want of permission. A caller that treats only `0` as success gets the
+strict reading; one that accepts `0` and `2` gets "nothing is known to be
+broken".
+
+**Safe to run against a live daemon.** Nothing in the default path changes
+state the daemon depends on: the NAT-PMP check asks the gateway for a mapping
+with the daemon's own short lease and lets that lease expire rather than
+deleting it, because NAT-PMP's delete removes *every* mapping the tunnel
+address holds — including the daemon's. `--bring-up` skips an interface that
+already exists and never lowers one it did not raise, for the same reason:
+`wg-quick down` on a live slot's tunnel fences that slot until the daemon is
+restarted.
+
+**Run it as the daemon's user** where you can. The kill-switch checks describe
+one uid; with `sudo` (which `--bring-up` usually needs) pass `--as-uid` so
+they describe the daemon's rather than root's, or they will report `unknown`.
+
+**What a pass establishes**, for a WireGuard slot with
+`port_forward = "natpmp"`: the profile is readable; `wg` and `wg-quick` run;
+the interface holds an IPv4 address; the latest handshake is inside
+`vpn_handshake_max_age_secs`; the gateway hands out a forwarded port when
+asked over the tunnel; the effective `rp_filter` for that interface is not
+strict; and, with the kill switch on, that `nft --check` accepts the ruleset
+boot would install for the uid given.
+
+**What it does not.** It does not establish that any port is reachable from
+the public internet — there is no inbound test — nor that the port a session
+ends up announcing is the one tested, since boot negotiates its own. It takes
+one sample of the handshake and one negotiation: a slot whose first
+negotiation succeeds and whose renewals all fail passes. And with `--egress`
+it proves a round trip from the tunnel address, not the identity of the exit.
+
+To check the exit address itself, ask something that reports it:
+
+```bash
+curl --interface wg-acct-a -s https://api.ipify.org; echo
+```
 
 ## 10. Migrating a pool from another client
 
