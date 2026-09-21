@@ -26,9 +26,12 @@ use std::time::Instant;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::PasswordHasher;
 use argon2::password_hash::SaltString;
+use argon2::Algorithm;
 use argon2::Argon2;
+use argon2::Params;
 use argon2::PasswordHash;
 use argon2::PasswordVerifier;
+use argon2::Version;
 use parking_lot::Mutex;
 use rand::RngCore;
 use serde::Deserialize;
@@ -204,34 +207,57 @@ pub struct Auth {
 ///   attacker simply varies the header and is never throttled.
 ///
 /// So a per-IP bucket is used exactly when the address came from the socket
-/// or from a proxy in `trusted_proxies`, and the global bucket otherwise —
-/// which, with no trusted proxies configured, is the whole of the previous
-/// behaviour.
+/// or from a proxy in `trusted_proxies`, and the global bucket when no address
+/// could be established at all, or when the per-client map is full and the
+/// sweep could not make room for one more.
+///
+/// Note that this is *not* the previous behaviour with no trusted proxies
+/// configured. The socket peer is an address, so the empty default now keys
+/// per source IP rather than sharing one bucket. That is the better property —
+/// one attacker can no longer lock every operator out — and both overflow
+/// paths degrade to the shared bucket rather than to no throttle at all.
 #[derive(Debug)]
 pub struct LoginThrottle {
     /// The fallback, for requests whose client cannot be established.
     global: Mutex<ThrottleState>,
-    /// Per client. Bounded, and swept of expired entries on insert, so a
-    /// rotating source cannot grow it without limit.
+    /// Per client. Bounded, and swept of entries idle beyond the penalty
+    /// window on insert, so a rotating source cannot grow it without limit.
     per_client: Mutex<HashMap<IpAddr, ThrottleState>>,
     max_burst: u32,
     penalty: Duration,
 }
 
-/// Cap on distinct clients tracked at once. An attacker rotating addresses
-/// evicts their own entries long before this matters; a real deployment has a
-/// handful of operators.
+/// Cap on distinct clients tracked at once. A real deployment has a handful of
+/// operators; a source rotating addresses reaches this cap, and from there the
+/// sweep reclaims whatever has gone idle and the global bucket covers whoever
+/// the sweep could not make room for.
 const MAX_TRACKED_CLIENTS: usize = 1024;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ThrottleState {
     failures: u32,
     locked_until: Option<Instant>,
+    /// When this entry was last read or written. Liveness has to be a time
+    /// question: `failures` never decays, so an entry that has one is live
+    /// forever, and every entry the throttle creates has one from its first
+    /// call.
+    last_seen: Instant,
+}
+
+impl Default for ThrottleState {
+    fn default() -> Self {
+        Self {
+            failures: 0,
+            locked_until: None,
+            last_seen: Instant::now(),
+        }
+    }
 }
 
 impl ThrottleState {
     /// How long the caller must wait, or `None` if an attempt is allowed.
     fn retry_after(&mut self) -> Option<Duration> {
+        self.last_seen = Instant::now();
         match self.locked_until {
             Some(until) if Instant::now() < until => Some(until - Instant::now()),
             Some(_) => {
@@ -245,15 +271,23 @@ impl ThrottleState {
     }
 
     fn note_failure(&mut self, max_burst: u32, penalty: Duration) {
+        self.last_seen = Instant::now();
         self.failures = self.failures.saturating_add(1);
         if self.failures >= max_burst {
             self.locked_until = Some(Instant::now() + penalty);
         }
     }
 
-    /// Whether this entry is worth keeping.
-    fn is_live(&self) -> bool {
-        self.failures > 0 || self.locked_until.is_some_and(|u| u > Instant::now())
+    /// Whether this entry is worth keeping: it is still locking someone out,
+    /// or it has been touched within `idle`.
+    ///
+    /// Not `failures > 0`. Nothing decays `failures`, and `note_failure`
+    /// increments it on the first call, so that disjunct is true for every
+    /// entry the throttle ever creates and the sweep can never reclaim
+    /// anything — least of all in the case it exists for, a source that
+    /// rotates addresses and by definition never revisits a key.
+    fn is_live(&self, idle: Duration) -> bool {
+        self.locked_until.is_some_and(|u| u > Instant::now()) || self.last_seen.elapsed() < idle
     }
 }
 
@@ -267,16 +301,39 @@ impl LoginThrottle {
         }
     }
 
-    /// How long `client` must wait, or `None` if an attempt is allowed.
-    pub fn retry_after(&self, client: Option<IpAddr>) -> Option<Duration> {
-        match client {
-            None => self.global.lock().retry_after(),
-            Some(ip) => self
-                .per_client
-                .lock()
-                .get_mut(&ip)
-                .and_then(ThrottleState::retry_after),
+    /// The same throttle with a shorter penalty, so a test can observe the
+    /// idle sweep without sleeping for the production window.
+    #[cfg(test)]
+    fn with_penalty(penalty: Duration) -> Self {
+        Self {
+            penalty,
+            ..Self::new()
         }
+    }
+
+    /// How long `client` must wait, or `None` if an attempt is allowed.
+    ///
+    /// The read path has to mirror the write path exactly. `note_failure`
+    /// routes an identified client with no bucket of its own to the global
+    /// bucket once the map is full, so this consults the global bucket in the
+    /// same case. Returning `None` there instead would mean that filling the
+    /// map — 1024 requests from 1024 addresses, which one routed IPv6 /64
+    /// supplies — leaves every address after it permanently unthrottled, and
+    /// an unthrottled login route is a free CPU-exhaustion lever for an
+    /// unauthenticated caller.
+    pub fn retry_after(&self, client: Option<IpAddr>) -> Option<Duration> {
+        let Some(ip) = client else {
+            return self.global.lock().retry_after();
+        };
+        let mut g = self.per_client.lock();
+        if let Some(state) = g.get_mut(&ip) {
+            return state.retry_after();
+        }
+        if g.len() >= MAX_TRACKED_CLIENTS {
+            drop(g);
+            return self.global.lock().retry_after();
+        }
+        None
     }
 
     /// Record a failed attempt, locking out once the burst is spent.
@@ -289,7 +346,7 @@ impl LoginThrottle {
         };
         let mut g = self.per_client.lock();
         if g.len() >= MAX_TRACKED_CLIENTS && !g.contains_key(&ip) {
-            g.retain(|_, st| st.is_live());
+            g.retain(|_, st| st.is_live(self.penalty));
             // Still full of live entries: fall back to the global bucket
             // rather than letting the map grow, since an attack that fills it
             // is exactly when throttling has to keep working.
@@ -348,7 +405,9 @@ impl Auth {
         let Ok(parsed) = PasswordHash::new(&self.config.password_hash) else {
             return false;
         };
-        Argon2::default()
+        // The parameters come from the stored PHC string, not from here, so a
+        // hash produced at any other cost still verifies.
+        argon2id()
             .verify_password(candidate.as_bytes(), &parsed)
             .is_ok()
     }
@@ -384,10 +443,35 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Memory cost in KiB, iterations, and parallelism for Argon2id here.
+///
+/// Pinned rather than taken from `Argon2::default()`. These are OWASP's
+/// current recommendation for Argon2id and they are also what the `argon2`
+/// crate happens to default to at the version `Cargo.lock` holds — which is
+/// the problem: `README.md` quotes the numbers, so leaving them at a
+/// dependency's discretion made a documented security parameter true by
+/// coincidence, and a routine `cargo update` past a release that revised those
+/// defaults would move the cost of the credential KDF in either direction with
+/// nothing in this repository recording that it had.
+///
+/// Changing these does not invalidate existing credentials: a PHC string
+/// carries the parameters it was produced with, and `verify_password` uses
+/// those, not these.
+const ARGON2_M_COST_KIB: u32 = 19_456;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
+
+/// The hasher this daemon hashes and verifies with, at the pinned cost.
+fn argon2id() -> Argon2<'static> {
+    let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+        .expect("pinned Argon2id parameters are in range");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 /// Hash a password for the config file.
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
+    argon2id()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| anyhow::anyhow!("hash password: {e}"))
@@ -421,6 +505,43 @@ mod tests {
         assert!(!auth.verify_password("Correct horse"));
         assert!(!auth.verify_password(""));
         assert!(!auth.verify_password("correct horse "));
+    }
+
+    #[test]
+    fn the_hash_carries_the_cost_readme_quotes() {
+        // README.md's authentication section quotes `m=19456, t=2, p=1`. The
+        // numbers were the argon2 crate's defaults and appeared nowhere in
+        // this tree, so the documentation was true by coincidence of a
+        // dependency. They are pinned now, and this is what holds them to it.
+        let h = hash_password("correct horse").unwrap();
+        assert!(h.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "got {h}",);
+        let parsed = PasswordHash::new(&h).unwrap();
+        let params = Params::try_from(&parsed).unwrap();
+        assert_eq!(params.m_cost(), ARGON2_M_COST_KIB);
+        assert_eq!(params.t_cost(), ARGON2_T_COST);
+        assert_eq!(params.p_cost(), ARGON2_P_COST);
+    }
+
+    #[test]
+    fn a_hash_made_at_another_cost_still_verifies() {
+        // The pin decides what new hashes cost; it must not invalidate a
+        // credential generated before it, or raising the cost later becomes a
+        // lockout rather than an upgrade.
+        let cheap = Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(8 * 1024, 1, 1, None).unwrap(),
+        );
+        let salt = SaltString::generate(&mut OsRng);
+        let h = cheap
+            .hash_password(b"correct horse", &salt)
+            .unwrap()
+            .to_string();
+        assert!(h.contains("m=8192,t=1,p=1"), "got {h}");
+
+        let auth = Auth::new(cfg(h));
+        assert!(auth.verify_password("correct horse"));
+        assert!(!auth.verify_password("wrong horse"));
     }
 
     #[test]
@@ -599,6 +720,61 @@ mod tests {
         assert!(
             t.per_client.lock().len() <= MAX_TRACKED_CLIENTS,
             "tracked clients must stay bounded",
+        );
+    }
+
+    #[test]
+    fn the_sweep_reclaims_a_client_that_never_came_back() {
+        // The sweep exists for the rotating source, and the rotating source is
+        // exactly the caller it could never reclaim while liveness was
+        // `failures > 0`: every entry it creates has `failures == 1`, nothing
+        // decays it, and rotating means never revisiting a key to reset it.
+        let t = LoginThrottle::with_penalty(Duration::from_millis(10));
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        assert_eq!(t.per_client.lock().len(), MAX_TRACKED_CLIENTS);
+
+        std::thread::sleep(Duration::from_millis(40));
+        // The next unknown client is what triggers a sweep on insert.
+        t.note_failure(ip(1));
+        assert!(
+            t.per_client.lock().len() < MAX_TRACKED_CLIENTS,
+            "an entry idle beyond the penalty window must be evictable",
+        );
+    }
+
+    #[test]
+    fn a_rotating_client_is_still_throttled_once_the_map_is_full() {
+        // The property that matters is not that the map stayed small, it is
+        // that filling the map is not a way to stop being throttled. Once it
+        // is full `note_failure` routes an unknown client's failures to the
+        // global bucket, so `retry_after` has to read that same bucket for the
+        // same client — otherwise 1024 addresses buy every address after them
+        // unlimited Argon2id verifications and unlimited password guessing.
+        let t = LoginThrottle::new();
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        assert_eq!(
+            t.per_client.lock().len(),
+            MAX_TRACKED_CLIENTS,
+            "the map has to be full for this test to be testing anything",
+        );
+
+        // Addresses the map has never seen, arriving one apiece — the shape of
+        // the attack, where rotating means never revisiting a key.
+        let fresh = |n: u32| Some(IpAddr::V4(std::net::Ipv4Addr::from(0xc000_0000 + n)));
+        for n in 0..5 {
+            assert!(
+                t.retry_after(fresh(n)).is_none(),
+                "the first burst is still allowed",
+            );
+            t.note_failure(fresh(n));
+        }
+        assert!(
+            t.retry_after(fresh(99)).is_some(),
+            "a rotating client must still be throttled once the map is full",
         );
     }
 

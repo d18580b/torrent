@@ -73,10 +73,25 @@ Everyday tasks:
 | `mise run test-all`| every test layer, including the ignored ones             |
 | `mise run native`  | Provision the shared libtorrent prefix (see Build)       |
 | `mise run native-clean` | Delete every cached native prefix                   |
+| `mise run vpn-check <config> [-- <flags>]` | Verify a real VPN configuration (see below) |
 
 Formatting requires **nightly rustfmt** (`imports_granularity`/`group_imports` are
 unstable); `mise run setup` installs it and the `fmt` tasks invoke `cargo +nightly fmt`.
 Everything else builds/lints/tests on the pinned stable toolchain.
+
+`vpn-check` is deliberately outside every `test` task: it needs a real host
+with real tunnels and is meaningless in CI. It takes a config path and
+forwards any trailing flags to `torrentd … vpn check`, and it exits with that
+subcommand's status — `0` clean, `1` any failure, `2` nothing failed but
+something could not be checked.
+
+```bash
+mise run vpn-check /etc/torrentd/torrentd.toml
+mise run vpn-check /etc/torrentd/torrentd.toml -- --bring-up --json
+```
+
+See [docs/running.md](docs/running.md#checking-the-vpn-on-its-own) for what a
+pass does and does not establish.
 
 ### Git hooks
 
@@ -202,7 +217,7 @@ fields have **one** spelling each, because log queries depend on it:
 
 | Field | Notes |
 | --- | --- |
-| `profile_id` | Which profile the event belongs to. **Never** `slot_id`, its name before profiles; CI fails on that spelling anywhere in `crates/`. |
+| `profile_id` | The `id` of a configured `[[profile]]`. Always present — every torrent belongs to exactly one profile, and there is no implicit one. **Never** `slot_id`, its name before profiles; CI fails on that spelling anywhere in `crates/`. |
 | `infohash` | Lowercase hex, 40 chars. **Never** `info_hash` — CI fails on that spelling anywhere in `crates/`. |
 | `op` | The engine operation: `add_torrent`, `remove_torrent`, `pause_torrent`, `resume_torrent`, `save_resume_data`, `set_upload_limit`, `set_file_priority`, `force_recheck`, `move_storage`, `apply_settings`. |
 | `alert_type` | Lowercase `AlertKind`, e.g. `add_torrent`. |

@@ -1,8 +1,9 @@
-//! Runtime profile registry (multi-profile mode only).
+//! Runtime profile registry.
 //!
-//! Holds the per-profile engine plus the VPN/health state that the `/profiles` HTTP
-//! API and the VPN health monitor share. Single-session mode has no profile
-//! registry (`AppState::profiles` is `None`).
+//! Holds the per-profile engine plus the VPN/health state that the `/profiles`
+//! HTTP API and the VPN health monitor share. Always present: a daemon has at
+//! least one profile or it does not boot, so `AppState::profiles` is a plain
+//! `Arc<ProfileRegistry>` rather than an `Option`.
 
 use std::net::IpAddr;
 use std::sync::Arc;

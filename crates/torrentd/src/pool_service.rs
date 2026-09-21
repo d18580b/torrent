@@ -418,7 +418,7 @@ enum VerifyOutcome {
 /// check is moved to libtorrent's `downloading` state, which the phase mapping
 /// deliberately ignores, so it never becomes `Errored` and never becomes
 /// `Seeding`. Waiting on phase alone therefore waits forever, and a handful of
-/// corrupt torrents would hold every verify profile and wedge adoption for the
+/// corrupt torrents would hold every verify slot and wedge adoption for the
 /// whole pool.
 fn verify_outcome(
     entry: Option<&torrentd_engine::TorrentState>,
@@ -615,10 +615,10 @@ mod tests {
     /// The wedge this fix exists for. A torrent whose payload fails hashing is
     /// left in libtorrent's `downloading` state, which the phase mapping keeps
     /// as `Checking` — so it is neither `Seeding` nor `Errored`, and before the
-    /// `checked_at` arm it held a verify profile forever. Four of these were
+    /// `checked_at` arm it held a verify slot forever. Four of these were
     /// enough to stop the whole pool adopting.
     #[test]
-    fn a_torrent_that_failed_hashing_does_not_hold_its_profile_forever() {
+    fn a_torrent_that_failed_hashing_does_not_hold_its_verify_slot_forever() {
         let s = st(TorrentPhase::Checking, Some(Duration::from_secs(60)));
         assert_eq!(
             verify_outcome(Some(&s), SETTLE),

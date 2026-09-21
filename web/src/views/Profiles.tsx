@@ -3,15 +3,15 @@ import { api, type ProfileSummary, type Status } from '../lib/api'
 import { count, rate } from '../lib/format'
 import { Card, ErrorBanner, StatePill } from '../components/Bits'
 
-/// Session health. In multi-profile mode each profile is a libtorrent session pinned
-/// to its own VPN tunnel, and a fenced profile is the thing an operator most needs
-/// to notice — it stops seeding and will not resume without intervention.
+/// Session health. Each profile is a libtorrent session with its own network
+/// posture — a VPN tunnel, or the host's own interfaces — and a fenced profile
+/// is the thing an operator most needs to notice: it stops seeding and will not
+/// resume without intervention.
 export function Profiles() {
   const status = useQuery({ queryKey: ['status'], queryFn: () => api.get<Status>('/api/status') })
   const profiles = useQuery({
     queryKey: ['profiles'],
     queryFn: () => api.get<ProfileSummary[]>('/api/profiles'),
-    // Single-session mode does not mount /profiles at all.
     retry: false,
   })
 
@@ -33,12 +33,12 @@ export function Profiles() {
         </div>
       )}
 
-      {profiles.isError && (
-        <div className="banner">
-          Single-session mode — no VPN profiles configured. Add <code>[[profile]]</code> tables to
-          run multi-account seeding with per-account tunnel isolation.
-        </div>
-      )}
+      {/* `/api/profiles` is mounted unconditionally — a daemon always has at
+          least one profile, and one with no `[[profile]]` table cannot boot —
+          so an error here is auth or the network, never a configuration to
+          fix. The banner this replaces told an operator whose session had
+          lapsed that their config was wrong. */}
+      <ErrorBanner error={profiles.error} />
 
       {profiles.data && profiles.data.length > 0 && (
         <div className="scroll">

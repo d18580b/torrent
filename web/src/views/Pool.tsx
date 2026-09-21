@@ -1,9 +1,11 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  adoptPool,
   api,
   type AdoptResponse,
   type PoolOverview,
+  type ProfileSummary,
   type TreeResponse,
 } from '../lib/api'
 import { bytes, count } from '../lib/format'
@@ -20,13 +22,23 @@ export function Pool() {
   const [rootId, setRootId] = useState<number | null>(null)
   const [path, setPath] = useState('')
   const [notice, setNotice] = useState<string | null>(null)
+  const [profileId, setProfileId] = useState<string | null>(null)
 
   const overview = useQuery({
     queryKey: ['pool', 'overview'],
     queryFn: () => api.get<PoolOverview>('/api/pool'),
   })
 
+  // Adoption hands every matched torrent to one profile's session, and the
+  // daemon requires the caller to say which — there is no default, and a
+  // profile is an account identity, so guessing one is not a safe fallback.
+  const profiles = useQuery({
+    queryKey: ['profiles'],
+    queryFn: () => api.get<ProfileSummary[]>('/api/profiles'),
+  })
+
   const activeRoot = rootId ?? overview.data?.roots[0]?.root_id ?? null
+  const activeProfile = profileId ?? profiles.data?.[0]?.profile_id ?? null
 
   const tree = useQuery({
     queryKey: ['pool', 'tree', activeRoot, path],
@@ -45,15 +57,21 @@ export function Pool() {
 
   const [preview, setPreview] = useState<AdoptResponse | null>(null)
 
+  // `activeProfile` is null only before `/api/profiles` resolves; both buttons
+  // are disabled until then rather than sending a request the daemon refuses.
   const dryRun = useMutation({
-    mutationFn: () =>
-      api.post<AdoptResponse>('/api/pool/adopt', { root_id: activeRoot, path, dry_run: true }),
+    mutationFn: () => {
+      if (activeProfile === null) throw new Error('no profile to adopt into')
+      return adoptPool({ profile_id: activeProfile, root_id: activeRoot, path, dry_run: true })
+    },
     onSuccess: setPreview,
   })
 
   const adopt = useMutation({
-    mutationFn: () =>
-      api.post<AdoptResponse>('/api/pool/adopt', { root_id: activeRoot, path }),
+    mutationFn: () => {
+      if (activeProfile === null) throw new Error('no profile to adopt into')
+      return adoptPool({ profile_id: activeProfile, root_id: activeRoot, path })
+    },
     onSuccess: (r) => {
       setPreview(null)
       setNotice(
@@ -91,14 +109,30 @@ export function Pool() {
           <button className="ghost" onClick={() => scan.mutate()} disabled={scan.isPending}>
             {scan.isPending ? 'Scanning…' : 'Rescan'}
           </button>
-          <button className="ghost" onClick={() => dryRun.mutate()} disabled={dryRun.isPending}>
+          <label className="row small">
+            Adopt into
+            <select
+              value={activeProfile ?? ''}
+              onChange={(e) => setProfileId(e.target.value)}
+              disabled={!profiles.data || profiles.data.length === 0}
+            >
+              {(profiles.data ?? []).map((p) => (
+                <option key={p.profile_id} value={p.profile_id}>{p.profile_id}</option>
+              ))}
+            </select>
+          </label>
+          <button
+            className="ghost"
+            onClick={() => dryRun.mutate()}
+            disabled={dryRun.isPending || activeProfile === null}
+          >
             Adopt this subtree…
           </button>
         </div>
       </div>
 
       {notice && <div className="banner">{notice}</div>}
-      <ErrorBanner error={scan.error ?? dryRun.error ?? adopt.error} />
+      <ErrorBanner error={profiles.error ?? scan.error ?? dryRun.error ?? adopt.error} />
 
       <div className="cards">
         <Card label="Torrents" value={count(o.torrents)} />
@@ -211,6 +245,7 @@ export function Pool() {
         <AdoptDialog
           preview={preview}
           path={path}
+          profileId={activeProfile ?? ''}
           busy={adopt.isPending}
           onCancel={() => setPreview(null)}
           onConfirm={() => adopt.mutate()}
@@ -226,12 +261,14 @@ export function Pool() {
 function AdoptDialog({
   preview,
   path,
+  profileId,
   busy,
   onCancel,
   onConfirm,
 }: {
   preview: AdoptResponse
   path: string
+  profileId: string
   busy: boolean
   onCancel: () => void
   onConfirm: () => void
@@ -240,7 +277,9 @@ function AdoptDialog({
     preview.fast_path.length === 0 && preview.queued_for_verification.length === 0
   return (
     <dialog open>
-      <h3 style={{ marginTop: 0 }}>Adopt {path ? <code>{path}</code> : 'the whole root'}</h3>
+      <h3 style={{ marginTop: 0 }}>
+        Adopt {path ? <code>{path}</code> : 'the whole root'} into <code>{profileId}</code>
+      </h3>
       <ul style={{ paddingLeft: 18, lineHeight: 1.8 }}>
         <li>
           <strong>{preview.fast_path.length}</strong> seed immediately — resume data says

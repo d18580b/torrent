@@ -1,10 +1,12 @@
 //! Startup orchestrator: build the engine(s), wire the alert loop, bind
 //! the HTTP server, install signal handlers, and run until shutdown.
 //!
-//! The single-session and multi-profile paths converge at the AlertSource
-//! trait — both produce an `Arc<dyn AlertSource>` that the rest of the
-//! daemon consumes uniformly.
+//! There is one path, not two: every profile becomes a session, and the set
+//! of them becomes one `Arc<dyn AlertSource>` that the rest of the daemon
+//! consumes uniformly. A deployment with a single profile is that set with
+//! n = 1.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -219,6 +221,51 @@ pub async fn boot(
         AssignmentRegistry::load_from(cfg.registry_path(), cfg.legacy_registry_path())
             .context("load assignment registry")?,
     );
+
+    // Reconcile it against the configured profiles before anything reads it.
+    //
+    // The migration above carries a pre-profiles registry over verbatim, which
+    // means it still names that deployment's ids — `default`, on the
+    // single-session layout this release replaces. Nothing reconciles those
+    // with the `[[profile]]` tables, and nothing prunes them, so an id with no
+    // table behind it strands every torrent it holds: the resume and torrent
+    // scans are partitioned per profile and never look at the old paths, so
+    // nothing loads; re-adding answers 409 because the registry says the
+    // info-hash is taken; and `DELETE` cannot clear it either. The daemon
+    // reports itself healthy the whole time.
+    //
+    // Refusing is not the gentlest outcome, but it is the honest one: a silent
+    // total outage that answers 200 on `/healthz` is worse than a daemon that
+    // says which ids it does not recognise and what to do about them. The
+    // check runs against the *configured* set rather than the profiles that
+    // came up — a profile that failed its tunnel is Safety Rule 1's business,
+    // not this one's.
+    {
+        let configured: HashSet<ProfileId> = cfg.profile.iter().map(|p| p.id.clone()).collect();
+        let unknown = registry.unknown_profiles(&configured);
+        if !unknown.is_empty() {
+            let named = unknown
+                .iter()
+                .map(|(id, n)| format!("{id} ({n} torrent(s))"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let known = cfg
+                .profile
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "the assignment registry at {registry_path} assigns torrents to profiles that no \
+                 [[profile]] table declares: {named}. Configured profiles: {known}. Those \
+                 torrents cannot be loaded, re-added or deleted while the mismatch stands. \
+                 Either give one of the configured profiles the id the registry names — the \
+                 upgrade path from the pre-profiles layout, where every entry says `default` — \
+                 or remove those entries from {registry_path} and re-add the torrents.",
+                registry_path = cfg.registry_path().display(),
+            );
+        }
+    }
 
     // Metrics sink — created early so the startup scans can record registry
     // rejections (profile_assignment_registry_errors_total).
@@ -477,9 +524,9 @@ pub async fn boot(
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
         for (ih, data) in entries {
-            // Cross-check the registry; the spec aborts the profile on mismatch.
-            // Single-session always uses ProfileId::DEFAULT, so the check
-            // mainly guards multi-profile mode.
+            // Cross-check the registry; the spec aborts the profile on
+            // mismatch. A resume file under one profile's directory that the
+            // registry assigns to another is the operator's to reconcile.
             if let Some(existing) = registry.lookup(&ih) {
                 if existing != profile {
                     warn!(
@@ -655,14 +702,16 @@ pub async fn boot(
         metrics_for_loop,
         clock,
     )
-    // `listen_failed` is fatal in single-session mode
-    // (nothing else is listening, so seeding just stops silently). In
-    // multi-profile mode the per-profile handler marks that profile failed and the
-    // remaining profiles carry on.
-    // A listen failure is fatal only where the daemon has one
-    // profile: with several, the others keep serving and the failure is
-    // reported per profile rather than taking everything down.
-    .fatal_listen_failure(cfg.profile.len() == 1)
+    // A listen failure is fatal only where it stops the daemon listening at
+    // all: with a second session still up, the others keep serving and the
+    // failure is reported per profile rather than taking everything down.
+    //
+    // Keyed on the sessions that actually came up, not on `cfg.profile.len()`.
+    // A daemon configured with two profiles but reduced to one by a bring-up
+    // failure has exactly the same exposure as one configured with one — and
+    // keying on the configured count treated that survivor's listen failure as
+    // non-fatal, leaving a daemon that is up, healthy and listening on nothing.
+    .fatal_listen_failure(profile_registry.iter().count() == 1)
     .on_fatal({
         let tx = shutdown_tx.clone();
         Arc::new(move |reason| {
@@ -814,6 +863,9 @@ impl DaemonHandle {
             }
         };
         info!(addr = %http_listen, "HTTP server listening");
+        if let Some(posture) = unauthenticated_posture(&cfg) {
+            warn!(target: "torrentd::auth", addr = %http_listen, "{posture}");
+        }
 
         // The unit is `Type=notify`: systemd holds it in `activating` until
         // READY=1, so this must come after the listener is actually bound.
@@ -996,4 +1048,70 @@ fn save_session_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
         }
     }
     Ok(())
+}
+
+/// What a daemon running without `[auth]` says about itself at boot.
+///
+/// `None` when `[auth]` is configured. Otherwise the operator opted into
+/// authenticating nothing — a legitimate posture behind a proxy that does its
+/// own access control, and one a running daemon stated nowhere: no boot line,
+/// no `/healthz` field, and an `sd_notify` status of "seeding; API on {addr}"
+/// either way. Somebody inheriting a host could not establish the posture from
+/// the journal, which is the first place they look.
+fn unauthenticated_posture(cfg: &Config) -> Option<String> {
+    if cfg.auth.is_some() {
+        return None;
+    }
+    Some(format!(
+        "running unauthenticated: allow_unauthenticated = true and no [auth] section, so \
+         every route on {} — including every mutating one — is open to anything that can \
+         reach it. Access control belongs to whatever sits in front of this daemon.",
+        cfg.http_listen,
+    ))
+}
+
+#[cfg(test)]
+mod posture_tests {
+    use super::*;
+
+    /// Top-level keys only. `[[profile]]` is a TOML table, so anything a test
+    /// appends has to land before it.
+    const TOP_LEVEL: &str = r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+"#;
+
+    const ONE_HOST_PROFILE: &str = r#"
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
+"#;
+
+    /// A config with `extra` appended to the top-level keys.
+    fn cfg_from(extra: &str) -> Config {
+        toml::from_str(&format!("{TOP_LEVEL}{extra}\n{ONE_HOST_PROFILE}")).expect("config parses")
+    }
+
+    #[test]
+    fn an_unauthenticated_daemon_says_so_and_names_its_bind() {
+        // The property: the posture is legible from the journal. A host
+        // inherited from someone else answers "does this authenticate?" with
+        // a log line, rather than with a config file the reader has to find
+        // and a default they have to know.
+        let line = unauthenticated_posture(&cfg_from("allow_unauthenticated = true"))
+            .expect("a daemon with no [auth] states its posture");
+        assert!(line.contains("unauthenticated"), "got: {line}");
+        assert!(line.contains("127.0.0.1:8080"), "it names the bind: {line}");
+    }
+
+    #[test]
+    fn a_daemon_with_auth_says_nothing() {
+        // A warning that fires either way is one nobody reads.
+        let hash = crate::auth::hash_password("hunter2").unwrap();
+        let cfg = cfg_from(&format!("[auth]\npassword_hash = \"{hash}\""));
+        assert_eq!(unauthenticated_posture(&cfg), None);
+    }
 }
