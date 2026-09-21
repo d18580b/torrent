@@ -25,9 +25,12 @@ use std::time::Instant;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::PasswordHasher;
 use argon2::password_hash::SaltString;
+use argon2::Algorithm;
 use argon2::Argon2;
+use argon2::Params;
 use argon2::PasswordHash;
 use argon2::PasswordVerifier;
+use argon2::Version;
 use parking_lot::Mutex;
 use rand::RngCore;
 use serde::Deserialize;
@@ -277,7 +280,9 @@ impl Auth {
         let Ok(parsed) = PasswordHash::new(&self.config.password_hash) else {
             return false;
         };
-        Argon2::default()
+        // The parameters come from the stored PHC string, not from here, so a
+        // hash produced at any other cost still verifies.
+        argon2id()
             .verify_password(candidate.as_bytes(), &parsed)
             .is_ok()
     }
@@ -313,10 +318,35 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Memory cost in KiB, iterations, and parallelism for Argon2id here.
+///
+/// Pinned rather than taken from `Argon2::default()`. These are OWASP's
+/// current recommendation for Argon2id and they are also what the `argon2`
+/// crate happens to default to at the version `Cargo.lock` holds — which is
+/// the problem: `README.md` quotes the numbers, so leaving them at a
+/// dependency's discretion made a documented security parameter true by
+/// coincidence, and a routine `cargo update` past a release that revised those
+/// defaults would move the cost of the credential KDF in either direction with
+/// nothing in this repository recording that it had.
+///
+/// Changing these does not invalidate existing credentials: a PHC string
+/// carries the parameters it was produced with, and `verify_password` uses
+/// those, not these.
+const ARGON2_M_COST_KIB: u32 = 19_456;
+const ARGON2_T_COST: u32 = 2;
+const ARGON2_P_COST: u32 = 1;
+
+/// The hasher this daemon hashes and verifies with, at the pinned cost.
+fn argon2id() -> Argon2<'static> {
+    let params = Params::new(ARGON2_M_COST_KIB, ARGON2_T_COST, ARGON2_P_COST, None)
+        .expect("pinned Argon2id parameters are in range");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
 /// Hash a password for the config file.
 pub fn hash_password(password: &str) -> anyhow::Result<String> {
     let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
+    argon2id()
         .hash_password(password.as_bytes(), &salt)
         .map(|h| h.to_string())
         .map_err(|e| anyhow::anyhow!("hash password: {e}"))
@@ -350,6 +380,43 @@ mod tests {
         assert!(!auth.verify_password("Correct horse"));
         assert!(!auth.verify_password(""));
         assert!(!auth.verify_password("correct horse "));
+    }
+
+    #[test]
+    fn the_hash_carries_the_cost_readme_quotes() {
+        // README.md's authentication section quotes `m=19456, t=2, p=1`. The
+        // numbers were the argon2 crate's defaults and appeared nowhere in
+        // this tree, so the documentation was true by coincidence of a
+        // dependency. They are pinned now, and this is what holds them to it.
+        let h = hash_password("correct horse").unwrap();
+        assert!(h.starts_with("$argon2id$v=19$m=19456,t=2,p=1$"), "got {h}",);
+        let parsed = PasswordHash::new(&h).unwrap();
+        let params = Params::try_from(&parsed).unwrap();
+        assert_eq!(params.m_cost(), ARGON2_M_COST_KIB);
+        assert_eq!(params.t_cost(), ARGON2_T_COST);
+        assert_eq!(params.p_cost(), ARGON2_P_COST);
+    }
+
+    #[test]
+    fn a_hash_made_at_another_cost_still_verifies() {
+        // The pin decides what new hashes cost; it must not invalidate a
+        // credential generated before it, or raising the cost later becomes a
+        // lockout rather than an upgrade.
+        let cheap = Argon2::new(
+            Algorithm::Argon2id,
+            Version::V0x13,
+            Params::new(8 * 1024, 1, 1, None).unwrap(),
+        );
+        let salt = SaltString::generate(&mut OsRng);
+        let h = cheap
+            .hash_password(b"correct horse", &salt)
+            .unwrap()
+            .to_string();
+        assert!(h.contains("m=8192,t=1,p=1"), "got {h}");
+
+        let auth = Auth::new(cfg(h));
+        assert!(auth.verify_password("correct horse"));
+        assert!(!auth.verify_password("wrong horse"));
     }
 
     #[test]
