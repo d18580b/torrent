@@ -105,6 +105,10 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # tracker DNS through the tunnel. Removed cleanly on SIGTERM.
 # network_kill_switch = false
 
+# A wireguard slot's vpn_profile must be /etc/wireguard/<vpn_interface>.conf
+# — wg-quick derives the interface from the file name on the way up and
+# resolves the name back to that directory on the way down, so anything
+# else brings up a tunnel that can never be torn down. Refused at startup.
 # [[slot]]
 # id                       = "account_a"
 # vpn_profile              = "/etc/wireguard/wg-acct-a.conf"

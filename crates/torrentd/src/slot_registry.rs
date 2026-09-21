@@ -119,7 +119,10 @@ pub(crate) fn test_entry(id: &str, status: SlotStatus) -> SlotEntry {
 
     let config = SlotConfig {
         id: SlotId::new(id),
-        vpn_profile: PathBuf::from(format!("/etc/wg/{id}.conf")),
+        vpn_profile: PathBuf::from(format!(
+            "{}/wg-{id}.conf",
+            torrentd_engine::SlotConfig::WG_CONFIG_DIR
+        )),
         vpn_type: VpnType::Wireguard,
         vpn_interface: format!("wg-{id}"),
         listen_port: Some(6881),

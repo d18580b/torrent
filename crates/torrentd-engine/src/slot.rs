@@ -190,6 +190,13 @@ impl SlotConfig {
     /// gateway. Only meaningful when `port_forward == Natpmp`.
     pub const DEFAULT_NATPMP_GATEWAY: &'static str = "10.2.0.1";
 
+    /// The only directory a WireGuard `vpn_profile` may live in.
+    ///
+    /// `wg-quick`'s own default, and the only one it will resolve a bare
+    /// interface name against at teardown. torrentd never sets
+    /// `WG_CONFIG_DIR`, so this is not configurable here either.
+    pub const WG_CONFIG_DIR: &'static str = "/etc/wireguard";
+
     pub fn port_forward_gateway_or_default(&self) -> &str {
         self.port_forward_gateway
             .as_deref()
@@ -238,14 +245,17 @@ pub enum SlotConfigError {
     )]
     ReservedId(String),
     #[error(
-        "slot {slot:?}: vpn_interface {iface:?} must equal the file stem of vpn_profile \
-         ({profile:?}); wg-quick derives the interface name from the file name, so these \
-         cannot differ"
+        "slot {slot:?}: a wireguard vpn_profile must be {dir}/{iface}.conf, not {profile:?}. \
+         `wg-quick up <path>` names the interface after the file, and `wg-quick down <iface>` \
+         resolves that bare name only against {dir} (or $WG_CONFIG_DIR, which torrentd does \
+         not set) — so a profile under any other name, or in any other directory, brings up a \
+         tunnel that can never be torn down"
     )]
     InterfaceProfileMismatch {
         slot: String,
         iface: String,
         profile: String,
+        dir: &'static str,
     },
 }
 
@@ -309,22 +319,33 @@ impl SlotConfig {
                 return Err(SlotConfigError::DuplicateInterface(s.vpn_interface.clone()));
             }
             // `wg-quick up <path>` names the interface after the file, and
-            // `wg-quick down <iface>` looks the file back up from the name.
-            // A slot whose two fields disagree therefore brings a tunnel up
-            // under one name, waits 30s for an address on another, fails, and
-            // — if it ever did come up — could never be torn down. Refuse the
-            // config instead of discovering it at the timeout.
+            // `wg-quick down <iface>` looks the file back up from the name —
+            // resolving a bare name *only* against `WG_CONFIG_DIR`, default
+            // `/etc/wireguard`. A slot whose two fields disagree therefore
+            // brings a tunnel up under one name, waits 30s for an address on
+            // another, fails, and — if it ever did come up — could never be
+            // torn down. So does a slot whose profile lives anywhere else,
+            // even with a matching stem: `wg-quick down` dies looking for the
+            // file before it ever reaches `del_if`, and that surviving tunnel
+            // is the headline defect this validation exists to make
+            // unreachable. `bring_down` is handed only the interface name
+            // (`VpnManager::bring_down(&self, iface: &str)`), so the
+            // directory has to be pinned here rather than threaded through.
+            // Refuse the config instead of discovering it at the timeout.
             if s.vpn_type == VpnType::Wireguard {
                 let stem = s
                     .vpn_profile
                     .file_stem()
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                if stem != s.vpn_interface {
+                let dir = s.vpn_profile.parent();
+                if stem != s.vpn_interface || dir != Some(std::path::Path::new(Self::WG_CONFIG_DIR))
+                {
                     return Err(SlotConfigError::InterfaceProfileMismatch {
                         slot: s.id.as_str().to_string(),
                         iface: s.vpn_interface.clone(),
                         profile: s.vpn_profile.display().to_string(),
+                        dir: Self::WG_CONFIG_DIR,
                     });
                 }
             }
@@ -400,7 +421,7 @@ mod tests {
     fn cfg(id: &str, port: u16, iface: &str, fp: &str, ua: &str) -> SlotConfig {
         SlotConfig {
             id: SlotId::new(id),
-            vpn_profile: PathBuf::from(format!("/etc/wg/{iface}.conf")),
+            vpn_profile: PathBuf::from(format!("{}/{iface}.conf", SlotConfig::WG_CONFIG_DIR)),
             vpn_type: VpnType::Wireguard,
             vpn_interface: iface.to_string(),
             listen_port: Some(port),
@@ -419,6 +440,34 @@ mod tests {
     fn wireguard_interface_must_match_its_profile_file() {
         let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
         s.vpn_profile = PathBuf::from("/etc/wireguard/something-else.conf");
+        assert!(matches!(
+            SlotConfig::validate_set(&[s]),
+            Err(SlotConfigError::InterfaceProfileMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wireguard_profile_outside_etc_wireguard_is_refused() {
+        // The stem matches here; only the directory does not. `wg-quick up`
+        // takes the full path and brings the tunnel up regardless, but
+        // `wg-quick down wg-a` resolves the bare name against /etc/wireguard,
+        // finds nothing, and dies before `del_if` — so the tunnel survives
+        // graceful shutdown and every restart, which is the very defect the
+        // rest of this change exists to fix.
+        let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+        s.vpn_profile = PathBuf::from("/etc/torrentd/wg-a.conf");
+        assert!(matches!(
+            SlotConfig::validate_set(&[s]),
+            Err(SlotConfigError::InterfaceProfileMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wireguard_profile_with_no_parent_directory_is_refused() {
+        // `file_stem()` alone accepts a bare relative name; `wg-quick down`
+        // still has only /etc/wireguard to look in.
+        let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+        s.vpn_profile = PathBuf::from("wg-a.conf");
         assert!(matches!(
             SlotConfig::validate_set(&[s]),
             Err(SlotConfigError::InterfaceProfileMismatch { .. })
