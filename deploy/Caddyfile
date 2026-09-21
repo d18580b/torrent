@@ -13,11 +13,18 @@
 torrentd.example.com {
 	encode zstd gzip
 
-	# The headers torrentd reads, and the only two it needs. It reads them
+	# The headers torrentd reads: X-Forwarded-For, X-Forwarded-Proto and
+	# RFC 7239 Forwarded. All three, which is why there are three
+	# `header_up` lines below and not two. It reads them
 	# **only** from a peer listed in `trusted_proxies`, so set that to this
 	# container's address on the compose network — 172.28.0.2, which
 	# `deploy/compose.yaml` pins so there is a fixed address to name. Get it
 	# wrong and they are ignored and the daemon falls back to the socket peer.
+	#
+	# Adapting this to nginx or Traefik means carrying all three across.
+	# Setting only the two `X-` names leaves `Forwarded` a client-controlled
+	# input arriving from a peer this daemon believes, and where an `X-` name
+	# is absent the client's `Forwarded` is what the daemon reads.
 	reverse_proxy torrentd:8080 {
 		header_up X-Forwarded-For {remote_host}
 		header_up X-Forwarded-Proto {scheme}
