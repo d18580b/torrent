@@ -211,20 +211,7 @@ dht               = true
 # Authentication — required, one way or the other
 # ---------------------------------------------------------------------------
 # The daemon refuses to start unless you have either configured `[auth]` or
-# written `allow_unauthenticated = true
-
-# Peers whose X-Forwarded-For / X-Forwarded-Proto headers are believed, as IPs
-# or CIDR blocks. Empty by default, which means no forwarding header is ever
-# read and the socket's peer address is the client.
-#
-# Set this to the address your reverse proxy connects from, and only that:
-# anything listed here can claim to be any client. Two things use it — the
-# login throttle, which becomes per-client instead of one shared bucket, and
-# the `Secure` attribute on the session cookie, which is set when the original
-# request was over TLS.
-#
-# torrentd never terminates TLS itself. See deploy/Caddyfile.
-# trusted_proxies = ["172.16.0.0/12"]`. Without `[auth]` it authenticates
+# written `allow_unauthenticated = true`. Without `[auth]` it authenticates
 # nothing: every route, including every mutating one, is open to anyone who can
 # reach the port. That is a legitimate posture behind a reverse proxy that does
 # its own access control — but not one to arrive at by omission, which is what
