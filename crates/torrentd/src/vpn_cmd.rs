@@ -789,6 +789,12 @@ fn egress_probe(src: IpAddr, dest: SocketAddr) -> Check {
     }
 }
 
+/// Check one **vpn** profile.
+///
+/// The three assertions below hold because [`profile_reports`] filters the
+/// selection on [`ProfileConfig::is_vpn`] and routes a host profile to
+/// [`no_tunnel_report`] instead. They were reachable before that filter
+/// existed.
 fn profile_checks(
     cfg: &Config,
     profile: &ProfileConfig,
@@ -802,7 +808,9 @@ fn profile_checks(
         .expect("only vpn profiles reach profile_checks");
     let vpn_config = match &profile.network {
         torrentd_engine::ProfileNetwork::Vpn { vpn_config, .. } => vpn_config.clone(),
-        torrentd_engine::ProfileNetwork::Host { .. } => unreachable!("filtered above"),
+        torrentd_engine::ProfileNetwork::Host { .. } => {
+            unreachable!("filtered by profile_reports")
+        }
     };
     let vpn_type = profile
         .vpn_type()
@@ -1107,18 +1115,29 @@ fn vpn_type_str(t: VpnType) -> &'static str {
     }
 }
 
-/// Run the checks, print them, and return the exit status they imply — `0`
-/// clean, `1` for any failure, `2` for "nothing failed, but something could not
-/// be checked". Usable as a pre-flight step in a unit or a CI job, which is why
-/// `2` exists: those consumers read the status and not the report.
-pub fn check(
+/// Select the profiles `only` names and report on each.
+///
+/// A profile with no tunnel gets a `skip` line rather than being dropped or
+/// being handed to [`profile_checks`]. Dropping it would make a bare
+/// `vpn check` on a host-only deployment print nothing and exit 0, which reads
+/// as "checked, all clear" on a machine that has no tunnel at all —
+/// `README.md` and `cli.rs` both document the bare invocation as every
+/// configured profile. Handing it over is what the command did before: the
+/// selection filtered on id alone, so `profile_checks`'s
+/// `expect("only vpn profiles reach profile_checks")` was reachable from the
+/// shipped sample config, and a documented pre-flight exited 101 — outside the
+/// 0/1/2 contract `cli.rs` publishes. The `skip` follows the precedent the
+/// `--egress` check already sets: report that it did not apply, and do not
+/// colour the exit status.
+///
+/// Split out of [`check`] so the selection is reachable without a real host.
+fn profile_reports(
     cfg: &Config,
     only: Option<&str>,
-    json: bool,
     bring_up: bool,
     egress: Option<SocketAddr>,
-    as_uid: Option<u32>,
-) -> anyhow::Result<i32> {
+    host: &dyn CheckHost,
+) -> anyhow::Result<Vec<ProfileReport>> {
     if cfg.profile.is_empty() {
         anyhow::bail!(
             "no [[profile]] entries are configured, so there is no VPN to check. \
@@ -1135,13 +1154,50 @@ pub fn check(
         anyhow::bail!("no profile matches {:?}", only.unwrap_or_default());
     }
 
+    Ok(selected
+        .into_iter()
+        .map(|s| {
+            if s.is_vpn() {
+                profile_checks(cfg, s, bring_up, egress, host)
+            } else {
+                no_tunnel_report(s)
+            }
+        })
+        .collect())
+}
+
+/// The report for a profile that has no tunnel to check.
+fn no_tunnel_report(profile: &ProfileConfig) -> ProfileReport {
+    ProfileReport {
+        profile_id: profile.id.as_str().to_string(),
+        vpn_type: "none",
+        checks: vec![Check::skip(
+            "tunnel",
+            format!(
+                "profile {:?} is network = \"host\" and reaches the network over the \
+                 machine's own interfaces, so it has no tunnel to check",
+                profile.id.as_str(),
+            ),
+        )],
+    }
+}
+
+/// Run the checks, print them, and return the exit status they imply — `0`
+/// clean, `1` for any failure, `2` for "nothing failed, but something could not
+/// be checked". Usable as a pre-flight step in a unit or a CI job, which is why
+/// `2` exists: those consumers read the status and not the report.
+pub fn check(
+    cfg: &Config,
+    only: Option<&str>,
+    json: bool,
+    bring_up: bool,
+    egress: Option<SocketAddr>,
+    as_uid: Option<u32>,
+) -> anyhow::Result<i32> {
     let host = RealHost;
     let report = Report {
         host: host_checks(cfg, as_uid),
-        profiles: selected
-            .into_iter()
-            .map(|s| profile_checks(cfg, s, bring_up, egress, &host))
-            .collect(),
+        profiles: profile_reports(cfg, only, bring_up, egress, &host)?,
     };
 
     if json {
@@ -1398,8 +1454,126 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
         .expect("test config parses")
     }
 
+    /// A config holding whatever `tables` spells out.
+    ///
+    /// [`cfg_with_profile`] interpolates its argument *inside* the one
+    /// `[[profile]]` table it builds, so it can express neither a second
+    /// profile nor a host profile — which is why a 41-test suite was green
+    /// while the binary panicked on the shipped sample, and the sample ships
+    /// exactly one profile, `network = "host"`.
+    fn cfg_with_tables(tables: &str) -> Config {
+        toml::from_str(&format!(
+            r#"
+default_save_path = "/tmp/torrentd-test/data"
+resume_dir = "/tmp/torrentd-test/state/resume"
+torrent_dir = "/tmp/torrentd-test/torrents"
+http_listen = "127.0.0.1:8080"
+{tables}
+"#
+        ))
+        .expect("test config parses")
+    }
+
+    /// The shipped sample's shape: one profile, `network = "host"`.
+    const HOST_TABLE: &str = r#"
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6882,[::]:6882"
+"#;
+
+    const VPN_TABLE: &str = r#"
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg-acct-a.conf"
+vpn_interface        = "wg-acct-a"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+"#;
+
     fn find<'a>(checks: &'a [Check], name: &str) -> Option<&'a Check> {
         checks.iter().find(|c| c.name == name)
+    }
+
+    #[test]
+    fn a_host_profile_is_skipped_rather_than_handed_to_profile_checks() {
+        // F14. `check()` filtered the selection by id alone and mapped
+        // `profile_checks` over every survivor, and `profile_checks` opens
+        // with `.expect("only vpn profiles reach profile_checks")`. On the
+        // shipped sample — one `network = "host"` profile — the documented
+        // bare invocation panicked and exited 101, outside the 0/1/2 contract
+        // `cli.rs` publishes.
+        let cfg = cfg_with_tables(HOST_TABLE);
+        let host = FakeHost::new();
+
+        let reports = profile_reports(&cfg, None, false, None, &host)
+            .expect("a host-only config is a legal config to check");
+
+        assert_eq!(reports.len(), 1, "the profile is reported, not dropped");
+        assert_eq!(reports[0].profile_id, "public");
+        assert_eq!(reports[0].vpn_type, "none");
+        let tunnel = find(&reports[0].checks, "tunnel")
+            .expect("a host profile still gets a line, or the run reads as `checked, all clear`");
+        assert_eq!(tunnel.verdict, Verdict::Skip, "detail: {}", tunnel.detail);
+        assert!(
+            tunnel.detail.contains("public") && tunnel.detail.contains("no tunnel"),
+            "the operator has to be told why it was skipped: {}",
+            tunnel.detail,
+        );
+
+        // A `skip` does not colour the status: the command exits 0 rather
+        // than 101.
+        let report = Report {
+            host: Vec::new(),
+            profiles: reports,
+        };
+        assert_eq!(report.exit_code(), EXIT_OK);
+        assert!(!report.incomplete(), "a skip is not an unknown");
+    }
+
+    #[test]
+    fn scoping_to_a_host_profile_by_id_is_skipped_too() {
+        // `--profile public` on a mixed config. The id filter is what used to
+        // select the panicking profile on its own.
+        let cfg = cfg_with_tables(&format!("{VPN_TABLE}{HOST_TABLE}"));
+        let host = FakeHost::new();
+
+        let reports = profile_reports(&cfg, Some("public"), false, None, &host)
+            .expect("naming a host profile is not a usage error");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].profile_id, "public");
+        assert_eq!(
+            find(&reports[0].checks, "tunnel").unwrap().verdict,
+            Verdict::Skip
+        );
+    }
+
+    #[test]
+    fn a_mixed_config_checks_the_tunnel_and_skips_the_host() {
+        // The bare invocation on a config that has both. Every profile is
+        // reported, in configured order, and only the tunnelled one is
+        // actually probed.
+        let cfg = cfg_with_tables(&format!("{VPN_TABLE}{HOST_TABLE}"));
+        let host = FakeHost::new()
+            .with_existing("wg-acct-a")
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+
+        let reports = profile_reports(&cfg, None, false, None, &host)
+            .expect("a mixed config is legal and --check-config calls it OK");
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].profile_id, "acct_a");
+        assert!(
+            find(&reports[0].checks, "tunnel_ip").is_some(),
+            "the vpn profile is still fully checked",
+        );
+        assert_eq!(reports[1].profile_id, "public");
+        assert_eq!(reports[1].checks.len(), 1, "a host profile gets one line");
+        assert_eq!(reports[1].checks[0].verdict, Verdict::Skip);
     }
 
     #[test]
