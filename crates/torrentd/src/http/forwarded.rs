@@ -1,8 +1,10 @@
 //! Resolving the real client behind a reverse proxy.
 //!
 //! The daemon does not terminate TLS and is expected to sit behind a proxy, so
-//! the socket's peer address is usually the proxy's. Two things need the real
-//! client: the login throttle, and the log line that records a failed attempt.
+//! the socket's peer address is usually the proxy's. Three things need the
+//! real client: the login throttle, the `Secure` attribute on the session
+//! cookie, and the `client_ip` field on the log line that records a failed
+//! attempt.
 //!
 //! Neither could have it before. `axum::serve` was called without
 //! `into_make_service_with_connect_info`, so no handler could see even the
