@@ -85,12 +85,22 @@ services:
 # fixed address and compose will not hand out a stable one otherwise. Change
 # the subnet if 172.28.0.0/24 collides with something on your host, and change
 # `proxy`'s address and torrentd.toml's `trusted_proxies` with it.
+#
+# `ip_range` is what keeps the pin usable. Dynamic allocation hands out the
+# lowest free address in the pool, and `torrentd` is unpinned on this network
+# and created *first* — `proxy` declares `depends_on: [torrentd]` — so without
+# a confined range it takes 172.28.0.2 before `proxy` asks for it and the
+# stack fails to come up with that address already in use. So the bottom half
+# is reserved and nothing dynamic lands in it: .1 is the gateway, .2 is
+# `proxy`, .3-.127 are spare for anything else this file pins by hand, and
+# every unpinned service is allocated from 172.28.0.128/25.
 networks:
   front:
     driver: bridge
     ipam:
       config:
         - subnet: 172.28.0.0/24
+          ip_range: 172.28.0.128/25
 
 volumes:
   torrentd-resume:
