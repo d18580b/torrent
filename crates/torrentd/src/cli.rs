@@ -36,6 +36,11 @@ pub enum Command {
     },
     /// Hash a password for the `[auth] password_hash` config key.
     HashPassword,
+    /// Verify VPN configuration against the real host, without seeding.
+    Vpn {
+        #[command(subcommand)]
+        cmd: VpnCmd,
+    },
     /// Generate an API token and the hash to record in the config.
     NewToken {
         /// Label for the token, so a leaked one is identifiable from logs.
@@ -44,6 +49,36 @@ pub enum Command {
         /// One or more of: read, write, metrics.
         #[arg(long, value_delimiter = ',', default_value = "read")]
         scopes: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VpnCmd {
+    /// Run every VPN pre-flight check the daemon would depend on, and report
+    /// each one separately.
+    ///
+    /// Observe-only unless `--bring-up` is given: it reads interfaces and `wg`
+    /// state, and a NAT-PMP slot's mapping is released as soon as it is
+    /// negotiated. No libtorrent session is constructed and no tracker is
+    /// contacted, so this is safe to run against real credentials on a host
+    /// that has never seeded anything.
+    Check {
+        /// Check only this slot. Default: every configured slot.
+        #[arg(long, value_name = "ID")]
+        slot: Option<String>,
+        /// Emit the report as JSON.
+        #[arg(long)]
+        json: bool,
+        /// Raise each tunnel before checking it and lower it afterwards. This
+        /// is the only option here that modifies the host.
+        #[arg(long)]
+        bring_up: bool,
+        /// Prove the tunnel carries traffic: send a DNS query from a socket
+        /// bound to the tunnel address and require a reply, e.g. `1.1.1.1:53`.
+        /// Without this the check confirms the tunnel has an address, not that
+        /// anything can leave through it.
+        #[arg(long, value_name = "IP:PORT")]
+        egress: Option<std::net::SocketAddr>,
     },
 }
 

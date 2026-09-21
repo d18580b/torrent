@@ -57,6 +57,16 @@ run = [
   "npm run screenshot",
 ]
 
+# Live verification against real VPN credentials. Deliberately separate from
+# every `test` task: it needs a real host with real tunnels, it is the one
+# check here that can touch the network, and it is meaningless in CI.
+#
+#   mise run vpn-check /etc/torrentd/torrentd.toml
+#   mise run vpn-check /etc/torrentd/torrentd.toml -- --bring-up --json
+[tasks.vpn-check]
+description = "Verify a real VPN configuration, with no torrents involved"
+run = 'cargo run --quiet -p torrentd -- --config "{{arg(name="config")}}" vpn check'
+
 [tasks.check]
 description = "Formatting + clippy"
 depends = ["fmt", "lint"]
