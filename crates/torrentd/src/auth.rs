@@ -260,15 +260,28 @@ impl LoginThrottle {
     }
 
     /// How long `client` must wait, or `None` if an attempt is allowed.
+    ///
+    /// The read path has to mirror the write path exactly. `note_failure`
+    /// routes an identified client with no bucket of its own to the global
+    /// bucket once the map is full, so this consults the global bucket in the
+    /// same case. Returning `None` there instead would mean that filling the
+    /// map — 1024 requests from 1024 addresses, which one routed IPv6 /64
+    /// supplies — leaves every address after it permanently unthrottled, and
+    /// an unthrottled login route is a free CPU-exhaustion lever for an
+    /// unauthenticated caller.
     pub fn retry_after(&self, client: Option<IpAddr>) -> Option<Duration> {
-        match client {
-            None => self.global.lock().retry_after(),
-            Some(ip) => self
-                .per_client
-                .lock()
-                .get_mut(&ip)
-                .and_then(ThrottleState::retry_after),
+        let Some(ip) = client else {
+            return self.global.lock().retry_after();
+        };
+        let mut g = self.per_client.lock();
+        if let Some(state) = g.get_mut(&ip) {
+            return state.retry_after();
         }
+        if g.len() >= MAX_TRACKED_CLIENTS {
+            drop(g);
+            return self.global.lock().retry_after();
+        }
+        None
     }
 
     /// Record a failed attempt, locking out once the burst is spent.
@@ -591,6 +604,40 @@ mod tests {
         assert!(
             t.per_client.lock().len() <= MAX_TRACKED_CLIENTS,
             "tracked clients must stay bounded",
+        );
+    }
+
+    #[test]
+    fn a_rotating_client_is_still_throttled_once_the_map_is_full() {
+        // The property that matters is not that the map stayed small, it is
+        // that filling the map is not a way to stop being throttled. Once it
+        // is full `note_failure` routes an unknown client's failures to the
+        // global bucket, so `retry_after` has to read that same bucket for the
+        // same client — otherwise 1024 addresses buy every address after them
+        // unlimited Argon2id verifications and unlimited password guessing.
+        let t = LoginThrottle::new();
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        assert_eq!(
+            t.per_client.lock().len(),
+            MAX_TRACKED_CLIENTS,
+            "the map has to be full for this test to be testing anything",
+        );
+
+        // Addresses the map has never seen, arriving one apiece — the shape of
+        // the attack, where rotating means never revisiting a key.
+        let fresh = |n: u32| Some(IpAddr::V4(std::net::Ipv4Addr::from(0xc000_0000 + n)));
+        for n in 0..5 {
+            assert!(
+                t.retry_after(fresh(n)).is_none(),
+                "the first burst is still allowed",
+            );
+            t.note_failure(fresh(n));
+        }
+        assert!(
+            t.retry_after(fresh(99)).is_some(),
+            "a rotating client must still be throttled once the map is full",
         );
     }
 
