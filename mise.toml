@@ -121,6 +121,12 @@ arg "<flags>" var=#true required=#false help="Flags for `vpn check`, e.g. --brin
 '''
 run = 'cargo run --quiet -p torrentd -- --config "$usage_config" vpn check $usage_flags'
 
+# `depends` here, not the sequential `run` list `test-all` uses: mise schedules
+# these two in parallel and that is safe, which is the boundary between the two
+# forms. `fmt` is `cargo fmt --check` and never touches `target/`, so `lint` is
+# the only member taking cargo's build-directory lock and has nothing to
+# contend with; and neither task carries a wall-clock deadline. A composed task
+# whose members share `target/` or race a timeout gets an ordered `run` list.
 [tasks.check]
 description = "Formatting + clippy"
 depends = ["fmt", "lint"]
