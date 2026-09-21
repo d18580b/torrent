@@ -361,6 +361,46 @@ impl PoolStore {
         Ok(())
     }
 
+    /// Whether this file is the one `b28a778` wrote: v3's schema under v2's
+    /// version.
+    ///
+    /// **This does not reopen the decision that the migration is keyed on
+    /// `user_version`.** That decision rejected keying the *migration* on
+    /// `PRAGMA table_info` — probing for the old column and renaming where it
+    /// is present — because a schema that inspects itself has two sources of
+    /// truth about its own shape. Nothing here keys a migration on anything:
+    /// the steps below are unchanged and still run off `found`. This is a
+    /// one-shot repair of one file that a superseded build of this very branch
+    /// wrote with a version its schema does not match, and the transaction
+    /// around `migrate` means no build after it can produce another.
+    ///
+    /// Bounded to that one shape deliberately: `user_version = 2`, a `profile`
+    /// column, and **no** `slot` column. A file with both, or with neither, is
+    /// not this one and goes down the ordinary path. A genuine v2 file has
+    /// `slot` and no `profile`, so it cannot match.
+    ///
+    /// The alternative was to tell the operator this file cannot be migrated
+    /// and must be deleted. That is honest and it destroys the `plan` /
+    /// `plan_step` journal `from_conn` documents as not reconstructible by
+    /// rescanning — the one thing in the file worth protecting. The copy-aside
+    /// does not help either: it is a `VACUUM INTO` of the already-broken
+    /// database, so the rollback the upgrade note describes restores the same
+    /// unopenable file.
+    fn is_b28a778_shape(&self) -> Result<bool, PoolError> {
+        let mut has_profile = false;
+        let mut has_slot = false;
+        let mut stmt = self.conn.prepare("PRAGMA table_info(torrent)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            match r.get::<_, String>(1)?.as_str() {
+                "profile" => has_profile = true,
+                "slot" => has_slot = true,
+                _ => {}
+            }
+        }
+        Ok(has_profile && !has_slot)
+    }
+
     /// Walk the schema forward from whatever the file reports.
     ///
     /// Every step and the `user_version` write go inside **one**
@@ -374,11 +414,8 @@ impl PoolStore {
     /// `Restart=on-failure`. `PRAGMA user_version` is journaled and
     /// participates in the transaction.
     ///
-    /// The backup this takes first is for the state the transaction cannot
-    /// help with: a file written by an earlier build of this branch, which
-    /// folded the rename into v1 and so produced a `user_version = 2` file
-    /// that already carries `profile`. v3 cannot apply to it and nothing can
-    /// make it, so the answer is that the operator keeps the journal.
+    /// One shape is recognised rather than stepped: see
+    /// [`PoolStore::is_b28a778_shape`].
     fn migrate(&self) -> Result<(), PoolError> {
         let found: i64 = self
             .conn
@@ -390,6 +427,22 @@ impl PoolStore {
             });
         }
         if found == SCHEMA_VERSION {
+            return Ok(());
+        }
+        // The one file no version-keyed step can reach. Stamped, not stepped,
+        // and before the backup: there is nothing destructive to copy aside
+        // when the only write is a `PRAGMA`.
+        if found == 2 && self.is_b28a778_shape()? {
+            self.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            warn!(
+                target: "torrentd_pool::store",
+                from_version = found,
+                to_version = SCHEMA_VERSION,
+                "pool index already carries the v3 schema at user_version = 2; stamping the \
+                 version to match. This file was written by a superseded build of this change \
+                 that folded the rename into v1. No schema change was made and no data moved",
+            );
             return Ok(());
         }
         // Outside the transaction: VACUUM cannot run inside one. Only for a
