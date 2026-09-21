@@ -153,9 +153,26 @@ pub struct Client {
     pub secure: bool,
 }
 
-/// The last element of `name`'s value, across every field line it arrived on.
+/// What reading a forwarding header yielded.
 ///
-/// Two rules, and they are the same rule at two levels.
+/// The two questions are separate and must stay separate. *Was the name
+/// there at all* decides which source `resolve` consults; *did it carry a
+/// readable element* decides what that source says. Collapsing them into one
+/// `Option` — the obvious shape — makes a header the proxy wrote but that
+/// carries nothing readable indistinguishable from a header the proxy never
+/// wrote, and those two have opposite safe answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeaderRead<'a> {
+    /// Whether any field line carried this name, readable or not.
+    present: bool,
+    /// The last readable element across every field line, if there was one.
+    last: Option<&'a str>,
+}
+
+/// The last element of `name`'s value, across every field line it arrived on,
+/// and whether the name was present at all.
+///
+/// Two rules for the element, and they are the same rule at two levels.
 ///
 /// A forwarding header is a chain appended to by each hop, so the entry the
 /// *trusted* proxy added is the last one, not the first. Taking the first —
@@ -169,15 +186,24 @@ pub struct Client {
 /// line — hands the choice straight back to the client, which is the same
 /// defect one level up. Joining every line in order and taking the last
 /// element makes the proxy's field-line style stop mattering.
-fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> Option<&'a str> {
-    req.headers()
-        .get_all(name)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .next_back()
+///
+/// `present` is reported separately because empty segments and non-UTF-8
+/// bytes are filtered out on the way to `last`. A header that is present and
+/// yields nothing — `X-Forwarded-For:`, `X-Forwarded-For: , `, or a value
+/// that is not UTF-8 — is still a header the trusted proxy wrote, and
+/// `resolve` must not treat it as one the proxy omitted.
+fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> HeaderRead<'a> {
+    let values = req.headers().get_all(name);
+    HeaderRead {
+        present: values.iter().next().is_some(),
+        last: values
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .next_back(),
+    }
 }
 
 /// The value of `key` in one RFC 7239 element, e.g. `proto` in
@@ -249,29 +275,48 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     // where that path is the only reachable one, and the address ends up in
     // the throttle key and in `client_ip` on the failed-login line.
     //
+    // Unreadable means *anything* the grammar cannot use, and which arm runs
+    // is decided by `present` rather than by whether an element came back. A
+    // value that does not parse, a value that is empty, a value that is only
+    // separators, and a value that is not UTF-8 are one case: the proxy wrote
+    // the header, so the peer stands. Deciding on the element instead splits
+    // that case in two, and the half that reaches `Forwarded` takes the
+    // client's word for the client's address.
+    //
     // Both arms go through `node_addr`, so they parse one grammar: the bare
     // address, `host:port`, and a bracketed IPv6 literal are read the same on
     // either. Otherwise the *stricter* parser is the one that falls through
     // to the *less* trustworthy source, which is how the asymmetry bit.
-    let ip = match last_element(req, "x-forwarded-for") {
-        Some(xff) => node_addr(xff).or(Some(peer)),
-        None => forwarded
+    let xff = last_element(req, "x-forwarded-for");
+    let ip = if xff.present {
+        xff.last.and_then(node_addr).or(Some(peer))
+    } else {
+        forwarded
+            .last
             .and_then(|f| param(f, "for"))
             .and_then(node_addr)
-            .or(Some(peer)),
+            .or(Some(peer))
     };
 
-    // The same precedence, for the scheme. An `||` across the two headers
-    // lets a client-supplied `proto=https` override the trusted proxy's
-    // explicit `X-Forwarded-Proto: http`, which issues the session cookie
-    // `Secure` over a plain-HTTP request: the browser then neither stores nor
-    // returns it over http:// and the operator cannot log in at all. One
-    // function must not carry two opposite rules.
-    let secure = match last_element(req, "x-forwarded-proto") {
-        Some(proto) => proto.eq_ignore_ascii_case("https"),
-        None => forwarded
+    // The same precedence, and the same presence rule, for the scheme. An
+    // `||` across the two headers lets a client-supplied `proto=https`
+    // override the trusted proxy's explicit `X-Forwarded-Proto: http`, which
+    // issues the session cookie `Secure` over a plain-HTTP request: the
+    // browser then neither stores nor returns it over http:// and the
+    // operator cannot log in at all. One function must not carry two opposite
+    // rules.
+    //
+    // Where `X-Forwarded-Proto` is present and unreadable the answer is
+    // `false`, not `Forwarded`'s. `false` is the safe direction here — it
+    // only ever withholds `Secure`, and the operator can still log in.
+    let xfp = last_element(req, "x-forwarded-proto");
+    let secure = if xfp.present {
+        xfp.last.is_some_and(|p| p.eq_ignore_ascii_case("https"))
+    } else {
+        forwarded
+            .last
             .and_then(|f| param(f, "proto"))
-            .is_some_and(|p| p.eq_ignore_ascii_case("https")),
+            .is_some_and(|p| p.eq_ignore_ascii_case("https"))
     };
 
     Client { ip, secure }
@@ -537,6 +582,93 @@ mod tests {
             Some("10.1.2.3".parse().unwrap()),
             "an unreadable X-Forwarded-For stands the peer up; `Forwarded` is \
              not a second opinion on a header the proxy did write",
+        );
+    }
+
+    #[test]
+    fn a_present_but_empty_x_forwarded_for_stands_the_peer_up_too() {
+        // "Unreadable" is decided on the header's *presence*, not on whether
+        // an element survived parsing. Emptiness, separators-only and
+        // non-UTF-8 bytes are all values the trusted proxy wrote, so each
+        // stands the socket peer up exactly as an unparseable one does.
+        //
+        // Deciding on the surviving element instead splits the unreadable
+        // case in two and sends half of it to `Forwarded` — the one header
+        // the proxy did not write — which hands the client address, the
+        // throttle key and the `client_ip` on the failed-login line to
+        // whoever sent it.
+        let attacker = ("forwarded", "for=203.0.113.98");
+        let peer = Some("10.1.2.3".parse().unwrap());
+
+        for empty in ["", "  ", ",", " ,  , "] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-for", empty), attacker]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert_eq!(
+                c.ip, peer,
+                "X-Forwarded-For: {empty:?} is present and carries nothing \
+                 readable, so the peer stands rather than the client's \
+                 `Forwarded`",
+            );
+        }
+
+        // Non-UTF-8 is the same case. `to_str` fails, no element survives,
+        // and the name was still present.
+        let mut r = Request::new(());
+        r.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "10.1.2.3".parse().unwrap(),
+            12345,
+        )));
+        r.headers_mut().insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        r.headers_mut()
+            .insert("forwarded", HeaderValue::from_static("for=203.0.113.98"));
+        assert_eq!(
+            resolve(&r, &trusted(&["10.0.0.0/8"])).ip,
+            peer,
+            "a non-UTF-8 X-Forwarded-For is unreadable, not absent",
+        );
+    }
+
+    #[test]
+    fn a_present_but_empty_x_forwarded_proto_does_not_let_forwarded_decide() {
+        // The scheme arm, at the same spelling. `X-Forwarded-Proto` decides
+        // wherever it is *present*; present and unreadable means `false`,
+        // which only ever withholds `Secure`. Letting the client's
+        // `Forwarded: proto=https` decide instead issues a `Secure` cookie
+        // over a plain-HTTP request, which the browser will neither store nor
+        // return — so the operator cannot log in at all.
+        let attacker = ("forwarded", "proto=https");
+
+        for empty in ["", "  ", ",", " ,  , "] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", empty), attacker]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert!(
+                !c.secure,
+                "X-Forwarded-Proto: {empty:?} is present, so it decides, and \
+                 it does not say https",
+            );
+        }
+
+        let mut r = Request::new(());
+        r.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "10.1.2.3".parse().unwrap(),
+            12345,
+        )));
+        r.headers_mut().insert(
+            "x-forwarded-proto",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        r.headers_mut()
+            .insert("forwarded", HeaderValue::from_static("proto=https"));
+        assert!(
+            !resolve(&r, &trusted(&["10.0.0.0/8"])).secure,
+            "a non-UTF-8 X-Forwarded-Proto is unreadable, not absent",
         );
     }
 
