@@ -82,6 +82,18 @@ pub async fn run(
         metrics.set_gauge("slot_vpn_tunnel_up", 1.0, &labels);
         metrics.set_gauge("slot_torrents_paused_vpn_down", 0.0, &labels);
         metrics.add_counter("slot_vpn_tunnel_ip_changes_total", 0, &labels);
+        // WireGuard only. There is no handshake to probe on an OpenVPN slot,
+        // so any constant seeded there would assert a health signal nothing
+        // measures — an absent series is honest, a pinned one is not. For a
+        // WireGuard slot the baseline is 1: the slot's session was built on a
+        // tunnel that had just come up, and an alert on
+        // `slot_vpn_handshake_probe_ok == 0` should read "no" from a cold
+        // start rather than "no data" for the first POLL_INTERVAL — and for
+        // the whole run on a slot that is fenced before the first probe, the
+        // `continue` above running before the probe does.
+        if e.config.vpn_type == VpnType::Wireguard {
+            metrics.set_gauge("slot_vpn_handshake_probe_ok", 1.0, &labels);
+        }
         for reason in [DownReason::IpLostOrChanged, DownReason::HandshakeStale] {
             metrics.add_counter(
                 "slot_vpn_fenced_total",
