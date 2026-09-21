@@ -133,9 +133,36 @@ impl Serialize for ProfileId {
         s.serialize_str(&self.0)
     }
 }
+/// Enforces the charset rule at the only door untrusted text comes through.
+///
+/// `[A-Za-z0-9_-]{1,64}`, the same rule
+/// [`ProfileConfig::validate_set`] applies — see
+/// [`ProfileConfig::is_valid_id`] for why the set is what it is.
+///
+/// It is checked here as well because two files deserialize into `ProfileId`
+/// and only one of them passes through the validator: the config file does,
+/// and `profile_assignments.json` does not. An id read from a hand-edited
+/// registry reached `dir_for` and was joined onto a path with nothing between
+/// it and the filesystem, so the safety of `<resume_dir>/<id>` rested entirely
+/// on the startup bail staying correct. Making it a property of the type
+/// rather than of having called something means the raw string cannot get that
+/// far.
+///
+/// `ProfileId::new` stays infallible. Making it fallible and routing every
+/// construction through it is the tidier end state, but it ripples through
+/// every internal call site for no additional safety once this door is closed
+/// — the remaining callers build ids from values that already validated.
 impl<'de> Deserialize<'de> for ProfileId {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
+        if !ProfileConfig::is_valid_id(&s) {
+            return Err(serde::de::Error::custom(format!(
+                "profile id {s:?} is not usable: an id may be 1-64 characters of [A-Za-z0-9_-] \
+                 only. The id is a path component in three places (<resume_dir>/<id>, \
+                 <torrent_dir>/<id>, session_state-<id>.dat) and a URL path segment, so \
+                 anything else either escapes those directories or cannot be addressed."
+            )));
+        }
         Ok(ProfileId::new(s))
     }
 }
@@ -232,8 +259,15 @@ struct RawProfile {
     // host
     #[serde(default, skip_serializing_if = "Option::is_none")]
     listen_interfaces: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    dht: bool,
+    /// `Option`, not `bool`, so the vpn arm can reject it **on presence**.
+    ///
+    /// As a `#[serde(default)] bool` it was indistinguishable from absent when
+    /// written `dht = false`, so that spelling was silently accepted on a vpn
+    /// profile — alone among the wrong-posture keys, every one of which is an
+    /// `Option` rejected on presence. It reads to an operator as a setting
+    /// that took.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dht: Option<bool>,
 
     // vpn
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,7 +346,7 @@ impl TryFrom<RawProfile> for ProfileConfig {
                             id.as_str()
                         )
                     })?,
-                    dht: r.dht,
+                    dht: r.dht.unwrap_or(false),
                 }
             }
             NetworkKind::Vpn => {
@@ -322,13 +356,30 @@ impl TryFrom<RawProfile> for ProfileConfig {
                     "listen_interfaces",
                     "host",
                 )?;
-                r.reject(&id, r.dht, "dht", "host")?;
+                r.reject(&id, r.dht.is_some(), "dht", "host")?;
                 let missing = |key: &str| {
                     format!(
                         "profile {:?} declares network = \"vpn\" and must set {key}",
                         id.as_str()
                     )
                 };
+                // `listen_port` under NAT-PMP is a value nothing reads. The
+                // gateway assigns the port at runtime, nothing binds the
+                // configured one, Safety Rule 8 does not enter it into
+                // `seen_port` — and `/api/profiles` then reports it back
+                // under a field documented as "`null` for natpmp profiles".
+                // Accepting and ignoring it is the shape every other
+                // wrong-posture rule in this function exists to refuse.
+                if r.port_forward == Some(PortForwardMode::Natpmp) && r.listen_port.is_some() {
+                    return Err(format!(
+                        "profile {:?} sets port_forward = \"natpmp\" and listen_port. The \
+                         gateway assigns the port at runtime and renews its lease, so nothing \
+                         binds the configured one; read the negotiated port from \
+                         GET /api/profiles/{} instead.",
+                        id.as_str(),
+                        id.as_str(),
+                    ));
+                }
                 ProfileNetwork::Vpn {
                     vpn_type: r.vpn_type.ok_or_else(|| missing("vpn_type"))?,
                     vpn_config: r.vpn_config.clone().ok_or_else(|| missing("vpn_config"))?,
@@ -369,7 +420,7 @@ impl ProfileConfig {
             id: c.id.clone(),
             network: NetworkKind::Host,
             listen_interfaces: None,
-            dht: false,
+            dht: None,
             vpn_type: None,
             vpn_config: None,
             vpn_interface: None,
@@ -389,7 +440,7 @@ impl ProfileConfig {
                 dht,
             } => {
                 raw.listen_interfaces = Some(listen_interfaces.clone());
-                raw.dht = *dht;
+                raw.dht = Some(*dht);
             }
             ProfileNetwork::Vpn {
                 vpn_type,
@@ -660,7 +711,7 @@ impl ProfileConfig {
     /// is also URL-safe unescaped, which is what `/api/profiles/<id>` needs.
     /// The 64-character bound keeps `session_state-<id>.dat` inside a
     /// filename-length limit on every platform the daemon targets.
-    fn is_valid_id(id: &str) -> bool {
+    pub(crate) fn is_valid_id(id: &str) -> bool {
         !id.is_empty()
             && id.len() <= 64
             && id
