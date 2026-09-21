@@ -112,16 +112,28 @@ fn seed_baselines(slots: &SlotRegistry, metrics: &PromSink) {
     // was dark.
     //
     // `0` here is a measured fact rather than a pinned constant: the tunnel
-    // demonstrably did not come up. Nothing else is seeded for these slots —
-    // a slot with no session has no torrents, so any
-    // `slot_torrents_paused_vpn_down` value would assert a count nothing
-    // measured, and the poll loop never visits them to correct it.
+    // demonstrably did not come up.
+    //
+    // `slot_vpn_handshake_probe_ok` goes with it, for a WireGuard slot and on
+    // the same ground. It is seeded at `1` above for every *live* WireGuard
+    // slot, so leaving it absent here gives a dashboard computing probe-ok
+    // over the configured set a denominator that moves — the shape decision
+    // 18 exists to prevent one endpoint over, where `/healthz`'s `slots`
+    // stopped meaning two different things. And there is nothing pinned about
+    // the value: a tunnel that never came up cannot have handshaked, so `0`
+    // is measured exactly as `slot_vpn_tunnel_up = 0` is.
+    //
+    // `slot_torrents_paused_vpn_down` still is not seeded, and the difference
+    // is the point. A slot with no session has no torrents, so any value there
+    // would assert a *count* nothing measured; the poll loop never visits
+    // these slots to correct it. An absent series is honest, a pinned one is
+    // not — and the probe gauge is not pinned.
     for f in slots.failed() {
-        metrics.set_gauge(
-            "slot_vpn_tunnel_up",
-            0.0,
-            &[("slot_id", f.config.id.as_str())],
-        );
+        let labels = [("slot_id", f.config.id.as_str())];
+        metrics.set_gauge("slot_vpn_tunnel_up", 0.0, &labels);
+        if f.config.vpn_type == VpnType::Wireguard {
+            metrics.set_gauge("slot_vpn_handshake_probe_ok", 0.0, &labels);
+        }
     }
 }
 
@@ -354,6 +366,56 @@ mod tests {
         assert!(
             !exported.contains("torrents_paused_vpn_down{slot_id=\"account_c\"}"),
             "a slot with no session has no paused count to report; got:\n{exported}",
+        );
+    }
+
+    /// The other series a boot-failed WireGuard slot has to carry, and the
+    /// one it must not.
+    ///
+    /// `slot_vpn_handshake_probe_ok` is seeded at `1` for every *live*
+    /// WireGuard slot, so a boot-failed one having no series at all leaves a
+    /// dashboard computing probe-ok across the configured set with a moving
+    /// denominator — the shape decision 18 exists to prevent one endpoint
+    /// over. The value is measured, not pinned: a tunnel that never came up
+    /// cannot have handshaked.
+    ///
+    /// And it stays WireGuard-only on the failed side exactly as on the live
+    /// side: there is no handshake to probe on an OpenVPN slot, so a constant
+    /// there would assert a health signal nothing measures.
+    ///
+    /// Drop the probe gauge from the failed-slot seed and the first assertion
+    /// fails; seed it unconditionally and the third does.
+    #[test]
+    fn a_boot_failed_wireguard_slot_carries_the_probe_series_it_cannot_satisfy() {
+        use torrentd_engine::VpnType;
+
+        use crate::slot_registry::test_entry;
+        use crate::slot_registry::test_failed_slot;
+
+        let mut openvpn_failure = test_failed_slot("account_d");
+        openvpn_failure.config.vpn_type = VpnType::Openvpn;
+
+        let slots = SlotRegistry::new(vec![test_entry("account_a", SlotStatus::Active)])
+            .with_failed(vec![test_failed_slot("account_c"), openvpn_failure]);
+        let metrics = PromSink::new();
+
+        seed_baselines(&slots, &metrics);
+
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        assert!(
+            exported.contains("torrentd_slot_vpn_handshake_probe_ok{slot_id=\"account_c\"} 0"),
+            "a WireGuard tunnel that never came up demonstrably never \
+             handshaked, and the series must say so rather than be absent \
+             from a set the live slots are in; got:\n{exported}",
+        );
+        assert!(
+            exported.contains("torrentd_slot_vpn_handshake_probe_ok{slot_id=\"account_a\"} 1"),
+            "and a live WireGuard slot still baselines at 1; got:\n{exported}",
+        );
+        assert!(
+            !exported.contains("handshake_probe_ok{slot_id=\"account_d\"}"),
+            "there is no handshake to probe on an OpenVPN slot, failed or \
+             live, so no constant is asserted for one; got:\n{exported}",
         );
     }
 }
