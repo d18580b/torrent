@@ -335,6 +335,37 @@ impl Config {
         // not a posture judgement, so an operator tool reports it too.
         crate::http::forwarded::TrustedProxies::parse(&self.trusted_proxies)
             .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?;
+        // A `/0` prefix is every address there is. Syntax alone accepts it,
+        // and it is the one value that defeats the whole mechanism: with it
+        // set, every caller on earth is a trusted proxy, so every forwarding
+        // header is believed — the throttle keys on a value the caller
+        // chooses and rotates, `Secure` is set or withheld at the caller's
+        // discretion, and the `client_ip` on the failed-login line is
+        // whatever the caller wrote. That is the "a spoofable header is worse
+        // than none" posture this key exists to make impossible, and both
+        // README.md and docs/running.md §6a promise it "fails safe rather
+        // than open".
+        //
+        // Refused rather than warned, for the same reason
+        // `validate_auth_posture` refuses an unauthenticated routable bind: a
+        // silent footgun in a security posture is the daemon's problem. `/0`
+        // is the bright line — any stricter floor would be a guess about
+        // somebody's network, and refusing a legitimate `/8` would be worse
+        // than the startup log that now records the parsed set.
+        for entry in &self.trusted_proxies {
+            if let Some((_, prefix)) = entry.split_once('/') {
+                if prefix.trim() == "0" {
+                    anyhow::bail!(
+                        "trusted_proxies: {entry:?} trusts every peer there is. Anything listed \
+                         here can claim to be any client, so a /0 prefix makes every forwarding \
+                         header client-controlled: the login throttle keys on a value the caller \
+                         picks, the session cookie's Secure attribute is the caller's choice, and \
+                         the client_ip on the failed-login line is whatever the caller wrote. \
+                         List the address your reverse proxy connects from, and only that."
+                    );
+                }
+            }
+        }
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -771,6 +802,58 @@ listen_interfaces = "0.0.0.0:6881"
     /// A valid config with `extra` appended to the top-level keys.
     fn with_top_level(extra: &str) -> String {
         format!("{TOP_LEVEL}{extra}\n{ONE_HOST_PROFILE}")
+    }
+
+    #[test]
+    fn a_trusted_proxies_entry_that_trusts_everyone_is_refused() {
+        // The property: `trusted_proxies` is validated for *posture*, not
+        // only for syntax. A `/0` prefix is every address there is, so it
+        // makes every caller a trusted proxy and every forwarding header
+        // client-controlled — the throttle key, the cookie's `Secure`
+        // attribute and the `client_ip` on the failed-login line all become
+        // the caller's to choose. README.md and docs/running.md §6a both
+        // promise this key "fails safe rather than open"; without this
+        // refusal the one value that defeats it is the one that validates.
+        let dir = tempdir().unwrap();
+
+        for wide in ["0.0.0.0/0", "::/0"] {
+            let body = with_top_level(&format!("trusted_proxies = [\"{wide}\"]"));
+            // `parse` alone, so the refusal is attributed to `validate`
+            // rather than to the file being unreadable.
+            let cfg = Config::parse(&write_cfg(dir.path(), &body)).unwrap();
+            let err = cfg
+                .validate()
+                .expect_err("a /0 prefix trusts every peer and must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(wide),
+                "the refusal must name the offending entry; got {msg}",
+            );
+
+            // And it is not a posture judgement, so the operator subcommands
+            // that skip the posture check — `--check-config` among them — get
+            // it too. That is the command run before a restart.
+            assert!(
+                cfg.validate_without_auth_posture().is_err(),
+                "{wide} must be refused for operator tools as well",
+            );
+
+            // Which means loading the file fails outright.
+            assert!(
+                Config::load(&write_cfg(dir.path(), &body)).is_err(),
+                "{wide} must not produce a daemon that starts",
+            );
+        }
+
+        // The refusal is about breadth, not about prefixes. A real proxy
+        // network still validates, and so does the empty default.
+        for ok in ["\"172.28.0.2\"", "\"10.0.0.0/8\"", "\"2001:db8::/32\""] {
+            let body = with_top_level(&format!("trusted_proxies = [{ok}]"));
+            Config::load(&write_cfg(dir.path(), &body))
+                .unwrap_or_else(|e| panic!("{ok} is a legitimate trust set: {e:#}"));
+        }
+        Config::load(&write_cfg(dir.path(), &single_session()))
+            .expect("the empty default is the safe one and must still load");
     }
 
     #[test]
