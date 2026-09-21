@@ -404,7 +404,7 @@ impl Config {
     ///
     /// Mirrors `FsResumeStore::dir_for` and `FsTorrentStore::dir_for`, which is
     /// what `startup.rs` assembles from exactly these two fields.
-    fn effective_store_dirs(&self, p: &ProfileConfig) -> (PathBuf, PathBuf) {
+    pub(crate) fn effective_store_dirs(&self, p: &ProfileConfig) -> (PathBuf, PathBuf) {
         let resolve = |explicit: Option<&PathBuf>, base: &Path| -> PathBuf {
             let raw = explicit
                 .cloned()
@@ -583,6 +583,21 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
         field("user_agent", a.user_agent != b.user_agent);
         field("resume_dir", a.resume_dir != b.resume_dir);
         field("torrent_dir", a.torrent_dir != b.torrent_dir);
+        // The two keys outside the network block. Neither is applied by a
+        // reload — the add path reads `ProfileRegistry`'s immutable startup
+        // snapshot and nothing rebuilds it — and without them here a SIGHUP
+        // that changed only one of them produced an empty diff and logged
+        // "SIGHUP: config unchanged" over a file that plainly had. They are
+        // exactly the fields the comment above claimed could not be
+        // forgotten.
+        field(
+            "upload_rate_limit",
+            a.upload_rate_limit != b.upload_rate_limit,
+        );
+        field(
+            "allowed_tracker_domains",
+            a.allowed_tracker_domains != b.allowed_tracker_domains,
+        );
     }
     out
 }
@@ -618,10 +633,22 @@ impl ConfigDiff {
     /// discovery on exactly the sessions that must never have it. A host
     /// profile still honours the key, which is the only place it means
     /// anything.
+    ///
+    /// `upload_rate_limit` is withheld in the same shape, from a profile that
+    /// sets its own. `startup.rs` applies a per-profile `upload_rate_limit`
+    /// over the top-level one at boot; passing the top-level value through
+    /// here meant that editing only the top-level key and sending SIGHUP
+    /// patched every session alike and silently discarded the override until
+    /// the next restart. A profile that sets nothing still takes the
+    /// top-level value, which is what makes it a default.
     pub fn to_settings_patch_for(&self, profile: &ProfileConfig) -> libtorrent_safe::Settings {
         libtorrent_safe::Settings {
             connections_limit: self.connections_limit,
-            upload_rate_limit: self.upload_rate_limit,
+            upload_rate_limit: if profile.upload_rate_limit != 0 {
+                None
+            } else {
+                self.upload_rate_limit
+            },
             max_concurrent_http_announces: self.max_concurrent_http_announces,
             aio_threads: self.aio_threads,
             enable_lsd: if profile.is_vpn() {
@@ -1050,6 +1077,148 @@ listen_interfaces = "0.0.0.0:6882"
         let dir = tempdir().unwrap();
         let p = write_cfg(dir.path(), &two_host_profiles("", ""));
         Config::load(&p).expect("derived per-profile directories are distinct");
+    }
+
+    // -----------------------------------------------------------------
+    // The shipped samples.
+    // -----------------------------------------------------------------
+
+    /// Nothing in this repository parsed either sample: no test, no CI step.
+    /// That is why 265 changed lines of `torrentd.sample.toml` shipped with a
+    /// duplicate listen port, a duplicate fingerprint and a duplicate user
+    /// agent between its own examples, two daemon-wide keys stranded behind a
+    /// `[[profile]]` header where TOML binds them to the table, and a
+    /// `network = "host"` profile that made the documented `vpn check`
+    /// invocation panic — while a 41-test suite stayed green.
+    fn sample(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy")
+            .join(name)
+    }
+
+    fn load_sample(name: &str) -> Config {
+        let path = sample(name);
+        Config::load(&path).unwrap_or_else(|e| panic!("{name} must load and validate: {e:#}"))
+    }
+
+    #[test]
+    fn the_shipped_sample_loads_and_validates() {
+        let cfg = load_sample("torrentd.sample.toml");
+        assert_eq!(cfg.profile.len(), 1);
+        assert_eq!(cfg.profile[0].id.as_str(), "public");
+        assert!(
+            !cfg.profile[0].is_vpn(),
+            "the shipped sample is a host-only deployment; `vpn check` has to cope with it",
+        );
+    }
+
+    #[test]
+    fn the_multi_account_sample_loads_and_validates() {
+        // The case the other sample only describes in comments. A commented
+        // block is unreachable by any test and by `--check-config`, which is
+        // the whole mechanism: the operator uncomments it and finds out then.
+        let cfg = load_sample("torrentd.multi-account.sample.toml");
+        assert_eq!(cfg.profile.len(), 3);
+        assert_eq!(
+            cfg.profile.iter().filter(|p| p.is_vpn()).count(),
+            2,
+            "two accounts, each with its own tunnel",
+        );
+        assert!(
+            cfg.peer_fingerprint.is_none() && cfg.user_agent.is_none(),
+            "no top-level identity for a profile to inherit",
+        );
+    }
+
+    #[test]
+    fn the_samples_daemon_wide_keys_are_not_stranded_behind_a_profile_table() {
+        // TOML binds any key after a `[[table]]` header to that table, so a
+        // daemon-wide key written below the first `[[profile]]` cannot be
+        // uncommented: `deny_unknown_fields` rejects it as an unknown
+        // `[[profile]]` field, and the message lists the profile keys — which
+        // reads as "this key does not exist", about the kill switch the file
+        // calls defence-in-depth.
+        for name in ["torrentd.sample.toml", "torrentd.multi-account.sample.toml"] {
+            let text = fs::read_to_string(sample(name)).unwrap();
+            let first_table = text
+                .find("\n[[profile]]")
+                .expect("every sample configures at least one profile");
+            for key in ["vpn_handshake_max_age_secs", "network_kill_switch"] {
+                let at = text
+                    .find(key)
+                    .unwrap_or_else(|| panic!("{name} should document {key}"));
+                assert!(
+                    at < first_table,
+                    "{name}: {key} sits below the first [[profile]] header, \
+                     where TOML binds it to that table",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reload_does_not_overwrite_a_per_profile_upload_rate_limit() {
+        // `startup.rs` applies a per-profile `upload_rate_limit` over the
+        // top-level one at boot. Passing the top-level value through here
+        // meant an operator who edited only the top-level key and sent SIGHUP
+        // patched every session alike — the override was silently discarded
+        // until the next restart, with nothing logged.
+        let diff = ConfigDiff {
+            upload_rate_limit: Some(2_000_000),
+            ..Default::default()
+        };
+        let mut capped = host_profile();
+        capped.upload_rate_limit = 100_000;
+
+        assert_eq!(
+            diff.to_settings_patch_for(&capped).upload_rate_limit,
+            None,
+            "a profile that set its own must not be patched from the top level",
+        );
+        assert_eq!(
+            diff.to_settings_patch_for(&host_profile())
+                .upload_rate_limit,
+            Some(2_000_000),
+            "a profile that set nothing still takes the default; that is what makes it one",
+        );
+    }
+
+    #[test]
+    fn a_profile_only_upload_rate_limit_change_is_reported_rather_than_swallowed() {
+        // `ConfigDiff::is_empty()` was true for this edit, so `reload.rs`
+        // logged "SIGHUP: config unchanged" over a file that plainly had.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        b.profile[0].upload_rate_limit = 100_000;
+
+        let d = Config::diff(&a, &b);
+        assert!(!d.is_empty(), "the file changed and the daemon must say so");
+        assert!(
+            d.profile_changes
+                .iter()
+                .any(|c| c == "public.upload_rate_limit"),
+            "got {:?}",
+            d.profile_changes,
+        );
+    }
+
+    #[test]
+    fn a_profile_only_allowed_tracker_domains_change_is_reported_rather_than_swallowed() {
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        b.profile[0].allowed_tracker_domains = vec!["tracker.example.com".into()];
+
+        let d = Config::diff(&a, &b);
+        assert!(!d.is_empty());
+        assert!(
+            d.profile_changes
+                .iter()
+                .any(|c| c == "public.allowed_tracker_domains"),
+            "got {:?}",
+            d.profile_changes,
+        );
     }
 
     #[test]
