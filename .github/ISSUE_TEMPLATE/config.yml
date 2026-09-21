@@ -1,0 +1,5 @@
+# Blank issues stay enabled on purpose: this repository ships one template (the
+# bug report), and most of the tracker is feature, testing and documentation
+# work that no template specifies. Disabling blank issues would make that work
+# unfileable through the chooser.
+blank_issues_enabled: true

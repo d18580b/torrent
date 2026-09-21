@@ -1,0 +1,66 @@
+name: Bug report
+description: Report a defect in torrentd, with the four facts CONTRIBUTING.md asks for
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form restates [`CONTRIBUTING.md` § *Reporting bugs*](https://github.com/milkyisles/torrent/blob/master/CONTRIBUTING.md#reporting-bugs),
+        which stays the authority on what a bug report contains. Every command you
+        need is given with the field that wants its output.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: >-
+        The behaviour you saw and the behaviour you expected instead. Include the
+        exact request or command if there was one, and say whether it reproduces.
+      placeholder: |
+        POST /torrents with a magnet returned 200, but the torrent never left
+        checking_resume_data. I expected it to reach downloading_metadata.
+        Reproduces on every start.
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: "Output of `uname -srm`."
+      placeholder: "Linux 6.11.3-200.fc40.x86_64 x86_64"
+    validations:
+      required: true
+
+  - type: input
+    id: libtorrent-sha
+    attributes:
+      label: libtorrent submodule SHA
+      description: "Output of `git -C vendor/libtorrent rev-parse HEAD`."
+      placeholder: "0123456789abcdef0123456789abcdef01234567"
+    validations:
+      required: true
+
+  - type: input
+    id: cargo-version
+    attributes:
+      label: Cargo version
+      description: "Output of `cargo --version`."
+      placeholder: "cargo 1.90.0 (840b83a10 2025-07-30)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: JSON log output
+      description: >-
+        The daemon's JSON log around the failure. If it reproduces, capture it with
+        `RUST_LOG=debug` — e.g. `RUST_LOG=debug torrentd --config /etc/torrentd/config.toml`.
+        Redact tracker URLs, passkeys and API tokens before pasting.
+      render: text
+      placeholder: |
+        {"timestamp":"2026-09-21T09:14:02.881Z","level":"WARN","fields":{"message":"..."}}
+    validations:
+      required: true
