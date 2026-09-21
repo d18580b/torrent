@@ -61,6 +61,25 @@ run = [
 description = "Formatting + clippy"
 depends = ["fmt", "lint"]
 
+# The native prefix deliberately does NOT get its path from a [env] entry here:
+# a bare `cargo build` outside mise has to resolve the same directory, so both
+# sides independently expand ${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native.
+[tasks.native]
+description = "Provision the shared libtorrent/Boost prefix (first run: 5-15 min)"
+run = [
+  "git submodule update --init --recursive --depth 1",
+  "cargo build -p libtorrent-sys",
+  # Honours LIBTORRENT_SYS_CACHE_DIR, which build.rs checks before XDG, and
+  # tolerates the glob not matching rather than failing a 15-minute task.
+  'ls -d "${LIBTORRENT_SYS_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native}"/*/ || true',
+]
+
+[tasks.native-clean]
+description = "Delete every cached native prefix (~115 MB per pinned version)"
+run = 'rm -rf "${LIBTORRENT_SYS_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/torrentd/native}"'
+
+# Deliberately does NOT depend on `native`: installing the git hooks should not
+# cost a 15-minute, 1.5 GB provision for someone who only wants the hooks.
 [tasks.setup]
 description = "One-time dev setup: nightly rustfmt toolchain + activate git hooks"
 run = [

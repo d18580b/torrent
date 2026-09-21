@@ -25,9 +25,23 @@ ENV PATH=/root/.cargo/bin:${PATH}
 WORKDIR /src
 COPY . /src
 
+# Where libtorrent-sys keeps its content-addressed native prefixes. Mounted
+# as a build cache below so repeated local image builds reuse the Boost +
+# libtorrent build instead of spending 6-15 minutes on it every time.
+#
+# .dockerignore excludes .git/, so build.rs cannot read the submodule gitlinks
+# here and identifies the vendored trees by hashing marker files instead. That
+# is deterministic across builds, which is what makes the mount worth having.
+#
+# Note this helps local iteration only: the CI `container` job runs on a fresh
+# VM, where a build cache mount starts empty.
+ENV LIBTORRENT_SYS_CACHE_DIR=/root/.cache/torrentd/native
+
 # `cargo build --release` will re-read rust-toolchain.toml and download
 # the matching channel automatically.
-RUN cargo build --release --workspace --bin torrentd
+RUN --mount=type=cache,target=/root/.cache/torrentd,sharing=locked \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
+    cargo build --release --workspace --bin torrentd
 
 # ---- runtime --------------------------------------------------------------
 

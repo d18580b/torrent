@@ -1,7 +1,10 @@
 [submodule "vendor/libtorrent"]
 	path = vendor/libtorrent
 	url = https://github.com/arvidn/libtorrent.git
-	branch = RC_2_0
+	# An immutable tag, not the RC_2_0 branch: with a branch here,
+	# `git submodule update --remote` silently moves the pin to the
+	# branch tip.
+	branch = v2.0.14
 [submodule "vendor/boost"]
 	path = vendor/boost
 	url = https://github.com/boostorg/boost.git

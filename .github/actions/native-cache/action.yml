@@ -1,0 +1,70 @@
+name: native-cache
+description: >-
+  Restore the shared vendored libtorrent/Boost prefix, and fetch the vendor
+  submodules only when it missed.
+
+inputs:
+  path:
+    description: >-
+      Directory holding the content-addressed native prefixes. Passed in
+      explicitly rather than read from the env context, so the value is
+      resolved by the workflow that owns it.
+    required: true
+  fixtures:
+    description: >-
+      Initialize vendor/libtorrent even on a cache hit. The shim FFI suite
+      reads .torrent fixtures out of the pinned libtorrent test corpus
+      (crates/libtorrent-sys/tests/shim.rs), so that job needs the tree on
+      disk whether or not it needs to build anything. libtorrent alone is
+      ~16 MB shallow; Boost, the expensive one, is still skipped.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    # The gitlink SHAs come out of the superproject's own tree, so this works
+    # with the submodules absent and costs ~1ms. The previous key used
+    # hashFiles('vendor/libtorrent/**'), which walked the whole submodule on
+    # every run and covered none of Boost's sources.
+    - id: ids
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "lt=$(git rev-parse HEAD:vendor/libtorrent)" >> "$GITHUB_OUTPUT"
+        echo "boost=$(git rev-parse HEAD:vendor/boost)" >> "$GITHUB_OUTPUT"
+
+    # This key is only a hit-rate heuristic. Correctness lives in the .stamp
+    # file that build.rs compares: if the two ever disagree the worst outcome
+    # is a rebuild, never a stale link. The restore-keys prefix stops at the
+    # two vendor SHAs so a shim-only edit still restores the ~111 MB libtorrent
+    # prefix and rebuilds only the ~4 MB shim.
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ inputs.path }}
+        key: >-
+          native-v1-${{ runner.os }}-${{ steps.ids.outputs.lt }}-${{ steps.ids.outputs.boost }}-${{
+          hashFiles('crates/libtorrent-sys/build.rs',
+                    'crates/libtorrent-sys/Cargo.toml',
+                    'crates/libtorrent-sys/wrapper.h',
+                    'crates/libtorrent-sys/shim/**') }}
+        restore-keys: |
+          native-v1-${{ runner.os }}-${{ steps.ids.outputs.lt }}-${{ steps.ids.outputs.boost }}-
+
+    # ~4 minutes per job. vendor/boost is a 165-sub-repo superproject and is
+    # needed only to *build* the prefix, never to consume one.
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: git submodule update --init --recursive --depth 1 vendor/libtorrent vendor/boost
+
+    - if: inputs.fixtures == 'true' && steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: git submodule update --init --depth 1 vendor/libtorrent
+
+    # Makes the hit/miss visible in the job log: four jobs printing identical
+    # stamps is the proof they share one prefix.
+    - shell: bash
+      run: |
+        cat "${{ inputs.path }}"/*/.stamp 2>/dev/null \
+          || echo "no native prefix restored; build.rs will provision one"
