@@ -502,6 +502,14 @@ pub fn bind_endpoint(ip: std::net::IpAddr, port: u16) -> String {
 pub enum ProfileConfigError {
     #[error("profile id {0:?} appears more than once")]
     DuplicateId(String),
+    #[error(
+        "profile id {0:?} is not usable: an id may be 1-64 characters of \
+         [A-Za-z0-9_-] only. The id is a path component in three places \
+         (<resume_dir>/<id>, <torrent_dir>/<id>, session_state-<id>.dat) and a \
+         URL path segment, so anything else either escapes those directories or \
+         cannot be addressed."
+    )]
+    BadId(String),
     #[error("listen_port {0} appears more than once")]
     DuplicatePort(u16),
     #[error("profile {0:?} uses port_forward = \"static\" but has no listen_port")]
@@ -571,6 +579,22 @@ impl ProfileConfig {
         hex.eq_ignore_ascii_case("2d4c54323043302d")
     }
 
+    /// `[A-Za-z0-9_-]{1,64}`.
+    ///
+    /// Deliberately narrower than what a filesystem accepts. The set excludes
+    /// `.`, so `.` and `..` are unrepresentable without a special case, and
+    /// excludes `/` and `\`, so an id is always exactly one path component. It
+    /// is also URL-safe unescaped, which is what `/api/profiles/<id>` needs.
+    /// The 64-character bound keeps `session_state-<id>.dat` inside a
+    /// filename-length limit on every platform the daemon targets.
+    fn is_valid_id(id: &str) -> bool {
+        !id.is_empty()
+            && id.len() <= 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    }
+
     /// Validate the whole configured set.
     ///
     /// Called at startup and on SIGHUP. Most rules here are uniqueness rules:
@@ -602,6 +626,17 @@ impl ProfileConfig {
         let mut seen_torrent = std::collections::HashSet::new();
 
         for p in profiles {
+            // The id is not just a label. It is a path component in
+            // `<resume_dir>/<id>`, `<torrent_dir>/<id>` and
+            // `session_state-<id>.dat`, and a segment of `/api/profiles/<id>`.
+            // `PathBuf::join` with an absolute id replaces the base outright,
+            // so `id = "/etc"` would write resume data to `/etc`, and
+            // `id = "../.."` escapes upward. Constrain the id itself rather
+            // than sanitising at three filesystem call sites and a URL, each
+            // one a place to forget.
+            if !Self::is_valid_id(p.id.as_str()) {
+                return Err(ProfileConfigError::BadId(p.id.as_str().to_string()));
+            }
             if !seen_id.insert(p.id.as_str().to_string()) {
                 return Err(ProfileConfigError::DuplicateId(p.id.as_str().to_string()));
             }
@@ -864,6 +899,52 @@ mod tests {
             host("public2", "0.0.0.0:6882", false),
         ];
         ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    #[test]
+    fn a_profile_id_that_escapes_its_directory_is_refused() {
+        // The id lands in `<resume_dir>/<id>`, `<torrent_dir>/<id>` and
+        // `session_state-<id>.dat`. `PathBuf::join` with an absolute path
+        // replaces the base outright, so an unconstrained id writes resume
+        // data wherever it says.
+        for bad in ["/etc", "../..", "a/b", "has space", "dot.dot", "", "a\\b"] {
+            let mut p = host("placeholder", "0.0.0.0:6881", false);
+            p.id = ProfileId::new(bad);
+            assert!(
+                matches!(
+                    ProfileConfig::validate_set(&[p]),
+                    Err(ProfileConfigError::BadId(_))
+                ),
+                "id {bad:?} was accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn a_profile_id_longer_than_64_characters_is_refused() {
+        let mut p = host("placeholder", "0.0.0.0:6881", false);
+        p.id = ProfileId::new("a".repeat(65));
+        assert!(matches!(
+            ProfileConfig::validate_set(&[p]),
+            Err(ProfileConfigError::BadId(_))
+        ));
+    }
+
+    #[test]
+    fn ordinary_profile_ids_are_accepted() {
+        // Including `default`: #12 banned that name because it collided with
+        // the implicit single-session slot, and this model deletes that
+        // concept, so the collision the ban protected against is gone. It is
+        // also the one id that lets a migrated registry resolve without
+        // hand-editing.
+        for good in ["default", "acct_a", "acct-b", "Public2", &"a".repeat(64)] {
+            let mut p = host("placeholder", "0.0.0.0:6881", false);
+            p.id = ProfileId::new(good);
+            assert!(
+                ProfileConfig::validate_set(&[p]).is_ok(),
+                "id {good:?} was refused",
+            );
+        }
     }
 
     #[test]
