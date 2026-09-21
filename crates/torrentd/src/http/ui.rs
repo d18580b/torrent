@@ -154,6 +154,38 @@ fn etag(file: &rust_embed::EmbeddedFile) -> String {
     s
 }
 
+/// The strong validator for the representation actually being sent.
+///
+/// A validator identifies a representation, not a resource: RFC 9110 §8.8.3
+/// asks a strong one to change when the bytes on the wire change, and the
+/// brotli bytes and the identity bytes of one path are different bytes.
+/// `etag` hashes the identity file, so the encoding token has to be folded in
+/// or the two representations ship the same validator and a shared cache
+/// keyed on it can hand a `.br` body to a client that sent no
+/// `Accept-Encoding`. `Vary: accept-encoding` is still sent; this is the half
+/// that does not depend on the cache honouring it.
+///
+/// Kept strong rather than marked weak. Weakening gives up strong-validator
+/// semantics on every request to cover a case the token covers exactly.
+fn etag_for(file: &rust_embed::EmbeddedFile, encoding: Option<&str>) -> String {
+    with_encoding(&etag(file), encoding)
+}
+
+/// Fold an encoding token into an entity-tag.
+///
+/// Split from [`etag_for`] because the rule is about the tag and not about
+/// the file, and this is the half a test can reach: `Assets` is whatever the
+/// build embedded, so a test cannot rely on a path with a precompressed
+/// sibling existing.
+fn with_encoding(tag: &str, encoding: Option<&str>) -> String {
+    match encoding {
+        // Inside the quotes: an entity-tag *is* the quoted string, so the
+        // token has to be part of it to be compared by `matches_etag` at all.
+        Some(e) => format!("{}-{e}\"", tag.trim_end_matches('"')),
+        None => tag.to_string(),
+    }
+}
+
 /// Whether `If-None-Match` already holds this version.
 ///
 /// `*` matches anything present, per RFC 9110; otherwise any member of the
@@ -191,7 +223,15 @@ fn cache_control(path: &str) -> &'static str {
 fn respond(path: &str, req_headers: &HeaderMap) -> Option<Response> {
     let file = Assets::get(path)?;
 
-    let tag = etag(&file);
+    // Negotiation happens *before* the validator, because the validator is
+    // per representation. `etag()` hashes the identity bytes, so computing it
+    // first meant one strong validator covering both the identity body and
+    // the `.br` body — which RFC 9110 §8.8.3 asks it not to do, and which lets
+    // a shared cache keyed only on the validator hand brotli bytes to a client
+    // that sent no `Accept-Encoding`. `Vary: accept-encoding` below makes that
+    // tolerable rather than correct.
+    let chosen = negotiated(path, req_headers);
+    let tag = etag_for(&file, chosen.as_ref().map(|(_, encoding)| *encoding));
 
     let mut headers = HeaderMap::new();
     security_headers(&mut headers);
@@ -218,10 +258,7 @@ fn respond(path: &str, req_headers: &HeaderMap) -> Option<Response> {
         headers.insert(header::CONTENT_TYPE, v);
     }
 
-    // Negotiation happens after the ETag, on purpose: the validator identifies
-    // the *resource*, so a client holding a fresh copy gets its 304 whether or
-    // not a precompressed sibling exists for it.
-    let body = match negotiated(path, req_headers) {
+    let body = match chosen {
         Some((compressed, encoding)) => {
             headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static(encoding));
             compressed.data
@@ -432,4 +469,36 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn a_precompressed_representation_gets_its_own_validator() {
+        // A strong validator identifies a representation, not a resource
+        // (RFC 9110 §8.8.3). `etag` hashes the identity bytes, so without the
+        // encoding token the `.br` body and the raw body ship the same one,
+        // and a shared cache keyed only on the validator can hand brotli
+        // bytes to a client that sent no `Accept-Encoding`.
+        let identity = "\"0123456789abcdef\"";
+        let br = with_encoding(identity, Some("br"));
+        let gzip = with_encoding(identity, Some("gzip"));
+
+        assert_ne!(br, identity, "the brotli body is not the identity body");
+        assert_ne!(gzip, identity);
+        assert_ne!(br, gzip, "nor is it the gzip body");
+        assert_eq!(
+            with_encoding(identity, None),
+            identity,
+            "an unencoded response keeps the validator it always had",
+        );
+
+        // Still a syntactically valid entity-tag, so `matches_etag` — which
+        // compares the quoted string — can hit on it.
+        assert!(br.starts_with('"') && br.ends_with('"'));
+        assert!(
+            matches_etag(&headers(&[(header::IF_NONE_MATCH, &br)]), &br),
+            "a client holding the brotli representation still gets its 304",
+        );
+        assert!(
+            !matches_etag(&headers(&[(header::IF_NONE_MATCH, identity)]), &br),
+            "and one holding the identity representation does not",
+        );
+    }
 }
