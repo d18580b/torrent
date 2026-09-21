@@ -10,6 +10,15 @@ inputs:
       explicitly rather than read from the env context, so the value is
       resolved by the workflow that owns it.
     required: true
+  fixtures:
+    description: >-
+      Initialize vendor/libtorrent even on a cache hit. The shim FFI suite
+      reads .torrent fixtures out of the pinned libtorrent test corpus
+      (crates/libtorrent-sys/tests/shim.rs), so that job needs the tree on
+      disk whether or not it needs to build anything. libtorrent alone is
+      ~16 MB shallow; Boost, the expensive one, is still skipped.
+    required: false
+    default: 'false'
 
 runs:
   using: composite
@@ -48,6 +57,10 @@ runs:
     - if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
       run: git submodule update --init --recursive --depth 1 vendor/libtorrent vendor/boost
+
+    - if: inputs.fixtures == 'true' && steps.cache.outputs.cache-hit == 'true'
+      shell: bash
+      run: git submodule update --init --depth 1 vendor/libtorrent
 
     # Makes the hit/miss visible in the job log: four jobs printing identical
     # stamps is the proof they share one prefix.
