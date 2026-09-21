@@ -4,8 +4,19 @@
 //! existing JSON-file conventions carry — and the web client needs to sort,
 //! filter and paginate over that set without shipping it all to the browser.
 //! One transactional file serves the file index, the torrent library, adoption
-//! state, and the torrent→profile registry that used to live in
-//! `slot_assignments.json` (now `profile_assignments.json`).
+//! state, and a copy of the torrent→profile mapping that lives in
+//! `profile_assignments.json` (once `slot_assignments.json`).
+//!
+//! # `torrent.profile` is a cache, not the authority
+//!
+//! `profile_assignments.json` is the authority for which profile owns which
+//! info-hash. It is what the daemon's resume scan writes, what every load is
+//! gated on, and what the daemon refuses to boot against when it disagrees
+//! with the configured profiles. This column is a copy of it, written by
+//! `pool scan` — which an operator may never run — so it can be stale, and
+//! nothing here may be read as overriding the file. Where the two disagree
+//! the resume scan warns naming both values rather than silently preferring
+//! one.
 
 use std::collections::HashMap;
 use std::path::Path;
