@@ -97,9 +97,17 @@ behaviour it only points at.
 
 - **Vulnerabilities in vendored dependencies.** `vendor/libtorrent`
   (`v2.0.14`) and `vendor/boost` (`boost-1.83.0`) are pinned here, not
-  maintained here. Report them to
-  [arvidn/libtorrent](https://github.com/arvidn/libtorrent/security) and
-  [boostorg](https://github.com/boostorg/boost/security/policy) upstream. A
-  report that *this* repository pins a version with a known upstream
+  maintained here. Report a libtorrent vulnerability to
+  [arvidn/libtorrent](https://github.com/arvidn/libtorrent/security), which
+  publishes a security policy and takes private reports. A Boost
+  vulnerability belongs with the Boost project, against the pinned
+  `boost-1.83.0` — **no link is given for it, deliberately.** No Boost
+  destination could be shown to carry a reporting route: `boostorg/boost`
+  publishes no security policy, there is no organisation-level fallback, and
+  private vulnerability reporting is switched off, so every candidate page
+  either answers with a statement that the project has no security policy or
+  is a generic page served for an unrecognised path. A link to one of those
+  is worse than no link, because it looks like a destination.
+  A report that *this* repository pins a version with a known upstream
   advisory is welcome — that is a pin to move, and it belongs in a normal
   issue.
