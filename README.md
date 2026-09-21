@@ -357,8 +357,13 @@ health, handshake age, port-forward state and `kill_switch_active`.
 
 > A shipped Grafana dashboard and alert rules are planned rather than present.
 > Until then, note that series register on first emission, so anything not yet
-> emitted reads as "no data" rather than zero — the per-profile VPN series are
-> seeded at their baseline for exactly this reason, and most others are not.
+> emitted reads as "no data" rather than zero — the per-profile tunnel,
+> fencing and port-forward series are seeded at their baseline for exactly this
+> reason, and most others are not. The two handshake series
+> (`profile_vpn_handshake_age_seconds`, `profile_vpn_handshake_probe_ok`) are
+> not seeded: they exist only for WireGuard profiles and register on the first
+> probe, so an alert on either reads "no data" until the first poll completes,
+> and permanently on a `vpn` profile that is not WireGuard.
 
 ## Deployment
 
