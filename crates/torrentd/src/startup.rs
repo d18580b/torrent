@@ -365,8 +365,7 @@ pub async fn boot(
     // `boot_shutdown_receivers` for what subscribing the second one late cost
     // and why the order of these two lines is the whole property.
     let (mut boot_shutdown, shutdown_rx) = boot_shutdown_receivers(&shutdown_tx);
-    // Drop the receiver returned by signals::run; we wired our own pair.
-    let _ = signals::run(channels.clone(), 8).await;
+    signals::run(channels.clone()).await;
 
     // Undoes what boot has raised, for every exit that is not a successful
     // one. Tunnels and the kill-switch table outlive the process, so a `?`
