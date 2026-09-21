@@ -1545,6 +1545,79 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
     }
 
     #[test]
+    fn the_json_report_keeps_the_shape_its_consumers_parse() {
+        // C7/C8. `--json` is a contract: the four verdicts are lowercase
+        // strings, and the report is `host` plus `slots`, each slot carrying
+        // `slot_id`, `vpn_type` and `checks` of `name`/`verdict`/`detail`.
+        // Nothing here is enforced by the type system — `#[serde(rename_all)]`
+        // is one attribute away from renaming every verdict at once.
+        let r = Report {
+            host: vec![Check::pass("iproute2", "`ip` is available")],
+            slots: vec![SlotReport {
+                slot_id: "acct_a".into(),
+                vpn_type: "wireguard",
+                checks: vec![
+                    Check::fail("tunnel_ip", "no address"),
+                    Check::skip("port_forward", "static"),
+                    Check::unknown("handshake", "probe unavailable"),
+                ],
+            }],
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+
+        assert_eq!(v["host"][0]["name"], "iproute2");
+        assert_eq!(v["host"][0]["verdict"], "pass");
+        assert_eq!(v["host"][0]["detail"], "`ip` is available");
+        assert_eq!(v["slots"][0]["slot_id"], "acct_a");
+        assert_eq!(v["slots"][0]["vpn_type"], "wireguard");
+        assert_eq!(v["slots"][0]["checks"][0]["verdict"], "fail");
+        assert_eq!(v["slots"][0]["checks"][1]["verdict"], "skip");
+        assert_eq!(v["slots"][0]["checks"][2]["verdict"], "unknown");
+    }
+
+    #[test]
+    fn every_verdict_serialises_to_its_documented_lowercase_name() {
+        for (verdict, expected) in [
+            (Verdict::Pass, "pass"),
+            (Verdict::Fail, "fail"),
+            (Verdict::Skip, "skip"),
+            (Verdict::Unknown, "unknown"),
+        ] {
+            assert_eq!(serde_json::to_value(verdict).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn a_single_session_config_is_refused_with_an_explanation() {
+        // C38. Single-session mode uses no tunnel, so there is nothing to
+        // check and an empty report would read as a clean bill of health.
+        let cfg: Config = toml::from_str(
+            r#"
+listen_interfaces = "0.0.0.0:6881"
+default_save_path = "/tmp/torrentd-test/data"
+resume_dir = "/tmp/torrentd-test/state/resume"
+torrent_dir = "/tmp/torrentd-test/torrents"
+http_listen = "127.0.0.1:8080"
+"#,
+        )
+        .unwrap();
+
+        let e = check(&cfg, None, false, false, None, None).unwrap_err();
+        let msg = format!("{e:#}");
+        assert!(msg.contains("[[slot]]"), "got {msg}");
+        assert!(msg.contains("Single-session"), "got {msg}");
+    }
+
+    #[test]
+    fn a_slot_filter_that_matches_nothing_is_refused_rather_than_reported_clean() {
+        // C39. `--slot typo` used to be indistinguishable from "every slot
+        // passed": no slots selected, no failures, exit 0.
+        let cfg = cfg_with_slot("");
+        let e = check(&cfg, Some("acct_b"), false, false, None, None).unwrap_err();
+        assert!(format!("{e:#}").contains("acct_b"), "got {e:#}");
+    }
+
+    #[test]
     fn a_missing_tool_is_reported_rather_than_panicking() {
         assert!(!tool_available(
             "torrentd-definitely-not-a-binary",
