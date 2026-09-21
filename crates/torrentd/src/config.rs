@@ -297,7 +297,13 @@ impl Config {
     /// Everything [`Config::validate`] checks except the authentication
     /// posture. See [`Config::load_for_operator_tool`] for who gets this and
     /// why.
-    pub fn validate_without_auth_posture(&self) -> anyhow::Result<()> {
+    ///
+    /// `pub(crate)`, not `pub`. The exemption seam this crate records is
+    /// `load_for_operator_tool`; a second entry point that runs every check
+    /// except the security one is a door nobody recorded opening. There is no
+    /// library target today, so nothing outside the crate can reach it either
+    /// way — which is what makes narrowing it free now and a wager later.
+    pub(crate) fn validate_without_auth_posture(&self) -> anyhow::Result<()> {
         self.validate_inner(false)
     }
 
