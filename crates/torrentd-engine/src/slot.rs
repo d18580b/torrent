@@ -74,7 +74,6 @@ use serde::Serialize;
 use serde::Serializer;
 use thiserror::Error;
 
-use crate::engine::TorrentEngine;
 use crate::port_forward::PortForwardMode;
 use crate::vpn::VpnProfile;
 use crate::vpn::VpnType;
@@ -182,6 +181,20 @@ impl SlotConfig {
         self.port_forward_gateway
             .as_deref()
             .unwrap_or(Self::DEFAULT_NATPMP_GATEWAY)
+    }
+}
+
+/// Format `ip:port` the way libtorrent's `listen_interfaces` expects.
+///
+/// `format!("{ip}:{port}")` is correct for IPv4 and produces an unparseable
+/// string for IPv6, where the address has to be bracketed. Nothing can return
+/// a v6 tunnel address today — the interface lookup is IPv4-only — so this is
+/// a latent bug rather than a live one, and it is the kind that surfaces as a
+/// slot silently failing to bind on the day that changes.
+pub fn bind_endpoint(ip: std::net::IpAddr, port: u16) -> String {
+    match ip {
+        std::net::IpAddr::V4(v4) => format!("{v4}:{port}"),
+        std::net::IpAddr::V6(v6) => format!("[{v6}]:{port}"),
     }
 }
 
@@ -363,17 +376,6 @@ impl SlotStatus {
             SlotStatus::VpnDown => "vpn_down",
         }
     }
-}
-
-/// Runtime per-slot state. Owns an `Arc<dyn TorrentEngine>` so the
-/// `MultiSlotSource` and HTTP handlers can share it.
-#[derive(Debug)]
-pub struct Slot {
-    pub config: SlotConfig,
-    pub engine: Arc<dyn TorrentEngine>,
-    pub status: SlotStatus,
-    /// Last observed tunnel IP. None if VPN has never come up.
-    pub tunnel_ip: Option<std::net::IpAddr>,
 }
 
 #[cfg(test)]

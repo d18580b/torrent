@@ -158,7 +158,7 @@ pub fn renew_and_rebind(
                 };
             }
             let settings = Settings {
-                listen_interfaces: Some(format!("{tunnel_ip}:{port}")),
+                listen_interfaces: Some(crate::slot::bind_endpoint(tunnel_ip, port)),
                 ..Default::default()
             };
             match engine.apply_settings(&settings) {
