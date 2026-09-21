@@ -812,6 +812,9 @@ impl DaemonHandle {
             }
         };
         info!(addr = %http_listen, "HTTP server listening");
+        if let Some(posture) = unauthenticated_posture(&cfg) {
+            warn!(target: "torrentd::auth", addr = %http_listen, "{posture}");
+        }
 
         // The unit is `Type=notify`: systemd holds it in `activating` until
         // READY=1, so this must come after the listener is actually bound.
@@ -987,4 +990,70 @@ fn save_session_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
         }
     }
     Ok(())
+}
+
+/// What a daemon running without `[auth]` says about itself at boot.
+///
+/// `None` when `[auth]` is configured. Otherwise the operator opted into
+/// authenticating nothing — a legitimate posture behind a proxy that does its
+/// own access control, and one a running daemon stated nowhere: no boot line,
+/// no `/healthz` field, and an `sd_notify` status of "seeding; API on {addr}"
+/// either way. Somebody inheriting a host could not establish the posture from
+/// the journal, which is the first place they look.
+fn unauthenticated_posture(cfg: &Config) -> Option<String> {
+    if cfg.auth.is_some() {
+        return None;
+    }
+    Some(format!(
+        "running unauthenticated: allow_unauthenticated = true and no [auth] section, so \
+         every route on {} — including every mutating one — is open to anything that can \
+         reach it. Access control belongs to whatever sits in front of this daemon.",
+        cfg.http_listen,
+    ))
+}
+
+#[cfg(test)]
+mod posture_tests {
+    use super::*;
+
+    /// Top-level keys only. `[[profile]]` is a TOML table, so anything a test
+    /// appends has to land before it.
+    const TOP_LEVEL: &str = r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+"#;
+
+    const ONE_HOST_PROFILE: &str = r#"
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
+"#;
+
+    /// A config with `extra` appended to the top-level keys.
+    fn cfg_from(extra: &str) -> Config {
+        toml::from_str(&format!("{TOP_LEVEL}{extra}\n{ONE_HOST_PROFILE}")).expect("config parses")
+    }
+
+    #[test]
+    fn an_unauthenticated_daemon_says_so_and_names_its_bind() {
+        // The property: the posture is legible from the journal. A host
+        // inherited from someone else answers "does this authenticate?" with
+        // a log line, rather than with a config file the reader has to find
+        // and a default they have to know.
+        let line = unauthenticated_posture(&cfg_from("allow_unauthenticated = true"))
+            .expect("a daemon with no [auth] states its posture");
+        assert!(line.contains("unauthenticated"), "got: {line}");
+        assert!(line.contains("127.0.0.1:8080"), "it names the bind: {line}");
+    }
+
+    #[test]
+    fn a_daemon_with_auth_says_nothing() {
+        // A warning that fires either way is one nobody reads.
+        let hash = crate::auth::hash_password("hunter2").unwrap();
+        let cfg = cfg_from(&format!("[auth]\npassword_hash = \"{hash}\""));
+        assert_eq!(unauthenticated_posture(&cfg), None);
+    }
 }
