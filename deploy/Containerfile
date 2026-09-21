@@ -49,9 +49,11 @@ RUN --mount=type=cache,target=/root/.cache/torrentd,sharing=locked \
 # exists in any registry, so the runtime stage could never be pulled.
 FROM registry.fedoraproject.org/fedora-minimal:43
 
-# curl: used by HEALTHCHECK below. procps-ng: `pkill`, which the OpenVPN
-# teardown path shells out to — a hard runtime dependency for vpn_type =
-# "openvpn", and one no documentation mentioned.
+# curl: used by HEALTHCHECK below. procps-ng: `kill`, which the OpenVPN
+# teardown path shells out to against a pid it has verified against
+# /proc/<pid>/cmdline — a hard runtime dependency for vpn_type = "openvpn",
+# and one no documentation mentioned. (It provided `pkill` for the earlier
+# pattern-based teardown, which a recycled pid made unsafe.)
 RUN microdnf install -y \
         openssl ca-certificates curl iproute wireguard-tools nftables procps-ng \
     && microdnf clean all

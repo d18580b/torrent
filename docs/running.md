@@ -357,7 +357,7 @@ On a scratch pool, not your real one.
 | Build panics mentioning `npm` | Node missing; install it or use `--no-default-features` (§3). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
-| `/healthz` 503 `all_slots_fenced` | Every configured slot's tunnel is down, so the daemon is seeding nothing. Check `/slots`, bring the tunnels back, then restart — fenced slots do not resume themselves by design. |
+| `/healthz` 503 `all_slots_fenced` | Every configured slot is out of service — its tunnel is down, or it never came up at boot — so the daemon is seeding nothing. Check `/slots`, which lists both kinds, bring the tunnels back, then restart — fenced slots do not resume themselves by design. |
 | Daemon refuses to start, "vpn_profile must be /etc/wireguard/…" | A WireGuard slot's profile is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run as `torrentd` with `CAP_NET_ADMIN`. |
 | Adds fail with 409 and `vpn_down` | The slot is fenced. An operator restart is required by design. |
