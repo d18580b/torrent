@@ -41,6 +41,32 @@ run = "cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
 description = "Workspace tests (default features; parity with CI)"
 run = "cargo test --workspace"
 
+# The layers above `test`, each needing something `test` does not. They exist
+# as tasks because the rule at the top of this file — that a command lives in
+# exactly one place — was only true of fmt/lint/test: these four were spelled
+# out longhand in CI *and* in the README, so there were three copies of each
+# and nothing kept them in step.
+
+[tasks.test-shim]
+description = "Layer 2: FFI shim tests (needs the vendored libtorrent fixtures)"
+run = "cargo test -p libtorrent-sys --features shim-tests"
+
+[tasks.test-lifecycle]
+description = "Layer 3: real libtorrent sessions against real disk (no network)"
+run = "cargo test -p torrentd-engine --test lifecycle -- --ignored"
+
+[tasks.test-daemon]
+description = "Layer 3: spawns the built binary and drives it over HTTP"
+run = "cargo test -p torrentd --test daemon -- --ignored"
+
+[tasks.test-all]
+description = "Every automated test, including the ignored integration layers"
+depends = ["test", "test-shim", "test-lifecycle", "test-daemon"]
+
+[tasks.bench]
+description = "Layer 4: memory and throughput at scale (manual; minutes, GBs of RAM)"
+run = "cargo run --release -p torrentd-bench --"
+
 [tasks.web]
 description = "Type-check and bundle the web client"
 dir = "web"
