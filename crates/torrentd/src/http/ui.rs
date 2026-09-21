@@ -66,27 +66,49 @@ fn security_headers(res: &mut HeaderMap) {
 /// honour, but declining leaves the response in the identity encoding, which
 /// every client can read — the safe direction when nothing named the encoding
 /// explicitly.
+///
+/// Every field line is read, not just the first. `Accept-Encoding` is a
+/// list-valued header, and RFC 9110 §5.2-5.3 makes repeated field lines of one
+/// name semantically identical to a single comma-joined value — the same rule
+/// `forwarded::last_element` cites. Reading `HeaderMap::get` sees only the
+/// first line, so a client that sends `gzip` and `br` on two lines has the
+/// second silently ignored. Browsers send one line; intermediaries and
+/// embedded clients do not, and this is client input on an unauthenticated
+/// route.
+///
+/// A `q=0` **refuses** the encoding wherever it appears, including after an
+/// unqualified mention of the same name. Flattening the lines is necessary and
+/// not sufficient: with a plain `any()`, `br, br;q=0` still accepts `br`, so
+/// the function would read every line and still get the answer wrong. The cost
+/// of honouring the refusal is the identity encoding, which every client can
+/// read.
 fn accepts(headers: &HeaderMap, encoding: &str) -> bool {
-    headers
-        .get(header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| {
-            v.split(',').any(|part| {
-                let mut fields = part.split(';');
-                let name = fields.next().unwrap_or("").trim();
-                if !name.eq_ignore_ascii_case(encoding) {
-                    return false;
-                }
-                // Any `q` parameter on this entry; absent means q=1.
-                let q = fields.find_map(|p| {
-                    let (k, val) = p.split_once('=')?;
-                    k.trim()
-                        .eq_ignore_ascii_case("q")
-                        .then(|| val.trim().parse::<f32>().unwrap_or(0.0))
-                });
-                q.is_none_or(|q| q > 0.0)
-            })
-        })
+    let mut accepted = false;
+    for part in headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+    {
+        let mut fields = part.split(';');
+        let name = fields.next().unwrap_or("").trim();
+        if !name.eq_ignore_ascii_case(encoding) {
+            continue;
+        }
+        // Any `q` parameter on this entry; absent means q=1. An unparseable
+        // one is read as a refusal, which is the safe direction.
+        let q = fields.find_map(|p| {
+            let (k, val) = p.split_once('=')?;
+            k.trim()
+                .eq_ignore_ascii_case("q")
+                .then(|| val.trim().parse::<f32>().unwrap_or(0.0))
+        });
+        match q {
+            Some(q) if q <= 0.0 => return false,
+            _ => accepted = true,
+        }
+    }
+    accepted
 }
 
 /// The best precompressed sibling of `path` the client will take.
@@ -168,6 +190,7 @@ fn cache_control(path: &str) -> &'static str {
 
 fn respond(path: &str, req_headers: &HeaderMap) -> Option<Response> {
     let file = Assets::get(path)?;
+
     let tag = etag(&file);
 
     let mut headers = HeaderMap::new();
@@ -334,4 +357,79 @@ mod tests {
         assert!(cache_control("assets/index-abc123.js").contains("immutable"));
         assert_eq!(cache_control("index.html"), "no-cache");
     }
+
+    /// A `HeaderMap` where a repeated name becomes a second field line rather
+    /// than replacing the first, which is what an appending intermediary
+    /// produces.
+    fn appended(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.append(k.clone(), HeaderValue::from_str(v).unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn accept_encoding_is_read_across_every_field_line() {
+        // RFC 9110 §5.2-5.3: repeated field lines of one name are one
+        // comma-joined value. `HeaderMap::get` returns only the first, so a
+        // client that sends `gzip` and `br` on two lines has the second
+        // ignored and the 226 KB bundle goes out gzip-compressed — or, with
+        // the order reversed, raw.
+        let h = appended(&[
+            (header::ACCEPT_ENCODING, "gzip"),
+            (header::ACCEPT_ENCODING, "br"),
+        ]);
+        assert!(
+            accepts(&h, "br"),
+            "the second field line is part of the value"
+        );
+        assert!(accepts(&h, "gzip"));
+        assert!(!accepts(&h, "zstd"));
+
+        // And in the other order, so this is not passing by reading only the
+        // last line either.
+        let h = appended(&[
+            (header::ACCEPT_ENCODING, "br"),
+            (header::ACCEPT_ENCODING, "gzip"),
+        ]);
+        assert!(accepts(&h, "br"));
+        assert!(accepts(&h, "gzip"));
+    }
+
+    #[test]
+    fn a_q_zero_refuses_an_encoding_wherever_it_appears() {
+        // Flattening the field lines is necessary and not sufficient. A plain
+        // `any()` over the flattened list accepts `br, br;q=0`, because the
+        // first mention satisfies it and the refusal is never reached — so
+        // the function would read every line and still answer wrongly. A
+        // client that says q=0 has stated it cannot decode the encoding; the
+        // cost of believing it is the identity encoding, which every client
+        // can read.
+        assert!(
+            !accepts(&headers(&[(header::ACCEPT_ENCODING, "br, br;q=0")]), "br"),
+            "a later q=0 refuses an encoding named earlier",
+        );
+        assert!(
+            !accepts(&headers(&[(header::ACCEPT_ENCODING, "br;q=0, br")]), "br"),
+            "and an earlier one refuses a later mention",
+        );
+        assert!(
+            !accepts(
+                &appended(&[
+                    (header::ACCEPT_ENCODING, "gzip, br"),
+                    (header::ACCEPT_ENCODING, "br;q=0"),
+                ]),
+                "br",
+            ),
+            "including across field lines, which is the case both halves of \
+             this repair have to cover together",
+        );
+        // The refusal is specific to the encoding named.
+        assert!(accepts(
+            &headers(&[(header::ACCEPT_ENCODING, "gzip, br;q=0")]),
+            "gzip",
+        ));
+    }
+
 }
