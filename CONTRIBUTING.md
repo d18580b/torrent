@@ -186,12 +186,12 @@ fields have **one** spelling each, because log queries depend on it:
 
 | Field | Notes |
 | --- | --- |
-| `slot_id` | `default` in single-session mode. |
+| `profile_id` | `default` in single-session mode. |
 | `infohash` | Lowercase hex, 40 chars. **Never** `info_hash` — CI fails on that spelling anywhere in `crates/`. |
 | `op` | The engine operation: `add_torrent`, `remove_torrent`, `pause_torrent`, `resume_torrent`, `save_resume_data`, `set_upload_limit`, `set_file_priority`, `force_recheck`, `move_storage`, `apply_settings`. |
 | `alert_type` | Lowercase `AlertKind`, e.g. `add_torrent`. |
 | `error.kind` / `error.code` / `error.cause` | Short identifier, OS or libtorrent code, human-readable cause. |
-| `vpn_iface`, `tunnel_ip` | Slot networking. |
+| `vpn_iface`, `tunnel_ip` | Profile networking. |
 | `pending_resume_count` | Outstanding `save_resume_data` calls. |
 
 `error.kind` cannot be the first field in an `error!` macro — the macro name and

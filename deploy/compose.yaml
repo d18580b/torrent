@@ -5,7 +5,7 @@ services:
       dockerfile: deploy/Containerfile
     image: torrentd:latest
     restart: unless-stopped
-    # Multi-slot mode brings up its own WireGuard tunnels (and, with
+    # Multi-profile mode brings up its own WireGuard tunnels (and, with
     # network_kill_switch = true, installs an nftables table). Single-session
     # mode doesn't need NET_ADMIN; remove the cap_add + devices stanzas
     # in that case.

@@ -1,15 +1,15 @@
-//! Torrent → slot assignment registry.
+//! Torrent → profile assignment registry.
 //!
 //! Safety Rule 3 — global info-hash uniqueness — lives here. Every
 //! torrent the daemon loads (via API add, startup resume scan, or
 //! startup torrent dir scan) is first looked up here. Two outcomes:
 //!
-//!   - The infohash is already mapped to *any* slot → reject (409).
-//!   - The infohash is unmapped → assign to the requested slot, persist
+//!   - The infohash is already mapped to *any* profile → reject (409).
+//!   - The infohash is unmapped → assign to the requested profile, persist
 //!     the file, return Ok.
 //!
-//! Persistence is `<data_dir>/slot_assignments.json`, a flat JSON object
-//! `{ "<infohash_hex>": "<slot_id>" }`. Writes are atomic (temp file +
+//! Persistence is `<data_dir>/profile_assignments.json`, a flat JSON object
+//! `{ "<infohash_hex>": "<profile_id>" }`. Writes are atomic (temp file +
 //! fsync + rename) — a partial write must leave the previous registry
 //! file intact.
 
@@ -25,7 +25,7 @@ use thiserror::Error;
 use tracing::debug;
 use tracing::info;
 
-use crate::slot::SlotId;
+use crate::profile::ProfileId;
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
@@ -35,17 +35,17 @@ pub enum RegistryError {
     #[error(transparent)]
     Parse(#[from] serde_json::Error),
 
-    #[error("infohash {infohash} already assigned to slot {existing}")]
+    #[error("infohash {infohash} already assigned to profile {existing}")]
     Conflict {
         infohash: InfoHash,
-        existing: SlotId,
+        existing: ProfileId,
     },
 }
 
 #[derive(Debug)]
 pub struct AssignmentRegistry {
     path: PathBuf,
-    inner: RwLock<HashMap<InfoHash, SlotId>>,
+    inner: RwLock<HashMap<InfoHash, ProfileId>>,
 }
 
 impl AssignmentRegistry {
@@ -59,8 +59,37 @@ impl AssignmentRegistry {
 
     /// Load from disk; missing file is not an error (empty registry).
     pub fn load(path: impl Into<PathBuf>) -> Result<Self, RegistryError> {
+        Self::load_from(path, None)
+    }
+
+    /// Load `path`, falling back to `legacy` when `path` does not exist.
+    ///
+    /// The fallback is read-only: the first `assign` or `remove` persists under
+    /// `path`, so the old file is left alone rather than deleted or moved. An
+    /// operator who rolls back gets their original file intact.
+    pub fn load_from(
+        path: impl Into<PathBuf>,
+        legacy: Option<PathBuf>,
+    ) -> Result<Self, RegistryError> {
         let path = path.into();
-        let map: HashMap<InfoHash, SlotId> = match fs::read(&path) {
+        let source = match legacy {
+            Some(l) if !path.exists() && l.exists() => {
+                info!(
+                    target: "torrentd_engine::registry",
+                    from = %l.display(),
+                    to = %path.display(),
+                    "reading the pre-profiles assignment registry; \
+                     it will be rewritten under the new name on the next change",
+                );
+                l
+            }
+            _ => path.clone(),
+        };
+        Self::load_inner(path, source)
+    }
+
+    fn load_inner(path: PathBuf, source: PathBuf) -> Result<Self, RegistryError> {
+        let map: HashMap<InfoHash, ProfileId> = match fs::read(&source) {
             Ok(bytes) if !bytes.is_empty() => {
                 let raw: HashMap<String, String> = serde_json::from_slice(&bytes)?;
                 let mut out = HashMap::with_capacity(raw.len());
@@ -73,11 +102,11 @@ impl AssignmentRegistry {
                         );
                         continue;
                     };
-                    out.insert(ih, SlotId::new(v));
+                    out.insert(ih, ProfileId::new(v));
                 }
                 out
             }
-            Ok(_) | Err(_) if !path.exists() => HashMap::new(),
+            Ok(_) | Err(_) if !source.exists() => HashMap::new(),
             Ok(_) => HashMap::new(),
             Err(e) => return Err(e.into()),
         };
@@ -100,22 +129,22 @@ impl AssignmentRegistry {
         self.inner.read().is_empty()
     }
 
-    pub fn lookup(&self, ih: &InfoHash) -> Option<SlotId> {
+    pub fn lookup(&self, ih: &InfoHash) -> Option<ProfileId> {
         self.inner.read().get(ih).cloned()
     }
 
-    /// Atomically assign an infohash to a slot. Conflict iff the infohash
-    /// is already mapped to *any* slot.
-    pub fn assign(&self, ih: InfoHash, slot: SlotId) -> Result<(), RegistryError> {
+    /// Atomically assign an infohash to a profile. Conflict iff the infohash
+    /// is already mapped to *any* profile.
+    pub fn assign(&self, ih: InfoHash, profile: ProfileId) -> Result<(), RegistryError> {
         {
             let mut g = self.inner.write();
             if let Some(existing) = g.get(&ih) {
-                if *existing == slot {
+                if *existing == profile {
                     debug!(
                         target: "torrentd_engine::registry",
                         infohash = %ih,
-                        slot_id = %slot,
-                        "assign no-op (already assigned to same slot)",
+                        profile_id = %profile,
+                        "assign no-op (already assigned to same profile)",
                     );
                     return Ok(());
                 }
@@ -124,20 +153,20 @@ impl AssignmentRegistry {
                     existing: existing.clone(),
                 });
             }
-            g.insert(ih, slot.clone());
+            g.insert(ih, profile.clone());
         }
         self.persist()?;
         info!(
             target: "torrentd_engine::registry",
             infohash = %ih,
-            slot_id = %slot,
+            profile_id = %profile,
             "assigned",
         );
         Ok(())
     }
 
     /// Remove an assignment. No-op if the infohash isn't present.
-    pub fn remove(&self, ih: &InfoHash) -> Result<Option<SlotId>, RegistryError> {
+    pub fn remove(&self, ih: &InfoHash) -> Result<Option<ProfileId>, RegistryError> {
         let prev = self.inner.write().remove(ih);
         if prev.is_some() {
             self.persist()?;
@@ -150,10 +179,10 @@ impl AssignmentRegistry {
         Ok(prev)
     }
 
-    /// Snapshot of every (infohash, slot) pair, sorted by slot for
+    /// Snapshot of every (infohash, profile) pair, sorted by profile for
     /// deterministic iteration in tests and startup logs.
-    pub fn entries(&self) -> Vec<(InfoHash, SlotId)> {
-        let mut v: Vec<(InfoHash, SlotId)> = self
+    pub fn entries(&self) -> Vec<(InfoHash, ProfileId)> {
+        let mut v: Vec<(InfoHash, ProfileId)> = self
             .inner
             .read()
             .iter()
@@ -163,22 +192,22 @@ impl AssignmentRegistry {
         v
     }
 
-    /// All infohashes currently assigned to `slot`.
-    pub fn for_slot(&self, slot: &SlotId) -> Vec<InfoHash> {
+    /// All infohashes currently assigned to `profile`.
+    pub fn for_profile(&self, profile: &ProfileId) -> Vec<InfoHash> {
         self.inner
             .read()
             .iter()
-            .filter(|(_, s)| *s == slot)
+            .filter(|(_, s)| *s == profile)
             .map(|(ih, _)| *ih)
             .collect()
     }
 
-    /// Iterate over every (infohash, slot) and execute `visit`. Used by
+    /// Iterate over every (infohash, profile) and execute `visit`. Used by
     /// the startup cross-check that compares the registry against
-    /// resume files on disk per slot.
-    pub fn for_each<F: FnMut(&InfoHash, &SlotId)>(&self, mut visit: F) {
-        for (ih, slot) in self.inner.read().iter() {
-            visit(ih, slot);
+    /// resume files on disk per profile.
+    pub fn for_each<F: FnMut(&InfoHash, &ProfileId)>(&self, mut visit: F) {
+        for (ih, profile) in self.inner.read().iter() {
+            visit(ih, profile);
         }
     }
 
@@ -236,7 +265,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([1u8; 20]);
-        r.assign(ih, SlotId::new("a")).unwrap();
+        r.assign(ih, ProfileId::new("a")).unwrap();
         assert_eq!(r.lookup(&ih).unwrap().as_str(), "a");
         assert_eq!(r.len(), 1);
     }
@@ -246,22 +275,67 @@ mod tests {
         let dir = tempdir().unwrap();
         let r = AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([2u8; 20]);
-        r.assign(ih, SlotId::new("a")).unwrap();
-        let err = r.assign(ih, SlotId::new("b")).unwrap_err();
+        r.assign(ih, ProfileId::new("a")).unwrap();
+        let err = r.assign(ih, ProfileId::new("b")).unwrap_err();
         assert!(
             matches!(err, RegistryError::Conflict { existing, .. } if existing.as_str() == "a")
         );
     }
 
     #[test]
-    fn assign_same_slot_is_idempotent() {
+    fn assign_same_profile_is_idempotent() {
         let dir = tempdir().unwrap();
         let r = AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([3u8; 20]);
-        let slot = SlotId::new("x");
-        r.assign(ih, slot.clone()).unwrap();
-        r.assign(ih, slot).unwrap(); // OK, same slot
+        let profile = ProfileId::new("x");
+        r.assign(ih, profile.clone()).unwrap();
+        r.assign(ih, profile).unwrap(); // OK, same profile
         assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn the_pre_profiles_registry_is_read_once_and_rewritten_under_the_new_name() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("slot_assignments.json");
+        let current = dir.path().join("profile_assignments.json");
+        {
+            let r = AssignmentRegistry::new_empty(&legacy);
+            r.assign(InfoHash([0xAA; 20]), ProfileId::new("acct_a"))
+                .unwrap();
+        }
+
+        let r = AssignmentRegistry::load_from(&current, Some(legacy.clone())).unwrap();
+        assert_eq!(
+            r.lookup(&InfoHash([0xAA; 20])).unwrap().as_str(),
+            "acct_a",
+            "without this the daemon starts with no record of who owns what, and the \
+             cross-profile uniqueness rule has nothing to enforce against",
+        );
+
+        // Writing goes to the new name; the old file is left intact so a
+        // rollback still has it.
+        r.assign(InfoHash([0xBB; 20]), ProfileId::new("acct_b"))
+            .unwrap();
+        assert!(current.exists());
+        assert_eq!(AssignmentRegistry::load(&current).unwrap().len(), 2);
+        assert_eq!(AssignmentRegistry::load(&legacy).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_current_registry_wins_over_a_legacy_one() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("slot_assignments.json");
+        let current = dir.path().join("profile_assignments.json");
+        AssignmentRegistry::new_empty(&legacy)
+            .assign(InfoHash([0xAA; 20]), ProfileId::new("stale"))
+            .unwrap();
+        AssignmentRegistry::new_empty(&current)
+            .assign(InfoHash([0xBB; 20]), ProfileId::new("live"))
+            .unwrap();
+
+        let r = AssignmentRegistry::load_from(&current, Some(legacy)).unwrap();
+        assert_eq!(r.len(), 1);
+        assert!(r.lookup(&InfoHash([0xAA; 20])).is_none());
     }
 
     #[test]
@@ -271,9 +345,9 @@ mod tests {
 
         {
             let r = AssignmentRegistry::new_empty(&path);
-            r.assign(InfoHash([0xAA; 20]), SlotId::new("acct_a"))
+            r.assign(InfoHash([0xAA; 20]), ProfileId::new("acct_a"))
                 .unwrap();
-            r.assign(InfoHash([0xBB; 20]), SlotId::new("acct_b"))
+            r.assign(InfoHash([0xBB; 20]), ProfileId::new("acct_b"))
                 .unwrap();
             assert_eq!(r.len(), 2);
         }
@@ -287,16 +361,16 @@ mod tests {
     }
 
     #[test]
-    fn for_slot_returns_only_matching() {
+    fn for_profile_returns_only_matching() {
         let dir = tempdir().unwrap();
         let r = AssignmentRegistry::new_empty(dir.path().join("reg.json"));
-        r.assign(InfoHash([1u8; 20]), SlotId::new("a")).unwrap();
-        r.assign(InfoHash([2u8; 20]), SlotId::new("a")).unwrap();
-        r.assign(InfoHash([3u8; 20]), SlotId::new("b")).unwrap();
+        r.assign(InfoHash([1u8; 20]), ProfileId::new("a")).unwrap();
+        r.assign(InfoHash([2u8; 20]), ProfileId::new("a")).unwrap();
+        r.assign(InfoHash([3u8; 20]), ProfileId::new("b")).unwrap();
 
-        let mut as_a = r.for_slot(&SlotId::new("a"));
+        let mut as_a = r.for_profile(&ProfileId::new("a"));
         as_a.sort_by_key(|ih| ih.0);
         assert_eq!(as_a.len(), 2);
-        assert_eq!(r.for_slot(&SlotId::new("b")).len(), 1);
+        assert_eq!(r.for_profile(&ProfileId::new("b")).len(), 1);
     }
 }

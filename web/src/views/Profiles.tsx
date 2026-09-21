@@ -1,17 +1,17 @@
 import { useQuery } from '@tanstack/react-query'
-import { api, type SlotSummary, type Status } from '../lib/api'
+import { api, type ProfileSummary, type Status } from '../lib/api'
 import { count, rate } from '../lib/format'
 import { Card, ErrorBanner, StatePill } from '../components/Bits'
 
-/// Session health. In multi-slot mode each slot is a libtorrent session pinned
-/// to its own VPN tunnel, and a fenced slot is the thing an operator most needs
+/// Session health. In multi-profile mode each profile is a libtorrent session pinned
+/// to its own VPN tunnel, and a fenced profile is the thing an operator most needs
 /// to notice — it stops seeding and will not resume without intervention.
-export function Slots() {
+export function Profiles() {
   const status = useQuery({ queryKey: ['status'], queryFn: () => api.get<Status>('/api/status') })
-  const slots = useQuery({
-    queryKey: ['slots'],
-    queryFn: () => api.get<SlotSummary[]>('/api/slots'),
-    // Single-session mode does not mount /slots at all.
+  const profiles = useQuery({
+    queryKey: ['profiles'],
+    queryFn: () => api.get<ProfileSummary[]>('/api/profiles'),
+    // Single-session mode does not mount /profiles at all.
     retry: false,
   })
 
@@ -19,7 +19,7 @@ export function Slots() {
 
   return (
     <div className="stack">
-      <h2>Slots</h2>
+      <h2>Profiles</h2>
       <ErrorBanner error={status.error} />
 
       {s && (
@@ -33,27 +33,27 @@ export function Slots() {
         </div>
       )}
 
-      {slots.isError && (
+      {profiles.isError && (
         <div className="banner">
-          Single-session mode — no VPN slots configured. Add <code>[[slot]]</code> tables to
+          Single-session mode — no VPN profiles configured. Add <code>[[profile]]</code> tables to
           run multi-account seeding with per-account tunnel isolation.
         </div>
       )}
 
-      {slots.data && slots.data.length > 0 && (
+      {profiles.data && profiles.data.length > 0 && (
         <div className="scroll">
           <table>
             <thead>
               <tr>
-                <th>Slot</th><th>Status</th><th>Tunnel IP</th>
+                <th>Profile</th><th>Status</th><th>Tunnel IP</th>
                 <th className="num">Port</th><th>Forwarding</th>
                 <th className="num">Torrents</th><th>User agent</th>
               </tr>
             </thead>
             <tbody>
-              {slots.data.map((sl) => (
-                <tr key={sl.slot_id}>
-                  <td><strong>{sl.slot_id}</strong></td>
+              {profiles.data.map((sl) => (
+                <tr key={sl.profile_id}>
+                  <td><strong>{sl.profile_id}</strong></td>
                   <td>
                     <StatePill state={sl.status === 'active' ? 'adopted' : 'overlap'} />
                     {sl.status !== 'active' && (
@@ -72,9 +72,9 @@ export function Slots() {
         </div>
       )}
 
-      {slots.data?.some((sl) => sl.status === 'vpn_down') && (
+      {profiles.data?.some((sl) => sl.status === 'vpn_down') && (
         <div className="banner err">
-          A slot is fenced: its tunnel failed, every torrent in it was paused, and it will not
+          A profile is fenced: its tunnel failed, every torrent in it was paused, and it will not
           resume automatically. Fix the tunnel and restart the daemon.
         </div>
       )}

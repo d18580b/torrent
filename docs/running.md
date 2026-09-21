@@ -33,9 +33,9 @@ runtime and are easy to miss because nothing checks for them at startup:
 
 | Binary | Package | Needed for |
 | --- | --- | --- |
-| `ip` | `iproute2` / `iproute` | Any multi-slot deployment. Polled every 30s per slot for the tunnel IP. |
-| `wg`, `wg-quick` | `wireguard-tools` | WireGuard slots — bring-up, teardown, handshake age. |
-| `openvpn`, `pkill` | `openvpn`, `procps-ng` | OpenVPN slots. `pkill` is how teardown stops the process. |
+| `ip` | `iproute2` / `iproute` | Any multi-profile deployment. Polled every 30s per profile for the tunnel IP. |
+| `wg`, `wg-quick` | `wireguard-tools` | WireGuard profiles — bring-up, teardown, handshake age. |
+| `openvpn`, `pkill` | `openvpn`, `procps-ng` | OpenVPN profiles. `pkill` is how teardown stops the process. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
 
 Single-session mode needs none of them.
@@ -144,7 +144,7 @@ typo is caught rather than ignored.
 | Key | Default |
 | --- | --- |
 | `log_level` | `info` |
-| `registry_path` | `<resume_dir>/../slot_assignments.json` |
+| `registry_path` | `<resume_dir>/../profile_assignments.json` |
 | `session_state_path` | `<resume_dir>/../session_state.dat` |
 | `vpn_handshake_max_age_secs` | `180` |
 | `network_kill_switch` | `false` |
@@ -162,13 +162,13 @@ the daemon's own state), `library_dir` (required), `db_path`
 moving and deleting files inside your roots; the index, matching, adoption and
 reporting are all read-only without it.
 
-**`[[slot]]`** (optional; any entry switches on multi-slot mode) — `id`,
-`vpn_profile`, `vpn_type`, `vpn_interface`, `peer_fingerprint_hex` (16 hex
+**`[[profile]]`** (optional; any entry switches on multi-profile mode) — `id`,
+`vpn_config`, `vpn_type`, `vpn_interface`, `peer_fingerprint_hex` (16 hex
 chars, must not be libtorrent's default), `user_agent`, `resume_dir` and
 `torrent_dir` are all required. `listen_port` is required only for
 `port_forward = "static"`. `id`, `listen_port`, `vpn_interface`,
 `peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all be
-unique across slots.
+unique across profiles.
 
 Validate without starting anything:
 
@@ -208,7 +208,7 @@ The daemon sets none of these itself.
   `file_pool_size = 1000` will exhaust a default 1024-descriptor limit
   immediately. The systemd unit sets 65536 and the compose file matches; **a
   bare-metal run outside either gets nothing** and will hit `EMFILE`.
-- **`net.ipv4.conf.all.rp_filter = 2`** for multi-slot. Sockets are source-bound
+- **`net.ipv4.conf.all.rp_filter = 2`** for multi-profile. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on
   bare metal.
@@ -236,7 +236,7 @@ tunnels down, and exits.
 ## 9. First-run checks
 
 ```bash
-curl -s localhost:8080/healthz            # {"ok":true,"slots":1,"heartbeat_age_secs":0}
+curl -s localhost:8080/healthz            # {"ok":true,"profiles":1,"heartbeat_age_secs":0}
 curl -s localhost:8080/status | jq        # counts by state, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
@@ -297,8 +297,8 @@ On a scratch pool, not your real one.
    daemon does not clear it — only a rescan does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
    /api/pool/plans` and `DELETE /torrents/:hash?delete_files=true` both 403.
-5. **Multi-slot: pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
-   slot should pause its torrents, report `vpn_down`, and refuse adds and
+5. **Multi-profile: pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
+   profile should pause its torrents, report `vpn_down`, and refuse adds and
    resumes with 409 until you restart the daemon. It must not restart itself.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
@@ -313,6 +313,6 @@ On a scratch pool, not your real one.
 | Build panics mentioning `npm` | Node missing; install it or use `--no-default-features` (§3). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
-| Adds fail with 409 and `vpn_down` | The slot is fenced. An operator restart is required by design. |
+| Adds fail with 409 and `vpn_down` | The profile is fenced. An operator restart is required by design. |
 | Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
-| Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole slot when its tunnel drops. Check `/slots`, then `POST /slots/<id>/resume-all`. |
+| Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `/profiles`, then `POST /profiles/<id>/resume-all`. |

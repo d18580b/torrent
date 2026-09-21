@@ -189,7 +189,7 @@ fn import_legacy(store: &mut PoolStore, registry_path: &Path) -> anyhow::Result<
     let n = store.import_legacy_registry(&raw)?;
     if n > 0 {
         println!(
-            "  imported {n} slot assignments from {}",
+            "  imported {n} profile assignments from {}",
             registry_path.display(),
         );
     }

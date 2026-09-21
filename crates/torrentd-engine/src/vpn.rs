@@ -23,7 +23,7 @@ pub enum VpnType {
 }
 
 #[derive(Clone, Debug)]
-pub struct VpnProfile {
+pub struct VpnTunnel {
     pub r#type: VpnType,
     /// e.g. /etc/wireguard/wg-acct-a.conf
     pub config_path: PathBuf,
@@ -48,7 +48,7 @@ pub trait VpnManager: Send + Sync + std::fmt::Debug {
     /// Bring the tunnel up and return its assigned IP. Blocks (with an
     /// internal timeout — says 30s) until either an IP is
     /// observed or the timeout elapses.
-    fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, VpnError>;
+    fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError>;
 
     /// Read the current IPv4 of `iface`. Used by the 30-second health
     /// poll to detect mid-session IP changes.
@@ -92,7 +92,7 @@ impl MockVpn {
 }
 
 impl VpnManager for MockVpn {
-    fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, VpnError> {
+    fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError> {
         let mut g = self.inner.lock();
         g.bring_up_calls.push(profile.interface.clone());
         match g.ips.get(&profile.interface) {
@@ -131,7 +131,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
         m.set_ip("wg0", ip);
 
-        let p = VpnProfile {
+        let p = VpnTunnel {
             r#type: VpnType::Wireguard,
             config_path: PathBuf::from("/etc/wireguard/wg0.conf"),
             interface: "wg0".to_string(),

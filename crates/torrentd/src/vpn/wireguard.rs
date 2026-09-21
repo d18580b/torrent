@@ -15,7 +15,7 @@ use std::time::UNIX_EPOCH;
 
 use torrentd_engine::VpnError;
 use torrentd_engine::VpnManager;
-use torrentd_engine::VpnProfile;
+use torrentd_engine::VpnTunnel;
 use tracing::info;
 use tracing::warn;
 
@@ -97,7 +97,7 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
     if latest > now {
         // The handshake is stamped in our future, so one of the two clocks has
         // moved. Treating that as an enormous age is the dangerous reading: it
-        // would fence a healthy slot permanently, and fencing requires an
+        // would fence a healthy profile permanently, and fencing requires an
         // operator to undo. Report it as fresh and say why.
         warn!(
             target: "torrentd::vpn::wireguard",
@@ -167,7 +167,7 @@ impl WireguardManager {
     /// address. Anything less and the daemon would be binding its sockets to a
     /// tunnel it cannot vouch for, which is the one thing Safety Rule 1 exists
     /// to prevent.
-    fn adoptable(&self, profile: &VpnProfile) -> Option<IpAddr> {
+    fn adoptable(&self, profile: &VpnTunnel) -> Option<IpAddr> {
         let live = interface_public_key(&profile.interface)?;
         let expected = profile_public_key(&profile.config_path)?;
         if live != expected {
@@ -186,7 +186,7 @@ impl WireguardManager {
 }
 
 impl VpnManager for WireguardManager {
-    fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, VpnError> {
+    fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError> {
         info!(
             target: "torrentd::vpn::wireguard",
             vpn_iface = %profile.interface,
@@ -201,8 +201,8 @@ impl VpnManager for WireguardManager {
         if !status.success() {
             // `wg-quick up` refuses an interface that already exists, which is
             // what a previous process leaves behind when it is killed rather
-            // than shut down: the tunnel outlives it, every slot then fails to
-            // come up, and the daemon exits because no slot came up. Restarting
+            // than shut down: the tunnel outlives it, every profile then fails to
+            // come up, and the daemon exits because no profile came up. Restarting
             // was impossible without an operator tearing the tunnels down by
             // hand — on a host whose whole point is to keep seeding.
             //

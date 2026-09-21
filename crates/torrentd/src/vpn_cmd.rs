@@ -1,8 +1,8 @@
-//! `torrentd vpn check` — verify a slot's VPN configuration against the real
+//! `torrentd vpn check` — verify a profile's VPN configuration against the real
 //! host, with no libtorrent session, no torrents and no tracker contact.
 //!
 //! Every other way of exercising this code needs a fully configured daemon: a
-//! pool, a torrent library, real payload, and an operator watching `/slots` for
+//! pool, a torrent library, real payload, and an operator watching `/profiles` for
 //! thirty seconds to see whether the health monitor fences anything. That
 //! conflates two independent things — "does my VPN configuration work" and
 //! "does my seeding setup work" — and it is the first of those that has to be
@@ -12,7 +12,7 @@
 //! first failure here is the first failure the daemon would hit.
 //!
 //! Observe-only by default. Nothing in the default path mutates host state:
-//! it reads interfaces, reads `wg` output, and — for a NAT-PMP slot — asks the
+//! it reads interfaces, reads `wg` output, and — for a NAT-PMP profile — asks the
 //! gateway for a mapping and immediately releases it again. `--bring-up` opts
 //! into raising and lowering tunnels, which is the one thing that changes the
 //! machine.
@@ -25,7 +25,7 @@ use serde::Serialize;
 use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
-use torrentd_engine::SlotConfig;
+use torrentd_engine::ProfileConfig;
 use torrentd_engine::VpnType;
 
 use crate::config::Config;
@@ -39,7 +39,7 @@ const EGRESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Verdict {
     Pass,
     Fail,
-    /// Correctly configured to not apply — a NAT-PMP check on a static slot,
+    /// Correctly configured to not apply — a NAT-PMP check on a static profile,
     /// a handshake check on OpenVPN. Distinct from `Pass` so a summary cannot
     /// read as "everything was verified" when most of it was skipped.
     Skip,
@@ -88,13 +88,13 @@ impl Check {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SlotReport {
-    pub slot_id: String,
+pub struct ProfileReport {
+    pub profile_id: String,
     pub vpn_type: &'static str,
     pub checks: Vec<Check>,
 }
 
-impl SlotReport {
+impl ProfileReport {
     pub fn failed(&self) -> bool {
         self.checks.iter().any(|c| c.verdict == Verdict::Fail)
     }
@@ -103,13 +103,13 @@ impl SlotReport {
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub host: Vec<Check>,
-    pub slots: Vec<SlotReport>,
+    pub profiles: Vec<ProfileReport>,
 }
 
 impl Report {
     pub fn failed(&self) -> bool {
         self.host.iter().any(|c| c.verdict == Verdict::Fail)
-            || self.slots.iter().any(SlotReport::failed)
+            || self.profiles.iter().any(ProfileReport::failed)
     }
 }
 
@@ -124,7 +124,7 @@ fn tool_available(bin: &str, probe_arg: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Checks that are about the host, not any one slot.
+/// Checks that are about the host, not any one profile.
 fn host_checks(cfg: &Config) -> Vec<Check> {
     let mut out = Vec::new();
 
@@ -138,7 +138,7 @@ fn host_checks(cfg: &Config) -> Vec<Check> {
     });
 
     // rp_filter in strict mode drops the replies to a source-bound socket, so
-    // a multi-slot daemon looks like a tunnel that connects and carries no
+    // a multi-profile daemon looks like a tunnel that connects and carries no
     // traffic. docs/running.md calls for 2 (loose).
     let rp = std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/rp_filter")
         .ok()
@@ -179,7 +179,11 @@ fn host_checks(cfg: &Config) -> Vec<Check> {
             ),
         });
         if let Ok(uid) = vpn::killswitch::current_uid() {
-            let tunnels: Vec<String> = cfg.slot.iter().map(|s| s.vpn_interface.clone()).collect();
+            let tunnels: Vec<String> = cfg
+                .profile
+                .iter()
+                .map(|s| s.vpn_interface.clone())
+                .collect();
             out.push(Check::pass(
                 "kill_switch_ruleset",
                 format!(
@@ -199,8 +203,8 @@ fn host_checks(cfg: &Config) -> Vec<Check> {
 ///
 /// This is the check that distinguishes a tunnel which exists from a tunnel
 /// which works, and it is the same question the daemon asks implicitly of
-/// every slot: `outgoing_interfaces` is pinned to the tunnel IP, so if traffic
-/// cannot leave from that source address the slot connects to no peers and
+/// every profile: `outgoing_interfaces` is pinned to the tunnel IP, so if traffic
+/// cannot leave from that source address the profile connects to no peers and
 /// announces to no tracker, while looking perfectly healthy to the IP-presence
 /// check.
 ///
@@ -222,7 +226,7 @@ fn egress_probe(src: IpAddr, dest: SocketAddr) -> Check {
                 "egress",
                 format!(
                     "cannot bind a UDP socket to the tunnel address {src}: {e}. Every socket \
-                     in this slot would fail the same way."
+                     in this profile would fail the same way."
                 ),
             )
         }
@@ -272,26 +276,26 @@ fn egress_probe(src: IpAddr, dest: SocketAddr) -> Check {
     }
 }
 
-fn slot_checks(
+fn profile_checks(
     cfg: &Config,
-    slot: &SlotConfig,
+    profile: &ProfileConfig,
     bring_up: bool,
     egress: Option<SocketAddr>,
-) -> SlotReport {
+) -> ProfileReport {
     let mut checks = Vec::new();
-    let iface = slot.vpn_interface.as_str();
+    let iface = profile.vpn_interface.as_str();
 
     // 1. The profile the daemon would hand to wg-quick / openvpn.
-    checks.push(match std::fs::metadata(&slot.vpn_profile) {
+    checks.push(match std::fs::metadata(&profile.vpn_config) {
         Ok(_) => Check::pass(
             "profile",
-            format!("{} is readable", slot.vpn_profile.display()),
+            format!("{} is readable", profile.vpn_config.display()),
         ),
-        Err(e) => Check::fail("profile", format!("{}: {e}", slot.vpn_profile.display())),
+        Err(e) => Check::fail("profile", format!("{}: {e}", profile.vpn_config.display())),
     });
 
-    // 2. The tools that slot's type needs.
-    match slot.vpn_type {
+    // 2. The tools that profile's type needs.
+    match profile.vpn_type {
         VpnType::Wireguard => {
             checks.push(if tool_available("wg", "--version") {
                 Check::pass("wireguard_tools", "`wg` is available")
@@ -318,22 +322,22 @@ fn slot_checks(
     }
 
     // 3. Optionally raise the tunnel, exactly as boot would.
-    let manager = vpn::for_type(slot.vpn_type, &cfg.state_dir());
+    let manager = vpn::for_type(profile.vpn_type, &cfg.state_dir());
     if bring_up {
-        match manager.bring_up(&slot.vpn_profile()) {
+        match manager.bring_up(&profile.vpn_config()) {
             Ok(ip) => checks.push(Check::pass("bring_up", format!("tunnel came up on {ip}"))),
             Err(e) => {
                 checks.push(Check::fail("bring_up", format!("{e}")));
-                return SlotReport {
-                    slot_id: slot.id.as_str().to_string(),
-                    vpn_type: vpn_type_str(slot.vpn_type),
+                return ProfileReport {
+                    profile_id: profile.id.as_str().to_string(),
+                    vpn_type: vpn_type_str(profile.vpn_type),
                     checks,
                 };
             }
         }
     }
 
-    // 4. The address the daemon would bind every socket in this slot to.
+    // 4. The address the daemon would bind every socket in this profile to.
     let tunnel_ip = match vpn::first_ipv4(iface) {
         Ok(v4) => {
             checks.push(Check::pass("tunnel_ip", format!("{iface} has {v4}")));
@@ -357,7 +361,7 @@ fn slot_checks(
 
     // 5. Handshake liveness — the same probe and the same threshold the health
     //    monitor applies every 30 seconds.
-    match slot.vpn_type {
+    match profile.vpn_type {
         VpnType::Wireguard => {
             let max = Duration::from_secs(cfg.vpn_handshake_max_age_secs);
             match vpn::wireguard_handshake_age(iface) {
@@ -373,7 +377,7 @@ fn slot_checks(
                     "handshake",
                     format!(
                         "last handshake {}s ago, over the {}s threshold: the daemon would \
-                         fence this slot",
+                         fence this profile",
                         age.as_secs(),
                         max.as_secs()
                     ),
@@ -401,16 +405,16 @@ fn slot_checks(
 
     // 6. Port forwarding, against the real gateway. The mapping is released
     //    immediately; this is a negotiation, not a reservation.
-    match slot.port_forward {
+    match profile.port_forward {
         PortForwardMode::Static => {
             checks.push(Check::skip(
                 "port_forward",
-                format!("static listen_port {:?}", slot.listen_port),
+                format!("static listen_port {:?}", profile.listen_port),
             ));
         }
         PortForwardMode::Natpmp => match (
             tunnel_ip,
-            slot.port_forward_gateway_or_default().parse::<IpAddr>(),
+            profile.port_forward_gateway_or_default().parse::<IpAddr>(),
         ) {
             (Some(bind_ip), Ok(gateway)) => {
                 let req = PortMapRequest {
@@ -455,9 +459,9 @@ fn slot_checks(
         checks.push(Check::pass("bring_down", "tunnel taken back down"));
     }
 
-    SlotReport {
-        slot_id: slot.id.as_str().to_string(),
-        vpn_type: vpn_type_str(slot.vpn_type),
+    ProfileReport {
+        profile_id: profile.id.as_str().to_string(),
+        vpn_type: vpn_type_str(profile.vpn_type),
         checks,
     }
 }
@@ -478,26 +482,26 @@ pub fn check(
     bring_up: bool,
     egress: Option<SocketAddr>,
 ) -> anyhow::Result<()> {
-    if cfg.slot.is_empty() {
+    if cfg.profile.is_empty() {
         anyhow::bail!(
-            "no [[slot]] entries are configured, so there is no VPN to check. \
+            "no [[profile]] entries are configured, so there is no VPN to check. \
              Single-session mode does not use a tunnel."
         );
     }
-    let selected: Vec<&SlotConfig> = cfg
-        .slot
+    let selected: Vec<&ProfileConfig> = cfg
+        .profile
         .iter()
         .filter(|s| only.is_none_or(|id| s.id.as_str() == id))
         .collect();
     if selected.is_empty() {
-        anyhow::bail!("no slot matches {:?}", only.unwrap_or_default());
+        anyhow::bail!("no profile matches {:?}", only.unwrap_or_default());
     }
 
     let report = Report {
         host: host_checks(cfg),
-        slots: selected
+        profiles: selected
             .into_iter()
-            .map(|s| slot_checks(cfg, s, bring_up, egress))
+            .map(|s| profile_checks(cfg, s, bring_up, egress))
             .collect(),
     };
 
@@ -527,8 +531,8 @@ fn print_human(report: &Report) {
     for c in &report.host {
         println!("  [{}] {:<20} {}", symbol(c.verdict), c.name, c.detail);
     }
-    for s in &report.slots {
-        println!("\nslot {} ({})", s.slot_id, s.vpn_type);
+    for s in &report.profiles {
+        println!("\nprofile {} ({})", s.profile_id, s.vpn_type);
         for c in &s.checks {
             println!("  [{}] {:<20} {}", symbol(c.verdict), c.name, c.detail);
         }
@@ -543,8 +547,8 @@ mod tests {
     fn a_report_fails_when_any_check_fails() {
         let r = Report {
             host: vec![Check::pass("a", "")],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "wireguard",
                 checks: vec![Check::pass("b", ""), Check::fail("c", "")],
             }],
@@ -558,8 +562,8 @@ mod tests {
         // reporting it as a failure would train an operator to ignore them.
         let r = Report {
             host: vec![Check::unknown("a", "")],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "openvpn",
                 checks: vec![Check::skip("b", ""), Check::unknown("c", "")],
             }],

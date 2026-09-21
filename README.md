@@ -137,36 +137,36 @@ With `[pool]` configured: `GET /api/pool`, `/pool/tree`, `/pool/torrents`,
 `/pool/verify`; and the plan surface `GET`/`POST /api/pool/plans`,
 `GET`/`DELETE /api/pool/plans/:id`, `POST /api/pool/plans/:id/apply`.
 
-Multi-slot mode additionally mounts `GET /slots`, `/slots/:id`,
-`/slots/:id/torrents` and `POST /slots/:id/pause-all` \| `/resume-all`.
+Multi-profile mode additionally mounts `GET /profiles`, `/profiles/:id`,
+`/profiles/:id/torrents` and `POST /profiles/:id/pause-all` \| `/resume-all`.
 
 ## Modes
 
 One config file drives everything; unknown keys are a fatal error. See
 [`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml).
 
-**Single-session** (no `[[slot]]` tables): one libtorrent session, DHT
+**Single-session** (no `[[profile]]` tables): one libtorrent session, DHT
 enabled, session state persisted across restarts. Right for public-tracker and
 DHT content.
 
-**Multi-slot** (one or more `[[slot]]` tables): each slot is an independent
+**Multi-profile** (one or more `[[profile]]` tables): each profile is an independent
 session pinned to its own VPN tunnel, for multi-account private-tracker
-seeding. `POST /torrents` then requires `slot_id`. The listen port is either
+seeding. `POST /torrents` then requires `profile_id`. The listen port is either
 static or negotiated over NAT-PMP against the tunnel gateway
 (ProtonVPN/PIA-style ephemeral ports, renewed continuously, with the live
 socket rebinding when it changes).
 
-## Security posture (multi-slot)
+## Security posture (multi-profile)
 
 Private trackers ban permanently for cross-contamination between accounts, so
 the isolation is layered — and honest about its limits.
 
-- **Per-slot tunnel binding** — listen and outgoing sockets are source-bound
-  to the tunnel IP, never `0.0.0.0`, and private slots disable DHT, PEX and
+- **Per-profile tunnel binding** — listen and outgoing sockets are source-bound
+  to the tunnel IP, never `0.0.0.0`, and private profiles disable DHT, PEX and
   LSD so seeding is tracker-only.
 - **Health monitor** — every 30s it checks the tunnel IP and, for WireGuard,
   the latest-handshake age. On loss, IP change or a stale handshake it pauses
-  the slot's torrents and **fences** it: no auto-restart, and `add`/`resume`
+  the profile's torrents and **fences** it: no auto-restart, and `add`/`resume`
   return 409 until an operator intervenes.
 - **Network kill switch** (opt-in, `network_kill_switch = true`) — a
   fail-closed nftables table confining the daemon's egress to loopback and the
@@ -178,7 +178,7 @@ not an egress control. Public content that wants DHT belongs in
 single-session mode.
 
 The eight rules this is built on, and why each exists, are documented on the
-`torrentd-engine::slot` module.
+`torrentd-engine::profile` module.
 
 ## Authentication
 
@@ -211,7 +211,7 @@ else**, so a scrape credential can never reach the control plane.
 
 Served at `/`, embedded in the binary, so a deployment stays one artifact. The
 pool browser above is the primary view; there is also a virtualised torrent
-list built for 100K rows and a slot view for VPN and port-forward health.
+list built for 100K rows and a profile view for VPN and port-forward health.
 
 Updates arrive over SSE: the daemon emits a tick when something visible
 changes and the client refetches only the panels it has mounted. Polling every
@@ -225,12 +225,12 @@ mise run screenshot       # regenerate the image above from a fixture
 
 ## Metrics
 
-All series are namespaced `torrentd_*`. Session gauges carry a `slot_id`
+All series are namespaced `torrentd_*`. Session gauges carry a `profile_id`
 label; per-torrent series are deliberately absent (unusable at 10K+ torrents —
 the HTTP API serves per-torrent status on demand). Alongside the libtorrent
 gauges (`torrentd_libtorrent_*`) there are daemon counters for torrent
 lifecycle, resume writes, disk and hash errors, dropped alerts, storage moves
-and pool verification; multi-slot adds VPN tunnel and port-forward health, and
+and pool verification; multi-profile adds VPN tunnel and port-forward health, and
 `kill_switch_active`.
 
 ## Deployment

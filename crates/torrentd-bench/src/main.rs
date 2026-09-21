@@ -25,7 +25,7 @@ use libtorrent_safe::Session;
 use libtorrent_safe::Settings;
 use libtorrent_safe::TorrentFlags;
 use torrentd_engine::InfoHash;
-use torrentd_engine::SlotId;
+use torrentd_engine::ProfileId;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentHandle;
 use torrentd_engine::TorrentState;
@@ -87,7 +87,7 @@ fn alert_throughput(torrents: usize, rounds: usize) {
         };
         state.insert(
             h.infohash,
-            TorrentState::newly_added(h, SlotId::default_single(), Instant::now()),
+            TorrentState::newly_added(h, ProfileId::default_single(), Instant::now()),
         );
     }
 

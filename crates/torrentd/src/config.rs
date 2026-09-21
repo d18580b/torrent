@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
-use torrentd_engine::SlotConfig;
-use torrentd_engine::SlotId;
+use torrentd_engine::ProfileConfig;
+use torrentd_engine::ProfileId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,12 +50,12 @@ pub struct Config {
     pub log_level: LogLevel,
 
     /// Where the assignment registry lives. Defaults to
-    /// `<resume_dir parent>/slot_assignments.json`.
+    /// `<resume_dir parent>/profile_assignments.json`.
     #[serde(default)]
     pub registry_path: Option<PathBuf>,
 
     /// Where DHT/session state is persisted across restarts (single-session
-    /// mode only; slots run with `enable_dht=false`). Defaults to
+    /// mode only; profiles run with `enable_dht=false`). Defaults to
     /// `<resume_dir parent>/session_state.dat`.
     #[serde(default)]
     pub session_state_path: Option<PathBuf>,
@@ -79,21 +79,21 @@ pub struct Config {
     pub user_agent: Option<String>,
 
     /// Max age of a WireGuard tunnel's latest handshake before the health
-    /// monitor treats the slot as down (multi-slot mode). Catches a tunnel that
+    /// monitor treats the profile as down (multi-profile mode). Catches a tunnel that
     /// keeps its IP but has silently stopped handshaking. Default 180s.
     #[serde(default = "Config::default_handshake_max_age")]
     pub vpn_handshake_max_age_secs: u64,
 
-    /// Install a fail-closed nftables kill switch (multi-slot mode) that
-    /// confines the daemon's egress to loopback + the slots' tunnel interfaces.
+    /// Install a fail-closed nftables kill switch (multi-profile mode) that
+    /// confines the daemon's egress to loopback + the profiles' tunnel interfaces.
     /// Off by default; requires `CAP_NET_ADMIN` and that torrentd runs as its own
     /// user. See `vpn::killswitch`.
     #[serde(default)]
     pub network_kill_switch: bool,
 
-    /// `[[slot]]` array. Empty → single-session mode.
+    /// `[[profile]]` array. Empty → single-session mode.
     #[serde(default)]
-    pub slot: Vec<SlotConfig>,
+    pub profile: Vec<ProfileConfig>,
 
     /// HTTP authentication. Absent → unauthenticated, as before.
     #[serde(default)]
@@ -128,7 +128,7 @@ pub struct PoolConfig {
     #[serde(default = "PoolConfig::default_max_concurrent_verify")]
     pub max_concurrent_verify: usize,
 
-    /// Fold a legacy `slot_assignments.json` into the index on the next scan.
+    /// Fold a legacy assignment registry into the index on the next scan.
     /// The JSON is left on disk; existing in-index assignments always win.
     #[serde(default = "PoolConfig::default_true")]
     pub import_legacy_registry: bool,
@@ -155,6 +155,12 @@ impl PoolConfig {
     }
 }
 
+/// Where torrent-to-profile assignments are persisted.
+const REGISTRY_FILE: &str = "profile_assignments.json";
+/// Its name before profiles replaced slots. Read once, then written under the
+/// current name.
+const LEGACY_REGISTRY_FILE: &str = "slot_assignments.json";
+
 impl Config {
     fn default_log_level() -> LogLevel {
         LogLevel::Info
@@ -173,8 +179,8 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !self.slot.is_empty() {
-            SlotConfig::validate_set(&self.slot).context("[[slot]] validation failed")?;
+        if !self.profile.is_empty() {
+            ProfileConfig::validate_set(&self.profile).context("[[profile]] validation failed")?;
         }
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
@@ -312,7 +318,7 @@ impl Config {
         if old.session_state_path != new.session_state_path {
             d.non_reloadable_changes.push("session_state_path");
         }
-        d.slot_changes = diff_slots(&old.slot, &new.slot);
+        d.profile_changes = diff_profiles(&old.profile, &new.profile);
         d
     }
 
@@ -353,7 +359,22 @@ impl Config {
     pub fn registry_path(&self) -> PathBuf {
         self.registry_path
             .clone()
-            .unwrap_or_else(|| self.state_dir().join("slot_assignments.json"))
+            .unwrap_or_else(|| self.state_dir().join(REGISTRY_FILE))
+    }
+
+    /// The pre-rename registry file, if it is the only one present.
+    ///
+    /// Renaming profiles to profiles renamed this file too, and a daemon that
+    /// simply started with an empty registry would have no record of which
+    /// profile owns which info-hash — which is the authority for the
+    /// cross-profile uniqueness rule. It would then happily load the same
+    /// torrent into two profiles. Read the old name once instead.
+    pub fn legacy_registry_path(&self) -> Option<PathBuf> {
+        if self.registry_path.is_some() {
+            return None;
+        }
+        let legacy = self.state_dir().join(LEGACY_REGISTRY_FILE);
+        (legacy.exists() && !self.registry_path().exists()).then_some(legacy)
     }
 
     /// Where the pool index lives.
@@ -381,17 +402,17 @@ impl Config {
 }
 
 /// Result of `Config::diff`. Reloadable fields are populated with the
-/// Report `[[slot]]` changes that a reload cannot apply.
+/// Report `[[profile]]` changes that a reload cannot apply.
 ///
 /// Every field here is identity-critical: the tunnel a session is bound to,
 /// the port it announces, the peer fingerprint and user agent a tracker sees,
 /// and where its resume and torrent files live. Changing any of them means a
 /// different account identity to the tracker, which is a restart — not
-/// something to swap under a live session. Adding or removing slots is
-/// likewise a restart, since the slot set is fixed when sessions are built.
-fn diff_slots(old: &[SlotConfig], new: &[SlotConfig]) -> Vec<String> {
+/// something to swap under a live session. Adding or removing profiles is
+/// likewise a restart, since the profile set is fixed when sessions are built.
+fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
     use std::collections::BTreeMap;
-    let index = |v: &[SlotConfig]| -> BTreeMap<String, SlotConfig> {
+    let index = |v: &[ProfileConfig]| -> BTreeMap<String, ProfileConfig> {
         v.iter()
             .map(|s| (s.id.as_str().to_string(), s.clone()))
             .collect()
@@ -401,12 +422,14 @@ fn diff_slots(old: &[SlotConfig], new: &[SlotConfig]) -> Vec<String> {
 
     for id in n.keys() {
         if !o.contains_key(id) {
-            out.push(format!("{id}: added (the slot set is fixed at startup)"));
+            out.push(format!("{id}: added (the profile set is fixed at startup)"));
         }
     }
     for (id, a) in &o {
         let Some(b) = n.get(id) else {
-            out.push(format!("{id}: removed (the slot set is fixed at startup)"));
+            out.push(format!(
+                "{id}: removed (the profile set is fixed at startup)"
+            ));
             continue;
         };
         let mut field = |name: &str, changed: bool| {
@@ -414,7 +437,7 @@ fn diff_slots(old: &[SlotConfig], new: &[SlotConfig]) -> Vec<String> {
                 out.push(format!("{id}.{name}"));
             }
         };
-        field("vpn_profile", a.vpn_profile != b.vpn_profile);
+        field("vpn_config", a.vpn_config != b.vpn_config);
         field("vpn_type", a.vpn_type != b.vpn_type);
         field("vpn_interface", a.vpn_interface != b.vpn_interface);
         field("listen_port", a.listen_port != b.listen_port);
@@ -445,33 +468,33 @@ pub struct ConfigDiff {
     pub enable_lsd: Option<bool>,
     pub log_level: Option<LogLevel>,
     pub non_reloadable_changes: Vec<&'static str>,
-    /// Per-slot identity fields that changed and were ignored, as
-    /// `"<slot_id>.<field>"`. Safety Rule 7 requires a warning for these and
-    /// `Config::diff` used to skip `[[slot]]` entirely, so changing a slot's
+    /// Per-profile identity fields that changed and were ignored, as
+    /// `"<profile_id>.<field>"`. Safety Rule 7 requires a warning for these and
+    /// `Config::diff` used to skip `[[profile]]` entirely, so changing a profile's
     /// VPN interface, port, fingerprint, user agent or directories on SIGHUP
     /// was swallowed in silence.
-    pub slot_changes: Vec<String>,
+    pub profile_changes: Vec<String>,
 }
 
 impl ConfigDiff {
-    /// Build the `Settings` patch for `slot`, containing only the reloadable
-    /// fields that changed and are permitted to reach that slot.
+    /// Build the `Settings` patch for `profile`, containing only the reloadable
+    /// fields that changed and are permitted to reach that profile.
     ///
-    /// `enable_lsd` is withheld from every slot but the single-session
-    /// default. Safety Rule 6 says a private slot runs with DHT, PEX and LSD
+    /// `enable_lsd` is withheld from every profile but the single-session
+    /// default. Safety Rule 6 says a private profile runs with DHT, PEX and LSD
     /// off unconditionally and that no config key can turn them on — but
     /// `enable_lsd` is a top-level *reloadable* key that was applied to every
     /// session alike, so `enable_lsd = true` plus a SIGHUP quietly re-enabled
     /// local peer discovery on exactly the sessions that must never have it.
     /// The daemon still honours the key for the public single session, which
     /// is the only place it means anything.
-    pub fn to_settings_patch_for(&self, slot: &SlotId) -> libtorrent_safe::Settings {
+    pub fn to_settings_patch_for(&self, profile: &ProfileId) -> libtorrent_safe::Settings {
         libtorrent_safe::Settings {
             connections_limit: self.connections_limit,
             upload_rate_limit: self.upload_rate_limit,
             max_concurrent_http_announces: self.max_concurrent_http_announces,
             aio_threads: self.aio_threads,
-            enable_lsd: if slot.is_default() {
+            enable_lsd: if profile.is_default() {
                 self.enable_lsd
             } else {
                 None
@@ -488,7 +511,7 @@ impl ConfigDiff {
             && self.enable_lsd.is_none()
             && self.log_level.is_none()
             && self.non_reloadable_changes.is_empty()
-            && self.slot_changes.is_empty()
+            && self.profile_changes.is_empty()
     }
 }
 
@@ -562,8 +585,8 @@ connections_limit = 10000
     }
 
     #[test]
-    fn enable_lsd_never_reaches_a_private_slot() {
-        // Safety Rule 6: a private slot has LSD off unconditionally, and no
+    fn enable_lsd_never_reaches_a_private_profile() {
+        // Safety Rule 6: a private profile has LSD off unconditionally, and no
         // config key may turn it on. `enable_lsd` is top-level and reloadable,
         // so without this filter a SIGHUP re-enabled local peer discovery on
         // exactly the sessions that must never have it.
@@ -572,16 +595,16 @@ connections_limit = 10000
             ..Default::default()
         };
         assert_eq!(
-            diff.to_settings_patch_for(&SlotId::default_single())
+            diff.to_settings_patch_for(&ProfileId::default_single())
                 .enable_lsd,
             Some(true),
             "the public single session still honours the key",
         );
         assert_eq!(
-            diff.to_settings_patch_for(&SlotId::new("acct_a"))
+            diff.to_settings_patch_for(&ProfileId::new("acct_a"))
                 .enable_lsd,
             None,
-            "a private slot must not receive it",
+            "a private profile must not receive it",
         );
     }
 
@@ -591,7 +614,7 @@ connections_limit = 10000
         let p = write_cfg(dir.path(), SINGLE_SESSION);
         let cfg = Config::load(&p).unwrap();
         assert_eq!(cfg.connections_limit, Some(10000));
-        assert!(cfg.slot.is_empty());
+        assert!(cfg.profile.is_empty());
     }
 
     #[test]

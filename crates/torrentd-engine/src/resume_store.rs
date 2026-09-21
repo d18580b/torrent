@@ -1,12 +1,12 @@
 //! Resume data persistence.
 //!
 //! `FsResumeStore` writes one bencoded file per info-hash under
-//! `<base_dir>/<slot_id>/<infohash_hex>.resume`. Writes go via temp file +
+//! `<base_dir>/<profile_id>/<infohash_hex>.resume`. Writes go via temp file +
 //! `fsync` + `rename` for atomicity: a partial write must leave the
 //! previous resume file intact.
 //!
 //! `MemoryResumeStore` keeps everything in a `DashMap` keyed by
-//! `(slot, infohash)`. Used by Layer 1 unit tests so we don't hit the
+//! `(profile, infohash)`. Used by Layer 1 unit tests so we don't hit the
 //! filesystem.
 
 use std::fs;
@@ -20,19 +20,27 @@ use thiserror::Error;
 use tracing::debug;
 use tracing::warn;
 
-use crate::slot::SlotId;
+use crate::profile::ProfileId;
 
 pub trait ResumeStore: Send + Sync + std::fmt::Debug {
-    /// Load every resume file owned by `slot`. Implementations skip
+    /// Load every resume file owned by `profile`. Implementations skip
     /// files that don't parse as a 40-char hex info-hash filename.
-    fn load_all(&self, slot: &SlotId) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError>;
+    fn load_all(
+        &self,
+        profile: &ProfileId,
+    ) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError>;
 
-    /// Atomically replace the resume file for `(slot, ih)` with `data`.
-    fn write(&self, slot: &SlotId, ih: &InfoHash, data: &[u8]) -> Result<(), ResumeStoreError>;
+    /// Atomically replace the resume file for `(profile, ih)` with `data`.
+    fn write(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        data: &[u8],
+    ) -> Result<(), ResumeStoreError>;
 
-    /// Delete the resume file for `(slot, ih)`. Missing files are not an
+    /// Delete the resume file for `(profile, ih)`. Missing files are not an
     /// error.
-    fn delete(&self, slot: &SlotId, ih: &InfoHash) -> Result<(), ResumeStoreError>;
+    fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError>;
 }
 
 #[derive(Debug, Error)]
@@ -50,14 +58,14 @@ pub enum ResumeStoreError {
 #[derive(Debug)]
 pub struct FsResumeStore {
     base: PathBuf,
-    /// Explicit directory for a slot, from its `[[slot]]` config.
+    /// Explicit directory for a profile, from its `[[profile]]` config.
     ///
-    /// Without this the layout is always `<base>/<slot_id>`, and a slot that
+    /// Without this the layout is always `<base>/<profile_id>`, and a profile that
     /// configured a directory elsewhere had it validated for uniqueness and
     /// then silently ignored — the files landed somewhere the operator had not
     /// asked for, and matched only by coincidence when the configured path
     /// happened to equal the derived one.
-    overrides: std::collections::HashMap<SlotId, PathBuf>,
+    overrides: std::collections::HashMap<ProfileId, PathBuf>,
 }
 
 impl FsResumeStore {
@@ -68,34 +76,38 @@ impl FsResumeStore {
         }
     }
 
-    /// Pin `slot` to an explicit directory rather than the derived one.
-    pub fn with_slot_dir(mut self, slot: SlotId, dir: impl Into<PathBuf>) -> Self {
-        self.overrides.insert(slot, dir.into());
+    /// Pin `profile` to an explicit directory rather than the derived one.
+    pub fn with_profile_dir(mut self, profile: ProfileId, dir: impl Into<PathBuf>) -> Self {
+        self.overrides.insert(profile, dir.into());
         self
     }
 
-    fn dir_for(&self, slot: &SlotId) -> PathBuf {
-        if let Some(dir) = self.overrides.get(slot) {
+    fn dir_for(&self, profile: &ProfileId) -> PathBuf {
+        if let Some(dir) = self.overrides.get(profile) {
             return dir.clone();
         }
-        // SlotId::DEFAULT lives directly under base for single-session mode;
-        // otherwise we partition by slot id so multi-slot mode never
+        // ProfileId::DEFAULT lives directly under base for single-session mode;
+        // otherwise we partition by profile id so multi-profile mode never
         // co-mingles resume files.
-        if slot.is_default() {
+        if profile.is_default() {
             self.base.clone()
         } else {
-            self.base.join(slot.as_str())
+            self.base.join(profile.as_str())
         }
     }
 
-    fn file_for(&self, slot: &SlotId, ih: &InfoHash) -> PathBuf {
-        self.dir_for(slot).join(format!("{}.resume", ih.to_hex()))
+    fn file_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
+        self.dir_for(profile)
+            .join(format!("{}.resume", ih.to_hex()))
     }
 }
 
 impl ResumeStore for FsResumeStore {
-    fn load_all(&self, slot: &SlotId) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError> {
-        let dir = self.dir_for(slot);
+    fn load_all(
+        &self,
+        profile: &ProfileId,
+    ) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError> {
+        let dir = self.dir_for(profile);
         if !dir.exists() {
             return Ok(Vec::new());
         }
@@ -117,7 +129,7 @@ impl ResumeStore for FsResumeStore {
                 None => {
                     warn!(
                         target: "torrentd_engine::resume_store",
-                        slot_id = %slot,
+                        profile_id = %profile,
                         file = %path.display(),
                         "skipping resume file with invalid name",
                     );
@@ -127,10 +139,15 @@ impl ResumeStore for FsResumeStore {
         Ok(out)
     }
 
-    fn write(&self, slot: &SlotId, ih: &InfoHash, data: &[u8]) -> Result<(), ResumeStoreError> {
-        let dir = self.dir_for(slot);
+    fn write(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        data: &[u8],
+    ) -> Result<(), ResumeStoreError> {
+        let dir = self.dir_for(profile);
         fs::create_dir_all(&dir)?;
-        let final_path = self.file_for(slot, ih);
+        let final_path = self.file_for(profile, ih);
         let tmp_path = dir.join(format!("{}.resume.tmp", ih.to_hex()));
 
         // Atomic write: temp file → fsync(file) → rename. The temp file is
@@ -153,7 +170,7 @@ impl ResumeStore for FsResumeStore {
         }
         debug!(
             target: "torrentd_engine::resume_store",
-            slot_id = %slot,
+            profile_id = %profile,
             infohash = %ih,
             bytes = data.len(),
             "wrote resume file",
@@ -161,8 +178,8 @@ impl ResumeStore for FsResumeStore {
         Ok(())
     }
 
-    fn delete(&self, slot: &SlotId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
-        let path = self.file_for(slot, ih);
+    fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
+        let path = self.file_for(profile, ih);
         match fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -177,7 +194,7 @@ impl ResumeStore for FsResumeStore {
 
 #[derive(Debug, Default)]
 pub struct MemoryResumeStore {
-    inner: DashMap<(SlotId, InfoHash), Vec<u8>>,
+    inner: DashMap<(ProfileId, InfoHash), Vec<u8>>,
 }
 
 impl MemoryResumeStore {
@@ -192,33 +209,41 @@ impl MemoryResumeStore {
         self.inner.is_empty()
     }
 
-    /// Test helper: contents for a slot.
-    pub fn snapshot(&self, slot: &SlotId) -> Vec<(InfoHash, Vec<u8>)> {
+    /// Test helper: contents for a profile.
+    pub fn snapshot(&self, profile: &ProfileId) -> Vec<(InfoHash, Vec<u8>)> {
         self.inner
             .iter()
-            .filter(|e| e.key().0 == *slot)
+            .filter(|e| e.key().0 == *profile)
             .map(|e| (e.key().1, e.value().clone()))
             .collect()
     }
 }
 
 impl ResumeStore for MemoryResumeStore {
-    fn load_all(&self, slot: &SlotId) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError> {
+    fn load_all(
+        &self,
+        profile: &ProfileId,
+    ) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError> {
         Ok(self
             .inner
             .iter()
-            .filter(|e| e.key().0 == *slot)
+            .filter(|e| e.key().0 == *profile)
             .map(|e| (e.key().1, ResumeData::new(e.value().clone())))
             .collect())
     }
 
-    fn write(&self, slot: &SlotId, ih: &InfoHash, data: &[u8]) -> Result<(), ResumeStoreError> {
-        self.inner.insert((slot.clone(), *ih), data.to_vec());
+    fn write(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        data: &[u8],
+    ) -> Result<(), ResumeStoreError> {
+        self.inner.insert((profile.clone(), *ih), data.to_vec());
         Ok(())
     }
 
-    fn delete(&self, slot: &SlotId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
-        self.inner.remove(&(slot.clone(), *ih));
+    fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
+        self.inner.remove(&(profile.clone(), *ih));
         Ok(())
     }
 }
@@ -233,26 +258,26 @@ mod tests {
     fn fs_store_atomic_roundtrip() {
         let dir = tempdir().unwrap();
         let store = FsResumeStore::new(dir.path());
-        let slot = SlotId::default_single();
+        let profile = ProfileId::default_single();
         let ih = InfoHash([0x42u8; 20]);
-        store.write(&slot, &ih, b"hello").unwrap();
-        let loaded = store.load_all(&slot).unwrap();
+        store.write(&profile, &ih, b"hello").unwrap();
+        let loaded = store.load_all(&profile).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, ih);
         assert_eq!(loaded[0].1.as_bytes(), b"hello");
-        store.delete(&slot, &ih).unwrap();
-        assert_eq!(store.load_all(&slot).unwrap().len(), 0);
+        store.delete(&profile, &ih).unwrap();
+        assert_eq!(store.load_all(&profile).unwrap().len(), 0);
     }
 
     #[test]
-    fn memory_store_partitions_by_slot() {
+    fn memory_store_partitions_by_profile() {
         let store = MemoryResumeStore::new();
-        let a = SlotId::new("a");
-        let b = SlotId::new("b");
+        let a = ProfileId::new("a");
+        let b = ProfileId::new("b");
         let ih = InfoHash([0x01u8; 20]);
-        store.write(&a, &ih, b"slot-a").unwrap();
-        store.write(&b, &ih, b"slot-b").unwrap();
-        assert_eq!(store.snapshot(&a)[0].1, b"slot-a");
-        assert_eq!(store.snapshot(&b)[0].1, b"slot-b");
+        store.write(&a, &ih, b"profile-a").unwrap();
+        store.write(&b, &ih, b"profile-b").unwrap();
+        assert_eq!(store.snapshot(&a)[0].1, b"profile-a");
+        assert_eq!(store.snapshot(&b)[0].1, b"profile-b");
     }
 }

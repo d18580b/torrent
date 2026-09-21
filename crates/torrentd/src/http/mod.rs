@@ -5,7 +5,7 @@ mod events;
 mod healthz;
 mod metrics;
 mod pool;
-mod slots;
+mod profiles;
 mod status;
 pub(crate) mod torrents;
 #[cfg(feature = "web-ui")]
@@ -20,7 +20,7 @@ use crate::app_state::AppState;
 /// Build the full router.
 ///
 /// Everything is served under `/api`, with the historical bare paths kept as
-/// aliases so deployed scripts and scrapes keep working. Slot and pool routes
+/// aliases so deployed scripts and scrapes keep working. Profile and pool routes
 /// are mounted only when those features are configured, so an unconfigured
 /// daemon returns 404 for them rather than a confusing empty success.
 pub fn router(state: AppState) -> Router {
@@ -44,13 +44,16 @@ pub fn router(state: AppState) -> Router {
             post(torrents::set_file_priority),
         );
 
-    if state.slots.is_some() {
+    if state.profiles.is_some() {
         api = api
-            .route("/slots", get(slots::list))
-            .route("/slots/:slot_id", get(slots::get))
-            .route("/slots/:slot_id/torrents", get(slots::torrents))
-            .route("/slots/:slot_id/pause-all", post(slots::pause_all))
-            .route("/slots/:slot_id/resume-all", post(slots::resume_all));
+            .route("/profiles", get(profiles::list))
+            .route("/profiles/:profile_id", get(profiles::get))
+            .route("/profiles/:profile_id/torrents", get(profiles::torrents))
+            .route("/profiles/:profile_id/pause-all", post(profiles::pause_all))
+            .route(
+                "/profiles/:profile_id/resume-all",
+                post(profiles::resume_all),
+            );
     }
 
     if state.pool.is_some() {

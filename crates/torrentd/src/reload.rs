@@ -46,13 +46,13 @@ pub async fn run(
                 "SIGHUP: change to non-reloadable field requires daemon restart; ignored",
             );
         }
-        // Safety Rule 7: identity-critical slot fields cannot change under a
+        // Safety Rule 7: identity-critical profile fields cannot change under a
         // live session, and the operator has to be told rather than left
         // believing a reload took.
-        for sc in &diff.slot_changes {
+        for sc in &diff.profile_changes {
             warn!(
                 changed_field = %sc,
-                "SIGHUP: slot identity change requires daemon restart; ignored",
+                "SIGHUP: profile identity change requires daemon restart; ignored",
             );
         }
         if let Some(level) = diff.log_level {
@@ -61,13 +61,13 @@ pub async fn run(
                 Err(e) => warn!(error.cause = %e, "SIGHUP: failed to apply log level"),
             }
         }
-        for slot in source.slots() {
-            let patch = diff.to_settings_patch_for(&slot);
-            if let Some(eng) = source.engine_for(&slot) {
+        for profile in source.profiles() {
+            let patch = diff.to_settings_patch_for(&profile);
+            if let Some(eng) = source.engine_for(&profile) {
                 if let Err(e) = eng.apply_settings(&patch).context("apply_settings") {
-                    warn!(slot_id = %slot, error.cause = %e, "SIGHUP: apply_settings failed");
+                    warn!(profile_id = %profile, error.cause = %e, "SIGHUP: apply_settings failed");
                 } else {
-                    info!(slot_id = %slot, "SIGHUP: settings applied");
+                    info!(profile_id = %profile, "SIGHUP: settings applied");
                 }
             }
         }

@@ -58,14 +58,14 @@ pub enum VpnCmd {
     /// each one separately.
     ///
     /// Observe-only unless `--bring-up` is given: it reads interfaces and `wg`
-    /// state, and a NAT-PMP slot's mapping is released as soon as it is
+    /// state, and a NAT-PMP profile's mapping is released as soon as it is
     /// negotiated. No libtorrent session is constructed and no tracker is
     /// contacted, so this is safe to run against real credentials on a host
     /// that has never seeded anything.
     Check {
-        /// Check only this slot. Default: every configured slot.
+        /// Check only this profile. Default: every configured profile.
         #[arg(long, value_name = "ID")]
-        slot: Option<String>,
+        profile: Option<String>,
         /// Emit the report as JSON.
         #[arg(long)]
         json: bool,

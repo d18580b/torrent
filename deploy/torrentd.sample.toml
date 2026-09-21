@@ -15,9 +15,9 @@ log_level         = "info"   # error | warn | info | debug (reloadable on SIGHUP
 
 # Optional daemon paths (defaults derived from resume_dir's parent):
 #   - DHT/session state, persisted across restarts (single-session mode only).
-#   - torrent -> slot assignment registry.
+#   - torrent -> profile assignment registry.
 # session_state_path = "/var/lib/torrentd/session_state.dat"
-# registry_path      = "/var/lib/torrentd/slot_assignments.json"
+# registry_path      = "/var/lib/torrentd/profile_assignments.json"
 
 # libtorrent settings overrides (applied on top of high_performance_seed
 # preset). All optional; omit any to use the preset's default.
@@ -83,31 +83,31 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # roots       = ["/data/torrents"]        # must not nest
 # library_dir = "/var/lib/torrentd/library"
 # db_path     = "/var/lib/torrentd/pool.db"   # default: alongside resume_dir
-# import_legacy_registry = true              # fold slot_assignments.json in
+# import_legacy_registry = true              # fold profile_assignments.json in
 
 # ---------------------------------------------------------------------------
-# Multi-slot example — uncomment and adjust the [[slot]] tables below.
-# Presence of any [[slot]] entry switches the daemon into multi-slot
-# mode; in that case POST /torrents requires `slot_id`.
+# Multi-profile example — uncomment and adjust the [[profile]] tables below.
+# Presence of any [[profile]] entry switches the daemon into multi-profile
+# mode; in that case POST /torrents requires `profile_id`.
 # ---------------------------------------------------------------------------
 
 # Liveness: max age (seconds) of a WireGuard tunnel's latest handshake before
-# the health monitor declares the slot down and pauses it. Catches a tunnel
+# the health monitor declares the profile down and pauses it. Catches a tunnel
 # that keeps its IP but has silently stopped handshaking. Default 180.
 # vpn_handshake_max_age_secs = 180
 
-# Defence-in-depth kill switch (multi-slot only). When true, torrentd installs a
+# Defence-in-depth kill switch (multi-profile only). When true, torrentd installs a
 # fail-closed nftables table (`torrentd_ks`) that confines the daemon's own
-# egress to loopback + the slots' tunnel interfaces — so if a tunnel drops, the
+# egress to loopback + the profiles' tunnel interfaces — so if a tunnel drops, the
 # kernel drops the traffic regardless of libtorrent's socket bind or the 30s
 # monitor. Requires CAP_NET_ADMIN, the `nft` binary, and that torrentd runs as a
 # dedicated user (the packaged systemd unit uses User=torrentd). Also forces
 # tracker DNS through the tunnel. Removed cleanly on SIGTERM.
 # network_kill_switch = false
 
-# [[slot]]
+# [[profile]]
 # id                       = "account_a"
-# vpn_profile              = "/etc/wireguard/wg-acct-a.conf"
+# vpn_config              = "/etc/wireguard/wg-acct-a.conf"
 # vpn_type                 = "wireguard"
 # vpn_interface            = "wg-acct-a"
 # listen_port              = 6881
@@ -118,9 +118,9 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # allowed_tracker_domains  = ["tracker.example.com"]
 # upload_rate_limit        = 0
 
-# [[slot]]
+# [[profile]]
 # id                       = "account_b"
-# vpn_profile              = "/etc/wireguard/wg-acct-b.conf"
+# vpn_config              = "/etc/wireguard/wg-acct-b.conf"
 # vpn_type                 = "wireguard"
 # vpn_interface            = "wg-acct-b"
 # listen_port              = 6882
@@ -138,12 +138,12 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # negotiated at runtime over NAT-PMP against the tunnel gateway, is ephemeral,
 # and its ~60s lease is renewed continuously. Set `port_forward = "natpmp"`;
 # `listen_port` is then ignored (omit it) and the negotiated port is bound and
-# surfaced via `GET /slots/<id>` (`forwarded_port`) plus the `slot_forwarded_port`
-# / `slot_port_forward_up` metrics.
+# surfaced via `GET /profiles/<id>` (`forwarded_port`) plus the `profile_forwarded_port`
+# / `profile_port_forward_up` metrics.
 #
-# [[slot]]
+# [[profile]]
 # id                       = "proton_a"
-# vpn_profile              = "/etc/wireguard/proton-a.conf"
+# vpn_config              = "/etc/wireguard/proton-a.conf"
 # vpn_type                 = "wireguard"
 # vpn_interface            = "proton-a"
 # port_forward             = "natpmp"

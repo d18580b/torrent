@@ -4,12 +4,12 @@
 //! same invariants have to hold on four independent add paths — the HTTP API,
 //! the startup torrent-dir scan, the startup resume reload, and pool adoption
 //! — and a guard that lapses on one of them is not a guard. Each path used to
-//! spell its own `if slot.is_default() { … } else { … }`, which is how
+//! spell its own `if profile.is_default() { … } else { … }`, which is how
 //! `UPLOAD_MODE` came to be asserted on none of them.
 
 use libtorrent_safe::TorrentFlags;
 
-use crate::slot::SlotId;
+use crate::profile::ProfileId;
 
 /// Flags carried by every add, on every path, in every mode.
 ///
@@ -35,14 +35,14 @@ fn no_download() -> TorrentFlags {
     TorrentFlags::UPLOAD_MODE
 }
 
-/// Per-torrent discovery guards for a torrent living in `slot`.
+/// Per-torrent discovery guards for a torrent living in `profile`.
 ///
 /// Safety Rules 5 and 6: PEX and DHT are disabled unconditionally on every
-/// torrent in a private slot, belt-and-braces against the torrent's own
-/// `private` bit being wrong. The single-session default slot is the public
+/// torrent in a private profile, belt-and-braces against the torrent's own
+/// `private` bit being wrong. The single-session default profile is the public
 /// posture and deliberately keeps them.
-pub fn discovery_guards(slot: &SlotId) -> TorrentFlags {
-    if slot.is_default() {
+pub fn discovery_guards(profile: &ProfileId) -> TorrentFlags {
+    if profile.is_default() {
         TorrentFlags::empty()
     } else {
         TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
@@ -51,8 +51,8 @@ pub fn discovery_guards(slot: &SlotId) -> TorrentFlags {
 
 /// Flags for an add whose payload is believed complete, so libtorrent may skip
 /// hashing (`SEED_MODE`) and seed immediately.
-pub fn seed_flags(slot: &SlotId) -> TorrentFlags {
-    TorrentFlags::SEED_MODE | no_download() | discovery_guards(slot)
+pub fn seed_flags(profile: &ProfileId) -> TorrentFlags {
+    TorrentFlags::SEED_MODE | no_download() | discovery_guards(profile)
 }
 
 /// Flags for an add that must be hash-checked before it seeds. Deliberately no
@@ -60,8 +60,8 @@ pub fn seed_flags(slot: &SlotId) -> TorrentFlags {
 /// the no-download invariant still applies, and applies *most* here: this is
 /// the path where a failed check would otherwise turn the torrent into a
 /// leecher.
-pub fn verify_flags(slot: &SlotId) -> TorrentFlags {
-    no_download() | discovery_guards(slot)
+pub fn verify_flags(profile: &ProfileId) -> TorrentFlags {
+    no_download() | discovery_guards(profile)
 }
 
 /// Flags re-asserted when loading resume data.
@@ -71,29 +71,29 @@ pub fn verify_flags(slot: &SlotId) -> TorrentFlags {
 /// resume file. It *does* re-assert everything that must never lapse, because
 /// resume data written before a guard existed would otherwise come back
 /// without it.
-pub fn resume_flags_set(slot: &SlotId) -> TorrentFlags {
-    no_download() | discovery_guards(slot)
+pub fn resume_flags_set(profile: &ProfileId) -> TorrentFlags {
+    no_download() | discovery_guards(profile)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn private() -> SlotId {
-        SlotId::new("acct_a")
+    fn private() -> ProfileId {
+        ProfileId::new("acct_a")
     }
 
     #[test]
     fn every_path_forbids_downloading() {
-        for slot in [SlotId::default_single(), private()] {
+        for profile in [ProfileId::default_single(), private()] {
             for flags in [
-                seed_flags(&slot),
-                verify_flags(&slot),
-                resume_flags_set(&slot),
+                seed_flags(&profile),
+                verify_flags(&profile),
+                resume_flags_set(&profile),
             ] {
                 assert!(
                     flags.contains(TorrentFlags::UPLOAD_MODE),
-                    "no-download invariant missing for {slot}",
+                    "no-download invariant missing for {profile}",
                 );
             }
         }
@@ -101,14 +101,14 @@ mod tests {
 
     #[test]
     fn only_the_seed_path_skips_hashing() {
-        let s = SlotId::default_single();
+        let s = ProfileId::default_single();
         assert!(seed_flags(&s).contains(TorrentFlags::SEED_MODE));
         assert!(!verify_flags(&s).contains(TorrentFlags::SEED_MODE));
         assert!(!resume_flags_set(&s).contains(TorrentFlags::SEED_MODE));
     }
 
     #[test]
-    fn private_slots_disable_discovery_on_every_path() {
+    fn private_profiles_disable_discovery_on_every_path() {
         let p = private();
         for flags in [seed_flags(&p), verify_flags(&p), resume_flags_set(&p)] {
             assert!(flags.contains(TorrentFlags::DISABLE_PEX));
@@ -118,8 +118,8 @@ mod tests {
     }
 
     #[test]
-    fn the_default_slot_keeps_discovery() {
-        let d = SlotId::default_single();
+    fn the_default_profile_keeps_discovery() {
+        let d = ProfileId::default_single();
         assert!(!seed_flags(&d).contains(TorrentFlags::DISABLE_DHT));
         assert!(!seed_flags(&d).contains(TorrentFlags::DISABLE_PEX));
     }

@@ -1,7 +1,7 @@
 //! Startup orchestrator: build the engine(s), wire the alert loop, bind
 //! the HTTP server, install signal handlers, and run until shutdown.
 //!
-//! The single-session and multi-slot paths converge at the AlertSource
+//! The single-session and multi-profile paths converge at the AlertSource
 //! trait — both produce an `Arc<dyn AlertSource>` that the rest of the
 //! daemon consumes uniformly.
 
@@ -19,16 +19,16 @@ use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::FsResumeStore;
 use torrentd_engine::FsTorrentStore;
 use torrentd_engine::MetricsSink;
-use torrentd_engine::MultiSlotSource;
 use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
+use torrentd_engine::ProfileId;
+use torrentd_engine::ProfileSource;
+use torrentd_engine::ProfileStatus;
 use torrentd_engine::RealEngine;
 use torrentd_engine::ResumeStore;
 use torrentd_engine::ShutdownReason;
 use torrentd_engine::SingleSessionSource;
-use torrentd_engine::SlotId;
-use torrentd_engine::SlotStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::SystemClock;
 use torrentd_engine::TorrentEngine;
@@ -43,12 +43,12 @@ use crate::app_state::Mode;
 use crate::config::Config;
 use crate::http;
 use crate::metrics_sink::PromSink;
+use crate::profile_registry::ProfileEntry;
+use crate::profile_registry::ProfileRegistry;
 use crate::reload;
 use crate::sd_notify;
 use crate::signals::SignalChannels;
 use crate::signals::{self};
-use crate::slot_registry::SlotEntry;
-use crate::slot_registry::SlotRegistry;
 use crate::vpn;
 
 /// How stale the alert loop's heartbeat may be before the watchdog ping is
@@ -96,7 +96,7 @@ impl BootCleanup {
         self.kill_switch = true;
     }
 
-    /// Bring one tunnel down now and stop tracking it — for a slot that failed
+    /// Bring one tunnel down now and stop tracking it — for a profile that failed
     /// after its tunnel came up, whose tunnel must go even if boot succeeds.
     fn take_down(&mut self, iface: &str) {
         if let Some(i) = self.tunnels.iter().position(|(_, n)| n == iface) {
@@ -145,7 +145,7 @@ pub struct DaemonHandle {
     metrics: Arc<PromSink>,
     pool: Option<Arc<crate::pool_service::PoolService>>,
     registry: Arc<AssignmentRegistry>,
-    slot_registry: Option<Arc<SlotRegistry>>,
+    profile_registry: Option<Arc<ProfileRegistry>>,
     /// Whether the nftables kill switch was installed and must be torn down on
     /// graceful shutdown.
     kill_switch_active: bool,
@@ -159,10 +159,10 @@ pub async fn boot(
     log_handle: crate::tracing_init::LogReloadHandle,
 ) -> anyhow::Result<DaemonHandle> {
     info!("starting torrentd");
-    let mode = if cfg.slot.is_empty() {
+    let mode = if cfg.profile.is_empty() {
         Mode::Single
     } else {
-        Mode::MultiSlot
+        Mode::MultiProfile
     };
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
@@ -172,7 +172,7 @@ pub async fn boot(
     //
     // They used to go in after the resume and torrent-dir scans, which left
     // the whole of startup running on the default disposition — and startup is
-    // where the daemon spends up to 30 seconds *per slot* waiting for a tunnel
+    // where the daemon spends up to 30 seconds *per profile* waiting for a tunnel
     // to come up. A SIGTERM in that window killed the process outright, with
     // every tunnel it had already raised still up and nothing left to take
     // them down.
@@ -182,52 +182,50 @@ pub async fn boot(
     // Drop the receiver returned by signals::run; we wired our own pair.
     let _ = signals::run(channels.clone(), 8).await;
     let shutdown_tx = channels.shutdown_tx;
-    // Subscribed before the slot loop so a signal raised during bring-up is
+    // Subscribed before the profile loop so a signal raised during bring-up is
     // still there to be observed when the loop next checks.
     let mut boot_shutdown = shutdown_tx.subscribe();
 
     // Undoes what boot has raised, for every exit that is not a successful
     // one. Tunnels and the kill-switch table outlive the process, so a `?`
-    // anywhere after the slot loop used to leave a host with live tunnels, an
+    // anywhere after the profile loop used to leave a host with live tunnels, an
     // nftables table confining a uid that no longer exists, and no daemon.
     let mut cleanup = BootCleanup::new(run_dir.clone());
 
     // Resume store — rooted at the top-level `resume_dir` and partitioned by
-    // slot id, except where a `[[slot]]` names its own directory. Those keys
+    // profile id, except where a `[[profile]]` names its own directory. Those keys
     // were validated for uniqueness and then ignored, so files landed under
     // the derived path and only matched the configured one by coincidence.
     let resume_store: Arc<dyn ResumeStore> = Arc::new(
-        cfg.slot
+        cfg.profile
             .iter()
-            .fold(FsResumeStore::new(cfg.resume_dir.clone()), |st, slot| {
-                st.with_slot_dir(slot.id.clone(), slot.resume_dir.clone())
+            .fold(FsResumeStore::new(cfg.resume_dir.clone()), |st, profile| {
+                st.with_profile_dir(profile.id.clone(), profile.resume_dir.clone())
             }),
     );
 
-    // Torrent store — same per-slot partitioning as the resume store; holds
+    // Torrent store — same per-profile partitioning as the resume store; holds
     // the raw .torrent files for the startup inventory scan, magnet-metadata
     // persistence, and removal cleanup.
-    let torrent_store: Arc<dyn TorrentStore> = Arc::new(
-        cfg.slot
-            .iter()
-            .fold(FsTorrentStore::new(cfg.torrent_dir.clone()), |st, slot| {
-                st.with_slot_dir(slot.id.clone(), slot.torrent_dir.clone())
-            }),
-    );
+    let torrent_store: Arc<dyn TorrentStore> = Arc::new(cfg.profile.iter().fold(
+        FsTorrentStore::new(cfg.torrent_dir.clone()),
+        |st, profile| st.with_profile_dir(profile.id.clone(), profile.torrent_dir.clone()),
+    ));
 
     // Assignment registry.
     let registry = Arc::new(
-        AssignmentRegistry::load(cfg.registry_path()).context("load assignment registry")?,
+        AssignmentRegistry::load_from(cfg.registry_path(), cfg.legacy_registry_path())
+            .context("load assignment registry")?,
     );
 
     // Metrics sink — created early so the startup scans can record registry
-    // rejections (slot_assignment_registry_errors_total).
+    // rejections (profile_assignment_registry_errors_total).
     let metrics = Arc::new(PromSink::new());
 
-    // Engines per slot (or one for single-session). In multi-slot mode we
-    // also build the runtime slot registry that the /slots API and the VPN
+    // Engines per profile (or one for single-session). In multi-profile mode we
+    // also build the runtime profile registry that the /profiles API and the VPN
     // health monitor consume.
-    let mut slot_registry: Option<Arc<SlotRegistry>> = None;
+    let mut profile_registry: Option<Arc<ProfileRegistry>> = None;
     let source: Arc<dyn AlertSource> = match mode {
         Mode::Single => {
             // Restore the DHT routing table + session state across restarts.
@@ -245,41 +243,41 @@ pub async fn boot(
             let engine: Arc<dyn TorrentEngine> = Arc::new(RealEngine::from_session(session));
             Arc::new(SingleSessionSource::new(engine))
         }
-        Mode::MultiSlot => {
-            let mut slot_entries: Vec<SlotEntry> = Vec::new();
-            // Safety Rule 1: a slot whose tunnel does not come up never gets a
+        Mode::MultiProfile => {
+            let mut profile_entries: Vec<ProfileEntry> = Vec::new();
+            // Safety Rule 1: a profile whose tunnel does not come up never gets a
             // session, and the others carry on. It still has to be *reported*
-            // as failed — skipping it outright made it vanish from `/slots`,
+            // as failed — skipping it outright made it vanish from `/profiles`,
             // so an operator wondering why an account was quiet found no trace
             // of it anywhere but the startup log.
-            let mut failed_slots: Vec<crate::slot_registry::FailedSlot> = Vec::new();
-            macro_rules! fail_slot {
+            let mut failed_profiles: Vec<crate::profile_registry::FailedProfile> = Vec::new();
+            macro_rules! fail_profile {
                 ($cfg:expr, $reason:expr) => {{
-                    failed_slots.push(crate::slot_registry::FailedSlot {
+                    failed_profiles.push(crate::profile_registry::FailedProfile {
                         config: $cfg.clone(),
                         reason: $reason,
                     });
                     continue;
                 }};
             }
-            for s in &cfg.slot {
+            for s in &cfg.profile {
                 // 1) Bring the VPN up first. Safety Rule 1: if it
-                //    fails, the slot's lt::session is never constructed
+                //    fails, the profile's lt::session is never constructed
                 //    — no bare-IP fallback.
-                // A shutdown asked for during a previous slot's bring-up is
+                // A shutdown asked for during a previous profile's bring-up is
                 // honoured here rather than after every remaining tunnel has
                 // been raised.
                 if boot_shutdown.try_recv().is_ok() {
-                    anyhow::bail!("shutdown requested during slot bring-up");
+                    anyhow::bail!("shutdown requested during profile bring-up");
                 }
                 let vpn = vpn::for_type(s.vpn_type, &run_dir);
                 // `bring_up` shells out and polls for up to 30 seconds. On a
-                // runtime worker that is 30 seconds per slot during which
+                // runtime worker that is 30 seconds per profile during which
                 // nothing else — including the signal handler that is supposed
                 // to interrupt exactly this — gets to run on that thread.
                 let brought_up = {
                     let vpn = vpn.clone();
-                    let profile = s.vpn_profile();
+                    let profile = s.vpn_config();
                     tokio::task::spawn_blocking(move || vpn.bring_up(&profile))
                         .await
                         .context("vpn bring-up task")?
@@ -291,19 +289,19 @@ pub async fn boot(
                     }
                     Err(e) => {
                         error!(
-                            slot_id = %s.id,
+                            profile_id = %s.id,
                             error.cause = %e,
-                            "VPN bring-up failed; slot disabled (no bare-IP fallback)",
+                            "VPN bring-up failed; profile disabled (no bare-IP fallback)",
                         );
-                        fail_slot!(s, format!("VPN bring-up failed: {e}"));
+                        fail_profile!(s, format!("VPN bring-up failed: {e}"));
                     }
                 };
 
-                // 2) Determine the listening port. Static slots bind the
-                //    operator's `listen_port`; natpmp slots negotiate an
+                // 2) Determine the listening port. Static profiles bind the
+                //    operator's `listen_port`; natpmp profiles negotiate an
                 //    ephemeral forwarded port from the tunnel gateway
                 //    (ProtonVPN et al.). A startup negotiation failure disables
-                //    the slot — loud, like a VPN bring-up failure — rather than
+                //    the profile — loud, like a VPN bring-up failure — rather than
                 //    silently seeding on an unforwarded port. Mid-session
                 //    renewal failures are the soft warn+keep-seeding path
                 //    (see port_forward_monitor).
@@ -312,9 +310,9 @@ pub async fn boot(
                         Some(port) => (port, None, 0),
                         None => {
                             // validate_set should have caught this; be defensive.
-                            error!(slot_id = %s.id, "static slot missing listen_port; slot disabled");
+                            error!(profile_id = %s.id, "static profile missing listen_port; profile disabled");
                             cleanup.take_down(&s.vpn_interface);
-                            fail_slot!(s, "static slot has no listen_port".to_string());
+                            fail_profile!(s, "static profile has no listen_port".to_string());
                         }
                     },
                     PortForwardMode::Natpmp => {
@@ -322,9 +320,9 @@ pub async fn boot(
                         let gateway: IpAddr = match gw_str.parse() {
                             Ok(ip) => ip,
                             Err(e) => {
-                                error!(slot_id = %s.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; slot disabled");
+                                error!(profile_id = %s.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; profile disabled");
                                 cleanup.take_down(&s.vpn_interface);
-                                fail_slot!(s, format!("invalid port_forward_gateway: {e}"));
+                                fail_profile!(s, format!("invalid port_forward_gateway: {e}"));
                             }
                         };
                         let req = PortMapRequest {
@@ -335,13 +333,13 @@ pub async fn boot(
                         };
                         match vpn::NatpmpForwarder::for_startup().map(&req) {
                             Ok(m) => {
-                                info!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
+                                info!(profile_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
                                 (m.port, Some(m.port), m.epoch)
                             }
                             Err(e) => {
-                                error!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; slot disabled (no bare-IP fallback)");
+                                error!(profile_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; profile disabled (no bare-IP fallback)");
                                 cleanup.take_down(&s.vpn_interface);
-                                fail_slot!(s, format!("NAT-PMP negotiation failed: {e}"));
+                                fail_profile!(s, format!("NAT-PMP negotiation failed: {e}"));
                             }
                         }
                     }
@@ -355,8 +353,8 @@ pub async fn boot(
                 settings.listen_interfaces =
                     Some(torrentd_engine::bind_endpoint(tunnel_ip, effective_port));
                 settings.outgoing_interfaces = Some(tunnel_ip.to_string());
-                // `[[slot]] upload_rate_limit` was parsed, documented in the
-                // sample config, and applied nowhere — a slot's limit silently
+                // `[[profile]] upload_rate_limit` was parsed, documented in the
+                // sample config, and applied nowhere — a profile's limit silently
                 // did nothing. Zero means "inherit the top-level limit", which
                 // is what the default has always meant in practice.
                 if s.upload_rate_limit > 0 {
@@ -370,13 +368,13 @@ pub async fn boot(
                 match RealEngine::new(&settings) {
                     Ok(engine) => {
                         info!(
-                            slot_id = %s.id,
+                            profile_id = %s.id,
                             tunnel_ip = %tunnel_ip,
                             listen_port = effective_port,
-                            "slot engine up",
+                            "profile engine up",
                         );
                         let engine: Arc<dyn TorrentEngine> = Arc::new(engine);
-                        slot_entries.push(SlotEntry::new(
+                        profile_entries.push(ProfileEntry::new(
                             s.clone(),
                             engine,
                             tunnel_ip,
@@ -386,34 +384,34 @@ pub async fn boot(
                     }
                     Err(e) => {
                         error!(
-                            slot_id = %s.id,
+                            profile_id = %s.id,
                             error.cause = %e,
-                            "slot engine construction failed; tearing down VPN",
+                            "profile engine construction failed; tearing down VPN",
                         );
                         cleanup.take_down(&s.vpn_interface);
-                        failed_slots.push(crate::slot_registry::FailedSlot {
+                        failed_profiles.push(crate::profile_registry::FailedProfile {
                             config: s.clone(),
                             reason: format!("session construction failed: {e}"),
                         });
                     }
                 }
             }
-            if slot_entries.is_empty() {
-                anyhow::bail!("multi-slot mode: no slots came up");
+            if profile_entries.is_empty() {
+                anyhow::bail!("multi-profile mode: no profiles came up");
             }
-            let source_entries: Vec<(SlotId, Arc<dyn TorrentEngine>)> = slot_entries
+            let source_entries: Vec<(ProfileId, Arc<dyn TorrentEngine>)> = profile_entries
                 .iter()
                 .map(|e| (e.config.id.clone(), e.engine.clone()))
                 .collect();
-            slot_registry = Some(Arc::new(
-                SlotRegistry::new(slot_entries).with_failed(failed_slots),
+            profile_registry = Some(Arc::new(
+                ProfileRegistry::new(profile_entries).with_failed(failed_profiles),
             ));
-            Arc::new(MultiSlotSource::new(source_entries))
+            Arc::new(ProfileSource::new(source_entries))
         }
     };
 
-    // Network-layer kill switch (defence-in-depth; multi-slot + opt-in).
-    // Installed once, after every slot's tunnel is up, so the ruleset covers all
+    // Network-layer kill switch (defence-in-depth; multi-profile + opt-in).
+    // Installed once, after every profile's tunnel is up, so the ruleset covers all
     // tunnel interfaces. Fail-closed: if the operator asked for it and it can't
     // be installed, abort rather than seed without the backstop.
     let mut kill_switch_active = false;
@@ -424,7 +422,7 @@ pub async fn boot(
     // condition could never fire.
     metrics.set_gauge("kill_switch_active", 0.0, &[]);
     if cfg.network_kill_switch {
-        match &slot_registry {
+        match &profile_registry {
             Some(sr) => {
                 let tunnels: Vec<String> =
                     sr.iter().map(|e| e.config.vpn_interface.clone()).collect();
@@ -443,59 +441,59 @@ pub async fn boot(
                 // mode has no tunnel to confine egress to, so the honest answer
                 // is that the config is contradictory.
                 anyhow::bail!(
-                    "network_kill_switch = true but no [[slot]] entries are configured. \
-                     The kill switch confines the daemon's egress to its slots' tunnel \
+                    "network_kill_switch = true but no [[profile]] entries are configured. \
+                     The kill switch confines the daemon's egress to its profiles' tunnel \
                      interfaces, and single-session mode has none — it would seed from \
-                     the bare IP with no backstop. Configure slots, or unset \
+                     the bare IP with no backstop. Configure profiles, or unset \
                      network_kill_switch.",
                 );
             }
         }
     }
 
-    // Resume scan: load every saved resume file per slot. The shim
+    // Resume scan: load every saved resume file per profile. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
     // won't double-add.
-    for slot in source.slots() {
-        let entries = resume_store.load_all(&slot).context("scan resume dir")?;
+    for profile in source.profiles() {
+        let entries = resume_store.load_all(&profile).context("scan resume dir")?;
         let count = entries.len();
         let mut missing_metadata = 0usize;
         let engine = source
-            .engine_for(&slot)
-            .ok_or_else(|| anyhow::anyhow!("no engine for slot {}", slot))?;
+            .engine_for(&profile)
+            .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
         for (ih, data) in entries {
-            // Cross-check the registry; the spec aborts the slot on mismatch.
-            // Single-session always uses SlotId::DEFAULT, so the check
-            // mainly guards multi-slot mode.
+            // Cross-check the registry; the spec aborts the profile on mismatch.
+            // Single-session always uses ProfileId::DEFAULT, so the check
+            // mainly guards multi-profile mode.
             if let Some(existing) = registry.lookup(&ih) {
-                if existing != slot {
+                if existing != profile {
                     warn!(
-                        slot_id = %slot,
+                        profile_id = %profile,
                         infohash = %ih,
-                        existing_slot = %existing,
-                        "resume file in wrong slot; skipping (operator must reconcile)",
+                        existing_profile = %existing,
+                        "resume file in wrong profile; skipping (operator must reconcile)",
                     );
                     metrics.inc_counter(
-                        "slot_assignment_registry_errors_total",
-                        &[("slot_id", slot.as_str())],
+                        "profile_assignment_registry_errors_total",
+                        &[("profile_id", profile.as_str())],
                     );
                     continue;
                 }
-            } else if let Err(e) = registry.assign(ih, slot.clone()) {
+            } else if let Err(e) = registry.assign(ih, profile.clone()) {
                 // Rule 4 makes the registry the gate every load passes. An
                 // assignment that failed to persist is one that disappears at
                 // the next restart, after which nothing knows this info-hash
-                // belongs to this slot — so refuse the load rather than seed a
+                // belongs to this profile — so refuse the load rather than seed a
                 // torrent the uniqueness rule can no longer see.
                 warn!(
-                    slot_id = %slot,
+                    profile_id = %profile,
                     infohash = %ih,
                     error.cause = %e,
                     "could not record the resume assignment; skipping this torrent",
                 );
                 metrics.inc_counter(
-                    "slot_assignment_registry_errors_total",
-                    &[("slot_id", slot.as_str())],
+                    "profile_assignment_registry_errors_total",
+                    &[("profile_id", profile.as_str())],
                 );
                 continue;
             }
@@ -504,13 +502,13 @@ pub async fn boot(
             // (vendor/libtorrent/src/torrent.cpp: `ret.ti = m_torrent_file` is
             // gated on that flag), so resume data alone leaves the torrent with
             // no metadata and it re-enters downloading_metadata on restart —
-            // fatal for a private slot with DHT and PEX disabled. Setting the
+            // fatal for a private profile with DHT and PEX disabled. Setting the
             // flag instead would embed a full piece-hash table in every resume
             // file, so pass the .torrent already on disk.
-            let torrent = match torrent_store.read(&slot, &ih) {
+            let torrent = match torrent_store.read(&profile, &ih) {
                 Ok(t) => t,
                 Err(e) => {
-                    warn!(slot_id = %slot, infohash = %ih, error.cause = %e,
+                    warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
                           "could not read .torrent for resume add; continuing without metadata");
                     None
                 }
@@ -523,7 +521,7 @@ pub async fn boot(
             // that a guard which lapses on restart is not a guard.
             //
             // PAUSED is deliberately *not* cleared. It is tempting: the VPN
-            // monitor pauses a whole slot when its tunnel drops, and if the
+            // monitor pauses a whole profile when its tunnel drops, and if the
             // resume sweep lands in that window every torrent comes back
             // paused. But resume data does not record *why* a torrent was
             // paused, so clearing it also silently restarts a torrent an
@@ -531,7 +529,7 @@ pub async fn boot(
             // mistake that ends an account. A pool that comes back paused is
             // visible in `/status` and fixed with `resume-all`; a pool that
             // comes back seeding when it was told not to is not recoverable.
-            let flags_set = torrentd_engine::resume_flags_set(&slot);
+            let flags_set = torrentd_engine::resume_flags_set(&profile);
             let flags_clear = TorrentFlags::empty();
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: data.into_inner(),
@@ -540,31 +538,33 @@ pub async fn boot(
                 flags_set,
                 flags_clear,
             }) {
-                warn!(slot_id = %slot, infohash = %ih, error.cause = %e, "resume add failed");
+                warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed");
             }
         }
         if missing_metadata > 0 {
             // Not fatal — libtorrent can still fetch metadata from peers where
-            // discovery is enabled — but on a private slot it usually means the
+            // discovery is enabled — but on a private profile it usually means the
             // torrent will sit idle, so make it visible rather than silent.
             warn!(
-                slot_id = %slot,
+                profile_id = %profile,
                 torrent_count = missing_metadata,
                 "resume entries with no .torrent on disk; these rely on peer metadata exchange",
             );
         }
-        info!(slot_id = %slot, torrent_count = count, "resume scan complete");
+        info!(profile_id = %profile, torrent_count = count, "resume scan complete");
     }
 
     // Torrent-dir scan: add any .torrent whose info-hash has no resume file
     // (resume always wins; startup inventory). After this the torrent
     // dir is not re-scanned — new torrents arrive only via the API.
     let scan_save_path = cfg.default_save_path.to_string_lossy().into_owned();
-    for slot in source.slots() {
-        let entries = torrent_store.load_all(&slot).context("scan torrent dir")?;
+    for profile in source.profiles() {
+        let entries = torrent_store
+            .load_all(&profile)
+            .context("scan torrent dir")?;
         let engine = source
-            .engine_for(&slot)
-            .ok_or_else(|| anyhow::anyhow!("no engine for slot {}", slot))?;
+            .engine_for(&profile)
+            .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
         let mut added = 0usize;
         for (ih, bytes) in entries {
             // Resume data already loaded this torrent (the registry holds
@@ -576,20 +576,20 @@ pub async fn boot(
             // left a window in which the session held a torrent the registry
             // had never agreed to, and dropped the claim silently if it could
             // not be written.
-            if let Err(e) = registry.assign(ih, slot.clone()) {
+            if let Err(e) = registry.assign(ih, profile.clone()) {
                 warn!(
-                    slot_id = %slot,
+                    profile_id = %profile,
                     infohash = %ih,
                     error.cause = %e,
                     "could not record the torrent-dir assignment; skipping this torrent",
                 );
                 metrics.inc_counter(
-                    "slot_assignment_registry_errors_total",
-                    &[("slot_id", slot.as_str())],
+                    "profile_assignment_registry_errors_total",
+                    &[("profile_id", profile.as_str())],
                 );
                 continue;
             }
-            let flags = torrentd_engine::seed_flags(&slot);
+            let flags = torrentd_engine::seed_flags(&profile);
             match engine.add_torrent(AddParams::File {
                 bytes,
                 save_path: scan_save_path.clone(),
@@ -602,7 +602,7 @@ pub async fn boot(
                     // Release the claim so a later run can retry the add.
                     let _ = registry.remove(&ih);
                     warn!(
-                        slot_id = %slot,
+                        profile_id = %profile,
                         infohash = %ih,
                         error.cause = %e,
                         "torrent-dir add failed",
@@ -611,7 +611,7 @@ pub async fn boot(
             }
         }
         if added > 0 {
-            info!(slot_id = %slot, torrent_count = added, "torrent dir scan: added new torrents");
+            info!(profile_id = %profile, torrent_count = added, "torrent dir scan: added new torrents");
         }
     }
 
@@ -639,8 +639,8 @@ pub async fn boot(
     )
     // `listen_failed` is fatal in single-session mode
     // (nothing else is listening, so seeding just stops silently). In
-    // multi-slot mode the per-slot handler marks that slot failed and the
-    // remaining slots carry on.
+    // multi-profile mode the per-profile handler marks that profile failed and the
+    // remaining profiles carry on.
     .fatal_listen_failure(mode == Mode::Single)
     .on_fatal({
         let tx = shutdown_tx.clone();
@@ -649,16 +649,16 @@ pub async fn boot(
         }) as torrentd_engine::FatalCallback
     })
     // The engine resumes torrents on its own upload-mode retry schedule and
-    // has no concept of a tunnel, so it has to be told which slots the VPN
+    // has no concept of a tunnel, so it has to be told which profiles the VPN
     // monitor has fenced.
-    .slot_fenced({
-        let slots = slot_registry.clone();
-        Arc::new(move |id: &torrentd_engine::SlotId| {
-            slots
+    .profile_fenced({
+        let profiles = profile_registry.clone();
+        Arc::new(move |id: &torrentd_engine::ProfileId| {
+            profiles
                 .as_ref()
                 .and_then(|sr| sr.get(id))
-                .is_some_and(|e| e.health().status == SlotStatus::VpnDown)
-        }) as torrentd_engine::SlotFenced
+                .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
+        }) as torrentd_engine::ProfileFenced
     })
     .spawn();
 
@@ -679,7 +679,7 @@ pub async fn boot(
         metrics,
         pool,
         registry,
-        slot_registry,
+        profile_registry,
         kill_switch_active,
         log_handle,
         alert_loop,
@@ -702,17 +702,17 @@ impl DaemonHandle {
             metrics,
             pool,
             registry,
-            slot_registry,
+            profile_registry,
             kill_switch_active,
             log_handle,
             alert_loop,
         } = self;
 
-        // VPN health monitor (multi-slot only). Spawned before AppState
+        // VPN health monitor (multi-profile only). Spawned before AppState
         // consumes the registry/state/metrics.
-        if let Some(slots) = slot_registry.clone() {
+        if let Some(profiles) = profile_registry.clone() {
             tokio::spawn(crate::vpn_monitor::run(
-                slots.clone(),
+                profiles.clone(),
                 state.clone(),
                 metrics.clone(),
                 std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
@@ -721,7 +721,7 @@ impl DaemonHandle {
             // Port-forward renewal monitor: keeps NAT-PMP leases alive and
             // rebinds the live session if the forwarded port changes.
             tokio::spawn(crate::port_forward_monitor::run(
-                slots,
+                profiles,
                 metrics.clone(),
                 shutdown_tx.subscribe(),
             ));
@@ -746,7 +746,7 @@ impl DaemonHandle {
                 source.clone(),
                 state.clone(),
                 metrics.clone(),
-                slot_registry.clone(),
+                profile_registry.clone(),
                 shutdown_tx.subscribe(),
             ));
         }
@@ -754,7 +754,7 @@ impl DaemonHandle {
         let app_state = AppState {
             source: source.clone(),
             registry: registry.clone(),
-            slots: slot_registry.clone(),
+            profiles: profile_registry.clone(),
             state,
             torrents,
             metrics: metrics.clone(),
@@ -763,10 +763,10 @@ impl DaemonHandle {
             alert_heartbeat: alert_loop.heartbeat(),
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),
-            mode: if cfg.slot.is_empty() {
+            mode: if cfg.profile.is_empty() {
                 Mode::Single
             } else {
-                Mode::MultiSlot
+                Mode::MultiProfile
             },
         };
 
@@ -870,10 +870,10 @@ impl DaemonHandle {
         }
 
         // Persist DHT/session state for the next start (single-session mode;
-        // slots run with enable_dht=false and skip this). The session
+        // profiles run with enable_dht=false and skip this). The session
         // is still alive here — only dropped when `source` goes out of scope.
-        if cfg.slot.is_empty() {
-            if let Some(engine) = source.engine_for(&SlotId::default_single()) {
+        if cfg.profile.is_empty() {
+            if let Some(engine) = source.engine_for(&ProfileId::default_single()) {
                 match engine.session_state() {
                     Ok(bytes) if !bytes.is_empty() => {
                         match save_session_state(&cfg.session_state_path(), &bytes) {
@@ -888,7 +888,7 @@ impl DaemonHandle {
         }
 
         // Remove the network kill switch last, once seeding has drained. The
-        // tunnel is still up during a graceful shutdown, so the slots' sockets
+        // tunnel is still up during a graceful shutdown, so the profiles' sockets
         // (still source-bound to the tunnel IP) can't leak in this window.
         if kill_switch_active {
             match crate::vpn::killswitch::disable() {
@@ -903,13 +903,13 @@ impl DaemonHandle {
         // every restart accumulated interfaces and left an idle tunnel
         // connected to the provider indefinitely. Only on the graceful path —
         // a startup failure already tears down what it created.
-        if let Some(slots) = &slot_registry {
+        if let Some(profiles) = &profile_registry {
             let run_dir = cfg.state_dir();
-            for entry in slots.iter() {
+            for entry in profiles.iter() {
                 let vpn = crate::vpn::for_type(entry.config.vpn_type, &run_dir);
                 vpn.bring_down(&entry.config.vpn_interface);
                 info!(
-                    slot_id = %entry.config.id,
+                    profile_id = %entry.config.id,
                     vpn_iface = %entry.config.vpn_interface,
                     "tunnel down",
                 );
