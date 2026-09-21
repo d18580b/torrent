@@ -4,8 +4,19 @@
 //! existing JSON-file conventions carry — and the web client needs to sort,
 //! filter and paginate over that set without shipping it all to the browser.
 //! One transactional file serves the file index, the torrent library, adoption
-//! state, and the torrent→profile registry that used to live in
-//! `slot_assignments.json` (now `profile_assignments.json`).
+//! state, and a copy of the torrent→profile mapping that lives in
+//! `profile_assignments.json` (once `slot_assignments.json`).
+//!
+//! # `torrent.profile` is a cache, not the authority
+//!
+//! `profile_assignments.json` is the authority for which profile owns which
+//! info-hash. It is what the daemon's resume scan writes, what every load is
+//! gated on, and what the daemon refuses to boot against when it disagrees
+//! with the configured profiles. This column is a copy of it, written by
+//! `pool scan` — which an operator may never run — so it can be stale, and
+//! nothing here may be read as overriding the file. Where the two disagree
+//! the resume scan warns naming both values rather than silently preferring
+//! one.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -305,6 +316,69 @@ impl PoolStore {
         }
     }
 
+    /// Suffix of the copy [`PoolStore::migrate`] leaves before the first
+    /// destructive schema step. Named in `docs/running.md`'s rollback note.
+    pub const PRE_V3_BACKUP_SUFFIX: &'static str = ".pre-v3.bak";
+
+    /// Take a consistent copy of an existing database aside, once, before v3
+    /// touches it.
+    ///
+    /// v3 is the first schema step that destroys information: `ALTER TABLE
+    /// torrent RENAME COLUMN slot TO profile` cannot be undone by re-running
+    /// anything, and the file also holds the `plan` / `plan_step` journal that
+    /// [`PoolStore::from_conn`] documents as not reconstructible by rescanning.
+    /// The sibling artefact takes the same posture for the same reason — the
+    /// assignment registry keeps its pre-migration file "intact for a
+    /// rollback" — and nothing argued the index should behave differently.
+    ///
+    /// `VACUUM INTO` rather than a file copy: the database runs in WAL mode,
+    /// so the bytes at `path` are not by themselves a complete database.
+    ///
+    /// An existing backup is left alone. It is from an earlier attempt at this
+    /// same migration, and that attempt rolled back, so it describes the same
+    /// state this one would write — and the older file is the one an operator
+    /// has had time to notice.
+    fn backup_before_v3(&self) -> Result<(), PoolError> {
+        // No path: an in-memory store, which has nothing to roll back to.
+        let Some(path) = self.conn.path().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        let backup = format!("{path}{}", Self::PRE_V3_BACKUP_SUFFIX);
+        if Path::new(&backup).exists() {
+            info!(
+                target: "torrentd_pool::store",
+                backup = %backup,
+                "pool schema v3 backup already exists; keeping it",
+            );
+            return Ok(());
+        }
+        self.conn.execute("VACUUM INTO ?1", params![backup])?;
+        info!(
+            target: "torrentd_pool::store",
+            backup = %backup,
+            "pool database copied aside before the v3 schema migration",
+        );
+        Ok(())
+    }
+
+    /// Walk the schema forward from whatever the file reports.
+    ///
+    /// Every step and the `user_version` write go inside **one**
+    /// `BEGIN IMMEDIATE … COMMIT`. `execute_batch` without an explicit
+    /// transaction gives one implicit transaction *per statement*, so a
+    /// `RENAME COLUMN` that commits before a failing `DROP INDEX` or
+    /// `CREATE INDEX` — `SQLITE_FULL`, `SQLITE_IOERR`, or the process dying —
+    /// left `user_version` at 2 over a schema that had already moved to 3.
+    /// Every later open then re-ran v3 and failed on its own completed work,
+    /// permanently, on a database `startup.rs` opens with `?` under
+    /// `Restart=on-failure`. `PRAGMA user_version` is journaled and
+    /// participates in the transaction.
+    ///
+    /// The backup this takes first is for the state the transaction cannot
+    /// help with: a file written by an earlier build of this branch, which
+    /// folded the rename into v1 and so produced a `user_version = 2` file
+    /// that already carries `profile`. v3 cannot apply to it and nothing can
+    /// make it, so the answer is that the operator keeps the journal.
     fn migrate(&self) -> Result<(), PoolError> {
         let found: i64 = self
             .conn
@@ -315,26 +389,50 @@ impl PoolStore {
                 expected: SCHEMA_VERSION,
             });
         }
-        if found < 1 {
-            self.conn.execute_batch(SCHEMA_V1)?;
+        if found == SCHEMA_VERSION {
+            return Ok(());
         }
-        if found < 2 {
-            self.conn.execute_batch(SCHEMA_V2)?;
+        // Outside the transaction: VACUUM cannot run inside one. Only for a
+        // database that already exists — `found >= 1` — because there is
+        // nothing to preserve in a file this call is about to create.
+        if found >= 1 {
+            self.backup_before_v3()?;
         }
-        if found < 3 {
-            self.conn.execute_batch(SCHEMA_V3)?;
-        }
-        if found != SCHEMA_VERSION {
+
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let stepped = (|| -> Result<(), PoolError> {
+            if found < 1 {
+                self.conn.execute_batch(SCHEMA_V1)?;
+            }
+            if found < 2 {
+                self.conn.execute_batch(SCHEMA_V2)?;
+            }
+            if found < 3 {
+                self.conn.execute_batch(SCHEMA_V3)?;
+            }
             self.conn
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            info!(
-                target: "torrentd_pool::store",
-                from_version = found,
-                to_version = SCHEMA_VERSION,
-                "pool schema migrated",
-            );
+            Ok(())
+        })();
+        match stepped {
+            Ok(()) => {
+                self.conn.execute_batch("COMMIT")?;
+                info!(
+                    target: "torrentd_pool::store",
+                    from_version = found,
+                    to_version = SCHEMA_VERSION,
+                    "pool schema migrated",
+                );
+                Ok(())
+            }
+            Err(e) => {
+                // Report the original failure; a rollback that itself fails
+                // means the connection is unusable either way, and `open`
+                // returns the error that says what went wrong.
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
         }
-        Ok(())
     }
 
     // -- roots -------------------------------------------------------------

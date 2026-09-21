@@ -205,15 +205,34 @@ key.
 
 **2. Give a profile the id your registry already uses, or clear the entries.**
 The assignment registry — which torrent belongs to which account — is migrated
-automatically: `slot_assignments.json` is read once and rewritten as
-`profile_assignments.json`, with the old file left intact for a rollback. The
-migration is *verbatim*, so every entry still names the id that deployment used,
-which on a single-session deployment is `default`.
+automatically: `slot_assignments.json` is read once and written straight back
+out as `profile_assignments.json`, on that first boot and before anything else
+reads it, with the old file left intact for a rollback. The migration is
+*verbatim*, so every entry still names the id that deployment used, which on a
+single-session deployment is `default`.
 
 Nothing reconciles those ids with your `[[profile]]` tables, so the daemon
-refuses to start until they agree, listing the ids it does not recognise. Either
-name one of your profiles `default` — `default` is a legal profile id — or
-delete those entries from `profile_assignments.json` and re-add the torrents.
+refuses to start until they agree, listing the ids it does not recognise and
+naming the file it read them from. Either name one of your profiles `default` —
+`default` is a legal profile id — or delete those entries from
+`profile_assignments.json` and re-add the torrents. Edit
+`profile_assignments.json`, not `slot_assignments.json`: the old file is kept
+only so a rollback has something to go back to, and the daemon does not read it
+again.
+
+`torrentd pool scan` reads the same registry, and reads the old file too where
+that is the only one present — so running the scan before the daemon's first
+boot, which is the order this section uses, still folds your assignments into
+the pool index. It prints which file it read and how many entries it took.
+
+**2a. The pool index migrates one way, and leaves a copy.** If you have a
+`[pool]` section, the first open on this build renames the index's
+torrent→account column from `slot` to `profile`. A build predating this change
+cannot open the result. Before that step the daemon copies the database aside
+as `<db_path>.pre-v3.bak` — restore that file to roll back. Keep it until you
+are sure: it is the only copy of the `plan`/`plan_step` mutation journal, which
+a rescan does not reconstruct. The migration is applied in one transaction, so
+a failure part way through leaves the index exactly as it was.
 
 **3. Point each profile at its files, or move them.** Resume and `.torrent`
 files used to live directly under `resume_dir` and `torrent_dir`; they now live
@@ -367,6 +386,24 @@ empty.
 `SIGTERM` drains resume data (30s budget), persists session state, brings
 tunnels down, and exits.
 
+`POST /api/reload` does what `SIGHUP` does, over HTTP, for a caller that has no
+way to signal the process — a container without `kill`, or the web client.
+
+```bash
+curl -sS -X POST localhost:8080/api/reload
+```
+
+| Status | Meaning |
+| --- | --- |
+| `202` | Accepted. The reload runs asynchronously; watch the journal for its result. |
+| `429` | A reload is already in flight. Retry. |
+| `503` | The daemon is shutting down, or was built without the reload channel wired up. |
+
+It needs a token with the `write` scope (or a logged-in session) where `[auth]`
+is configured; `read` and `metrics` tokens are refused. It reloads exactly what
+`SIGHUP` reloads, and reports the same Safety Rule 7 warning for a
+`[[profile]]` field that changed and cannot be applied without a restart.
+
 ## 9. First-run checks
 
 ```bash
@@ -405,26 +442,45 @@ torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
 | `--json` | Emit the report as JSON instead of the human table. |
 | `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
 | `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host. |
-| `--as-uid UID` | Judge the kill-switch checks against the uid the daemon runs as. Default: this process's own. |
+| `--as-uid UID` | Render and dry-run the kill-switch ruleset for this uid instead of this process's own. |
 
 Exit status: `0` clean, `1` any check failed, `2` nothing failed but at least
-one check could not be performed — an unreadable sysctl, a `wg show` refused
-for want of permission. A caller that treats only `0` as success gets the
-strict reading; one that accepts `0` and `2` gets "nothing is known to be
-broken".
+one check could not be performed — an unreadable sysctl, a `wg` probe that
+failed. A caller that treats only `0` as success gets the strict reading; one
+that accepts `0` and `2` gets "nothing is known to be broken".
 
-**Safe to run against a live daemon.** Nothing in the default path changes
-state the daemon depends on: the NAT-PMP check asks the gateway for a mapping
-with the daemon's own short lease and lets that lease expire rather than
-deleting it, because NAT-PMP's delete removes *every* mapping the tunnel
-address holds — including the daemon's. `--bring-up` skips an interface that
-already exists and never lowers one it did not raise, for the same reason:
-`wg-quick down` on a live profile's tunnel fences that profile until the
-daemon is restarted.
+A check that could not be performed *because this invocation lacks
+`CAP_NET_ADMIN`* is reported `[?cap]` and does **not** raise the status to
+`2`. The daemon holds that capability and an operator shell usually does not,
+so `wg show <iface> latest-handshakes` and `nft --check` are routinely refused
+on a host where nothing is wrong; counting those would make `2` the normal
+answer everywhere and the distinction the exit code carries would mean
+nothing. They are still printed, and the `--json` report marks them with
+`"needs_capability": true`.
 
-**Run it as the daemon's user** where you can. The kill-switch checks describe
-one uid; with `sudo` (which `--bring-up` usually needs) pass `--as-uid` so
-they describe the daemon's rather than root's, or they will report `unknown`.
+**No host change, and nothing deleted.** The default path reads state and
+writes none. Its one interaction with a running daemon is the NAT-PMP check,
+which asks the gateway for a mapping with the daemon's own short lease and
+leaves that lease to expire: NAT-PMP's delete removes *every* mapping the
+tunnel address holds — including the daemon's — so the client this command
+negotiates with issues no delete on any branch, not even the one that tidies a
+UDP mapping the gateway put on an unexpected port. The request goes out from
+the same NAT-PMP client identity the daemon uses; whether a gateway coalesces
+it with the mapping the daemon already holds or hands out a second one is
+gateway behaviour, and nothing here tests it. `--bring-up` is the exception
+that changes the host: it skips an interface that already exists and lowers
+again only what it was observed to have raised, because `wg-quick down` on a
+live profile's tunnel fences that profile until the daemon is restarted.
+
+**Run it as the daemon's user** where you can, so the `wg` probes describe the
+process that will actually run them. The kill-switch pair is the one place
+that is not enough: with `sudo` (which `--bring-up` usually needs) pass
+`--as-uid` so the ruleset is rendered and dry-run for the daemon's uid rather
+than root's. The `kill_switch_uid` line itself still reports `unknown`
+whenever the invoker is not the uid named — nothing here can observe which
+user the daemon runs as — while the ruleset below it is validated for the uid
+you gave either way. The exception is uid `0`, which fails whoever asks,
+because the kill switch refuses to install for root unconditionally.
 
 **What a pass establishes**, for a WireGuard profile with
 `port_forward = "natpmp"`: the tunnel config is readable; `wg` and `wg-quick`

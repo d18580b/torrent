@@ -138,6 +138,7 @@ pub struct DaemonHandle {
     state: Arc<StateMap>,
     source: Arc<dyn AlertSource>,
     torrents: Arc<dyn TorrentStore>,
+    resume: Arc<dyn ResumeStore>,
     shutdown_tx: broadcast::Sender<ShutdownReason>,
     /// Subscribed in `boot`, before the HTTP server exists, so a SIGTERM
     /// arriving during startup is buffered rather than dropped on the floor.
@@ -255,14 +256,31 @@ pub async fn boot(
                 .map(|p| p.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
+            // Name the file the entries were *read from*. On the path this
+            // fires on — a migrated registry, which is what produces ids like
+            // `default` — that is the pre-rename `slot_assignments.json`, and
+            // quoting the post-rename name sent the operator to look at a
+            // file whose contents are a copy made moments earlier. Both are
+            // named, because both now exist and only one is the one the
+            // daemon will read next time.
+            let source = registry.source_path().display().to_string();
+            let current = cfg.registry_path().display().to_string();
+            let where_to_edit = if source == current {
+                format!("remove those entries from {current}")
+            } else {
+                format!(
+                    "remove those entries from {current} (they were read from {source}, which is \
+                     left intact for a rollback; editing that file alone will not help, because \
+                     {current} is what the daemon reads from here on)"
+                )
+            };
             anyhow::bail!(
-                "the assignment registry at {registry_path} assigns torrents to profiles that no \
+                "the assignment registry at {source} assigns torrents to profiles that no \
                  [[profile]] table declares: {named}. Configured profiles: {known}. Those \
                  torrents cannot be loaded, re-added or deleted while the mismatch stands. \
                  Either give one of the configured profiles the id the registry names — the \
                  upgrade path from the pre-profiles layout, where every entry says `default` — \
-                 or remove those entries from {registry_path} and re-add the torrents.",
-                registry_path = cfg.registry_path().display(),
+                 or {where_to_edit} and re-add the torrents.",
             );
         }
     }
@@ -494,12 +512,19 @@ pub async fn boot(
             // flag precisely because they do not want traffic on the bare
             // address; warning and continuing would give them exactly that,
             // with a startup log line as the only trace.
+            //
+            // `--check-config` reproduces the configured-set half of this
+            // (`Config::check_boot_rules`), so a config with no vpn profile
+            // fails the systemd pre-flight. This check stays because it reads
+            // the profiles that actually came up: a config with one vpn
+            // profile whose tunnel failed lands here too, and no config check
+            // could have known.
+            cfg.check_boot_rules()?;
             anyhow::bail!(
-                "network_kill_switch = true but no profile uses network = \"vpn\". \
-                 The kill switch confines the daemon's egress to its profiles' tunnel \
-                 interfaces; with no tunnel there is nothing to confine it to, and \
-                 every profile would keep seeding from the host's own address with no \
-                 backstop. Configure a vpn profile, or unset network_kill_switch.",
+                "network_kill_switch = true and no configured vpn profile came up, so there is \
+                 no tunnel to confine the daemon's egress to. Every profile would keep seeding \
+                 from the host's own address with no backstop. Fix the tunnel bring-up reported \
+                 above, or unset network_kill_switch.",
             );
         }
         let uid = vpn::killswitch::enable(&tunnels)
@@ -509,6 +534,20 @@ pub async fn boot(
         metrics.set_gauge("kill_switch_active", 1.0, &[]);
         info!(uid, tunnels = ?tunnels, "network kill switch active");
     }
+
+    /// The two store directories a profile's sessions actually read, from the
+    /// one place that rule lives.
+    fn dirs_of(cfg: &Config, profile: &ProfileId) -> (std::path::PathBuf, std::path::PathBuf) {
+        match cfg.profile.iter().find(|p| &p.id == profile) {
+            Some(p) => cfg.effective_store_dirs(p),
+            None => (cfg.resume_dir.clone(), cfg.torrent_dir.clone()),
+        }
+    }
+
+    // How many torrents each profile actually ended up holding, across both
+    // scans. Compared against the registry's claim once both have run.
+    let mut loaded_by_profile: std::collections::HashMap<ProfileId, usize> =
+        std::collections::HashMap::new();
 
     // Resume scan: load every saved resume file per profile. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
@@ -520,6 +559,7 @@ pub async fn boot(
         let entries = resume_store.load_all(&profile).context("scan resume dir")?;
         let count = entries.len();
         let mut missing_metadata = 0usize;
+        let mut added_from_resume = 0usize;
         let engine = source
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
@@ -593,14 +633,17 @@ pub async fn boot(
             // comes back seeding when it was told not to is not recoverable.
             let flags_set = torrentd_engine::resume_flags_set(profile_cfg);
             let flags_clear = TorrentFlags::empty();
-            if let Err(e) = engine.add_torrent(AddParams::Resume {
+            match engine.add_torrent(AddParams::Resume {
                 bytes: data.into_inner(),
                 torrent,
                 save_path: None,
                 flags_set,
                 flags_clear,
             }) {
-                warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed");
+                Ok(_) => added_from_resume += 1,
+                Err(e) => {
+                    warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed")
+                }
             }
         }
         if missing_metadata > 0 {
@@ -614,6 +657,7 @@ pub async fn boot(
             );
         }
         info!(profile_id = %profile, torrent_count = count, "resume scan complete");
+        loaded_by_profile.insert(profile.clone(), added_from_resume);
     }
 
     // Torrent-dir scan: add any .torrent whose info-hash has no resume file
@@ -678,6 +722,59 @@ pub async fn boot(
         if added > 0 {
             info!(profile_id = %profile, torrent_count = added, "torrent dir scan: added new torrents");
         }
+        loaded_by_profile
+            .entry(profile.clone())
+            .and_modify(|n| *n += added)
+            .or_insert(added);
+    }
+
+    // Reconcile what the registry claims against what the scans actually
+    // loaded.
+    //
+    // The boot check above catches the adjacent mistake — a registry naming an
+    // id no `[[profile]]` declares — and refuses well. But an operator who
+    // takes its own advice ("give one of the configured profiles the id the
+    // registry names") and stops there boots successfully with every file
+    // still at the old un-partitioned root: `resume scan complete
+    // torrent_count=0` at `info`, `/healthz` 200, and `GET /api/profiles`
+    // reporting N torrents that no session holds, because it derives
+    // `torrent_count` from the registry rather than from loaded state. A
+    // silent total outage reported healthy is the failure mode this whole
+    // section exists to prevent; nothing was comparing the two numbers.
+    //
+    // A warning rather than a refusal: an operator may legitimately have
+    // deleted payload out from under a stale assignment, and the remedy — an
+    // override pointing at the old directory — is theirs to choose. The
+    // directory actually searched is named, because that is the value the
+    // remedy sets.
+    for profile in source.profiles() {
+        let claimed = registry.for_profile(&profile).len();
+        let loaded = loaded_by_profile.get(&profile).copied().unwrap_or(0);
+        if claimed > loaded {
+            warn!(
+                profile_id = %profile,
+                registry_torrents = claimed,
+                loaded_torrents = loaded,
+                resume_dir = %dirs_of(&cfg, &profile).0.display(),
+                torrent_dir = %dirs_of(&cfg, &profile).1.display(),
+                registry_path = %registry.source_path().display(),
+                "the assignment registry claims more torrents for this profile than the scans \
+                 loaded; the files are probably still at the pre-profiles root — point this \
+                 profile's resume_dir and torrent_dir at it, or move the files into the \
+                 directories named here",
+            );
+            metrics.set_gauge(
+                "profile_unloaded_registry_torrents",
+                (claimed - loaded) as f64,
+                &[("profile_id", profile.as_str())],
+            );
+        } else {
+            metrics.set_gauge(
+                "profile_unloaded_registry_torrents",
+                0.0,
+                &[("profile_id", profile.as_str())],
+            );
+        }
     }
 
     // Subscribe now, not when the HTTP server starts: a broadcast sent with no
@@ -688,6 +785,50 @@ pub async fn boot(
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call.
     let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
+
+    // Two artefacts persist a torrent→profile mapping, and nothing reconciled
+    // them: `profile_assignments.json`, which the resume scan above writes and
+    // every load is gated on, and the pool index's `torrent.profile` column,
+    // which `pool scan` writes and an operator may never run. The registry is
+    // the authority and the column is a cache of it — said so in both module
+    // docs now — but where the two disagree, the disagreement was previously
+    // resolved by whichever code path a reader happened to be in. Name both
+    // values instead. Read-only: rewriting an operator's index during boot is
+    // not this check's business.
+    if let Some(pool) = pool.as_ref() {
+        let stale = pool.with_store(|st| {
+            let mut out: Vec<(String, String, String)> = Vec::new();
+            for t in st.torrents().unwrap_or_default() {
+                let Some(indexed) = t.profile.as_deref() else {
+                    continue;
+                };
+                let Some(ih) = libtorrent_safe::InfoHash::from_hex(&t.infohash) else {
+                    continue;
+                };
+                if let Some(owner) = registry.lookup(&ih) {
+                    if owner.as_str() != indexed {
+                        out.push((
+                            t.infohash.clone(),
+                            owner.as_str().to_string(),
+                            indexed.to_string(),
+                        ));
+                    }
+                }
+            }
+            out
+        });
+        for (infohash, registry_profile, index_profile) in &stale {
+            warn!(
+                infohash = %infohash,
+                registry_profile = %registry_profile,
+                index_profile = %index_profile,
+                "the pool index and the assignment registry disagree about who owns this \
+                 torrent; the registry is authoritative and the index is a cache of it, so \
+                 `torrentd pool scan` will bring the index back into line",
+            );
+        }
+        metrics.set_gauge("pool_index_profile_disagreements", stale.len() as f64, &[]);
+    }
 
     // Alert loop.
     let metrics_for_loop: Arc<dyn MetricsSink> = metrics.clone();
@@ -742,6 +883,7 @@ pub async fn boot(
         state,
         source,
         torrents: torrent_store,
+        resume: resume_store,
         shutdown_tx,
         shutdown_rx,
         reload_rx,
@@ -766,6 +908,7 @@ impl DaemonHandle {
             state,
             source,
             torrents,
+            resume,
             shutdown_tx,
             shutdown_rx,
             reload_rx,
@@ -829,6 +972,7 @@ impl DaemonHandle {
             profiles: profile_registry.clone(),
             state,
             torrents,
+            resume,
             metrics: metrics.clone(),
             auth: cfg.auth.clone().map(crate::auth::Auth::new),
             pool,
