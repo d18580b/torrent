@@ -95,6 +95,9 @@ pub async fn boot(
     } else {
         Mode::MultiSlot
     };
+    // Where a VPN manager keeps state a *later* process has to find — see
+    // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
+    let run_dir = cfg.state_dir();
 
     // Resume store — rooted at the top-level `resume_dir` and partitioned by
     // slot id, except where a `[[slot]]` names its own directory. Those keys
@@ -170,7 +173,7 @@ pub async fn boot(
                 // 1) Bring the VPN up first. Safety Rule 1: if it
                 //    fails, the slot's lt::session is never constructed
                 //    — no bare-IP fallback.
-                let vpn = vpn::for_type(s.vpn_type);
+                let vpn = vpn::for_type(s.vpn_type, &run_dir);
                 let tunnel_ip = match vpn.bring_up(&s.vpn_profile()) {
                     Ok(ip) => ip,
                     Err(e) => {
@@ -776,8 +779,9 @@ impl DaemonHandle {
         // connected to the provider indefinitely. Only on the graceful path —
         // a startup failure already tears down what it created.
         if let Some(slots) = &slot_registry {
+            let run_dir = cfg.state_dir();
             for entry in slots.iter() {
-                let vpn = crate::vpn::for_type(entry.config.vpn_type);
+                let vpn = crate::vpn::for_type(entry.config.vpn_type, &run_dir);
                 vpn.bring_down(&entry.config.vpn_interface);
                 info!(
                     slot_id = %entry.config.id,

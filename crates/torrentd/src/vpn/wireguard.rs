@@ -5,6 +5,7 @@
 //! timeout fires.
 
 use std::net::IpAddr;
+use std::path::Path;
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
@@ -54,12 +55,77 @@ pub fn latest_handshake_age(iface: &str) -> Option<Duration> {
     Some(Duration::from_secs(now.saturating_sub(latest)))
 }
 
+/// The public key WireGuard reports for a live interface, or `None` if the
+/// interface does not exist or `wg` cannot be run.
+fn interface_public_key(iface: &str) -> Option<String> {
+    let out = Command::new("wg")
+        .args(["show", iface, "public-key"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!key.is_empty() && key != "(none)").then_some(key)
+}
+
+/// The public key derived from a profile's `PrivateKey`, or `None` if the file
+/// is unreadable or names no key.
+fn profile_public_key(config_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(config_path).ok()?;
+    let private = text.lines().find_map(|l| {
+        let (k, v) = l.split_once('=')?;
+        k.trim()
+            .eq_ignore_ascii_case("PrivateKey")
+            .then(|| v.trim().to_string())
+    })?;
+    let mut child = std::process::Command::new("wg")
+        .arg("pubkey")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    {
+        use std::io::Write;
+        child.stdin.take()?.write_all(private.as_bytes()).ok()?;
+    }
+    let out = child.wait_with_output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let key = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!key.is_empty()).then_some(key)
+}
+
 #[derive(Debug, Default)]
 pub struct WireguardManager;
 
 impl WireguardManager {
     pub fn new() -> Self {
         Self
+    }
+
+    /// The IP of an existing interface that is safe to adopt as `profile`'s
+    /// tunnel: it must be live, carry the profile's own public key, and have an
+    /// address. Anything less and the daemon would be binding its sockets to a
+    /// tunnel it cannot vouch for, which is the one thing Safety Rule 1 exists
+    /// to prevent.
+    fn adoptable(&self, profile: &VpnProfile) -> Option<IpAddr> {
+        let live = interface_public_key(&profile.interface)?;
+        let expected = profile_public_key(&profile.config_path)?;
+        if live != expected {
+            warn!(
+                target: "torrentd::vpn::wireguard",
+                vpn_iface = %profile.interface,
+                "an interface of this name exists but carries a different public key; \
+                 refusing to adopt it",
+            );
+            return None;
+        }
+        super::ip_lookup::first_ipv4(&profile.interface)
+            .ok()
+            .map(IpAddr::V4)
     }
 }
 
@@ -77,6 +143,27 @@ impl VpnManager for WireguardManager {
             .status()
             .map_err(VpnError::Io)?;
         if !status.success() {
+            // `wg-quick up` refuses an interface that already exists, which is
+            // what a previous process leaves behind when it is killed rather
+            // than shut down: the tunnel outlives it, every slot then fails to
+            // come up, and the daemon exits because no slot came up. Restarting
+            // was impossible without an operator tearing the tunnels down by
+            // hand — on a host whose whole point is to keep seeding.
+            //
+            // Adopt it instead, but only when it is genuinely the same tunnel:
+            // a live WireGuard interface of that name, carrying the public key
+            // this profile configures. A name collision with someone else's
+            // tunnel is not adopted.
+            if let Some(ip) = self.adoptable(profile) {
+                warn!(
+                    target: "torrentd::vpn::wireguard",
+                    vpn_iface = %profile.interface,
+                    tunnel_ip = %ip,
+                    "wg-quick up refused; adopting the existing tunnel of the same \
+                     public key (left by an unclean shutdown)",
+                );
+                return Ok(ip);
+            }
             return Err(VpnError::Spawn(format!("wg-quick up exited with {status}")));
         }
 

@@ -211,6 +211,16 @@ pub enum SlotConfigError {
         "slot id {0:?} is reserved for the single-session slot and cannot name a configured slot"
     )]
     ReservedId(String),
+    #[error(
+        "slot {slot:?}: vpn_interface {iface:?} must equal the file stem of vpn_profile \
+         ({profile:?}); wg-quick derives the interface name from the file name, so these \
+         cannot differ"
+    )]
+    InterfaceProfileMismatch {
+        slot: String,
+        iface: String,
+        profile: String,
+    },
 }
 
 impl SlotConfig {
@@ -271,6 +281,26 @@ impl SlotConfig {
             }
             if !seen_iface.insert(s.vpn_interface.clone()) {
                 return Err(SlotConfigError::DuplicateInterface(s.vpn_interface.clone()));
+            }
+            // `wg-quick up <path>` names the interface after the file, and
+            // `wg-quick down <iface>` looks the file back up from the name.
+            // A slot whose two fields disagree therefore brings a tunnel up
+            // under one name, waits 30s for an address on another, fails, and
+            // — if it ever did come up — could never be torn down. Refuse the
+            // config instead of discovering it at the timeout.
+            if s.vpn_type == VpnType::Wireguard {
+                let stem = s
+                    .vpn_profile
+                    .file_stem()
+                    .map(|f| f.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if stem != s.vpn_interface {
+                    return Err(SlotConfigError::InterfaceProfileMismatch {
+                        slot: s.id.as_str().to_string(),
+                        iface: s.vpn_interface.clone(),
+                        profile: s.vpn_profile.display().to_string(),
+                    });
+                }
             }
             if s.peer_fingerprint_hex.len() != 16 {
                 return Err(SlotConfigError::BadFingerprintLength(
@@ -355,7 +385,7 @@ mod tests {
     fn cfg(id: &str, port: u16, iface: &str, fp: &str, ua: &str) -> SlotConfig {
         SlotConfig {
             id: SlotId::new(id),
-            vpn_profile: PathBuf::from(format!("/etc/wg/{id}.conf")),
+            vpn_profile: PathBuf::from(format!("/etc/wg/{iface}.conf")),
             vpn_type: VpnType::Wireguard,
             vpn_interface: iface.to_string(),
             listen_port: Some(port),
@@ -368,6 +398,26 @@ mod tests {
             port_forward: PortForwardMode::Static,
             port_forward_gateway: None,
         }
+    }
+
+    #[test]
+    fn wireguard_interface_must_match_its_profile_file() {
+        let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+        s.vpn_profile = PathBuf::from("/etc/wireguard/something-else.conf");
+        assert!(matches!(
+            SlotConfig::validate_set(&[s]),
+            Err(SlotConfigError::InterfaceProfileMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn openvpn_slots_are_not_subject_to_the_wireguard_naming_rule() {
+        // openvpn takes --dev explicitly, so its profile file name carries no
+        // meaning for the interface.
+        let mut s = cfg("acct_a", 6881, "tun0", "a1b2c3d4e5f60718", "qB/5.0");
+        s.vpn_type = VpnType::Openvpn;
+        s.vpn_profile = PathBuf::from("/etc/openvpn/account-a.conf");
+        assert!(SlotConfig::validate_set(&[s]).is_ok());
     }
 
     #[test]

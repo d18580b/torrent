@@ -358,7 +358,7 @@ impl Config {
     }
 
     /// Directory the daemon keeps its own state in, derived from `resume_dir`.
-    fn state_dir(&self) -> PathBuf {
+    pub fn state_dir(&self) -> PathBuf {
         self.resume_dir
             .parent()
             .map(|p| p.to_path_buf())
