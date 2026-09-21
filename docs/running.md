@@ -311,8 +311,11 @@ The unit is `Type=notify`: `READY=1` once the HTTP listener is bound,
 resume drain. The watchdog ping is withheld if the alert loop stops advancing,
 so a wedged daemon gets restarted rather than reported healthy.
 
-Remove `AmbientCapabilities=CAP_NET_ADMIN` and `CapabilityBoundingSet` for
-a deployment with no `vpn` profile; they are only needed to manage tunnels.
+Uncomment `AmbientCapabilities=CAP_NET_ADMIN` and
+`CapabilityBoundingSet=CAP_NET_ADMIN` for a deployment **with** a `vpn`
+profile; they are only needed to manage tunnels. A deployment without one
+takes the unit as shipped, which grants no capability and bounds the set to
+empty.
 
 **Signals:** `SIGHUP` reloads log level, rate limits and connection limits.
 `SIGTERM` drains resume data (30s budget), persists session state, brings
