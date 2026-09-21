@@ -91,6 +91,14 @@ fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
 }
 
 /// The set of peers whose forwarding headers are believed.
+///
+/// A peer listed here can claim to be any client, so it has to be the address
+/// the reverse proxy connects from and only that. The one thing required of
+/// the proxy itself is that it **strips or overwrites** client-supplied
+/// forwarding headers rather than passing them through: a value this daemon
+/// believes must be one the proxy wrote. Whether the proxy appends by
+/// extending the existing field line or by adding another one does not
+/// matter — `last_element` reads both the same way.
 #[derive(Clone, Debug, Default)]
 pub struct TrustedProxies(Vec<Cidr>);
 
@@ -122,12 +130,34 @@ pub struct Client {
     pub secure: bool,
 }
 
-/// Resolve the client behind `req`.
+/// The last element of `name`'s value, across every field line it arrived on.
 ///
-/// `X-Forwarded-For` is a comma-separated chain appended to by each hop, so
-/// the entry the *trusted* proxy added is the last one, not the first. Taking
-/// the first — the usual mistake — takes whatever the original client sent,
-/// which is attacker-controlled even through an honest proxy.
+/// Two rules, and they are the same rule at two levels.
+///
+/// A forwarding header is a chain appended to by each hop, so the entry the
+/// *trusted* proxy added is the last one, not the first. Taking the first —
+/// the usual mistake — takes whatever the original client sent, which is
+/// attacker-controlled even through an honest proxy.
+///
+/// A proxy may append by adding a whole new field line rather than extending
+/// the existing one; HAProxy's `option forwardfor` does exactly that. RFC 9110
+/// §5.2-5.3 makes repeated field lines of one name semantically identical to a
+/// single comma-joined value, so reading only `HeaderMap::get` — the *first*
+/// line — hands the choice straight back to the client, which is the same
+/// defect one level up. Joining every line in order and taking the last
+/// element makes the proxy's field-line style stop mattering.
+fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> Option<&'a str> {
+    req.headers()
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .last()
+}
+
+/// Resolve the client behind `req`.
 pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     let peer = req
         .extensions()
@@ -149,21 +179,17 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
         };
     }
 
-    let header = |name: &str| {
-        req.headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .map(str::trim)
-    };
-
-    let ip = header("x-forwarded-for")
-        .and_then(|v| v.rsplit(',').next())
-        .map(str::trim)
+    let ip = last_element(req, "x-forwarded-for")
         .and_then(|s| s.parse::<IpAddr>().ok())
         .or(Some(peer));
 
-    let secure = header("x-forwarded-proto").is_some_and(|p| p.eq_ignore_ascii_case("https"))
-        || header("forwarded").is_some_and(|f| {
+    // The last `Forwarded` element, whose parameters are its own; an earlier
+    // element is another hop's, and through a proxy that appends rather than
+    // strips, the earliest one is the client's.
+    let forwarded = last_element(req, "forwarded");
+    let secure = last_element(req, "x-forwarded-proto")
+        .is_some_and(|p| p.eq_ignore_ascii_case("https"))
+        || forwarded.is_some_and(|f| {
             f.split(';')
                 .any(|part| part.trim().eq_ignore_ascii_case("proto=https"))
         });
@@ -183,6 +209,21 @@ mod tests {
             .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 12345)));
         for (k, v) in headers {
             r.headers_mut().insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        r
+    }
+
+    /// Like `req`, but appends each pair, so a repeated name becomes a second
+    /// field line rather than replacing the first.
+    fn req_appending(peer: &str, headers: &[(&str, &str)]) -> Request<()> {
+        let mut r = Request::new(());
+        r.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 12345)));
+        for (k, v) in headers {
+            r.headers_mut().append(
                 axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
                 HeaderValue::from_str(v).unwrap(),
             );
@@ -246,6 +287,83 @@ mod tests {
             &trusted(&["10.0.0.0/8"]),
         );
         assert_eq!(c.ip, Some("198.51.100.7".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_second_field_line_wins_over_the_first() {
+        // HAProxy's `option forwardfor` appends a whole new `X-Forwarded-For:`
+        // line instead of extending the one already there. RFC 9110 §5.2-5.3
+        // makes the two lines one comma-joined value, so the trusted proxy's
+        // entry is still last — reading only the first line would take the
+        // value the *client* sent and let it choose its own identity.
+        let c = resolve(
+            &req_appending(
+                "10.1.2.3",
+                &[
+                    ("x-forwarded-for", "198.51.100.7"),
+                    ("x-forwarded-for", "203.0.113.4"),
+                ],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some("203.0.113.4".parse().unwrap()),
+            "the last field line is the trusted proxy's; the first is the client's",
+        );
+    }
+
+    #[test]
+    fn a_second_proto_field_line_wins_over_the_first() {
+        let c = resolve(
+            &req_appending(
+                "10.1.2.3",
+                &[
+                    ("x-forwarded-proto", "https"),
+                    ("x-forwarded-proto", "http"),
+                ],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            !c.secure,
+            "the proxy's own line said http; the client's earlier https must not win",
+        );
+    }
+
+    #[test]
+    fn a_second_forwarded_field_line_wins_over_the_first() {
+        let c = resolve(
+            &req_appending(
+                "10.1.2.3",
+                &[
+                    ("forwarded", "proto=https"),
+                    ("forwarded", "for=203.0.113.4;proto=http"),
+                ],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(!c.secure, "the last field line is the trusted proxy's");
+    }
+
+    #[test]
+    fn an_earlier_forwarded_element_cannot_supply_the_scheme() {
+        // The same last-hop rule as X-Forwarded-For, one level down: a proxy
+        // that appends rather than strips leaves the client's element first.
+        // Splitting the whole header on `;` accepted that element's
+        // `proto=https` over a plain-HTTP request, which issues the session
+        // cookie `Secure` and stops the browser returning it over http://.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[("forwarded", "proto=https ;x=1, for=203.0.113.9;proto=http")],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            !c.secure,
+            "only the last element's proto counts; an earlier one is another hop's",
+        );
     }
 
     #[test]
