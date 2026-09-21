@@ -70,6 +70,8 @@ Everyday tasks:
 | `mise run lint-fix`| Clippy autofix                                           |
 | `mise run test`    | `cargo test --workspace`                                 |
 | `mise run check`   | fmt + lint                                               |
+| `mise run native`  | Provision the shared libtorrent prefix (see Build)       |
+| `mise run native-clean` | Delete every cached native prefix                   |
 
 Formatting requires **nightly rustfmt** (`imports_granularity`/`group_imports` are
 unstable); `mise run setup` installs it and the `fmt` tasks invoke `cargo +nightly fmt`.
@@ -90,20 +92,23 @@ Everything else builds/lints/tests on the pinned stable toolchain.
 
 Vendored C/C++ dependencies live under `vendor/` as git submodules:
 
-- `vendor/libtorrent` — pinned to `v2.0.12` (arvidn/libtorrent)
+- `vendor/libtorrent` — pinned to `v2.0.14` (arvidn/libtorrent)
 - `vendor/boost` — pinned to `boost-1.83.0` (boostorg/boost super-repo)
 
 After cloning the repo:
 
 ```bash
-git submodule update --init --recursive --depth 1
+mise run native     # submodules, then the one-off libtorrent build
 ```
 
-The Boost super-repo references ~150 sub-repos. With `--depth 1` the total clone is roughly
-1.5 GB. Without `--depth 1` it is over 4 GB.
+The Boost super-repo references ~150 sub-repos. With `--depth 1` (which `mise run native`
+uses) the total clone is roughly 1.5 GB. Without it, over 4 GB.
 
-If you skip this step the `libtorrent-sys` build will fail with a clear error pointing
-back to this command.
+The submodules are needed to *provision* the native prefix described below; once you have
+one, building does not need them, which is how CI skips the clone when the prefix cache
+hits. One exception: the shim FFI suite reads `.torrent` fixtures straight out of
+`vendor/libtorrent/test/test_torrents`, so `cargo test -p libtorrent-sys --features
+shim-tests` needs that submodule on disk regardless.
 
 ## Build
 
@@ -112,9 +117,44 @@ cargo build --workspace          # debug
 cargo build --workspace --release
 ```
 
-The first build of `libtorrent-sys` is **slow** (5–15 min depending on host), as it
-compiles Boost and libtorrent from source. Subsequent builds are incremental and fast
-unless the submodules update.
+### The shared native prefix
+
+`libtorrent-sys` builds Boost and libtorrent into a content-addressed directory outside
+`target/`:
+
+```
+${XDG_CACHE_HOME:-~/.cache}/torrentd/native/lt-<key>/      Boost headers + libtorrent.a
+${XDG_CACHE_HOME:-~/.cache}/torrentd/native/shim-<key>/    the compiled C shim
+```
+
+The first build is **slow** (5–15 min depending on host). Every build after it — any cargo
+profile, any feature set, any git worktree, and after any `cargo clean` — reuses the same
+prefix and costs about a second. The key covers both submodule pins, your C++ compiler's
+version and target, the OpenSSL version, and the contents of `build.rs` and the shim, so a
+rebuild happens when, and only when, one of those actually changes.
+
+| Task | Effect |
+| --- | --- |
+| `mise run native` | Fetch submodules and provision the prefix |
+| `mise run native-clean` | Delete every cached prefix (~115 MB per pinned version) |
+
+Two consequences worth knowing:
+
+- **`cargo clean` no longer resets everything.** It clears `target/` but leaves the native
+  prefix, which is the point. To force the native build too, use `mise run native-clean` or
+  `LIBTORRENT_SYS_FORCE_REBUILD=1`.
+- **Old prefixes are kept, not collected.** That is what makes reverting an edit instant, at
+  roughly 115 MB per distinct key. `mise run native-clean` is the reaper.
+
+| Variable | Effect |
+| --- | --- |
+| `LIBTORRENT_SYS_CACHE_DIR` | Relocate the prefix root |
+| `LIBTORRENT_SYS_PREFIX` | Build the shim against an existing libtorrent + Boost install instead of the vendored one |
+| `LIBTORRENT_SYS_FORCE_REBUILD` | Ignore both stamps and rebuild |
+
+Deleting the cache directory by hand is safe even with a warm `target/`: the build script
+registers the stamp file with `rerun-if-changed`, so cargo treats its disappearance as a
+reason to re-run and rebuild rather than linking against paths that no longer exist.
 
 ## Test
 
