@@ -153,6 +153,14 @@ pub trait CheckHost {
 
     /// The tunnel manager for a slot's VPN type.
     fn manager(&self, t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager>;
+
+    /// A NAT-PMP client configured the way startup configures its own.
+    ///
+    /// The return type is the whole port-forward surface these checks can
+    /// reach, and `PortForwarder` carries `map` and nothing else. Releasing a
+    /// mapping is therefore not expressible here — which is the point of the
+    /// trait rather than an accident of it.
+    fn forwarder(&self) -> Arc<dyn PortForwarder>;
 }
 
 /// `CheckHost` against the actual machine.
@@ -172,6 +180,10 @@ impl CheckHost for RealHost {
 
     fn manager(&self, t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager> {
         vpn::for_type(t, run_dir)
+    }
+
+    fn forwarder(&self) -> Arc<dyn PortForwarder> {
+        Arc::new(vpn::NatpmpForwarder::for_startup())
     }
 }
 
@@ -480,8 +492,23 @@ fn slot_checks(
         }
     }
 
-    // 6. Port forwarding, against the real gateway. The mapping is released
-    //    immediately; this is a negotiation, not a reservation.
+    // 6. Port forwarding, against the real gateway.
+    //
+    //    The mapping is left to expire rather than deleted. NAT-PMP's delete
+    //    is the RFC 6886 §3.4 wildcard form — internal port 0, lifetime 0 —
+    //    and it cannot be narrowed: it removes *every* mapping held by the
+    //    requesting address, which over a tunnel the daemon is already using
+    //    means that daemon's live TCP and UDP forwards. The daemon does not
+    //    notice for up to a renewal interval, during which no new inbound peer
+    //    can connect; if the gateway then hands back a different port the
+    //    renewal churns the listen sockets and leaves a stale port advertised
+    //    to trackers until the next reannounce.
+    //
+    //    Asking for the same short lease the daemon asks for costs nothing and
+    //    is safe for the opposite reason: this is the same NAT-PMP client
+    //    identity, so the gateway may legitimately answer with the port the
+    //    daemon already holds, and that is a refreshed lease rather than a
+    //    destroyed mapping.
     match slot.port_forward {
         PortForwardMode::Static => {
             checks.push(Check::skip(
@@ -494,19 +521,26 @@ fn slot_checks(
             slot.port_forward_gateway_or_default().parse::<IpAddr>(),
         ) {
             (Some(bind_ip), Ok(gateway)) => {
+                let lease = crate::port_forward_monitor::LEASE_SECS;
                 let req = PortMapRequest {
                     gateway,
                     bind_ip,
                     internal_port: 0,
-                    lifetime_secs: 60,
+                    // The daemon's own lease. `LEASE_SECS` is public so both
+                    // paths agree; re-deriving it here would silently move the
+                    // pre-flight out of step with the daemon the first time
+                    // anyone changed it.
+                    lifetime_secs: lease,
                 };
-                let fwd = vpn::NatpmpForwarder::for_startup();
-                match fwd.map(&req) {
+                match host.forwarder().map(&req) {
                     Ok(m) => {
-                        let _ = fwd.unmap(gateway, bind_ip);
                         checks.push(Check::pass(
                             "port_forward",
-                            format!("gateway {gateway} offered port {} (released again)", m.port),
+                            format!(
+                                "gateway {gateway} offered port {}; its {lease}s lease is left \
+                                 to expire, not deleted",
+                                m.port,
+                            ),
                         ));
                     }
                     Err(e) => checks.push(Check::fail(
@@ -623,6 +657,7 @@ fn print_human(report: &Report) {
 mod tests {
     use std::sync::Mutex;
 
+    use torrentd_engine::MockForwarder;
     use torrentd_engine::MockVpn;
 
     use super::*;
@@ -635,6 +670,7 @@ mod tests {
         existing: Vec<String>,
         addrs: Mutex<Vec<(String, Option<Ipv4Addr>)>>,
         vpn: MockVpn,
+        fwd: MockForwarder,
     }
 
     impl FakeHost {
@@ -643,6 +679,7 @@ mod tests {
                 existing: Vec::new(),
                 addrs: Mutex::new(Vec::new()),
                 vpn: MockVpn::new(),
+                fwd: MockForwarder::new(),
             }
         }
 
@@ -688,6 +725,10 @@ mod tests {
 
         fn manager(&self, _t: VpnType, _run_dir: &Path) -> Arc<dyn VpnManager> {
             Arc::new(self.vpn.clone())
+        }
+
+        fn forwarder(&self) -> Arc<dyn PortForwarder> {
+            Arc::new(self.fwd.clone())
         }
     }
 
@@ -798,6 +839,70 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
         assert!(host.vpn.bring_down_calls().is_empty());
         assert!(find(&r.checks, "bring_up").is_none());
         assert!(find(&r.checks, "bring_down").is_none());
+    }
+
+    #[test]
+    fn the_default_path_leaves_its_mapping_to_expire_rather_than_deleting_it() {
+        // F2. The flagless path is the one documented as observe-only, and it
+        // used to finish by issuing NAT-PMP's wildcard delete from the tunnel
+        // address — which removes every mapping that address holds, i.e. the
+        // running daemon's live TCP and UDP forwards.
+        //
+        // Two things hold that shut. `PortForwarder` is the whole surface the
+        // call site can reach and it has no delete, so a release cannot be
+        // reintroduced through this parameter at all. And the reported
+        // contract, asserted below, is that the lease is left to lapse: the
+        // previous wording said the mapping had been "released again", so this
+        // assertion fails against the behaviour it replaced.
+        let cfg = cfg_with_slot("port_forward = \"natpmp\"\nport_forward_gateway = \"10.2.0.1\"");
+        let host = FakeHost::new().with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+        host.fwd.push_ok(51413);
+
+        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+
+        assert_eq!(
+            host.fwd.call_count(),
+            1,
+            "exactly one negotiation, and nothing after it",
+        );
+        let req = host.fwd.calls()[0];
+        assert_eq!(
+            req.lifetime_secs,
+            crate::port_forward_monitor::LEASE_SECS,
+            "the pre-flight must ask for the daemon's lease, not a second copy of it",
+        );
+        assert_eq!(req.bind_ip, IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+
+        let pf = find(&r.checks, "port_forward").expect("a port_forward line");
+        assert_eq!(pf.verdict, Verdict::Pass, "detail: {}", pf.detail);
+        assert!(
+            pf.detail.contains("left to expire"),
+            "the operator is told the mapping is left alone: {}",
+            pf.detail,
+        );
+        assert!(
+            !pf.detail.contains("released"),
+            "a released mapping is the daemon's mapping: {}",
+            pf.detail,
+        );
+    }
+
+    #[test]
+    fn a_natpmp_slot_with_no_tunnel_address_negotiates_nothing() {
+        // The gateway is only reachable through the tunnel, so with no tunnel
+        // address there is nothing to negotiate from and nothing to report but
+        // a skip. Checked here because it is the arm that keeps the mapping
+        // call off a host that has no tunnel at all.
+        let cfg = cfg_with_slot("port_forward = \"natpmp\"");
+        let host = FakeHost::new();
+
+        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+
+        assert_eq!(host.fwd.call_count(), 0);
+        assert_eq!(
+            find(&r.checks, "port_forward").map(|c| c.verdict),
+            Some(Verdict::Skip),
+        );
     }
 
     #[test]

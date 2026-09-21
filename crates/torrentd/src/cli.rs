@@ -58,10 +58,12 @@ pub enum VpnCmd {
     /// each one separately.
     ///
     /// Observe-only unless `--bring-up` is given: it reads interfaces and `wg`
-    /// state, and a NAT-PMP slot's mapping is released as soon as it is
-    /// negotiated. No libtorrent session is constructed and no tracker is
-    /// contacted, so this is safe to run against real credentials on a host
-    /// that has never seeded anything.
+    /// state, and a NAT-PMP slot's mapping is negotiated with the same short
+    /// lease the daemon uses and then left to expire rather than deleted —
+    /// NAT-PMP's delete removes every mapping the tunnel address holds, which
+    /// would include a running daemon's. No libtorrent session is constructed
+    /// and no tracker is contacted, so this is safe to run against real
+    /// credentials, and safe to run while the daemon is up.
     Check {
         /// Check only this slot. Default: every configured slot.
         #[arg(long, value_name = "ID")]
