@@ -188,11 +188,15 @@ summary cannot quietly mean "mostly not checked", and the exit status carries
 the same distinction: `0` clean, `1` any failure, `2` nothing failed but
 something could not be checked.
 
-Safe to run while the daemon is up. The default path reads state and asks the
-gateway for a NAT-PMP mapping with the daemon's own short lease, which it
-leaves to expire; `--bring-up` is the only option that raises a tunnel, and it
-lowers again only what it raised. What a pass does and does not establish is
-set out in [docs/running.md](docs/running.md#9-first-run-checks).
+The default path makes no host change and deletes nothing: it reads state and
+asks the gateway for a NAT-PMP mapping with the daemon's own short lease,
+which it leaves to expire. Against a running daemon that request is its only
+interaction, sent from the same NAT-PMP client identity; whether a gateway
+coalesces it with the daemon's existing mapping is gateway-dependent and is
+not tested here. `--bring-up` is the only option that raises a tunnel, and it
+lowers again only what it was observed to have raised. What a pass does and
+does not establish is set out in
+[docs/running.md](docs/running.md#9-first-run-checks).
 
 `allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds,
 not an egress control. Public content that wants DHT belongs in
