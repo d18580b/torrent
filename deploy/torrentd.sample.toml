@@ -38,12 +38,41 @@ enable_lsd = false
 
 # Default peer identity for profiles that do not set their own. A `vpn`
 # profile must set its own — see below.
+#
+# These are defaults, not a shared identity: two profiles that both end up
+# with the same effective `peer_fingerprint` / `user_agent` — one inheriting
+# these, one spelling them out — are refused, because that is one peer-id
+# prefix on the wire from two postures.
 # peer_fingerprint = "-XX1234-"
 # user_agent       = "libtorrent/2.0"
+
+# Liveness: max age (seconds) of a WireGuard tunnel's latest handshake before
+# the health monitor declares the profile down and pauses it. Catches a tunnel
+# that keeps its address but has silently stopped handshaking. Default 180.
+# vpn_handshake_max_age_secs = 180
+
+# Defence-in-depth kill switch. When true, torrentd installs a fail-closed
+# nftables table (`torrentd_ks`) confining the daemon's own egress to loopback
+# and its vpn profiles' tunnel interfaces — so if a tunnel drops, the kernel
+# drops the traffic regardless of libtorrent's socket bind or the 30s monitor.
+# Also forces tracker DNS through the tunnel. Removed cleanly on SIGTERM.
+#
+# Requires `nft`, CAP_NET_ADMIN, at least one `network = "vpn"` profile, and a
+# dedicated non-root user: the ruleset matches on the daemon's uid, and as root
+# it would drop every root-owned process's traffic on the host. The packaged
+# systemd unit uses User=torrentd.
+#
+# Verify the whole tunnel setup before trusting it, without seeding anything:
+#   torrentd --config /etc/torrentd/torrentd.toml vpn check
+# network_kill_switch = false
 
 # ---------------------------------------------------------------------------
 # Profiles — at least one is required
 # ---------------------------------------------------------------------------
+# Everything below this line belongs to a `[[profile]]` table. TOML binds a
+# key written after a `[[table]]` header to that table, so a daemon-wide key
+# added down here is rejected as an unknown `[[profile]]` field — put it in
+# the "Daemon-wide" block above.
 # A profile is one libtorrent session with its own network posture, identity
 # and directories. There is no default profile and no implicit one: every
 # profile states how it reaches the network, because the alternative —
@@ -70,10 +99,14 @@ listen_interfaces = "0.0.0.0:6881,[::]:6881"
 # write it.
 dht               = true
 
-# Optional per-profile overrides:
+# Optional per-profile overrides. Every value below is distinct from every
+# other profile's in this file, and has to stay that way: `listen_port` (which
+# shares one namespace with the ports in a host profile's
+# `listen_interfaces`), `peer_fingerprint_hex` and `user_agent` are all
+# refused when two profiles end up with the same one.
 # resume_dir           = "/var/lib/torrentd/resume/public"
 # torrent_dir          = "/var/lib/torrentd/torrents/public"
-# peer_fingerprint_hex = "a1b2c3d4e5f60718"
+# peer_fingerprint_hex = "b7c6d5e4f3a29180"
 # user_agent           = "libtorrent/2.0"
 # upload_rate_limit    = 0
 
@@ -96,13 +129,18 @@ dht               = true
 # it catches loading one account's torrent into another — not an egress
 # control. It is empty by default, which disables the check entirely.
 
+# The port here shares one namespace with the ports `public` binds above, so
+# it is 6891 rather than 6881: an announced port that two profiles share is
+# what correlates them to a tracker operator, whichever address each announced
+# from.
+#
 # [[profile]]
 # id                       = "account_a"
 # network                  = "vpn"
 # vpn_type                 = "wireguard"
 # vpn_config               = "/etc/wireguard/wg-acct-a.conf"
 # vpn_interface            = "wg-acct-a"
-# listen_port              = 6881
+# listen_port              = 6891
 # peer_fingerprint_hex     = "a1b2c3d4e5f60718"
 # user_agent               = "qBittorrent/5.0.3"
 # resume_dir               = "/var/lib/torrentd/resume/account_a"
@@ -127,30 +165,15 @@ dht               = true
 # port_forward             = "natpmp"
 # port_forward_gateway     = "10.2.0.1"   # ProtonVPN WireGuard gateway (default)
 # peer_fingerprint_hex     = "3c2d1e0f4a5b6c7d"
-# user_agent               = "qBittorrent/5.0.3"
+# user_agent               = "Transmission/4.0.6"
 # resume_dir               = "/var/lib/torrentd/resume/proton_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/proton_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
 
-# Liveness: max age (seconds) of a WireGuard tunnel's latest handshake before
-# the health monitor declares the profile down and pauses it. Catches a tunnel
-# that keeps its address but has silently stopped handshaking. Default 180.
-# vpn_handshake_max_age_secs = 180
-
-# Defence-in-depth kill switch. When true, torrentd installs a fail-closed
-# nftables table (`torrentd_ks`) confining the daemon's own egress to loopback
-# and its vpn profiles' tunnel interfaces — so if a tunnel drops, the kernel
-# drops the traffic regardless of libtorrent's socket bind or the 30s monitor.
-# Also forces tracker DNS through the tunnel. Removed cleanly on SIGTERM.
-#
-# Requires `nft`, CAP_NET_ADMIN, at least one `network = "vpn"` profile, and a
-# dedicated non-root user: the ruleset matches on the daemon's uid, and as root
-# it would drop every root-owned process's traffic on the host. The packaged
-# systemd unit uses User=torrentd.
-#
-# Verify the whole tunnel setup before trusting it, without seeding anything:
-#   torrentd --config /etc/torrentd/torrentd.toml vpn check
-# network_kill_switch = false
+# A two-account deployment, live and uncommented, is in
+# deploy/torrentd.multi-account.sample.toml. Both files are parsed and
+# validated by this repository's own test suite, so what ships here is a
+# configuration the daemon accepts rather than one that merely reads well.
 
 # ---------------------------------------------------------------------------
 # Managed pool (optional)
@@ -170,6 +193,13 @@ dht               = true
 #   torrentd --config /etc/torrentd/torrentd.toml pool scan
 #   torrentd --config /etc/torrentd/torrentd.toml pool status
 #   torrentd --config /etc/torrentd/torrentd.toml pool orphans
+#
+# The index schema moves forward one way. The first open on this build
+# migrates the torrent→account column from `slot` to `profile`, and a build
+# predating that change cannot open the result. The pre-migration database is
+# left beside it as `<db_path>.pre-v3.bak` — restore that file to roll back.
+# It is the only copy of the `plan` / `plan_step` mutation journal, which a
+# rescan does not reconstruct.
 #
 # [pool]
 # roots       = ["/data/torrents"]        # must not nest
