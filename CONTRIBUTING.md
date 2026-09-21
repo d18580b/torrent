@@ -118,6 +118,11 @@ cargo build --workspace          # debug
 cargo build --workspace --release
 ```
 
+Node is a build dependency of the default feature set and the build panics
+without it. Building headless — the `--no-default-features` flag and what it
+costs you — is documented in one place,
+[`docs/running.md` §3](docs/running.md#3-build).
+
 ### The shared native prefix
 
 `libtorrent-sys` builds Boost and libtorrent into a content-addressed directory outside
