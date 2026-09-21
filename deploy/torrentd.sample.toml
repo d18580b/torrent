@@ -101,8 +101,10 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # egress to loopback + the slots' tunnel interfaces — so if a tunnel drops, the
 # kernel drops the traffic regardless of libtorrent's socket bind or the 30s
 # monitor. Requires CAP_NET_ADMIN, the `nft` binary, and that torrentd runs as a
-# dedicated user (the packaged systemd unit uses User=torrentd). Also forces
-# tracker DNS through the tunnel. Removed cleanly on SIGTERM.
+# dedicated user (the packaged systemd unit uses User=torrentd) — as uid 0 the
+# ruleset would drop every root-owned socket on the host, so the daemon refuses
+# to start rather than install it. Also forces tracker DNS through the tunnel.
+# Removed cleanly on SIGTERM.
 # network_kill_switch = false
 
 # A wireguard slot's vpn_profile must be /etc/wireguard/<vpn_interface>.conf
