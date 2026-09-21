@@ -295,9 +295,11 @@ torrentd does not terminate TLS and will not; `deploy/Caddyfile` and
 `deploy/compose.yaml` are a working pair that does. `X-Forwarded-For` and
 `X-Forwarded-Proto` are read **only** from peers listed in `trusted_proxies`
 — empty by default, meaning no forwarding header is read at all and the
-socket's peer address is the client. They feed exactly two things: a per-client
-login throttle instead of one shared bucket, and `Secure` on the session
-cookie when the original request was over TLS.
+socket's peer address is the client. They feed three things: a per-client
+login throttle instead of one shared bucket, `Secure` on the session cookie
+when the original request was over TLS, and the `client_ip` field on the login
+log lines — the record of who tried, which is the consumer this support exists
+to create.
 
 ## Metrics
 

@@ -31,10 +31,11 @@ allow_unauthenticated = true
 # read and the socket's peer address is the client.
 #
 # Set this to the address your reverse proxy connects from, and only that:
-# anything listed here can claim to be any client. Two things use it — the
-# login throttle, which becomes per-client instead of one shared bucket, and
-# the `Secure` attribute on the session cookie, which is set when the original
-# request was over TLS.
+# anything listed here can claim to be any client. Three things use it — the
+# login throttle, which becomes per-client instead of one shared bucket; the
+# `Secure` attribute on the session cookie, which is set when the original
+# request was over TLS; and the `client_ip` field on the login log lines,
+# including the one that records a failed attempt.
 #
 # One address, not a range. `deploy/compose.yaml` pins its `proxy` service to
 # 172.28.0.2 on an explicit subnet precisely so a single /32 can be named here;
