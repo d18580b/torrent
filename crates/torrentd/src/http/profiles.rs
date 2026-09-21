@@ -27,7 +27,8 @@ pub struct ProfileSummary {
     /// Current effective listen port: the NAT-PMP-negotiated port for natpmp
     /// profiles, else the configured static port.
     forwarded_port: Option<u16>,
-    user_agent: String,
+    /// `None` for a host profile that did not override it.
+    user_agent: Option<String>,
     /// Why the profile has no session. Only set when `status` is `failed`.
     #[serde(skip_serializing_if = "Option::is_none")]
     failure_reason: Option<String>,
@@ -37,7 +38,8 @@ pub struct ProfileSummary {
 pub struct ProfileDetail {
     #[serde(flatten)]
     summary: ProfileSummary,
-    vpn_interface: String,
+    /// `None` for a host profile.
+    vpn_interface: Option<String>,
     allowed_tracker_domains: Vec<String>,
     /// Torrents currently paused because the tunnel went down.
     paused_for_vpn: u64,
@@ -50,26 +52,20 @@ fn summary_of(s: &AppState, e: &ProfileEntry) -> ProfileSummary {
     let h = e.health();
     // For natpmp profiles the effective port is the negotiated one; for static
     // profiles it's the configured listen_port.
-    let forwarded_port = h.forwarded_port.or(e.config.listen_port);
+    let forwarded_port = h.forwarded_port.or(e.config.listen_port());
     ProfileSummary {
         profile_id: e.config.id.as_str().to_string(),
         status: h.status.as_str().to_string(),
         tunnel_ip: h.tunnel_ip.map(|ip| ip.to_string()),
         torrent_count: s.registry.for_profile(&e.config.id).len(),
-        listen_port: e.config.listen_port,
-        port_forward: e.config.port_forward.as_str().to_string(),
+        listen_port: e.config.listen_port(),
+        port_forward: e.config.port_forward().as_str().to_string(),
         forwarded_port,
         user_agent: e.config.user_agent.clone(),
         failure_reason: None,
     }
 }
 
-fn not_configured() -> (StatusCode, Json<serde_json::Value>) {
-    (
-        StatusCode::NOT_FOUND,
-        Json(serde_json::json!({"error": "profiles not configured"})),
-    )
-}
 fn no_such_profile() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::NOT_FOUND,
@@ -94,8 +90,8 @@ fn summary_of_failed(f: &crate::profile_registry::FailedProfile) -> ProfileSumma
         status: ProfileStatus::Failed.as_str().to_string(),
         tunnel_ip: None,
         torrent_count: 0,
-        listen_port: f.config.listen_port,
-        port_forward: f.config.port_forward.as_str().to_string(),
+        listen_port: f.config.listen_port(),
+        port_forward: f.config.port_forward().as_str().to_string(),
         forwarded_port: None,
         user_agent: f.config.user_agent.clone(),
         failure_reason: Some(f.reason.clone()),
@@ -105,7 +101,7 @@ fn summary_of_failed(f: &crate::profile_registry::FailedProfile) -> ProfileSumma
 pub async fn list(
     State(s): State<AppState>,
 ) -> Result<Json<Vec<ProfileSummary>>, (StatusCode, Json<serde_json::Value>)> {
-    let profiles = s.profiles.as_ref().ok_or_else(not_configured)?;
+    let profiles = &s.profiles;
     let mut out: Vec<ProfileSummary> = profiles.iter().map(|e| summary_of(&s, e)).collect();
     out.extend(profiles.failed().iter().map(summary_of_failed));
     Ok(Json(out))
@@ -115,7 +111,7 @@ pub async fn get(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<ProfileDetail>, (StatusCode, Json<serde_json::Value>)> {
-    let profiles = s.profiles.as_ref().ok_or_else(not_configured)?;
+    let profiles = &s.profiles;
     let profile_id = ProfileId::new(id);
     let Some(e) = profiles.get(&profile_id) else {
         // A configured profile that failed to come up is still a profile; answering
@@ -123,7 +119,7 @@ pub async fn get(
         if let Some(f) = profiles.failed_profile(&profile_id) {
             return Ok(Json(ProfileDetail {
                 summary: summary_of_failed(f),
-                vpn_interface: f.config.vpn_interface.clone(),
+                vpn_interface: f.config.vpn_interface().map(str::to_string),
                 allowed_tracker_domains: f.config.allowed_tracker_domains.clone(),
                 paused_for_vpn: 0,
                 port_forward_ok: false,
@@ -134,7 +130,7 @@ pub async fn get(
     let h = e.health();
     Ok(Json(ProfileDetail {
         summary: summary_of(&s, e),
-        vpn_interface: e.config.vpn_interface.clone(),
+        vpn_interface: e.config.vpn_interface().map(str::to_string),
         allowed_tracker_domains: e.config.allowed_tracker_domains.clone(),
         paused_for_vpn: h.paused_for_vpn,
         port_forward_ok: h.port_forward_ok,
@@ -145,7 +141,7 @@ pub async fn torrents(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Vec<TorrentSummary>>, (StatusCode, Json<serde_json::Value>)> {
-    let profiles = s.profiles.as_ref().ok_or_else(not_configured)?;
+    let profiles = &s.profiles;
     let profile_id = ProfileId::new(id);
     if profiles.get(&profile_id).is_none() {
         return Err(no_such_profile());
@@ -163,7 +159,7 @@ pub async fn pause_all(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let profiles = s.profiles.as_ref().ok_or_else(not_configured)?;
+    let profiles = &s.profiles;
     let profile_id = ProfileId::new(id);
     let entry = profiles.get(&profile_id).ok_or_else(no_such_profile)?;
     let mut count = 0usize;
@@ -180,7 +176,7 @@ pub async fn resume_all(
     State(s): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
-    let profiles = s.profiles.as_ref().ok_or_else(not_configured)?;
+    let profiles = &s.profiles;
     let profile_id = ProfileId::new(id);
     let entry = profiles.get(&profile_id).ok_or_else(no_such_profile)?;
     // A VpnDown profile is fenced: its torrents were paused because the tunnel is

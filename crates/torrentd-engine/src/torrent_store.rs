@@ -97,11 +97,10 @@ impl FsTorrentStore {
         if let Some(dir) = self.overrides.get(profile) {
             return dir.clone();
         }
-        if profile.is_default() {
-            self.base.clone()
-        } else {
-            self.base.join(profile.as_str())
-        }
+        // Always partitioned by profile id. There is no profile that owns
+        // the base directory: that was the single-session special case, and
+        // with it went the last place two profiles could co-mingle files.
+        self.base.join(profile.as_str())
     }
 
     pub fn path_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
@@ -273,7 +272,7 @@ mod tests {
     fn fs_store_atomic_roundtrip() {
         let dir = tempdir().unwrap();
         let store = FsTorrentStore::new(dir.path());
-        let profile = ProfileId::default_single();
+        let profile = ProfileId::new("p");
         let ih = InfoHash([0x42u8; 20]);
         assert!(!store.exists(&profile, &ih));
         store.write(&profile, &ih, b"d4:infod...e").unwrap();
@@ -292,7 +291,7 @@ mod tests {
     fn read_returns_none_for_a_missing_torrent() {
         let dir = tempdir().unwrap();
         let store = FsTorrentStore::new(dir.path());
-        let profile = ProfileId::default_single();
+        let profile = ProfileId::new("p");
         let ih = InfoHash([0x9au8; 20]);
         assert_eq!(store.read(&profile, &ih).unwrap(), None);
         store.write(&profile, &ih, b"payload").unwrap();
@@ -314,10 +313,7 @@ mod tests {
             .join("acct_a")
             .join(format!("{}.torrent", ih.to_hex()))
             .exists());
-        assert!(store
-            .load_all(&ProfileId::default_single())
-            .unwrap()
-            .is_empty());
+        assert!(store.load_all(&ProfileId::new("p")).unwrap().is_empty());
         assert_eq!(store.load_all(&a).unwrap().len(), 1);
     }
 }

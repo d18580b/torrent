@@ -93,13 +93,13 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
-            profile_id: ProfileId::default_single(),
+            profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
 
         handle(&alert, &mut ctx);
 
-        let saved = torrents.load_all(&ProfileId::default_single()).unwrap();
+        let saved = torrents.load_all(&ProfileId::new("p")).unwrap();
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].0, ih);
         // Wrapped as a minimal `.torrent`: { "info": <info_section> }.

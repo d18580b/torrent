@@ -86,14 +86,11 @@ impl FsResumeStore {
         if let Some(dir) = self.overrides.get(profile) {
             return dir.clone();
         }
-        // ProfileId::DEFAULT lives directly under base for single-session mode;
-        // otherwise we partition by profile id so multi-profile mode never
-        // co-mingles resume files.
-        if profile.is_default() {
-            self.base.clone()
-        } else {
-            self.base.join(profile.as_str())
-        }
+        // Always partitioned by profile id. There is no profile that
+        // owns the base directory: that was the single-session special
+        // case, and with it went the last place two profiles could
+        // co-mingle files by accident.
+        self.base.join(profile.as_str())
     }
 
     fn file_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
@@ -258,7 +255,7 @@ mod tests {
     fn fs_store_atomic_roundtrip() {
         let dir = tempdir().unwrap();
         let store = FsResumeStore::new(dir.path());
-        let profile = ProfileId::default_single();
+        let profile = ProfileId::new("p");
         let ih = InfoHash([0x42u8; 20]);
         store.write(&profile, &ih, b"hello").unwrap();
         let loaded = store.load_all(&profile).unwrap();

@@ -127,7 +127,7 @@ mod tests {
         };
         state.insert(
             ih(b),
-            TorrentState::newly_added(h, ProfileId::default_single(), Instant::now()),
+            TorrentState::newly_added(h, ProfileId::new("p"), Instant::now()),
         );
     }
 
@@ -143,7 +143,7 @@ mod tests {
             metrics,
             clock: &clock,
             engine: &engine,
-            profile_id: ProfileId::default_single(),
+            profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
         handle(alert, &mut ctx);

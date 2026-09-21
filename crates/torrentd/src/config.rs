@@ -40,8 +40,6 @@ impl LogLevel {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// libtorrent listen_interfaces (e.g. "0.0.0.0:6881,[::]:6881").
-    pub listen_interfaces: String,
     pub default_save_path: PathBuf,
     pub resume_dir: PathBuf,
     pub torrent_dir: PathBuf,
@@ -53,12 +51,6 @@ pub struct Config {
     /// `<resume_dir parent>/profile_assignments.json`.
     #[serde(default)]
     pub registry_path: Option<PathBuf>,
-
-    /// Where DHT/session state is persisted across restarts (single-session
-    /// mode only; profiles run with `enable_dht=false`). Defaults to
-    /// `<resume_dir parent>/session_state.dat`.
-    #[serde(default)]
-    pub session_state_path: Option<PathBuf>,
 
     // libtorrent settings overrides.
     #[serde(default)]
@@ -179,9 +171,9 @@ impl Config {
     }
 
     pub fn validate(&self) -> anyhow::Result<()> {
-        if !self.profile.is_empty() {
-            ProfileConfig::validate_set(&self.profile).context("[[profile]] validation failed")?;
-        }
+        // Unconditional: an empty set is itself a refusal now, because there
+        // is no implicit profile to fall back to.
+        ProfileConfig::validate_set(&self.profile).context("[[profile]] validation failed")?;
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -240,13 +232,14 @@ impl Config {
             // Nothing in the library claims those files, so they are orphans by
             // definition — and `delete_orphans` over the root would erase the
             // torrent library, the resume store, or the index itself.
-            let state: [(&str, &Path); 6] = [
+            // Session-state files are per profile and live in state_dir,
+            // which resume_dir's parent already covers.
+            let state: [(&str, &Path); 5] = [
                 ("resume_dir", &self.resume_dir),
                 ("torrent_dir", &self.torrent_dir),
                 ("[pool] library_dir", &pool.library_dir),
                 ("[pool] db_path", &self.pool_db_path()),
                 ("registry_path", &self.registry_path()),
-                ("session_state_path", &self.session_state_path()),
             ];
             for (name, path) in state {
                 let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -289,13 +282,10 @@ impl Config {
             d.log_level = Some(new.log_level);
         }
 
-        // Identity-critical / non-reloadable fields: listen_interfaces,
+        // Identity-critical / non-reloadable fields:
         // resume_dir, torrent_dir, peer_fingerprint, user_agent. Any change
         // to these is reported in `non_reloadable_changes` so SIGHUP can
         // log+ignore.
-        if old.listen_interfaces != new.listen_interfaces {
-            d.non_reloadable_changes.push("listen_interfaces");
-        }
         if old.resume_dir != new.resume_dir {
             d.non_reloadable_changes.push("resume_dir");
         }
@@ -315,9 +305,6 @@ impl Config {
         if old.user_agent != new.user_agent {
             d.non_reloadable_changes.push("user_agent");
         }
-        if old.session_state_path != new.session_state_path {
-            d.non_reloadable_changes.push("session_state_path");
-        }
         d.profile_changes = diff_profiles(&old.profile, &new.profile);
         d
     }
@@ -326,7 +313,6 @@ impl Config {
     /// preset overrides plus the operator's overrides in this Config.
     pub fn libtorrent_settings(&self) -> libtorrent_safe::Settings {
         let mut s = libtorrent_safe::Settings::server_seed_overrides();
-        s.listen_interfaces = Some(self.listen_interfaces.clone());
         if let Some(v) = self.connections_limit {
             s.connections_limit = Some(v);
         }
@@ -393,11 +379,15 @@ impl Config {
             .unwrap_or_else(|| PathBuf::from("/var/lib/torrentd"))
     }
 
-    /// Where DHT/session state should be persisted (single-session mode).
-    pub fn session_state_path(&self) -> PathBuf {
-        self.session_state_path
-            .clone()
-            .unwrap_or_else(|| self.state_dir().join("session_state.dat"))
+    /// Where a profile's DHT/session state is persisted.
+    ///
+    /// Per profile, because more than one host profile can run DHT and a
+    /// single shared file would have them overwriting each other's routing
+    /// table. This replaces the top-level `session_state_path` key, which
+    /// could only ever have described one session.
+    pub fn session_state_path(&self, profile: &ProfileId) -> PathBuf {
+        self.state_dir()
+            .join(format!("session_state-{}.dat", profile.as_str()))
     }
 }
 
@@ -437,10 +427,11 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
                 out.push(format!("{id}.{name}"));
             }
         };
-        field("vpn_config", a.vpn_config != b.vpn_config);
-        field("vpn_type", a.vpn_type != b.vpn_type);
-        field("vpn_interface", a.vpn_interface != b.vpn_interface);
-        field("listen_port", a.listen_port != b.listen_port);
+        // The whole network block is identity: which tunnel, which port,
+        // whether DHT runs. Comparing it as one value means a new field
+        // cannot be forgotten here the way `file_pool_size` was forgotten
+        // from the top-level diff.
+        field("network", a.network != b.network);
         field(
             "peer_fingerprint_hex",
             a.peer_fingerprint_hex != b.peer_fingerprint_hex,
@@ -448,11 +439,6 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
         field("user_agent", a.user_agent != b.user_agent);
         field("resume_dir", a.resume_dir != b.resume_dir);
         field("torrent_dir", a.torrent_dir != b.torrent_dir);
-        field("port_forward", a.port_forward != b.port_forward);
-        field(
-            "port_forward_gateway",
-            a.port_forward_gateway != b.port_forward_gateway,
-        );
     }
     out
 }
@@ -477,27 +463,27 @@ pub struct ConfigDiff {
 }
 
 impl ConfigDiff {
-    /// Build the `Settings` patch for `profile`, containing only the reloadable
-    /// fields that changed and are permitted to reach that profile.
+    /// Build the `Settings` patch for `profile`, containing only the
+    /// reloadable fields that changed and are permitted to reach it.
     ///
-    /// `enable_lsd` is withheld from every profile but the single-session
-    /// default. Safety Rule 6 says a private profile runs with DHT, PEX and LSD
-    /// off unconditionally and that no config key can turn them on — but
-    /// `enable_lsd` is a top-level *reloadable* key that was applied to every
-    /// session alike, so `enable_lsd = true` plus a SIGHUP quietly re-enabled
-    /// local peer discovery on exactly the sessions that must never have it.
-    /// The daemon still honours the key for the public single session, which
-    /// is the only place it means anything.
-    pub fn to_settings_patch_for(&self, profile: &ProfileId) -> libtorrent_safe::Settings {
+    /// `enable_lsd` is withheld from every tunnelled profile. Safety Rule 6
+    /// says such a profile runs with DHT, PEX and LSD off unconditionally and
+    /// that no config key can turn them on — but `enable_lsd` is a top-level
+    /// *reloadable* key that was applied to every session alike, so
+    /// `enable_lsd = true` plus a SIGHUP quietly re-enabled local peer
+    /// discovery on exactly the sessions that must never have it. A host
+    /// profile still honours the key, which is the only place it means
+    /// anything.
+    pub fn to_settings_patch_for(&self, profile: &ProfileConfig) -> libtorrent_safe::Settings {
         libtorrent_safe::Settings {
             connections_limit: self.connections_limit,
             upload_rate_limit: self.upload_rate_limit,
             max_concurrent_http_announces: self.max_concurrent_http_announces,
             aio_threads: self.aio_threads,
-            enable_lsd: if profile.is_default() {
-                self.enable_lsd
-            } else {
+            enable_lsd: if profile.is_vpn() {
                 None
+            } else {
+                self.enable_lsd
             },
             ..Default::default()
         }
@@ -525,7 +511,6 @@ impl Config {
     pub fn minimal_for_tests(dir: &Path, allow_mutations: bool) -> Self {
         let mut cfg: Config = toml::from_str(&format!(
             r#"
-listen_interfaces = "0.0.0.0:6881"
 default_save_path = "{d}/data"
 resume_dir = "{d}/resume"
 torrent_dir = "{d}/torrents"
@@ -560,8 +545,9 @@ mod tests {
         p
     }
 
-    const SINGLE_SESSION: &str = r#"
-listen_interfaces = "0.0.0.0:6881"
+    /// Top-level keys only. `[[profile]]` is a TOML *table*, so anything a
+    /// test appends has to land before it — hence the split.
+    const TOP_LEVEL: &str = r#"
 default_save_path = "/data/torrents"
 resume_dir = "/var/lib/torrentd/resume"
 torrent_dir = "/var/lib/torrentd/torrents"
@@ -570,10 +556,27 @@ log_level = "info"
 connections_limit = 10000
 "#;
 
+    const ONE_HOST_PROFILE: &str = r#"
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
+"#;
+
+    /// A minimal valid config.
+    fn single_session() -> String {
+        format!("{TOP_LEVEL}{ONE_HOST_PROFILE}")
+    }
+
+    /// A valid config with `extra` appended to the top-level keys.
+    fn with_top_level(extra: &str) -> String {
+        format!("{TOP_LEVEL}{extra}\n{ONE_HOST_PROFILE}")
+    }
+
     #[test]
     fn a_file_pool_size_change_is_reported_rather_than_swallowed() {
         let dir = tempdir().unwrap();
-        let a = Config::load(&write_cfg(dir.path(), SINGLE_SESSION)).unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
         let mut b = a.clone();
         b.file_pool_size = Some(2048);
         let d = Config::diff(&a, &b);
@@ -582,6 +585,42 @@ connections_limit = 10000
             "got {:?}",
             d.non_reloadable_changes,
         );
+    }
+
+    fn host_profile() -> ProfileConfig {
+        ProfileConfig {
+            id: ProfileId::new("public"),
+            network: torrentd_engine::ProfileNetwork::Host {
+                listen_interfaces: "0.0.0.0:6881".into(),
+                dht: false,
+            },
+            peer_fingerprint_hex: None,
+            user_agent: None,
+            resume_dir: None,
+            torrent_dir: None,
+            allowed_tracker_domains: vec![],
+            upload_rate_limit: 0,
+        }
+    }
+
+    fn vpn_profile() -> ProfileConfig {
+        ProfileConfig {
+            id: ProfileId::new("acct_a"),
+            network: torrentd_engine::ProfileNetwork::Vpn {
+                vpn_type: torrentd_engine::VpnType::Wireguard,
+                vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
+                vpn_interface: "wg0".into(),
+                listen_port: Some(6881),
+                port_forward: Default::default(),
+                port_forward_gateway: None,
+            },
+            peer_fingerprint_hex: Some("a1b2c3d4e5f60718".into()),
+            user_agent: Some("qB/5.0".into()),
+            resume_dir: None,
+            torrent_dir: None,
+            allowed_tracker_domains: vec![],
+            upload_rate_limit: 0,
+        }
     }
 
     #[test]
@@ -595,32 +634,72 @@ connections_limit = 10000
             ..Default::default()
         };
         assert_eq!(
-            diff.to_settings_patch_for(&ProfileId::default_single())
-                .enable_lsd,
+            diff.to_settings_patch_for(&host_profile()).enable_lsd,
             Some(true),
-            "the public single session still honours the key",
+            "a host profile still honours the key",
         );
         assert_eq!(
-            diff.to_settings_patch_for(&ProfileId::new("acct_a"))
-                .enable_lsd,
+            diff.to_settings_patch_for(&vpn_profile()).enable_lsd,
             None,
-            "a private profile must not receive it",
+            "a tunnelled profile must not receive it",
         );
     }
 
     #[test]
-    fn parses_single_session() {
+    fn parses_one_host_profile() {
         let dir = tempdir().unwrap();
-        let p = write_cfg(dir.path(), SINGLE_SESSION);
+        let p = write_cfg(dir.path(), &single_session());
         let cfg = Config::load(&p).unwrap();
         assert_eq!(cfg.connections_limit, Some(10000));
-        assert!(cfg.profile.is_empty());
+        assert_eq!(cfg.profile.len(), 1);
+        assert_eq!(cfg.profile[0].id.as_str(), "public");
+        assert!(!cfg.profile[0].is_vpn());
+        assert!(
+            !cfg.profile[0].dht_enabled(),
+            "dht is off unless the profile writes it",
+        );
+    }
+
+    #[test]
+    fn a_config_with_no_profiles_is_refused() {
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), TOP_LEVEL);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("[[profile]]"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_key_from_the_other_posture_is_refused() {
+        // Not an unknown key — a key that would never be read. Flattening the
+        // network enum into the table would have accepted this silently.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
+             listen_interfaces = \"0.0.0.0:6881\"\nvpn_interface = \"wg0\"\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("vpn_interface"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_typo_in_a_profile_table_is_still_fatal() {
+        // The property `deny_unknown_fields` gives the rest of the config, kept
+        // for `[[profile]]` by parsing a flat shape and converting.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
+             listen_interfaces = \"0.0.0.0:6881\"\nlisten_interface = \"typo\"\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("listen_interface"), "got: {msg}");
     }
 
     #[test]
     fn unknown_key_is_fatal() {
         let dir = tempdir().unwrap();
-        let bad = SINGLE_SESSION.to_string() + "\nunknown_setting = 42\n";
+        let bad = with_top_level("unknown_setting = 42");
         let p = write_cfg(dir.path(), &bad);
         let err = Config::load(&p).unwrap_err();
         let msg = format!("{err:#}");
@@ -634,8 +713,10 @@ connections_limit = 10000
         // so the default has to stay false — asserted here because a stray
         // `#[serde(default = "...true")]` would be silent otherwise.
         let dir = tempdir().unwrap();
-        let body = SINGLE_SESSION.to_string()
-            + "\n[pool]\nroots = [\"/data/torrents\"]\nlibrary_dir = \"/var/lib/torrentd/library\"\n";
+        let body = format!(
+            "{TOP_LEVEL}{ONE_HOST_PROFILE}\n[pool]\nroots = [\"/data/torrents\"]\n\
+             library_dir = \"/var/lib/torrentd/library\"\n"
+        );
         let p = write_cfg(dir.path(), &body);
         let cfg = Config::load(&p).unwrap();
         assert!(!cfg.pool.as_ref().unwrap().allow_mutations);
@@ -655,11 +736,15 @@ connections_limit = 10000
         std::fs::create_dir_all(&root).unwrap();
         let body = format!(
             r#"
-listen_interfaces = "0.0.0.0:6881"
 default_save_path = "{r}"
 resume_dir = "{r}/resume"
 torrent_dir = "{d}/torrents"
 http_listen = "127.0.0.1:8080"
+
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
 
 [pool]
 roots = ["{r}"]
@@ -683,11 +768,15 @@ library_dir = "{d}/library"
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let body = format!(
             r#"
-listen_interfaces = "0.0.0.0:6881"
 default_save_path = "{d}/data"
 resume_dir = "{d}/resume"
 torrent_dir = "{d}/torrents"
 http_listen = "127.0.0.1:8080"
+
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
 
 [pool]
 roots = ["{r}", "{a}/inner"]
@@ -705,7 +794,7 @@ library_dir = "{d}/library"
     #[test]
     fn out_of_range_numbers_are_rejected_at_startup() {
         let dir = tempdir().unwrap();
-        let bad = SINGLE_SESSION.to_string() + "\naio_threads = 0\n";
+        let bad = with_top_level("aio_threads = 0");
         let p = write_cfg(dir.path(), &bad);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("aio_threads"), "got: {msg}");
@@ -715,13 +804,13 @@ library_dir = "{d}/library"
     #[test]
     fn diff_separates_reloadable_from_non() {
         let dir = tempdir().unwrap();
-        let p = write_cfg(dir.path(), SINGLE_SESSION);
+        let p = write_cfg(dir.path(), &single_session());
         let old = Config::load(&p).unwrap();
         let mut new = old.clone();
         new.connections_limit = Some(20000);
-        new.listen_interfaces = "0.0.0.0:9999".into();
+        new.torrent_dir = std::path::PathBuf::from("/var/lib/torrentd/other");
         let d = Config::diff(&old, &new);
         assert_eq!(d.connections_limit, Some(20000));
-        assert_eq!(d.non_reloadable_changes, vec!["listen_interfaces"]);
+        assert_eq!(d.non_reloadable_changes, vec!["torrent_dir"]);
     }
 }

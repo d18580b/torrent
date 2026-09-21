@@ -112,12 +112,18 @@ pub async fn run(
             // Both probes shell out. Two processes per profile per tick is
             // cheap, but it is still blocking work and it belongs off the
             // runtime's worker threads.
-            let iface = e.config.vpn_interface.clone();
-            let is_wg = e.config.vpn_type == VpnType::Wireguard;
-            let probe = tokio::task::spawn_blocking(move || {
-                let ip = vpn::first_ipv4(&iface).ok().map(IpAddr::V4);
-                let hs = is_wg.then(|| vpn::wireguard_handshake_age(&iface));
-                (ip, hs)
+            // A host profile has no tunnel to watch.
+            let Some(iface) = e.config.vpn_interface().map(str::to_string) else {
+                continue;
+            };
+            let is_wg = e.config.vpn_type() == Some(VpnType::Wireguard);
+            let probe = tokio::task::spawn_blocking({
+                let iface = iface.clone();
+                move || {
+                    let ip = vpn::first_ipv4(&iface).ok().map(IpAddr::V4);
+                    let hs = is_wg.then(|| vpn::wireguard_handshake_age(&iface));
+                    (ip, hs)
+                }
             })
             .await;
             let (current, handshake_probe) = match probe {
@@ -150,7 +156,7 @@ pub async fn run(
                         warn!(
                             target: "torrentd::vpn_monitor",
                             profile_id = %profile_id,
-                            vpn_iface = %e.config.vpn_interface,
+                            vpn_iface = %iface,
                             reason = why.as_str(),
                             "wireguard handshake probe unavailable; \
                              falling back to IP presence alone",
@@ -210,7 +216,7 @@ pub async fn run(
             error!(
                 target: "torrentd::vpn_monitor",
                 profile_id = %profile_id,
-                vpn_iface = %e.config.vpn_interface,
+                vpn_iface = %iface,
                 tunnel_ip = current.map(|c| c.to_string()).unwrap_or_default(),
                 reason = reason.as_str(),
                 handshake_age_secs = handshake_age.map(|a| a.as_secs()).unwrap_or_default(),

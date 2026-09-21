@@ -37,7 +37,7 @@ StateDirectory=torrentd
 StateDirectoryMode=0750
 
 # WireGuard / tunnel control. Multi-slot mode needs NET_ADMIN; remove
-# both lines if you only run single-session mode.
+# both lines if no profile uses network = "vpn".
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 

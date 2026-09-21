@@ -87,7 +87,7 @@ fn alert_throughput(torrents: usize, rounds: usize) {
         };
         state.insert(
             h.infohash,
-            TorrentState::newly_added(h, ProfileId::default_single(), Instant::now()),
+            TorrentState::newly_added(h, ProfileId::new("p"), Instant::now()),
         );
     }
 

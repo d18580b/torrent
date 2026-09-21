@@ -720,7 +720,13 @@ mod tests {
     use crate::metrics::RecordingSink;
     use crate::mock::MockEngine;
     use crate::resume_store::MemoryResumeStore;
-    use crate::source::SingleSessionSource;
+    use crate::source::ProfileSource;
+
+    /// A source with one profile, which is what most of these tests need.
+    /// Named rather than inlined so the profile id is one value.
+    fn single_profile_source(engine: Arc<dyn TorrentEngine>) -> ProfileSource {
+        ProfileSource::new(vec![(ProfileId::new("p"), engine)])
+    }
     use crate::torrent_store::MemoryTorrentStore;
 
     fn add_torrent_alert(byte: u8, id: u64) -> Alert {
@@ -796,7 +802,7 @@ mod tests {
 
     fn builder_with(engine: Arc<MockEngine>) -> AlertLoopBuilder {
         AlertLoopBuilder::new(
-            Arc::new(SingleSessionSource::new(engine)),
+            Arc::new(single_profile_source(engine)),
             Arc::new(StateMap::new()),
             Arc::new(MemoryResumeStore::new()),
             Arc::new(MemoryTorrentStore::new()),
@@ -895,7 +901,7 @@ mod tests {
 
         let seen: Arc<parking_lot::Mutex<Vec<ShutdownReason>>> = Arc::default();
         let handle = AlertLoopBuilder::new(
-            Arc::new(SingleSessionSource::new(engine)),
+            Arc::new(single_profile_source(engine)),
             Arc::new(StateMap::new()),
             Arc::new(MemoryResumeStore::new()),
             Arc::new(MemoryTorrentStore::new()),
@@ -953,7 +959,7 @@ mod tests {
     #[test]
     fn dispatch_add_torrent_inserts_into_state() {
         let engine = Arc::new(MockEngine::new());
-        let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
         let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
@@ -961,7 +967,7 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
         dispatch_alert(
-            ProfileId::default_single(),
+            ProfileId::new("p"),
             add_torrent_alert(0x42, 1),
             &source,
             &state,
@@ -978,7 +984,7 @@ mod tests {
     #[test]
     fn resume_handler_writes_and_decrements() {
         let engine = Arc::new(MockEngine::new());
-        let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume_store = Arc::new(MemoryResumeStore::new());
         let resume: Arc<dyn ResumeStore> = resume_store.clone();
@@ -997,13 +1003,13 @@ mod tests {
                     id: 1,
                     infohash: InfoHash([0xAA; 20]),
                 },
-                ProfileId::default_single(),
+                ProfileId::new("p"),
                 clock.now(),
             ),
         );
 
         dispatch_alert(
-            ProfileId::default_single(),
+            ProfileId::new("p"),
             save_resume_alert(0xAA, 1, b"BENCODE"),
             &source,
             &state,
@@ -1020,7 +1026,7 @@ mod tests {
     #[test]
     fn save_resume_failed_decrements_counter() {
         let engine = Arc::new(MockEngine::new());
-        let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
         let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
@@ -1031,7 +1037,7 @@ mod tests {
         state.note_resume_requested();
 
         dispatch_alert(
-            ProfileId::default_single(),
+            ProfileId::new("p"),
             save_resume_failed_alert(0xBB, 1),
             &source,
             &state,
@@ -1054,7 +1060,7 @@ mod tests {
         let h1 = engine.register_handle(InfoHash([0x01; 20]));
         let h2 = engine.register_handle(InfoHash([0x02; 20]));
 
-        let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
         let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
@@ -1064,11 +1070,11 @@ mod tests {
         let now = clock.now();
         state.insert(
             h1.infohash,
-            crate::state::TorrentState::newly_added(h1, ProfileId::default_single(), now),
+            crate::state::TorrentState::newly_added(h1, ProfileId::new("p"), now),
         );
         state.insert(
             h2.infohash,
-            crate::state::TorrentState::newly_added(h2, ProfileId::default_single(), now),
+            crate::state::TorrentState::newly_added(h2, ProfileId::new("p"), now),
         );
 
         run_shutdown(
@@ -1104,7 +1110,7 @@ mod tests {
         engine.push_alert(save_resume_failed_alert(0x10, h1.id));
         engine.push_alert(save_resume_alert(0x20, h2.id, b"ok"));
 
-        let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
         let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
@@ -1114,11 +1120,11 @@ mod tests {
         let now = clock.now();
         state.insert(
             h1.infohash,
-            crate::state::TorrentState::newly_added(h1, ProfileId::default_single(), now),
+            crate::state::TorrentState::newly_added(h1, ProfileId::new("p"), now),
         );
         state.insert(
             h2.infohash,
-            crate::state::TorrentState::newly_added(h2, ProfileId::default_single(), now),
+            crate::state::TorrentState::newly_added(h2, ProfileId::new("p"), now),
         );
 
         // Both alerts are queued before run_shutdown. The first drain
@@ -1148,7 +1154,7 @@ mod tests {
         let engine = Arc::new(MockEngine::new());
         let h = engine.register_handle(InfoHash([0xC0; 20]));
 
-        let source: Arc<dyn AlertSource> = Arc::new(SingleSessionSource::new(engine.clone()));
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
         let state = Arc::new(StateMap::new());
         let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
         let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
@@ -1157,7 +1163,7 @@ mod tests {
 
         state.insert(
             h.infohash,
-            crate::state::TorrentState::newly_added(h, ProfileId::default_single(), clock.now()),
+            crate::state::TorrentState::newly_added(h, ProfileId::new("p"), clock.now()),
         );
 
         // No alerts queued; the engine accepts save_resume_data but the

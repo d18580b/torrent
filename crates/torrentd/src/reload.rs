@@ -20,6 +20,7 @@ pub async fn run(
     config_path: PathBuf,
     initial: Config,
     source: Arc<dyn AlertSource>,
+    profiles: Arc<crate::profile_registry::ProfileRegistry>,
     mut reload_rx: Receiver<()>,
     log_handle: crate::tracing_init::LogReloadHandle,
 ) {
@@ -62,7 +63,10 @@ pub async fn run(
             }
         }
         for profile in source.profiles() {
-            let patch = diff.to_settings_patch_for(&profile);
+            let Some(cfg) = profiles.config(&profile) else {
+                continue;
+            };
+            let patch = diff.to_settings_patch_for(cfg);
             if let Some(eng) = source.engine_for(&profile) {
                 if let Err(e) = eng.apply_settings(&patch).context("apply_settings") {
                     warn!(profile_id = %profile, error.cause = %e, "SIGHUP: apply_settings failed");

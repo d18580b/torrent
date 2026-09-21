@@ -54,21 +54,19 @@ pub async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
     // serving, and taking the daemon out of rotation would stop them too. The
     // count is reported either way, and `torrentd_profile_vpn_tunnel_up` is the
     // per-profile signal to alert on.
-    let fenced = s.fenced_profiles().map(|(f, _)| f).unwrap_or(0);
-    if let Some((fenced, total)) = s.fenced_profiles() {
-        if total > 0 && fenced == total {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "reason": "all_profiles_fenced",
-                    "profiles": total,
-                    "profiles_fenced": fenced,
-                    "heartbeat_age_secs": age.as_secs(),
-                })),
-            )
-                .into_response();
-        }
+    let (fenced, total) = s.fenced_profiles();
+    if total > 0 && fenced == total {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "reason": "all_profiles_fenced",
+                "profiles": total,
+                "profiles_fenced": fenced,
+                "heartbeat_age_secs": age.as_secs(),
+            })),
+        )
+            .into_response();
     }
 
     (
@@ -128,6 +126,26 @@ mod tests {
             .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
         let resp = healthz(State(s)).await.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn a_host_profile_can_never_fence_the_daemon() {
+        // A host profile has no tunnel, so it is never `VpnDown`. A daemon of
+        // host profiles alone must therefore never report all-fenced.
+        use std::sync::Arc;
+
+        use crate::profile_registry::test_host_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            test_host_entry("a"),
+            test_host_entry("b"),
+        ]));
+        let s = build_test_state(Some(reg));
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        let resp = healthz(State(s)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

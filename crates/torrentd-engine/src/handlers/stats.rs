@@ -146,7 +146,7 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
-            profile_id: ProfileId::default_single(),
+            profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
         handle_with(&session_stats(counters), &mut ctx, table);
@@ -162,7 +162,7 @@ mod tests {
                 MetricCall::SetGauge { name, value, labels }
                 if name == "libtorrent_net_sent_bytes"
                     && *value == 4242.0
-                    && labels.iter().any(|(k, v)| k == "profile_id" && v == "default"))
+                    && labels.iter().any(|(k, v)| k == "profile_id" && v == "p"))
         });
         assert!(found, "expected gauge for index 2, got {calls:?}");
     }

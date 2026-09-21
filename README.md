@@ -114,9 +114,8 @@ Requires `allow_mutations = true`. A mistake here destroys data, so:
 
 ## HTTP API
 
-Default bind `127.0.0.1:8080`. Everything is served under `/api/…`; the bare
-paths remain as aliases, and `/healthz` and `/metrics` stay at the root so
-probes and scrapes do not move.
+Everything is served under `/api/…`. `/healthz` and `/metrics` stay at the
+root, where probes and scrapes conventionally look.
 
 | Method & path | Purpose |
 | --- | --- |
@@ -137,26 +136,53 @@ With `[pool]` configured: `GET /api/pool`, `/pool/tree`, `/pool/torrents`,
 `/pool/verify`; and the plan surface `GET`/`POST /api/pool/plans`,
 `GET`/`DELETE /api/pool/plans/:id`, `POST /api/pool/plans/:id/apply`.
 
-Multi-profile mode additionally mounts `GET /profiles`, `/profiles/:id`,
-`/profiles/:id/torrents` and `POST /profiles/:id/pause-all` \| `/resume-all`.
+Profile routes: `GET /api/profiles`, `/profiles/:id`, `/profiles/:id/torrents`,
+and `POST /api/profiles/:id/pause-all` \| `/resume-all`.
 
-## Modes
+## Profiles
 
-One config file drives everything; unknown keys are a fatal error. See
+One config file drives everything; unknown keys are a fatal error, inside
+`[[profile]]` tables too. See
 [`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml).
 
-**Single-session** (no `[[profile]]` tables): one libtorrent session, DHT
-enabled, session state persisted across restarts. Right for public-tracker and
-DHT content.
+A **profile** is one libtorrent session with its own network posture, identity
+and directories. At least one is required, and there is no default profile:
+every profile states how it reaches the network, because the alternative —
+the host's own interfaces with DHT enabled — is the least private posture the
+daemon has, and it should not be what you get by writing nothing. `POST
+/api/torrents` therefore always requires `profile_id`.
 
-**Multi-profile** (one or more `[[profile]]` tables): each profile is an independent
-session pinned to its own VPN tunnel, for multi-account private-tracker
-seeding. `POST /torrents` then requires `profile_id`. The listen port is either
-static or negotiated over NAT-PMP against the tunnel gateway
-(ProtonVPN/PIA-style ephemeral ports, renewed continuously, with the live
-socket rebinding when it changes).
+```toml
+[[profile]]
+id                = "public"
+network           = "host"          # binds this machine's interfaces
+listen_interfaces = "0.0.0.0:6881,[::]:6881"
+dht               = true            # off unless written
 
-## Security posture (multi-profile)
+[[profile]]
+id                   = "account_a"
+network              = "vpn"        # binds a tunnel; dht/pex/lsd forced off
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg-acct-a.conf"
+vpn_interface        = "wg-acct-a"
+port_forward         = "natpmp"
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+```
+
+A `vpn` profile pins every socket to its tunnel address and disables DHT, PEX
+and LSD unconditionally — there is no key that turns them back on. Its
+listening port is either static or negotiated over NAT-PMP against the tunnel
+gateway (ProtonVPN/PIA-style ephemeral ports, renewed continuously, with the
+live socket rebinding when it changes).
+
+Verify a tunnel before trusting it, with no torrents involved:
+
+```bash
+torrentd --config … vpn check          # add --bring-up to raise the tunnels
+```
+
+## Security posture (vpn profiles)
 
 Private trackers ban permanently for cross-contamination between accounts, so
 the isolation is layered — and honest about its limits.
@@ -174,8 +200,8 @@ the isolation is layered — and honest about its limits.
   of socket binds or poll timing. Needs `CAP_NET_ADMIN` and a dedicated user.
 
 `allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds,
-not an egress control. Public content that wants DHT belongs in
-single-session mode.
+not an egress control. Public content that wants DHT belongs in a
+`network = "host"` profile.
 
 The eight rules this is built on, and why each exists, are documented on the
 `torrentd-engine::profile` module.
@@ -230,7 +256,7 @@ label; per-torrent series are deliberately absent (unusable at 10K+ torrents —
 the HTTP API serves per-torrent status on demand). Alongside the libtorrent
 gauges (`torrentd_libtorrent_*`) there are daemon counters for torrent
 lifecycle, resume writes, disk and hash errors, dropped alerts, storage moves
-and pool verification; multi-profile adds VPN tunnel and port-forward health, and
+and pool verification; a vpn profile adds tunnel and port-forward health, and
 `kill_switch_active`.
 
 ## Deployment
