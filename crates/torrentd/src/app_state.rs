@@ -79,6 +79,22 @@ impl AppState {
         self.profiles.config(profile_id)
     }
 
+    /// Why `profile_id` has no engine, when it is configured and failed to
+    /// come up.
+    ///
+    /// `None` means the id names nothing at all. The distinction is the whole
+    /// point of the failed list: `http/profiles.rs` already argues it — "a
+    /// configured-but-failed profile... answering 404 would be
+    /// indistinguishable from a typo in the id" — and it was applied at one of
+    /// five profile-resolution sites. At the other four an operator whose
+    /// tunnel had failed was told the id did not exist, and went to check the
+    /// config file.
+    pub fn profile_failure_reason(&self, profile_id: &ProfileId) -> Option<&str> {
+        self.profiles
+            .failed_profile(profile_id)
+            .map(|f| f.reason.as_str())
+    }
+
     /// `(fenced, total)` over the configured profiles.
     ///
     /// Counted from the profile registry rather than the alert source: the
@@ -97,6 +113,21 @@ impl AppState {
 
 #[cfg(test)]
 pub(crate) fn build_test_state(profiles: Option<Arc<ProfileRegistry>>) -> AppState {
+    build_test_state_with_sessions(profiles, &["p"])
+}
+
+/// As [`build_test_state`], but with the set of *live sessions* stated
+/// separately from the profile registry.
+///
+/// They are different things, and conflating them is what `/healthz` did: a
+/// profile that failed bring-up is in the registry's failed list and in no
+/// session, so a test that cannot express "configured, not live" cannot reach
+/// the readiness answer for a total bring-up failure at all.
+#[cfg(test)]
+pub(crate) fn build_test_state_with_sessions(
+    profiles: Option<Arc<ProfileRegistry>>,
+    session_ids: &[&str],
+) -> AppState {
     use torrentd_engine::AssignmentRegistry;
     use torrentd_engine::MemoryTorrentStore;
     use torrentd_engine::MockEngine;
@@ -123,7 +154,12 @@ pub(crate) fn build_test_state(profiles: Option<Arc<ProfileRegistry>>) -> AppSta
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     AppState {
-        source: Arc::new(ProfileSource::new(vec![(ProfileId::new("p"), engine)])),
+        source: Arc::new(ProfileSource::new(
+            session_ids
+                .iter()
+                .map(|id| (ProfileId::new(*id), Arc::clone(&engine)))
+                .collect(),
+        )),
         registry: Arc::new(AssignmentRegistry::new_empty(reg_path)),
         profiles,
         state: Arc::new(StateMap::new()),
