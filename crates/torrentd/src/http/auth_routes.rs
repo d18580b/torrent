@@ -29,7 +29,11 @@ pub struct LoginResponse {
     expires_in: u64,
 }
 
-pub async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
+pub async fn login(State(s): State<AppState>, req: Request) -> Response {
+    // Resolved before the body is consumed, and before the `[auth]` check, so
+    // the throttle and the log line have it on every path.
+    let client = crate::http::forwarded::resolve(&req, &s.trusted_proxies);
+
     let Some(auth) = s.auth.as_ref() else {
         // 404 read as "no such route", which is what the shipped login form
         // surfaced when an operator had not configured `[auth]` — a dead end
@@ -38,7 +42,10 @@ pub async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> 
         return (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": "this daemon runs without authentication                           (allow_unauthenticated = true). There is no session to create;                           access control belongs to whatever sits in front of it.                           Configure [auth] to log in here."
+                "error": "this daemon runs without authentication \
+                          (allow_unauthenticated = true). There is no session to create; \
+                          access control belongs to whatever sits in front of it. \
+                          Configure [auth] to log in here."
             })),
         )
             .into_response();
@@ -46,9 +53,10 @@ pub async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> 
 
     // Argon2id costs ~50 ms of CPU on purpose. Unthrottled, an unauthenticated
     // caller can spend the whole machine's CPU on password verification.
-    if let Some(wait) = auth.throttle.retry_after() {
+    if let Some(wait) = auth.throttle.retry_after(client.ip) {
         warn!(
             target: "torrentd::auth",
+            client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default(),
             retry_after_secs = wait.as_secs(),
             "login throttled after repeated failures",
         );
@@ -60,28 +68,65 @@ pub async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> 
             .into_response();
     }
 
-    if !auth.verify_password(&req.password) {
-        auth.throttle.note_failure();
+    let body = match axum::body::to_bytes(req.into_body(), MAX_LOGIN_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "malformed request body"})),
+            )
+                .into_response()
+        }
+    };
+    let Ok(login_req) = serde_json::from_slice::<LoginRequest>(&body) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "expected {\"password\": \"…\"}"})),
+        )
+            .into_response();
+    };
+
+    if !auth.verify_password(&login_req.password) {
+        auth.throttle.note_failure(client.ip);
         // No detail about which part was wrong, and no username to enumerate.
-        warn!(target: "torrentd::auth", "failed login attempt");
+        // The source address is logged, which it never was: a brute-force
+        // attempt left no trace of where it came from, so the proxy's log was
+        // the only record that it had happened at all.
+        warn!(
+            target: "torrentd::auth",
+            client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default(),
+            "failed login attempt",
+        );
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "invalid password"})),
         )
             .into_response();
     }
-    auth.throttle.note_success();
+    auth.throttle.note_success(client.ip);
 
     let id = auth.sessions.create();
     let ttl = auth.config.session_ttl_secs;
-    info!(target: "torrentd::auth", "operator logged in");
+    info!(
+        target: "torrentd::auth",
+        client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default(),
+        "operator logged in",
+    );
 
     // HttpOnly keeps the cookie away from page scripts; SameSite=Strict means a
     // cross-site request cannot carry it, which is the CSRF defence for a
-    // cookie-authenticated mutating API. Secure is omitted deliberately: the
-    // daemon speaks plain HTTP and is expected behind a TLS proxy, and a
-    // Secure cookie would break a loopback session over http://localhost.
-    let cookie = format!("{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl}");
+    // cookie-authenticated mutating API.
+    //
+    // `Secure` is set when the *original* request was over TLS, which is only
+    // knowable from a trusted proxy. It used to be omitted unconditionally, on
+    // the grounds that the daemon speaks plain HTTP and a Secure cookie would
+    // break `http://localhost` — true, and it also meant that a deployment
+    // fronted by TLS handed out a cookie the browser would send in clear to
+    // any plain-HTTP origin on that host. Now loopback still gets a usable
+    // cookie and a TLS-fronted deployment gets a protected one.
+    let secure = if client.secure { "; Secure" } else { "" };
+    let cookie =
+        format!("{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl}{secure}");
     (
         StatusCode::OK,
         [(header::SET_COOKIE, cookie)],
@@ -92,6 +137,9 @@ pub async fn login(State(s): State<AppState>, Json(req): Json<LoginRequest>) -> 
     )
         .into_response()
 }
+
+/// A login body is one short JSON object; anything larger is not one.
+const MAX_LOGIN_BODY_BYTES: usize = 8 * 1024;
 
 pub async fn logout(State(s): State<AppState>, req: Request) -> Response {
     if let Some(auth) = s.auth.as_ref() {

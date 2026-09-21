@@ -787,6 +787,8 @@ impl DaemonHandle {
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),
             reload_tx: Some(reload_tx.clone()),
+            trusted_proxies: crate::http::forwarded::TrustedProxies::parse(&cfg.trusted_proxies)
+                .expect("validated at startup"),
         };
 
         let app: Router = http::router(app_state);
@@ -854,7 +856,14 @@ impl DaemonHandle {
         }
 
         let mut shutdown_rx = shutdown_rx;
-        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        // `into_make_service_with_connect_info` is what makes the peer address
+        // reach a handler at all. Without it nothing downstream — the login
+        // throttle, the auth failure log — could see who was calling.
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
             let _ = shutdown_rx.recv().await;
         });
 

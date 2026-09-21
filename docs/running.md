@@ -246,6 +246,47 @@ There is no token-only mode: `[auth]` requires `password_hash`. Scopes are
 `POST /api/login` returns 409 with an explanation when the daemon is running
 unauthenticated, rather than the 404 that used to look like a missing route.
 
+## 6a. Reverse proxy
+
+torrentd does not terminate TLS and will not. An HTTP server's TLS
+configuration is a thing to get wrong, there is no certificate handling here,
+and there is a mature implementation one hop away. What the daemon does
+provide is an origin that behaves correctly behind one: ETags and conditional
+requests on the web client's assets, precompressed `.br`/`.gz` variants, and a
+`Vary: accept-encoding` so a shared cache keys on it.
+
+[`deploy/Caddyfile`](../deploy/Caddyfile) and
+[`deploy/compose.yaml`](../deploy/compose.yaml) are a working pair. The
+contract is two headers:
+
+| Header | What torrentd does with it |
+| --- | --- |
+| `X-Forwarded-For` | the client address, for the login throttle and the failed-login log line |
+| `X-Forwarded-Proto` | `https` sets `Secure` on the session cookie |
+
+RFC 7239 `Forwarded` is read for the scheme as well.
+
+**Both are read only from a peer listed in `trusted_proxies`.** That key is
+empty by default, and with it empty no forwarding header is read at all — the
+socket's peer address is the client, which is what the daemon did before any
+of this existed. Set it to the address your proxy connects from and nothing
+else: anything in that list can claim to be any client.
+
+Getting it wrong fails safe rather than open. An unset `trusted_proxies` means
+the daemon sees the proxy's address for every request: the login throttle
+falls back to one shared bucket, and the cookie loses its `Secure`
+attribute. Nothing becomes forgeable.
+
+The proxy must **strip client-supplied forwarding headers before adding its
+own**. `X-Forwarded-For` is a chain each hop appends to, so torrentd reads the
+*last* entry — the one the trusted proxy added — rather than the first, which
+is whatever the original client chose to send. A proxy that forwards
+client-supplied values intact is a proxy that cannot be trusted about
+anything.
+
+One nginx-specific note: `proxy_buffering off` is required on `/api/events`,
+or the SSE stream arrives in one lump at timeout. Caddy streams by default.
+
 ## 7. Limits and sysctls
 
 The daemon sets none of these itself.

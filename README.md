@@ -245,15 +245,31 @@ Served at `/`, embedded in the binary, so a deployment stays one artifact. The
 pool browser above is the primary view; there is also a virtualised torrent
 list built for 100K rows and a profile view for VPN and port-forward health.
 
+It is a static bundle with no server-side rendering — the daemon serves files
+and JSON, and every route the client has is resolved in the browser. The
+origin behaves properly behind a cache: strong ETags and conditional requests,
+precompressed `.br`/`.gz` variants chosen on `Accept-Encoding` (226 KB of
+JavaScript becomes 62 KB), fingerprinted assets marked immutable, and
+`Vary: accept-encoding` so a shared cache keys on it.
+
 Updates arrive over SSE: the daemon emits a tick when something visible
 changes and the client refetches only the panels it has mounted. Polling every
-15s is the fallback when the stream drops. Routes use the fragment (`#/pool`)
-because the compatibility aliases make `/pool` and `/torrents` real API paths.
+15s is the fallback when the stream drops.
 
 ```bash
 cd web && npm run dev     # dev server, proxying the API to :8080
 mise run screenshot       # regenerate the image above from a fixture
 ```
+
+## Reverse proxy
+
+torrentd does not terminate TLS and will not; `deploy/Caddyfile` and
+`deploy/compose.yaml` are a working pair that does. `X-Forwarded-For` and
+`X-Forwarded-Proto` are read **only** from peers listed in `trusted_proxies`
+— empty by default, meaning no forwarding header is read at all and the
+socket's peer address is the client. They feed exactly two things: a per-client
+login throttle instead of one shared bucket, and `Secure` on the session
+cookie when the original request was over TLS.
 
 ## Metrics
 

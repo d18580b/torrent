@@ -22,12 +22,11 @@ services:
     ports:
       - "6881:6881/tcp"
       - "6881:6881/udp"
-      # The API is published to the host's loopback only. Note that the
-      # daemon must bind 0.0.0.0:8080 *inside* the container for this mapping
-      # to reach it — a config that binds 127.0.0.1 there is unreachable, and
-      # this is the one place the sample config cannot be copied verbatim.
-      # A non-loopback bind requires [auth]; the daemon refuses otherwise.
-      - "127.0.0.1:8080:8080"
+      # The API is NOT published to the host. `proxy` reaches it over the
+      # compose network, which is the only thing that should. Inside the
+      # container the daemon binds 0.0.0.0:8080 — the one place the sample
+      # config cannot be copied verbatim — and a non-loopback bind requires
+      # [auth], which is exactly the posture this stack is in.
     volumes:
       - ./torrentd.toml:/etc/torrentd/torrentd.toml:ro
       - torrentd-resume:/var/lib/torrentd/resume
@@ -37,6 +36,30 @@ services:
       # Operator places the actual data here; torrentd reads only.
       - /data/torrents:/data/torrents:ro
 
+  # torrentd does not terminate TLS, by design: an HTTP server's TLS
+  # configuration is a thing to get wrong, and there is a mature one right
+  # here. Caddy terminates it, serves the web client's assets from its own
+  # cache, and forwards the API.
+  #
+  # The two headers below are the contract. `trusted_proxies` in torrentd.toml
+  # must name this service's address on the compose network, or the daemon
+  # ignores both — which is the safe direction, not a broken one: it falls
+  # back to the socket peer, and the throttle falls back to its shared bucket.
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - torrentd
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
 volumes:
   torrentd-resume:
   torrentd-torrents:
+  caddy-data:
+  caddy-config:

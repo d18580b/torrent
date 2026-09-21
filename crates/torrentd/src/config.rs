@@ -48,6 +48,15 @@ pub struct Config {
     #[serde(default = "Config::default_http_listen")]
     pub http_listen: SocketAddr,
 
+    /// Peers whose forwarding headers are believed, as IPs or CIDR blocks.
+    ///
+    /// Empty by default, which means no forwarding header is ever read and
+    /// the socket's peer address is the client — the behaviour that existed
+    /// before this key. Set it to the address the reverse proxy connects
+    /// from, and only that: anything in this list can claim to be any client.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
     /// Permit running with no `[auth]` section.
     ///
     /// Without `[auth]` the daemon authenticates nothing: every route,
@@ -233,6 +242,10 @@ impl Config {
         ProfileConfig::validate_set(&self.profile).context("[[profile]] validation failed")?;
 
         self.validate_auth_posture()?;
+        // Parsed at startup so a malformed CIDR is a config error rather than
+        // a proxy that silently stops being trusted.
+        crate::http::forwarded::TrustedProxies::parse(&self.trusted_proxies)
+            .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?;
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out

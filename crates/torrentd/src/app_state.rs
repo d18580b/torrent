@@ -46,6 +46,8 @@ pub struct AppState {
     /// Asks the reload pump to re-read the config file. `None` only in tests,
     /// which do not run one.
     pub reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Peers whose forwarding headers are believed. Empty means none are.
+    pub trusted_proxies: crate::http::forwarded::TrustedProxies,
 }
 
 impl AppState {
@@ -140,6 +142,7 @@ pub(crate) fn build_test_state(profiles: Option<Arc<ProfileRegistry>>) -> AppSta
         default_save_path: std::env::temp_dir(),
         torrent_dir: std::env::temp_dir(),
         reload_tx: None,
+        trusted_proxies: Default::default(),
     }
 }
 
