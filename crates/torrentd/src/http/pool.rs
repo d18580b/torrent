@@ -300,7 +300,10 @@ pub struct AdoptRequest {
     root_id: Option<i64>,
     #[serde(default)]
     path: Option<String>,
-    /// Required in multi-profile mode.
+    /// Always required. A profile is an account identity, and adoption hands
+    /// every matched torrent to one profile's session — there is no count at
+    /// which the daemon may pick one for the caller. `Option` here is how the
+    /// handler tells a missing field from an unknown id; it is not a default.
     profile_id: Option<String>,
     /// Report what would happen and change nothing.
     #[serde(default)]
@@ -848,6 +851,59 @@ mod tests {
     use crate::app_state::build_test_state;
 
     const IH: &str = "0101010101010101010101010101010101010101";
+
+    /// A state with a real pool index, so `adopt` gets past its `no_pool`
+    /// guard and the checks under test are what answer.
+    fn state_with_pool(dir: &std::path::Path) -> AppState {
+        let mut s = build_test_state(None);
+        s.pool = crate::pool_service::PoolService::open(&crate::config::Config::minimal_for_tests(
+            dir, false,
+        ))
+        .unwrap();
+        assert!(s.pool.is_some(), "fixture is wrong: the pool must be open");
+        s
+    }
+
+    /// `POST /api/pool/adopt` is unreachable without a `profile_id`, in every
+    /// configuration. The web client's adopt and preview buttons sent
+    /// `{root_id, path}` and nothing else, so both were dead across a language
+    /// boundary no compiler and no green suite could see. `AdoptRequest` in
+    /// `web/src/lib/api.ts` now declares the field required, which turns the
+    /// omission into a `npm run build` failure; this is the same contract from
+    /// the daemon's side.
+    #[tokio::test]
+    async fn adopt_without_a_profile_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_pool(dir.path());
+        // serde reads a missing `Option` field as `None`, which is exactly what
+        // the shipped client sent.
+        let req: AdoptRequest = serde_json::from_str(r#"{"root_id":1,"path":""}"#).unwrap();
+        assert!(req.profile_id.is_none());
+
+        let (code, body) = match adopt(State(s), Json(req)).await {
+            Ok(_) => panic!("a request with no profile_id must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"], "profile_id is required");
+    }
+
+    /// And the same request with a profile the daemon does not run is refused
+    /// too, rather than silently adopting into the wrong account.
+    #[tokio::test]
+    async fn adopt_with_an_unknown_profile_id_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = state_with_pool(dir.path());
+        let req: AdoptRequest =
+            serde_json::from_str(r#"{"root_id":1,"path":"","profile_id":"nope"}"#).unwrap();
+
+        let (code, body) = match adopt(State(s), Json(req)).await {
+            Ok(_) => panic!("an unknown profile_id must be refused"),
+            Err(e) => e,
+        };
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(body.0["error"], "unknown profile_id");
+    }
 
     #[test]
     fn adopting_an_infohash_another_profile_holds_is_refused() {
