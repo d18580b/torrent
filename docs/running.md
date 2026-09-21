@@ -273,7 +273,7 @@ torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
 | `--slot ID` | Check one slot instead of every configured slot. |
 | `--json` | Emit the report as JSON instead of the human table. |
 | `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
-| `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host. |
+| `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host, and **the only one that needs root** — see below. |
 | `--as-uid UID` | Render and dry-run the kill-switch ruleset for this uid instead of this process's own. |
 
 Exit status: `0` clean, `1` any check failed, `2` nothing failed but at least
@@ -281,14 +281,24 @@ one check could not be performed — an unreadable sysctl, a `wg` probe that
 failed. A caller that treats only `0` as success gets the strict reading; one
 that accepts `0` and `2` gets "nothing is known to be broken".
 
-A check that could not be performed *because this invocation lacks
-`CAP_NET_ADMIN`* is reported `[?cap]` and does **not** raise the status to
-`2`. The daemon holds that capability and an operator shell usually does not,
-so `wg show <iface> latest-handshakes` and `nft --check` are routinely refused
-on a host where nothing is wrong; counting those would make `2` the normal
-answer everywhere and the distinction the exit code carries would mean
-nothing. They are still printed, and the `--json` report marks them with
-`"needs_capability": true`.
+A check that *nothing this invocation could be given would settle* is reported
+`[?cap]` and does **not** raise the status to `2`. Counting it would make `2`
+the normal answer on a host where nothing is wrong, and the distinction the
+exit code carries would mean nothing. Two things land in that class:
+
+- **A missing `CAP_NET_ADMIN`**, which is the common one and the one the marker
+  is named for. The daemon holds it and an operator shell usually does not, so
+  `wg show <iface> latest-handshakes` and `nft --check`'s kernel validation are
+  routinely refused on a healthy host.
+- **The `kill_switch_uid` mismatch.** `--as-uid` names a uid the invoker is not
+  by definition, and nothing here can observe which user the daemon runs as, so
+  no argument, privilege or configuration settles it. Raising privileges only
+  moves the problem: as root the subject becomes `0`, which fails outright.
+
+Each line says which of the two it is. They are still printed, and the `--json`
+report marks them with `"needs_capability": true`. An `unknown` a different
+input *would* settle — an unreadable sysctl, a `wg` probe that failed for a
+reason other than permission — still raises the status to `2`.
 
 **No host change, and nothing deleted.** The default path reads state and
 writes none. Its one interaction with a running daemon is the NAT-PMP check,
@@ -304,6 +314,18 @@ that changes the host: it skips an interface that already exists and lowers
 again only what it was observed to have raised, because `wg-quick down` on a
 live slot's tunnel fences that slot until the daemon is restarted.
 
+**`--bring-up` needs root, and it is not usable unattended without arranging
+for that.** `wg-quick` re-execs itself under `sudo` when it is not uid 0
+(`[[ $UID == 0 ]] || exec sudo -p … -- "$BASH" -- "$SELF" …`), so on a
+TTY-less invocation with no askpass helper configured it prompts for a
+password it cannot read and the bring-up fails. Run it under `sudo` yourself,
+or from a unit that already runs as root. If you put `vpn check` in a systemd
+`ExecStartPre`, that suggestion applies **only with `--bring-up` omitted, or
+with the unit running as root** — an `ExecStartPre` under `User=torrentd`
+with `--bring-up` hangs on the prompt and then fails the unit start. Without
+the flag the command changes nothing and needs no privilege at all, which is
+the form worth automating.
+
 **Run it as the daemon's user** where you can, so the `wg` probes describe the
 process that will actually run them. The kill-switch pair is the one place
 that is not enough: with `sudo` (which `--bring-up` usually needs) pass
@@ -315,12 +337,25 @@ you gave either way. The exception is uid `0`, which fails whoever asks,
 because the kill switch refuses to install for root unconditionally.
 
 **What a pass establishes**, for a WireGuard slot with
-`port_forward = "natpmp"`: the profile is readable; `wg` and `wg-quick` run;
-the interface holds an IPv4 address; the latest handshake is inside
-`vpn_handshake_max_age_secs`; the gateway hands out a forwarded port when
-asked over the tunnel; the effective `rp_filter` for that interface is not
-strict; and, with the kill switch on, that `nft --check` accepts the ruleset
-boot would install for the uid given.
+`port_forward = "natpmp"`, depends on what the invocation could reach. Each
+line below names the capability it needs; anything marked `[?cap]` in the
+report was *not* established, and a `0` does not carry it.
+
+| A pass establishes | Needs |
+| --- | --- |
+| the profile file is readable | nothing beyond read access to it |
+| `wg`, `wg-quick` and `ip` are executable | nothing — it is a binary-presence probe, and says nothing about the configuration |
+| the interface holds an IPv4 address | nothing |
+| the effective `rp_filter` for that interface is not strict | nothing |
+| the gateway hands out a forwarded port when asked over the tunnel | a live tunnel and a live gateway; this is the strongest thing the command does |
+| the latest handshake is inside `vpn_handshake_max_age_secs` | **`CAP_NET_ADMIN`.** Without it `wg show <iface> latest-handshakes` is refused, the check reports `[?cap]`, and a `0` says nothing about handshake liveness |
+| `nft --check` accepts the ruleset boot would install for the uid given | **`CAP_NET_ADMIN`.** Without it `nft` cannot initialise its netlink cache and the check reports `[?cap]`. A ruleset that does not *parse* is still reported as a failure without the capability, because nftables parses before it touches netlink |
+| the uid named is the one the daemon runs as | nothing establishes this. `--as-uid` names a uid the invoker is not, and no process here can observe the daemon's; the line reports `[?cap]` and does not colour the status |
+
+So on the invocation this page recommends — the daemon's user, in an operator
+shell without `CAP_NET_ADMIN` — a `0` carries the first five rows and not the
+last three. That is materially less than "the VPN is working", and it is the
+honest content of a pass.
 
 **What it does not.** It does not establish that any port is reachable from
 the public internet — there is no inbound test — nor that the port a session
