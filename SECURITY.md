@@ -44,9 +44,9 @@ window.
 The surfaces below are where a report is most useful. The list **points
 rather than bounds**: it is where to start, not the limit of what may be
 reported, and a surface it does not name is still worth a report. Each entry
-points at the documentation that describes the behaviour rather than
-restating it, so a fix does not leave a second description behind to go
-stale.
+**names** the surface and **links** the documentation that describes it; the
+detail lives there, so this file does not have to be kept in step with a
+behaviour it only points at.
 
 - **Authentication** — described in
   [`README.md` § *Authentication*](README.md#authentication) and
