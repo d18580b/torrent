@@ -72,23 +72,13 @@ impl AppState {
             .map(|e| e.health().status == SlotStatus::VpnDown)
             .unwrap_or(false)
     }
-}
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Mode {
-    Single,
-    MultiSlot,
-}
-
-/// Minimal AppState for handler/unit tests. `slots = Some(..)` puts it in
-/// multi-slot mode; everything else is a throwaway in-memory double.
-impl AppState {
     /// `(fenced, total)` over the configured slots, or `None` in
     /// single-session mode, which has no tunnel to lose.
     ///
     /// Counted from the slot registry rather than from the alert source: the
     /// source counts live sessions, and a slot the VPN monitor fenced still
-    /// has one.
+    /// has one. On the request path — `/healthz` calls it on every probe.
     pub fn fenced_slots(&self) -> Option<(usize, usize)> {
         let sr = self.slots.as_ref()?;
         let total = sr.iter().len();
@@ -100,6 +90,14 @@ impl AppState {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Mode {
+    Single,
+    MultiSlot,
+}
+
+/// Minimal AppState for handler/unit tests. `slots = Some(..)` puts it in
+/// multi-slot mode; everything else is a throwaway in-memory double.
 #[cfg(test)]
 pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
     use torrentd_engine::AssignmentRegistry;
