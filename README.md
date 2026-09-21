@@ -200,6 +200,27 @@ the isolation is layered — and honest about its limits.
   tunnel interfaces, so a dropped tunnel fails closed at the kernel regardless
   of socket binds or poll timing. Needs `CAP_NET_ADMIN` and a dedicated user.
 
+**Checking a tunnel without seeding anything** — `vpn check` runs the VPN
+pre-flight the daemon depends on and reports each part separately, with no
+libtorrent session, no torrents and no tracker contact.
+
+```bash
+torrentd --config … vpn check                            # every profile
+torrentd --config … vpn check --profile acct_a --json    # one profile, machine-readable
+torrentd --config … vpn check --egress 1.1.1.1:53      # prove traffic leaves the tunnel
+```
+
+Verdicts are four-valued — `pass`, `fail`, `skip`, `unknown` — so a green
+summary cannot quietly mean "mostly not checked", and the exit status carries
+the same distinction: `0` clean, `1` any failure, `2` nothing failed but
+something could not be checked.
+
+Safe to run while the daemon is up. The default path reads state and asks the
+gateway for a NAT-PMP mapping with the daemon's own short lease, which it
+leaves to expire; `--bring-up` is the only option that raises a tunnel, and it
+lowers again only what it raised. What a pass does and does not establish is
+set out in [docs/running.md](docs/running.md#9-first-run-checks).
+
 `allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds,
 not an egress control. Public content that wants DHT belongs in a
 `network = "host"` profile.
