@@ -111,3 +111,11 @@ behaviour it only points at.
   A report that *this* repository pins a version with a known upstream
   advisory is welcome — that is a pin to move, and it belongs in a normal
   issue.
+
+**What a link in this file has to do.** An outbound link is held to the thing
+the sentence sends you for, not to whether it answers. A link offered as a
+route to report something has to be shown to carry a route; a link offered as
+documentation has to be shown to carry the documentation. The test is the
+target's content, not its status code — a page can answer `200` and say
+nothing but that there is no policy there. That is the standard for editing
+this file, and it is why the Boost pointer above is prose.
