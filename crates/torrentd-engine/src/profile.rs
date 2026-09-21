@@ -544,6 +544,24 @@ pub enum ProfileConfigError {
     DuplicateResumeDir(PathBuf),
     #[error("torrent_dir {0:?} appears more than once (after symlink resolution)")]
     DuplicateTorrentDir(PathBuf),
+    /// One profile's effective store directory lies inside another's.
+    ///
+    /// Equality is the [`ProfileConfigError::DuplicateResumeDir`] case; this
+    /// is the nesting one, which the derived `<base>/<id>` layout makes easy
+    /// to write by accident — an override of `<base>` itself contains every
+    /// other profile's derived directory. `load_all` filters on the file name
+    /// only, so a profile pointed at a containing directory loads every other
+    /// profile's state as its own.
+    #[error(
+        "{key} {inner:?} lies inside {outer:?} (after symlink resolution), so both \
+         profiles' sessions would read one store. Each profile's {key} must be \
+         disjoint from every other's."
+    )]
+    NestedProfileDir {
+        key: &'static str,
+        outer: PathBuf,
+        inner: PathBuf,
+    },
     #[error("peer_fingerprint_hex must not equal libtorrent default (-LT20C0-)")]
     DefaultFingerprintForbidden,
     #[error("peer_fingerprint_hex {0:?} is not 16 hex chars")]
@@ -651,9 +669,26 @@ impl ProfileConfig {
     /// fingerprint shared with a tunnelled profile puts one peer-id prefix on
     /// the wire from both the tunnel address and the host's real address,
     /// which is exactly the cross-account correlation these rules exist to
-    /// prevent. So requiredness is checked per posture, below; the length, the
-    /// libtorrent-default ban and the uniqueness inserts run for any profile
-    /// that sets the field, whatever its posture.
+    /// prevent. So requiredness is checked per posture, below, and the length
+    /// and the libtorrent-default ban run for any profile that sets the field,
+    /// whatever its posture.
+    ///
+    /// Two rules are deliberately **not** here, because they are not decidable
+    /// from `&[ProfileConfig]` alone:
+    ///
+    /// - identity uniqueness, which has to compare each profile's *effective*
+    ///   `peer_fingerprint_hex` / `user_agent` — its own value or the
+    ///   top-level default it inherits when it sets none; and
+    /// - store-directory uniqueness, which has to compare each profile's
+    ///   *effective* resume and `.torrent` directory — its own override or the
+    ///   `<base>/<id>` [`crate::resume_store::FsResumeStore::dir_for`] derives
+    ///   from the top-level root.
+    ///
+    /// Both need the top-level `Config`, so both live in `Config::validate`.
+    /// Checking only the explicit spellings here is what let a host profile
+    /// inherit a vpn profile's identity, and an explicit `resume_dir` equal
+    /// another profile's derived one, while `--check-config` printed
+    /// `config OK`.
     pub fn validate_set(profiles: &[ProfileConfig]) -> Result<(), ProfileConfigError> {
         if profiles.is_empty() {
             return Err(ProfileConfigError::NoProfiles);
@@ -662,10 +697,6 @@ impl ProfileConfig {
         let mut seen_id = std::collections::HashSet::new();
         let mut seen_port = std::collections::HashSet::new();
         let mut seen_iface = std::collections::HashSet::new();
-        let mut seen_fp = std::collections::HashSet::new();
-        let mut seen_ua = std::collections::HashSet::new();
-        let mut seen_resume = std::collections::HashSet::new();
-        let mut seen_torrent = std::collections::HashSet::new();
 
         for p in profiles {
             // The id is not just a label. It is a path component in
@@ -786,36 +817,20 @@ impl ProfileConfig {
             // 8-byte peer-id prefix on the wire from the tunnel and from the
             // host's real address. Keeping these checks inside the `Vpn` arm
             // made that configuration validate clean.
+            //
+            // Shape only. *Uniqueness* is not decidable here: a profile that
+            // sets neither key inherits the top-level `peer_fingerprint` /
+            // `user_agent`, which this function cannot see, so a set of
+            // `ProfileConfig`s that looks distinct here can still put one
+            // peer-id prefix on the wire from two postures. `Config::validate`
+            // resolves each profile's effective identity and owns the
+            // uniqueness rule.
             if let Some(fp) = p.peer_fingerprint_hex.as_deref() {
                 if fp.len() != 16 {
                     return Err(ProfileConfigError::BadFingerprintLength(fp.to_string()));
                 }
                 if Self::is_libtorrent_default_fingerprint(fp) {
                     return Err(ProfileConfigError::DefaultFingerprintForbidden);
-                }
-                if !seen_fp.insert(fp.to_string()) {
-                    return Err(ProfileConfigError::DuplicateFingerprint(fp.to_string()));
-                }
-            }
-            if let Some(ua) = p.user_agent.as_deref() {
-                if !seen_ua.insert(ua.to_string()) {
-                    return Err(ProfileConfigError::DuplicateUserAgent(ua.to_string()));
-                }
-            }
-
-            // Directories, where they are named explicitly. Resolve symlinks;
-            // on a first run the directory may not exist yet, so fall back to
-            // the literal value and let startup create it.
-            if let Some(dir) = &p.resume_dir {
-                let r = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-                if !seen_resume.insert(r.clone()) {
-                    return Err(ProfileConfigError::DuplicateResumeDir(r));
-                }
-            }
-            if let Some(dir) = &p.torrent_dir {
-                let t = dir.canonicalize().unwrap_or_else(|_| dir.clone());
-                if !seen_torrent.insert(t.clone()) {
-                    return Err(ProfileConfigError::DuplicateTorrentDir(t));
                 }
             }
         }
@@ -1079,44 +1094,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_host_profile_may_not_wear_a_vpn_profiles_identity() {
-        // The configuration this is written from: the operator writes the VPN
-        // profile, copies the table to make the public one, and edits `id`,
-        // `network` and `listen_interfaces`. The fingerprint and user agent
-        // come along. `startup.rs` applies `peer_fingerprint_hex` to every
-        // session with no posture guard, so the private tracker then sees one
-        // peer-id prefix announcing from the tunnel address and from the
-        // host's real address — the cross-account correlation whose stated
-        // consequence is a permanent ban.
-        //
-        // With the uniqueness inserts inside the `Vpn` arm, this validates
-        // clean.
-        let mut public = host("public", "0.0.0.0:6882", false);
-        public.peer_fingerprint_hex = Some("a1b2c3d4e5f60718".to_string());
-        let profiles = vec![
-            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
-            public,
-        ];
-        assert!(matches!(
-            ProfileConfig::validate_set(&profiles),
-            Err(ProfileConfigError::DuplicateFingerprint(_))
-        ));
-    }
-
-    #[test]
-    fn a_host_profile_may_not_wear_a_vpn_profiles_user_agent() {
-        let mut public = host("public", "0.0.0.0:6882", false);
-        public.user_agent = Some("qB/5.0".to_string());
-        let profiles = vec![
-            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
-            public,
-        ];
-        assert!(matches!(
-            ProfileConfig::validate_set(&profiles),
-            Err(ProfileConfigError::DuplicateUserAgent(_))
-        ));
-    }
+    // Cross-posture identity uniqueness — a host profile wearing a vpn
+    // profile's fingerprint or user agent, spelled explicitly or inherited
+    // from the top-level default — is `Config::validate`'s rule now, because
+    // the inherited spelling is not decidable from `&[ProfileConfig]` alone.
+    // The tests live beside it, in `crates/torrentd/src/config.rs`.
 
     #[test]
     fn a_host_profiles_fingerprint_is_length_checked_like_any_other() {
@@ -1218,19 +1200,6 @@ mod tests {
         assert!(matches!(
             ProfileConfig::validate_set(&profiles),
             Err(ProfileConfigError::DuplicatePort(6881))
-        ));
-    }
-
-    #[test]
-    fn duplicate_fingerprint_rejected() {
-        let same = "a1b2c3d4e5f60718";
-        let profiles = vec![
-            cfg("a", 6881, "wg0", same, "ua-a"),
-            cfg("b", 6882, "wg1", same, "ua-b"),
-        ];
-        assert!(matches!(
-            ProfileConfig::validate_set(&profiles),
-            Err(ProfileConfigError::DuplicateFingerprint(_))
         ));
     }
 
