@@ -528,11 +528,43 @@ pub async fn remove(
                 Json(serde_json::json!({"error": format!("{e}")})),
             )
         })?;
+        // And the two stores. Clearing the registry entry alone does not
+        // hold: `startup.rs` re-scans `<resume_dir>/<id>` and
+        // `<torrent_dir>/<id>` at the next start and re-`assign`s every
+        // info-hash it finds, so the operator's clear is silently undone the
+        // first time the daemon restarts. The engine-backed path gets this
+        // for free through `TorrentRemoved` -> `handlers/add.rs`; with no
+        // session there is no alert, so it is done here.
+        //
+        // Reported rather than warned: a clear that will resurrect is not a
+        // clear, and this branch exists precisely because the operator had no
+        // other way to make it stick. Both deletes are no-ops on a missing
+        // file, so an error here means the filesystem, not a race.
+        let store_err = |what: &str, e: String| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "the assignment was cleared but the {what} could not be deleted: {e}. \
+                         The startup scan will re-assign this info-hash until it is gone; \
+                         retry the delete."
+                    )
+                })),
+            )
+        };
+        s.resume
+            .delete(&profile, &ih)
+            .map_err(|e| store_err("resume file", e.to_string()))?;
+        s.torrents
+            .delete(&profile, &ih)
+            .map_err(|e| store_err(".torrent file", e.to_string()))?;
         tracing::warn!(
             target: "torrentd::http",
             infohash = %ih,
             profile_id = %profile,
-            "cleared an assignment whose profile has no running session",
+            "cleared an assignment whose profile has no running session, and \
+             deleted its resume and .torrent files so the startup scan does not \
+             re-assign it",
         );
         return Ok(StatusCode::NO_CONTENT);
     };
@@ -829,6 +861,46 @@ mod tests {
         assert!(
             app.registry.lookup(&ih).is_none(),
             "the assignment survived the delete",
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_a_stale_assignment_deletes_the_metadata_that_would_resurrect_it() {
+        // Clearing the registry entry alone does not hold: `startup.rs`
+        // re-scans `<resume_dir>/<id>` and `<torrent_dir>/<id>` at the next
+        // start and re-`assign`s every info-hash it finds, so the operator's
+        // clear is silently undone by the first restart. The engine-backed
+        // path gets both stores cleaned through `TorrentRemoved`; this branch
+        // has no session and therefore no alert.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+        let app = state_with_a_stale_assignment(dir.path(), ih);
+        let profile = ProfileId::new("gone");
+
+        app.resume.write(&profile, &ih, b"resume-bytes").unwrap();
+        app.torrents.write(&profile, &ih, b"torrent-bytes").unwrap();
+        assert_eq!(app.resume.load_all(&profile).unwrap().len(), 1);
+        assert_eq!(app.torrents.load_all(&profile).unwrap().len(), 1);
+
+        let code = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery {
+                delete_files: false,
+            }),
+        )
+        .await
+        .expect("delete must succeed");
+
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        assert!(app.registry.lookup(&ih).is_none());
+        assert!(
+            app.resume.load_all(&profile).unwrap().is_empty(),
+            "the resume file survives, so the next startup scan re-assigns this info-hash",
+        );
+        assert!(
+            app.torrents.load_all(&profile).unwrap().is_empty(),
+            "the .torrent survives, so the torrent-dir scan re-assigns this info-hash",
         );
     }
 

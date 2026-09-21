@@ -138,6 +138,7 @@ pub struct DaemonHandle {
     state: Arc<StateMap>,
     source: Arc<dyn AlertSource>,
     torrents: Arc<dyn TorrentStore>,
+    resume: Arc<dyn ResumeStore>,
     shutdown_tx: broadcast::Sender<ShutdownReason>,
     /// Subscribed in `boot`, before the HTTP server exists, so a SIGTERM
     /// arriving during startup is buffered rather than dropped on the floor.
@@ -882,6 +883,7 @@ pub async fn boot(
         state,
         source,
         torrents: torrent_store,
+        resume: resume_store,
         shutdown_tx,
         shutdown_rx,
         reload_rx,
@@ -906,6 +908,7 @@ impl DaemonHandle {
             state,
             source,
             torrents,
+            resume,
             shutdown_tx,
             shutdown_rx,
             reload_rx,
@@ -969,6 +972,7 @@ impl DaemonHandle {
             profiles: profile_registry.clone(),
             state,
             torrents,
+            resume,
             metrics: metrics.clone(),
             auth: cfg.auth.clone().map(crate::auth::Auth::new),
             pool,
