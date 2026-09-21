@@ -105,9 +105,21 @@ fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
 /// the reverse proxy connects from and only that. The one thing required of
 /// the proxy itself is that it **strips or overwrites** client-supplied
 /// forwarding headers rather than passing them through: a value this daemon
-/// believes must be one the proxy wrote. Whether the proxy appends by
-/// extending the existing field line or by adding another one does not
-/// matter — `last_element` reads both the same way.
+/// believes must be one the proxy wrote.
+///
+/// There are **three** such headers and all three have to be covered, not
+/// just the two an operator thinks of: `X-Forwarded-For`,
+/// `X-Forwarded-Proto` and RFC 7239 `Forwarded`. `resolve` reads `Forwarded`
+/// for both the address and the scheme, so a proxy that overwrites the two
+/// `X-` names while forwarding `Forwarded` verbatim — nginx's default for a
+/// header it does not know about — is handing a client-controlled value to a
+/// peer this daemon believes. `deploy/Caddyfile` is the worked example of
+/// covering all three: two `header_up` lines overwrite the `X-` pair and
+/// `header_up -Forwarded` removes the third outright.
+///
+/// Whether the proxy appends by extending the existing field line or by
+/// adding another one does not matter — `last_element` reads both the same
+/// way.
 #[derive(Clone, Debug, Default)]
 pub struct TrustedProxies(Vec<Cidr>);
 
