@@ -43,11 +43,40 @@ pub async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
             .into_response();
     }
 
+    // A fenced slot is a slot whose tunnel the monitor found unhealthy: its
+    // torrents are paused, it will not resume without an operator, and it is
+    // seeding nothing. A daemon in which *every* slot is in that state is not
+    // healthy by any definition an operator would recognise, and reporting
+    // `{"ok":true}` for it meant the probe was green through exactly the
+    // incident it exists to catch.
+    //
+    // Some-but-not-all fenced stays 200: the remaining slots are still
+    // serving, and taking the daemon out of rotation would stop them too. The
+    // count is reported either way, and `torrentd_slot_vpn_tunnel_up` is the
+    // per-slot signal to alert on.
+    let fenced = s.fenced_slots().map(|(f, _)| f).unwrap_or(0);
+    if let Some((fenced, total)) = s.fenced_slots() {
+        if total > 0 && fenced == total {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "reason": "all_slots_fenced",
+                    "slots": total,
+                    "slots_fenced": fenced,
+                    "heartbeat_age_secs": age.as_secs(),
+                })),
+            )
+                .into_response();
+        }
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "slots": n_slots,
+            "slots_fenced": fenced,
             "heartbeat_age_secs": age.as_secs(),
         })),
     )
@@ -75,6 +104,46 @@ mod tests {
     #[tokio::test]
     async fn fresh_heartbeat_is_ok() {
         let s = build_test_state(None);
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        let resp = healthz(State(s)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_with_every_slot_fenced_is_unready() {
+        use std::sync::Arc;
+
+        use torrentd_engine::SlotStatus;
+
+        use crate::slot_registry::test_entry;
+        use crate::slot_registry::SlotRegistry;
+
+        let reg = Arc::new(SlotRegistry::new(vec![
+            test_entry("a", SlotStatus::VpnDown),
+            test_entry("b", SlotStatus::VpnDown),
+        ]));
+        let s = build_test_state(Some(reg));
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        let resp = healthz(State(s)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn one_healthy_slot_keeps_the_daemon_in_rotation() {
+        use std::sync::Arc;
+
+        use torrentd_engine::SlotStatus;
+
+        use crate::slot_registry::test_entry;
+        use crate::slot_registry::SlotRegistry;
+
+        let reg = Arc::new(SlotRegistry::new(vec![
+            test_entry("a", SlotStatus::VpnDown),
+            test_entry("b", SlotStatus::Active),
+        ]));
+        let s = build_test_state(Some(reg));
         s.alert_heartbeat
             .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
         let resp = healthz(State(s)).await.into_response();

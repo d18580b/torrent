@@ -398,6 +398,12 @@ pub async fn boot(
     // tunnel interfaces. Fail-closed: if the operator asked for it and it can't
     // be installed, abort rather than seed without the backstop.
     let mut kill_switch_active = false;
+    // Seed the gauge at zero so `kill_switch_active == 0` is a series that
+    // exists and can be alerted on. Registered lazily on first emission, it
+    // was previously only ever set to 1 — so on a daemon running without the
+    // backstop the metric was simply absent, and an alert for exactly that
+    // condition could never fire.
+    metrics.set_gauge("kill_switch_active", 0.0, &[]);
     if cfg.network_kill_switch {
         match &slot_registry {
             Some(sr) => {
@@ -732,7 +738,7 @@ impl DaemonHandle {
             slots: slot_registry.clone(),
             state,
             torrents,
-            metrics,
+            metrics: metrics.clone(),
             auth: cfg.auth.clone().map(crate::auth::Auth::new),
             pool,
             alert_heartbeat: alert_loop.heartbeat(),
@@ -870,6 +876,7 @@ impl DaemonHandle {
                 Ok(()) => info!("network kill switch removed"),
                 Err(e) => warn!(error.cause = %e, "failed to remove network kill switch"),
             }
+            metrics.set_gauge("kill_switch_active", 0.0, &[]);
         }
 
         // Then bring the tunnels down, after the sessions are gone. The daemon
