@@ -99,6 +99,7 @@ behaviour it only points at.
   (`v2.0.14`) and `vendor/boost` (`boost-1.83.0`) are pinned here, not
   maintained here. Report them to
   [arvidn/libtorrent](https://github.com/arvidn/libtorrent/security) and
-  [boostorg](https://www.boost.org/users/security.html) upstream. A report
-  that *this* repository pins a version with a known upstream advisory is
-  welcome — that is a pin to move, and it belongs in a normal issue.
+  [boostorg](https://github.com/boostorg/boost/security/policy) upstream. A
+  report that *this* repository pins a version with a known upstream
+  advisory is welcome — that is a pin to move, and it belongs in a normal
+  issue.
