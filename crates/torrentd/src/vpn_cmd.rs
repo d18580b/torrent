@@ -339,6 +339,15 @@ pub trait CheckHost {
     /// [`judge_nft_check`] classifies on, and a test that shells out to the
     /// real `nft` asserts whatever this machine happens to answer.
     fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output>;
+
+    /// Whether `iface` is a WireGuard device: `Some(false)` is a positive
+    /// reading that it is not one, and `None` means neither read answered.
+    ///
+    /// Behind the trait for the same reason as the rest, and separate from
+    /// the handshake probe because it is the one question `wg show` cannot
+    /// answer: `wg` refuses a non-WireGuard interface and an interface it
+    /// lacks the capability to read with the same error.
+    fn wireguard_device(&self, iface: &str) -> Option<bool>;
 }
 
 /// `CheckHost` against the actual machine.
@@ -392,6 +401,37 @@ impl CheckHost for RealHost {
 
     fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output> {
         nft_check(ruleset)
+    }
+
+    fn wireguard_device(&self, iface: &str) -> Option<bool> {
+        // Both reads need no capability. `DEVTYPE=wireguard` in the kernel's
+        // own uevent is the cheap one and needs no subprocess; `ip -d link
+        // show` reports the same link type and is consulted second, because
+        // a device that sets no `DEVTYPE` is only evidence of "not WireGuard"
+        // once something else has looked. Neither answering is `None`, which
+        // leaves the handshake verdict exactly where it was.
+        let uevent =
+            std::fs::read_to_string(Path::new("/sys/class/net").join(iface).join("uevent")).ok();
+        if uevent
+            .as_deref()
+            .is_some_and(|u| u.lines().any(|l| l.trim() == "DEVTYPE=wireguard"))
+        {
+            return Some(true);
+        }
+        let out = std::process::Command::new("ip")
+            .args(["-d", "link", "show", iface])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // The bare word, not a substring: an interface *named* `wireguard`
+        // prints as `wireguard:` and must not answer this question itself.
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .any(|t| t == "wireguard"),
+        )
     }
 }
 
@@ -642,14 +682,35 @@ fn judge_nft_check(
 /// this process holds `CAP_NET_ADMIN`, which is what `wg show <iface>
 /// latest-handshakes` needs.
 ///
-/// Refused *without* it establishes nothing about this host and is bounded by
-/// the capability, while refused *with* it is a real gap.
+/// `is_wireguard_device` is [`CheckHost::wireguard_device`]'s reading, and it
+/// is what settles the one thing the probe cannot. `ProbeUnavailable::Refused`
+/// is documented at `vpn/wireguard.rs` as meaning *either* "not a WireGuard
+/// interface" *or* "no permission", and privilege is the one axis that cannot
+/// separate them: `wg show lo` and `wg show <nonexistent>` return the same
+/// refusal. Resolving it by privilege alone gave a wireguard slot pointed at a
+/// non-WireGuard interface — a configuration `SlotConfig::validate_set`
+/// accepts, since it constrains only that the interface equals the profile's
+/// file stem — an all-clear `0` and a message asserting the daemon would be
+/// fine. A capability-free read of the link type says otherwise, and that is a
+/// `fail` about the configuration rather than an `unknown` about this shell.
 fn judge_handshake(
     iface: &str,
     probe: Result<Option<Duration>, &str>,
     max: Duration,
     privileged: bool,
+    is_wireguard_device: Option<bool>,
 ) -> Check {
+    if is_wireguard_device == Some(false) {
+        return Check::fail(
+            "handshake",
+            format!(
+                "{iface} is not a WireGuard device: the kernel reports no wireguard link \
+                 type for it, so `wg show {iface} latest-handshakes` can never answer and \
+                 the daemon's health monitor would fall back to IP presence alone for this \
+                 slot. Point vpn_interface at the slot's own tunnel"
+            ),
+        );
+    }
     match probe {
         Ok(Some(age)) if age <= max => Check::pass(
             "handshake",
@@ -672,14 +733,31 @@ fn judge_handshake(
             "handshake",
             "no peer has handshaked yet; the tunnel may still be coming up",
         ),
-        Err("refused") if !privileged => Check::unknown_without_capability(
-            "handshake",
-            format!(
-                "`wg show {iface} latest-handshakes` was refused and this process does not \
-                 hold CAP_NET_ADMIN, which it needs; the daemon has it and would run this \
-                 probe. Run as the daemon's user with that capability to settle it"
-            ),
-        ),
+        Err("refused") if !privileged => {
+            // What was established, and nothing more. The old text finished
+            // "the daemon has it and would run this probe", which is a
+            // prediction about a process this command never looked at — and
+            // it was printed verbatim for an interface `wg` would refuse the
+            // daemon too.
+            let corroboration = match is_wireguard_device {
+                Some(true) => format!(
+                    " {iface} is a WireGuard device, so the missing capability accounts for \
+                     the refusal on its own."
+                ),
+                _ => format!(
+                    " Whether {iface} is a WireGuard device could not be read either, so the \
+                     refusal has two possible causes and this run separated neither."
+                ),
+            };
+            Check::unknown_without_capability(
+                "handshake",
+                format!(
+                    "`wg show {iface} latest-handshakes` was refused and this process does \
+                     not hold CAP_NET_ADMIN, which it needs.{corroboration} Run as a user \
+                     that holds that capability to settle it"
+                ),
+            )
+        }
         Err(why) => Check::unknown(
             "handshake",
             format!("probe unavailable ({why}); the daemon would run on IP presence alone"),
@@ -1036,7 +1114,13 @@ fn slot_checks(
         VpnType::Wireguard => {
             let max = Duration::from_secs(cfg.vpn_handshake_max_age_secs);
             let probe = vpn::wireguard_handshake_age(iface).map_err(|why| why.as_str());
-            checks.push(judge_handshake(iface, probe, max, host.has_cap_net_admin()));
+            checks.push(judge_handshake(
+                iface,
+                probe,
+                max,
+                host.has_cap_net_admin(),
+                host.wireguard_device(iface),
+            ));
         }
         VpnType::Openvpn => {
             checks.push(Check::skip(
@@ -1312,6 +1396,9 @@ mod tests {
         /// Scripted `nft --check` outcomes as `(exit code, stderr)`, consumed
         /// in call order. Empty means "accepted".
         nft: Mutex<Vec<(i32, String)>>,
+        /// Scripted `wireguard_device` answers. An interface not listed reads
+        /// as `None`, which is "neither read answered".
+        wg_devices: Vec<(String, bool)>,
     }
 
     impl FakeHost {
@@ -1328,6 +1415,7 @@ mod tests {
                 uid: Ok(2000),
                 privileged: false,
                 nft: Mutex::new(Vec::new()),
+                wg_devices: Vec::new(),
             }
         }
 
@@ -1340,6 +1428,12 @@ mod tests {
         /// Script `nft --check`, call by call, as `(exit code, stderr)`.
         fn with_nft(self, seq: impl IntoIterator<Item = (i32, &'static str)>) -> Self {
             *self.nft.lock().unwrap() = seq.into_iter().map(|(c, e)| (c, e.to_string())).collect();
+            self
+        }
+
+        /// Script what the capability-free link-type read says about `iface`.
+        fn with_wireguard_device(mut self, iface: &str, is_wg: bool) -> Self {
+            self.wg_devices.push((iface.to_string(), is_wg));
             self
         }
 
@@ -1456,6 +1550,14 @@ mod tests {
             }
             let (code, stderr) = g.remove(0);
             Ok(nft_out(code, &stderr))
+        }
+
+        fn wireguard_device(&self, iface: &str) -> Option<bool> {
+            self.record(format!("wireguard_device {iface}"));
+            self.wg_devices
+                .iter()
+                .find(|(i, _)| i == iface)
+                .map(|(_, v)| *v)
         }
     }
 
@@ -2679,7 +2781,7 @@ http_listen = "127.0.0.1:8080"
         // Refused without CAP_NET_ADMIN on an interface the kernel confirms
         // *is* a WireGuard device: the capability the daemon has and this
         // shell does not. Reported, and not counted against the status.
-        let c = judge_handshake("wg-acct-a", Err("refused"), max, false);
+        let c = judge_handshake("wg-acct-a", Err("refused"), max, false, Some(true));
         assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
         assert!(c.needs_capability, "detail: {}", c.detail);
         assert!(
@@ -2687,34 +2789,114 @@ http_listen = "127.0.0.1:8080"
             "the operator is told what would settle it: {}",
             c.detail,
         );
+        assert!(
+            !c.detail.contains("would run this probe"),
+            "the report does not predict what a process it never looked at would do: {}",
+            c.detail,
+        );
 
         // Refused *with* the capability is a real gap — `wg` cannot read it —
         // and still colours the status.
-        let c = judge_handshake("wg-acct-a", Err("refused"), max, true);
+        let c = judge_handshake("wg-acct-a", Err("refused"), max, true, Some(true));
         assert_eq!(c.verdict, Verdict::Unknown);
         assert!(!c.needs_capability, "detail: {}", c.detail);
 
         // A missing `wg` is not a capability problem at any privilege.
         for privileged in [true, false] {
-            let c = judge_handshake("wg-acct-a", Err("no_tool"), max, privileged);
+            let c = judge_handshake("wg-acct-a", Err("no_tool"), max, privileged, Some(true));
             assert_eq!(c.verdict, Verdict::Unknown);
             assert!(!c.needs_capability, "detail: {}", c.detail);
         }
 
         // And the verdicts that do not turn on privilege at all.
         assert_eq!(
-            judge_handshake("wg-acct-a", Ok(Some(Duration::from_secs(30))), max, false).verdict,
+            judge_handshake(
+                "wg-acct-a",
+                Ok(Some(Duration::from_secs(30))),
+                max,
+                false,
+                Some(true),
+            )
+            .verdict,
             Verdict::Pass,
         );
         assert_eq!(
-            judge_handshake("wg-acct-a", Ok(Some(Duration::from_secs(300))), max, true).verdict,
+            judge_handshake(
+                "wg-acct-a",
+                Ok(Some(Duration::from_secs(300))),
+                max,
+                true,
+                Some(true),
+            )
+            .verdict,
             Verdict::Fail,
         );
-        let c = judge_handshake("wg-acct-a", Ok(None), max, true);
+        let c = judge_handshake("wg-acct-a", Ok(None), max, true, Some(true));
         assert_eq!(c.verdict, Verdict::Unknown);
         assert!(
             !c.needs_capability,
             "a tunnel still coming up is not a permission problem"
+        );
+
+        // C30's missing arm. The link type could not be read at all, so the
+        // refusal has two causes and the report says so rather than picking
+        // one.
+        let c = judge_handshake("wg-acct-a", Err("refused"), max, false, None);
+        assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
+        assert!(c.needs_capability, "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("could not be read"),
+            "an unread link type is disclosed, not assumed: {}",
+            c.detail,
+        );
+    }
+
+    #[test]
+    fn a_wireguard_slot_pointed_at_a_device_that_is_not_wireguard_fails() {
+        // F14. `ProbeUnavailable::Refused` means *either* "not a WireGuard
+        // interface" *or* "no permission", and privilege is the one axis that
+        // cannot separate them — `wg show lo` and `wg show <nonexistent>`
+        // return the same refusal on this host. Resolving it by privilege gave
+        // a wireguard slot pointed at `lo` — a config `validate_set` accepts,
+        // because it constrains only that the interface equals the profile's
+        // file stem — an all-clear `0` and a line asserting the daemon would
+        // be fine.
+        //
+        // A capability-free read of the link type settles it, and a
+        // misconfigured slot is a `fail` about the configuration.
+        let c = judge_handshake(
+            "lo",
+            Err("refused"),
+            Duration::from_secs(180),
+            false,
+            Some(false),
+        );
+        assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+        assert!(!c.needs_capability, "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("lo"),
+            "the offending interface is named: {}",
+            c.detail,
+        );
+
+        // And through the whole slot: the verdict has to reach the report and
+        // the exit status, not just the judge.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new()
+            .with_existing("wg-acct-a")
+            .with_wireguard_device("wg-acct-a", false)
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(127, 0, 0, 1)))]);
+        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        let hs = find(&r.checks, "handshake").expect("the handshake line is still reported");
+        assert_eq!(hs.verdict, Verdict::Fail, "detail: {}", hs.detail);
+        let report = Report {
+            host: Vec::new(),
+            slots: vec![r],
+        };
+        assert_eq!(
+            report.exit_code(),
+            EXIT_FAILED,
+            "a slot whose handshake can never answer is not a clean run",
         );
     }
 }
