@@ -343,26 +343,45 @@ torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
 | `--json` | Emit the report as JSON instead of the human table. |
 | `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
 | `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host. |
-| `--as-uid UID` | Judge the kill-switch checks against the uid the daemon runs as. Default: this process's own. |
+| `--as-uid UID` | Render and dry-run the kill-switch ruleset for this uid instead of this process's own. |
 
 Exit status: `0` clean, `1` any check failed, `2` nothing failed but at least
-one check could not be performed — an unreadable sysctl, a `wg show` refused
-for want of permission. A caller that treats only `0` as success gets the
-strict reading; one that accepts `0` and `2` gets "nothing is known to be
-broken".
+one check could not be performed — an unreadable sysctl, a `wg` probe that
+failed. A caller that treats only `0` as success gets the strict reading; one
+that accepts `0` and `2` gets "nothing is known to be broken".
 
-**Safe to run against a live daemon.** Nothing in the default path changes
-state the daemon depends on: the NAT-PMP check asks the gateway for a mapping
-with the daemon's own short lease and lets that lease expire rather than
-deleting it, because NAT-PMP's delete removes *every* mapping the tunnel
-address holds — including the daemon's. `--bring-up` skips an interface that
-already exists and never lowers one it did not raise, for the same reason:
-`wg-quick down` on a live profile's tunnel fences that profile until the
-daemon is restarted.
+A check that could not be performed *because this invocation lacks
+`CAP_NET_ADMIN`* is reported `[?cap]` and does **not** raise the status to
+`2`. The daemon holds that capability and an operator shell usually does not,
+so `wg show <iface> latest-handshakes` and `nft --check` are routinely refused
+on a host where nothing is wrong; counting those would make `2` the normal
+answer everywhere and the distinction the exit code carries would mean
+nothing. They are still printed, and the `--json` report marks them with
+`"needs_capability": true`.
 
-**Run it as the daemon's user** where you can. The kill-switch checks describe
-one uid; with `sudo` (which `--bring-up` usually needs) pass `--as-uid` so
-they describe the daemon's rather than root's, or they will report `unknown`.
+**No host change, and nothing deleted.** The default path reads state and
+writes none. Its one interaction with a running daemon is the NAT-PMP check,
+which asks the gateway for a mapping with the daemon's own short lease and
+leaves that lease to expire: NAT-PMP's delete removes *every* mapping the
+tunnel address holds — including the daemon's — so the client this command
+negotiates with issues no delete on any branch, not even the one that tidies a
+UDP mapping the gateway put on an unexpected port. The request goes out from
+the same NAT-PMP client identity the daemon uses; whether a gateway coalesces
+it with the mapping the daemon already holds or hands out a second one is
+gateway behaviour, and nothing here tests it. `--bring-up` is the exception
+that changes the host: it skips an interface that already exists and lowers
+again only what it was observed to have raised, because `wg-quick down` on a
+live profile's tunnel fences that profile until the daemon is restarted.
+
+**Run it as the daemon's user** where you can, so the `wg` probes describe the
+process that will actually run them. The kill-switch pair is the one place
+that is not enough: with `sudo` (which `--bring-up` usually needs) pass
+`--as-uid` so the ruleset is rendered and dry-run for the daemon's uid rather
+than root's. The `kill_switch_uid` line itself still reports `unknown`
+whenever the invoker is not the uid named — nothing here can observe which
+user the daemon runs as — while the ruleset below it is validated for the uid
+you gave either way. The exception is uid `0`, which fails whoever asks,
+because the kill switch refuses to install for root unconditionally.
 
 **What a pass establishes**, for a WireGuard profile with
 `port_forward = "natpmp"`: the tunnel config is readable; `wg` and `wg-quick`
