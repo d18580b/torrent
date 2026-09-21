@@ -35,7 +35,7 @@ runtime and are easy to miss because nothing checks for them at startup:
 | --- | --- | --- |
 | `ip` | `iproute2` / `iproute` | Any multi-slot deployment. Polled every 30s per slot for the tunnel IP. |
 | `wg`, `wg-quick` | `wireguard-tools` | WireGuard slots — bring-up, teardown, handshake age. |
-| `openvpn`, `pkill` | `openvpn`, `procps-ng` | OpenVPN slots. `pkill` is how teardown stops the process. |
+| `openvpn`, `kill` | `openvpn`, `util-linux` | OpenVPN slots. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
 
 Single-session mode needs none of them.
@@ -147,7 +147,7 @@ typo is caught rather than ignored.
 | `registry_path` | `<resume_dir>/../slot_assignments.json` |
 | `session_state_path` | `<resume_dir>/../session_state.dat` |
 | `vpn_handshake_max_age_secs` | `180` |
-| `network_kill_switch` | `false` |
+| `network_kill_switch` | `false` — **refused as uid 0**; see §11.6 |
 | `connections_limit`, `file_pool_size`, `enable_lsd`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
 | `peer_fingerprint`, `user_agent` | libtorrent's own |
 
@@ -169,6 +169,22 @@ chars, must not be libtorrent's default), `user_agent`, `resume_dir` and
 `port_forward = "static"`. `id`, `listen_port`, `vpn_interface`,
 `peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all be
 unique across slots.
+
+**A WireGuard slot's `vpn_profile` must be `/etc/wireguard/<vpn_interface>.conf`
+— exactly that directory, and a file name matching the interface.** This is
+refused at startup, and by `--check-config`, rather than discovered later.
+`wg-quick up <path>` names the interface after the file, and `wg-quick down
+<iface>` resolves that bare name only against `/etc/wireguard`; a profile with
+a different stem, or in any other directory, brings up a tunnel that no
+shutdown or restart can ever take down. OpenVPN slots are unaffected —
+torrentd passes `--dev` explicitly, so their profile name carries no meaning.
+
+**`[[slot]] upload_rate_limit`** (optional, bytes/sec) is applied to that
+slot's session at boot. **Omit it to inherit the top-level
+`upload_rate_limit`; set it to `0` to make that slot explicitly unlimited**
+under a global cap. It is not reloadable: a change to it is reported on SIGHUP
+and ignored until a restart, and a SIGHUP that changes the *top-level* limit
+is withheld from any slot that sets its own.
 
 Validate without starting anything:
 
@@ -236,14 +252,22 @@ tunnels down, and exits.
 ## 9. First-run checks
 
 ```bash
-curl -s localhost:8080/healthz            # {"ok":true,"slots":1,"heartbeat_age_secs":0}
+curl -s localhost:8080/healthz            # {"ok":true,"slots":1,"slots_fenced":0,"heartbeat_age_secs":0}
 curl -s localhost:8080/status | jq        # counts by state, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
 
-`/healthz` returns 503 with `{"ok":false,"reason":"no_sessions"}` before a
-session is up, and `{"ok":false,"reason":"alert_loop_stalled",…}` if the alert
-loop stops advancing for 15 seconds.
+`slots` is the number of **configured** slots — the same denominator in every
+response, so `slots_fenced / slots` reads as one fraction whether the daemon is
+healthy or not. In single-session mode it is always `1`.
+
+`/healthz` returns 503 with one of three reasons:
+
+| `reason` | Meaning |
+| --- | --- |
+| `no_sessions` | No session is up yet. |
+| `alert_loop_stalled` | The alert loop stopped advancing for 15 seconds. |
+| `all_slots_fenced` | Every configured slot's tunnel is down and its torrents are paused. Some-but-not-all fenced stays **200** — the remaining slots are still serving — with the count in `slots_fenced`. |
 
 Confirm settings actually applied rather than trusting the config parsed:
 
@@ -303,7 +327,12 @@ On a scratch pool, not your real one.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
    interfaces for the daemon's uid. Setting it in single-session mode is a
-   startup error, not a warning.
+   startup error, not a warning. **So is running as root**: the ruleset matches
+   the daemon's traffic by uid, and `meta skuid 0` would drop every root-owned
+   socket on the host — the package manager, the NTP client, sshd's replies.
+   The daemon refuses to install it rather than take the host off the network,
+   so run it as its own user with `CAP_NET_ADMIN`, which is what the packaged
+   unit's `User=torrentd` does.
 
 ## Troubleshooting
 
@@ -313,6 +342,9 @@ On a scratch pool, not your real one.
 | Build panics mentioning `npm` | Node missing; install it or use `--no-default-features` (§3). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
+| `/healthz` 503 `all_slots_fenced` | Every configured slot's tunnel is down, so the daemon is seeding nothing. Check `/slots`, bring the tunnels back, then restart — fenced slots do not resume themselves by design. |
+| Daemon refuses to start, "vpn_profile must be /etc/wireguard/…" | A WireGuard slot's profile is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
+| Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run as `torrentd` with `CAP_NET_ADMIN`. |
 | Adds fail with 409 and `vpn_down` | The slot is fenced. An operator restart is required by design. |
 | Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
 | Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole slot when its tunnel drops. Check `/slots`, then `POST /slots/<id>/resume-all`. |
