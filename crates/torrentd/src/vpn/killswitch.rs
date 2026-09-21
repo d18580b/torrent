@@ -90,11 +90,16 @@ pub fn nft_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Install the kill switch for the current process's uid, confining egress to
-/// loopback + `tunnels`. Returns the uid the ruleset was written for. Replaces
-/// any stale table left by a previous unclean exit first.
-pub fn enable(tunnels: &[String]) -> io::Result<u32> {
-    let uid = current_uid()?;
+/// Why `enable` must refuse to install a ruleset for `uid`, or `None` if it
+/// may proceed.
+///
+/// Pure, and separate from `enable`, so the refusal is reachable by a test:
+/// `enable` needs `nft` on the host and the process's own uid, so a test
+/// cannot call it with 0. The guard was previously inline and covered only by
+/// a test of `render_ruleset`, which the guard does not touch — deleting the
+/// guard left the whole suite green while the change it prevents takes a host
+/// off the network.
+pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
     // The ruleset confines *this uid's* egress to loopback and the tunnels. As
     // root that is not a kill switch, it is an outage: every root-owned socket
     // on the host — the package manager, the NTP client, sshd's replies —
@@ -103,13 +108,25 @@ pub fn enable(tunnels: &[String]) -> io::Result<u32> {
     // `wg-quick` is usually a root tool, so reaching here as root is an easy
     // mistake to make; the packaged unit's `User=torrentd` plus
     // `AmbientCapabilities=CAP_NET_ADMIN` is the supported shape.
-    if uid == 0 {
-        return Err(io::Error::other(
+    (uid == 0).then(|| {
+        io::Error::other(
             "network_kill_switch = true requires a dedicated non-root user: the ruleset \
              confines the daemon's uid to loopback and its tunnels, and as uid 0 that \
              would drop every root-owned process's traffic on this host. Run torrentd as \
              its own user with CAP_NET_ADMIN (see deploy/torrentd.service).",
-        ));
+        )
+    })
+}
+
+/// Install the kill switch for the current process's uid, confining egress to
+/// loopback + `tunnels`. Returns the uid the ruleset was written for. Replaces
+/// any stale table left by a previous unclean exit first.
+///
+/// Refuses uid 0 outright — see [`refusal_for_uid`].
+pub fn enable(tunnels: &[String]) -> io::Result<u32> {
+    let uid = current_uid()?;
+    if let Some(refusal) = refusal_for_uid(uid) {
+        return Err(refusal);
     }
     let ruleset = render_ruleset(uid, tunnels);
     // Clear a stale table before reloading. `nft -f -` merges into an existing
@@ -186,14 +203,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_root_ruleset_is_never_rendered_by_enable() {
-        // `render_ruleset` is pure and will happily render uid 0 — the guard
-        // lives in `enable`, which is the only thing that installs one. This
-        // pins the shape the guard exists to prevent.
+    fn enable_refuses_to_install_a_ruleset_as_root() {
+        // The guard `enable` actually consults. Delete it and this fails,
+        // which is the whole point: the test that used to carry this name
+        // asserted on `render_ruleset`, a function the guard does not touch,
+        // so removing the guard left the suite green while the change it
+        // prevents takes a host off the network.
+        let e = refusal_for_uid(0).expect("uid 0 must be refused");
+        assert!(
+            e.to_string().contains("non-root user"),
+            "the refusal has to say what to do instead; got {e}",
+        );
+    }
+
+    #[test]
+    fn enable_proceeds_for_a_dedicated_uid() {
+        assert!(
+            refusal_for_uid(998).is_none(),
+            "the supported shape — User=torrentd with CAP_NET_ADMIN — is not refused",
+        );
+    }
+
+    #[test]
+    fn render_ruleset_would_happily_confine_uid_0() {
+        // `render_ruleset` is pure and has no guard of its own: it renders a
+        // ruleset that drops every root-owned socket on the host. This pins
+        // the shape `refusal_for_uid` exists to keep out of `nft`; on its own
+        // it establishes nothing about whether anything checks.
         let rs = render_ruleset(0, &["wg0".to_string()]);
         assert!(
             rs.contains("meta skuid 0 counter drop"),
-            "if this ever stops being catastrophic, revisit the guard in enable()",
+            "if this ever stops being catastrophic, revisit refusal_for_uid",
         );
     }
 
