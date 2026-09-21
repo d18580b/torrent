@@ -1490,19 +1490,114 @@ mod tests {
     ///
     /// This is the shape the repository already uses for an invariant no
     /// runtime assertion can carry — the tracing field-name gate is a grep
-    /// over these same sources. Hand-inline a second teardown here and it
-    /// fails.
+    /// over these same sources, and `no_source_invokes_the_binaries_procps_ng_provides`
+    /// walks the tree the same way. Hand-inline a second teardown anywhere in
+    /// `crates/torrentd/src/` and it fails.
+    ///
+    /// **Scope.** It used to count one literal — the `context(…)` string the
+    /// helper names its join with — in `startup.rs` alone, which is the whole
+    /// of what replaces a test of
+    /// `boot`: a fourth teardown written with any other context string, or in
+    /// any other module of this crate, passed it in silence. Both halves are
+    /// now checked across the crate's sources: the helper is defined and
+    /// wrapped once, and `bring_down` is called at exactly the two sites that
+    /// document why they are not the helper — `Drop for BootCleanup`, which
+    /// cannot await, and the shutdown job builder in `run_until_signal`, which
+    /// is outside `boot` entirely.
     #[test]
     fn boot_has_exactly_one_teardown_shape() {
-        let module = include_str!("startup.rs");
+        let sources = crate_sources();
+
         // The needle appears escaped in this test's own source, so the only
-        // literal occurrence is the real one.
-        let sites = module.matches("context(\"vpn teardown task\")").count();
+        // literal occurrence in `startup.rs` is the real one.
+        let wrappers: Vec<_> = sources
+            .iter()
+            .filter_map(|(path, text)| {
+                let n = text.matches("context(\"vpn teardown task\")").count();
+                (n > 0).then(|| format!("{path}: {n}"))
+            })
+            .collect();
         assert_eq!(
-            sites, 1,
-            "every teardown in `boot` goes through `take_down_off_worker`; \
-             {sites} places wrap a teardown join instead of one",
+            wrappers,
+            vec!["startup.rs: 1".to_string()],
+            "the wrapper that turns a teardown `JoinError` into this module's \
+             error belongs to `take_down_off_worker` and to nothing else; found \
+             {wrappers:?}",
         );
+
+        // And the helper is what every teardown in `boot` reaches for, so a
+        // direct `bring_down` outside the two documented sites is the same
+        // hazard arriving without the context string.
+        //
+        // Counted rather than located: a line number would have to be moved
+        // by every edit above it, and a gate its readers keep re-pinning stops
+        // being read. `vpn/` is where the trait's implementations and their
+        // own tests live, so calls there are the definitions being exercised
+        // and not teardowns `boot` reaches.
+        // Assembled rather than written out, so this test's own source is not
+        // one of the call sites it counts.
+        let call = concat!(".", "bring_down", "(");
+        let direct: Vec<_> = sources
+            .iter()
+            .filter(|(path, _)| !path.starts_with("vpn/"))
+            .filter_map(|(path, text)| {
+                let n = text.matches(call).count();
+                (n > 0).then(|| format!("{path}: {n}"))
+            })
+            .collect();
+        assert_eq!(
+            direct,
+            // One inside `take_down_off_worker`, which is the helper, plus the
+            // two sites that document why they are not it: `Drop for
+            // BootCleanup`, where `drop` cannot await, and the shutdown job
+            // builder in `run_until_signal`, which is outside `boot` entirely.
+            vec!["startup.rs: 3".to_string()],
+            "every teardown in `boot` goes through `take_down_off_worker`; the \
+             only other `bring_down` calls are the two that say why they are \
+             not it. Found {direct:?} — a new one wants the helper, and a \
+             fourth documented site wants this count and its comment moved \
+             together",
+        );
+    }
+
+    /// Every `.rs` under this crate's `src/`, as `(path relative to src/,
+    /// text)`.
+    ///
+    /// Read from disk rather than `include_str!` because the invariant is
+    /// about the crate and not about one file, which is the scope the
+    /// single-literal count was missing.
+    fn crate_sources() -> Vec<(String, String)> {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            let entries = std::fs::read_dir(&dir).expect("this crate's own sources");
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a source file this crate built");
+                let rel = path
+                    .strip_prefix(&root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((rel, text));
+            }
+        }
+        assert!(
+            out.iter().any(|(p, _)| p == "startup.rs"),
+            "the gate found no sources to walk, so it would pass on an empty \
+             set; it read {}",
+            root.display(),
+        );
+        out.sort();
+        out
     }
 
     /// The graceful-shutdown drain does not scale with slot count.
