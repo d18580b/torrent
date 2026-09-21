@@ -119,14 +119,39 @@ pub async fn run(
             };
 
             let labels = [("slot_id", slot_id.as_str())];
-            match renew_and_rebind(
-                &forwarder,
-                &*e.engine,
-                &req,
-                previous_port,
-                previous_epoch,
-                tunnel_ip,
-            ) {
+            // The NAT-PMP exchange retransmits on an exponential schedule and
+            // can take the best part of sixteen seconds against an
+            // unresponsive gateway. Held on a runtime worker, one wedged
+            // gateway stalls a thread for that long on every tick, and a
+            // deployment with several natpmp slots can stall all of them.
+            let outcome = {
+                let forwarder = forwarder.clone();
+                let engine = e.engine.clone();
+                tokio::task::spawn_blocking(move || {
+                    renew_and_rebind(
+                        &forwarder,
+                        &*engine,
+                        &req,
+                        previous_port,
+                        previous_epoch,
+                        tunnel_ip,
+                    )
+                })
+                .await
+            };
+            let outcome = match outcome {
+                Ok(o) => o,
+                Err(err) => {
+                    warn!(
+                        target: "torrentd::port_forward_monitor",
+                        slot_id = %slot_id,
+                        error.cause = %err,
+                        "port-forward renewal task failed; keeping the current mapping",
+                    );
+                    continue;
+                }
+            };
+            match outcome {
                 RenewOutcome::Unchanged {
                     port,
                     epoch,
