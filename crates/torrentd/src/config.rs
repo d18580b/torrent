@@ -51,9 +51,21 @@ pub struct Config {
     /// Peers whose forwarding headers are believed, as IPs or CIDR blocks.
     ///
     /// Empty by default, which means no forwarding header is ever read and
-    /// the socket's peer address is the client — the behaviour that existed
-    /// before this key. Set it to the address the reverse proxy connects
-    /// from, and only that: anything in this list can claim to be any client.
+    /// the socket's peer address is the client.
+    ///
+    /// That is not quite the behaviour that existed before this key. The
+    /// login throttle used to be a single shared bucket; it now keys on the
+    /// address resolved here. Behind a proxy that is the proxy's address for
+    /// every request, so it behaves like the shared bucket it was, but a
+    /// directly exposed daemon — a supported posture, since `[auth]` permits
+    /// any bind — now throttles per source IP. That is the better property:
+    /// one attacker can no longer lock every operator out of the login form,
+    /// and a client the tracked-client map has no room for falls back to the
+    /// shared bucket rather than to nothing.
+    ///
+    /// Set it to the address the reverse proxy connects from, and only that:
+    /// anything in this list can claim to be any client. The proxy must strip
+    /// or overwrite client-supplied forwarding headers before adding its own.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
 

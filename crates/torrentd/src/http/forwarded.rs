@@ -13,10 +13,19 @@
 //!
 //! What makes one not spoofable is knowing who is allowed to set it. A
 //! forwarding header is read **only** when the immediate peer is in
-//! `[http] trusted_proxies`; from anyone else it is ignored entirely, because
-//! anyone else can write whatever they like in it. With no trusted proxies
-//! configured — the default — no header is ever read and the behaviour is
-//! exactly what it was.
+//! `trusted_proxies` — a top-level key, beside `http_listen`, not a table of
+//! its own; from anyone else it is ignored entirely, because anyone else can
+//! write whatever they like in it.
+//!
+//! With no trusted proxies configured — the default — no header is ever read
+//! and the socket's peer address is the client. That is not *quite* the
+//! behaviour that existed before: the throttle was one shared bucket then,
+//! and now it keys on whatever address this returns. Behind a proxy that is
+//! the proxy's address for every request, so the effect is the shared bucket
+//! again; on a directly exposed daemon it is the real client, so the throttle
+//! keys per source IP. That is the better property — one attacker can no
+//! longer lock every operator out — and it is the behaviour the daemon has,
+//! so it is what is written down here.
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -269,7 +278,9 @@ mod tests {
 
     #[test]
     fn with_no_trusted_proxies_no_header_is_ever_read() {
-        // The default, and the behaviour that existed before any of this.
+        // The default. No header is read — which is what the daemon did
+        // before any of this — but the socket peer now *is* an address, so
+        // the throttle keys on it rather than sharing one bucket.
         let c = resolve(
             &req("203.0.113.9", &[("x-forwarded-for", "10.0.0.1")]),
             &TrustedProxies::default(),

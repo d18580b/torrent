@@ -196,9 +196,15 @@ pub struct Auth {
 ///   attacker simply varies the header and is never throttled.
 ///
 /// So a per-IP bucket is used exactly when the address came from the socket
-/// or from a proxy in `trusted_proxies`, and the global bucket otherwise —
-/// which, with no trusted proxies configured, is the whole of the previous
-/// behaviour.
+/// or from a proxy in `trusted_proxies`, and the global bucket when no address
+/// could be established at all, or when the per-client map is full and the
+/// sweep could not make room for one more.
+///
+/// Note that this is *not* the previous behaviour with no trusted proxies
+/// configured. The socket peer is an address, so the empty default now keys
+/// per source IP rather than sharing one bucket. That is the better property —
+/// one attacker can no longer lock every operator out — and both overflow
+/// paths degrade to the shared bucket rather than to no throttle at all.
 #[derive(Debug)]
 pub struct LoginThrottle {
     /// The fallback, for requests whose client cannot be established.

@@ -264,25 +264,41 @@ contract is two headers:
 | `X-Forwarded-For` | the client address, for the login throttle and the failed-login log line |
 | `X-Forwarded-Proto` | `https` sets `Secure` on the session cookie |
 
-RFC 7239 `Forwarded` is read for the scheme as well.
+RFC 7239 `Forwarded` supplies both: its `for=` parameter is read as the client
+address where `X-Forwarded-For` is absent, and its `proto=` as the scheme. A
+proxy that emits only the standardised header is therefore fully supported.
 
-**Both are read only from a peer listed in `trusted_proxies`.** That key is
+**All are read only from a peer listed in `trusted_proxies`.** That key is
 empty by default, and with it empty no forwarding header is read at all — the
-socket's peer address is the client, which is what the daemon did before any
-of this existed. Set it to the address your proxy connects from and nothing
-else: anything in that list can claim to be any client.
+socket's peer address is the client. Set it to the address your proxy connects
+from and nothing else: anything in that list can claim to be any client.
 
 Getting it wrong fails safe rather than open. An unset `trusted_proxies` means
-the daemon sees the proxy's address for every request: the login throttle
-falls back to one shared bucket, and the cookie loses its `Secure`
-attribute. Nothing becomes forgeable.
+no header is read and the socket's peer address is the client. Behind a proxy
+that is the proxy's address for every request, so the login throttle behaves
+as one shared bucket; on a **directly exposed** daemon it is the real client's
+address, so the throttle keys per source IP — which is the better property,
+because one attacker can then no longer lock every operator out of the login
+form. Either way the cookie loses its `Secure` attribute, and nothing becomes
+forgeable.
 
-The proxy must **strip client-supplied forwarding headers before adding its
-own**. `X-Forwarded-For` is a chain each hop appends to, so torrentd reads the
-*last* entry — the one the trusted proxy added — rather than the first, which
-is whatever the original client chose to send. A proxy that forwards
-client-supplied values intact is a proxy that cannot be trusted about
+The proxy must **strip or overwrite client-supplied forwarding headers before
+adding its own**. That is the only requirement torrentd places on it. Each of
+these headers is a chain every hop appends to, so torrentd reads the *last*
+entry — the one the trusted proxy added — rather than the first, which is
+whatever the original client chose to send. Whether your proxy appends by
+extending the existing field line (nginx, Caddy) or by adding a second one
+(HAProxy's `option forwardfor`) makes no difference: repeated field lines are
+joined in order first, exactly as RFC 9110 §5.2-5.3 defines them. A proxy that
+forwards client-supplied values intact is a proxy that cannot be trusted about
 anything.
+
+**The compose stack does not publish the API to the host.** `deploy/compose.yaml`
+publishes only the BitTorrent ports on `torrentd` and 80/443 on `proxy`; the
+API is reachable over the compose network, by the proxy, and nowhere else.
+That is deliberate — a proxy fronting the daemon is the whole point of this
+section — but it means `localhost:8080` is not an address on that deployment.
+See §9 for what the first-run checks look like there.
 
 One nginx-specific note: `proxy_buffering off` is required on `/api/events`,
 or the SSE stream arrives in one lump at timeout. Caddy streams by default.
@@ -322,10 +338,21 @@ tunnels down, and exits.
 
 ## 9. First-run checks
 
+These address the daemon directly, so they are written for a deployment that
+publishes the API — the systemd path of §8, and any run bound to loopback.
+
 ```bash
 curl -s localhost:8080/healthz            # {"ok":true,"profiles":1,"heartbeat_age_secs":0}
 curl -s localhost:8080/status | jq        # counts by state, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
+```
+
+**On the compose stack there is no `localhost:8080`** — §6a explains why — so
+run the same checks from inside the container, or through the proxy:
+
+```bash
+docker compose exec torrentd curl -s localhost:8080/healthz
+curl -s https://your.host/healthz         # through `proxy`, once TLS is up
 ```
 
 `/healthz` returns 503 with `{"ok":false,"reason":"no_sessions"}` before a
@@ -337,6 +364,9 @@ Confirm settings actually applied rather than trusting the config parsed:
 ```bash
 curl -s localhost:8080/metrics | grep torrentd_libtorrent_
 ```
+
+(Compose: `docker compose exec torrentd curl -s localhost:8080/metrics | grep
+torrentd_libtorrent_`.)
 
 Then add one torrent and watch it reach `seeding` in `/status`.
 
@@ -366,6 +396,9 @@ curl -sX POST localhost:8080/api/pool/adopt \
      -H 'content-type: application/json' \
      -d '{"root_id":1,"path":"movies","dry_run":true}'
 ```
+
+On the compose stack, prefix this with `docker compose exec torrentd` or send
+it through the proxy — §9 again.
 
 ## 11. Drills worth doing once, before you trust it
 
