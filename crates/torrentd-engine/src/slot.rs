@@ -190,6 +190,18 @@ impl SlotConfig {
     /// gateway. Only meaningful when `port_forward == Natpmp`.
     pub const DEFAULT_NATPMP_GATEWAY: &'static str = "10.2.0.1";
 
+    /// The largest `upload_rate_limit` a slot may state, in bytes/sec.
+    ///
+    /// Not a policy about bandwidth — a slot may legally exceed the top-level
+    /// `upload_rate_limit`, which is a default rather than a cap — but the
+    /// point past which the number stops meaning what it says. Settings reach
+    /// libtorrent's `settings_pack` through a `static_cast<int>`, so a value
+    /// above `i32::MAX` arrives as a *negative* rate limit: the slot is
+    /// configured for 3 GB/s and seeds at whatever libtorrent makes of a
+    /// negative cap. Refused at validation, where the operator can still read
+    /// what they typed.
+    pub const MAX_UPLOAD_RATE_LIMIT: u32 = i32::MAX as u32;
+
     /// The only directory a WireGuard `vpn_profile` may live in.
     ///
     /// `wg-quick`'s own default, and the only one it will resolve a bare
@@ -256,6 +268,16 @@ pub enum SlotConfigError {
         iface: String,
         profile: String,
         dir: &'static str,
+    },
+    #[error(
+        "slot {slot:?}: upload_rate_limit = {value} is out of range (0..={max}). A slot may \
+         exceed the top-level upload_rate_limit, but the value reaches libtorrent as a C int, \
+         so anything above {max} would be applied as a negative rate limit"
+    )]
+    UploadRateLimitOutOfRange {
+        slot: String,
+        value: u32,
+        max: u32,
     },
 }
 
@@ -349,6 +371,21 @@ impl SlotConfig {
                     });
                 }
             }
+            // A slot's own limit is range-checked the way the top-level key
+            // of the same name is, and is *not* bounded by it: clamping a
+            // slot to the global default would remove the main reason to
+            // give one its own limit. The bound that matters is the one the
+            // value has to survive on its way to libtorrent — see
+            // `MAX_UPLOAD_RATE_LIMIT`.
+            if let Some(v) = s.upload_rate_limit {
+                if v > Self::MAX_UPLOAD_RATE_LIMIT {
+                    return Err(SlotConfigError::UploadRateLimitOutOfRange {
+                        slot: s.id.as_str().to_string(),
+                        value: v,
+                        max: Self::MAX_UPLOAD_RATE_LIMIT,
+                    });
+                }
+            }
             if s.peer_fingerprint_hex.len() != 16 {
                 return Err(SlotConfigError::BadFingerprintLength(
                     s.peer_fingerprint_hex.clone(),
@@ -433,6 +470,37 @@ mod tests {
             upload_rate_limit: None,
             port_forward: PortForwardMode::Static,
             port_forward_gateway: None,
+        }
+    }
+
+    #[test]
+    fn a_slot_upload_rate_limit_libtorrent_cannot_hold_is_refused() {
+        // The value is handed to `settings_pack` through a
+        // `static_cast<int>`, so `u32::MAX` arrives as -1 and the slot the
+        // operator configured for 4 GB/s seeds under a negative cap. The
+        // sibling top-level key is range-checked; this one was not checked
+        // at all.
+        let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+        s.upload_rate_limit = Some(u32::MAX);
+        assert!(matches!(
+            SlotConfig::validate_set(&[s]),
+            Err(SlotConfigError::UploadRateLimitOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn a_slot_may_exceed_the_top_level_upload_rate_limit() {
+        // The top-level key is a default, not a ceiling: giving one account
+        // more bandwidth than the rest is the main reason to set a per-slot
+        // limit, so the check bounds the representable range and nothing
+        // else. `0` -- explicitly unlimited -- is in range too.
+        for v in [0, 1, SlotConfig::MAX_UPLOAD_RATE_LIMIT] {
+            let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+            s.upload_rate_limit = Some(v);
+            assert!(
+                SlotConfig::validate_set(&[s]).is_ok(),
+                "upload_rate_limit = {v} is a legal slot limit",
+            );
         }
     }
 

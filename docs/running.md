@@ -182,9 +182,12 @@ torrentd passes `--dev` explicitly, so their profile name carries no meaning.
 **`[[slot]] upload_rate_limit`** (optional, bytes/sec) is applied to that
 slot's session at boot. **Omit it to inherit the top-level
 `upload_rate_limit`; set it to `0` to make that slot explicitly unlimited**
-under a global cap. It is not reloadable: a change to it is reported on SIGHUP
-and ignored until a restart, and a SIGHUP that changes the *top-level* limit
-is withheld from any slot that sets its own.
+under a global cap. A slot may set a limit **above** the top-level one — that
+key is a default, not a ceiling — up to `2147483647`, past which libtorrent
+would read the value as a negative rate limit and the config is refused. It is
+not reloadable: a change to it is reported on SIGHUP and ignored until a
+restart, and a SIGHUP that changes the *top-level* limit is withheld from any
+slot that sets its own.
 
 Validate without starting anything:
 
