@@ -36,8 +36,10 @@ ReadWritePaths=/var/lib/torrentd /data/torrents
 StateDirectory=torrentd
 StateDirectoryMode=0750
 
-# WireGuard / tunnel control. Multi-slot mode needs NET_ADMIN; remove
-# both lines if no profile uses network = "vpn".
+# WireGuard / tunnel control. A `vpn` profile brings up its own tunnel (and,
+# with network_kill_switch = true, installs an nftables table), and both need
+# NET_ADMIN. A deployment whose profiles are all `network = "host"` needs
+# neither: remove both lines in that case.
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 

@@ -276,8 +276,16 @@ list built for 100K rows and a profile view for VPN and port-forward health.
 
 Updates arrive over SSE: the daemon emits a tick when something visible
 changes and the client refetches only the panels it has mounted. Polling every
-15s is the fallback when the stream drops. Routes use the fragment (`#/pool`)
-because the compatibility aliases make `/pool` and `/torrents` real API paths.
+15s is the fallback when the stream drops.
+
+Routes use the fragment (`#/pool`). The compatibility aliases that once made
+`/pool` and `/torrents` real API paths are gone — every route is under `/api`
+now — so the reason is no longer a collision. It is that the client is served
+as a static bundle from the router's fallback: a bare `/pool` answers 200 with
+the SPA whatever the path is, which means a path-routed client would be
+indistinguishable from a typo, and a reload of a deep link would depend on the
+server knowing every client-side route. The fragment keeps that knowledge on
+the client.
 
 ```bash
 cd web && npm run dev     # dev server, proxying the API to :8080
