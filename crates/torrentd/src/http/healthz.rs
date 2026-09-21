@@ -43,8 +43,9 @@ pub async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
             .into_response();
     }
 
-    // A fenced slot is a slot whose tunnel the monitor found unhealthy: its
-    // torrents are paused, it will not resume without an operator, and it is
+    // A fenced slot is a slot whose tunnel the monitor found unhealthy — or
+    // one whose tunnel never came up at boot: its torrents are paused (or
+    // were never loaded), it will not resume without an operator, and it is
     // seeding nothing. A daemon in which *every* slot is in that state is not
     // healthy by any definition an operator would recognise, and reporting
     // `{"ok":true}` for it meant the probe was green through exactly the
@@ -55,15 +56,19 @@ pub async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
     // count is reported either way, and `torrentd_slot_vpn_tunnel_up` is the
     // per-slot signal to alert on.
     //
-    // `slots` counts **configured** slots in both responses, and
-    // `slots_fenced` is counted over the same registry, so the two read as a
-    // coherent fraction. Reporting live sessions in the 200 body and
-    // configured slots in the 503 body — as this briefly did — gave a
-    // dashboard parsing `slots` one meaning when healthy and the other when
-    // fenced, and they diverge precisely during an incident: a *failed* slot
-    // is configured but has no session, so the live count shrinks exactly
-    // when the probe is being read. Single-session mode has no registry, and
-    // there its one session is the configured set.
+    // `slots` counts **configured** slots in both responses — the registry's
+    // live entries *plus* the slots whose tunnel never came up — and a slot
+    // that failed at boot is counted as fenced, because it has no session at
+    // all. `slots_fenced` is counted over the same set, so the two read as a
+    // coherent fraction whose denominator does not move during an incident.
+    //
+    // Counting the registry's live entries alone was the same number as the
+    // alert source's live sessions, so `slots` shrank exactly when the probe
+    // was being read: three configured slots with one tunnel down at boot
+    // answered `{"ok":true,"slots":2,"slots_fenced":0}`, and a dashboard
+    // reading the documented meaning saw a fully healthy daemon with a third
+    // of the operator's accounts dark. Single-session mode has no registry,
+    // and there its one session is the configured set.
     //
     // Computed once. It walks the registry twice per call, and the previous
     // shape called it twice and then shadowed the first binding.
@@ -161,12 +166,20 @@ mod tests {
         use torrentd_engine::SlotStatus;
 
         use crate::slot_registry::test_entry;
+        use crate::slot_registry::test_failed_slot;
         use crate::slot_registry::SlotRegistry;
 
-        let reg = Arc::new(SlotRegistry::new(vec![
-            test_entry("a", SlotStatus::VpnDown),
-            test_entry("b", SlotStatus::Active),
-        ]));
+        // Three slots configured, and `c`'s tunnel failed at boot, so it
+        // never got a session at all. The registry holds two entries and one
+        // failed slot: `iter()` walks the entries, which is the same set the
+        // alert source reports as live sessions.
+        let reg = Arc::new(
+            SlotRegistry::new(vec![
+                test_entry("a", SlotStatus::VpnDown),
+                test_entry("b", SlotStatus::Active),
+            ])
+            .with_failed(vec![test_failed_slot("c")]),
+        );
         let s = build_test_state(Some(reg));
         s.alert_heartbeat
             .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
@@ -174,12 +187,45 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         // `slots` is the configured count in *both* responses, so `fenced /
         // slots` is a fraction of one denominator wherever it is read. The
-        // source's live-session count is a different number during an
-        // incident, and this is the response that was reporting it.
+        // fixture has a failed slot precisely so the two readings differ:
+        // counting live entries answers 1/2 -- which is what shipped -- and
+        // the documented meaning answers 2/3, with the dark account visible.
         let b = body(resp).await;
         assert_eq!(b["ok"], true);
-        assert_eq!(b["slots"], 2, "configured slots, not live sessions");
-        assert_eq!(b["slots_fenced"], 1);
+        assert_eq!(b["slots"], 3, "configured slots, not live sessions");
+        assert_eq!(
+            b["slots_fenced"], 2,
+            "a slot with no session is worse off than a fenced one, not better",
+        );
+    }
+
+    /// The 503 threshold reads the same denominator: one live slot fenced and
+    /// one that never came up is *every* configured slot out of service, and
+    /// a load balancer that keeps sending traffic to it has nowhere for the
+    /// traffic to go.
+    #[tokio::test]
+    async fn a_fenced_slot_beside_a_slot_that_never_came_up_is_unready() {
+        use std::sync::Arc;
+
+        use torrentd_engine::SlotStatus;
+
+        use crate::slot_registry::test_entry;
+        use crate::slot_registry::test_failed_slot;
+        use crate::slot_registry::SlotRegistry;
+
+        let reg = Arc::new(
+            SlotRegistry::new(vec![test_entry("a", SlotStatus::VpnDown)])
+                .with_failed(vec![test_failed_slot("b")]),
+        );
+        let s = build_test_state(Some(reg));
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        let resp = healthz(State(s)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let b = body(resp).await;
+        assert_eq!(b["reason"], "all_slots_fenced");
+        assert_eq!(b["slots"], 2);
+        assert_eq!(b["slots_fenced"], 2);
     }
 
     #[tokio::test]

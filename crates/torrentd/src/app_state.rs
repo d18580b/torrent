@@ -73,19 +73,33 @@ impl AppState {
             .unwrap_or(false)
     }
 
-    /// `(fenced, total)` over the configured slots, or `None` in
+    /// `(fenced, total)` over the **configured** slots, or `None` in
     /// single-session mode, which has no tunnel to lose.
     ///
     /// Counted from the slot registry rather than from the alert source: the
     /// source counts live sessions, and a slot the VPN monitor fenced still
-    /// has one. On the request path — `/healthz` calls it on every probe.
+    /// has one.
+    ///
+    /// `total` is `entries + failed`, and a slot that failed at boot counts
+    /// as **fenced**. Counting `iter()` alone — which is `entries`, and
+    /// excludes `failed` — made this the live-session count under another
+    /// name: `MultiSlotSource` is built from the same entries, so
+    /// `iter().len()` and `source.slots().len()` are equal in every reachable
+    /// state, and three configured slots with one tunnel down at boot
+    /// answered `{"slots":2,"slots_fenced":0}` while a third of the
+    /// operator's accounts were dark. A failed slot has no session at all,
+    /// which is strictly worse than a fenced one, so it belongs in both
+    /// numbers rather than in neither.
+    ///
+    /// On the request path — `/healthz` calls it on every probe.
     pub fn fenced_slots(&self) -> Option<(usize, usize)> {
         let sr = self.slots.as_ref()?;
-        let total = sr.iter().len();
-        let fenced = sr
-            .iter()
-            .filter(|e| e.health().status == SlotStatus::VpnDown)
-            .count();
+        let never_came_up = sr.failed().len();
+        let total = sr.iter().len() + never_came_up;
+        let fenced = never_came_up
+            + sr.iter()
+                .filter(|e| e.health().status == SlotStatus::VpnDown)
+                .count();
         Some((fenced, total))
     }
 }
