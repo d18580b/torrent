@@ -86,9 +86,9 @@ pub struct Check {
     pub name: &'static str,
     pub verdict: Verdict,
     pub detail: String,
-    /// Set on an `Unknown` that could not be performed **because this
-    /// invocation lacks a capability**, as distinct from one that could not be
-    /// performed at all.
+    /// Set on an `Unknown` that **no invocation of this command on this host
+    /// could settle** — usually because it lacks a capability — as distinct
+    /// from one a different input, privilege or configuration would answer.
     ///
     /// They are not the same thing and collapsing them made `unknown` the
     /// normal outcome rather than the exceptional one. `docs/running.md`
@@ -144,6 +144,21 @@ impl Check {
     /// capability, which does not colour the exit status. See
     /// [`Check::needs_capability`].
     fn unknown_without_capability(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            needs_capability: true,
+            ..Self::unknown(name, detail)
+        }
+    }
+
+    /// An `Unknown` **nothing this process can be told would settle**, which
+    /// is the same non-colouring class for the same reason. See
+    /// [`Check::needs_capability`].
+    ///
+    /// The capability-bound ones are the common route into it. This is the
+    /// other: an answer that depends on a fact outside this process
+    /// altogether, where no argument, privilege or configuration change
+    /// available to this invocation produces one.
+    fn unknown_unsettleable(name: &'static str, detail: impl Into<String>) -> Self {
         Self {
             needs_capability: true,
             ..Self::unknown(name, detail)
@@ -551,12 +566,24 @@ fn judge_kill_switch_uid(as_uid: Option<u32>, invoker: Result<u32, String>) -> C
             Ok(i) => format!("this process is uid {i}"),
             Err(e) => format!("this process's own uid could not be read: {e}"),
         };
-        return Check::unknown(
+        // Not counted against the status, and for the same reason the
+        // capability-bound unknowns are not: nothing this invocation can be
+        // told settles it. `--as-uid` names a uid the invoker is not *by
+        // definition*, and this process cannot observe which user the daemon
+        // runs as, so the mismatch is the expected answer on the one
+        // privileged invocation the documentation describes rather than a
+        // sign of anything. Leaving it to colour the status left
+        // `vpn check` on a `network_kill_switch = true` host with no route to
+        // 0 by any argument combination — under `sudo` the subject is 0 and
+        // fails, `--as-uid 0` fails, and `--as-uid <daemon uid>` cost 2 —
+        // which is the trap the three-valued status exists to prevent.
+        return Check::unknown_unsettleable(
             "kill_switch_uid",
             format!(
                 "asked about uid {subject}, but {who}, so whether that uid is the one the \
-                 daemon runs as was not established. The ruleset below is still rendered and \
-                 dry-run for uid {subject}"
+                 daemon runs as was not established — and nothing this command can be given \
+                 would establish it. The ruleset below is still rendered and dry-run for uid \
+                 {subject}"
             ),
         );
     }
@@ -1322,10 +1349,12 @@ pub fn check(
 
 /// The four-character marker in front of a check.
 ///
-/// `?cap` rather than `?   ` for an `Unknown` this invocation could not settle
-/// for want of a capability: it is the one `Unknown` that does not colour the
-/// exit status, so the rendering has to distinguish it too, or a reader
-/// reconciling a `0` against a column of `?` has nothing to go on.
+/// `?cap` rather than `?   ` for an `Unknown` nothing this invocation can be
+/// given would settle: it is the one `Unknown` that does not colour the exit
+/// status, so the rendering has to distinguish it too, or a reader
+/// reconciling a `0` against a column of `?` has nothing to go on. A missing
+/// capability is the common reason and the one the marker is named for; the
+/// footnote states the class, and each line states its own cause.
 fn symbol(c: &Check) -> &'static str {
     match c.verdict {
         Verdict::Pass => "ok  ",
@@ -1349,10 +1378,11 @@ fn print_human(report: &Report) {
     }
     if report.capability_bound() {
         println!(
-            "\n[?cap] marks a check this invocation could not perform for want of \
-             CAP_NET_ADMIN. It is not counted against the exit status — the daemon has the \
-             capability and this shell does not — so the status says nothing about it either \
-             way."
+            "\n[?cap] marks a check nothing this invocation could be given would settle — \
+             usually for want of CAP_NET_ADMIN, which the daemon holds and this shell does \
+             not; each line says which. It is not counted against the exit status, because \
+             no argument to this command would change it, so the status says nothing about \
+             it either way."
         );
     }
 }
@@ -2027,6 +2057,60 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
             c.detail.contains("998") && c.detail.contains("uid 0"),
             "both uids are named: {}",
             c.detail,
+        );
+    }
+
+    #[test]
+    fn a_uid_mismatch_is_reported_without_colouring_the_exit_status() {
+        // F11, reopened. `--as-uid` names a uid the invoker is not *by
+        // definition* — that is the whole reason the flag exists — and this
+        // process cannot observe which user the daemon runs as. So the
+        // mismatch is unsettleable by any argument, privilege or
+        // configuration this invocation could be given, which is the same
+        // class as the capability-bound unknowns and is excluded from the
+        // status for the same reason.
+        //
+        // Leaving it to colour the status meant every combination of the one
+        // documented privileged invocation landed on 1 or 2: under `sudo`
+        // with no `--as-uid` the subject is 0 and fails, `--as-uid 0` fails,
+        // and `--as-uid <daemon uid>` cost 2. A status nobody can get a 0
+        // from trains both consumers to accept 2, which is what the
+        // three-valued status was introduced to prevent.
+        let c = judge_kill_switch_uid(Some(998), Ok(2000));
+        assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
+        assert!(
+            c.needs_capability,
+            "an unknown nothing can settle does not colour the status: {}",
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("998") && c.detail.contains("2000"),
+            "both uids are named: {}",
+            c.detail,
+        );
+
+        // Through the report: this is the invocation `docs/running.md`
+        // describes, and it has to be able to reach 0.
+        let report = Report {
+            host: vec![
+                Check::pass("iproute2", "`ip` is available"),
+                Check::pass("nftables", "`nft` is available"),
+                judge_kill_switch_uid(Some(998), Ok(2000)),
+            ],
+            slots: Vec::new(),
+        };
+        assert_eq!(
+            report.exit_code(),
+            EXIT_OK,
+            "--as-uid from a uid that is not the subject is the expected case, not a fault",
+        );
+
+        // The uid check still answers where the answer does not depend on the
+        // observer: uid 0 fails whoever asks.
+        assert_eq!(
+            judge_kill_switch_uid(Some(0), Ok(2000)).verdict,
+            Verdict::Fail,
+            "the non-colouring class does not swallow a decidable failure",
         );
     }
 
