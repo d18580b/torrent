@@ -125,16 +125,24 @@ impl BootCleanup {
         self.kill_switch = true;
     }
 
-    /// Bring one tunnel down now and stop tracking it — for a slot that failed
+    /// Bring one tunnel down and stop tracking it — for a slot that failed
     /// after its tunnel came up, whose tunnel must go even if boot succeeds.
     ///
-    /// Blocking, and deliberately so: the teardown shells out and then waits
-    /// for the process to go. Every `async` caller puts the returned job on
-    /// `spawn_blocking` rather than calling this.
-    fn take_down(&mut self, iface: &str) {
+    /// The wait goes to `spawn_blocking`, which is what makes this the only
+    /// teardown `boot` has. There used to be a synchronous `take_down`
+    /// beside it whose own doc asserted that "**every** `async` caller puts
+    /// the returned job on `spawn_blocking` rather than calling this", while
+    /// all three of its callers were statements inside this `async fn` and
+    /// none of them did — a wrapper that must not be called from `async`
+    /// code, living in an `async fn`'s own module, which is a hazard that
+    /// gets used again. It is gone rather than fixed at its call sites.
+    async fn take_down_off_worker(&mut self, iface: &str) -> anyhow::Result<()> {
         if let Some(job) = self.take_down_job(iface) {
-            job();
+            tokio::task::spawn_blocking(job)
+                .await
+                .context("vpn teardown task")?;
         }
+        Ok(())
     }
 
     /// Stop tracking `iface` and hand back its teardown as a job, or `None`
@@ -181,8 +189,8 @@ impl BootCleanup {
     /// `openvpn --daemon` that forked, exited 0, and is still retrying. Both
     /// outlive this process. Recording the tunnel only once an address had
     /// appeared left that one failure path — and only that one — with nothing
-    /// tracking it: `take_down` had nothing to remove, `Drop` had nothing to
-    /// bring down, `SlotRegistry::iter()` excludes failed slots so the
+    /// tracking it: the failure teardown had nothing to remove, `Drop` had
+    /// nothing to bring down, `SlotRegistry::iter()` excludes failed slots so the
     /// graceful-shutdown loop never saw it either, and the next boot
     /// overwrote the `--writepid` file that was the only remaining handle on
     /// the orphan.
@@ -485,7 +493,7 @@ pub async fn boot(
                         None => {
                             // validate_set should have caught this; be defensive.
                             error!(slot_id = %s.id, "static slot missing listen_port; slot disabled");
-                            cleanup.take_down(&s.vpn_interface);
+                            cleanup.take_down_off_worker(&s.vpn_interface).await?;
                             fail_slot!(s, "static slot has no listen_port".to_string());
                         }
                     },
@@ -495,7 +503,7 @@ pub async fn boot(
                             Ok(ip) => ip,
                             Err(e) => {
                                 error!(slot_id = %s.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; slot disabled");
-                                cleanup.take_down(&s.vpn_interface);
+                                cleanup.take_down_off_worker(&s.vpn_interface).await?;
                                 fail_slot!(s, format!("invalid port_forward_gateway: {e}"));
                             }
                         };
@@ -512,7 +520,7 @@ pub async fn boot(
                             }
                             Err(e) => {
                                 error!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; slot disabled (no bare-IP fallback)");
-                                cleanup.take_down(&s.vpn_interface);
+                                cleanup.take_down_off_worker(&s.vpn_interface).await?;
                                 fail_slot!(s, format!("NAT-PMP negotiation failed: {e}"));
                             }
                         }
@@ -1182,14 +1190,46 @@ mod tests {
         )
     }
 
+    /// A `VpnManager` that records **which thread** its teardown ran on.
+    ///
+    /// `MockVpn` records the interface, which cannot tell a teardown that
+    /// held a runtime worker for its bounded exit wait from one that did
+    /// not — and that distinction is the whole of what the teardown paths
+    /// here were repaired for.
+    #[derive(Clone, Debug, Default)]
+    struct ThreadWatchingVpn {
+        down_on: Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+    }
+
+    impl torrentd_engine::VpnManager for ThreadWatchingVpn {
+        fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, torrentd_engine::VpnError> {
+            Err(torrentd_engine::VpnError::BringUpTimeout {
+                iface: profile.interface.clone(),
+            })
+        }
+
+        fn current_ip(&self, iface: &str) -> Result<IpAddr, torrentd_engine::VpnError> {
+            Err(torrentd_engine::VpnError::NoAddress {
+                iface: iface.to_string(),
+            })
+        }
+
+        fn bring_down(&self, _iface: &str) {
+            self.down_on
+                .lock()
+                .expect("no test panics while holding this")
+                .push(std::thread::current().id());
+        }
+    }
+
     /// A tunnel whose bring-up fails *after* the spawn.
     ///
     /// `openvpn --daemon` exits 0 as soon as it forks, and `wg-quick up`
     /// creates the interface before any address appears, so the 30-second
     /// address poll expiring leaves something live behind. Recording the
     /// tunnel only once an address had appeared meant nothing ever brought
-    /// that one down: the failure arm called neither `note_tunnel` nor
-    /// `take_down`, unlike its four siblings, and `SlotRegistry::iter()`
+    /// that one down: the failure arm called neither `note_tunnel` nor any
+    /// teardown, unlike its four siblings, and `SlotRegistry::iter()`
     /// excludes failed slots so the shutdown loop never saw it either.
     #[tokio::test]
     async fn a_tunnel_whose_bring_up_fails_is_still_brought_down() {
@@ -1269,6 +1309,75 @@ mod tests {
         // resume directory that cannot be read — and the guard takes it down.
         drop(cleanup);
         assert_eq!(vpn.bring_down_calls(), vec!["wg-a".to_string()]);
+    }
+
+    /// `boot`'s only teardown keeps its bounded wait off the worker.
+    ///
+    /// `boot` had three call sites that reached a *synchronous* `take_down`
+    /// instead — a static slot with no `listen_port`, an unparseable
+    /// `port_forward_gateway`, and a NAT-PMP negotiation that failed, which
+    /// is what an `openvpn` slot on a provider account without port
+    /// forwarding looks like. `validate_set` ties `vpn_type` to neither
+    /// `port_forward` nor the gateway, so each reached
+    /// `OpenvpnManager::bring_down`'s `thread::sleep` poll — up to
+    /// `TERM_GRACE + KILL_GRACE`, seven seconds, on the runtime worker,
+    /// during which the signal handling the neighbouring commits exist to
+    /// keep responsive does not run either. `take_down` is deleted, so the
+    /// shape below is the only one `boot` has.
+    ///
+    /// Call `job()` directly in `take_down_off_worker` instead of handing it
+    /// to `spawn_blocking` and this fails.
+    #[tokio::test]
+    async fn boots_only_teardown_keeps_its_bounded_wait_off_the_worker() {
+        let vpn = ThreadWatchingVpn::default();
+        let observed = Arc::clone(&vpn.down_on);
+        let mut cleanup = BootCleanup::with_vpn_factory(
+            PathBuf::from("/var/lib/torrentd"),
+            Arc::new(move |_t, _dir| Arc::new(vpn.clone()) as Arc<dyn torrentd_engine::VpnManager>),
+        );
+        cleanup.note_tunnel(VpnType::Openvpn, "tun-a");
+
+        cleanup
+            .take_down_off_worker("tun-a")
+            .await
+            .expect("the teardown task itself did not fail");
+
+        let threads = observed.lock().expect("uncontended").clone();
+        assert_eq!(threads.len(), 1, "the tunnel was torn down exactly once");
+        assert_ne!(
+            threads[0],
+            std::thread::current().id(),
+            "the bounded exit wait must not run on the thread `boot` is on",
+        );
+
+        // And it is no longer tracked, so the drop guard does not wait again.
+        drop(cleanup);
+        assert_eq!(
+            observed.lock().expect("uncontended").len(),
+            1,
+            "a tunnel taken down here is not the drop guard's to take again",
+        );
+    }
+
+    /// The other half of `take_down_job`'s contract: an interface this boot
+    /// never recorded yields no job, so nothing is spawned and nothing waits.
+    #[tokio::test]
+    async fn an_untracked_interface_yields_no_teardown_at_all() {
+        let vpn = ThreadWatchingVpn::default();
+        let observed = Arc::clone(&vpn.down_on);
+        let mut cleanup = BootCleanup::with_vpn_factory(
+            PathBuf::from("/var/lib/torrentd"),
+            Arc::new(move |_t, _dir| Arc::new(vpn.clone()) as Arc<dyn torrentd_engine::VpnManager>),
+        );
+        assert!(cleanup.take_down_job("tun-never-raised").is_none());
+        cleanup
+            .take_down_off_worker("tun-never-raised")
+            .await
+            .expect("nothing to do is not a failure");
+        assert!(
+            observed.lock().expect("uncontended").is_empty(),
+            "an interface this boot did not record is not brought down",
+        );
     }
 
     /// `disarm` hands the tunnels to the shutdown path; dropping after it
