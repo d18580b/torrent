@@ -8,7 +8,13 @@ services:
     # Only a `network = "vpn"` profile needs these: bringing up WireGuard
     # tunnels, and installing the nftables table when
     # network_kill_switch = true. Granted by default is granted to deployments
-    # that do not need it, so uncomment them when you add a vpn profile.
+    # that do not need it, so uncomment them when you add a vpn profile —
+    # together with `user: "0:0"` below. The image runs as `USER 1000:1000`,
+    # and `cap_add` only fills the container's bounding and permitted sets: a
+    # non-root uid with no ambient and no file capabilities gets nothing
+    # effective from it, so the tunnel still fails with EPERM. The
+    # Containerfile's own comment beside that USER line says the same thing.
+    # user: "0:0"
     # cap_add:
     #   - NET_ADMIN
     # devices:
