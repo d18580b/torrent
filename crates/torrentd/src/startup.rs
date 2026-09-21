@@ -1484,28 +1484,57 @@ mod tests {
     /// series named as the thing it was avoiding. `deploy/torrentd.service`
     /// sets no `TimeoutStopSec`, so systemd's default is the only bound.
     ///
-    /// Six jobs of 200 ms are 1.2 s serialized and about 200 ms in flight at
-    /// once. Await each job in turn in `join_teardowns` and this fails.
+    /// The property is overlap, so overlap is what is counted.
+    ///
+    /// This used to assert that six 200 ms sleeps drained inside 600 ms — the
+    /// only wall-clock assertion in the workspace, and one that says
+    /// "concurrent" only as long as the runner is not busy. CI runners are
+    /// busy, so that reading held by luck. Each job here instead announces
+    /// itself, waits for the rest to arrive, and the peak count of jobs inside
+    /// the closure at once is asserted directly: six means every teardown was
+    /// in flight together, whatever the machine was doing at the time.
+    ///
+    /// The deadline is a failure bound, not a measurement. Serialized, job 0
+    /// waits it out alone, the peak is 1 and the assertion fails on what it
+    /// counted — where a stopwatch could only report a slow runner. Await each
+    /// job in turn in `join_teardowns` and this fails.
     #[tokio::test]
     async fn every_tunnel_teardown_is_in_flight_at_once() {
-        let jobs: Vec<_> = (0..6u8)
+        const SLOTS: usize = 6;
+        let live = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let jobs: Vec<_> = (0..SLOTS)
             .map(|i| {
+                let live = Arc::clone(&live);
+                let peak = Arc::clone(&peak);
                 (
                     SlotId::new(format!("account_{i}")),
                     format!("tun-{i}"),
-                    || std::thread::sleep(std::time::Duration::from_millis(200)),
+                    move || {
+                        use std::sync::atomic::Ordering::SeqCst;
+                        let now = live.fetch_add(1, SeqCst) + 1;
+                        peak.fetch_max(now, SeqCst);
+                        // Hold until everyone has arrived — or give up, so a
+                        // serialized `join_teardowns` fails rather than hangs.
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        while live.load(SeqCst) < SLOTS && std::time::Instant::now() < deadline {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        live.fetch_sub(1, SeqCst);
+                    },
                 )
             })
             .collect();
 
-        let started = std::time::Instant::now();
         join_teardowns(jobs).await;
-        let drain = started.elapsed();
 
-        assert!(
-            drain < std::time::Duration::from_millis(600),
-            "six 200ms teardowns drained in {drain:?}; serialized they are 1.2s, \
-             and a deployment's stop time must not scale with its slot count",
+        assert_eq!(
+            peak.load(std::sync::atomic::Ordering::SeqCst),
+            SLOTS,
+            "at most this many teardowns were ever inside the job at once; \
+             a deployment's stop time must not scale with its slot count",
         );
     }
 
