@@ -136,31 +136,36 @@ impl BootCleanup {
     /// none of them did — a wrapper that must not be called from `async`
     /// code, living in an `async fn`'s own module, which is a hazard that
     /// gets used again. It is gone rather than fixed at its call sites.
-    async fn take_down_off_worker(&mut self, iface: &str) -> anyhow::Result<()> {
-        if let Some(job) = self.take_down_job(iface) {
-            tokio::task::spawn_blocking(job)
-                .await
-                .context("vpn teardown task")?;
-        }
-        Ok(())
-    }
-
-    /// Stop tracking `iface` and hand back its teardown as a job, or `None`
-    /// if it was not tracked.
+    ///
+    /// "The only teardown `boot` has" was asserted here while a second shape
+    /// stood forty lines further down and a third in `bring_up_tracked` above
+    /// — each a `take_down_job` handed straight to `spawn_blocking`, each
+    /// byte-equivalent to this body, each correct today and each invisible to
+    /// a change made through this function. The job-returning helper they were
+    /// built from is gone too, for the reason `take_down` went: an API from
+    /// which a second teardown shape can be assembled is one that will be, and
+    /// deleting it closes the class where converting its call sites closes
+    /// three instances. Every teardown in `boot` is now this call.
     ///
     /// `OpenvpnManager::bring_down` signals the process and then polls for it
     /// to exit — up to `TERM_GRACE + KILL_GRACE`, seven seconds, per tunnel.
     /// On a runtime worker that is seven seconds in which nothing else
-    /// scheduled on that thread runs, and on the shutdown path it is seven
-    /// seconds per slot. This series already moved bring-up, the NAT-PMP
-    /// exchange and the monitor probes onto `spawn_blocking` for exactly that
-    /// reason; the job shape is what lets the teardown go the same way.
-    fn take_down_job(&mut self, iface: &str) -> Option<Box<dyn FnOnce() + Send + 'static>> {
-        let i = self.tunnels.iter().position(|(_, n)| n == iface)?;
+    /// scheduled on that thread runs. This series already moved bring-up, the
+    /// NAT-PMP exchange and the monitor probes onto `spawn_blocking` for
+    /// exactly that reason.
+    ///
+    /// An interface this boot did not record spawns nothing at all.
+    async fn take_down_off_worker(&mut self, iface: &str) -> anyhow::Result<()> {
+        let Some(i) = self.tunnels.iter().position(|(_, n)| n == iface) else {
+            return Ok(());
+        };
         let (t, name) = self.tunnels.remove(i);
         let vpn_for = Arc::clone(&self.vpn_for);
         let run_dir = self.run_dir.clone();
-        Some(Box::new(move || vpn_for(t, &run_dir).bring_down(&name)))
+        tokio::task::spawn_blocking(move || vpn_for(t, &run_dir).bring_down(&name))
+            .await
+            .context("vpn teardown task")?;
+        Ok(())
     }
 
     /// The manager for a tunnel of this type, built by the same factory the
@@ -238,11 +243,7 @@ impl BootCleanup {
                 self.forget_tunnel(&iface);
             }
             Err(_) => {
-                if let Some(job) = self.take_down_job(&iface) {
-                    tokio::task::spawn_blocking(job)
-                        .await
-                        .context("vpn teardown task")?;
-                }
+                self.take_down_off_worker(&iface).await?;
             }
         }
         Ok(brought_up)
@@ -602,13 +603,13 @@ pub async fn boot(
                             error.cause = %e,
                             "slot engine construction failed; tearing down VPN",
                         );
-                        // Off the worker, like the bring-up above it: the
-                        // same bounded exit wait, reached by a second path.
-                        if let Some(job) = cleanup.take_down_job(&s.vpn_interface) {
-                            tokio::task::spawn_blocking(job)
-                                .await
-                                .context("vpn teardown task")?;
-                        }
+                        // Through the helper, like every other teardown in
+                        // `boot`: the same bounded exit wait, reached by a
+                        // fifth path. Hand-inlining it here meant a change to
+                        // the teardown contract — a timeout on the join, a
+                        // retry, a metric — applied through the helper missed
+                        // this arm silently.
+                        cleanup.take_down_off_worker(&s.vpn_interface).await?;
                         failed_slots.push(crate::slot_registry::FailedSlot {
                             config: s.clone(),
                             reason: format!("session construction failed: {e}"),
@@ -1423,8 +1424,8 @@ mod tests {
         );
     }
 
-    /// The other half of `take_down_job`'s contract: an interface this boot
-    /// never recorded yields no job, so nothing is spawned and nothing waits.
+    /// The other half of the helper's contract: an interface this boot never
+    /// recorded spawns nothing, so nothing waits.
     #[tokio::test]
     async fn an_untracked_interface_yields_no_teardown_at_all() {
         let vpn = ThreadWatchingVpn::default();
@@ -1433,7 +1434,6 @@ mod tests {
             PathBuf::from("/var/lib/torrentd"),
             Arc::new(move |_t, _dir| Arc::new(vpn.clone()) as Arc<dyn torrentd_engine::VpnManager>),
         );
-        assert!(cleanup.take_down_job("tun-never-raised").is_none());
         cleanup
             .take_down_off_worker("tun-never-raised")
             .await
@@ -1441,6 +1441,37 @@ mod tests {
         assert!(
             observed.lock().expect("uncontended").is_empty(),
             "an interface this boot did not record is not brought down",
+        );
+    }
+
+    /// `boot` has exactly one teardown shape, and this is what says so.
+    ///
+    /// `take_down_off_worker`'s doc asserts it is "the only teardown `boot`
+    /// has". That was false three times over: a hand-inlined
+    /// spawn-the-job-and-await stood in `bring_up_tracked` and again in the
+    /// engine-construction arm, each byte-equivalent to the helper's body and
+    /// each correct on its own — so nothing failed, and a change made through
+    /// the helper (a timeout on the join, a retry, a metric) would have
+    /// missed them in silence while the next reader of that doc believed
+    /// there was nothing else to change. `boot` is not reachable by a test at
+    /// any revision, so the invariant is asserted where it lives: the wrapper
+    /// that turns a `JoinError` into this module's teardown error appears
+    /// once, inside the one helper.
+    ///
+    /// This is the shape the repository already uses for an invariant no
+    /// runtime assertion can carry — the tracing field-name gate is a grep
+    /// over these same sources. Hand-inline a second teardown here and it
+    /// fails.
+    #[test]
+    fn boot_has_exactly_one_teardown_shape() {
+        let module = include_str!("startup.rs");
+        // The needle appears escaped in this test's own source, so the only
+        // literal occurrence is the real one.
+        let sites = module.matches("context(\"vpn teardown task\")").count();
+        assert_eq!(
+            sites, 1,
+            "every teardown in `boot` goes through `take_down_off_worker`; \
+             {sites} places wrap a teardown join instead of one",
         );
     }
 
