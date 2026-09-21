@@ -214,13 +214,17 @@ Without `[auth]` it authenticates nothing — every route, including every
 mutating one, is open to anyone who can reach the port. That is a legitimate
 posture behind a reverse proxy that does its own access control; it is not one
 to arrive at by omission. The opt-out does not extend to a routable address
-either: `allow_unauthenticated` with a non-loopback `http_listen` is refused.
-`http_listen` defaults to `127.0.0.1:8080`.
+either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
+and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
+inert and reads as though the daemon authenticates nothing. `http_listen`
+defaults to `127.0.0.1:8080`. All three are read once, at startup: changing
+them takes a restart, not a `SIGHUP`.
 
 Two credential kinds, hashed differently on purpose. The **operator password**
 is human-chosen and therefore low-entropy, so it gets Argon2id — `m=19456,
-t=2, p=1`, which is OWASP's current recommendation — verified once at login
-and rate-limited. **API tokens** are 256 bits this daemon generated, so there
+t=2, p=1`, which is OWASP's current recommendation, pinned in `auth.rs` rather
+than inherited from the `argon2` crate's defaults so that a dependency bump
+cannot quietly move it — verified once at login and rate-limited. **API tokens** are 256 bits this daemon generated, so there
 is nothing to guess and SHA-256 is correct; Argon2 on every Prometheus scrape
 would burn ~50 ms of CPU per request by design.
 

@@ -224,9 +224,25 @@ impl Config {
     /// * no `[auth]` on a non-loopback bind, even *with* the opt-out — that is
     ///   an unauthenticated mutating API on a routable address, and
     ///   `allow_unauthenticated` is for delegating access control to something
-    ///   in front, not for having none.
+    ///   in front, not for having none;
+    /// * `[auth]` *and* the opt-out together — the flag is inert, and an inert
+    ///   security-relevant flag left in a config file is a standing misreading
+    ///   of the very question this check exists to make explicit.
+    ///
+    /// The whole point is that the posture is stated rather than inferred, so
+    /// a config that states two postures is no better than one that states
+    /// none.
     fn validate_auth_posture(&self) -> anyhow::Result<()> {
         if self.auth.is_some() {
+            if self.allow_unauthenticated {
+                anyhow::bail!(
+                    "[auth] is configured and allow_unauthenticated = true is set as well. \
+                     The flag has no effect here — a daemon with [auth] authenticates — but \
+                     it is the one line anyone reads to answer \"does this daemon \
+                     authenticate?\", and left in place it answers no. Delete \
+                     `allow_unauthenticated` from the config."
+                );
+            }
             return Ok(());
         }
         if !self.allow_unauthenticated {
@@ -865,6 +881,29 @@ listen_interfaces = "0.0.0.0:6881"
         );
         let p = write_cfg(dir.path(), &body);
         assert!(Config::load(&p).is_ok());
+    }
+
+    #[test]
+    fn the_opt_out_alongside_configured_auth_is_refused() {
+        // The property: a config states one posture. `[auth]` plus the opt-out
+        // states two, and the flag is the one a reader checks — so a daemon
+        // that authenticates ships a config file saying it does not.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}{ONE_HOST_PROFILE}\n[auth]\npassword_hash = \"{}\"\n",
+            crate::auth::hash_password("hunter2").unwrap(),
+        );
+        assert!(
+            body.contains("allow_unauthenticated = true"),
+            "TOP_LEVEL carries the opt-out; this test is about it being there",
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("allow_unauthenticated"), "got: {msg}");
+        assert!(
+            msg.contains("Delete"),
+            "the error names the edit that fixes it; got: {msg}",
+        );
     }
 
     #[test]

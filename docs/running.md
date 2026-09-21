@@ -223,17 +223,56 @@ So there are two safe shapes:
 | loopback | absent, `allow_unauthenticated = true` | access control is the proxy's job |
 | anything | configured | the daemon authenticates itself |
 
+And exactly two, so `[auth]` **and** `allow_unauthenticated = true` together is
+refused as well: the flag does nothing once `[auth]` is present, but it is the
+line anyone reads to answer "does this daemon authenticate?", and a stale copy
+of it answers no. Delete it when you add the section, which is what the sample
+config tells you to do.
+
 `http_listen` defaults to `127.0.0.1:8080`.
 
+**Restart, not reload.** `[auth]`, `allow_unauthenticated` and `http_listen`
+are read once, at startup: the session store is built and the listener bound
+before anything is served, and neither can change under a live server. Editing
+any of them and then sending `SIGHUP` or calling `POST /api/reload` logs
+
+```
+SIGHUP: change to non-reloadable field requires daemon restart; ignored
+```
+
+and leaves the running daemon exactly as it was. Use
+`systemctl restart torrentd`.
+
 > **Bootstrapping order matters.** `--config` is required *before* any
-> subcommand and is validated first, so `hash-password` cannot run until a valid
-> config already exists. Write the config with `allow_unauthenticated = true`,
-> generate the values, then replace it with the `[auth]` section.
+> subcommand and is read first, so `hash-password` cannot run until a config
+> file exists and parses. What it does *not* have to satisfy is the
+> authentication posture: the subcommands construct no session and bind
+> nothing, so they load a config the daemon itself would refuse to start from.
+> Write the config with the `http_listen` the deployment actually needs and no
+> `[auth]`, generate the values, add the `[auth]` section, then start.
 
 ```bash
 torrentd --config /etc/torrentd/torrentd.toml hash-password
 torrentd --config /etc/torrentd/torrentd.toml new-token --name prometheus --scopes metrics
 ```
+
+That exemption is what makes a non-loopback deployment migratable at all. A
+container publishes `127.0.0.1:8080:8080` to a daemon bound `0.0.0.0` *inside*
+the namespace, so it cannot bind loopback and cannot write
+`allow_unauthenticated = true` either — the opt-out on a routable address is
+refused outright. Run the subcommands in a throwaway container against the
+same config the service mounts:
+
+```bash
+podman compose -f deploy/compose.yaml run --rm torrentd hash-password
+podman compose -f deploy/compose.yaml run --rm torrentd new-token --name ci --scopes read
+# `docker compose … run --rm torrentd …` is the same command.
+```
+
+`run --rm` publishes no ports and starts no listener; the image's entrypoint
+already carries `--config /etc/torrentd/torrentd.toml`, so the subcommand is
+the only argument. Paste the output into the mounted config and
+`compose up -d` as usual.
 
 `hash-password` prompts twice when stdin is a TTY, once when piped. `new-token`
 prints the **token on stdout** and the **config stanza on stderr**, so
