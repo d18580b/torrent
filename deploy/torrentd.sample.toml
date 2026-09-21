@@ -108,6 +108,10 @@ dht               = true
 # torrent_dir          = "/var/lib/torrentd/torrents/public"
 # peer_fingerprint_hex = "b7c6d5e4f3a29180"
 # user_agent           = "libtorrent/2.0"
+# Per-profile upload cap in bytes/sec, overriding the daemon-wide key above.
+# `0` here means *unlimited* for this profile, not "unset": writing it is how
+# you uncap one account while the daemon-wide key caps the rest. Omit the key
+# entirely to take the daemon-wide value.
 # upload_rate_limit    = 0
 
 # ---------------------------------------------------------------------------
@@ -146,6 +150,8 @@ dht               = true
 # resume_dir               = "/var/lib/torrentd/resume/account_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/account_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
+# `0` means unlimited for this profile, overriding the daemon-wide cap; omit
+# the key to inherit it.
 # upload_rate_limit        = 0
 
 # Dynamic port forwarding (ProtonVPN / PIA-style ephemeral ports). Providers

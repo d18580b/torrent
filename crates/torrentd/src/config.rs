@@ -723,7 +723,7 @@ impl ConfigDiff {
     pub fn to_settings_patch_for(&self, profile: &ProfileConfig) -> libtorrent_safe::Settings {
         libtorrent_safe::Settings {
             connections_limit: self.connections_limit,
-            upload_rate_limit: if profile.upload_rate_limit != 0 {
+            upload_rate_limit: if profile.upload_rate_limit.is_some() {
                 None
             } else {
                 self.upload_rate_limit
@@ -849,7 +849,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
         }
     }
 
@@ -869,7 +869,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
         }
     }
 
@@ -1372,7 +1372,7 @@ listen_interfaces = "0.0.0.0:6882"
             ..Default::default()
         };
         let mut capped = host_profile();
-        capped.upload_rate_limit = 100_000;
+        capped.upload_rate_limit = Some(100_000);
 
         assert_eq!(
             diff.to_settings_patch_for(&capped).upload_rate_limit,
@@ -1388,13 +1388,66 @@ listen_interfaces = "0.0.0.0:6882"
     }
 
     #[test]
+    fn a_per_profile_upload_rate_limit_of_zero_means_unlimited_not_unset() {
+        // F40. `0` is the value both shipped samples use to illustrate this
+        // override, and the top-level key's own comment defines it as
+        // "unlimited". While the field was a plain `u32` the reload guard and
+        // the boot path both read an explicit `0` as an absent key and pushed
+        // the daemon-wide cap onto a session the operator had uncapped — with
+        // nothing logged, and nothing in `diff_profiles` to report it, because
+        // the two values compared equal.
+        let diff = ConfigDiff {
+            upload_rate_limit: Some(2_000_000),
+            ..Default::default()
+        };
+        let mut uncapped = host_profile();
+        uncapped.upload_rate_limit = Some(0);
+
+        assert_eq!(
+            diff.to_settings_patch_for(&uncapped).upload_rate_limit,
+            None,
+            "an explicit 0 is a value the profile set, so the reload must not overwrite it",
+        );
+
+        // And the two are distinguishable at the type, which is what the boot
+        // path keys on.
+        assert_ne!(uncapped.upload_rate_limit, host_profile().upload_rate_limit);
+        assert_eq!(
+            host_profile().upload_rate_limit,
+            None,
+            "absent stays absent"
+        );
+    }
+
+    #[test]
+    fn an_explicit_zero_upload_rate_limit_round_trips_through_toml() {
+        // The distinction has to survive the parser, or the field is `Option`
+        // for nothing: `#[serde(default)]` over a `u32` turned a written `0`
+        // and an absent key into the same value before it ever reached a
+        // guard.
+        let dir = tempdir().unwrap();
+        let body = two_host_profiles(r#"upload_rate_limit = 0"#, "");
+        let p = write_cfg(dir.path(), &body);
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(
+            cfg.profile[0].upload_rate_limit,
+            Some(0),
+            "a written 0 is a value",
+        );
+        assert_eq!(
+            cfg.profile[1].upload_rate_limit, None,
+            "and an unwritten key is not",
+        );
+    }
+
+    #[test]
     fn a_profile_only_upload_rate_limit_change_is_reported_rather_than_swallowed() {
         // `ConfigDiff::is_empty()` was true for this edit, so `reload.rs`
         // logged "SIGHUP: config unchanged" over a file that plainly had.
         let dir = tempdir().unwrap();
         let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
         let mut b = a.clone();
-        b.profile[0].upload_rate_limit = 100_000;
+        b.profile[0].upload_rate_limit = Some(100_000);
 
         let d = Config::diff(&a, &b);
         assert!(!d.is_empty(), "the file changed and the daemon must say so");
