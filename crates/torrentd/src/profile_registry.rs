@@ -212,6 +212,25 @@ impl ProfileRegistry {
         self.failed.iter().find(|f| &f.config.id == id)
     }
 
+    /// Whether `id` names a configured profile **at all** — live or failed.
+    ///
+    /// The one question "is this a typo, or an account that is down?" has to
+    /// be asked in one place. Every resolution site used to ask `get`, which
+    /// searches `entries` only, and so answered 404 "unknown profile_id" for a
+    /// configured profile whose tunnel failed — sending the operator to the
+    /// config file to look for an id that is already in it. A repair that
+    /// fixed the four routes resolving through `engine_for` left the three
+    /// resolving through `get` untouched, which is what this exists to make
+    /// impossible: the pairing is a property of the registry, not something a
+    /// call site has to remember.
+    ///
+    /// Callers that need to distinguish the two still ask `get` and
+    /// [`ProfileRegistry::failed_profile`]; this is for the guard that comes
+    /// before them.
+    pub fn is_configured(&self, id: &ProfileId) -> bool {
+        self.get(id).is_some() || self.failed_profile(id).is_some()
+    }
+
     /// The configuration of a live profile.
     ///
     /// The add-time flag policy keys off the profile's declared network, so
