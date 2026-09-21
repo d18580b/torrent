@@ -356,12 +356,9 @@ pub async fn run_verify_queue(
                 }
             };
             // No SEED_MODE: that is what makes libtorrent hash the payload
-            // against the piece hashes before it will seed.
-            let flags = if item.slot.is_default() {
-                TorrentFlags::empty()
-            } else {
-                TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
-            };
+            // against the piece hashes before it will seed. The no-download
+            // invariant rides along regardless — see `torrentd_engine::policy`.
+            let flags = torrentd_engine::verify_flags(&item.slot);
             match engine.add_torrent(AddParams::File {
                 bytes,
                 save_path: item.save_path.to_string_lossy().into_owned(),
@@ -484,14 +481,7 @@ pub fn execute_adopt(
             // SAVE_INFO_DICT carries no metadata; libtorrent ignores it when
             // the resume data already has an info dict.
             let torrent = std::fs::read(&torrent_path).ok();
-            let flags = TorrentFlags::SEED_MODE
-                | if slot.is_default() {
-                    TorrentFlags::empty()
-                } else {
-                    TorrentFlags::DISABLE_PEX
-                        | TorrentFlags::DISABLE_DHT
-                        | TorrentFlags::DISABLE_LSD
-                };
+            let flags = torrentd_engine::seed_flags(&slot);
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: resume,
                 torrent: torrent.clone(),

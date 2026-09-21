@@ -15,7 +15,6 @@ use libtorrent_safe::info_hash_from_magnet;
 use libtorrent_safe::info_hash_from_torrent;
 use libtorrent_safe::AddParams;
 use libtorrent_safe::InfoHash;
-use libtorrent_safe::TorrentFlags;
 use serde::Deserialize;
 use serde::Serialize;
 use torrentd_engine::MetricsSink;
@@ -341,12 +340,7 @@ async fn do_add(
             p
         }
     };
-    let flags = TorrentFlags::SEED_MODE
-        | if !slot_id.is_default() {
-            TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
-        } else {
-            TorrentFlags::empty()
-        };
+    let flags = torrentd_engine::seed_flags(&slot_id);
 
     // Compute the info-hash WITHOUT touching any session: Safety Rule 4
     // (the session never receives an unverified torrent) and Rule 3 (global

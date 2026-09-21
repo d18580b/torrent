@@ -19,6 +19,9 @@
 //!     match the piece hashes and never seeds when they don't.
 //!   - alert-queue overflow: a tiny `alert_queue_size` flooded without draining
 //!     surfaces `alerts_dropped` and keeps draining cleanly (no hang/panic).
+//!   - the no-download invariant: `UPLOAD_MODE` survives a real session, holds
+//!     for a magnet (which `SEED_MODE` cannot cover at all), and holds through
+//!     the verification failure that drops `SEED_MODE`.
 
 mod support;
 
@@ -330,4 +333,82 @@ fn alert_queue_overflow_surfaces_drop_and_keeps_draining() {
 
     // Drain whatever remains; the session stays responsive (no hang/panic).
     let _ = session.drain_alerts();
+}
+
+// ---------------------------------------------------------------------------
+// The no-download invariant
+// ---------------------------------------------------------------------------
+
+/// `torrentd_engine::policy` asserts `UPLOAD_MODE` on every add path. This
+/// proves the claim it rests on: that libtorrent honours and *keeps* the flag,
+/// rather than treating it the way it treats `SEED_MODE`.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn upload_mode_survives_a_failed_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = dir.path().to_str().unwrap().to_string();
+    let good = support::payload(1, FILE_LEN);
+    let torrent = support::single_file_torrent("seed-A", &good, PIECE_LEN);
+    // Same length, different bytes: every piece hash fails.
+    std::fs::write(dir.path().join("seed-A"), support::payload(2, FILE_LEN)).unwrap();
+
+    let s = Session::new(&support::local_seed_settings()).unwrap();
+    // The pool's verify path exactly: no SEED_MODE, so libtorrent hashes.
+    let h = s
+        .add_torrent(AddParams::File {
+            bytes: torrent,
+            save_path: save,
+            flags: TorrentFlags::UPLOAD_MODE,
+        })
+        .unwrap();
+
+    let last = support::settle_status(&s, h, Duration::from_secs(10))
+        .expect("the torrent should report status");
+    let flags = TorrentFlags::from_bits_truncate(last.flags);
+
+    assert!(
+        flags.contains(TorrentFlags::UPLOAD_MODE),
+        "upload_mode must survive the hash failure that drops seed_mode; flags={flags:?}",
+    );
+    assert!(
+        !last.is_seeding,
+        "a torrent whose every piece failed must not seed",
+    );
+    assert_eq!(
+        last.download_rate, 0,
+        "a torrent in upload_mode must never request a piece",
+    );
+}
+
+/// The case `SEED_MODE` cannot cover: libtorrent documents it as a no-op for a
+/// torrent added without metadata, so a magnet add was previously unguarded and
+/// would fetch the whole payload once metadata arrived. `UPLOAD_MODE` is not
+/// conditioned on metadata.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn a_magnet_add_carries_upload_mode_without_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Session::new(&support::local_seed_settings()).unwrap();
+    let h = s
+        .add_torrent(AddParams::Magnet {
+            uri: "magnet:?xt=urn:btih:0101010101010101010101010101010101010101".into(),
+            save_path: dir.path().to_str().unwrap().to_string(),
+            flags: TorrentFlags::SEED_MODE | TorrentFlags::UPLOAD_MODE,
+        })
+        .unwrap();
+
+    let last = support::settle_status(&s, h, Duration::from_secs(5))
+        .expect("the torrent should report status");
+    let flags = TorrentFlags::from_bits_truncate(last.flags);
+
+    assert!(
+        !flags.contains(TorrentFlags::SEED_MODE),
+        "libtorrent ignores seed_mode without metadata — if this ever fails, \
+         the reasoning in torrentd_engine::policy needs revisiting; flags={flags:?}",
+    );
+    assert!(
+        flags.contains(TorrentFlags::UPLOAD_MODE),
+        "upload_mode is what actually holds for a magnet; flags={flags:?}",
+    );
+    assert_eq!(last.download_rate, 0);
 }

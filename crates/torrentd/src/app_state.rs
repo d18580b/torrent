@@ -96,11 +96,20 @@ pub(crate) fn build_test_state(slots: Option<Arc<SlotRegistry>>) -> AppState {
     } else {
         Mode::Single
     };
+    // A distinct registry file per call. Cargo runs tests in threads of one
+    // process, so a fixed name here is one file shared by every test that
+    // builds a state — harmless while nothing wrote to it, and a rename race
+    // the moment a test persists an assignment.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let reg_dir = std::env::temp_dir().join(format!("torrentd-test-{}", std::process::id()));
+    std::fs::create_dir_all(&reg_dir).expect("create test registry dir");
+    let reg_path = reg_dir.join(format!(
+        "reg-{}.json",
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     AppState {
         source: Arc::new(SingleSessionSource::new(engine)),
-        registry: Arc::new(AssignmentRegistry::new_empty(
-            std::env::temp_dir().join("torrentd-test-reg.json"),
-        )),
+        registry: Arc::new(AssignmentRegistry::new_empty(reg_path)),
         slots,
         state: Arc::new(StateMap::new()),
         torrents: Arc::new(MemoryTorrentStore::new()),
