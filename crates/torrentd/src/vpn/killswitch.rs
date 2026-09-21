@@ -124,10 +124,10 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
 ///
 /// Refuses uid 0 outright — see [`refusal_for_uid`].
 pub fn enable(tunnels: &[String]) -> io::Result<u32> {
-    enable_for_uid(current_uid()?, tunnels, apply)
+    enable_for_uid(current_uid()?, tunnels, disable, apply)
 }
 
-/// `enable`, with the uid and the `nft` call handed in.
+/// `enable`, with the uid and **both** `nft` calls handed in.
 ///
 /// Making `refusal_for_uid` pure was half a fix: it left the guard *reachable*
 /// by a test and the **call site** still unreachable by any of them, so
@@ -137,9 +137,19 @@ pub fn enable(tunnels: &[String]) -> io::Result<u32> {
 /// cannot be tested — it reads the process's real uid and shells out to `nft`
 /// — so the control flow the guard sits in lives here, where a test can drive
 /// uid 0 through it and watch `apply` not be called.
+///
+/// Injecting `apply` alone was half a seam, for the same reason one step on:
+/// the refusal arm became reachable and the whole success path stayed
+/// unreached, because `disable` still shelled out unconditionally and no test
+/// could drive a non-zero uid past it. Deleting the `clear()?` line left the
+/// suite green — and that line is what keeps a previous run's rules, and its
+/// tunnel interfaces, from staying in force beside this run's. Both calls are
+/// handed in, so the order and the ruleset are asserted rather than reasoned
+/// about.
 pub(crate) fn enable_for_uid(
     uid: u32,
     tunnels: &[String],
+    clear: impl Fn() -> io::Result<()>,
     apply: impl Fn(&str) -> io::Result<()>,
 ) -> io::Result<u32> {
     if let Some(refusal) = refusal_for_uid(uid) {
@@ -150,7 +160,7 @@ pub(crate) fn enable_for_uid(
     // table rather than replacing it, so a delete that silently failed would
     // leave a previous run's rules in force alongside the new ones — with the
     // old run's tunnel interfaces still accepted.
-    disable()?;
+    clear()?;
     apply(&ruleset)?;
     info!(
         target: "torrentd::vpn::killswitch",
@@ -228,10 +238,19 @@ mod tests {
         // deleted with the suite still green while a host running the daemon
         // as root lost every root-owned socket on it.
         let called = std::cell::Cell::new(false);
-        let e = enable_for_uid(0, &["wg-a".to_string()], |_| {
-            called.set(true);
-            Ok(())
-        })
+        let cleared = std::cell::Cell::new(false);
+        let e = enable_for_uid(
+            0,
+            &["wg-a".to_string()],
+            || {
+                cleared.set(true);
+                Ok(())
+            },
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        )
         .expect_err("uid 0 must be refused");
         assert!(
             e.to_string().contains("non-root user"),
@@ -241,6 +260,11 @@ mod tests {
             !called.get(),
             "the refusal comes before anything is handed to nft",
         );
+        assert!(
+            !cleared.get(),
+            "and before the existing table is deleted — a refused enable must \
+             not disarm a kill switch a previous run installed",
+        );
     }
 
     #[test]
@@ -249,11 +273,74 @@ mod tests {
         assert!(e.to_string().contains("non-root user"), "got {e}");
     }
 
+    /// The success path, driven through `enable_for_uid`'s real control flow.
+    ///
+    /// This test used to assert `refusal_for_uid(998).is_none()` — a function
+    /// its name does not mention, and a duplicate of the test above it — so
+    /// `render_ruleset`, the pre-clear and `apply` were reached by nothing at
+    /// all. Deleting the `clear()?` line left the whole suite green, and that
+    /// line is the one whose absence lets a previous run's rules stay in
+    /// force beside this run's: `nft -f -` merges into an existing table
+    /// rather than replacing it, so the old run's tunnel interfaces would
+    /// still be accepted by a ruleset that does not own them.
     #[test]
-    fn enable_proceeds_for_a_dedicated_uid() {
+    fn enable_clears_the_stale_table_before_it_installs_the_new_one() {
+        // One log, so the order is asserted and not just the two calls.
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let uid = enable_for_uid(
+            998,
+            &["wg-b".to_string(), "wg-a".to_string()],
+            || {
+                calls.borrow_mut().push("clear".to_string());
+                Ok(())
+            },
+            |rs| {
+                calls.borrow_mut().push(format!("apply:{rs}"));
+                Ok(())
+            },
+        )
+        .expect("the supported shape — User=torrentd with CAP_NET_ADMIN — is not refused");
+
+        assert_eq!(uid, 998, "the uid the ruleset was written for is returned");
+        let calls = calls.borrow();
+        assert_eq!(calls.len(), 2, "one clear and one apply; got {calls:?}");
+        assert_eq!(
+            calls[0], "clear",
+            "the stale table goes before the new one is merged in",
+        );
+        assert_eq!(
+            calls[1],
+            format!(
+                "apply:{}",
+                render_ruleset(998, &["wg-a".to_string(), "wg-b".to_string()])
+            ),
+            "and the ruleset handed to nft is this uid's, over these tunnels",
+        );
+    }
+
+    /// A pre-clear that fails is fatal: an `nft delete` that reported a real
+    /// error leaves a table whose rules this run would be merging into.
+    #[test]
+    fn a_failed_pre_clear_stops_the_install() {
+        let applied = std::cell::Cell::new(false);
+        let e = enable_for_uid(
+            998,
+            &[],
+            || {
+                Err(io::Error::other(
+                    "nft delete table exited 1: something else",
+                ))
+            },
+            |_| {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a pre-clear failure is not swallowed");
+        assert!(e.to_string().contains("nft delete table"), "got {e}");
         assert!(
-            refusal_for_uid(998).is_none(),
-            "the supported shape — User=torrentd with CAP_NET_ADMIN — is not refused",
+            !applied.get(),
+            "a ruleset is never merged into a table that would not clear",
         );
     }
 
