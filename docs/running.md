@@ -144,6 +144,7 @@ typo is caught rather than ignored.
 | Key | Default |
 | --- | --- |
 | `http_listen` | `127.0.0.1:8080`. A non-loopback value requires `[auth]` — §6. |
+| `trusted_proxies` | `[]`, so no forwarding header is read and the socket's peer address is the client — §6a. Read once, at startup. |
 | `log_level` | `info` |
 | `registry_path` | `<resume_dir>/../profile_assignments.json` |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
@@ -274,10 +275,11 @@ config tells you to do.
 
 `http_listen` defaults to `127.0.0.1:8080`.
 
-**Restart, not reload.** `[auth]`, `allow_unauthenticated` and `http_listen`
-are read once, at startup: the session store is built and the listener bound
-before anything is served, and neither can change under a live server. Editing
-any of them and then sending `SIGHUP` or calling `POST /api/reload` logs
+**Restart, not reload.** `[auth]`, `allow_unauthenticated`, `http_listen` and
+`trusted_proxies` are read once, at startup: the session store is built, the
+listener bound and the trusted-proxy set parsed before anything is served, and
+none of them can change under a live server. Editing any of them and then
+sending `SIGHUP` or calling `POST /api/reload` logs
 
 ```
 SIGHUP: change to non-reloadable field requires daemon restart; ignored

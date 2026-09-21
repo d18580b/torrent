@@ -484,6 +484,16 @@ impl Config {
         if old.http_listen != new.http_listen {
             d.non_reloadable_changes.push("http_listen");
         }
+        // Same again for the trust set: `TrustedProxies` is parsed once into
+        // `AppState` inside `DaemonHandle::boot` and `reload::run` rebuilds no
+        // `AppState`, so a changed value cannot follow a running daemon.
+        // Without this line an operator who decommissions a proxy, deletes its
+        // address and sends SIGHUP is told `config unchanged` while the daemon
+        // goes on believing forwarding headers from the removed address for
+        // the life of the process.
+        if old.trusted_proxies != new.trusted_proxies {
+            d.non_reloadable_changes.push("trusted_proxies");
+        }
         d.profile_changes = diff_profiles(&old.profile, &new.profile);
         d
     }
@@ -818,6 +828,23 @@ listen_interfaces = "0.0.0.0:6881"
         assert!(!d.is_empty());
         assert!(
             d.non_reloadable_changes.contains(&"http_listen"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+
+        // And the trust set, settled once in `DaemonHandle::boot`. An
+        // operator who decommissions a proxy and deletes its address here is
+        // otherwise told the config did not change, while the daemon keeps
+        // believing that address's forwarding headers until it restarts.
+        let mut proxied = a.clone();
+        proxied.trusted_proxies = vec!["172.28.0.2".to_string()];
+        let d = Config::diff(&a, &proxied);
+        assert!(
+            !d.is_empty(),
+            "a trusted_proxies-only edit must not look like an unchanged config",
+        );
+        assert!(
+            d.non_reloadable_changes.contains(&"trusted_proxies"),
             "got {:?}",
             d.non_reloadable_changes,
         );

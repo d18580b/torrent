@@ -239,8 +239,10 @@ to arrive at by omission. The opt-out does not extend to a routable address
 either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
 and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
 inert and reads as though the daemon authenticates nothing. `http_listen`
-defaults to `127.0.0.1:8080`. All three are read once, at startup: changing
-them takes a restart, not a `SIGHUP`.
+defaults to `127.0.0.1:8080`. All three, and `trusted_proxies` alongside them,
+are read once, at startup: changing any of the four takes a restart, not a
+`SIGHUP`. A `SIGHUP` that changes one says so — "requires daemon restart;
+ignored" — rather than reporting the config unchanged.
 
 Two credential kinds, hashed differently on purpose. The **operator password**
 is human-chosen and therefore low-entropy, so it gets Argon2id — `m=19456,

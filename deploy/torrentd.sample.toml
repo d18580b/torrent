@@ -21,9 +21,9 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 # before exposing the API anywhere — a non-loopback bind without [auth] is
 # refused outright.
 #
-# Read once, at startup, like [auth] and http_listen: editing any of the three
-# takes effect on restart, not on SIGHUP. A reload after such an edit warns
-# "requires daemon restart; ignored" and changes nothing.
+# Read once, at startup, like [auth], http_listen and trusted_proxies: editing
+# any of the four takes effect on restart, not on SIGHUP. A reload after such an
+# edit warns "requires daemon restart; ignored" and changes nothing.
 allow_unauthenticated = true
 
 # Peers whose X-Forwarded-For / X-Forwarded-Proto headers are believed, as IPs
@@ -40,6 +40,12 @@ allow_unauthenticated = true
 # 172.28.0.2 on an explicit subnet precisely so a single /32 can be named here;
 # a range such as 172.16.0.0/12 would trust every container on every Docker
 # network on the host.
+#
+# Read once, at startup, like [auth], http_listen and allow_unauthenticated:
+# the trust set is parsed before anything is served and does not follow a
+# running daemon. Editing this key and sending SIGHUP warns "requires daemon
+# restart; ignored" and changes nothing — decommission a proxy here and the
+# daemon keeps believing its headers until you restart.
 #
 # torrentd never terminates TLS itself. See deploy/Caddyfile.
 # trusted_proxies = ["172.28.0.2"]
