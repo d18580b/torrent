@@ -372,15 +372,9 @@ pub async fn boot(
             if torrent.is_none() {
                 missing_metadata += 1;
             }
-            // Resume data carries the flags it was saved with, which is why
-            // this path does not re-assert SEED_MODE.
-            //
-            // The private-slot guards *are* re-asserted. Safety Rule 5 says
-            // disable_pex is set unconditionally on every torrent in every
-            // slot, but resume data written before the flag existed — or by
-            // any other path — would come back without it. These are
-            // belt-and-braces against the torrent's own `private` bit, and
-            // belt-and-braces that lapse on restart are neither.
+            // Which flags are re-asserted here, and why, is
+            // `torrentd_engine::policy`'s to decide — the short version is
+            // that a guard which lapses on restart is not a guard.
             //
             // PAUSED is deliberately *not* cleared. It is tempting: the VPN
             // monitor pauses a whole slot when its tunnel drops, and if the
@@ -391,11 +385,7 @@ pub async fn boot(
             // mistake that ends an account. A pool that comes back paused is
             // visible in `/status` and fixed with `resume-all`; a pool that
             // comes back seeding when it was told not to is not recoverable.
-            let flags_set = if slot.is_default() {
-                TorrentFlags::empty()
-            } else {
-                TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
-            };
+            let flags_set = torrentd_engine::resume_flags_set(&slot);
             let flags_clear = TorrentFlags::empty();
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: data.into_inner(),
@@ -436,14 +426,7 @@ pub async fn boot(
             if registry.lookup(&ih).is_some() {
                 continue;
             }
-            let flags = if slot.is_default() {
-                TorrentFlags::SEED_MODE
-            } else {
-                TorrentFlags::SEED_MODE
-                    | TorrentFlags::DISABLE_PEX
-                    | TorrentFlags::DISABLE_DHT
-                    | TorrentFlags::DISABLE_LSD
-            };
+            let flags = torrentd_engine::seed_flags(&slot);
             match engine.add_torrent(AddParams::File {
                 bytes,
                 save_path: scan_save_path.clone(),
