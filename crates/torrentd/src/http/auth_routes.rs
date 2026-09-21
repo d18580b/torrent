@@ -16,6 +16,7 @@ use tracing::warn;
 use crate::app_state::AppState;
 use crate::auth::Scope;
 use crate::auth::SESSION_COOKIE;
+use crate::http::forwarded::Client;
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
@@ -61,59 +62,9 @@ pub async fn login(State(s): State<AppState>, req: Request) -> Response {
             .into_response();
     };
 
-    // Argon2id costs ~50 ms of CPU on purpose. Unthrottled, an unauthenticated
-    // caller can spend the whole machine's CPU on password verification.
-    if let Some(wait) = auth.throttle.retry_after(client.ip) {
-        warn!(
-            target: "torrentd::auth",
-            client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default(),
-            retry_after_secs = wait.as_secs(),
-            "login throttled after repeated failures",
-        );
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [("retry-after", wait.as_secs().max(1).to_string())],
-            Json(serde_json::json!({"error": "too many failed attempts; try again shortly"})),
-        )
-            .into_response();
+    if let Err(res) = authenticate(auth, client, req).await {
+        return res;
     }
-
-    let body = match axum::body::to_bytes(req.into_body(), MAX_LOGIN_BODY_BYTES).await {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": "malformed request body"})),
-            )
-                .into_response()
-        }
-    };
-    let Ok(login_req) = serde_json::from_slice::<LoginRequest>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "expected {\"password\": \"…\"}"})),
-        )
-            .into_response();
-    };
-
-    if !auth.verify_password(&login_req.password) {
-        auth.throttle.note_failure(client.ip);
-        // No detail about which part was wrong, and no username to enumerate.
-        // The source address is logged, which it never was: a brute-force
-        // attempt left no trace of where it came from, so the proxy's log was
-        // the only record that it had happened at all.
-        warn!(
-            target: "torrentd::auth",
-            client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default(),
-            "failed login attempt",
-        );
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "invalid password"})),
-        )
-            .into_response();
-    }
-    auth.throttle.note_success(client.ip);
 
     let id = auth.sessions.create();
     let ttl = auth.config.session_ttl_secs;
@@ -150,6 +101,126 @@ pub async fn login(State(s): State<AppState>, req: Request) -> Response {
 
 /// A login body is one short JSON object; anything larger is not one.
 const MAX_LOGIN_BODY_BYTES: usize = 8 * 1024;
+
+/// Everything a login request must survive before a session exists: the media
+/// type, the throttle, the body, and the password.
+///
+/// Split out from [`login`] so the order is testable. The order is the whole
+/// point — `crates/torrentd` has no library target, so nothing in the suite
+/// can drive the handler itself, and without a seam here the media-type gate
+/// below is a claim rather than a tested property.
+///
+/// `Ok(())` means the caller proved the password. Every `Err` is the response
+/// to send.
+async fn authenticate(
+    auth: &crate::auth::Auth,
+    client: Client,
+    req: Request,
+) -> Result<(), Response> {
+    // Checked first, before the throttle is consulted and before the body is
+    // read at all.
+    //
+    // Replacing the `Json<LoginRequest>` extractor with a manual read dropped
+    // this, and it was the only thing keeping the route out of reach of a
+    // cross-origin page: `application/json` is not a CORS-safelisted media
+    // type and `http::router` installs no CORS layer to answer a preflight,
+    // so without it this route is a CORS *simple request*. An HTML
+    // `<form enctype="text/plain">` can then post a body that parses as JSON,
+    // which means any page the operator visits can auto-submit five of them
+    // to the deployment's own origin: five ~50 ms Argon2id verifications, and
+    // a 30 s lockout on the *victim's* own resolved address. That reinstates,
+    // through a different door, exactly the operator lockout that keying the
+    // throttle per client removed.
+    //
+    // `SameSite=Strict` does not cover this. It governs whether the browser
+    // attaches the session cookie, and `/api/login` needs no cookie.
+    if !declares_json(&req) {
+        return Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            Json(serde_json::json!({"error": "expected Content-Type: application/json"})),
+        )
+            .into_response());
+    }
+
+    // Argon2id costs ~50 ms of CPU on purpose. Unthrottled, an unauthenticated
+    // caller can spend the whole machine's CPU on password verification.
+    if let Some(wait) = auth.throttle.retry_after(client.ip) {
+        warn!(
+            target: "torrentd::auth",
+            client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default(),
+            retry_after_secs = wait.as_secs(),
+            "login throttled after repeated failures",
+        );
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", wait.as_secs().max(1).to_string())],
+            Json(serde_json::json!({"error": "too many failed attempts; try again shortly"})),
+        )
+            .into_response());
+    }
+
+    let body = match axum::body::to_bytes(req.into_body(), MAX_LOGIN_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "malformed request body"})),
+            )
+                .into_response())
+        }
+    };
+    let Ok(login_req) = serde_json::from_slice::<LoginRequest>(&body) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "expected {\"password\": \"…\"}"})),
+        )
+            .into_response());
+    };
+
+    if !auth.verify_password(&login_req.password) {
+        auth.throttle.note_failure(client.ip);
+        // No detail about which part was wrong, and no username to enumerate.
+        // The source address is logged, which it never was: a brute-force
+        // attempt left no trace of where it came from, so the proxy's log was
+        // the only record that it had happened at all.
+        warn!(
+            target: "torrentd::auth",
+            client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default(),
+            "failed login attempt",
+        );
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid password"})),
+        )
+            .into_response());
+    }
+    auth.throttle.note_success(client.ip);
+    Ok(())
+}
+
+/// Whether the request declares a JSON body, by the rule the
+/// `Json<LoginRequest>` extractor applied: `application/json`, or any
+/// `application/…+json` suffix, with parameters ignored.
+///
+/// An absent `Content-Type` is not a declaration, so it is refused too — that
+/// is also what the extractor did.
+fn declares_json(req: &Request) -> bool {
+    req.headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            let essence = v.split(';').next().unwrap_or("").trim();
+            let Some((ty, sub)) = essence.split_once('/') else {
+                return false;
+            };
+            ty.trim().eq_ignore_ascii_case("application")
+                && (sub.trim().eq_ignore_ascii_case("json")
+                    || sub
+                        .trim()
+                        .rsplit_once('+')
+                        .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json")))
+        })
+}
 
 pub async fn logout(State(s): State<AppState>, req: Request) -> Response {
     if let Some(auth) = s.auth.as_ref() {
@@ -257,6 +328,142 @@ mod tests {
             .header(header_name, value)
             .body(Body::empty())
             .unwrap()
+    }
+
+    /// An `Auth` with a real Argon2id hash and a real throttle. Cheap: none
+    /// of it needs the engine, the config file or a listener.
+    fn test_auth() -> crate::auth::Auth {
+        crate::auth::Auth::new(crate::auth::AuthConfig {
+            password_hash: crate::auth::hash_password("correct-horse-battery").unwrap(),
+            session_ttl_secs: 3600,
+            token: vec![],
+        })
+    }
+
+    fn login_req(content_type: &str, body: &str) -> Request {
+        HttpRequest::builder()
+            .method("POST")
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn a_client() -> Client {
+        Client {
+            ip: Some("198.51.100.5".parse().unwrap()),
+            secure: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_login_that_does_not_declare_json_is_refused_before_anything_costs_anything() {
+        // Two properties, and the second is the one that matters.
+        //
+        // 1. A body that does not declare `application/json` is refused 415.
+        //    That requirement is what keeps this route out of reach of a
+        //    cross-origin page: `application/json` is not CORS-safelisted and
+        //    there is no CORS layer here to answer a preflight, so without it
+        //    an HTML `<form enctype="text/plain">` reaches the handler.
+        //
+        // 2. The refusal happens before the password is verified, so
+        //    `note_failure` is never called. Without it, the body below —
+        //    which is exactly what such a form produces — parses as JSON,
+        //    runs a ~50 ms Argon2id verification, fails, and records a
+        //    failure against the *victim's* resolved address. Five of those
+        //    trip the 30 s lockout, which is the operator lockout keying the
+        //    throttle per client was supposed to have removed.
+        let auth = test_auth();
+        let client = a_client();
+
+        for _ in 0..5 {
+            let res = authenticate(
+                &auth,
+                client,
+                login_req("text/plain", r#"{"password":"a=b"}"#),
+            )
+            .await
+            .expect_err("a text/plain body is not a JSON login");
+            assert_eq!(res.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        }
+
+        assert!(
+            auth.throttle.retry_after(client.ip).is_none(),
+            "five refused requests must record no failures: the media-type \
+             gate runs before the password is verified, so a page that can \
+             only post text/plain cannot spend this client's burst",
+        );
+
+        // The same five with the correct declaration do reach the password,
+        // and do accrue — which is what shows the assertion above is about
+        // the gate rather than about the throttle being inert.
+        for _ in 0..5 {
+            let res = authenticate(
+                &auth,
+                client,
+                login_req("application/json", r#"{"password":"wrong"}"#),
+            )
+            .await
+            .expect_err("a wrong password is refused");
+            assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        }
+        assert!(
+            auth.throttle.retry_after(client.ip).is_some(),
+            "five declared-JSON failures do trip the lockout",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_declared_json_login_with_the_right_password_still_succeeds() {
+        // The gate refuses a media type, not a caller. The shipped web client
+        // sends `application/json`, and so does every API client the docs
+        // describe.
+        let auth = test_auth();
+        authenticate(
+            &auth,
+            a_client(),
+            login_req(
+                "application/json",
+                r#"{"password":"correct-horse-battery"}"#,
+            ),
+        )
+        .await
+        .expect("the documented content type and the correct password");
+    }
+
+    #[test]
+    fn the_json_media_type_rule_is_the_one_the_extractor_applied() {
+        // Parameters are ignored and a `+json` suffix counts, which is what
+        // `Json::from_request` accepts. An absent `Content-Type` is not a
+        // declaration — also what the extractor did.
+        for accepted in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "APPLICATION/JSON",
+            "application/merge-patch+json",
+        ] {
+            assert!(
+                declares_json(&req_with(header::CONTENT_TYPE, accepted)),
+                "{accepted} declares JSON",
+            );
+        }
+        for refused in [
+            "text/plain",
+            "text/plain;charset=UTF-8",
+            "application/x-www-form-urlencoded",
+            "multipart/form-data",
+            "application/jsonish",
+            "json",
+            "",
+        ] {
+            assert!(
+                !declares_json(&req_with(header::CONTENT_TYPE, refused)),
+                "{refused:?} does not declare JSON",
+            );
+        }
+        assert!(
+            !declares_json(&HttpRequest::builder().body(Body::empty()).unwrap()),
+            "no Content-Type at all is not a declaration",
+        );
     }
 
     #[test]
