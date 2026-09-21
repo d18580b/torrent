@@ -61,8 +61,8 @@ pub async fn run(
                 Err(e) => warn!(error.cause = %e, "SIGHUP: failed to apply log level"),
             }
         }
-        let patch = diff.to_settings_patch();
         for slot in source.slots() {
+            let patch = diff.to_settings_patch_for(&slot);
             if let Some(eng) = source.engine_for(&slot) {
                 if let Err(e) = eng.apply_settings(&patch).context("apply_settings") {
                     warn!(slot_id = %slot, error.cause = %e, "SIGHUP: apply_settings failed");
