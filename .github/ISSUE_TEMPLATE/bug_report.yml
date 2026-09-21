@@ -1,6 +1,6 @@
 name: Bug report
 description: Report a defect in torrentd, with the four facts CONTRIBUTING.md asks for
-title: "[bug] "
+title: "bug: "
 labels: ["bug"]
 body:
   - type: markdown
@@ -18,7 +18,7 @@ body:
         The behaviour you saw and the behaviour you expected instead. Include the
         exact request or command if there was one, and say whether it reproduces.
       placeholder: |
-        POST /torrents with a magnet returned 200, but the torrent never left
+        POST /torrents with a magnet returned 201, but the torrent never left
         checking_resume_data. I expected it to reach downloading_metadata.
         Reproduces on every start.
     validations:
@@ -57,7 +57,7 @@ body:
       label: JSON log output
       description: >-
         The daemon's JSON log around the failure. If it reproduces, capture it with
-        `RUST_LOG=debug` — e.g. `RUST_LOG=debug torrentd --config /etc/torrentd/config.toml`.
+        `RUST_LOG=debug` — e.g. `RUST_LOG=debug torrentd --config /etc/torrentd/torrentd.toml`.
         Redact tracker URLs, passkeys and API tokens before pasting.
       render: text
       placeholder: |
