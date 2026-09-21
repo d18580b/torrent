@@ -46,6 +46,13 @@ pub struct Config {
     pub torrent_dir: PathBuf,
     /// Where the control API listens. Defaults to loopback, which is the only
     /// address it is safe to expose without `[auth]`.
+    ///
+    /// The `serde(default)` removed a refusal as well as making the README's
+    /// claim true: an omitted `http_listen` used to fail to parse with
+    /// `missing field http_listen`, and now binds loopback silently. That is
+    /// the right default everywhere but inside a network namespace, where the
+    /// bind succeeds and the published port reaches nothing — see
+    /// `deploy/compose.yaml`, which therefore sets the key explicitly.
     #[serde(default = "Config::default_http_listen")]
     pub http_listen: SocketAddr,
 
