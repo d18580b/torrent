@@ -157,6 +157,15 @@ pub(crate) fn test_vpn_entry(id: &str, status: ProfileStatus) -> ProfileEntry {
     entry
 }
 
+/// A configured vpn profile whose bring-up failed, so it never got a session.
+#[cfg(test)]
+pub(crate) fn test_failed_profile(id: &str, reason: &str) -> FailedProfile {
+    FailedProfile {
+        config: test_vpn_entry(id, ProfileStatus::Active).config,
+        reason: reason.to_string(),
+    }
+}
+
 /// A host profile, which has no tunnel and therefore no tunnel health.
 #[cfg(test)]
 pub(crate) fn test_host_entry(id: &str) -> ProfileEntry {

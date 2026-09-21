@@ -15,6 +15,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 use torrentd_engine::ProfileConfig;
+use torrentd_engine::ProfileConfigError;
 use torrentd_engine::ProfileId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -304,6 +305,10 @@ impl Config {
         // Unconditional: an empty set is itself a refusal now, because there
         // is no implicit profile to fall back to.
         ProfileConfig::validate_set(&self.profile).context("[[profile]] validation failed")?;
+        self.validate_effective_identities()
+            .context("[[profile]] validation failed")?;
+        self.validate_effective_store_dirs()
+            .context("[[profile]] validation failed")?;
 
         if check_auth_posture {
             self.validate_auth_posture()?;
@@ -493,6 +498,158 @@ impl Config {
         s
     }
 
+    /// The one boot refusal that is a pure function of the config file.
+    ///
+    /// `startup::boot` refuses `network_kill_switch = true` with no tunnel to
+    /// confine egress to, and `--check-config` — which
+    /// `deploy/torrentd.service` runs as its `ExecStartPre`, so that a bad
+    /// configuration fails before `ExecStart` rather than under
+    /// `Restart=on-failure` — did not. The configuration that reaches it, a
+    /// set of profiles with zero tunnels, is new in this change.
+    ///
+    /// Kept separate from [`Config::validate`] because it is a boot rule
+    /// rather than a well-formedness rule: `vpn check` and the `pool`
+    /// subcommands load the same file and have no business refusing it.
+    pub fn check_boot_rules(&self) -> anyhow::Result<()> {
+        if self.network_kill_switch && !self.profile.iter().any(|p| p.is_vpn()) {
+            anyhow::bail!(
+                "network_kill_switch = true but no profile uses network = \"vpn\". \
+                 The kill switch confines the daemon's egress to its profiles' tunnel \
+                 interfaces; with no tunnel there is nothing to confine it to, and \
+                 every profile would keep seeding from the host's own address with no \
+                 backstop. Configure a vpn profile, or unset network_kill_switch.",
+            );
+        }
+        Ok(())
+    }
+
+    /// A profile's effective `peer_fingerprint_hex` and `user_agent` — its own
+    /// values, or the top-level defaults it inherits where it sets none.
+    ///
+    /// `libtorrent_settings()` seeds every session from the top-level keys and
+    /// `startup.rs` overrides only where the profile set its own, so this pair
+    /// is what actually goes on the wire.
+    fn effective_identity<'a>(
+        &'a self,
+        p: &'a ProfileConfig,
+    ) -> (Option<&'a str>, Option<&'a str>) {
+        (
+            p.peer_fingerprint_hex
+                .as_deref()
+                .or(self.peer_fingerprint.as_deref()),
+            p.user_agent.as_deref().or(self.user_agent.as_deref()),
+        )
+    }
+
+    /// Refuse two profiles that would announce one identity.
+    ///
+    /// `ProfileConfig::validate_set` sees only what a `[[profile]]` spells out,
+    /// so it closes the copy-paste spelling and not the inherited one: a host
+    /// profile that declares neither key — the documented way to use a
+    /// top-level default — inherits the same 8-byte peer-id prefix and client
+    /// string as a vpn profile that declares them explicitly, and both
+    /// sessions put them on the wire, one from the tunnel address and one from
+    /// the machine's real address. That is the cross-account correlation
+    /// `torrentd_engine::profile`'s Safety Rules 2-4 exist to prevent, and its
+    /// stated consequence is a permanent tracker ban.
+    ///
+    /// Both keys reach one `libtorrent_safe::Settings` field in one encoding,
+    /// so the collision is expressible however it is spelled.
+    fn validate_effective_identities(&self) -> Result<(), ProfileConfigError> {
+        let mut seen_fp: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        let mut seen_ua: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
+        for p in &self.profile {
+            let (fp, ua) = self.effective_identity(p);
+            if let Some(fp) = fp {
+                if seen_fp.insert(fp, p.id.as_str()).is_some() {
+                    return Err(ProfileConfigError::DuplicateFingerprint(fp.to_string()));
+                }
+            }
+            if let Some(ua) = ua {
+                if seen_ua.insert(ua, p.id.as_str()).is_some() {
+                    return Err(ProfileConfigError::DuplicateUserAgent(ua.to_string()));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A profile's effective resume and `.torrent` directories — its own
+    /// overrides, or the `<base>/<id>` the two stores derive.
+    ///
+    /// Mirrors `FsResumeStore::dir_for` and `FsTorrentStore::dir_for`, which is
+    /// what `startup.rs` assembles from exactly these two fields.
+    pub(crate) fn effective_store_dirs(&self, p: &ProfileConfig) -> (PathBuf, PathBuf) {
+        let resolve = |explicit: Option<&PathBuf>, base: &Path| -> PathBuf {
+            let raw = explicit
+                .cloned()
+                .unwrap_or_else(|| base.join(p.id.as_str()));
+            // On a first run the directory may not exist yet, so fall back to
+            // the literal value and let startup create it.
+            raw.canonicalize().unwrap_or(raw)
+        };
+        (
+            resolve(p.resume_dir.as_ref(), &self.resume_dir),
+            resolve(p.torrent_dir.as_ref(), &self.torrent_dir),
+        )
+    }
+
+    /// Refuse two profiles that would share, or nest, a store directory.
+    ///
+    /// `validate_set` de-duplicates only the *explicit* overrides against each
+    /// other and cannot see a derived path, so an override set to another
+    /// profile's `<base>/<id>` validated clean and two sessions then read one
+    /// store. On a fresh registry the first-declared profile claims every
+    /// info-hash it finds there and seeds another account's torrents under its
+    /// own fingerprint, user agent and tunnel address.
+    ///
+    /// Containment is refused as well as equality: `load_all` filters on the
+    /// file name alone, so a profile pointed at a directory that *contains*
+    /// another's loads that profile's state as its own. An override of the
+    /// top-level root itself is exactly that shape, and the upgrade note tells
+    /// operators to hand-write these overrides.
+    fn validate_effective_store_dirs(&self) -> Result<(), ProfileConfigError> {
+        let dirs: Vec<(&str, PathBuf, PathBuf)> = self
+            .profile
+            .iter()
+            .map(|p| {
+                let (r, t) = self.effective_store_dirs(p);
+                (p.id.as_str(), r, t)
+            })
+            .collect();
+
+        for (i, (_, a_resume, a_torrent)) in dirs.iter().enumerate() {
+            for (_, b_resume, b_torrent) in dirs.iter().skip(i + 1) {
+                for (key, a, b) in [
+                    ("resume_dir", a_resume, b_resume),
+                    ("torrent_dir", a_torrent, b_torrent),
+                ] {
+                    if a == b {
+                        return Err(match key {
+                            "resume_dir" => ProfileConfigError::DuplicateResumeDir(a.clone()),
+                            _ => ProfileConfigError::DuplicateTorrentDir(a.clone()),
+                        });
+                    }
+                    if a.starts_with(b) {
+                        return Err(ProfileConfigError::NestedProfileDir {
+                            key,
+                            outer: b.clone(),
+                            inner: a.clone(),
+                        });
+                    }
+                    if b.starts_with(a) {
+                        return Err(ProfileConfigError::NestedProfileDir {
+                            key,
+                            outer: a.clone(),
+                            inner: b.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Where the assignment registry should be persisted.
     pub fn registry_path(&self) -> PathBuf {
         self.registry_path
@@ -601,6 +758,21 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
         field("user_agent", a.user_agent != b.user_agent);
         field("resume_dir", a.resume_dir != b.resume_dir);
         field("torrent_dir", a.torrent_dir != b.torrent_dir);
+        // The two keys outside the network block. Neither is applied by a
+        // reload — the add path reads `ProfileRegistry`'s immutable startup
+        // snapshot and nothing rebuilds it — and without them here a SIGHUP
+        // that changed only one of them produced an empty diff and logged
+        // "SIGHUP: config unchanged" over a file that plainly had. They are
+        // exactly the fields the comment above claimed could not be
+        // forgotten.
+        field(
+            "upload_rate_limit",
+            a.upload_rate_limit != b.upload_rate_limit,
+        );
+        field(
+            "allowed_tracker_domains",
+            a.allowed_tracker_domains != b.allowed_tracker_domains,
+        );
     }
     out
 }
@@ -636,10 +808,22 @@ impl ConfigDiff {
     /// discovery on exactly the sessions that must never have it. A host
     /// profile still honours the key, which is the only place it means
     /// anything.
+    ///
+    /// `upload_rate_limit` is withheld in the same shape, from a profile that
+    /// sets its own. `startup.rs` applies a per-profile `upload_rate_limit`
+    /// over the top-level one at boot; passing the top-level value through
+    /// here meant that editing only the top-level key and sending SIGHUP
+    /// patched every session alike and silently discarded the override until
+    /// the next restart. A profile that sets nothing still takes the
+    /// top-level value, which is what makes it a default.
     pub fn to_settings_patch_for(&self, profile: &ProfileConfig) -> libtorrent_safe::Settings {
         libtorrent_safe::Settings {
             connections_limit: self.connections_limit,
-            upload_rate_limit: self.upload_rate_limit,
+            upload_rate_limit: if profile.upload_rate_limit != 0 {
+                None
+            } else {
+                self.upload_rate_limit
+            },
             max_concurrent_http_announces: self.max_concurrent_http_announces,
             aio_threads: self.aio_threads,
             enable_lsd: if profile.is_vpn() {
@@ -854,6 +1038,412 @@ listen_interfaces = "0.0.0.0:6881"
         );
     }
 
+    // -----------------------------------------------------------------
+    // Effective identity — the uniqueness rule `validate_set` cannot decide.
+    // -----------------------------------------------------------------
+
+    /// Top-level keys, then a vpn profile, then a host profile.
+    ///
+    /// `top` lands in the daemon-wide block; `host_extra` inside the host
+    /// profile's table. The ports are distinct so Safety Rule 8 does not fire
+    /// first and mask what is being asserted.
+    fn vpn_plus_host(top: &str, host_extra: &str) -> String {
+        format!(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+{top}
+
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg0.conf"
+vpn_interface        = "wg0"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6882"
+{host_extra}
+"#
+        )
+    }
+
+    fn refusal(body: &str) -> String {
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), body);
+        let err = Config::load(&p).expect_err("this configuration must be refused");
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn a_host_profile_may_not_wear_a_vpn_profiles_identity() {
+        // The configuration this is written from: the operator writes the VPN
+        // profile, copies the table to make the public one, and edits `id`,
+        // `network` and `listen_interfaces`. The fingerprint and user agent
+        // come along. `startup.rs` applies `peer_fingerprint_hex` to every
+        // session with no posture guard, so the private tracker then sees one
+        // peer-id prefix announcing from the tunnel address and from the
+        // host's real address — the cross-account correlation whose stated
+        // consequence is a permanent ban.
+        let msg = refusal(&vpn_plus_host(
+            "",
+            r#"peer_fingerprint_hex = "a1b2c3d4e5f60718""#,
+        ));
+        assert!(
+            msg.contains("peer_fingerprint_hex") && msg.contains("a1b2c3d4e5f60718"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_host_profile_may_not_wear_a_vpn_profiles_user_agent() {
+        let msg = refusal(&vpn_plus_host("", r#"user_agent = "qBittorrent/5.0.3""#));
+        assert!(
+            msg.contains("user_agent") && msg.contains("qBittorrent/5.0.3"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn two_profiles_may_not_share_a_fingerprint() {
+        let dir = tempdir().unwrap();
+        let body = format!(
+            r#"{TOP_LEVEL}
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg0.conf"
+vpn_interface        = "wg0"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "ua-a"
+
+[[profile]]
+id                   = "acct_b"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg1.conf"
+vpn_interface        = "wg1"
+listen_port          = 6882
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "ua-b"
+"#
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("peer_fingerprint_hex"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_host_profile_inheriting_the_top_level_identity_collides_with_a_vpn_profile() {
+        // F4, reopened. The host profile sets *neither* identity key — the
+        // documented way to use a top-level default (`docs/running.md`) — and
+        // the vpn profile spells out the same two values. Nothing in
+        // `[[profile]]` looks duplicated, so `validate_set` returns `Ok` and
+        // `--check-config` printed `config OK`; but `libtorrent_settings()`
+        // seeds every session from the top-level keys and `startup.rs`
+        // overrides only where a profile set its own, so both sessions put one
+        // 8-byte peer-id prefix and one client string on the wire — one from
+        // the tunnel address, one from the machine's real address.
+        let msg = refusal(&vpn_plus_host(
+            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+user_agent = "qBittorrent/5.0.3""#,
+            "",
+        ));
+        assert!(
+            msg.contains("peer_fingerprint_hex") && msg.contains("a1b2c3d4e5f60718"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_top_level_user_agent_inherited_by_two_profiles_is_refused() {
+        // The user-agent half of the same mechanism, reached on its own: the
+        // vpn profile spells out its own fingerprint but takes the top-level
+        // user agent, and so does the host profile.
+        let msg = refusal(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+user_agent = "qBittorrent/5.0.3"
+
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg0.conf"
+vpn_interface        = "wg0"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6882"
+"#,
+        );
+        assert!(msg.contains("user_agent"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_top_level_identity_with_exactly_one_profile_is_still_accepted() {
+        // The configuration the top-level default exists for. Refusing the
+        // keys outright would close F4 too, and break this.
+        let dir = tempdir().unwrap();
+        let body = with_top_level(
+            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+user_agent = "qBittorrent/5.0.3""#,
+        );
+        let p = write_cfg(dir.path(), &body);
+        Config::load(&p).expect("one profile inheriting the top-level identity is legal");
+    }
+
+    // -----------------------------------------------------------------
+    // Effective store directories.
+    // -----------------------------------------------------------------
+
+    /// Two host profiles with `extra_a` / `extra_b` appended to their tables.
+    fn two_host_profiles(extra_a: &str, extra_b: &str) -> String {
+        format!(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
+
+[[profile]]
+id                = "acct_a"
+network           = "host"
+listen_interfaces = "0.0.0.0:6881"
+{extra_a}
+
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6882"
+{extra_b}
+"#
+        )
+    }
+
+    #[test]
+    fn an_override_equal_to_another_profiles_derived_resume_dir_is_refused() {
+        // F15. `acct_a` names `<base>/public` explicitly; `public` sets no
+        // override, so `FsResumeStore::dir_for` derives exactly that path for
+        // it. `validate_set` de-duplicates only the explicit overrides against
+        // each other and cannot see a derived path, so this validated clean
+        // and both sessions then read one store — and on a fresh registry the
+        // first-declared profile claims every info-hash it finds there.
+        let msg = refusal(&two_host_profiles(
+            r#"resume_dir = "/var/lib/torrentd/resume/public""#,
+            "",
+        ));
+        assert!(
+            msg.contains("resume_dir") && msg.contains("/var/lib/torrentd/resume/public"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn an_override_equal_to_another_profiles_derived_torrent_dir_is_refused() {
+        let msg = refusal(&two_host_profiles(
+            r#"torrent_dir = "/var/lib/torrentd/torrents/public""#,
+            "",
+        ));
+        assert!(
+            msg.contains("torrent_dir") && msg.contains("/var/lib/torrentd/torrents/public"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn two_explicit_overrides_naming_one_resume_dir_are_refused() {
+        let msg = refusal(&two_host_profiles(
+            r#"resume_dir = "/srv/shared""#,
+            r#"resume_dir = "/srv/shared""#,
+        ));
+        assert!(msg.contains("resume_dir"), "got: {msg}");
+    }
+
+    #[test]
+    fn an_override_containing_another_profiles_resume_dir_is_refused() {
+        // Containment, not equality. `load_all` filters on the file name
+        // alone, so a profile pointed at the top-level root loads every other
+        // profile's `<base>/<id>` state as its own — and the root is the
+        // easiest value to write here by accident, because it is the one the
+        // upgrade note tells operators their files are currently under.
+        let msg = refusal(&two_host_profiles(
+            r#"resume_dir = "/var/lib/torrentd/resume""#,
+            "",
+        ));
+        assert!(msg.contains("resume_dir"), "got: {msg}");
+        assert!(msg.contains("lies inside"), "got: {msg}");
+    }
+
+    #[test]
+    fn distinct_derived_store_directories_are_accepted() {
+        // The ordinary case, so the new rule cannot pass by refusing
+        // everything: neither profile overrides anything and the derived
+        // `<base>/<id>` paths differ by construction.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &two_host_profiles("", ""));
+        Config::load(&p).expect("derived per-profile directories are distinct");
+    }
+
+    // -----------------------------------------------------------------
+    // The shipped samples.
+    // -----------------------------------------------------------------
+
+    /// Nothing in this repository parsed either sample: no test, no CI step.
+    /// That is why 265 changed lines of `torrentd.sample.toml` shipped with a
+    /// duplicate listen port, a duplicate fingerprint and a duplicate user
+    /// agent between its own examples, two daemon-wide keys stranded behind a
+    /// `[[profile]]` header where TOML binds them to the table, and a
+    /// `network = "host"` profile that made the documented `vpn check`
+    /// invocation panic — while a 41-test suite stayed green.
+    fn sample(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy")
+            .join(name)
+    }
+
+    fn load_sample(name: &str) -> Config {
+        let path = sample(name);
+        Config::load(&path).unwrap_or_else(|e| panic!("{name} must load and validate: {e:#}"))
+    }
+
+    #[test]
+    fn the_shipped_sample_loads_and_validates() {
+        let cfg = load_sample("torrentd.sample.toml");
+        assert_eq!(cfg.profile.len(), 1);
+        assert_eq!(cfg.profile[0].id.as_str(), "public");
+        assert!(
+            !cfg.profile[0].is_vpn(),
+            "the shipped sample is a host-only deployment; `vpn check` has to cope with it",
+        );
+    }
+
+    #[test]
+    fn the_multi_account_sample_loads_and_validates() {
+        // The case the other sample only describes in comments. A commented
+        // block is unreachable by any test and by `--check-config`, which is
+        // the whole mechanism: the operator uncomments it and finds out then.
+        let cfg = load_sample("torrentd.multi-account.sample.toml");
+        assert_eq!(cfg.profile.len(), 3);
+        assert_eq!(
+            cfg.profile.iter().filter(|p| p.is_vpn()).count(),
+            2,
+            "two accounts, each with its own tunnel",
+        );
+        assert!(
+            cfg.peer_fingerprint.is_none() && cfg.user_agent.is_none(),
+            "no top-level identity for a profile to inherit",
+        );
+    }
+
+    #[test]
+    fn the_samples_daemon_wide_keys_are_not_stranded_behind_a_profile_table() {
+        // TOML binds any key after a `[[table]]` header to that table, so a
+        // daemon-wide key written below the first `[[profile]]` cannot be
+        // uncommented: `deny_unknown_fields` rejects it as an unknown
+        // `[[profile]]` field, and the message lists the profile keys — which
+        // reads as "this key does not exist", about the kill switch the file
+        // calls defence-in-depth.
+        for name in ["torrentd.sample.toml", "torrentd.multi-account.sample.toml"] {
+            let text = fs::read_to_string(sample(name)).unwrap();
+            let first_table = text
+                .find("\n[[profile]]")
+                .expect("every sample configures at least one profile");
+            for key in ["vpn_handshake_max_age_secs", "network_kill_switch"] {
+                let at = text
+                    .find(key)
+                    .unwrap_or_else(|| panic!("{name} should document {key}"));
+                assert!(
+                    at < first_table,
+                    "{name}: {key} sits below the first [[profile]] header, \
+                     where TOML binds it to that table",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reload_does_not_overwrite_a_per_profile_upload_rate_limit() {
+        // `startup.rs` applies a per-profile `upload_rate_limit` over the
+        // top-level one at boot. Passing the top-level value through here
+        // meant an operator who edited only the top-level key and sent SIGHUP
+        // patched every session alike — the override was silently discarded
+        // until the next restart, with nothing logged.
+        let diff = ConfigDiff {
+            upload_rate_limit: Some(2_000_000),
+            ..Default::default()
+        };
+        let mut capped = host_profile();
+        capped.upload_rate_limit = 100_000;
+
+        assert_eq!(
+            diff.to_settings_patch_for(&capped).upload_rate_limit,
+            None,
+            "a profile that set its own must not be patched from the top level",
+        );
+        assert_eq!(
+            diff.to_settings_patch_for(&host_profile())
+                .upload_rate_limit,
+            Some(2_000_000),
+            "a profile that set nothing still takes the default; that is what makes it one",
+        );
+    }
+
+    #[test]
+    fn a_profile_only_upload_rate_limit_change_is_reported_rather_than_swallowed() {
+        // `ConfigDiff::is_empty()` was true for this edit, so `reload.rs`
+        // logged "SIGHUP: config unchanged" over a file that plainly had.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        b.profile[0].upload_rate_limit = 100_000;
+
+        let d = Config::diff(&a, &b);
+        assert!(!d.is_empty(), "the file changed and the daemon must say so");
+        assert!(
+            d.profile_changes
+                .iter()
+                .any(|c| c == "public.upload_rate_limit"),
+            "got {:?}",
+            d.profile_changes,
+        );
+    }
+
+    #[test]
+    fn a_profile_only_allowed_tracker_domains_change_is_reported_rather_than_swallowed() {
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        b.profile[0].allowed_tracker_domains = vec!["tracker.example.com".into()];
+
+        let d = Config::diff(&a, &b);
+        assert!(!d.is_empty());
+        assert!(
+            d.profile_changes
+                .iter()
+                .any(|c| c == "public.allowed_tracker_domains"),
+            "got {:?}",
+            d.profile_changes,
+        );
+    }
+
     #[test]
     fn parses_one_host_profile() {
         let dir = tempdir().unwrap();
@@ -996,6 +1586,141 @@ listen_interfaces = "0.0.0.0:6881"
         let p = write_cfg(dir.path(), &body);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("vpn_interface"), "got: {msg}");
+    }
+
+    #[test]
+    fn dht_false_on_a_vpn_profile_is_refused_like_every_other_wrong_posture_key() {
+        // `dht` was a `#[serde(default)] bool`, so `dht = false` was
+        // indistinguishable from absent and slipped through — alone among the
+        // wrong-posture keys, every other one being an `Option` rejected on
+        // presence. It reads to an operator as a setting that took, on the
+        // posture where Safety Rule 6 says no key can reach it at all.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
+             vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
+             vpn_interface = \"wg0\"\nlisten_port = 6891\n\
+             peer_fingerprint_hex = \"a1b2c3d4e5f60718\"\nuser_agent = \"ua-a\"\n\
+             dht = false\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("dht"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_listen_port_under_natpmp_is_refused_rather_than_ignored() {
+        // The gateway assigns the port at runtime and renews its lease, so
+        // nothing binds the configured one and Safety Rule 8 never enters it
+        // into the uniqueness set — and `/api/profiles` then reports it back
+        // under a field documented as `null` for natpmp profiles. Accepting
+        // and ignoring a key is the shape every other rule in this conversion
+        // exists to refuse.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
+             vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
+             vpn_interface = \"wg0\"\nport_forward = \"natpmp\"\nlisten_port = 6891\n\
+             peer_fingerprint_hex = \"a1b2c3d4e5f60718\"\nuser_agent = \"ua-a\"\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(
+            msg.contains("listen_port") && msg.contains("natpmp"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_natpmp_profile_without_a_listen_port_is_accepted() {
+        // The shape the rule above exists to leave alone.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
+             vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
+             vpn_interface = \"wg0\"\nport_forward = \"natpmp\"\n\
+             peer_fingerprint_hex = \"a1b2c3d4e5f60718\"\nuser_agent = \"ua-a\"\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        Config::load(&p).expect("a natpmp profile names no port; that is the point");
+    }
+
+    #[test]
+    fn a_profile_id_that_is_not_a_path_component_is_refused_at_deserialization() {
+        // The charset rule as a property of the *type*, not of having called
+        // `validate_set`. The config file is not the only door a `ProfileId`
+        // comes through: `profile_assignments.json` deserializes straight into
+        // one and never passes the validator, so a hand-edited registry
+        // naming `../..` reached `dir_for` and was joined onto a path with
+        // nothing in between. Deserializing the bare value is that door.
+        for bad in ["../..", "/etc", "a/b", "acct.a", "", &"x".repeat(65)] {
+            let err = serde_json::from_value::<ProfileId>(serde_json::json!(bad))
+                .err()
+                .unwrap_or_else(|| panic!("id {bad:?} was accepted by Deserialize"));
+            assert!(
+                err.to_string().contains("[A-Za-z0-9_-]"),
+                "id {bad:?} gave: {err}",
+            );
+        }
+        for good in ["default", "acct_a", "acct-b", "Public2", &"a".repeat(64)] {
+            serde_json::from_value::<ProfileId>(serde_json::json!(good))
+                .unwrap_or_else(|e| panic!("id {good:?} was refused: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_registry_file_naming_an_escaping_profile_id_does_not_load() {
+        // The file the rule above exists for. `AssignmentRegistry` maps its
+        // JSON values straight into `ProfileId`.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("profile_assignments.json");
+        fs::write(
+            &path,
+            r#"{"0101010101010101010101010101010101010101":"../../etc"}"#,
+        )
+        .unwrap();
+        assert!(
+            torrentd_engine::AssignmentRegistry::load(&path).is_err(),
+            "a registry naming an id that escapes its directory must not load",
+        );
+    }
+
+    #[test]
+    fn check_config_refuses_a_kill_switch_with_no_tunnel_to_confine_egress_to() {
+        // `deploy/torrentd.service` runs `--check-config` as its
+        // `ExecStartPre` so a bad configuration fails before `ExecStart`
+        // rather than under `Restart=on-failure`. This refusal is a pure
+        // function of the file and `boot` makes it anyway, so the pre-flight
+        // has no reason not to.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
+        let cfg = Config::load(&p).expect("it parses and validates; it does not boot");
+        let msg = format!("{:#}", cfg.check_boot_rules().unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch") && msg.contains("vpn"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_kill_switch_with_a_vpn_profile_passes_the_pre_flight() {
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\nnetwork_kill_switch = true\n\n[[profile]]\nid = \"acct_a\"\n\
+             network = \"vpn\"\nvpn_type = \"wireguard\"\n\
+             vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
+             listen_port = 6891\npeer_fingerprint_hex = \"a1b2c3d4e5f60718\"\n\
+             user_agent = \"ua-a\"\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        Config::load(&p).unwrap().check_boot_rules().unwrap();
+    }
+
+    #[test]
+    fn the_default_config_has_no_boot_rule_to_break() {
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &single_session());
+        Config::load(&p).unwrap().check_boot_rules().unwrap();
     }
 
     #[test]

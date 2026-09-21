@@ -336,7 +336,16 @@ pub async fn adopt(
         return Err(err(StatusCode::BAD_REQUEST, "profile_id is required"));
     };
     if s.source.engine_for(&profile).is_none() {
-        return Err(err(StatusCode::BAD_REQUEST, "unknown profile_id"));
+        // Configured and failed is not the same as unknown, and telling an
+        // operator their id does not exist sends them to the config file for
+        // a tunnel problem.
+        return Err(match s.profile_failure_reason(&profile) {
+            Some(reason) => err(
+                StatusCode::CONFLICT,
+                format_args!("profile failed to start: {reason}"),
+            ),
+            None => err(StatusCode::BAD_REQUEST, "unknown profile_id"),
+        });
     }
     // Adopting into a fenced profile would land every torrent paused and make the
     // profile look healthy; same guard as POST /torrents.
@@ -903,6 +912,46 @@ mod tests {
         };
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(body.0["error"], "unknown profile_id");
+    }
+
+    #[tokio::test]
+    async fn adopting_into_a_profile_that_failed_to_start_says_why() {
+        // A failed profile carries no engine by construction, so `engine_for`
+        // returns `None` for it exactly as it does for a typo — and the
+        // operator whose tunnel had failed was told their profile did not
+        // exist, and went to check the config file. `http/profiles.rs` already
+        // makes this distinction; it was applied at one of five sites.
+        use std::sync::Arc;
+
+        use crate::profile_registry::test_failed_profile;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(
+            ProfileRegistry::new(vec![]).with_failed(vec![test_failed_profile(
+                "acct_b",
+                "wg-acct_b did not come up within 30s",
+            )]),
+        );
+        let mut s = state_with_pool(dir.path());
+        s.profiles = reg;
+
+        let req: AdoptRequest =
+            serde_json::from_str(r#"{"root_id":1,"path":"","profile_id":"acct_b"}"#).unwrap();
+        let (code, body) = match adopt(State(s), Json(req)).await {
+            Ok(_) => panic!("a profile with no session cannot adopt"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            code,
+            StatusCode::CONFLICT,
+            "configured-and-failed is not a bad request",
+        );
+        let msg = body.0["error"].as_str().unwrap();
+        assert!(
+            msg.contains("did not come up"),
+            "the reason is the whole point: {msg}",
+        );
     }
 
     #[test]

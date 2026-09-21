@@ -129,6 +129,7 @@ root, where probes and scrapes conventionally look. Default bind
 | `POST /api/torrents/:infohash/upload-limit` | `{"bytes_per_sec":…}`, 0 = unlimited. |
 | `POST /api/torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 4 normal, 7 high). |
 | `POST /api/login` \| `/api/logout` | Session cookie in, revocation out. |
+| `POST /api/reload` | Re-read the config file, as SIGHUP does. 202 accepted, 429 if a reload is already running, 503 if the daemon is shutting down or was built without the reload channel. Needs a `write` token. |
 | `GET /api/events` | SSE change stream. |
 | `GET /metrics` | Prometheus text format. |
 
@@ -139,6 +140,14 @@ With `[pool]` configured: `GET /api/pool`, `/pool/tree`, `/pool/torrents`,
 
 Profile routes: `GET /api/profiles`, `/profiles/:id`, `/profiles/:id/torrents`,
 and `POST /api/profiles/:id/pause-all` \| `/resume-all`.
+
+`GET /api/profiles` lists **live profiles in the order their `[[profile]]`
+tables appear in the config file, then the profiles that failed to come up**,
+in config order among themselves. That order is the contract; it is not a
+substitute for reading `status`, since the first entry is an `active` profile
+only when at least one came up. A client choosing a profile to act on filters
+on `status == "active"` — a failed profile has no session, and every route that
+needs one answers 409 naming the failure reason.
 
 ## Profiles
 
@@ -215,11 +224,15 @@ summary cannot quietly mean "mostly not checked", and the exit status carries
 the same distinction: `0` clean, `1` any failure, `2` nothing failed but
 something could not be checked.
 
-Safe to run while the daemon is up. The default path reads state and asks the
-gateway for a NAT-PMP mapping with the daemon's own short lease, which it
-leaves to expire; `--bring-up` is the only option that raises a tunnel, and it
-lowers again only what it raised. What a pass does and does not establish is
-set out in [docs/running.md](docs/running.md#9-first-run-checks).
+The default path makes no host change and deletes nothing: it reads state and
+asks the gateway for a NAT-PMP mapping with the daemon's own short lease,
+which it leaves to expire. Against a running daemon that request is its only
+interaction, sent from the same NAT-PMP client identity; whether a gateway
+coalesces it with the daemon's existing mapping is gateway-dependent and is
+not tested here. `--bring-up` is the only option that raises a tunnel, and it
+lowers again only what it was observed to have raised. What a pass does and
+does not establish is set out in
+[docs/running.md](docs/running.md#9-first-run-checks).
 
 `allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds,
 not an egress control. Public content that wants DHT belongs in a
@@ -273,8 +286,16 @@ list built for 100K rows and a profile view for VPN and port-forward health.
 
 Updates arrive over SSE: the daemon emits a tick when something visible
 changes and the client refetches only the panels it has mounted. Polling every
-15s is the fallback when the stream drops. Routes use the fragment (`#/pool`)
-because the compatibility aliases make `/pool` and `/torrents` real API paths.
+15s is the fallback when the stream drops.
+
+Routes use the fragment (`#/pool`). The compatibility aliases that once made
+`/pool` and `/torrents` real API paths are gone — every route is under `/api`
+now — so the reason is no longer a collision. It is that the client is served
+as a static bundle from the router's fallback: a bare `/pool` answers 200 with
+the SPA whatever the path is, which means a path-routed client would be
+indistinguishable from a typo, and a reload of a deep link would depend on the
+server knowing every client-side route. The fragment keeps that knowledge on
+the client.
 
 ```bash
 cd web && npm run dev     # dev server, proxying the API to :8080

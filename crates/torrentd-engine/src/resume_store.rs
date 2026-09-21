@@ -258,6 +258,19 @@ mod tests {
         let profile = ProfileId::new("p");
         let ih = InfoHash([0x42u8; 20]);
         store.write(&profile, &ih, b"hello").unwrap();
+
+        // Pinned to the literal path, not just to the round trip. Reading
+        // back what this same store wrote passes whether or not `dir_for`
+        // partitions at all — and partitioning is the property: with it went
+        // the last place two profiles could co-mingle files by accident.
+        // `FsTorrentStore`'s equivalent asserts the path; this one did not.
+        let expected = dir.path().join("p").join(format!("{}.resume", ih.to_hex()));
+        assert!(
+            expected.exists(),
+            "resume data must land under <base>/<profile_id>/, got a store rooted at {}",
+            dir.path().display(),
+        );
+
         let loaded = store.load_all(&profile).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, ih);

@@ -12,6 +12,15 @@
 //! `{ "<infohash_hex>": "<profile_id>" }`. Writes are atomic (temp file +
 //! fsync + rename) — a partial write must leave the previous registry
 //! file intact.
+//!
+//! # This file is the authority
+//!
+//! Two artefacts persist a torrent→profile mapping: this one, and the pool
+//! index's `torrent.profile` column. **This one wins.** It is what the resume
+//! scan writes and what the daemon refuses to boot against when it disagrees
+//! with the configured profiles; the index's column is a cache of it, written
+//! by `pool scan`, which an operator may never run. Where they disagree the
+//! scan warns naming both values rather than silently preferring one.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -47,14 +56,24 @@ pub enum RegistryError {
 #[derive(Debug)]
 pub struct AssignmentRegistry {
     path: PathBuf,
+    /// The file the entries were actually read from.
+    ///
+    /// Equal to `path` except on the one boot that reads a pre-rename file.
+    /// `startup.rs` quotes it in the refusal that tells an operator which
+    /// entries to remove, and quoting `path` there named a file that, before
+    /// the unconditional persist below, was by construction not on disk on
+    /// exactly the path that refusal fires on.
+    source: PathBuf,
     inner: RwLock<HashMap<InfoHash, ProfileId>>,
 }
 
 impl AssignmentRegistry {
     /// Construct empty (in memory + on disk).
     pub fn new_empty(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
         Self {
-            path: path.into(),
+            source: path.clone(),
+            path,
             inner: RwLock::new(HashMap::new()),
         }
     }
@@ -66,14 +85,23 @@ impl AssignmentRegistry {
 
     /// Load `path`, falling back to `legacy` when `path` does not exist.
     ///
-    /// The fallback is read-only: the first `assign` or `remove` persists under
-    /// `path`, so the old file is left alone rather than deleted or moved. An
-    /// operator who rolls back gets their original file intact.
+    /// The old file is never deleted or moved: an operator who rolls back gets
+    /// it intact. The new one is written **once, unconditionally**, as soon as
+    /// the fallback is taken.
+    ///
+    /// Waiting for the first `assign` or `remove` to write it was not enough.
+    /// `assign` returns `Ok(())` without persisting when the info-hash is
+    /// already mapped to the same profile, and on a migrated deployment in
+    /// steady state the resume scan takes exactly that path for every entry —
+    /// so the new file appeared only at the first genuinely new assignment,
+    /// which might be never. Meanwhile `startup.rs`'s refusal and
+    /// `docs/running.md` both told the operator to edit it.
     pub fn load_from(
         path: impl Into<PathBuf>,
         legacy: Option<PathBuf>,
     ) -> Result<Self, RegistryError> {
         let path = path.into();
+        let mut migrated = false;
         let source = match legacy {
             Some(l) if !path.exists() && l.exists() => {
                 info!(
@@ -81,19 +109,39 @@ impl AssignmentRegistry {
                     from = %l.display(),
                     to = %path.display(),
                     "reading the pre-profiles assignment registry; \
-                     it will be rewritten under the new name on the next change",
+                     rewriting it under the new name now",
                 );
+                migrated = true;
                 l
             }
             _ => path.clone(),
         };
-        Self::load_inner(path, source)
+        let loaded = Self::load_inner(path, source)?;
+        if migrated {
+            loaded.persist()?;
+            info!(
+                target: "torrentd_engine::registry",
+                path = %loaded.path.display(),
+                entries = loaded.len(),
+                "assignment registry written under its current name",
+            );
+        }
+        Ok(loaded)
     }
 
     fn load_inner(path: PathBuf, source: PathBuf) -> Result<Self, RegistryError> {
         let map: HashMap<InfoHash, ProfileId> = match fs::read(&source) {
             Ok(bytes) if !bytes.is_empty() => {
-                let raw: HashMap<String, String> = serde_json::from_slice(&bytes)?;
+                // Deserialize the value as a `ProfileId`, not as a `String`
+                // converted afterwards. This file is the other door untrusted
+                // text comes through, and `ProfileId`'s `Deserialize` is what
+                // enforces the charset rule — a hand-edited id like `../..`
+                // otherwise reached `dir_for` and was joined onto a path with
+                // nothing in between. A bad id fails the load rather than
+                // being skipped: the map cannot be reconstructed, so dropping
+                // an entry quietly loses which torrent belonged to which
+                // account.
+                let raw: HashMap<String, ProfileId> = serde_json::from_slice(&bytes)?;
                 let mut out = HashMap::with_capacity(raw.len());
                 for (k, v) in raw {
                     let Some(ih) = InfoHash::from_hex(&k) else {
@@ -104,7 +152,7 @@ impl AssignmentRegistry {
                         );
                         continue;
                     };
-                    out.insert(ih, ProfileId::new(v));
+                    out.insert(ih, v);
                 }
                 out
             }
@@ -114,12 +162,13 @@ impl AssignmentRegistry {
         };
         info!(
             target: "torrentd_engine::registry",
-            path = %path.display(),
+            path = %source.display(),
             entries = map.len(),
             "registry loaded",
         );
         Ok(Self {
             path,
+            source,
             inner: RwLock::new(map),
         })
     }
@@ -129,6 +178,20 @@ impl AssignmentRegistry {
     }
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
+    }
+
+    /// Where the entries in memory were read from.
+    ///
+    /// The current path except on the one boot that reads a pre-rename file.
+    /// A message telling an operator to edit "those entries" has to name this
+    /// one.
+    pub fn source_path(&self) -> &Path {
+        &self.source
+    }
+
+    /// Where changes are written.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     pub fn lookup(&self, ih: &InfoHash) -> Option<ProfileId> {
@@ -344,6 +407,57 @@ mod tests {
         assert!(current.exists());
         assert_eq!(AssignmentRegistry::load(&current).unwrap().len(), 2);
         assert_eq!(AssignmentRegistry::load(&legacy).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_legacy_read_writes_the_new_file_before_anything_else_looks_for_it() {
+        // `assign` returns `Ok(())` without persisting when the info-hash is
+        // already mapped to the same profile, and on a migrated deployment in
+        // steady state the resume scan takes exactly that path for every
+        // entry — so waiting for the first change to write the new file meant
+        // it appeared at the first genuinely new assignment, which might be
+        // never. Meanwhile `startup.rs`'s refusal fires before any scan and
+        // tells the operator to edit that very file, and `docs/running.md`
+        // says the same.
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("slot_assignments.json");
+        let current = dir.path().join("profile_assignments.json");
+        {
+            let r = AssignmentRegistry::new_empty(&legacy);
+            r.assign(InfoHash([0xAA; 20]), ProfileId::new("default"))
+                .unwrap();
+        }
+
+        let r = AssignmentRegistry::load_from(&current, Some(legacy.clone())).unwrap();
+
+        assert!(
+            current.exists(),
+            "the file the refusal message quotes has to be on disk by the time it fires",
+        );
+        assert_eq!(AssignmentRegistry::load(&current).unwrap().len(), 1);
+        assert_eq!(
+            AssignmentRegistry::load(&legacy).unwrap().len(),
+            1,
+            "and the old file is still intact for a rollback",
+        );
+
+        // The entries came from the old file, and a message telling the
+        // operator which ones to look at has to be able to say so.
+        assert_eq!(r.source_path(), legacy);
+        assert_eq!(r.path(), current);
+    }
+
+    #[test]
+    fn a_registry_that_needed_no_migration_reads_and_writes_one_file() {
+        let dir = tempdir().unwrap();
+        let current = dir.path().join("profile_assignments.json");
+        let r = AssignmentRegistry::load_from(&current, None).unwrap();
+        assert_eq!(r.source_path(), current);
+        assert_eq!(r.path(), current);
+        assert!(
+            !current.exists(),
+            "nothing was migrated, so nothing is written until something changes",
+        );
     }
 
     #[test]

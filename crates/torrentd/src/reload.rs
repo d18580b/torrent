@@ -1,9 +1,20 @@
 //! SIGHUP reload pump.
 //!
-//! Reloadable fields Management: connections_limit,
-//! upload_rate_limit, max_concurrent_http_announces, aio_threads,
-//! enable_lsd, log_level. Everything else triggers a `warn` and is
-//! ignored.
+//! Reloadable: `connections_limit`, `upload_rate_limit`,
+//! `max_concurrent_http_announces`, `aio_threads`, `enable_lsd`, `log_level`.
+//! Everything else triggers a `warn` and is ignored.
+//!
+//! Two of those do not reach every session, and a flat list said they did:
+//!
+//! - `enable_lsd` is **withheld from every `network = "vpn"` profile**. Safety
+//!   Rule 6 says a tunnelled profile runs with LSD off unconditionally and
+//!   that no config key can turn it on, so a reload must not be the exception.
+//! - `upload_rate_limit` is **withheld from a profile that sets its own**,
+//!   which `startup.rs` applies over the top-level value at boot. Otherwise
+//!   editing only the top-level key discards every per-profile override until
+//!   the next restart.
+//!
+//! `ConfigDiff::to_settings_patch_for` is where both hold, per profile.
 
 use std::path::PathBuf;
 use std::sync::Arc;

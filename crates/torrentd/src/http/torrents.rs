@@ -300,12 +300,10 @@ async fn do_add(
         ));
     };
 
-    let engine = s.source.engine_for(&profile_id).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "unknown profile_id"})),
-        )
-    })?;
+    let engine = s
+        .source
+        .engine_for(&profile_id)
+        .ok_or_else(|| unresolved_profile(s, &profile_id))?;
 
     // Don't accept new torrents into a fenced (VpnDown) profile — they would land
     // paused and mislead the operator into thinking the profile is healthy.
@@ -340,10 +338,7 @@ async fn do_add(
         }
     };
     let Some(profile_cfg) = s.profile_config(&profile_id) else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "unknown profile_id"})),
-        ));
+        return Err(unresolved_profile(s, &profile_id));
     };
     let flags = torrentd_engine::seed_flags(profile_cfg);
 
@@ -533,11 +528,43 @@ pub async fn remove(
                 Json(serde_json::json!({"error": format!("{e}")})),
             )
         })?;
+        // And the two stores. Clearing the registry entry alone does not
+        // hold: `startup.rs` re-scans `<resume_dir>/<id>` and
+        // `<torrent_dir>/<id>` at the next start and re-`assign`s every
+        // info-hash it finds, so the operator's clear is silently undone the
+        // first time the daemon restarts. The engine-backed path gets this
+        // for free through `TorrentRemoved` -> `handlers/add.rs`; with no
+        // session there is no alert, so it is done here.
+        //
+        // Reported rather than warned: a clear that will resurrect is not a
+        // clear, and this branch exists precisely because the operator had no
+        // other way to make it stick. Both deletes are no-ops on a missing
+        // file, so an error here means the filesystem, not a race.
+        let store_err = |what: &str, e: String| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "the assignment was cleared but the {what} could not be deleted: {e}. \
+                         The startup scan will re-assign this info-hash until it is gone; \
+                         retry the delete."
+                    )
+                })),
+            )
+        };
+        s.resume
+            .delete(&profile, &ih)
+            .map_err(|e| store_err("resume file", e.to_string()))?;
+        s.torrents
+            .delete(&profile, &ih)
+            .map_err(|e| store_err(".torrent file", e.to_string()))?;
         tracing::warn!(
             target: "torrentd::http",
             infohash = %ih,
             profile_id = %profile,
-            "cleared an assignment whose profile has no running session",
+            "cleared an assignment whose profile has no running session, and \
+             deleted its resume and .torrent files so the startup scan does not \
+             re-assign it",
         );
         return Ok(StatusCode::NO_CONTENT);
     };
@@ -555,7 +582,25 @@ pub async fn remove(
                 Json(serde_json::json!({"error": format!("{e}")})),
             )
         })?;
-    let _ = s.registry.remove(&ih);
+    // Report a persist failure rather than discarding it. On a full or
+    // read-only state directory the payload is gone and the assignment write
+    // fails, and a 204 here said the delete succeeded — so the claim comes
+    // back from the file at the next restart, over a torrent that no longer
+    // exists, and clearing it then is the hard case. The no-engine branch
+    // above already reports this; this one now matches. The removal from the
+    // session has already happened, which the message says, so a retry is
+    // about the assignment alone.
+    s.registry.remove(&ih).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!(
+                    "the torrent was removed from its session but its assignment could not be \
+                     cleared: {e}. Retry the delete to clear the assignment."
+                )
+            })),
+        )
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -721,6 +766,33 @@ fn bad_infohash() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// The answer for a `profile_id` that resolves to no engine.
+///
+/// 409 with the reason where the profile is configured and failed to come up,
+/// 400 "unknown profile_id" only where the id names nothing. A failed profile
+/// carries no engine by construction, so every `engine_for` site reached the
+/// second answer and told an operator whose tunnel had failed that their
+/// profile did not exist — the trace-less answer `profile_registry.rs` says
+/// the failed list exists to end, and `http/profiles.rs` already argues the
+/// distinction in the same words.
+fn unresolved_profile(
+    s: &AppState,
+    profile_id: &ProfileId,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match s.profile_failure_reason(profile_id) {
+        Some(reason) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("profile failed to start: {reason}"),
+            })),
+        ),
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "unknown profile_id"})),
+        ),
+    }
+}
+
 fn vpn_down() -> (StatusCode, Json<serde_json::Value>) {
     (
         StatusCode::CONFLICT,
@@ -793,6 +865,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clearing_a_stale_assignment_deletes_the_metadata_that_would_resurrect_it() {
+        // Clearing the registry entry alone does not hold: `startup.rs`
+        // re-scans `<resume_dir>/<id>` and `<torrent_dir>/<id>` at the next
+        // start and re-`assign`s every info-hash it finds, so the operator's
+        // clear is silently undone by the first restart. The engine-backed
+        // path gets both stores cleaned through `TorrentRemoved`; this branch
+        // has no session and therefore no alert.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+        let app = state_with_a_stale_assignment(dir.path(), ih);
+        let profile = ProfileId::new("gone");
+
+        app.resume.write(&profile, &ih, b"resume-bytes").unwrap();
+        app.torrents.write(&profile, &ih, b"torrent-bytes").unwrap();
+        assert_eq!(app.resume.load_all(&profile).unwrap().len(), 1);
+        assert_eq!(app.torrents.load_all(&profile).unwrap().len(), 1);
+
+        let code = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery {
+                delete_files: false,
+            }),
+        )
+        .await
+        .expect("delete must succeed");
+
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        assert!(app.registry.lookup(&ih).is_none());
+        assert!(
+            app.resume.load_all(&profile).unwrap().is_empty(),
+            "the resume file survives, so the next startup scan re-assigns this info-hash",
+        );
+        assert!(
+            app.torrents.load_all(&profile).unwrap().is_empty(),
+            "the .torrent survives, so the torrent-dir scan re-assigns this info-hash",
+        );
+    }
+
+    #[tokio::test]
     async fn clearing_a_stale_assignment_refuses_to_pretend_it_deleted_the_payload() {
         // The payload is reachable only through the session, and there is no
         // session. Reporting 204 for a `delete_files` request would claim a
@@ -827,6 +939,68 @@ mod tests {
         assert!(
             app.registry.lookup(&ih).is_some(),
             "entry was cleared anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering_204() {
+        // `let _ = s.registry.remove(&ih)` discarded the persist error after
+        // `remove_torrent` had already succeeded. On a full or read-only
+        // state directory the payload is gone, the assignment write fails,
+        // and the handler answered 204 — so the claim comes back from the
+        // file at the next restart, over a torrent that no longer exists, and
+        // the re-add it then blocks answers 409. The no-engine branch above
+        // already reported this; this one did not.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+
+        let mut app = test_state(dir.path());
+        // A registry whose file cannot be written. Its "directory" is a
+        // regular file, so the atomic write fails at `create_dir_all` — which
+        // is what a state directory that has gone away, filled up or turned
+        // read-only looks like from here.
+        std::fs::write(dir.path().join("blocker"), b"not a directory").unwrap();
+        app.registry = Arc::new(AssignmentRegistry::new_empty(
+            dir.path().join("blocker").join("reg.json"),
+        ));
+        // `p` is the profile `build_test_state` gives a session to, so this
+        // takes the engine-backed branch.
+        let profile = ProfileId::new("p");
+        app.state.insert(
+            ih,
+            torrentd_engine::TorrentState::newly_added(
+                torrentd_engine::TorrentHandle {
+                    id: 1,
+                    infohash: ih,
+                },
+                profile.clone(),
+                std::time::Instant::now(),
+            ),
+        );
+        // `assign` inserts in memory and then fails to persist, which is
+        // exactly the state a delete has to cope with: the registry knows who
+        // owns it and cannot write that down.
+        assert!(
+            app.registry.assign(ih, profile).is_err(),
+            "fixture is wrong: the registry file must be unwritable",
+        );
+        assert!(app.registry.lookup(&ih).is_some());
+
+        let err = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery {
+                delete_files: false,
+            }),
+        )
+        .await
+        .expect_err("a delete whose assignment write failed is not a success");
+
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let msg = err.1 .0["error"].as_str().unwrap().to_string();
+        assert!(
+            msg.contains("assignment could not be cleared"),
+            "the operator has to know which half failed: {msg}",
         );
     }
 
