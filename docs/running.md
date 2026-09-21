@@ -129,8 +129,8 @@ Copy [`deploy/torrentd.sample.toml`](../deploy/torrentd.sample.toml) to
 `/etc/torrentd/torrentd.toml`. Unknown keys are a fatal startup error, so a
 typo is caught rather than ignored.
 
-**Required** — the daemon will not start without all four, plus at least one
-`[[profile]]`:
+**Required** — the daemon will not start without the first three, a stated
+authentication posture, and at least one `[[profile]]`:
 
 | Key | Meaning |
 | --- | --- |
