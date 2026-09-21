@@ -152,6 +152,25 @@ fn check_config_with_subcommand(cli: &Cli) -> Option<String> {
     ))
 }
 
+/// Whether this subcommand qualifies for the operator-tool exemption.
+///
+/// The exemption is justified on the ground that these subcommands "construct
+/// no session and bind nothing", so a check about serving is judging something
+/// they do not do. `vpn check --bring-up` is the one invocation here for which
+/// that is not the whole truth: it raises a real WireGuard tunnel on the host.
+/// A configuration the daemon refuses to start from should not be usable to
+/// mutate the host, so `--bring-up` takes the daemon's full check. Plain `vpn
+/// check` is observe-only and keeps the exemption — it is exactly the
+/// pre-flight an operator runs against the config they are trying to fix.
+fn is_exempt_operator_tool(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Vpn {
+            cmd: cli::VpnCmd::Check { bring_up: true, .. }
+        }
+    )
+}
+
 /// Load the config with the validation this invocation actually needs.
 ///
 /// The daemon and `--check-config` get the full check, authentication posture
@@ -159,9 +178,11 @@ fn check_config_with_subcommand(cli: &Cli) -> Option<String> {
 /// An operator subcommand gets everything but the posture — it constructs no
 /// session and binds nothing, and holding it to a check about serving is what
 /// made `hash-password` unreachable from the very configs the refusal sends an
-/// operator to it to fix.
+/// operator to it to fix. `vpn check --bring-up` is excluded from that, per
+/// [`is_exempt_operator_tool`].
 fn load_config(cli: &Cli) -> anyhow::Result<config::Config> {
-    let is_operator_tool = cli.command.is_some() && !cli.check_config;
+    let is_operator_tool =
+        cli.command.as_ref().is_some_and(is_exempt_operator_tool) && !cli.check_config;
     let loaded = if is_operator_tool {
         config::Config::load_for_operator_tool(&cli.config)
     } else {
@@ -326,6 +347,38 @@ mod tests {
     }
 
     #[test]
+    fn bringing_a_tunnel_up_is_not_exempt_but_checking_one_is() {
+        // The property: the operator-tool exemption is justified on
+        // "they construct no session and bind nothing". `vpn check
+        // --bring-up` raises a real WireGuard tunnel on the host, so it is
+        // held to the daemon's full check — a configuration the daemon
+        // refuses to start from must not be usable to mutate the host.
+        //
+        // Plain `vpn check` keeps the exemption, because the pre-flight has
+        // to work on exactly the config an operator is trying to fix. Both
+        // arms are pinned: dropping either one is the whole of this change.
+        let dir = tempfile::tempdir().unwrap();
+        let p = non_loopback_without_auth(dir.path());
+        let path = p.to_str().unwrap();
+
+        let cli = Cli::parse_from(["torrentd", "--config", path, "vpn", "check", "--bring-up"]);
+        let msg = format!(
+            "{:#}",
+            load_config(&cli).expect_err("--bring-up mutates the host and is not exempt"),
+        );
+        assert!(
+            msg.contains("allow_unauthenticated"),
+            "the refusal must be the posture one; got: {msg}",
+        );
+
+        let cli = Cli::parse_from(["torrentd", "--config", path, "vpn", "check"]);
+        assert!(
+            load_config(&cli).is_ok(),
+            "observe-only `vpn check` keeps the exemption",
+        );
+    }
+
+    #[test]
     fn check_config_beside_a_subcommand_is_refused_naming_both() {
         // The property: an invocation that asks for two incompatible
         // validations is refused rather than silently resolved in favour of
@@ -339,13 +392,30 @@ mod tests {
         // The message must name both, because the operator has to know which
         // half to drop.
         for (argv, sub) in [
-            (vec!["torrentd", "-c", "x", "--check-config", "hash-password"], "hash-password"),
             (
-                vec!["torrentd", "-c", "x", "--check-config", "new-token", "--name", "ci"],
+                vec!["torrentd", "-c", "x", "--check-config", "hash-password"],
+                "hash-password",
+            ),
+            (
+                vec![
+                    "torrentd",
+                    "-c",
+                    "x",
+                    "--check-config",
+                    "new-token",
+                    "--name",
+                    "ci",
+                ],
                 "new-token",
             ),
-            (vec!["torrentd", "-c", "x", "--check-config", "pool", "status"], "pool status"),
-            (vec!["torrentd", "-c", "x", "--check-config", "vpn", "check"], "vpn check"),
+            (
+                vec!["torrentd", "-c", "x", "--check-config", "pool", "status"],
+                "pool status",
+            ),
+            (
+                vec!["torrentd", "-c", "x", "--check-config", "vpn", "check"],
+                "vpn check",
+            ),
         ] {
             let cli = Cli::parse_from(argv.clone());
             let msg = check_config_with_subcommand(&cli)
