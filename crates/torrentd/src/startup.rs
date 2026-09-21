@@ -511,12 +511,19 @@ pub async fn boot(
             // flag precisely because they do not want traffic on the bare
             // address; warning and continuing would give them exactly that,
             // with a startup log line as the only trace.
+            //
+            // `--check-config` reproduces the configured-set half of this
+            // (`Config::check_boot_rules`), so a config with no vpn profile
+            // fails the systemd pre-flight. This check stays because it reads
+            // the profiles that actually came up: a config with one vpn
+            // profile whose tunnel failed lands here too, and no config check
+            // could have known.
+            cfg.check_boot_rules()?;
             anyhow::bail!(
-                "network_kill_switch = true but no profile uses network = \"vpn\". \
-                 The kill switch confines the daemon's egress to its profiles' tunnel \
-                 interfaces; with no tunnel there is nothing to confine it to, and \
-                 every profile would keep seeding from the host's own address with no \
-                 backstop. Configure a vpn profile, or unset network_kill_switch.",
+                "network_kill_switch = true and no configured vpn profile came up, so there is \
+                 no tunnel to confine the daemon's egress to. Every profile would keep seeding \
+                 from the host's own address with no backstop. Fix the tunnel bring-up reported \
+                 above, or unset network_kill_switch.",
             );
         }
         let uid = vpn::killswitch::enable(&tunnels)
@@ -777,6 +784,50 @@ pub async fn boot(
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call.
     let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
+
+    // Two artefacts persist a torrent→profile mapping, and nothing reconciled
+    // them: `profile_assignments.json`, which the resume scan above writes and
+    // every load is gated on, and the pool index's `torrent.profile` column,
+    // which `pool scan` writes and an operator may never run. The registry is
+    // the authority and the column is a cache of it — said so in both module
+    // docs now — but where the two disagree, the disagreement was previously
+    // resolved by whichever code path a reader happened to be in. Name both
+    // values instead. Read-only: rewriting an operator's index during boot is
+    // not this check's business.
+    if let Some(pool) = pool.as_ref() {
+        let stale = pool.with_store(|st| {
+            let mut out: Vec<(String, String, String)> = Vec::new();
+            for t in st.torrents().unwrap_or_default() {
+                let Some(indexed) = t.profile.as_deref() else {
+                    continue;
+                };
+                let Some(ih) = libtorrent_safe::InfoHash::from_hex(&t.infohash) else {
+                    continue;
+                };
+                if let Some(owner) = registry.lookup(&ih) {
+                    if owner.as_str() != indexed {
+                        out.push((
+                            t.infohash.clone(),
+                            owner.as_str().to_string(),
+                            indexed.to_string(),
+                        ));
+                    }
+                }
+            }
+            out
+        });
+        for (infohash, registry_profile, index_profile) in &stale {
+            warn!(
+                infohash = %infohash,
+                registry_profile = %registry_profile,
+                index_profile = %index_profile,
+                "the pool index and the assignment registry disagree about who owns this \
+                 torrent; the registry is authoritative and the index is a cache of it, so \
+                 `torrentd pool scan` will bring the index back into line",
+            );
+        }
+        metrics.set_gauge("pool_index_profile_disagreements", stale.len() as f64, &[]);
+    }
 
     // Alert loop.
     let metrics_for_loop: Arc<dyn MetricsSink> = metrics.clone();
