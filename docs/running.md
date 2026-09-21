@@ -124,6 +124,30 @@ What the daemon does and does not create:
 - **Must already exist:** `[pool] roots` and `library_dir`. Missing roots are a
   scan-time error, not a config error.
 
+The daemon also writes small state files of its own, beside the resume data, in
+**the parent of `resume_dir`** (`/var/lib/torrentd` under the shipped unit).
+It creates that directory if it is missing. Both kinds are safe
+to delete **while the daemon is stopped**, and neither is safe to delete while
+it is running:
+
+- **`openvpn-<iface>.pid`** — the pid `openvpn --writepid` recorded for an
+  OpenVPN slot. It is the only handle the teardown has on that process, and it
+  is verified against `/proc/<pid>/cmdline` before anything is signalled, so a
+  recycled pid is not signalled. Delete it while the daemon is running and the
+  tunnel survives the next shutdown.
+- **`wireguard-<iface>.raised`** — a note that *this boot of this host* raised
+  that WireGuard interface. It is what lets a restart after an unclean
+  shutdown adopt the tunnel still standing instead of leaving the slot dark,
+  for profiles that keep the key out of the `.conf`
+  (`PostUp = wg set %i private-key …`). It carries the host's boot id, so it is
+  never believed after a reboot; the daemon discards it at startup if the
+  interface it names is gone, and again whenever it declines to adopt one.
+  Deleting it costs at most one adoption.
+
+> If you point `resume_dir` somewhere else, these move with it — and
+> `ReadWritePaths=` has to list wherever they land, or the daemon logs that it
+> could not record a raised interface and the adoption above stops working.
+
 > **`ProtectSystem=strict` will refuse to start the unit** if anything in
 > `ReadWritePaths=` does not exist. The shipped unit lists
 > `/var/lib/torrentd /data/torrents`. If you point any path at somewhere else,
@@ -368,6 +392,7 @@ On a scratch pool, not your real one.
 | `/healthz` 503 `all_slots_fenced` | Every configured slot is out of service — its tunnel is down, or it never came up at boot — so the daemon is seeding nothing. Check `/slots`, which lists both kinds, bring the tunnels back, then restart — fenced slots do not resume themselves by design. |
 | Daemon refuses to start, "vpn_profile must be /etc/wireguard/…" | A WireGuard slot's profile is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run as `torrentd` with `CAP_NET_ADMIN`. |
+| One slot fenced at boot, log says "an interface of this name is already up and is not this slot's" | A link named by that slot's `vpn_interface` is standing and this boot could not establish that the daemon raised it — a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. **The daemon leaves it completely alone**: it will not `wg-quick down` something it cannot vouch for, because that would take a stranger's routes and rules with it. Find out whose it is (`wg show <iface>`, `ip -d link show <iface>`). If it is yours, rename one of the two. If it is stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart — the daemon discards the matching `wireguard-<iface>.raised` (§4) by itself, at the next startup and whenever it declines an adoption, so there is nothing to clean up after it. |
 | Adds fail with 409 and `vpn_down` | The slot is fenced. An operator restart is required by design. |
 | Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
 | Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole slot when its tunnel drops. Check `/slots`, then `POST /slots/<id>/resume-all`. |
