@@ -247,11 +247,18 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
             .or(Some(peer)),
     };
 
-    let secure = last_element(req, "x-forwarded-proto")
-        .is_some_and(|p| p.eq_ignore_ascii_case("https"))
-        || forwarded
+    // The same precedence, for the scheme. An `||` across the two headers
+    // lets a client-supplied `proto=https` override the trusted proxy's
+    // explicit `X-Forwarded-Proto: http`, which issues the session cookie
+    // `Secure` over a plain-HTTP request: the browser then neither stores nor
+    // returns it over http:// and the operator cannot log in at all. One
+    // function must not carry two opposite rules.
+    let secure = match last_element(req, "x-forwarded-proto") {
+        Some(proto) => proto.eq_ignore_ascii_case("https"),
+        None => forwarded
             .and_then(|f| param(f, "proto"))
-            .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+            .is_some_and(|p| p.eq_ignore_ascii_case("https")),
+    };
 
     Client { ip, secure }
 }
@@ -542,6 +549,46 @@ mod tests {
              to name its client",
         );
         assert!(c.secure);
+    }
+
+    #[test]
+    fn an_explicit_x_forwarded_proto_is_not_overridden_by_forwarded() {
+        // The scheme follows the same precedence as the address. The trusted
+        // proxy terminated plain HTTP and said so; a client whose `Forwarded`
+        // the proxy passed through verbatim — nginx's default for a header it
+        // does not know — must not turn that into https. It would issue the
+        // session cookie `Secure` over a plain-HTTP request, and the browser
+        // then neither stores nor returns it over http://, so the operator
+        // cannot log in at all.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[("x-forwarded-proto", "http"), ("forwarded", "proto=https")],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            !c.secure,
+            "X-Forwarded-Proto decides where it is present; Forwarded is the \
+             fallback, not a second opinion",
+        );
+    }
+
+    #[test]
+    fn a_single_forwarded_element_still_supplies_the_scheme() {
+        // The other direction of the same rule, so precedence is pinned both
+        // ways: with no `X-Forwarded-Proto` there is nothing to take
+        // precedence over, and a proxy emitting only RFC 7239 still sets
+        // `Secure`. One element, so last-wins has nothing to discard either.
+        let c = resolve(
+            &req("10.1.2.3", &[("forwarded", "proto=https")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            c.secure,
+            "Forwarded is the fallback where X-Forwarded-Proto is absent, and \
+             a fallback that never fires is not a fallback",
+        );
     }
 
     #[test]
