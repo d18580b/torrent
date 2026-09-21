@@ -11,6 +11,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use serde::Serialize;
+use torrentd_engine::MetricsSink;
 use torrentd_engine::SlotId;
 use torrentd_pool::AdoptionState;
 use torrentd_pool::DirRollup;
@@ -386,46 +387,57 @@ pub async fn adopt(
             .with_store(|st| torrentd_pool::adopt::plan(st, &ih, |id| pool.root_path_of(id)))
             .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
-        match plan {
-            torrentd_pool::AdoptPlan::Refuse { reason } => resp.refused.push(RefusedTorrent {
-                infohash: ih,
-                reason: reason.to_string(),
-            }),
-            torrentd_pool::AdoptPlan::FastPath { .. } => {
-                if req.dry_run {
-                    resp.fast_path.push(ih);
-                    continue;
-                }
-                match execute_adopt(pool, &s.source, &ih, slot.clone()) {
-                    Ok(_) => {
-                        assign_in_registry(&s, &ih, &slot);
-                        resp.fast_path.push(ih);
-                    }
-                    Err(reason) => resp.refused.push(RefusedTorrent {
-                        infohash: ih,
-                        reason,
-                    }),
-                }
+        // The two adoptable outcomes differ only in which bucket they land in
+        // and whether their bytes are counted, so collapse them: everything
+        // after this point — the registry claim above all — must hold for both,
+        // and holding it in two branches is how it came to hold in neither.
+        let verifies = match plan {
+            torrentd_pool::AdoptPlan::Refuse { reason } => {
+                resp.refused.push(RefusedTorrent {
+                    infohash: ih,
+                    reason: reason.to_string(),
+                });
+                continue;
             }
-            torrentd_pool::AdoptPlan::Verify { .. } => {
-                let size = pool
-                    .with_store(|st| st.torrent(&ih).ok().flatten().map(|t| t.total_size))
-                    .unwrap_or(0);
-                resp.verify_bytes += size;
-                if req.dry_run {
-                    resp.queued_for_verification.push(ih);
-                    continue;
-                }
-                match execute_adopt(pool, &s.source, &ih, slot.clone()) {
-                    Ok(_) => {
-                        assign_in_registry(&s, &ih, &slot);
-                        resp.queued_for_verification.push(ih);
-                    }
-                    Err(reason) => resp.refused.push(RefusedTorrent {
-                        infohash: ih,
-                        reason,
-                    }),
-                }
+            torrentd_pool::AdoptPlan::FastPath { .. } => false,
+            torrentd_pool::AdoptPlan::Verify { .. } => true,
+        };
+
+        if verifies {
+            resp.verify_bytes += pool
+                .with_store(|st| st.torrent(&ih).ok().flatten().map(|t| t.total_size))
+                .unwrap_or(0);
+        }
+        if req.dry_run {
+            bucket(&mut resp, verifies).push(ih);
+            continue;
+        }
+
+        // Safety Rules 3 and 4, in the order they are written: the registry is
+        // the authority on which slot owns an info-hash, and it is consulted
+        // *before* any session receives the torrent.
+        //
+        // Claiming afterwards could not enforce anything. libtorrent refuses a
+        // duplicate within one session, but a slot is a whole separate session
+        // by construction, so an info-hash already seeding in slot A was free
+        // to be adopted into slot B and start announcing from a second account
+        // — the permanent-ban case Rule 3 exists for — while the conflict was
+        // recorded as a warning after the fact.
+        if let Err(reason) = claim_in_registry(&s, &ih, &slot) {
+            resp.refused.push(RefusedTorrent {
+                infohash: ih,
+                reason,
+            });
+            continue;
+        }
+        match execute_adopt(pool, &s.source, &ih, slot.clone()) {
+            Ok(_) => bucket(&mut resp, verifies).push(ih),
+            Err(reason) => {
+                release_claim(&s, &ih);
+                resp.refused.push(RefusedTorrent {
+                    infohash: ih,
+                    reason,
+                });
             }
         }
     }
@@ -441,20 +453,53 @@ pub async fn adopt(
     Ok(Json(resp))
 }
 
-/// Mirror the adoption into the assignment registry, which is still the
-/// authority for the cross-slot info-hash uniqueness rule that `POST /torrents`
-/// enforces. A conflict here means the torrent is already loaded in another
-/// slot; the add itself will have failed, so this only logs.
-fn assign_in_registry(s: &AppState, infohash: &str, slot: &SlotId) {
+/// Which response bucket an adopted torrent belongs in.
+fn bucket(resp: &mut AdoptResponse, verifies: bool) -> &mut Vec<String> {
+    if verifies {
+        &mut resp.queued_for_verification
+    } else {
+        &mut resp.fast_path
+    }
+}
+
+/// Claim `infohash` for `slot` before any session sees it.
+///
+/// Deliberately the same shape as the claim in `POST /torrents`: an info-hash
+/// already mapped to *any* slot is a refusal rather than a warning, because the
+/// registry is the only thing that can see across slots. `assign` re-checks
+/// uniqueness under its own lock, which closes the gap between the lookup and
+/// the insert.
+fn claim_in_registry(s: &AppState, infohash: &str, slot: &SlotId) -> Result<(), String> {
+    let Some(ih) = libtorrent_safe::InfoHash::from_hex(infohash) else {
+        return Err("malformed info-hash".to_string());
+    };
+    if let Some(existing) = s.registry.lookup(&ih) {
+        s.metrics.inc_counter(
+            "slot_assignment_registry_errors_total",
+            &[("slot_id", slot.as_str())],
+        );
+        return Err(format!("info-hash already loaded in slot {existing}"));
+    }
+    s.registry.assign(ih, slot.clone()).map_err(|e| {
+        s.metrics.inc_counter(
+            "slot_assignment_registry_errors_total",
+            &[("slot_id", slot.as_str())],
+        );
+        format!("{e}")
+    })
+}
+
+/// Release a claim whose add then failed, so the info-hash can be retried.
+fn release_claim(s: &AppState, infohash: &str) {
     let Some(ih) = libtorrent_safe::InfoHash::from_hex(infohash) else {
         return;
     };
-    if let Err(e) = s.registry.assign(ih, slot.clone()) {
+    if let Err(e) = s.registry.remove(&ih) {
         tracing::warn!(
             target: "torrentd::http::pool",
             infohash = %infohash,
             error.cause = %e,
-            "adopted torrent could not be recorded in the assignment registry",
+            "could not release the registry claim of a failed adopt",
         );
     }
 }
@@ -801,4 +846,68 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use torrentd_engine::InfoHash;
+
+    use super::*;
+    use crate::app_state::build_test_state;
+
+    const IH: &str = "0101010101010101010101010101010101010101";
+
+    #[test]
+    fn adopting_an_infohash_another_slot_holds_is_refused() {
+        // Safety Rule 3. libtorrent cannot see this: a slot is a separate
+        // session, so the add into slot B would have succeeded and the same
+        // info-hash would have started announcing from a second account. The
+        // registry is the only thing with a cross-slot view, which is why the
+        // claim has to happen before the session ever sees the torrent.
+        let s = build_test_state(None);
+        let ih = InfoHash::from_hex(IH).unwrap();
+        s.registry.assign(ih, SlotId::new("acct_a")).unwrap();
+
+        let err = claim_in_registry(&s, IH, &SlotId::new("acct_b")).unwrap_err();
+        assert!(err.contains("already loaded in slot acct_a"), "got {err}");
+    }
+
+    #[test]
+    fn a_free_infohash_is_claimed_before_the_add() {
+        let s = build_test_state(None);
+        let slot = SlotId::new("acct_a");
+        assert!(claim_in_registry(&s, IH, &slot).is_ok());
+
+        let ih = InfoHash::from_hex(IH).unwrap();
+        assert_eq!(s.registry.lookup(&ih), Some(slot));
+    }
+
+    #[test]
+    fn re_adopting_a_torrent_this_slot_already_holds_is_refused() {
+        // Not a no-op: the session already has it, and `duplicate_is_error`
+        // would reject the add anyway. Refusing here keeps the message honest
+        // and means a failed add can always release its own claim safely.
+        let s = build_test_state(None);
+        let slot = SlotId::new("acct_a");
+        claim_in_registry(&s, IH, &slot).unwrap();
+
+        let err = claim_in_registry(&s, IH, &slot).unwrap_err();
+        assert!(err.contains("already loaded in slot acct_a"), "got {err}");
+    }
+
+    #[test]
+    fn a_released_claim_can_be_retried() {
+        let s = build_test_state(None);
+        let slot = SlotId::new("acct_a");
+        claim_in_registry(&s, IH, &slot).unwrap();
+        release_claim(&s, IH);
+        assert!(claim_in_registry(&s, IH, &slot).is_ok());
+    }
+
+    #[test]
+    fn a_malformed_infohash_never_reaches_the_registry() {
+        let s = build_test_state(None);
+        assert!(claim_in_registry(&s, "not-hex", &SlotId::new("acct_a")).is_err());
+        assert_eq!(s.registry.len(), 0);
+    }
 }
