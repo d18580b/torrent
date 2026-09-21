@@ -59,6 +59,75 @@ use crate::vpn;
 /// healthy is the worst of both answers.
 const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Undoes what `boot` raised on the host, for every exit from `boot` that is
+/// not a successful one.
+///
+/// Tunnels and the nftables kill-switch table outlive the process that created
+/// them, and `boot` has a dozen `?`s after the point where it starts creating
+/// them — a pool database that will not open, a resume directory that cannot
+/// be read. Each of those used to leave the host with live tunnels, a table
+/// confining a uid that no longer exists, and no daemon to explain either.
+///
+/// Armed from construction; `disarm` hands ownership to the shutdown path.
+#[derive(Debug)]
+struct BootCleanup {
+    run_dir: std::path::PathBuf,
+    tunnels: Vec<(torrentd_engine::VpnType, String)>,
+    kill_switch: bool,
+    armed: bool,
+}
+
+impl BootCleanup {
+    fn new(run_dir: std::path::PathBuf) -> Self {
+        Self {
+            run_dir,
+            tunnels: Vec::new(),
+            kill_switch: false,
+            armed: true,
+        }
+    }
+
+    /// Record a tunnel this boot raised.
+    fn note_tunnel(&mut self, t: torrentd_engine::VpnType, iface: &str) {
+        self.tunnels.push((t, iface.to_string()));
+    }
+
+    fn note_kill_switch(&mut self) {
+        self.kill_switch = true;
+    }
+
+    /// Bring one tunnel down now and stop tracking it — for a slot that failed
+    /// after its tunnel came up, whose tunnel must go even if boot succeeds.
+    fn take_down(&mut self, iface: &str) {
+        if let Some(i) = self.tunnels.iter().position(|(_, n)| n == iface) {
+            let (t, name) = self.tunnels.remove(i);
+            crate::vpn::for_type(t, &self.run_dir).bring_down(&name);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for BootCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.kill_switch {
+            match crate::vpn::killswitch::disable() {
+                Ok(()) => info!("boot failed: network kill switch removed"),
+                Err(e) => warn!(error.cause = %e, "boot failed: could not remove kill switch"),
+            }
+        }
+        for (t, iface) in std::mem::take(&mut self.tunnels) {
+            warn!(vpn_iface = %iface, "boot failed: bringing tunnel down");
+            crate::vpn::for_type(t, &self.run_dir).bring_down(&iface);
+        }
+    }
+}
+
 pub struct DaemonHandle {
     cfg: Config,
     /// The `--config` path exactly as parsed by clap. Threaded through rather
@@ -98,6 +167,30 @@ pub async fn boot(
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
+
+    // Signals, installed before anything that can block or fail.
+    //
+    // They used to go in after the resume and torrent-dir scans, which left
+    // the whole of startup running on the default disposition — and startup is
+    // where the daemon spends up to 30 seconds *per slot* waiting for a tunnel
+    // to come up. A SIGTERM in that window killed the process outright, with
+    // every tunnel it had already raised still up and nothing left to take
+    // them down.
+    let channels = SignalChannels::new();
+    let (reload_tx, reload_rx) = mpsc::channel::<()>(8);
+    let channels = SignalChannels::from_parts(channels.shutdown_tx, reload_tx);
+    // Drop the receiver returned by signals::run; we wired our own pair.
+    let _ = signals::run(channels.clone(), 8).await;
+    let shutdown_tx = channels.shutdown_tx;
+    // Subscribed before the slot loop so a signal raised during bring-up is
+    // still there to be observed when the loop next checks.
+    let mut boot_shutdown = shutdown_tx.subscribe();
+
+    // Undoes what boot has raised, for every exit that is not a successful
+    // one. Tunnels and the kill-switch table outlive the process, so a `?`
+    // anywhere after the slot loop used to leave a host with live tunnels, an
+    // nftables table confining a uid that no longer exists, and no daemon.
+    let mut cleanup = BootCleanup::new(run_dir.clone());
 
     // Resume store — rooted at the top-level `resume_dir` and partitioned by
     // slot id, except where a `[[slot]]` names its own directory. Those keys
@@ -173,9 +266,18 @@ pub async fn boot(
                 // 1) Bring the VPN up first. Safety Rule 1: if it
                 //    fails, the slot's lt::session is never constructed
                 //    — no bare-IP fallback.
+                // A shutdown asked for during a previous slot's bring-up is
+                // honoured here rather than after every remaining tunnel has
+                // been raised.
+                if boot_shutdown.try_recv().is_ok() {
+                    anyhow::bail!("shutdown requested during slot bring-up");
+                }
                 let vpn = vpn::for_type(s.vpn_type, &run_dir);
                 let tunnel_ip = match vpn.bring_up(&s.vpn_profile()) {
-                    Ok(ip) => ip,
+                    Ok(ip) => {
+                        cleanup.note_tunnel(s.vpn_type, &s.vpn_interface);
+                        ip
+                    }
                     Err(e) => {
                         error!(
                             slot_id = %s.id,
@@ -200,7 +302,7 @@ pub async fn boot(
                         None => {
                             // validate_set should have caught this; be defensive.
                             error!(slot_id = %s.id, "static slot missing listen_port; slot disabled");
-                            vpn.bring_down(&s.vpn_interface);
+                            cleanup.take_down(&s.vpn_interface);
                             fail_slot!(s, "static slot has no listen_port".to_string());
                         }
                     },
@@ -210,7 +312,7 @@ pub async fn boot(
                             Ok(ip) => ip,
                             Err(e) => {
                                 error!(slot_id = %s.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; slot disabled");
-                                vpn.bring_down(&s.vpn_interface);
+                                cleanup.take_down(&s.vpn_interface);
                                 fail_slot!(s, format!("invalid port_forward_gateway: {e}"));
                             }
                         };
@@ -227,7 +329,7 @@ pub async fn boot(
                             }
                             Err(e) => {
                                 error!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; slot disabled (no bare-IP fallback)");
-                                vpn.bring_down(&s.vpn_interface);
+                                cleanup.take_down(&s.vpn_interface);
                                 fail_slot!(s, format!("NAT-PMP negotiation failed: {e}"));
                             }
                         }
@@ -269,7 +371,7 @@ pub async fn boot(
                             error.cause = %e,
                             "slot engine construction failed; tearing down VPN",
                         );
-                        vpn.bring_down(&s.vpn_interface);
+                        cleanup.take_down(&s.vpn_interface);
                         failed_slots.push(crate::slot_registry::FailedSlot {
                             config: s.clone(),
                             reason: format!("session construction failed: {e}"),
@@ -304,6 +406,7 @@ pub async fn boot(
                 let uid = vpn::killswitch::enable(&tunnels)
                     .context("install nftables kill switch (network_kill_switch=true)")?;
                 kill_switch_active = true;
+                cleanup.note_kill_switch();
                 metrics.set_gauge("kill_switch_active", 1.0, &[]);
                 info!(uid, "network kill switch active");
             }
@@ -487,15 +590,6 @@ pub async fn boot(
         }
     }
 
-    // Signals. Installed *before* the alert loop so the loop can trigger a
-    // shutdown itself on a fatal listen failure, and so the receiver exists
-    // before anything can send.
-    let channels = SignalChannels::new();
-    let (reload_tx, reload_rx) = mpsc::channel::<()>(8);
-    let channels = SignalChannels::from_parts(channels.shutdown_tx, reload_tx);
-    // Drop the receiver returned by signals::run; we wired our own pair.
-    let _ = signals::run(channels.clone(), 8).await;
-    let shutdown_tx = channels.shutdown_tx;
     // Subscribe now, not when the HTTP server starts: a broadcast sent with no
     // live receiver is discarded, so a SIGTERM during the resume scan would
     // otherwise leave the daemon running with nothing left to stop it.
@@ -542,6 +636,11 @@ pub async fn boot(
         }) as torrentd_engine::SlotFenced
     })
     .spawn();
+
+    // Boot succeeded: the shutdown path owns the tunnels and the kill switch
+    // from here, and tearing them down now would stop the daemon it just
+    // started.
+    cleanup.disarm();
 
     Ok(DaemonHandle {
         cfg,
