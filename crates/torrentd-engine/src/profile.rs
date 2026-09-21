@@ -573,11 +573,21 @@ impl ProfileConfig {
 
     /// Validate the whole configured set.
     ///
-    /// Called at startup and on SIGHUP. Most rules here are uniqueness rules,
-    /// and they apply to VPN profiles specifically: two accounts on one
-    /// tracker are distinguishable only by the things this enforces are
-    /// distinct. Host profiles share one identity because they *are* one host,
-    /// so requiring them to differ would be theatre.
+    /// Called at startup and on SIGHUP. Most rules here are uniqueness rules:
+    /// two accounts on one tracker are distinguishable only by the things this
+    /// enforces are distinct.
+    ///
+    /// Requiredness and uniqueness are separate questions, and they have
+    /// different answers. A host profile may *omit* `peer_fingerprint_hex` and
+    /// `user_agent` — it is the host, and two host profiles are one host, so
+    /// requiring them to differ would be theatre. But a value a host profile
+    /// does set must still be distinct from every other profile's, because a
+    /// fingerprint shared with a tunnelled profile puts one peer-id prefix on
+    /// the wire from both the tunnel address and the host's real address,
+    /// which is exactly the cross-account correlation these rules exist to
+    /// prevent. So requiredness is checked per posture, below; the length, the
+    /// libtorrent-default ban and the uniqueness inserts run for any profile
+    /// that sets the field, whatever its posture.
     pub fn validate_set(profiles: &[ProfileConfig]) -> Result<(), ProfileConfigError> {
         if profiles.is_empty() {
             return Err(ProfileConfigError::NoProfiles);
@@ -656,31 +666,49 @@ impl ProfileConfig {
                         }
                     }
 
-                    // Identity, required here and only here.
-                    let fp = p.peer_fingerprint_hex.as_deref().ok_or_else(|| {
-                        ProfileConfigError::MissingIdentity {
+                    // Identity is *required* here and only here. A tunnelled
+                    // profile with no fingerprint of its own announces under
+                    // the default one, which ties it to every other default
+                    // client the tracker sees.
+                    if p.peer_fingerprint_hex.is_none() {
+                        return Err(ProfileConfigError::MissingIdentity {
                             profile: p.id.as_str().to_string(),
                             field: "peer_fingerprint_hex",
-                        }
-                    })?;
-                    if fp.len() != 16 {
-                        return Err(ProfileConfigError::BadFingerprintLength(fp.to_string()));
+                        });
                     }
-                    if Self::is_libtorrent_default_fingerprint(fp) {
-                        return Err(ProfileConfigError::DefaultFingerprintForbidden);
-                    }
-                    if !seen_fp.insert(fp.to_string()) {
-                        return Err(ProfileConfigError::DuplicateFingerprint(fp.to_string()));
-                    }
-                    let ua = p.user_agent.as_deref().ok_or_else(|| {
-                        ProfileConfigError::MissingIdentity {
+                    if p.user_agent.is_none() {
+                        return Err(ProfileConfigError::MissingIdentity {
                             profile: p.id.as_str().to_string(),
                             field: "user_agent",
-                        }
-                    })?;
-                    if !seen_ua.insert(ua.to_string()) {
-                        return Err(ProfileConfigError::DuplicateUserAgent(ua.to_string()));
+                        });
                     }
+                }
+            }
+
+            // Identity, for any profile that set one.
+            //
+            // Outside the match on purpose. `startup.rs` applies
+            // `peer_fingerprint_hex` to every session with no posture guard,
+            // so a host profile that copies a VPN profile's table and edits
+            // only `id`, `network` and `listen_interfaces` — which is how the
+            // second profile in a config usually gets written — puts the same
+            // 8-byte peer-id prefix on the wire from the tunnel and from the
+            // host's real address. Keeping these checks inside the `Vpn` arm
+            // made that configuration validate clean.
+            if let Some(fp) = p.peer_fingerprint_hex.as_deref() {
+                if fp.len() != 16 {
+                    return Err(ProfileConfigError::BadFingerprintLength(fp.to_string()));
+                }
+                if Self::is_libtorrent_default_fingerprint(fp) {
+                    return Err(ProfileConfigError::DefaultFingerprintForbidden);
+                }
+                if !seen_fp.insert(fp.to_string()) {
+                    return Err(ProfileConfigError::DuplicateFingerprint(fp.to_string()));
+                }
+            }
+            if let Some(ua) = p.user_agent.as_deref() {
+                if !seen_ua.insert(ua.to_string()) {
+                    return Err(ProfileConfigError::DuplicateUserAgent(ua.to_string()));
                 }
             }
 
@@ -836,6 +864,98 @@ mod tests {
             host("public2", "0.0.0.0:6882", false),
         ];
         ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    #[test]
+    fn a_host_profile_may_not_wear_a_vpn_profiles_identity() {
+        // The configuration this is written from: the operator writes the VPN
+        // profile, copies the table to make the public one, and edits `id`,
+        // `network` and `listen_interfaces`. The fingerprint and user agent
+        // come along. `startup.rs` applies `peer_fingerprint_hex` to every
+        // session with no posture guard, so the private tracker then sees one
+        // peer-id prefix announcing from the tunnel address and from the
+        // host's real address — the cross-account correlation whose stated
+        // consequence is a permanent ban.
+        //
+        // With the uniqueness inserts inside the `Vpn` arm, this validates
+        // clean.
+        let mut public = host("public", "0.0.0.0:6882", false);
+        public.peer_fingerprint_hex = Some("a1b2c3d4e5f60718".to_string());
+        let profiles = vec![
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            public,
+        ];
+        assert!(matches!(
+            ProfileConfig::validate_set(&profiles),
+            Err(ProfileConfigError::DuplicateFingerprint(_))
+        ));
+    }
+
+    #[test]
+    fn a_host_profile_may_not_wear_a_vpn_profiles_user_agent() {
+        let mut public = host("public", "0.0.0.0:6882", false);
+        public.user_agent = Some("qB/5.0".to_string());
+        let profiles = vec![
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            public,
+        ];
+        assert!(matches!(
+            ProfileConfig::validate_set(&profiles),
+            Err(ProfileConfigError::DuplicateUserAgent(_))
+        ));
+    }
+
+    #[test]
+    fn a_host_profiles_fingerprint_is_length_checked_like_any_other() {
+        // A fingerprint that is not 8 bytes is not a fingerprint, and the
+        // posture that set it makes no difference to that.
+        let mut public = host("public", "0.0.0.0:6881", false);
+        public.peer_fingerprint_hex = Some("abc".to_string());
+        assert!(matches!(
+            ProfileConfig::validate_set(&[public]),
+            Err(ProfileConfigError::BadFingerprintLength(_))
+        ));
+    }
+
+    #[test]
+    fn a_host_profile_may_not_announce_the_libtorrent_default_fingerprint() {
+        // Setting the default explicitly is worse than leaving it unset: it
+        // reads as a deliberate identity while being the one every unmodified
+        // client already wears.
+        let mut public = host("public", "0.0.0.0:6881", false);
+        public.peer_fingerprint_hex = Some("2d4c54323043302d".to_string());
+        assert!(matches!(
+            ProfileConfig::validate_set(&[public]),
+            Err(ProfileConfigError::DefaultFingerprintForbidden)
+        ));
+    }
+
+    #[test]
+    fn a_host_profile_that_sets_no_identity_is_still_accepted() {
+        // Uniqueness applies to a value that is set; requiredness stays
+        // VPN-only. Two host profiles are one host, and a config that names
+        // neither field has to keep validating.
+        let profiles = vec![
+            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            host("public", "0.0.0.0:6882", false),
+            host("public2", "0.0.0.0:6883", false),
+        ];
+        ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    #[test]
+    fn a_vpn_profile_missing_only_its_fingerprint_is_refused() {
+        // The `peer_fingerprint_hex` arm of `MissingIdentity`; only the
+        // `user_agent` arm was reached before.
+        let mut p = cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a");
+        p.peer_fingerprint_hex = None;
+        assert!(matches!(
+            ProfileConfig::validate_set(&[p]),
+            Err(ProfileConfigError::MissingIdentity {
+                field: "peer_fingerprint_hex",
+                ..
+            })
+        ));
     }
 
     #[test]
