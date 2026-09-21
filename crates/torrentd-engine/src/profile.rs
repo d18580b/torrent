@@ -580,6 +580,19 @@ pub enum ProfileConfigError {
     },
     #[error("profile {0:?} has an empty listen_interfaces")]
     EmptyListenInterfaces(String),
+    /// Distinct from [`ProfileConfigError::EmptyListenInterfaces`]: the
+    /// operator wrote something, and none of it names a port.
+    #[error(
+        "profile {profile:?}: listen_interfaces {listen_interfaces:?} names no port that can be \
+         read. The format is a comma-separated list of <ip>:<port>, with an optional device name \
+         in place of the address and optional s/l flags — \"0.0.0.0:6881,[::]:6881\", \
+         \"eth0:6881s\". A profile that binds no port accepts no incoming connections and is \
+         exempt from the listen-port uniqueness rule, while the daemon reports itself healthy."
+    )]
+    UnreadableListenInterfaces {
+        profile: String,
+        listen_interfaces: String,
+    },
     #[error(
         "profile {profile:?}: vpn_interface {iface:?} must equal the file stem of vpn_config \
          ({vpn_config:?}); wg-quick derives the interface name from the file name, so these \
@@ -723,6 +736,25 @@ impl ProfileConfig {
                             p.id.as_str().to_string(),
                         ));
                     }
+                    // Non-empty, and yields nothing. `listen_ports` skips an
+                    // entry it cannot read because libtorrent owns the
+                    // grammar — but a string where *every* entry is
+                    // unreadable is not a grammar this validator merely
+                    // failed to keep up with, it is a profile that contributes
+                    // nothing to `seen_port` and is therefore exempt from
+                    // Safety Rule 8 entirely. With two live profiles
+                    // `fatal_listen_failure` is false, so the session binds
+                    // nothing while `--check-config` prints `config OK` and
+                    // `/healthz` answers 200 — exactly what the rule below
+                    // exists to prevent. Per-entry skipping stays for a list
+                    // with at least one readable entry.
+                    let ports = Self::listen_ports(listen_interfaces);
+                    if ports.is_empty() {
+                        return Err(ProfileConfigError::UnreadableListenInterfaces {
+                            profile: p.id.as_str().to_string(),
+                            listen_interfaces: listen_interfaces.clone(),
+                        });
+                    }
                     // Safety Rule 8. Its enforcement clause names static VPN
                     // profiles, but its rationale — an announced port
                     // correlating two profiles — applies verbatim to two host
@@ -732,7 +764,20 @@ impl ProfileConfig {
                     // the other's `listen_failed` is warned and swallowed, and
                     // `/healthz` reports 200 with `profiles_fenced: 0` while a
                     // profile accepts no incoming connections at all.
-                    for port in Self::listen_ports(listen_interfaces) {
+                    //
+                    // It refuses two host profiles that bind one port on
+                    // *different* NICs (`192.168.1.5:6881` and
+                    // `10.0.0.5:6881`) deliberately, even though the OS would
+                    // allow it. Keying the set on the `(address, port)` pair
+                    // instead does not decide the question it appears to: the
+                    // address in `listen_interfaces` need not be a literal —
+                    // an interface name is legal and `0.0.0.0` overlaps every
+                    // literal — and the rule's own reasoning is that two host
+                    // profiles are one host, which the split-NIC case does not
+                    // contradict. Refusing a configuration that would have
+                    // worked is one line to reverse; accepting one that
+                    // collides is a listen failure reported healthy.
+                    for port in ports {
                         if !seen_port.insert(port) {
                             return Err(ProfileConfigError::DuplicatePort(port));
                         }
@@ -1043,9 +1088,38 @@ mod tests {
         // Device name instead of an address, and the ssl/local flag suffixes.
         assert_eq!(ports("eth0:6881s"), vec![6881]);
         assert_eq!(ports("eth0:6881l,[::]:6882s"), vec![6881, 6882]);
-        // Unreadable entries are skipped, not guessed at: libtorrent owns this
-        // grammar and a parse failure here must not refuse a valid config.
+        // An unreadable entry *beside a readable one* is skipped, not guessed
+        // at: libtorrent owns this grammar and a parse failure here must not
+        // refuse a config the session would accept.
+        assert_eq!(ports("nonsense,0.0.0.0:6881"), vec![6881]);
+
+        // A string where every entry is unreadable yields nothing — and the
+        // validator refuses it. This assertion used to read
+        // `assert!(ports("nonsense").is_empty())` as though the empty result
+        // were the correct outcome, which locked the hole in: such a profile
+        // contributes nothing to `seen_port`, so it is exempt from Safety
+        // Rule 8, and it binds nothing while `--check-config` prints
+        // `config OK`.
         assert!(ports("nonsense").is_empty());
+        let mut p = host("public", "nonsense", false);
+        assert!(
+            matches!(
+                ProfileConfig::validate_set(std::slice::from_ref(&p)),
+                Err(ProfileConfigError::UnreadableListenInterfaces { .. })
+            ),
+            "a host profile that binds no port must be refused, not accepted",
+        );
+
+        // And distinctly from the empty case, which is a different mistake
+        // with a different remedy.
+        p.network = ProfileNetwork::Host {
+            listen_interfaces: "   ".to_string(),
+            dht: false,
+        };
+        assert!(matches!(
+            ProfileConfig::validate_set(&[p]),
+            Err(ProfileConfigError::EmptyListenInterfaces(_))
+        ));
     }
 
     #[test]
