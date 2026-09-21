@@ -22,6 +22,21 @@ pub enum PoolError {
     /// means every indexed file reads as unclaimed.
     #[error("refusing to clear claims outside a transaction")]
     ClaimsClearedOutsideTransaction,
+    /// The pre-v3 copy-aside could not be written.
+    ///
+    /// Reported as itself rather than as a bare `Sqlite`: the copy is a step
+    /// the operator did not ask for and has no reason to expect, so a raw
+    /// SQLite code here named no backup, no path, and no reason the migration
+    /// wanted one. `VACUUM INTO` writes a full second copy of an index that
+    /// carries one row per file, so `database or disk is full` on a volume
+    /// with less free space than the database is the ordinary way to reach it.
+    #[error(
+        "the pool index could not be copied aside to {path} before the one-way v3 schema \
+         migration: {reason}. That copy is a full second copy of the index, so this needs free \
+         space equal to the size of the database. The index has not been changed; free some \
+         space and start again."
+    )]
+    BackupFailed { path: String, reason: String },
     /// Another process holds the pool database's write lock — almost always the
     /// running daemon, or a second `pool scan`.
     #[error(

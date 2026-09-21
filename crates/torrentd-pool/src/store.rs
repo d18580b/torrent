@@ -352,7 +352,17 @@ impl PoolStore {
             );
             return Ok(());
         }
-        self.conn.execute("VACUUM INTO ?1", params![backup])?;
+        // Wrapped, not propagated. A bare `PoolError::Sqlite` here aborted an
+        // otherwise-valid migration with a SQLite code and no mention of a
+        // backup, a path, or why the migration needed one — and `startup.rs`
+        // opens the pool with `?`, so that code was the whole of what the
+        // operator got.
+        self.conn
+            .execute("VACUUM INTO ?1", params![backup])
+            .map_err(|e| PoolError::BackupFailed {
+                path: backup.clone(),
+                reason: e.to_string(),
+            })?;
         info!(
             target: "torrentd_pool::store",
             backup = %backup,

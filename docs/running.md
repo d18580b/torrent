@@ -234,6 +234,13 @@ the `plan`/`plan_step` mutation journal, which a rescan does not reconstruct.
 The migration is applied in one transaction, so a failure part way through
 leaves the index exactly as it was.
 
+The copy is a full second copy of the index, so **the first open on this build
+needs free space on the state volume equal to the size of `pool.db`**. The
+index carries one row per file, so on a large library that is not small. If the
+volume cannot take it the migration stops and says so, naming the backup path
+and the reason, and the index is left exactly as it was — free some space and
+start the daemon again.
+
 If you ran one of this change's own pre-release builds, you may hold a
 `pool.db` that reports schema version 2 but already carries the `profile`
 column. This build recognises that one file, stamps the version to match the

@@ -1426,6 +1426,47 @@ fn a_genuine_v2_index_is_still_migrated_by_the_version_keyed_step() {
 }
 
 #[test]
+fn a_backup_that_cannot_be_written_names_the_backup_and_the_reason() {
+    // C51. `VACUUM INTO` writes a full second copy of an index designed to
+    // carry one row per file of a multi-terabyte library, so a state volume
+    // with less free space than the database fails here — and this step is one
+    // the operator never asked for. Propagating the raw SQLite code aborted an
+    // otherwise-valid migration with no mention of a backup, a path, or why
+    // the migration wanted one, on a database `startup.rs` opens with `?`.
+    //
+    // The backup path is made unwritable by pointing it at a directory that
+    // does not exist. A plain file or directory in the way would not do it:
+    // `backup_before_v3` checks `exists()` first and keeps an existing copy,
+    // and `exists()` follows symlinks — so a dangling one is absent to that
+    // check and unopenable to `VACUUM INTO`, which is the shape a full volume
+    // presents.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::os::unix::fs::symlink(dir.path().join("no/such/dir/backup.db"), &backup).unwrap();
+    assert!(!backup.exists(), "a dangling symlink reads as absent");
+
+    let err = PoolStore::open(&db).expect_err("the copy cannot be written here");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&backup.display().to_string()),
+        "the failure names the backup it could not write, got: {msg}",
+    );
+    assert!(
+        msg.contains("copied aside") && msg.contains("free space"),
+        "and says what the step is and what it needs, got: {msg}",
+    );
+
+    // The migration aborted before touching anything, which is what makes
+    // "free some space and start again" a true instruction.
+    assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
+    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+}
+
+#[test]
 fn a_fresh_database_leaves_no_backup_behind() {
     // Nothing to preserve in a file the call is about to create, and a stray
     // `.pre-v3.bak` beside every new pool would read as a failed migration.
