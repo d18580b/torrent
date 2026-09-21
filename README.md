@@ -355,14 +355,23 @@ serves per-torrent status on demand.
 
 Alongside the libtorrent gauges (`torrentd_libtorrent_*`) there are daemon
 counters for torrent lifecycle, resume writes, disk and hash errors, dropped
-alerts, storage moves and pool verification; a `vpn` profile adds tunnel
-health, handshake age, port-forward state and `kill_switch_active`.
+alerts, storage moves and pool verification. Four `profile_id`-labelled series
+cover tunnel health and fencing — `profile_vpn_tunnel_up`,
+`profile_torrents_paused_vpn_down`, `profile_vpn_tunnel_ip_changes_total` and
+`profile_vpn_fenced_total` — and they are meaningful only on a tunnelled
+profile: a sample carrying the `profile_id` of a profile with no tunnel says
+nothing about any tunnel, so scope a panel or an alert to the profiles you
+actually tunnel rather than aggregating over every profile. Handshake age is
+reported per WireGuard profile, and port-forward state per profile that
+negotiates its port over NAT-PMP. `kill_switch_active` is none of these: it is
+a single unlabelled daemon-wide gauge, seeded at 0 at startup whether or not
+any kill switch or any `vpn` profile is configured.
 
 > A shipped Grafana dashboard and alert rules are planned rather than present.
 > Until then, note that series register on first emission, so anything not yet
-> emitted reads as "no data" rather than zero — the per-profile tunnel,
-> fencing and port-forward series are seeded at their baseline for exactly this
-> reason, and most others are not. The two handshake series
+> emitted reads as "no data" rather than zero — the per-profile tunnel and
+> fencing series are seeded at their baseline for exactly this reason, and most
+> others are not, port-forward state among them. The two handshake series
 > (`profile_vpn_handshake_age_seconds`, `profile_vpn_handshake_probe_ok`) are
 > not seeded: they exist only for WireGuard profiles and register on the first
 > probe, so an alert on either reads "no data" until the first poll completes,
