@@ -15,9 +15,17 @@ import { join } from 'node:path'
 import { brotliCompressSync, constants, gzipSync } from 'node:zlib'
 
 const DIST = new URL('../dist/', import.meta.url).pathname
-// Below roughly a packet's worth, compression is noise.
-const MIN_BYTES = 1024
-const COMPRESSIBLE = /\.(html|css|js|mjs|json|svg|map|txt|xml)$/i
+// A floor, not a packet's worth. At 1024 the one document that matters most
+// was excluded: Vite's index.html is typically well under a kilobyte, and it
+// is the only file served `Cache-Control: no-cache`, so it is the one
+// re-fetched on every cold load. Below a couple of hundred bytes the
+// shrink-only guard below would be doing all the work anyway, so the floor
+// stays — it is just in the right place now.
+const MIN_BYTES = 256
+// No `map`. A browser fetches a sourcemap only with devtools open, so a .br
+// and a .gz copy of every one is embedded weight in every deployed binary for
+// a request almost nobody makes.
+const COMPRESSIBLE = /\.(html|css|js|mjs|json|svg|txt|xml)$/i
 
 function* walk(dir) {
   for (const entry of readdirSync(dir)) {
