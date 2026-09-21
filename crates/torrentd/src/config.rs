@@ -15,6 +15,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
 use torrentd_engine::SlotConfig;
+use torrentd_engine::SlotId;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -446,15 +447,28 @@ pub struct ConfigDiff {
 }
 
 impl ConfigDiff {
-    /// Build a `Settings` patch containing only the reloadable fields
-    /// that changed.
-    pub fn to_settings_patch(&self) -> libtorrent_safe::Settings {
+    /// Build the `Settings` patch for `slot`, containing only the reloadable
+    /// fields that changed and are permitted to reach that slot.
+    ///
+    /// `enable_lsd` is withheld from every slot but the single-session
+    /// default. Safety Rule 6 says a private slot runs with DHT, PEX and LSD
+    /// off unconditionally and that no config key can turn them on — but
+    /// `enable_lsd` is a top-level *reloadable* key that was applied to every
+    /// session alike, so `enable_lsd = true` plus a SIGHUP quietly re-enabled
+    /// local peer discovery on exactly the sessions that must never have it.
+    /// The daemon still honours the key for the public single session, which
+    /// is the only place it means anything.
+    pub fn to_settings_patch_for(&self, slot: &SlotId) -> libtorrent_safe::Settings {
         libtorrent_safe::Settings {
             connections_limit: self.connections_limit,
             upload_rate_limit: self.upload_rate_limit,
             max_concurrent_http_announces: self.max_concurrent_http_announces,
             aio_threads: self.aio_threads,
-            enable_lsd: self.enable_lsd,
+            enable_lsd: if slot.is_default() {
+                self.enable_lsd
+            } else {
+                None
+            },
             ..Default::default()
         }
     }
@@ -525,6 +539,30 @@ http_listen = "127.0.0.1:8080"
 log_level = "info"
 connections_limit = 10000
 "#;
+
+    #[test]
+    fn enable_lsd_never_reaches_a_private_slot() {
+        // Safety Rule 6: a private slot has LSD off unconditionally, and no
+        // config key may turn it on. `enable_lsd` is top-level and reloadable,
+        // so without this filter a SIGHUP re-enabled local peer discovery on
+        // exactly the sessions that must never have it.
+        let diff = ConfigDiff {
+            enable_lsd: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(
+            diff.to_settings_patch_for(&SlotId::default_single())
+                .enable_lsd,
+            Some(true),
+            "the public single session still honours the key",
+        );
+        assert_eq!(
+            diff.to_settings_patch_for(&SlotId::new("acct_a"))
+                .enable_lsd,
+            None,
+            "a private slot must not receive it",
+        );
+    }
 
     #[test]
     fn parses_single_session() {
