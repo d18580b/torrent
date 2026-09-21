@@ -51,19 +51,14 @@ stale.
 - **Authentication** — described in
   [`README.md` § *Authentication*](README.md#authentication) and
   [`docs/running.md` § *6. Authentication (optional)*](docs/running.md#6-authentication-optional).
-  Authentication is **optional**: without an `[auth]` section the daemon
-  authenticates nothing, which is why the documented deployment binds to
-  loopback behind a reverse proxy. Anything that bypasses authentication once
-  it *is* configured — session handling, scope enforcement, token or password
-  verification — is in scope.
+  Anything that bypasses authentication once it *is* configured — session
+  handling, scope enforcement, token or password verification — is in scope.
 
 - **The network kill switch** — described in
   [`README.md` § *Security posture (multi-slot)*](README.md#security-posture-multi-slot)
   and [`docs/running.md` § *4. Service user, binary, directories*](docs/running.md#4-service-user-binary-directories).
-  It is opt-in (`network_kill_switch = true`), fail-closed, matches on the
-  daemon's uid, and needs `CAP_NET_ADMIN` and a dedicated user. Anything that
-  leaks egress past it, or that turns `CAP_NET_ADMIN` into a wider capability
-  than the table it installs, is in scope.
+  Anything that leaks egress past it, or that turns `CAP_NET_ADMIN` into a
+  wider capability than the table it installs, is in scope.
 
 - **Per-slot isolation** — described in
   [`README.md` § *Security posture (multi-slot)*](README.md#security-posture-multi-slot).
@@ -76,28 +71,27 @@ stale.
 - **`[pool] allow_mutations`** — described in
   [`README.md` § *Reorganising*](README.md#reorganising) and
   [`docs/running.md` § *5. Configuration*](docs/running.md#5-configuration).
-  It defaults to `false`. When it is on, the daemon may move and delete files
-  inside the configured `roots`. Anything that causes a write, move or delete
-  outside `roots`, that mutates with it off, or that defeats the plan/apply
-  separation, the journal, the re-stat at deletion time or the plan-derived
-  `confirm` token, is in scope.
+  When it is on, the daemon may move and delete files inside the configured
+  `roots`. Anything that causes a write, move or delete outside `roots`, that
+  mutates with it off, or that defeats the plan/apply separation, the journal,
+  the re-stat at deletion time or the plan-derived `confirm` token, is in
+  scope.
 
 - **The C++ FFI shim over libtorrent** — the suite that exercises it is named
   in [`README.md` § *Testing*](README.md#testing); the input path that reaches
   it is [`README.md` § *HTTP API*](README.md#http-api). `POST /torrents`
-  accepts a `.torrent` body of up to 50 MiB, so this is the memory-safety
-  boundary: attacker-supplied bytes cross into C++ here. Anything that turns a
-  crafted `.torrent`, alert or metadata payload into a crash, an
-  out-of-bounds access, a use-after-free or a type confusion across that
-  boundary is in scope.
+  accepts a `.torrent` body, so this is the memory-safety boundary:
+  attacker-supplied bytes cross into C++ here. Anything that turns a crafted
+  `.torrent`, alert or metadata payload into a crash, an out-of-bounds access,
+  a use-after-free or a type confusion across that boundary is in scope.
 
 - **The web client** — described in
-  [`README.md` § *Web client*](README.md#web-client). It is served at `/` and
-  embedded in the binary, and [`README.md` § *Authentication*](README.md#authentication)
-  is what makes it safe to expose. Anything that lets a page or a request
-  reach the API as a session it should not have — session-cookie handling,
-  request forgery, injection of tracker- or torrent-supplied strings into the
-  rendered view — is in scope.
+  [`README.md` § *Web client*](README.md#web-client), and
+  [`README.md` § *Authentication*](README.md#authentication) is what makes it
+  safe to expose. Anything that lets a page or a request reach the API as a
+  session it should not have — session-cookie handling, request forgery,
+  injection of tracker- or torrent-supplied strings into the rendered view —
+  is in scope.
 
 ## Out of scope
 

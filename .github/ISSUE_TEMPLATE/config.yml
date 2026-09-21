@@ -1,7 +1,11 @@
 # Blank issues stay enabled on purpose: this repository ships one template (the
 # bug report), and most of the tracker is feature, testing and documentation
 # work that no template specifies. Disabling blank issues would make that work
-# unfileable through the chooser.
+# unfileable through the chooser. SECURITY.md's reporting instruction also
+# depends on this setting: the contact link below routes a vulnerability
+# reporter to the policy, and the policy tells them to open an issue with a
+# `security:` prefix — for which there is deliberately no form, so a blank
+# issue is the only route to filing it.
 blank_issues_enabled: true
 contact_links:
   - name: Report a security vulnerability
