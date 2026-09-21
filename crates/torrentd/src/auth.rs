@@ -356,13 +356,42 @@ impl LoginThrottle {
     }
 
     /// A success clears the record; the credential was not being guessed.
+    ///
+    /// For an identified client the map does not hold, clearing means
+    /// *inserting* a cleared entry rather than removing nothing. Once the map
+    /// is full `note_failure` routes that client's failures to `global` and
+    /// `retry_after` reads `global` back for it, so without a slot of its own
+    /// a client that has just authenticated correctly is locked out by the
+    /// next failure from anyone else on the overflow path — immediately after
+    /// proving it is not the attacker who filled the map. Where the map is
+    /// full the entry evicted to make room is the least recently seen.
+    ///
+    /// `global` itself is **not** cleared. A caller holding one valid
+    /// credential could otherwise wipe the shared bucket between guesses at
+    /// another and never trip the lockout, which is a bypass rather than a
+    /// repair.
     pub fn note_success(&self, client: Option<IpAddr>) {
-        match client {
-            None => *self.global.lock() = ThrottleState::default(),
-            Some(ip) => {
-                self.per_client.lock().remove(&ip);
+        let Some(ip) = client else {
+            *self.global.lock() = ThrottleState::default();
+            return;
+        };
+        let mut g = self.per_client.lock();
+        if g.remove(&ip).is_some() {
+            return;
+        }
+        if g.len() >= MAX_TRACKED_CLIENTS {
+            g.retain(|_, st| st.is_live(self.penalty));
+        }
+        if g.len() >= MAX_TRACKED_CLIENTS {
+            let stalest = g
+                .iter()
+                .min_by_key(|(_, st)| st.last_seen)
+                .map(|(addr, _)| *addr);
+            if let Some(addr) = stalest {
+                g.remove(&addr);
             }
         }
+        g.insert(ip, ThrottleState::default());
     }
 }
 
@@ -767,6 +796,45 @@ mod tests {
         assert!(
             t.retry_after(fresh(99)).is_some(),
             "a rotating client must still be throttled once the map is full",
+        );
+    }
+
+    #[test]
+    fn a_success_from_an_overflow_client_is_not_undone_by_someone_else() {
+        // With the map full, this client's failures went to the shared bucket
+        // and `retry_after` reads that same bucket back for it. Removing an
+        // absent key clears nothing, so without a slot of its own the operator
+        // authenticates correctly and is then locked out by the next failure
+        // from anyone else on the overflow path — the attacker who filled the
+        // map in the first place.
+        let t = LoginThrottle::new();
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        assert_eq!(
+            t.per_client.lock().len(),
+            MAX_TRACKED_CLIENTS,
+            "the map has to be full for this test to be testing anything",
+        );
+
+        // Neither address is in the map: both are on the overflow path.
+        let operator = ip(1);
+        let other = ip(2);
+        for _ in 0..4 {
+            t.note_failure(operator);
+        }
+        t.note_success(operator);
+
+        // The fifth failure on the shared path trips its lockout.
+        t.note_failure(other);
+        assert!(
+            t.retry_after(other).is_some(),
+            "the shared bucket must still lock out the overflow path",
+        );
+        assert!(
+            t.retry_after(operator).is_none(),
+            "a client that has just authenticated must not be locked out by \
+             another client's failure on the shared path",
         );
     }
 
