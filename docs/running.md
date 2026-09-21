@@ -579,7 +579,6 @@ On a scratch pool, not your real one.
    not placed. This is derived from live session state, so restarting the
    daemon does not clear it — only a rescan does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
-4. **Mutations are off.** Without `allow_mutations = true`, `POST
    /api/pool/plans` and `DELETE /api/torrents/:infohash?delete_files=true` both
    403.
 5. **Pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
