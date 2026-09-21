@@ -104,17 +104,36 @@ fn new_token_cmd(name: &str, scopes: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What `--check-config` establishes beyond the file parsing and validating.
+///
+/// `deploy/torrentd.service` runs it as `ExecStartPre`, so every refusal
+/// reproduced here is one that lands before `ExecStart` rather than under
+/// `Restart=on-failure`. Split out of `main` so the wiring is reachable from a
+/// test: `main` parses the CLI and has no other seam.
+///
+/// The one boot refusal deliberately *not* here is the registry cross-check,
+/// which reads `profile_assignments.json` from the state directory. A config
+/// check that touched disk state would fail on a host where that directory is
+/// not yet provisioned, which is the pre-flight case this flag exists for. The
+/// flag's own help text says so.
+fn check_config(cfg: &config::Config) -> anyhow::Result<()> {
+    // Refusals that are pure functions of the config file.
+    cfg.check_boot_rules()?;
+    // The kill switch shells out to `nft`; fail the pre-flight check now
+    // rather than aborting startup later.
+    if cfg.network_kill_switch && !vpn::killswitch::nft_available() {
+        anyhow::bail!("network_kill_switch = true but the `nft` binary is not available");
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = config::Config::load(&cli.config)
         .with_context(|| format!("failed to load config from {}", cli.config.display()))?;
 
     if cli.check_config {
-        // The kill switch shells out to `nft`; fail the pre-flight check now
-        // rather than aborting startup later (systemd ExecStartPre).
-        if cfg.network_kill_switch && !vpn::killswitch::nft_available() {
-            anyhow::bail!("network_kill_switch = true but the `nft` binary is not available");
-        }
+        check_config(&cfg)?;
         eprintln!("config OK");
         return Ok(());
     }
@@ -176,4 +195,46 @@ fn main() -> anyhow::Result<()> {
     // unreachable
     info!("torrentd: clean exit");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOP: &str = r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+"#;
+
+    fn cfg_from(body: &str) -> config::Config {
+        toml::from_str(body).expect("test config parses")
+    }
+
+    #[test]
+    fn check_config_reproduces_the_kill_switch_boot_refusal() {
+        // `deploy/torrentd.service` runs `--check-config` as its
+        // `ExecStartPre`. `boot` refuses this configuration, and the
+        // pre-flight used to green-light it — so the failure landed at
+        // `ExecStart` under `Restart=on-failure` instead of before it.
+        let cfg = cfg_from(&format!(
+            "{TOP}network_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
+             network = \"host\"\nlisten_interfaces = \"0.0.0.0:6881\"\n"
+        ));
+        let msg = format!("{:#}", check_config(&cfg).unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch") && msg.contains("vpn"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn check_config_passes_a_configuration_the_daemon_would_boot() {
+        let cfg = cfg_from(&format!(
+            "{TOP}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
+             listen_interfaces = \"0.0.0.0:6881\"\n"
+        ));
+        check_config(&cfg).unwrap();
+    }
 }

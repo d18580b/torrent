@@ -19,7 +19,16 @@ pub struct Cli {
 
     /// Validate the config file and exit. Useful for systemd
     /// `ExecStartPre=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config`.
-    #[arg(long)]
+    ///
+    /// Checks everything decidable from the file itself, including the boot
+    /// refusal for `network_kill_switch = true` with no `network = "vpn"`
+    /// profile. It does NOT read the state directory, so the one boot check
+    /// that does — the assignment registry naming a profile no `[[profile]]`
+    /// table declares — still happens at startup and can still fail there. A
+    /// config check that touched disk state would fail on a host whose state
+    /// directory is not yet provisioned, which is the pre-flight case this
+    /// flag exists for.
+    #[arg(long, verbatim_doc_comment)]
     pub check_config: bool,
 
     /// Optional subcommand. Omit it to run the daemon.
