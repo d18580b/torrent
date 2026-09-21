@@ -85,9 +85,7 @@ pub async fn login(State(s): State<AppState>, req: Request) -> Response {
     // fronted by TLS handed out a cookie the browser would send in clear to
     // any plain-HTTP origin on that host. Now loopback still gets a usable
     // cookie and a TLS-fronted deployment gets a protected one.
-    let secure = if client.secure { "; Secure" } else { "" };
-    let cookie =
-        format!("{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl}{secure}");
+    let cookie = session_cookie_header(&id, ttl, client);
     (
         StatusCode::OK,
         [(header::SET_COOKIE, cookie)],
@@ -228,8 +226,34 @@ pub async fn logout(State(s): State<AppState>, req: Request) -> Response {
             auth.sessions.revoke(&id);
         }
     }
-    let cleared = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
+    // The clearing cookie carries `Secure` exactly when the login cookie
+    // would have. A cookie's attributes are part of what identifies it, and
+    // the pair that sets and clears one cookie describing it two different
+    // ways is an asymmetry with no reason behind it. Harmless in the shipped
+    // posture — RFC 6265bis's "leave secure cookies alone" rule keys on the
+    // browser's own channel, which is the secure one here — and free to make
+    // symmetric, since `resolve` has already been paid for on every other
+    // route.
+    let client = crate::http::forwarded::resolve(&req, &s.trusted_proxies);
+    let cleared = session_cookie_header("", 0, client);
     (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cleared)]).into_response()
+}
+
+/// The `Set-Cookie` value for the session cookie.
+///
+/// One function builds both the cookie that creates a session and the one
+/// that clears it — `id = ""` with `max_age = 0` is the clearing form — so
+/// the two cannot describe the same cookie differently. They did: the login
+/// cookie could carry `Secure` and the clearing cookie never could, which is
+/// an asymmetry in the pair of responses that set and clear one cookie.
+///
+/// Harmless in the shipped posture, because RFC 6265bis's "leave secure
+/// cookies alone" rule keys on the browser's own channel to the proxy, which
+/// is the secure one. Free to make symmetric, and one fewer thing that has to
+/// stay true by hand.
+fn session_cookie_header(id: &str, max_age: u64, client: Client) -> String {
+    let secure = if client.secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}={id}; HttpOnly; SameSite=Strict; Path=/; Max-Age={max_age}{secure}")
 }
 
 /// Whether the caller holds `needed`.
@@ -464,6 +488,40 @@ mod tests {
             !declares_json(&HttpRequest::builder().body(Body::empty()).unwrap()),
             "no Content-Type at all is not a declaration",
         );
+    }
+
+    #[test]
+    fn the_clearing_cookie_carries_secure_exactly_when_the_session_cookie_would() {
+        // One function decides both, so the pair that sets and clears one
+        // cookie cannot describe it two different ways.
+        let over_tls = Client {
+            ip: None,
+            secure: true,
+        };
+        let plain = Client {
+            ip: None,
+            secure: false,
+        };
+        // Behind a TLS-terminating proxy both carry it.
+        assert!(
+            session_cookie_header("abc", 3600, over_tls).ends_with("; Secure"),
+            "the login cookie is Secure over TLS",
+        );
+        assert!(
+            session_cookie_header("", 0, over_tls).ends_with("; Secure"),
+            "so is the cookie that clears it — a cookie's attributes are part \
+             of what identifies it, and the pair that sets and clears one \
+             cookie must not describe it two different ways",
+        );
+
+        // On plain HTTP neither does, or `http://localhost` breaks.
+        assert!(!session_cookie_header("abc", 3600, plain).contains("Secure"));
+        assert!(!session_cookie_header("", 0, plain).contains("Secure"));
+
+        // The clearing form is still a clearing form.
+        let cleared = session_cookie_header("", 0, over_tls);
+        assert!(cleared.contains(&format!("{SESSION_COOKIE}=;")));
+        assert!(cleared.contains("Max-Age=0"));
     }
 
     #[test]
