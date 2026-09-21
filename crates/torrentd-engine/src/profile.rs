@@ -603,24 +603,6 @@ pub enum ProfileConfigError {
     DuplicateResumeDir(PathBuf),
     #[error("torrent_dir {0:?} appears more than once (after symlink resolution)")]
     DuplicateTorrentDir(PathBuf),
-    /// One profile's effective store directory lies inside another's.
-    ///
-    /// Equality is the [`ProfileConfigError::DuplicateResumeDir`] case; this
-    /// is the nesting one, which the derived `<base>/<id>` layout makes easy
-    /// to write by accident — an override of `<base>` itself contains every
-    /// other profile's derived directory. `load_all` filters on the file name
-    /// only, so a profile pointed at a containing directory loads every other
-    /// profile's state as its own.
-    #[error(
-        "{key} {inner:?} lies inside {outer:?} (after symlink resolution), so both \
-         profiles' sessions would read one store. Each profile's {key} must be \
-         disjoint from every other's."
-    )]
-    NestedProfileDir {
-        key: &'static str,
-        outer: PathBuf,
-        inner: PathBuf,
-    },
     #[error("peer_fingerprint_hex must not equal libtorrent default (-LT20C0-)")]
     DefaultFingerprintForbidden,
     #[error("peer_fingerprint_hex {0:?} is not 16 hex chars")]
