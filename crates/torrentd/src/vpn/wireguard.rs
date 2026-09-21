@@ -22,15 +22,45 @@ use tracing::warn;
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// Time since the most recent WireGuard handshake on `iface`, or `None` if it
-/// can't be determined (not a WireGuard interface, `wg` unavailable, or no peer
-/// has ever completed a handshake).
+/// Why a handshake age could not be produced.
 ///
-/// This is the liveness signal the health monitor uses on top of IP presence:
-/// a tunnel can keep its address while its handshake silently stops (peer gone,
-/// key rotation stalled), which the IP check alone can't see. A seeding host
-/// always has traffic, so a healthy tunnel rekeys well inside the threshold.
-pub fn latest_handshake_age(iface: &str) -> Option<Duration> {
+/// Distinguished from "no peer has handshaked yet" because they mean opposite
+/// things to an operator: one is a tunnel that has not finished coming up, the
+/// other is half the liveness check silently not running. Both used to collapse
+/// into `None`, so a host with `wireguard-tools` missing or `wg` unprivileged
+/// degraded to IP-presence checking with nothing said.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ProbeUnavailable {
+    /// `wg` could not be executed at all.
+    NoTool,
+    /// `wg` ran and refused — not a WireGuard interface, or no permission.
+    Refused,
+    /// `wg` produced output this code could not parse.
+    Unparseable,
+}
+
+impl ProbeUnavailable {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ProbeUnavailable::NoTool => "no_tool",
+            ProbeUnavailable::Refused => "refused",
+            ProbeUnavailable::Unparseable => "unparseable",
+        }
+    }
+}
+
+/// Time since the most recent WireGuard handshake on `iface`.
+///
+/// * `Ok(Some(age))` — a peer has handshaked; this is how long ago.
+/// * `Ok(None)` — the interface is readable but no peer has ever handshaked.
+/// * `Err(_)` — the probe itself could not run, so there is no liveness signal
+///   and the caller is falling back to IP presence alone.
+///
+/// This is the signal the health monitor uses on top of IP presence: a tunnel
+/// can keep its address while its handshake silently stops (peer gone, key
+/// rotation stalled), which the IP check cannot see. A seeding host always has
+/// traffic, so a healthy tunnel rekeys well inside the threshold.
+pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavailable> {
     // `wg show <iface> latest-handshakes` prints `<pubkey>\t<unix_secs>` per
     // peer; 0 means "never". Take the freshest across peers.
     let out = Command::new("wg")
@@ -38,21 +68,47 @@ pub fn latest_handshake_age(iface: &str) -> Option<Duration> {
         .arg(iface)
         .arg("latest-handshakes")
         .output()
-        .ok()?;
+        .map_err(|_| ProbeUnavailable::NoTool)?;
     if !out.status.success() {
-        return None;
+        return Err(ProbeUnavailable::Refused);
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let latest = text
+    let Some(latest) = text
         .lines()
         .filter_map(|l| l.split_whitespace().nth(1))
         .filter_map(|s| s.parse::<u64>().ok())
-        .max()?;
+        .max()
+    else {
+        // Output we could not read at all is not the same as a tunnel with no
+        // peers, which prints a line per peer with a 0.
+        return if text.trim().is_empty() {
+            Ok(None)
+        } else {
+            Err(ProbeUnavailable::Unparseable)
+        };
+    };
     if latest == 0 {
-        return None; // never handshaked → no liveness signal yet
+        return Ok(None); // never handshaked → no liveness signal yet
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    Some(Duration::from_secs(now.saturating_sub(latest)))
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ProbeUnavailable::Unparseable)?
+        .as_secs();
+    if latest > now {
+        // The handshake is stamped in our future, so one of the two clocks has
+        // moved. Treating that as an enormous age is the dangerous reading: it
+        // would fence a healthy slot permanently, and fencing requires an
+        // operator to undo. Report it as fresh and say why.
+        warn!(
+            target: "torrentd::vpn::wireguard",
+            vpn_iface = %iface,
+            skew_secs = latest - now,
+            "latest handshake is in the future; treating the tunnel as fresh \
+             (check clock sync on this host)",
+        );
+        return Ok(Some(Duration::ZERO));
+    }
+    Ok(Some(Duration::from_secs(now - latest)))
 }
 
 /// The public key WireGuard reports for a live interface, or `None` if the
@@ -207,5 +263,22 @@ impl VpnManager for WireguardManager {
 
     fn bring_down(&self, iface: &str) {
         let _ = Command::new("wg-quick").arg("down").arg(iface).status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_interface_is_a_probe_failure_not_a_missing_handshake() {
+        // The distinction this enum exists for: an operator reading
+        // "no handshake yet" would wait, where the truth is that half the
+        // liveness check is not running.
+        let r = latest_handshake_age("torrentd-nonexistent-iface");
+        assert!(
+            matches!(r, Err(ProbeUnavailable::Refused | ProbeUnavailable::NoTool)),
+            "got {r:?}",
+        );
     }
 }
