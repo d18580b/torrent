@@ -69,6 +69,9 @@ body:
         pool index. Redact tracker URLs, passkeys and API tokens before pasting.
       render: text
       placeholder: |
-        {"timestamp":"2026-09-21T09:14:02.881234567+00:00","level":"ERROR","message":"failed to persist resume data","infohash":"0123456789abcdef0123456789abcdef01234567","error.kind":"resume_write","error.cause":"...","target":"torrentd_engine::handler::resume"}
+        {"timestamp":"2026-09-21T09:14:02.881234567+00:00","level":"ERROR","message":"failed to persist resume data","infohash":"0123456789abcdef0123456789abcdef01234567", …}
+
+        An excerpt, not a whole line — the formatter emits more keys than these,
+        and which ones it emits changes with the code. Paste the real lines whole.
     validations:
       required: true
