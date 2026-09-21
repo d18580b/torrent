@@ -10,11 +10,16 @@ body:
         which stays the authority on what a bug report contains. Every command you
         need is given with the field that wants its output.
 
-        The log and reload commands below are run on the **deployment host** and
-        the submodule command inside a **source checkout** — the same machine for
-        anyone who built and installed from source by
+        Each command below names the machine it is run on: `journalctl -u
+        torrentd` and `systemctl reload torrentd` on the **deployment host**,
+        `uname -srm` on the **host that failed**, and `git submodule status
+        vendor/libtorrent` and `cargo --version` inside a **source checkout**.
+        Those are the same machine for anyone who built and installed from
+        source by
         [`docs/running.md` § *3. Build*](https://github.com/d18580b/torrent/blob/master/docs/running.md#3-build)
-        and step `4b` of § *4. Service user, binary, directories*.
+        and step `4b` of § *4. Service user, binary, directories*. If they are
+        not the same machine for you, the two source-checkout fields below each
+        say what to give instead.
 
   - type: textarea
     id: what-happened
@@ -58,7 +63,11 @@ body:
     id: cargo-version
     attributes:
       label: Cargo version
-      description: "Output of `cargo --version`."
+      description: >-
+        Output of `cargo --version`, run inside the same source checkout. If
+        you have no checkout because you installed a distributed binary or
+        image, give that package or image version instead and say which it
+        is — the same answer as the field above.
       placeholder: "cargo 1.90.0 (840b83a10 2025-07-30)"
     validations:
       required: true
