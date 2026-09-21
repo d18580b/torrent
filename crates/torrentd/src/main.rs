@@ -140,8 +140,10 @@ fn main() -> anyhow::Result<()> {
                     json,
                     bring_up,
                     egress,
+                    as_uid,
                 } => {
-                    let code = vpn_cmd::check(&cfg, slot.as_deref(), json, bring_up, egress)?;
+                    let code =
+                        vpn_cmd::check(&cfg, slot.as_deref(), json, bring_up, egress, as_uid)?;
                     std::process::exit(code);
                 }
             },

@@ -8,8 +8,11 @@
 //! "does my seeding setup work" — and it is the first of those that has to be
 //! true before the second is worth testing.
 //!
-//! The checks are ordered the way the daemon performs them at boot, so the
-//! first failure here is the first failure the daemon would hit.
+//! Host prerequisites run first, then each slot's checks in the order `boot`
+//! performs them. The host block is deliberately *not* in boot's order: boot
+//! installs the kill switch last, after every slot is up, and burying a
+//! missing `iproute2` or `nft` behind a thirty-second tunnel bring-up would
+//! cost an operator the thing this command is for.
 //!
 //! Observe-only by default. Nothing in the default path mutates host state:
 //! it reads interfaces, reads `wg` output, and — for a NAT-PMP slot — asks the
@@ -234,8 +237,136 @@ impl CheckHost for RealHost {
     }
 }
 
+/// The effective reverse-path filter for one interface.
+///
+/// The kernel applies `max(conf/all/rp_filter, conf/<iface>/rp_filter)` to
+/// source validation on an interface, so `conf/all` alone answers the question
+/// in neither direction. A host with `all = 0` and `default = 1` gives every
+/// freshly created WireGuard interface `rp_filter = 1` by inheritance and drops
+/// every reply to a tunnel-bound socket — which is exactly the symptom this
+/// check exists to catch — while `conf/all` reads clean. The converse misfires
+/// too: `all = 1` with every interface at `2` is loose and healthy.
+///
+/// Each argument is the raw file contents, or `None` if the file could not be
+/// read. An unparseable value is `unknown`: the previous `Some(v) => pass` arm
+/// passed anything that was not the literal `"1"`, including nonsense.
+fn judge_rp_filter(iface: &str, all: Option<&str>, per_iface: Option<&str>) -> Check {
+    fn mode(v: u8) -> &'static str {
+        match v {
+            0 => "off",
+            1 => "strict",
+            _ => "loose",
+        }
+    }
+    let read = |what: &str, raw: Option<&str>| -> Result<u8, String> {
+        match raw {
+            None => Err(format!("could not read {what}")),
+            Some(s) => s
+                .trim()
+                .parse::<u8>()
+                .map_err(|e| format!("{what} is {s:?}, which is not a number: {e}")),
+        }
+    };
+    let all_path = "net.ipv4.conf.all.rp_filter";
+    let iface_path = format!("net.ipv4.conf.{iface}.rp_filter");
+    let (a, i) = match (read(all_path, all), read(&iface_path, per_iface)) {
+        (Ok(a), Ok(i)) => (a, i),
+        (Err(e), _) | (_, Err(e)) => {
+            return Check::unknown(
+                "rp_filter",
+                format!("{e}; the kernel takes max({all_path}, {iface_path}) for {iface}"),
+            )
+        }
+    };
+    let effective = a.max(i);
+    let detail = format!(
+        "{iface}: {all_path} = {a}, {iface_path} = {i}, effective {effective} ({})",
+        mode(effective)
+    );
+    if effective == 1 {
+        Check::fail(
+            "rp_filter",
+            format!(
+                "{detail}: replies to sockets bound to {iface} are dropped by the kernel. \
+                 Set both to 2."
+            ),
+        )
+    } else {
+        Check::pass("rp_filter", detail)
+    }
+}
+
+/// The uid the kill-switch ruleset would confine.
+///
+/// `as_uid` is what the operator asked about; `invoker` is this process. The
+/// packaged unit runs the daemon as `User=torrentd` while `--bring-up` all but
+/// requires root, so the invoking uid is routinely not the daemon's:
+/// `sudo torrentd … vpn check --bring-up` used to emit `kill_switch_uid
+/// running as uid 0` as its *first* line and exit 1, for a failure the daemon
+/// would never hit. The reverse held too — an ordinary uid checking a host
+/// whose service user is misconfigured as root passed.
+///
+/// The config carries no uid, so when the two differ this reports what it is:
+/// a property of the invoker, not of the daemon, and therefore unestablished.
+fn judge_kill_switch_uid(as_uid: Option<u32>, invoker: Result<u32, String>) -> Check {
+    let subject = match (as_uid, invoker.as_ref()) {
+        (Some(u), _) => u,
+        (None, Ok(u)) => *u,
+        (None, Err(e)) => {
+            return Check::unknown(
+                "kill_switch_uid",
+                format!("could not read this process's uid ({e}), and --as-uid was not given"),
+            )
+        }
+    };
+    if invoker.as_ref().ok() != Some(&subject) {
+        let who = match invoker.as_ref() {
+            Ok(i) => format!("this process is uid {i}"),
+            Err(e) => format!("this process's own uid could not be read: {e}"),
+        };
+        let root_note = if subject == 0 {
+            ". `killswitch::enable` refuses uid 0 outright, so if the daemon really runs as \
+             root the kill switch aborts the boot"
+        } else {
+            ""
+        };
+        return Check::unknown(
+            "kill_switch_uid",
+            format!("asked about uid {subject}, but {who}, so nothing was established{root_note}"),
+        );
+    }
+    if subject == 0 {
+        Check::fail(
+            "kill_switch_uid",
+            "running as uid 0: the kill-switch ruleset confines the daemon's uid to \
+             loopback and its tunnels, which as root would drop every root-owned \
+             process's traffic on this host",
+        )
+    } else {
+        Check::pass("kill_switch_uid", format!("running as uid {subject}"))
+    }
+}
+
+/// Dry-run a ruleset through `nft --check --file -`: nftables parses it and
+/// validates it against the live kernel, and installs nothing.
+fn nft_check(ruleset: &str) -> std::io::Result<std::process::Output> {
+    use std::io::Write;
+    let mut child = std::process::Command::new("nft")
+        .args(["--check", "--file", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("nft stdin unavailable"))?
+        .write_all(ruleset.as_bytes())?;
+    child.wait_with_output()
+}
+
 /// Checks that are about the host, not any one slot.
-fn host_checks(cfg: &Config) -> Vec<Check> {
+fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
     let mut out = Vec::new();
 
     out.push(if tool_available("ip", "-V") {
@@ -249,22 +380,17 @@ fn host_checks(cfg: &Config) -> Vec<Check> {
 
     // rp_filter in strict mode drops the replies to a source-bound socket, so
     // a multi-slot daemon looks like a tunnel that connects and carries no
-    // traffic. docs/running.md calls for 2 (loose).
-    let rp = std::fs::read_to_string("/proc/sys/net/ipv4/conf/all/rp_filter")
-        .ok()
-        .map(|s| s.trim().to_string());
-    out.push(match rp.as_deref() {
-        Some("1") => Check::fail(
-            "rp_filter",
-            "net.ipv4.conf.all.rp_filter = 1 (strict): replies to tunnel-bound sockets are \
-             dropped by the kernel. Set it to 2.",
-        ),
-        Some(v) => Check::pass("rp_filter", format!("net.ipv4.conf.all.rp_filter = {v}")),
-        None => Check::unknown(
-            "rp_filter",
-            "could not read /proc/sys/net/ipv4/conf/all/rp_filter",
-        ),
-    });
+    // traffic. docs/running.md calls for 2 (loose). Judged per interface,
+    // because that is how the kernel judges it.
+    let read_sysctl = |p: &str| std::fs::read_to_string(p).ok();
+    let all = read_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter");
+    let mut ifaces: Vec<&str> = cfg.slot.iter().map(|s| s.vpn_interface.as_str()).collect();
+    ifaces.sort_unstable();
+    ifaces.dedup();
+    for iface in ifaces {
+        let per = read_sysctl(&format!("/proc/sys/net/ipv4/conf/{iface}/rp_filter"));
+        out.push(judge_rp_filter(iface, all.as_deref(), per.as_deref()));
+    }
 
     if cfg.network_kill_switch {
         out.push(if vpn::killswitch::nft_available() {
@@ -275,29 +401,74 @@ fn host_checks(cfg: &Config) -> Vec<Check> {
                 "network_kill_switch = true but `nft` is not executable",
             )
         });
-        out.push(match vpn::killswitch::current_uid() {
-            Ok(0) => Check::fail(
-                "kill_switch_uid",
-                "running as uid 0: the kill-switch ruleset confines the daemon's uid to \
-                 loopback and its tunnels, which as root would drop every root-owned \
-                 process's traffic on this host",
-            ),
-            Ok(uid) => Check::pass("kill_switch_uid", format!("running as uid {uid}")),
-            Err(e) => Check::unknown(
-                "kill_switch_uid",
-                format!("could not read our own uid: {e}"),
-            ),
-        });
-        if let Ok(uid) = vpn::killswitch::current_uid() {
-            let tunnels: Vec<String> = cfg.slot.iter().map(|s| s.vpn_interface.clone()).collect();
-            out.push(Check::pass(
+
+        let invoker = vpn::killswitch::current_uid().map_err(|e| e.to_string());
+        let uid_check = judge_kill_switch_uid(as_uid, invoker.clone());
+        // Only a uid this check can stand behind gets a ruleset rendered for
+        // it; otherwise the rendering would be as unestablished as the uid.
+        let subject = match uid_check.verdict {
+            Verdict::Unknown => None,
+            _ => as_uid.or_else(|| invoker.ok()),
+        };
+        out.push(uid_check);
+
+        // The ruleset boot would install, dry-run rather than asserted.
+        // Rendering a string established only that a string was formatted: on
+        // a host where `nft` is present but the invoker lacks CAP_NET_ADMIN,
+        // or where `nft -f` would reject the table, `pass` was printed and the
+        // boot then aborted at `killswitch::enable`. `pass` sits in the same
+        // four-valued vocabulary as the rest, and it was the only verdict this
+        // check could ever produce.
+        out.push(match subject {
+            None => Check::unknown(
                 "kill_switch_ruleset",
-                format!(
-                    "would install:\n{}",
-                    vpn::killswitch::render_ruleset(uid, &tunnels)
-                ),
-            ));
-        }
+                "no uid this check can stand behind, so no ruleset was rendered or \
+                 validated; see kill_switch_uid",
+            ),
+            Some(uid) => {
+                let tunnels: Vec<String> =
+                    cfg.slot.iter().map(|s| s.vpn_interface.clone()).collect();
+                let ruleset = vpn::killswitch::render_ruleset(uid, &tunnels);
+                // Boot builds this interface list from the slots whose tunnel
+                // actually came up, not from every configured slot. Without a
+                // live registry this check cannot know that set; naming the
+                // discrepancy is honest, and guessing at it would not be.
+                let caveat = "interfaces listed are the configured slots; boot lists only \
+                              the slots whose tunnel came up";
+                match nft_check(&ruleset) {
+                    Err(e) => Check::unknown(
+                        "kill_switch_ruleset",
+                        format!("could not run `nft --check --file -`: {e}. {caveat}\n{ruleset}"),
+                    ),
+                    Ok(o) if o.status.success() => Check::pass(
+                        "kill_switch_ruleset",
+                        format!("`nft --check` accepted this ruleset for uid {uid}. {caveat}\n{ruleset}"),
+                    ),
+                    Ok(o) => {
+                        let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                        if err.contains("Operation not permitted")
+                            || err.contains("Permission denied")
+                        {
+                            Check::unknown(
+                                "kill_switch_ruleset",
+                                format!(
+                                    "`nft --check` needs CAP_NET_ADMIN and did not get it \
+                                     ({err}), so the ruleset was not validated. {caveat}"
+                                ),
+                            )
+                        } else {
+                            Check::fail(
+                                "kill_switch_ruleset",
+                                format!(
+                                    "`nft --check` rejected the ruleset boot would install, so \
+                                     the boot would abort installing it: {err}. {caveat}"
+                                ),
+                            )
+                        }
+                    }
+                }
+            }
+        });
     } else {
         out.push(Check::skip("kill_switch", "network_kill_switch = false"));
     }
@@ -371,12 +542,24 @@ fn egress_probe(src: IpAddr, dest: SocketAddr) -> Check {
             "egress",
             format!("{n} bytes came back from {dest} but not our query; treat as inconclusive"),
         ),
+        // What the probe establishes is that this destination did not answer a
+        // DNS query in time. "The tunnel carries nothing" is one reading of
+        // that and not the only one — the argument is a bare socket address
+        // that nothing validates as a resolver — and this is the branch that
+        // carries the exit code, so it states both rather than handing the
+        // operator the alarming one. The non-matching-reply branch above
+        // already reports itself this way.
         Err(e) => Check::fail(
             "egress",
             format!(
-                "no reply from {dest} within {}s on a socket bound to {src}: {e}. The tunnel \
-                 has an address but is not carrying traffic.",
-                EGRESS_TIMEOUT.as_secs()
+                "no reply from {} port {} within {}s on a socket bound to {src}: {e}. Two \
+                 readings: {} may not answer DNS on port {}, or the tunnel is not carrying \
+                 traffic.",
+                dest.ip(),
+                dest.port(),
+                EGRESS_TIMEOUT.as_secs(),
+                dest.ip(),
+                dest.port(),
             ),
         ),
     }
@@ -607,9 +790,18 @@ fn slot_checks(
         },
     }
 
-    // 7. Optional reachability probe.
-    if let (Some(src), Some(dest)) = (tunnel_ip, egress) {
-        checks.push(egress_probe(src, dest));
+    // 7. Optional reachability probe. A check the operator explicitly asked
+    //    for reports a verdict either way: omitting the line and the JSON key
+    //    when there is no address to bind to is the silent green the
+    //    four-valued vocabulary exists to prevent.
+    if let Some(dest) = egress {
+        checks.push(match tunnel_ip {
+            Some(src) => egress_probe(src, dest),
+            None => Check::skip(
+                "egress",
+                format!("{iface} has no address to send from, so {dest} was not probed"),
+            ),
+        });
     }
 
     // 8. Lower only what step 3 raised. An adopted interface is left exactly
@@ -662,6 +854,7 @@ pub fn check(
     json: bool,
     bring_up: bool,
     egress: Option<SocketAddr>,
+    as_uid: Option<u32>,
 ) -> anyhow::Result<i32> {
     if cfg.slot.is_empty() {
         anyhow::bail!(
@@ -680,7 +873,7 @@ pub fn check(
 
     let host = RealHost;
     let report = Report {
-        host: host_checks(cfg),
+        host: host_checks(cfg, as_uid),
         slots: selected
             .into_iter()
             .map(|s| slot_checks(cfg, s, bring_up, egress, &host))
@@ -1036,6 +1229,222 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
             }],
         };
         assert!(r.failed());
+    }
+
+    /// Answer one UDP datagram on loopback with `reply`, and hand back the
+    /// address to aim at. The same shape `vpn::natpmp`'s tests use for the
+    /// NAT-PMP gateway.
+    fn loopback_responder(reply: Vec<u8>) -> SocketAddr {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind a responder");
+        let addr = sock.local_addr().expect("responder address");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            if let Ok((_, from)) = sock.recv_from(&mut buf) {
+                let _ = sock.send_to(&reply, from);
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn an_egress_probe_passes_only_on_a_reply_to_its_own_query() {
+        // The transaction id is the whole of what makes the reply ours. A
+        // responder that echoes it is a round trip; one that does not is
+        // something else on the wire, and the verdict says so rather than
+        // claiming the tunnel works.
+        let ours = loopback_responder(vec![0x7d, 0x0e, 0x81, 0x80]);
+        let c = egress_probe(IpAddr::V4(Ipv4Addr::LOCALHOST), ours);
+        assert_eq!(c.verdict, Verdict::Pass, "detail: {}", c.detail);
+
+        let someone_else = loopback_responder(vec![0xff, 0xff, 0x81, 0x80]);
+        let c = egress_probe(IpAddr::V4(Ipv4Addr::LOCALHOST), someone_else);
+        assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
+        assert!(c.detail.contains("inconclusive"), "detail: {}", c.detail);
+    }
+
+    #[test]
+    fn an_egress_probe_that_cannot_bind_the_source_fails_with_the_address() {
+        // Every socket in the slot is source-bound to the tunnel address, so
+        // an address that cannot be bound is the whole slot failing, not just
+        // this probe.
+        let unbindable = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+        let c = egress_probe(unbindable, "127.0.0.1:53".parse().unwrap());
+        assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+        assert!(c.detail.contains("203.0.113.7"), "detail: {}", c.detail);
+    }
+
+    #[test]
+    fn an_egress_timeout_states_both_readings_and_names_the_port() {
+        // F9. The probe establishes that this destination did not answer a DNS
+        // query in time. It used to report "The tunnel has an address but is
+        // not carrying traffic." — one reading of several, asserted as the
+        // cause, on the branch that carries the exit code.
+        //
+        // A responder that accepts the datagram and never answers is the
+        // timeout, without waiting for one: bind a socket, aim at it, and let
+        // the read time out. Kept off the default 10s by overriding nothing —
+        // instead the discriminator documented in the probe itself is used, a
+        // destination that refuses the datagram outright.
+        let closed = {
+            let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let a = s.local_addr().unwrap();
+            drop(s);
+            a
+        };
+        let c = egress_probe(IpAddr::V4(Ipv4Addr::LOCALHOST), closed);
+        assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("Two readings"),
+            "the operator is handed both: {}",
+            c.detail,
+        );
+        assert!(
+            c.detail.contains(&closed.port().to_string()),
+            "the port is named: {}",
+            c.detail,
+        );
+        assert!(
+            !c.detail
+                .contains("has an address but is not carrying traffic"),
+            "the single asserted cause is gone: {}",
+            c.detail,
+        );
+    }
+
+    #[test]
+    fn an_egress_check_that_was_asked_for_and_could_not_run_says_so() {
+        // D7. `--egress` used to produce no line in the human report and no
+        // key in the JSON when the slot had no tunnel address — a check the
+        // operator explicitly asked for, silently absent.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new();
+
+        let r = slot_checks(
+            &cfg,
+            &cfg.slot[0],
+            false,
+            Some("1.1.1.1:53".parse().unwrap()),
+            &host,
+        );
+
+        let e = find(&r.checks, "egress").expect("an egress line even with no address");
+        assert_eq!(e.verdict, Verdict::Skip, "detail: {}", e.detail);
+        assert!(
+            e.detail.contains("1.1.1.1:53") && e.detail.contains("wg-acct-a"),
+            "detail: {}",
+            e.detail,
+        );
+    }
+
+    #[test]
+    fn no_egress_flag_means_no_egress_line() {
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new();
+        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        assert!(find(&r.checks, "egress").is_none());
+    }
+
+    #[test]
+    fn rp_filter_is_judged_on_the_pair_the_kernel_actually_uses() {
+        // F4. The kernel takes max(conf/all, conf/<iface>) for source
+        // validation on an interface. `conf/all` alone gets both directions
+        // wrong, and this host demonstrates the first of them directly: it
+        // reads all = 0 with every interface at 2.
+        //
+        // all = 0, default = 1 — the interface inherits strict at creation, so
+        // every reply to a tunnel-bound socket is dropped while conf/all reads
+        // clean. This used to print `[ok  ] rp_filter … = 0`.
+        let c = judge_rp_filter("wg-acct-a", Some("0"), Some("1"));
+        assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+        assert!(c.detail.contains("effective 1"), "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("wg-acct-a"),
+            "the operator has to see which interface binds: {}",
+            c.detail,
+        );
+
+        // The converse: all = 1 with the interface at 2 is loose and healthy,
+        // and used to FAIL and take the exit code with it.
+        let c = judge_rp_filter("wg-acct-a", Some("1"), Some("2"));
+        assert_eq!(c.verdict, Verdict::Pass, "detail: {}", c.detail);
+        assert!(c.detail.contains("effective 2"), "detail: {}", c.detail);
+
+        // Both loose, the documented configuration.
+        assert_eq!(
+            judge_rp_filter("wg-acct-a", Some("2"), Some("2")).verdict,
+            Verdict::Pass,
+        );
+        // Both strict.
+        assert_eq!(
+            judge_rp_filter("wg-acct-a", Some("1"), Some("1")).verdict,
+            Verdict::Fail,
+        );
+    }
+
+    #[test]
+    fn an_rp_filter_value_that_cannot_be_read_or_parsed_is_not_a_pass() {
+        // The old `Some(v) => pass` arm passed anything that was not the
+        // literal "1", nonsense included, and an interface whose sysctl is
+        // absent says nothing about the interface either way.
+        for (all, iface) in [
+            (None, Some("2")),
+            (Some("2"), None),
+            (Some("banana"), Some("2")),
+            (Some("2"), Some("")),
+        ] {
+            let c = judge_rp_filter("wg-acct-a", all, iface);
+            assert_eq!(
+                c.verdict,
+                Verdict::Unknown,
+                "all={all:?} iface={iface:?} gave {}",
+                c.detail,
+            );
+        }
+    }
+
+    #[test]
+    fn the_kill_switch_uid_checks_do_not_pass_judgement_on_the_wrong_process() {
+        // F3. The packaged unit runs the daemon as `User=torrentd`, and
+        // `--bring-up` all but requires root, so `sudo torrentd … vpn check
+        // --bring-up` measured uid 0 and emitted `[FAIL] kill_switch_uid` as
+        // its first line — a failure the daemon would never hit, on a check
+        // whose own module doc promises the first failure here is the first
+        // failure the daemon would hit.
+        let c = judge_kill_switch_uid(Some(998), Ok(0));
+        assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("998") && c.detail.contains("uid 0"),
+            "both uids are named: {}",
+            c.detail,
+        );
+
+        // And the reverse: an ordinary operator uid on a host whose service
+        // user is misconfigured as root used to report `ok` while boot would
+        // abort at `killswitch::enable`.
+        let c = judge_kill_switch_uid(Some(0), Ok(1000));
+        assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("refuses uid 0"),
+            "the root reading is still spelled out: {}",
+            c.detail,
+        );
+    }
+
+    #[test]
+    fn the_kill_switch_uid_check_still_judges_the_uid_it_is_actually_running_as() {
+        assert_eq!(judge_kill_switch_uid(None, Ok(1000)).verdict, Verdict::Pass);
+        assert_eq!(
+            judge_kill_switch_uid(Some(1000), Ok(1000)).verdict,
+            Verdict::Pass,
+        );
+        // uid 0 for real is still the outage `killswitch::enable` refuses.
+        assert_eq!(judge_kill_switch_uid(None, Ok(0)).verdict, Verdict::Fail);
+        assert_eq!(judge_kill_switch_uid(Some(0), Ok(0)).verdict, Verdict::Fail);
+        // Nothing to judge at all.
+        assert_eq!(
+            judge_kill_switch_uid(None, Err("no Uid line".into())).verdict,
+            Verdict::Unknown,
+        );
     }
 
     #[test]
