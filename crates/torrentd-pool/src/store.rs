@@ -5,7 +5,7 @@
 //! filter and paginate over that set without shipping it all to the browser.
 //! One transactional file serves the file index, the torrent library, adoption
 //! state, and the torrent→profile registry that used to live in
-//! `profile_assignments.json`.
+//! `slot_assignments.json` (now `profile_assignments.json`).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -29,7 +29,7 @@ use crate::model::TorrentFileRow;
 
 /// Bumped whenever the schema changes; `migrate` walks forward from whatever
 /// the file reports. A file from the future is refused rather than guessed at.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE root (
@@ -67,11 +67,15 @@ CREATE TABLE torrent (
     declared_save_path TEXT,
     category      TEXT,
     tags          TEXT,
-    profile          TEXT,
+    -- Historical text. v1 named this column `slot`; v3 renames it to
+    -- `profile`. Do not substitute the new name here: an index created by an
+    -- earlier build really does carry a `slot` column, and a v1 statement that
+    -- claims otherwise is a migration that never runs.
+    slot          TEXT,
     added_at      INTEGER NOT NULL
 );
 
-CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
+CREATE INDEX torrent_by_slot ON torrent(slot) WHERE slot IS NOT NULL;
 
 CREATE TABLE torrent_file (
     infohash    TEXT    NOT NULL REFERENCES torrent(infohash) ON DELETE CASCADE,
@@ -137,6 +141,25 @@ CREATE TABLE plan_step (
     error   TEXT,
     PRIMARY KEY (plan_id, seq)
 ) WITHOUT ROWID;
+"#;
+
+/// v3 renames the torrent→account column from `slot` to `profile`, following
+/// the same convention as v2: applied on top of v1 rather than folded into it,
+/// so an index created by an earlier build migrates forward in place. Folding
+/// the new name into v1 instead leaves a `user_version = 2` file untouched —
+/// `open` succeeds, the daemon boots clean, and the first pool query fails with
+/// `no such column: profile`, with no recovery but deleting the index and the
+/// `plan`/`plan_step` journal that `from_conn` documents as not reconstructible.
+///
+/// SQLite rewrites the surviving index's definition to follow the rename, so
+/// `torrent_by_slot` would keep its old name over the new column; it is dropped
+/// and recreated rather than left mislabelled.
+const SCHEMA_V3: &str = r#"
+ALTER TABLE torrent RENAME COLUMN slot TO profile;
+
+DROP INDEX torrent_by_slot;
+
+CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
 "#;
 
 pub struct PoolStore {
@@ -297,6 +320,9 @@ impl PoolStore {
         }
         if found < 2 {
             self.conn.execute_batch(SCHEMA_V2)?;
+        }
+        if found < 3 {
+            self.conn.execute_batch(SCHEMA_V3)?;
         }
         if found != SCHEMA_VERSION {
             self.conn

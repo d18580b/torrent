@@ -133,14 +133,15 @@ Requires `allow_mutations = true`. A mistake here destroys data, so:
 ## HTTP API
 
 Everything is served under `/api/…`. `/healthz` and `/metrics` stay at the
-root, where probes and scrapes conventionally look. Safe methods need the
-`read` scope and everything else needs `write`, derived from the method rather
-than listed per route — so a route added under `/api` cannot be added without
-a gate. Three routes are mounted on the root router outside both middleware
-layers — `/healthz`, `/api/login` and `/api/logout`, the rows below carrying
-scope **none**. A route added at that level is ungated, and the method-derived
-scoping does not catch it. (`/metrics` also sits at the root, but under its
-own `metrics`-scope layer.)
+root, where probes and scrapes conventionally look. Default bind
+`127.0.0.1:8080`. Safe methods need the `read` scope and everything else
+needs `write`, derived from the method rather than listed per route — so a
+route added under `/api` cannot be added without a gate. Three routes are
+mounted on the root router outside both middleware layers — `/healthz`,
+`/api/login` and `/api/logout`, the rows below carrying scope **none**. A
+route added at that level is ungated, and the method-derived scoping does not
+catch it. (`/metrics` also sits at the root, but under its own `metrics`-scope
+layer.)
 
 | Method & path | Scope | Purpose |
 | --- | --- | --- |
@@ -155,7 +156,7 @@ own `metrics`-scope layer.)
 | `GET`/`DELETE` `/api/torrents/:infohash` | read/write | `?delete_files=true` requires `[pool] allow_mutations`. |
 | `POST /api/torrents/:infohash/pause` \| `/resume` | write | `resume` is 409 while the profile is fenced. |
 | `POST /api/torrents/:infohash/upload-limit` | write | `{"bytes_per_sec":…}`, 0 = unlimited. |
-| `POST /api/torrents/:infohash/file-priority` | write | `{"file_idx":…,"priority":…}`, priority 0–7. |
+| `POST /api/torrents/:infohash/file-priority` | write | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 1 low, 4 normal, 7 high). |
 | `GET /api/profiles`, `/profiles/:id`, `/profiles/:id/torrents` | read | |
 | `POST /api/profiles/:id/pause-all` \| `/resume-all` | write | `resume-all` is 409 while fenced. |
 
@@ -238,6 +239,27 @@ a `vpn` profile's isolation is layered:
   daemon's egress to loopback and its tunnel interfaces, so a dropped tunnel
   fails closed at the kernel regardless of socket binds or poll timing.
 
+**Checking a tunnel without seeding anything** — `vpn check` runs the VPN
+pre-flight the daemon depends on and reports each part separately, with no
+libtorrent session, no torrents and no tracker contact.
+
+```bash
+torrentd --config … vpn check                            # every profile
+torrentd --config … vpn check --profile acct_a --json    # one profile, machine-readable
+torrentd --config … vpn check --egress 1.1.1.1:53      # prove traffic leaves the tunnel
+```
+
+Verdicts are four-valued — `pass`, `fail`, `skip`, `unknown` — so a green
+summary cannot quietly mean "mostly not checked", and the exit status carries
+the same distinction: `0` clean, `1` any failure, `2` nothing failed but
+something could not be checked.
+
+Safe to run while the daemon is up. The default path reads state and asks the
+gateway for a NAT-PMP mapping with the daemon's own short lease, which it
+leaves to expire; `--bring-up` is the only option that raises a tunnel, and it
+lowers again only what it raised. What a pass does and does not establish is
+set out in [docs/running.md](docs/running.md#9-first-run-checks).
+
 The eight rules this is built on, and why each exists, are documented on the
 `torrentd-engine::profile` module — where the code that enforces them is. The
 operational side of each knob, including what the kill switch costs and what
@@ -257,13 +279,17 @@ Without `[auth]` it authenticates nothing — every route, including every
 mutating one, is open to anyone who can reach the port. That is a legitimate
 posture behind a reverse proxy that does its own access control; it is not one
 to arrive at by omission. The opt-out does not extend to a routable address
-either: `allow_unauthenticated` with a non-loopback `http_listen` is refused.
-`http_listen` defaults to `127.0.0.1:8080`.
+either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
+and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
+inert and reads as though the daemon authenticates nothing. `http_listen`
+defaults to `127.0.0.1:8080`. All three are read once, at startup: changing
+them takes a restart, not a `SIGHUP`.
 
 Two credential kinds, hashed differently on purpose. The **operator password**
 is human-chosen and therefore low-entropy, so it gets Argon2id — `m=19456,
-t=2, p=1`, which is OWASP's current recommendation — verified once at login
-and rate-limited. **API tokens** are 256 bits this daemon generated, so there
+t=2, p=1`, which is OWASP's current recommendation, pinned in `auth.rs` rather
+than inherited from the `argon2` crate's defaults so that a dependency bump
+cannot quietly move it — verified once at login and rate-limited. **API tokens** are 256 bits this daemon generated, so there
 is nothing to guess and SHA-256 is correct; Argon2 on every Prometheus scrape
 would burn ~50 ms of CPU per request by design.
 

@@ -15,8 +15,9 @@ torrentd.example.com {
 
 	# The headers torrentd reads, and the only two it needs. It reads them
 	# **only** from a peer listed in `trusted_proxies`, so set that to this
-	# container's address on the compose network — otherwise they are ignored
-	# and the daemon falls back to the socket peer.
+	# container's address on the compose network — 172.28.0.2, which
+	# `deploy/compose.yaml` pins so there is a fixed address to name. Get it
+	# wrong and they are ignored and the daemon falls back to the socket peer.
 	reverse_proxy torrentd:8080 {
 		header_up X-Forwarded-For {remote_host}
 		header_up X-Forwarded-Proto {scheme}
@@ -29,12 +30,19 @@ torrentd.example.com {
 		header_up -Forwarded
 	}
 
-	# The SSE stream must not be buffered or it arrives in one lump at
-	# timeout. Caddy streams by default; this is here to say so, because a
-	# hand-rolled nginx config is the common place this goes wrong
-	# (`proxy_buffering off` on /api/events).
-	@events path /api/events
-	reverse_proxy @events torrentd:8080 {
-		flush_interval -1
-	}
+	# Nothing here for /api/events, deliberately. The SSE stream must not be
+	# buffered or it arrives in one lump at timeout, and Caddy already
+	# disables buffering for a `text/event-stream` response, so the stream
+	# works by default rather than by configuration.
+	#
+	# A second `reverse_proxy @events` block would in any case be dead: Caddy
+	# preserves source order between two instances of one directive in a site
+	# block, and the block above carries no matcher, so it matches
+	# /api/events first and terminates the handler chain. Were it ever made
+	# reachable it would proxy /api/events *without* the `header_up` rules
+	# above, i.e. with client-supplied forwarding headers intact to a peer
+	# torrentd trusts.
+	#
+	# A hand-rolled nginx config is the common place this does go wrong:
+	# there it needs `proxy_buffering off` on /api/events.
 }

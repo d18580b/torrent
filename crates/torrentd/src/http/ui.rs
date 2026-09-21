@@ -54,14 +54,37 @@ fn security_headers(res: &mut HeaderMap) {
 }
 
 /// Whether the client said it would accept `encoding`.
+///
+/// `q=0` is a refusal, not an acceptance: RFC 9110 §12.5.3 defines a quality
+/// of zero as "not acceptable". Ignoring it means answering
+/// `Accept-Encoding: gzip, br;q=0` with brotli bytes the client has just said
+/// it cannot decode, and the bundle then fails to load. Browsers do not send
+/// it, but intermediaries and embedded clients do, and this is client input on
+/// an unauthenticated route.
+///
+/// A bare `*` deliberately does **not** select a variant. It would be legal to
+/// honour, but declining leaves the response in the identity encoding, which
+/// every client can read — the safe direction when nothing named the encoding
+/// explicitly.
 fn accepts(headers: &HeaderMap, encoding: &str) -> bool {
     headers
         .get(header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| {
             v.split(',').any(|part| {
-                let name = part.split(';').next().unwrap_or("").trim();
-                name.eq_ignore_ascii_case(encoding)
+                let mut fields = part.split(';');
+                let name = fields.next().unwrap_or("").trim();
+                if !name.eq_ignore_ascii_case(encoding) {
+                    return false;
+                }
+                // Any `q` parameter on this entry; absent means q=1.
+                let q = fields.find_map(|p| {
+                    let (k, val) = p.split_once('=')?;
+                    k.trim()
+                        .eq_ignore_ascii_case("q")
+                        .then(|| val.trim().parse::<f32>().unwrap_or(0.0))
+                });
+                q.is_none_or(|q| q > 0.0)
             })
         })
 }
@@ -83,6 +106,19 @@ fn negotiated(path: &str, headers: &HeaderMap) -> Option<(rust_embed::EmbeddedFi
 }
 
 /// The strong validator for a file, from the hash rust-embed already computed.
+///
+/// That hash is over the embedded **bytes** and nothing else, so it is stable
+/// across rebuilds of unchanged input — which is what the `immutable`
+/// `Cache-Control` on a fingerprinted asset promises, and what makes a 304 on
+/// an unchanged `index.html` correct. Established from rust-embed 8.12.0's own
+/// source rather than assumed: `rust_embed_utils::read_file_from_fs` computes
+/// `Sha256::digest(&data)`, and `rust_embed_impl::embed_file` bakes that value
+/// into the binary at compile time.
+///
+/// This is exactly why `Last-Modified` is not used instead. Its sibling field
+/// there, `last_modified`, is `fs::metadata().modified()` — a filesystem
+/// timestamp the build rewrites on every checkout and every rebuild, so it
+/// would invalidate every client's cache for assets that had not changed.
 fn etag(file: &rust_embed::EmbeddedFile) -> String {
     let h = file.metadata.sha256_hash();
     // 16 hex chars of a SHA-256 is ample to distinguish builds of one asset,
@@ -252,6 +288,29 @@ mod tests {
     #[test]
     fn a_missing_header_never_matches() {
         assert!(!matches_etag(&HeaderMap::new(), "\"abc\""));
+    }
+
+    #[test]
+    fn a_q_of_zero_is_a_refusal() {
+        // RFC 9110 §12.5.3: q=0 means "not acceptable". Serving brotli to a
+        // client that just said it cannot decode brotli breaks the bundle.
+        let h = headers(&[(header::ACCEPT_ENCODING, "gzip, br;q=0")]);
+        assert!(!accepts(&h, "br"), "q=0 is a refusal, not an acceptance");
+        assert!(accepts(&h, "gzip"));
+
+        let h = headers(&[(header::ACCEPT_ENCODING, "br;q=0.000")]);
+        assert!(!accepts(&h, "br"), "any spelling of zero is still zero");
+
+        let h = headers(&[(header::ACCEPT_ENCODING, "br;q=0.001")]);
+        assert!(accepts(&h, "br"), "a low quality is still an acceptance");
+    }
+
+    #[test]
+    fn a_wildcard_does_not_select_a_variant() {
+        // Declining leaves the identity encoding, which every client reads.
+        let h = headers(&[(header::ACCEPT_ENCODING, "*")]);
+        assert!(!accepts(&h, "br"));
+        assert!(!accepts(&h, "gzip"));
     }
 
     #[test]

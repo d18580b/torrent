@@ -1,4 +1,5 @@
-//! `/profiles` endpoints (multi-profile mode only; mounted conditionally).
+//! `/profiles` endpoints. Always mounted: a daemon always has at least one
+//! profile.
 
 use axum::extract::Path;
 use axum::extract::State;

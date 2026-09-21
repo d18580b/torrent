@@ -104,9 +104,22 @@ run = [
 #
 #   mise run vpn-check /etc/torrentd/torrentd.toml
 #   mise run vpn-check /etc/torrentd/torrentd.toml -- --bring-up --json
+#
+# The exit status is the subcommand's: 0 clean, 1 any failure, 2 nothing
+# failed but something could not be checked.
+#
+# Declared with `usage` rather than the `{{arg()}}` template: the template
+# form cannot take a flag at all, so the second line above did not run, and
+# the pinned mise deprecates it on every invocation. The flags are forwarded
+# as a group rather than enumerated here — enumerating them would put a second
+# copy of `vpn check`'s own flag surface in this file, to drift against it.
 [tasks.vpn-check]
 description = "Verify a real VPN configuration, with no torrents involved"
-run = 'cargo run --quiet -p torrentd -- --config "{{arg(name="config")}}" vpn check'
+usage = '''
+arg "<config>" help="Path to the torrentd config to check"
+arg "<flags>" var=#true required=#false help="Flags for `vpn check`, e.g. --bring-up --json"
+'''
+run = 'cargo run --quiet -p torrentd -- --config "$usage_config" vpn check $usage_flags'
 
 [tasks.check]
 description = "Formatting + clippy"
