@@ -69,25 +69,54 @@ const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::fro
 /// confining a uid that no longer exists, and no daemon to explain either.
 ///
 /// Armed from construction; `disarm` hands ownership to the shutdown path.
-#[derive(Debug)]
 struct BootCleanup {
     run_dir: std::path::PathBuf,
+    /// How a recorded tunnel's manager is built. Injected so the teardown
+    /// paths below are reachable by a test without shelling out to
+    /// `wg-quick` or `kill`; production always passes `vpn::for_type`.
+    vpn_for: VpnFactory,
     tunnels: Vec<(torrentd_engine::VpnType, String)>,
     kill_switch: bool,
     armed: bool,
 }
 
+/// Builds the `VpnManager` for a tunnel `BootCleanup` has to take down.
+type VpnFactory = Arc<
+    dyn Fn(torrentd_engine::VpnType, &std::path::Path) -> Arc<dyn torrentd_engine::VpnManager>
+        + Send
+        + Sync,
+>;
+
+impl std::fmt::Debug for BootCleanup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootCleanup")
+            .field("run_dir", &self.run_dir)
+            .field("tunnels", &self.tunnels)
+            .field("kill_switch", &self.kill_switch)
+            .field("armed", &self.armed)
+            .finish_non_exhaustive()
+    }
+}
+
 impl BootCleanup {
     fn new(run_dir: std::path::PathBuf) -> Self {
+        Self::with_vpn_factory(run_dir, Arc::new(crate::vpn::for_type))
+    }
+
+    fn with_vpn_factory(run_dir: std::path::PathBuf, vpn_for: VpnFactory) -> Self {
         Self {
             run_dir,
+            vpn_for,
             tunnels: Vec::new(),
             kill_switch: false,
             armed: true,
         }
     }
 
-    /// Record a tunnel this boot raised.
+    /// Record a tunnel this boot may have raised.
+    ///
+    /// Called *before* the bring-up attempt, not after it succeeds — see
+    /// `bring_up_tracked`.
     fn note_tunnel(&mut self, t: torrentd_engine::VpnType, iface: &str) {
         self.tunnels.push((t, iface.to_string()));
     }
@@ -101,8 +130,48 @@ impl BootCleanup {
     fn take_down(&mut self, iface: &str) {
         if let Some(i) = self.tunnels.iter().position(|(_, n)| n == iface) {
             let (t, name) = self.tunnels.remove(i);
-            crate::vpn::for_type(t, &self.run_dir).bring_down(&name);
+            (self.vpn_for)(t, &self.run_dir).bring_down(&name);
         }
+    }
+
+    /// Bring a slot's tunnel up, recording it **before** the attempt.
+    ///
+    /// `bring_up` spawns the tunnel and only then polls up to 30 seconds for
+    /// an address, so every failure after the spawn leaves something running:
+    /// a WireGuard interface `wg-quick up` already created, or an
+    /// `openvpn --daemon` that forked, exited 0, and is still retrying. Both
+    /// outlive this process. Recording the tunnel only once an address had
+    /// appeared left that one failure path — and only that one — with nothing
+    /// tracking it: `take_down` had nothing to remove, `Drop` had nothing to
+    /// bring down, `SlotRegistry::iter()` excludes failed slots so the
+    /// graceful-shutdown loop never saw it either, and the next boot
+    /// overwrote the `--writepid` file that was the only remaining handle on
+    /// the orphan.
+    ///
+    /// Recorded first, the tunnel is torn down on failure here and is still
+    /// tracked by the drop guard if boot aborts. `bring_down` on an interface
+    /// that was never raised is a logged no-op, which is the conservative
+    /// direction.
+    ///
+    /// The bring-up itself runs on `spawn_blocking`: it shells out and polls,
+    /// and on a runtime worker that is 30 seconds per slot during which
+    /// nothing else — including the signal handler that is supposed to
+    /// interrupt exactly this — gets to run on that thread.
+    async fn bring_up_tracked(
+        &mut self,
+        vpn: Arc<dyn torrentd_engine::VpnManager>,
+        t: torrentd_engine::VpnType,
+        profile: torrentd_engine::VpnProfile,
+    ) -> anyhow::Result<Result<IpAddr, torrentd_engine::VpnError>> {
+        let iface = profile.interface.clone();
+        self.note_tunnel(t, &iface);
+        let brought_up = tokio::task::spawn_blocking(move || vpn.bring_up(&profile))
+            .await
+            .context("vpn bring-up task")?;
+        if brought_up.is_err() {
+            self.take_down(&iface);
+        }
+        Ok(brought_up)
     }
 
     fn disarm(&mut self) {
@@ -123,9 +192,33 @@ impl Drop for BootCleanup {
         }
         for (t, iface) in std::mem::take(&mut self.tunnels) {
             warn!(vpn_iface = %iface, "boot failed: bringing tunnel down");
-            crate::vpn::for_type(t, &self.run_dir).bring_down(&iface);
+            (self.vpn_for)(t, &self.run_dir).bring_down(&iface);
         }
     }
+}
+
+/// Take both shutdown receivers `boot` needs, on one line.
+///
+/// `broadcast::Sender::subscribe()` sets the new receiver's cursor to the
+/// channel's current tail, so a receiver created later provably cannot see a
+/// send that already happened, and a send with no live receiver behind it is
+/// discarded outright. `boot` used to subscribe the receiver that outlives
+/// boot only after the resume and torrent-dir scans — 400-odd lines after the
+/// signal listener was installed, and the whole of a single-session boot after
+/// it. A SIGTERM in that window was consumed by `boot_shutdown`, which the
+/// slot loop has already finished with, and the HTTP server's graceful
+/// shutdown then waited on a receiver that could never see it: the daemon
+/// served indefinitely and only SIGKILL ended it, skipping the resume drain
+/// and the tunnel teardown this boot path exists to guarantee.
+///
+/// Returned as a pair so the two subscriptions cannot drift apart again.
+fn boot_shutdown_receivers(
+    tx: &broadcast::Sender<ShutdownReason>,
+) -> (
+    broadcast::Receiver<ShutdownReason>,
+    broadcast::Receiver<ShutdownReason>,
+) {
+    (tx.subscribe(), tx.subscribe())
 }
 
 pub struct DaemonHandle {
@@ -182,9 +275,11 @@ pub async fn boot(
     // Drop the receiver returned by signals::run; we wired our own pair.
     let _ = signals::run(channels.clone(), 8).await;
     let shutdown_tx = channels.shutdown_tx;
-    // Subscribed before the slot loop so a signal raised during bring-up is
-    // still there to be observed when the loop next checks.
-    let mut boot_shutdown = shutdown_tx.subscribe();
+    // Both shutdown receivers, taken here rather than 400 lines apart: the
+    // one the slot loop polls during bring-up, and the one that outlives boot
+    // and the HTTP server's graceful shutdown waits on. See
+    // `boot_shutdown_receivers` for what subscribing the second one late cost.
+    let (mut boot_shutdown, shutdown_rx) = boot_shutdown_receivers(&shutdown_tx);
 
     // Undoes what boot has raised, for every exit that is not a successful
     // one. Tunnels and the kill-switch table outlive the process, so a `?`
@@ -272,23 +367,18 @@ pub async fn boot(
                 if boot_shutdown.try_recv().is_ok() {
                     anyhow::bail!("shutdown requested during slot bring-up");
                 }
-                let vpn = vpn::for_type(s.vpn_type, &run_dir);
-                // `bring_up` shells out and polls for up to 30 seconds. On a
-                // runtime worker that is 30 seconds per slot during which
-                // nothing else — including the signal handler that is supposed
-                // to interrupt exactly this — gets to run on that thread.
-                let brought_up = {
-                    let vpn = vpn.clone();
-                    let profile = s.vpn_profile();
-                    tokio::task::spawn_blocking(move || vpn.bring_up(&profile))
-                        .await
-                        .context("vpn bring-up task")?
-                };
+                // Recorded before the attempt and torn down on failure — a
+                // half-up tunnel is the one failure path nothing else can
+                // reach. See `BootCleanup::bring_up_tracked`.
+                let brought_up = cleanup
+                    .bring_up_tracked(
+                        vpn::for_type(s.vpn_type, &run_dir),
+                        s.vpn_type,
+                        s.vpn_profile(),
+                    )
+                    .await?;
                 let tunnel_ip = match brought_up {
-                    Ok(ip) => {
-                        cleanup.note_tunnel(s.vpn_type, &s.vpn_interface);
-                        ip
-                    }
+                    Ok(ip) => ip,
                     Err(e) => {
                         error!(
                             slot_id = %s.id,
@@ -411,6 +501,15 @@ pub async fn boot(
             Arc::new(MultiSlotSource::new(source_entries))
         }
     };
+
+    // The slot loop's own check is only re-evaluated at the top of the *next*
+    // iteration, so the last slot's 30-second bring-up had no check against
+    // it at all — and a one-slot deployment, or single-session mode, had
+    // none anywhere. Ask once more before boot commits to running, while the
+    // drop guard still owns every tunnel this boot raised.
+    if boot_shutdown.try_recv().is_ok() {
+        anyhow::bail!("shutdown requested during slot bring-up");
+    }
 
     // Network-layer kill switch (defence-in-depth; multi-slot + opt-in).
     // Installed once, after every slot's tunnel is up, so the ruleset covers all
@@ -614,11 +713,6 @@ pub async fn boot(
             info!(slot_id = %slot, torrent_count = added, "torrent dir scan: added new torrents");
         }
     }
-
-    // Subscribe now, not when the HTTP server starts: a broadcast sent with no
-    // live receiver is discarded, so a SIGTERM during the resume scan would
-    // otherwise leave the daemon running with nothing left to stop it.
-    let shutdown_rx = shutdown_tx.subscribe();
 
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call.
@@ -956,4 +1050,138 @@ fn save_session_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+    use std::path::PathBuf;
+
+    use torrentd_engine::MockVpn;
+    use torrentd_engine::VpnProfile;
+    use torrentd_engine::VpnType;
+
+    use super::*;
+
+    fn profile(iface: &str) -> VpnProfile {
+        VpnProfile {
+            r#type: VpnType::Wireguard,
+            config_path: PathBuf::from(format!("/etc/wireguard/{iface}.conf")),
+            interface: iface.to_string(),
+        }
+    }
+
+    /// `BootCleanup` wired to a `MockVpn`, so a teardown is observable
+    /// without shelling out to `wg-quick`.
+    fn cleanup_with(vpn: MockVpn) -> BootCleanup {
+        BootCleanup::with_vpn_factory(
+            PathBuf::from("/var/lib/torrentd"),
+            Arc::new(move |_t, _dir| Arc::new(vpn.clone()) as Arc<dyn torrentd_engine::VpnManager>),
+        )
+    }
+
+    /// A tunnel whose bring-up fails *after* the spawn.
+    ///
+    /// `openvpn --daemon` exits 0 as soon as it forks, and `wg-quick up`
+    /// creates the interface before any address appears, so the 30-second
+    /// address poll expiring leaves something live behind. Recording the
+    /// tunnel only once an address had appeared meant nothing ever brought
+    /// that one down: the failure arm called neither `note_tunnel` nor
+    /// `take_down`, unlike its four siblings, and `SlotRegistry::iter()`
+    /// excludes failed slots so the shutdown loop never saw it either.
+    #[tokio::test]
+    async fn a_tunnel_whose_bring_up_fails_is_still_brought_down() {
+        let vpn = MockVpn::new();
+        // No `set_ip`, so `bring_up` fails the way the address poll does.
+        let mut cleanup = cleanup_with(vpn.clone());
+        let r = cleanup
+            .bring_up_tracked(Arc::new(vpn.clone()), VpnType::Wireguard, profile("wg-a"))
+            .await
+            .expect("the bring-up task itself did not fail");
+        assert!(r.is_err(), "the mock has no address for wg-a");
+        assert_eq!(
+            vpn.bring_down_calls(),
+            vec!["wg-a".to_string()],
+            "a half-up tunnel must be torn down, not left standing",
+        );
+        // And it is no longer tracked, so the drop guard does not try again.
+        drop(cleanup);
+        assert_eq!(vpn.bring_down_calls(), vec!["wg-a".to_string()]);
+    }
+
+    /// The other half of the same repair: a tunnel that came up is left
+    /// standing for the daemon that is about to use it, and is handed to the
+    /// drop guard rather than torn down here.
+    #[tokio::test]
+    async fn a_tunnel_that_came_up_is_left_running_and_tracked() {
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+        let mut cleanup = cleanup_with(vpn.clone());
+        let r = cleanup
+            .bring_up_tracked(Arc::new(vpn.clone()), VpnType::Wireguard, profile("wg-a"))
+            .await
+            .expect("the bring-up task itself did not fail");
+        assert_eq!(
+            r.expect("wg-a came up"),
+            IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)),
+        );
+        assert!(
+            vpn.bring_down_calls().is_empty(),
+            "a tunnel that came up is not torn down by the bring-up path",
+        );
+        // Boot then fails somewhere later — a pool that will not open, a
+        // resume directory that cannot be read — and the guard takes it down.
+        drop(cleanup);
+        assert_eq!(vpn.bring_down_calls(), vec!["wg-a".to_string()]);
+    }
+
+    /// `disarm` hands the tunnels to the shutdown path; dropping after it
+    /// must not stop the daemon that just started.
+    #[tokio::test]
+    async fn a_disarmed_guard_leaves_the_running_daemon_alone() {
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+        let mut cleanup = cleanup_with(vpn.clone());
+        let _ = cleanup
+            .bring_up_tracked(Arc::new(vpn.clone()), VpnType::Wireguard, profile("wg-a"))
+            .await;
+        cleanup.disarm();
+        drop(cleanup);
+        assert!(vpn.bring_down_calls().is_empty());
+    }
+
+    /// The signal seam that used to have 400 lines in it.
+    ///
+    /// `subscribe()` sets a new receiver's cursor to the channel's current
+    /// tail, so a receiver created after a send provably cannot see it. Both
+    /// of `boot`'s receivers therefore have to exist before the signal
+    /// listener can send anything — which is what taking them as a pair
+    /// enforces.
+    #[test]
+    fn both_boot_receivers_see_a_shutdown_raised_during_boot() {
+        let (tx, _keep_open) = broadcast::channel(8);
+        let (mut boot_shutdown, mut shutdown_rx) = boot_shutdown_receivers(&tx);
+
+        // A SIGTERM arriving while boot is still scanning the resume dir.
+        tx.send(ShutdownReason::Sigterm).expect("a live receiver");
+
+        assert!(
+            boot_shutdown.try_recv().is_ok(),
+            "the slot loop's check sees it and aborts the boot",
+        );
+        assert!(
+            matches!(shutdown_rx.try_recv(), Ok(ShutdownReason::Sigterm)),
+            "and the receiver the HTTP server's graceful shutdown waits on \
+             still has its own copy",
+        );
+
+        // The counterfactual, and the reason the pair exists: subscribing
+        // after the send — where `boot` used to, past both startup scans —
+        // sees nothing at all, and the daemon serves until SIGKILL.
+        let mut subscribed_after = tx.subscribe();
+        assert!(
+            subscribed_after.try_recv().is_err(),
+            "a receiver subscribed after the send cannot see it",
+        );
+    }
 }
