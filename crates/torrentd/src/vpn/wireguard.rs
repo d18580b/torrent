@@ -167,6 +167,28 @@ impl WireguardManager {
     /// address. Anything less and the daemon would be binding its sockets to a
     /// tunnel it cannot vouch for, which is the one thing Safety Rule 1 exists
     /// to prevent.
+    ///
+    /// **"Vouch for" here means identity, not configuration.** The two
+    /// conditions establish that this is the peer the profile names and that
+    /// it has an address to bind to. They do not check the peer endpoint,
+    /// `AllowedIPs`, the routing table or the fwmark rule, so a tunnel left
+    /// by a partially completed `wg-quick down` — which removes routes and
+    /// rules *before* it removes the interface — is adoptable.
+    ///
+    /// That is deliberate, and it is not a leak. A daemon bound to an address
+    /// whose routes are gone cannot fall out over the physical interface: the
+    /// source address is not local to it, so the packets are dropped rather
+    /// than misrouted. `vpn_monitor` then fences the slot within one
+    /// `POLL_INTERVAL` on the handshake probe. The failure mode is a fenced
+    /// slot, and the four extra `wg`/`ip` subprocess calls per bring-up that
+    /// checking the rest would cost buy only a faster diagnosis of it.
+    ///
+    /// Adoption is likewise attempted on **any** non-zero `wg-quick up` exit
+    /// rather than on a probe for the interface first, or on matching
+    /// wg-quick's own "already exists" message. The public-key gate is what
+    /// decides safety; an existence probe adds a syscall path, and matching
+    /// the message adds a second thing to keep in step with a tool this
+    /// daemon does not own.
     fn adoptable(&self, profile: &VpnProfile) -> Option<IpAddr> {
         let live = interface_public_key(&profile.interface)?;
         let expected = profile_public_key(&profile.config_path)?;
