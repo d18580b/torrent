@@ -95,6 +95,22 @@ pub fn nft_available() -> bool {
 /// any stale table left by a previous unclean exit first.
 pub fn enable(tunnels: &[String]) -> io::Result<u32> {
     let uid = current_uid()?;
+    // The ruleset confines *this uid's* egress to loopback and the tunnels. As
+    // root that is not a kill switch, it is an outage: every root-owned socket
+    // on the host — the package manager, the NTP client, sshd's replies —
+    // matches `meta skuid 0` and gets dropped. Refuse rather than install it.
+    //
+    // `wg-quick` is usually a root tool, so reaching here as root is an easy
+    // mistake to make; the packaged unit's `User=torrentd` plus
+    // `AmbientCapabilities=CAP_NET_ADMIN` is the supported shape.
+    if uid == 0 {
+        return Err(io::Error::other(
+            "network_kill_switch = true requires a dedicated non-root user: the ruleset \
+             confines the daemon's uid to loopback and its tunnels, and as uid 0 that \
+             would drop every root-owned process's traffic on this host. Run torrentd as \
+             its own user with CAP_NET_ADMIN (see deploy/torrentd.service).",
+        ));
+    }
     let ruleset = render_ruleset(uid, tunnels);
     // Clear a stale table before reloading. `nft -f -` merges into an existing
     // table rather than replacing it, so a delete that silently failed would
@@ -168,6 +184,18 @@ fn apply(ruleset: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_root_ruleset_is_never_rendered_by_enable() {
+        // `render_ruleset` is pure and will happily render uid 0 — the guard
+        // lives in `enable`, which is the only thing that installs one. This
+        // pins the shape the guard exists to prevent.
+        let rs = render_ruleset(0, &["wg0".to_string()]);
+        assert!(
+            rs.contains("meta skuid 0 counter drop"),
+            "if this ever stops being catastrophic, revisit the guard in enable()",
+        );
+    }
 
     #[test]
     fn ruleset_confines_uid_to_lo_and_tunnels() {
