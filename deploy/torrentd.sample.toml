@@ -11,8 +11,16 @@
 default_save_path = "/data/torrents"
 resume_dir        = "/var/lib/torrentd/resume"
 torrent_dir       = "/var/lib/torrentd/torrents"
-http_listen       = "127.0.0.1:8080"
+http_listen       = "127.0.0.1:8080"   # loopback by default
 log_level         = "info"   # error | warn | info | debug (reloadable)
+
+# The daemon refuses to start unless you either configure [auth] (see the
+# bottom of this file) or say here that you do not want authentication. This
+# sample takes the second option because it binds loopback, where access
+# control is the reverse proxy's job. Delete this line and configure [auth]
+# before exposing the API anywhere — a non-loopback bind without [auth] is
+# refused outright.
+allow_unauthenticated = true
 
 # `resume_dir` and `torrent_dir` are roots: each profile gets its own
 # subdirectory under them, named after the profile id. A profile may override
@@ -187,8 +195,25 @@ dht               = true
 # allow_mutations = false
 
 # ---------------------------------------------------------------------------
-# Authentication
+# Authentication — required, one way or the other
 # ---------------------------------------------------------------------------
+# The daemon refuses to start unless you have either configured `[auth]` or
+# written `allow_unauthenticated = true`. Without `[auth]` it authenticates
+# nothing: every route, including every mutating one, is open to anyone who can
+# reach the port. That is a legitimate posture behind a reverse proxy that does
+# its own access control — but not one to arrive at by omission, which is what
+# it used to be.
+#
+# The opt-out does not extend to a routable address: `allow_unauthenticated`
+# with a non-loopback `http_listen` is refused, because that is an
+# unauthenticated mutating API on the network. So the two safe shapes are:
+#
+#   loopback + allow_unauthenticated   access control is the proxy's job
+#   any bind + [auth]                  the daemon authenticates itself
+#
+# This sample ships the first, because it binds loopback: see
+# `allow_unauthenticated` in the daemon-wide block at the top. Configure [auth]
+# below and delete that line before exposing the API anywhere.
 # Generate the values — never write a password or token here by hand:
 #   torrentd --config /etc/torrentd/torrentd.toml hash-password
 #   torrentd --config /etc/torrentd/torrentd.toml new-token --name ci --scopes read

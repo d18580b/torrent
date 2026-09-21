@@ -208,15 +208,21 @@ The eight rules this is built on, and why each exists, are documented on the
 
 ## Authentication
 
-Optional. Without an `[auth]` section the daemon does none — bind to loopback
-and put a reverse proxy in front. With one, it authenticates itself, which is
-what makes the web client safe to expose.
+**Required, one way or the other.** The daemon refuses to start unless you
+have either configured `[auth]` or written `allow_unauthenticated = true`.
+Without `[auth]` it authenticates nothing — every route, including every
+mutating one, is open to anyone who can reach the port. That is a legitimate
+posture behind a reverse proxy that does its own access control; it is not one
+to arrive at by omission. The opt-out does not extend to a routable address
+either: `allow_unauthenticated` with a non-loopback `http_listen` is refused.
+`http_listen` defaults to `127.0.0.1:8080`.
 
 Two credential kinds, hashed differently on purpose. The **operator password**
-is human-chosen and therefore low-entropy, so it gets Argon2id, verified once
-at login and rate-limited. **API tokens** are 256 bits this daemon generated,
-so there is nothing to guess and SHA-256 is correct — Argon2 on every
-Prometheus scrape would burn ~50 ms of CPU per request by design.
+is human-chosen and therefore low-entropy, so it gets Argon2id — `m=19456,
+t=2, p=1`, which is OWASP's current recommendation — verified once at login
+and rate-limited. **API tokens** are 256 bits this daemon generated, so there
+is nothing to guess and SHA-256 is correct; Argon2 on every Prometheus scrape
+would burn ~50 ms of CPU per request by design.
 
 ```bash
 torrentd --config … hash-password

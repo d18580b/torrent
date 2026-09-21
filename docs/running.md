@@ -203,16 +203,32 @@ Validate without starting anything:
 torrentd --config /etc/torrentd/torrentd.toml --check-config
 ```
 
-## 6. Authentication (optional)
+## 6. Authentication — required, one way or the other
 
-Without an `[auth]` section the daemon does no authentication at all — bind it
-to loopback and let a reverse proxy handle access. With one, it authenticates
-itself, which is what makes the web client safe to expose.
+The daemon refuses to start unless you have either configured `[auth]` or
+written `allow_unauthenticated = true`.
+
+Without `[auth]` it authenticates nothing: every route, including every
+mutating one, is open to anyone who can reach the port. That is a legitimate
+posture behind a reverse proxy that does its own access control — it is just
+not one to arrive at by omission, which is what it was. The opt-out does not
+extend to a routable address, either: `allow_unauthenticated` with a
+non-loopback `http_listen` is refused outright, because that is an
+unauthenticated mutating API on the network.
+
+So there are two safe shapes:
+
+| `http_listen` | `[auth]` | |
+| --- | --- | --- |
+| loopback | absent, `allow_unauthenticated = true` | access control is the proxy's job |
+| anything | configured | the daemon authenticates itself |
+
+`http_listen` defaults to `127.0.0.1:8080`.
 
 > **Bootstrapping order matters.** `--config` is required *before* any
 > subcommand and is validated first, so `hash-password` cannot run until a valid
-> config already exists. Write the config **without** `[auth]`, generate the
-> values, then add the section.
+> config already exists. Write the config with `allow_unauthenticated = true`,
+> generate the values, then replace it with the `[auth]` section.
 
 ```bash
 torrentd --config /etc/torrentd/torrentd.toml hash-password
@@ -226,6 +242,9 @@ prints the **token on stdout** and the **config stanza on stderr**, so
 There is no token-only mode: `[auth]` requires `password_hash`. Scopes are
 `read` (safe methods), `write` (anything that mutates) and `metrics`
 (`/metrics` and nothing else). `/healthz` is always unauthenticated.
+
+`POST /api/login` returns 409 with an explanation when the daemon is running
+unauthenticated, rather than the 404 that used to look like a missing route.
 
 ## 7. Limits and sysctls
 
