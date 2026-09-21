@@ -61,8 +61,11 @@ fn wait_healthy(addr: &str) {
 /// The profile every torrent in these tests belongs to.
 pub const PROFILE: &str = "test";
 
-/// Write a daemon config into `p` and spawn the binary against it.
-fn spawn_daemon(p: &std::path::Path, listen_port: u16, http_addr: &str) -> Child {
+/// Write a daemon config into `p`, returning its path.
+///
+/// `resume_dir` is `p/resume`, so the daemon's state dir — where the
+/// assignment registry lives — is `p` itself.
+fn write_config(p: &std::path::Path, listen_port: u16, http_addr: &str) -> std::path::PathBuf {
     for sub in ["data", "resume", "torrents"] {
         std::fs::create_dir_all(p.join(sub)).unwrap();
     }
@@ -86,7 +89,12 @@ fn spawn_daemon(p: &std::path::Path, listen_port: u16, http_addr: &str) -> Child
         ),
     )
     .unwrap();
+    cfg
+}
 
+/// Write a daemon config into `p` and spawn the binary against it.
+fn spawn_daemon(p: &std::path::Path, listen_port: u16, http_addr: &str) -> Child {
+    let cfg = write_config(p, listen_port, http_addr);
     Command::new(env!("CARGO_BIN_EXE_torrentd"))
         .arg("--config")
         .arg(&cfg)
@@ -193,5 +201,93 @@ fn daemon_graceful_shutdown_under_load() {
     assert!(
         p.join(format!("session_state-{PROFILE}.dat")).exists(),
         "a dht profile's session state should be written on SIGTERM"
+    );
+}
+
+/// The upgrade every pre-profiles deployment takes, and the one the published
+/// upgrade note does not cover.
+///
+/// A single-session deployment's `slot_assignments.json` maps every info-hash
+/// to `default`. The operator writes a `[[profile]]` table with some other id
+/// and starts the daemon. The registry migration carries those entries over
+/// verbatim, and nothing reconciles them: the per-profile resume and torrent
+/// scans never look at the old un-partitioned paths, so nothing loads; the
+/// registry says every one of those info-hashes is taken, so re-adding answers
+/// 409; and `DELETE` cannot clear an entry whose profile has no session
+/// either. The daemon serves `/healthz` 200 throughout, seeding nothing.
+///
+/// Without the reconciliation this test fails by timing out on a daemon that
+/// came up perfectly happy.
+#[test]
+#[ignore = "spawns the real daemon; run with --ignored"]
+fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, 16893, "127.0.0.1:18093");
+
+    // The pre-profiles registry, under its pre-profiles name. `write_config`
+    // puts `resume_dir` at `p/resume`, so the state dir is `p`.
+    std::fs::write(
+        p.join("slot_assignments.json"),
+        br#"{"0101010101010101010101010101010101010101":"default",
+             "0202020202020202020202020202020202020202":"default"}"#,
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+
+    let exited = wait_exit(&mut child, Duration::from_secs(30));
+    // The refusal is a tracing ERROR, which this daemon writes to stdout as
+    // JSON; read both streams so the assertions below do not depend on which.
+    let mut err = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut err)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut err)
+        .unwrap();
+
+    assert!(
+        exited,
+        "the daemon started against a registry it cannot serve; stderr: {err}"
+    );
+    assert!(
+        !child.wait().unwrap().success(),
+        "exit status must be a failure; stderr: {err}"
+    );
+
+    // The refusal has to be actionable: it names the id it does not recognise,
+    // the ids it does, and both ways out.
+    assert!(err.contains("default"), "must name the unknown id: {err}");
+    assert!(
+        err.contains(PROFILE),
+        "must name the configured profiles: {err}"
+    );
+    assert!(
+        err.contains("[[profile]]"),
+        "must say what declares a profile: {err}"
+    );
+    assert!(
+        err.contains("profile_assignments.json"),
+        "must name the file to edit: {err}"
+    );
+
+    // And it must not have been a silent success followed by a crash: nothing
+    // should have been loaded.
+    assert!(
+        !p.join(format!("session_state-{PROFILE}.dat")).exists(),
+        "the daemon got far enough to persist session state"
     );
 }
