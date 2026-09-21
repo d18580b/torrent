@@ -550,7 +550,25 @@ pub async fn remove(
                 Json(serde_json::json!({"error": format!("{e}")})),
             )
         })?;
-    let _ = s.registry.remove(&ih);
+    // Report a persist failure rather than discarding it. On a full or
+    // read-only state directory the payload is gone and the assignment write
+    // fails, and a 204 here said the delete succeeded — so the claim comes
+    // back from the file at the next restart, over a torrent that no longer
+    // exists, and clearing it then is the hard case. The no-engine branch
+    // above already reports this; this one now matches. The removal from the
+    // session has already happened, which the message says, so a retry is
+    // about the assignment alone.
+    s.registry.remove(&ih).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!(
+                    "the torrent was removed from its session but its assignment could not be \
+                     cleared: {e}. Retry the delete to clear the assignment."
+                )
+            })),
+        )
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -849,6 +867,68 @@ mod tests {
         assert!(
             app.registry.lookup(&ih).is_some(),
             "entry was cleared anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering_204() {
+        // `let _ = s.registry.remove(&ih)` discarded the persist error after
+        // `remove_torrent` had already succeeded. On a full or read-only
+        // state directory the payload is gone, the assignment write fails,
+        // and the handler answered 204 — so the claim comes back from the
+        // file at the next restart, over a torrent that no longer exists, and
+        // the re-add it then blocks answers 409. The no-engine branch above
+        // already reported this; this one did not.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+
+        let mut app = test_state(dir.path());
+        // A registry whose file cannot be written. Its "directory" is a
+        // regular file, so the atomic write fails at `create_dir_all` — which
+        // is what a state directory that has gone away, filled up or turned
+        // read-only looks like from here.
+        std::fs::write(dir.path().join("blocker"), b"not a directory").unwrap();
+        app.registry = Arc::new(AssignmentRegistry::new_empty(
+            dir.path().join("blocker").join("reg.json"),
+        ));
+        // `p` is the profile `build_test_state` gives a session to, so this
+        // takes the engine-backed branch.
+        let profile = ProfileId::new("p");
+        app.state.insert(
+            ih,
+            torrentd_engine::TorrentState::newly_added(
+                torrentd_engine::TorrentHandle {
+                    id: 1,
+                    infohash: ih,
+                },
+                profile.clone(),
+                std::time::Instant::now(),
+            ),
+        );
+        // `assign` inserts in memory and then fails to persist, which is
+        // exactly the state a delete has to cope with: the registry knows who
+        // owns it and cannot write that down.
+        assert!(
+            app.registry.assign(ih, profile).is_err(),
+            "fixture is wrong: the registry file must be unwritable",
+        );
+        assert!(app.registry.lookup(&ih).is_some());
+
+        let err = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery {
+                delete_files: false,
+            }),
+        )
+        .await
+        .expect_err("a delete whose assignment write failed is not a success");
+
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let msg = err.1 .0["error"].as_str().unwrap().to_string();
+        assert!(
+            msg.contains("assignment could not be cleared"),
+            "the operator has to know which half failed: {msg}",
         );
     }
 
