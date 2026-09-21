@@ -115,18 +115,19 @@ Requires `allow_mutations = true`. A mistake here destroys data, so:
 ## HTTP API
 
 Everything is served under `/api/…`. `/healthz` and `/metrics` stay at the
-root, where probes and scrapes conventionally look.
+root, where probes and scrapes conventionally look. Default bind
+`127.0.0.1:8080`.
 
 | Method & path | Purpose |
 | --- | --- |
 | `GET /healthz` | Liveness. 503 until a session is up, and again if the alert loop stops advancing. Never authenticated. |
-| `GET /status` | Counts by state, aggregate rates, peers. |
-| `GET /torrents` | List. `?after=<infohash>&limit=<n>` (default 100, max 1000), returns `{"items":[…],"next_cursor":…}`. |
-| `POST /torrents` | Add `{"magnet":…}` / `{"torrent_path":…}`, or a multipart `.torrent`. 409 on a duplicate info-hash. Body capped at 50 MiB. |
-| `GET`/`DELETE` `/torrents/:infohash` | One torrent; `?delete_files=true` requires a `[pool]` section with `allow_mutations`. |
-| `POST /torrents/:infohash/pause` \| `/resume` | Pause or resume one torrent. |
-| `POST /torrents/:infohash/upload-limit` | `{"bytes_per_sec":…}`, 0 = unlimited. |
-| `POST /torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 4 normal, 7 high). |
+| `GET /api/status` | Counts by state, aggregate rates, peers. |
+| `GET /api/torrents` | List. `?after=<infohash>&limit=<n>` (default 100, max 1000), returns `{"items":[…],"next_cursor":…}`. |
+| `POST /api/torrents` | Add `{"magnet":…,"profile_id":…}` / `{"torrent_path":…,"profile_id":…}`, or a multipart `.torrent`. 409 on a duplicate info-hash. Body capped at 50 MiB. |
+| `GET`/`DELETE` `/api/torrents/:infohash` | One torrent; `?delete_files=true` requires a `[pool]` section with `allow_mutations`. |
+| `POST /api/torrents/:infohash/pause` \| `/resume` | Pause or resume one torrent. |
+| `POST /api/torrents/:infohash/upload-limit` | `{"bytes_per_sec":…}`, 0 = unlimited. |
+| `POST /api/torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 4 normal, 7 high). |
 | `POST /api/login` \| `/api/logout` | Session cookie in, revocation out. |
 | `GET /api/events` | SSE change stream. |
 | `GET /metrics` | Prometheus text format. |
@@ -199,6 +200,27 @@ the isolation is layered — and honest about its limits.
   tunnel interfaces, so a dropped tunnel fails closed at the kernel regardless
   of socket binds or poll timing. Needs `CAP_NET_ADMIN` and a dedicated user.
 
+**Checking a tunnel without seeding anything** — `vpn check` runs the VPN
+pre-flight the daemon depends on and reports each part separately, with no
+libtorrent session, no torrents and no tracker contact.
+
+```bash
+torrentd --config … vpn check                            # every profile
+torrentd --config … vpn check --profile acct_a --json    # one profile, machine-readable
+torrentd --config … vpn check --egress 1.1.1.1:53      # prove traffic leaves the tunnel
+```
+
+Verdicts are four-valued — `pass`, `fail`, `skip`, `unknown` — so a green
+summary cannot quietly mean "mostly not checked", and the exit status carries
+the same distinction: `0` clean, `1` any failure, `2` nothing failed but
+something could not be checked.
+
+Safe to run while the daemon is up. The default path reads state and asks the
+gateway for a NAT-PMP mapping with the daemon's own short lease, which it
+leaves to expire; `--bring-up` is the only option that raises a tunnel, and it
+lowers again only what it raised. What a pass does and does not establish is
+set out in [docs/running.md](docs/running.md#9-first-run-checks).
+
 `allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds,
 not an egress control. Public content that wants DHT belongs in a
 `network = "host"` profile.
@@ -214,13 +236,17 @@ Without `[auth]` it authenticates nothing — every route, including every
 mutating one, is open to anyone who can reach the port. That is a legitimate
 posture behind a reverse proxy that does its own access control; it is not one
 to arrive at by omission. The opt-out does not extend to a routable address
-either: `allow_unauthenticated` with a non-loopback `http_listen` is refused.
-`http_listen` defaults to `127.0.0.1:8080`.
+either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
+and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
+inert and reads as though the daemon authenticates nothing. `http_listen`
+defaults to `127.0.0.1:8080`. All three are read once, at startup: changing
+them takes a restart, not a `SIGHUP`.
 
 Two credential kinds, hashed differently on purpose. The **operator password**
 is human-chosen and therefore low-entropy, so it gets Argon2id — `m=19456,
-t=2, p=1`, which is OWASP's current recommendation — verified once at login
-and rate-limited. **API tokens** are 256 bits this daemon generated, so there
+t=2, p=1`, which is OWASP's current recommendation, pinned in `auth.rs` rather
+than inherited from the `argon2` crate's defaults so that a dependency bump
+cannot quietly move it — verified once at login and rate-limited. **API tokens** are 256 bits this daemon generated, so there
 is nothing to guess and SHA-256 is correct; Argon2 on every Prometheus scrape
 would burn ~50 ms of CPU per request by design.
 

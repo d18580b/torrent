@@ -29,24 +29,34 @@ pub struct LoginResponse {
     expires_in: u64,
 }
 
+/// The 409 body, as an API client reads it.
+///
+/// Broken with `\` continuations rather than left as a bare multi-line
+/// literal: without them every line's indentation is *in* the string, and
+/// `web/src/lib/api.ts` lifts `body.error` verbatim into the banner an
+/// operator sees.
+const NO_AUTHENTICATION_CONFIGURED: &str = "this daemon runs without authentication \
+     (allow_unauthenticated = true). There is no session to create; access control belongs \
+     to whatever sits in front of it. Configure [auth] to log in here.";
+
 pub async fn login(State(s): State<AppState>, req: Request) -> Response {
     // Resolved before the body is consumed, and before the `[auth]` check, so
     // the throttle and the log line have it on every path.
     let client = crate::http::forwarded::resolve(&req, &s.trusted_proxies);
 
     let Some(auth) = s.auth.as_ref() else {
-        // 404 read as "no such route", which is what the shipped login form
-        // surfaced when an operator had not configured `[auth]` — a dead end
-        // with no indication of what to do. The route exists; the daemon is
-        // running in a posture where logging in is not a thing that happens.
+        // 404 read as "no such route", which is false: the route exists, and
+        // the daemon is running in a posture where logging in is not a thing
+        // that happens. 409 says that, and this is an API contract for
+        // external clients rather than a fix for anything the shipped web
+        // client can surface — with `auth: None` the status probe succeeds,
+        // `App.tsx` never sets `authed = false`, and the login form is never
+        // rendered. A client that offers no login when the daemon
+        // authenticates nothing is behaving correctly; this status code is for
+        // whoever posts here anyway.
         return (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "this daemon runs without authentication \
-                          (allow_unauthenticated = true). There is no session to create; \
-                          access control belongs to whatever sits in front of it. \
-                          Configure [auth] to log in here."
-            })),
+            Json(serde_json::json!({ "error": NO_AUTHENTICATION_CONFIGURED })),
         )
             .into_response();
     };
@@ -247,6 +257,25 @@ mod tests {
             .header(header_name, value)
             .body(Body::empty())
             .unwrap()
+    }
+
+    #[test]
+    fn the_409_body_is_one_paragraph_of_prose() {
+        // It ships to a human: `api.ts` lifts `body.error` into the thrown
+        // Error and `Login.tsx` renders it into the banner. A multi-line
+        // literal without `\` continuations puts its own source indentation in
+        // the string, which is how this one came to contain three runs of 27
+        // spaces in the exact diagnostic it exists to improve.
+        assert!(
+            !NO_AUTHENTICATION_CONFIGURED.contains("  "),
+            "no run of consecutive spaces: {NO_AUTHENTICATION_CONFIGURED:?}",
+        );
+        assert!(!NO_AUTHENTICATION_CONFIGURED.contains('\n'));
+        assert!(NO_AUTHENTICATION_CONFIGURED.contains("allow_unauthenticated"));
+        assert!(
+            NO_AUTHENTICATION_CONFIGURED.contains("[auth]"),
+            "it names the way out",
+        );
     }
 
     #[test]
