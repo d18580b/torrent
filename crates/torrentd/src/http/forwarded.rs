@@ -280,20 +280,81 @@ fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> HeaderRead<'a> {
             .iter()
             .next_back()
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| split_outside_quotes(v, ',').last())
+            .and_then(|v| split_elements(name, v, ',').last())
             .map(str::trim)
             .filter(|s| !s.is_empty()),
     }
 }
 
+/// Whether `name`'s grammar makes a `"` a quoted-string delimiter.
+///
+/// Only `Forwarded` does. RFC 7239 §4 makes a parameter value either a
+/// `token` — which cannot contain a quote, a comma or a semicolon — or a
+/// `quoted-string`, which can contain all three. `X-Forwarded-For` and
+/// `X-Forwarded-Proto` are de-facto headers with no grammar beyond a
+/// comma-separated list: nothing defines a quoted string in either, so a `"`
+/// in one of their values is ordinary data the client happened to send.
+///
+/// Sharing one quote-aware splitter across all three names is not tidiness,
+/// it is a hole. A client that plants **one unbalanced quote** makes the
+/// trusted proxy's own appended element part of a single quoted segment, so
+/// the positional last element is the client's text and `node_addr` reads the
+/// client's address straight out of it. Demonstrated behind an appending
+/// proxy — the `$proxy_add_x_forwarded_for` shape nginx documents, which is
+/// raw concatenation of the client's header with the peer's address —
+/// `[6.6.6.6]"`, `6.6.6.6:80"` and `[6.6.6.6]:80"` each resolved to
+/// `6.6.6.6`. End to end on one daemon: eight failed logins each planting a
+/// quote returned `401` eight times and were never throttled, while eight
+/// honest ones locked out at the sixth and stayed locked, and the security
+/// log recorded eight addresses the client chose. On `X-Forwarded-Proto` the
+/// same byte runs the other way: a lone `"` merged a TLS edge's own `https`
+/// into one unmatchable element and the session cookie shipped without
+/// `Secure`.
+///
+/// A proxy that adds a *second field line* rather than extending the existing
+/// one — HAProxy's `option forwardfor` — is unaffected either way, which is
+/// what makes this precise rather than universal.
+fn has_quoted_strings(name: &str) -> bool {
+    name.eq_ignore_ascii_case("forwarded")
+}
+
+/// Whether every `quoted-string` opened in `s` is closed.
+///
+/// RFC 7239 §4's `quoted-string` production requires the closing `DQUOTE`, so
+/// a value carrying an unterminated one is not a `Forwarded` value at all.
+/// Honouring the opening quote anyway is the same hole one name over: a
+/// client's `Forwarded: for=6.6.6.6:80"` leaves the quote open, the trusted
+/// proxy's appended `, for=203.0.113.1` falls inside it, and the element that
+/// answers is the client's — demonstrated live behind an appending proxy,
+/// resolving to `6.6.6.6`.
+///
+/// So quoting is honoured only where the grammar it comes from is satisfied,
+/// and an unterminated quote is data. The alternative — calling the whole
+/// value unreadable — discards an element the trusted proxy wrote correctly
+/// because the client sent a stray byte, and puts every client behind that
+/// proxy in one throttle bucket on client-controlled input.
+fn quotes_terminated(s: &str) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            escaped = false;
+        } else if quoted && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        }
+    }
+    !quoted
+}
+
 /// Split `s` on `sep`, ignoring separators inside a quoted string.
 ///
-/// RFC 7239 §4 makes a parameter value either a `token` — which cannot
-/// contain a quote, a comma or a semicolon — or a `quoted-string`, which can
-/// contain all three. Splitting on the bare byte therefore re-frames the
-/// grammar around a value the *client* supplied: the one parameter a proxy
-/// routinely copies from the request is `host=`, quoted precisely because the
-/// client's `Host` may contain characters a token may not.
+/// Splitting on the bare byte where the grammar *does* have a quoted string
+/// re-frames that grammar around a value the *client* supplied: the one
+/// parameter a proxy routinely copies from the request is `host=`, quoted
+/// precisely because the client's `Host` may contain characters a token may
+/// not.
 ///
 /// Demonstrated against a daemon trusting loopback, before this:
 /// `for=198.51.100.9;host="a,for=6.6.6.6"` read as two elements and resolved
@@ -302,12 +363,14 @@ fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> HeaderRead<'a> {
 /// destroyed the proxy's own `for=` *and* set `Secure`. The loss case needs
 /// no attacker at all — a proxy legitimately quoting a separator silently
 /// loses its own claim.
-struct SplitOutsideQuotes<'a> {
+struct SplitList<'a> {
     rest: Option<&'a str>,
     sep: char,
+    /// Whether a `"` opens a quoted string, or is ordinary data.
+    quoted_strings: bool,
 }
 
-impl<'a> Iterator for SplitOutsideQuotes<'a> {
+impl<'a> Iterator for SplitList<'a> {
     type Item = &'a str;
 
     fn next(&mut self) -> Option<&'a str> {
@@ -315,7 +378,12 @@ impl<'a> Iterator for SplitOutsideQuotes<'a> {
         let mut quoted = false;
         let mut escaped = false;
         for (i, c) in s.char_indices() {
-            if escaped {
+            if !self.quoted_strings {
+                if c == self.sep {
+                    self.rest = Some(&s[i + c.len_utf8()..]);
+                    return Some(&s[..i]);
+                }
+            } else if escaped {
                 escaped = false;
             } else if quoted && c == '\\' {
                 // `quoted-pair`: the next character is data whatever it is,
@@ -333,8 +401,29 @@ impl<'a> Iterator for SplitOutsideQuotes<'a> {
     }
 }
 
-fn split_outside_quotes(s: &str, sep: char) -> SplitOutsideQuotes<'_> {
-    SplitOutsideQuotes { rest: Some(s), sep }
+/// Split one `Forwarded` element's parameter list on `sep`.
+///
+/// The only caller is [`param`], which is reached from `Forwarded` and from
+/// nowhere else, so the grammar is known without being passed.
+fn split_outside_quotes(s: &str, sep: char) -> SplitList<'_> {
+    SplitList {
+        rest: Some(s),
+        sep,
+        quoted_strings: quotes_terminated(s),
+    }
+}
+
+/// Split `name`'s value on `sep` under `name`'s own grammar.
+///
+/// Quote-aware for `Forwarded`, and then only for a value whose quoted
+/// strings are closed; a bare split otherwise. [`has_quoted_strings`] and
+/// [`quotes_terminated`] each say what their half is protecting against.
+fn split_elements<'a>(name: &str, s: &'a str, sep: char) -> SplitList<'a> {
+    SplitList {
+        rest: Some(s),
+        sep,
+        quoted_strings: has_quoted_strings(name) && quotes_terminated(s),
+    }
 }
 
 /// Remove RFC 7239 §4 `quoted-string` quoting from a parameter value.
@@ -372,12 +461,12 @@ fn unquote(v: &str) -> std::borrow::Cow<'_, str> {
 /// that is not UTF-8 contributes nothing, which is why the caller still asks
 /// `last_element` whether the header is readable at all before believing an
 /// answer from here.
-fn elements<'a, B>(req: &'a Request<B>, name: &str) -> impl Iterator<Item = &'a str> {
+fn elements<'a, B>(req: &'a Request<B>, name: &'a str) -> impl Iterator<Item = &'a str> {
     req.headers()
         .get_all(name)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| split_outside_quotes(v, ','))
+        .flat_map(move |v| split_elements(name, v, ','))
         .map(str::trim)
         .filter(|s| !s.is_empty())
 }
@@ -823,6 +912,141 @@ mod tests {
         // Unquoting is not trimming quote characters off the ends.
         assert_eq!(param(r#"host="""#, "host").as_deref(), Some(""));
         assert_eq!(param("host=plain", "host").as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn one_unbalanced_quote_cannot_swallow_the_proxys_own_element() {
+        // The property: a `"` may re-frame a value only where the value's own
+        // grammar says it is structure, and even there only where the quoted
+        // string it opens is closed. Every value below is what the daemon
+        // sees *after* an appending proxy has added its own contribution to
+        // the client's text — `$proxy_add_x_forwarded_for` is raw
+        // concatenation, so the client owns everything left of the comma.
+        //
+        // Applying RFC 7239 §4's quoting to all three names put the trusted
+        // proxy's own appended element inside the client's quoted segment, so
+        // the positional last element became the client's text. Demonstrated
+        // end to end: eight failed logins each planting one quote returned
+        // `401` eight times and were never throttled, while eight honest ones
+        // locked out at the sixth and were still locked afterwards, and the
+        // security log carried eight addresses the client chose.
+        let proxy: Option<IpAddr> = Some("203.0.113.1".parse().unwrap());
+        let case = |name: &str, v: &str| {
+            resolve(&req("10.1.2.3", &[(name, v)]), &trusted(&["10.0.0.0/8"])).ip
+        };
+
+        // `X-Forwarded-For` has no quoted-string grammar, so a `"` is data.
+        for v in [
+            r#"[6.6.6.6]", 203.0.113.1"#,
+            r#"6.6.6.6:80", 203.0.113.1"#,
+            r#"[6.6.6.6]:80", 203.0.113.1"#,
+            r#""6.6.6.6, 203.0.113.1"#,
+            r#"6.6.6.6";q=", 203.0.113.1"#,
+        ] {
+            assert_eq!(
+                case("x-forwarded-for", v),
+                proxy,
+                "X-Forwarded-For: {v:?} — a quote is ordinary data here, so \
+                 the proxy's own trailing element is still the last one",
+            );
+        }
+
+        // `Forwarded` does have the grammar, but an *unterminated* quoted
+        // string is not a quoted string: RFC 7239 §4 requires the closing
+        // DQUOTE, and honouring the opening one lets the client's element
+        // swallow the proxy's.
+        for v in [
+            r#"for=6.6.6.6:80", for=203.0.113.1"#,
+            r#"host="a, for=203.0.113.1"#,
+            r#"for=6.6.6.6;host="a;x, for=203.0.113.1"#,
+        ] {
+            assert_eq!(
+                case("forwarded", v),
+                proxy,
+                "Forwarded: {v:?} leaves a quote open, so it is not a quoted \
+                 string and the proxy's own element still decides",
+            );
+        }
+
+        // The control that must keep working: a *closed* quoted string on
+        // `Forwarded` is still structure, which is the whole of the repair
+        // that introduced this hole.
+        assert_eq!(
+            case("forwarded", r#"for=203.0.113.1;host="a,for=6.6.6.6""#),
+            proxy,
+            "a closed quoted string still hides its comma",
+        );
+
+        // And on the scheme, where the same byte runs the other way: merging
+        // a TLS edge's own `https` into one unmatchable element withholds
+        // `Secure` from a deployment that really is TLS-fronted, and the
+        // session cookie then travels in clear.
+        let secure = |v: &str| {
+            resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", v)]),
+                &trusted(&["10.0.0.0/8"]),
+            )
+            .secure
+        };
+        assert!(
+            secure(r#"", https"#),
+            "the client's lone quote is data; the TLS edge's own https still \
+             names a hop that terminated TLS",
+        );
+        assert!(
+            !secure(r#"", http"#),
+            "and the control still names no TLS hop",
+        );
+
+        // The per-name half of the rule, asserted where it lives. Once an
+        // unterminated quote is data, no value an *appending* proxy can
+        // produce separates the two splitters at `resolve`: for the final
+        // comma to fall inside a terminated quoted string there must be a
+        // quote to the right of it, and everything to the right of it is the
+        // proxy's own contribution, which has none. So the rule that a
+        // grammar belongs only to the header that defines it is pinned at the
+        // splitter rather than through an outcome it cannot change.
+        assert_eq!(
+            split_elements("x-forwarded-for", r#""a,b", 1.2.3.4"#, ',').collect::<Vec<_>>(),
+            vec![r#""a"#, r#"b""#, " 1.2.3.4"],
+            "X-Forwarded-For has no quoted-string production, so every comma \
+             is a separator",
+        );
+        assert_eq!(
+            split_elements("x-forwarded-proto", r#""https,http", https"#, ',').collect::<Vec<_>>(),
+            vec![r#""https"#, r#"http""#, " https"],
+        );
+        assert_eq!(
+            split_elements("forwarded", r#"host="a,b", for=1.2.3.4"#, ',').collect::<Vec<_>>(),
+            vec![r#"host="a,b""#, " for=1.2.3.4"],
+            "Forwarded does have one, and a closed quoted string still hides \
+             its comma",
+        );
+    }
+
+    #[test]
+    fn a_bracketed_ipv4_literal_is_read_as_an_address() {
+        // Half of the primitive the quote spelling above needs: `node_addr`
+        // takes everything between the brackets, and `[6.6.6.6]` parses as an
+        // address even though the brackets exist for IPv6 literals. That is
+        // what let `[6.6.6.6]", 203.0.113.1` — one element, once the quote
+        // was honoured — yield `6.6.6.6` rather than nothing.
+        //
+        // It is pinned rather than changed: rejecting it would not have
+        // closed the hole (`6.6.6.6:80"` needs no brackets and resolved the
+        // same way), and a bracketed literal is how RFC 7239 §6 spells a node
+        // whether or not the address inside is v6.
+        assert_eq!(
+            node_addr("[6.6.6.6]"),
+            Some("6.6.6.6".parse().unwrap()),
+            "the brackets are the node syntax, not a family declaration",
+        );
+        assert_eq!(node_addr("[6.6.6.6]:80"), Some("6.6.6.6".parse().unwrap()),);
+        assert_eq!(
+            node_addr("[2001:db8::1]:443"),
+            Some("2001:db8::1".parse().unwrap()),
+        );
+        assert_eq!(node_addr("[not-an-ip]"), None);
     }
 
     #[test]
