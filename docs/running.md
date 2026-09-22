@@ -367,9 +367,18 @@ no header is read and the socket's peer address is the client. Behind a proxy
 that is the proxy's address for every request, so the login throttle behaves
 as one shared bucket; on a **directly exposed** daemon it is the real client's
 address, so the throttle keys per source IP — which is the better property,
-because one attacker can then no longer lock every operator out of the login
-form. Either way the cookie loses its `Secure` attribute, and nothing becomes
+because one attacker's failures no longer land in the same bucket as yours.
+Either way the cookie loses its `Secure` attribute, and nothing becomes
 forgeable.
+
+It is not a promise that nobody can lock you out of the login form. The
+daemon tracks a bounded number of clients — 1024 — and a caller with that many
+distinct source addresses, which one routed IPv6 /64 supplies, can fill the
+map and push every other client onto the shared bucket, where their failures
+lock everyone out exactly as before. Holding it there costs them one real
+failed login per tracked address per 30-second penalty window, at ~50 ms of
+Argon2 each; it is a rate to make expensive, not an attack the per-client key
+removes.
 
 The proxy must **strip or overwrite client-supplied forwarding headers before
 adding its own** — all three of the names in the table above, not just the two

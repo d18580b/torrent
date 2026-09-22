@@ -59,9 +59,15 @@ pub struct Config {
     /// every request, so it behaves like the shared bucket it was, but a
     /// directly exposed daemon — a supported posture, since `[auth]` permits
     /// any bind — now throttles per source IP. That is the better property:
-    /// one attacker can no longer lock every operator out of the login form,
-    /// and a client the tracked-client map has no room for falls back to the
-    /// shared bucket rather than to nothing.
+    /// one attacker's failures no longer land in the same bucket as the
+    /// operator's, and a client the tracked-client map has no room for falls
+    /// back to the shared bucket rather than to nothing.
+    ///
+    /// It is not a guarantee that nobody can lock the operator out. The map
+    /// tracks a bounded number of clients, so a caller with enough distinct
+    /// source addresses can fill it and push everyone else onto the shared
+    /// bucket — which is the old behaviour again, at the cost of one real
+    /// failed login per tracked entry per penalty window.
     ///
     /// Set it to the address the reverse proxy connects from, and only that:
     /// anything in this list can claim to be any client. The proxy must strip

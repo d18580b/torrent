@@ -25,9 +25,11 @@
 //! and now it keys on whatever address this returns. Behind a proxy that is
 //! the proxy's address for every request, so the effect is the shared bucket
 //! again; on a directly exposed daemon it is the real client, so the throttle
-//! keys per source IP. That is the better property — one attacker can no
-//! longer lock every operator out — and it is the behaviour the daemon has,
-//! so it is what is written down here.
+//! keys per source IP. That is the better property — one attacker's failures
+//! no longer share a bucket with the operator's, though a caller with enough
+//! distinct addresses can still fill the tracked-client map and put everyone
+//! back on the shared one — and it is the behaviour the daemon has, so it is
+//! what is written down here.
 
 use std::net::IpAddr;
 use std::net::SocketAddr;

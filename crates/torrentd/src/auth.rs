@@ -205,9 +205,18 @@ pub struct Auth {
 ///
 /// Note that this is *not* the previous behaviour with no trusted proxies
 /// configured. The socket peer is an address, so the empty default now keys
-/// per source IP rather than sharing one bucket. That is the better property —
-/// one attacker can no longer lock every operator out — and both overflow
-/// paths degrade to the shared bucket rather than to no throttle at all.
+/// per source IP rather than sharing one bucket. That removes the *single*
+/// shared bucket, and both overflow paths degrade to a shared bucket rather
+/// than to no throttle at all.
+///
+/// It does not make locking every operator out impossible, and nothing here
+/// should be read as claiming it does. A caller with enough distinct source
+/// addresses — `auth.rs`'s own note that one routed IPv6 /64 supplies 1024 of
+/// them applies here — can fill the map with live entries, and from then on
+/// every client the map has no room for is back on the shared bucket and
+/// locked out by that caller's failures. What the per-client key buys is that
+/// this now costs a real failed attempt per entry per penalty window, at
+/// ~50 ms of Argon2 each, instead of five requests every thirty seconds.
 #[derive(Debug)]
 pub struct LoginThrottle {
     /// The fallback, for requests whose client cannot be established.
@@ -248,8 +257,22 @@ impl Default for ThrottleState {
 
 impl ThrottleState {
     /// How long the caller must wait, or `None` if an attempt is allowed.
+    ///
+    /// Deliberately **not** a liveness touch. This is a consult, and a
+    /// consult is not an attempt: the throttle is asked before the request
+    /// body has been read, so a request that never becomes an attempt — one
+    /// whose body is unparseable, or larger than the cap — reaches here and
+    /// then ends in a 400. Refreshing `last_seen` on the way made that 400 a
+    /// way to hold a map entry alive at **zero** KDF cost, and the map is
+    /// bounded, so holding every entry alive is what pushes every other
+    /// client onto the shared bucket.
+    ///
+    /// Measured: 1024 real failed logins took 31.6 s of Argon2 to create
+    /// 1024 entries, and a full pass refreshing all 1024 with an unparseable
+    /// body took **0.07 s**. `note_failure` and `note_success` are where an
+    /// attempt is recorded, and both touch `last_seen`, so an entry that is
+    /// being used is still live.
     fn retry_after(&mut self) -> Option<Duration> {
-        self.last_seen = Instant::now();
         match self.locked_until {
             Some(until) if Instant::now() < until => Some(until - Instant::now()),
             Some(_) => {
@@ -423,8 +446,13 @@ impl LoginThrottle {
                 // discard that would not clear a live lockout, so no insertion
                 // is made and this client keeps the overflow path — the global
                 // bucket — until a slot frees. That is the same degradation
-                // the map's own capacity limit already has, and it is bounded
-                // by the penalty window.
+                // the map's own capacity limit already has, and it lasts as
+                // long as the entries holding the map do: an entry stays live
+                // while it is locked, and beyond that only while something
+                // keeps touching it. Since a consult is no longer a touch,
+                // holding one costs a real failed attempt — ~50 ms of Argon2
+                // — per entry per penalty window, rather than the penalty
+                // window being a bound anyone gets for free.
                 None => return,
             }
         }
@@ -799,6 +827,50 @@ mod tests {
         assert!(
             t.per_client.lock().len() < MAX_TRACKED_CLIENTS,
             "an entry idle beyond the penalty window must be evictable",
+        );
+    }
+
+    #[test]
+    fn a_consult_that_never_becomes_an_attempt_cannot_hold_the_map_open() {
+        // The property: `retry_after` is a consult, not an attempt, and only
+        // an attempt keeps a tracked entry alive.
+        //
+        // The throttle is asked before the login body is read, so a request
+        // with an unparseable body reaches the consult and then ends in a 400
+        // having done no Argon2 work at all. While that consult refreshed
+        // `last_seen`, the 400 was a free way to hold an entry live — and
+        // holding all 1024 live means the sweep reclaims nothing and every
+        // other client is routed to the shared bucket. Measured against a
+        // live daemon: 31.6 s of Argon2 to create the entries, 0.07 s per
+        // full pass to keep them.
+        let penalty = Duration::from_millis(50);
+        let t = LoginThrottle::with_penalty(penalty);
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        assert_eq!(t.per_client.lock().len(), MAX_TRACKED_CLIENTS);
+
+        // Idle past the window, then consult every entry — the refresh pass
+        // an attacker gets for the price of a malformed body.
+        std::thread::sleep(Duration::from_millis(150));
+        for n in 0..MAX_TRACKED_CLIENTS {
+            let addr = Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32)));
+            assert!(
+                t.retry_after(addr).is_none(),
+                "none of these is locked out; the consult is the whole point",
+            );
+        }
+
+        // A never-seen client now fails once. The insert sweeps, and what the
+        // sweep finds decides whether this client gets a slot of its own or
+        // the shared bucket.
+        let newcomer = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+        t.note_failure(Some(newcomer));
+        assert!(
+            t.per_client.lock().contains_key(&newcomer),
+            "entries touched only by consults have gone idle and the sweep \
+             reclaims them, so a client arriving afterwards is tracked rather \
+             than pushed onto the shared bucket",
         );
     }
 

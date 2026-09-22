@@ -142,6 +142,14 @@ async fn authenticate(
 
     // Argon2id costs ~50 ms of CPU on purpose. Unthrottled, an unauthenticated
     // caller can spend the whole machine's CPU on password verification.
+    //
+    // Consulted here, before the body is read, so a flood of malformed bodies
+    // cannot reach the KDF. The price of that ordering is that this consult
+    // happens for requests that never become attempts — the ones that end in
+    // the 400 below — which is why `ThrottleState::retry_after` does not
+    // refresh the entry's liveness. Refreshing it there made an unparseable
+    // body a free way to hold a tracked-client entry alive, and a map held
+    // full is a map every other client overflows out of.
     if let Some(wait) = auth.throttle.retry_after(client.ip) {
         warn!(
             target: "torrentd::auth",
