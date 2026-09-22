@@ -424,9 +424,10 @@ mise run test-all        # all of the above
 mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
 ```
 
-Against a real VPN, with no torrents and no tracker involved. `vpn check`
-inspects `vpn` profiles, so give it a configuration that has one, and name it
-with `--profile` when the configuration also carries `host` profiles:
+`mise run vpn-check` verifies a real VPN configuration against a real tunnel,
+with no torrents and no tracker involved. `vpn check` inspects `vpn` profiles,
+so give it a configuration that has one, and name it with `--profile` when the
+configuration also carries `host` profiles:
 
 ```bash
 mise run vpn-check /etc/torrentd/torrentd.toml --profile account_a
