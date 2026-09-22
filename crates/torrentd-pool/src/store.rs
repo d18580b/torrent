@@ -373,9 +373,9 @@ impl PoolStore {
     /// rollback copy at all, while `docs/running.md` tells the operator that
     /// restoring that file is how they go back. A promise of a rollback that
     /// does not exist is worse than a refusal naming why, so the migration
-    /// stops instead. Opening it read-only and asking SQLite for its schema
-    /// version is the test: it opens what SQLite can open and it creates
-    /// nothing.
+    /// stops instead. [`PoolStore::rollback_copy_of_an_index`] is that test,
+    /// and it asks what the sentence above claims rather than the weaker
+    /// question of whether SQLite can open the bytes.
     fn backup_before_v3(&self) -> Result<(), PoolError> {
         // No path: an in-memory store, which has nothing to roll back to.
         let Some(path) = self.conn.path().filter(|p| !p.is_empty()) else {
@@ -383,8 +383,8 @@ impl PoolStore {
         };
         let backup = format!("{path}{}", Self::PRE_V3_BACKUP_SUFFIX);
         if Path::new(&backup).symlink_metadata().is_ok() {
-            if let Err(reason) = Self::readable_database(&backup) {
-                return Err(PoolError::BackupNotADatabase {
+            if let Err(reason) = Self::rollback_copy_of_an_index(&backup, path) {
+                return Err(PoolError::BackupNotARollbackCopy {
                     path: backup,
                     reason,
                 });
@@ -415,21 +415,69 @@ impl PoolStore {
         Ok(())
     }
 
-    /// Whether SQLite can open `path` read-only and read a schema out of it,
-    /// or the reason it cannot.
+    /// Whether what is at `path` can be a rollback copy of the index at
+    /// `index`, or the reason it cannot.
     ///
     /// Read-only so nothing is created: a path that does not resolve — which
     /// is what a dangling symlink is — fails to open rather than being made.
-    /// The `PRAGMA` is what separates a database from any other bytes; SQLite
-    /// defers opening the file until the first statement, so the open alone
-    /// proves nothing.
-    fn readable_database(path: &str) -> Result<(), String> {
+    ///
+    /// Three questions, because the one this used to ask — can SQLite open it
+    /// and answer `PRAGMA schema_version` — is true of things that are not a
+    /// copy of anything, and the caller's doc promises the stronger claim:
+    ///
+    /// 1. **It is not this index.** `.pre-v3.bak` as a symlink to `pool.db`
+    ///    passed every other test there is, the migration proceeded, and the
+    ///    file `docs/running.md` tells the operator to restore was the
+    ///    *migrated v3 database*. Compared after `canonicalize`, because the
+    ///    two paths are equal only after the links on both are resolved.
+    /// 2. **It reports a pool schema version this build understands.** A
+    ///    zero-byte file is a valid empty database to SQLite: it opens, it
+    ///    answers a `PRAGMA`, and it reports `user_version = 0`. Nothing this
+    ///    project ever wrote reports 0 with data in it, and a copy from a
+    ///    *newer* build is not a rollback for this one either.
+    /// 3. **It carries this index's tables.** `root` and `torrent` are in
+    ///    `SCHEMA_V1` and in every version since, so any genuine copy has
+    ///    both, and an unrelated SQLite database an operator left at that path
+    ///    has neither.
+    ///
+    /// What this still cannot decide is whether a file that passes all three
+    /// is a copy of *this* index rather than of another deployment's — two
+    /// pool indexes are the same shape. Refusing every symlink would close
+    /// that, at the cost of refusing a copy an operator deliberately parked on
+    /// another volume, which is a posture nothing in this repository states.
+    fn rollback_copy_of_an_index(path: &str, index: &str) -> Result<(), String> {
         use rusqlite::OpenFlags;
+        if let (Ok(a), Ok(b)) = (std::fs::canonicalize(path), std::fs::canonicalize(index)) {
+            if a == b {
+                return Err("it resolves to the pool index itself".to_string());
+            }
+        }
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| e.to_string())?;
-        conn.pragma_query_value(None, "schema_version", |r| r.get::<_, i64>(0))
-            .map(|_| ())
-            .map_err(|e| e.to_string())
+        let version: i64 = conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .map_err(|e| e.to_string())?;
+        if !(1..=SCHEMA_VERSION).contains(&version) {
+            return Err(format!(
+                "it reports pool schema version {version}, and a copy of this index reports \
+                 1 to {SCHEMA_VERSION}"
+            ));
+        }
+        for table in ["root", "torrent"] {
+            let present: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .map_err(|e| e.to_string())?;
+            if present == 0 {
+                return Err(format!(
+                    "it has no {table} table, so it is not a copy of a pool index"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Whether this file carries v3's `torrent` columns: a `profile` column and

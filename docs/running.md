@@ -250,12 +250,20 @@ the daemon keeps it, says so, and takes no new copy: it is from an earlier
 attempt at this same migration, which rolled back, so it describes the same
 state.
 
-That holds for something that is a copy of the index. If what is at that path
-is not a database the daemon can read — a dangling symlink, a directory, a
-stray file — the migration **stops** and names it, without touching the index.
-Keeping it and carrying on would run the one-way rename with no rollback at
-all, while the paragraph above tells you restoring that file is how you go
-back. Move or remove whatever is there and start the daemon again.
+That holds for something that is a copy of the index, and the daemon checks
+that it is one. What is at that path has to be a pool index, at a schema
+version this build understands, and not this same `pool.db` reached by another
+name. Anything else — a dangling symlink, a directory, a stray file, an empty
+file, an unrelated database, a symlink pointing back at `pool.db` itself — the
+migration **stops** and names it, without touching the index. Keeping it and
+carrying on would run the one-way rename with no rollback at all, while the
+paragraph above tells you restoring that file is how you go back; and a
+`.pre-v3.bak` that resolves to `pool.db` would leave you restoring the migrated
+file over itself. Move or remove whatever is there and start the daemon again.
+
+What the daemon cannot tell you is whether a file that passes those checks is a
+copy of *this* index or of another deployment's: two pool indexes have the same
+shape. Keep `<db_path>.pre-v3.bak` for this index and nothing else.
 
 The copy is a full second copy of the index, so **the first open on this build
 needs free space on the state volume equal to the size of `pool.db`**. The

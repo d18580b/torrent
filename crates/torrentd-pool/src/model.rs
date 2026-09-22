@@ -37,7 +37,8 @@ pub enum PoolError {
          space and start again."
     )]
     BackupFailed { path: String, reason: String },
-    /// Something is already at the pre-v3 backup path and it is not a database.
+    /// Something is already at the pre-v3 backup path and it is not a copy of
+    /// this index.
     ///
     /// An existing backup is kept rather than overwritten — it is from an
     /// earlier attempt at this same migration. That posture only makes sense
@@ -45,14 +46,23 @@ pub enum PoolError {
     /// directory or a stray file is not one, and proceeding on it runs the
     /// irreversible v3 rename with no rollback while the runbook tells the
     /// operator that restoring this file is how they go back.
+    ///
+    /// "A database SQLite can read a schema out of" was too weak a test for
+    /// that sentence. An empty file is one — a zero-byte `.pre-v3.bak` opens,
+    /// answers a `PRAGMA`, and has no `torrent` table at all — and so is a
+    /// symlink pointing at something else SQLite wrote, including **the pool
+    /// index itself**, after which the file the runbook says to restore is the
+    /// migrated v3 database. The test is therefore what the sentence claims:
+    /// a pool index, at a schema version this build understands, that is not
+    /// this index under another name.
     #[error(
-        "the pre-v3 copy-aside cannot be taken: what is already at {path} is not a readable \
-         database ({reason}). An existing copy is kept rather than overwritten, so this file is \
-         in the way — and it is not a rollback, while the v3 rename this copy exists for cannot \
-         be undone. The index has not been changed; move or remove whatever is at that path and \
-         start again."
+        "the pre-v3 copy-aside cannot be taken: what is already at {path} is not a rollback copy \
+         of this pool index ({reason}). An existing copy is kept rather than overwritten, so this \
+         file is in the way — and it is not a rollback, while the v3 rename this copy exists for \
+         cannot be undone. The index has not been changed; move or remove whatever is at that \
+         path and start again."
     )]
-    BackupNotADatabase { path: String, reason: String },
+    BackupNotARollbackCopy { path: String, reason: String },
     /// A version-keyed schema step failed.
     ///
     /// Reported as itself rather than as a bare `Sqlite` so the operator is

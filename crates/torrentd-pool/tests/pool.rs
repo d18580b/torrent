@@ -1801,7 +1801,7 @@ fn a_dangling_backup_symlink_is_neither_written_through_nor_treated_as_a_rollbac
         "the refusal names what is in the way, got: {msg}",
     );
     assert!(
-        msg.contains("not a readable database"),
+        msg.contains("not a rollback copy"),
         "and says why it is not the copy it looks like, got: {msg}",
     );
 
@@ -1836,9 +1836,11 @@ fn a_real_backup_already_at_the_path_is_kept_and_the_migration_proceeds() {
     apply_v2_journal(&db);
 
     let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
-    let earlier = dir.path().join("earlier.db");
-    build_v1_index(&earlier);
-    std::fs::copy(&earlier, &backup).unwrap();
+    // A real `std::fs::copy` of `db`, not an independently built index. The
+    // fixture *is* the property: "kept" is the right answer for a copy of this
+    // database, and a separately built file that merely has the same shape
+    // pinned the weaker predicate the copy-aside used to apply.
+    std::fs::copy(&db, &backup).unwrap();
     let before = std::fs::read(&backup).unwrap();
 
     PoolStore::open(&db).expect("the migration runs; the existing copy is kept");
@@ -1849,6 +1851,11 @@ fn a_real_backup_already_at_the_path_is_kept_and_the_migration_proceeds() {
         before,
         "the operator's existing copy must not have been overwritten",
     );
+    assert_eq!(
+        user_version(&backup),
+        2,
+        "and it is still the pre-migration database, which is what makes it a rollback",
+    );
 }
 
 #[test]
@@ -1856,22 +1863,147 @@ fn a_non_database_at_the_backup_path_stops_the_migration() {
     // Not only symlinks. Anything an operator left at that path — a note, a
     // truncated download, a directory — is in the way of the copy and is not a
     // rollback, and the rename it protects cannot be undone.
+    //
+    // All three, because the comment used to claim three and the fixture was
+    // only the note. The truncated download is the one that mattered: a
+    // zero-byte file is a *valid empty database* to SQLite, so it opened, it
+    // answered `PRAGMA schema_version`, it was kept, the one-way rename ran —
+    // and the "rollback copy" left beside the migrated index had no `torrent`
+    // table at all.
+    for (what, place) in [
+        ("a note", 0usize),
+        ("a truncated download", 1),
+        ("a directory", 2),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        build_v1_index(&db);
+        apply_v2_journal(&db);
+
+        let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+        match place {
+            0 => std::fs::write(&backup, b"not a database, just bytes someone left here").unwrap(),
+            1 => std::fs::write(&backup, b"").unwrap(),
+            _ => std::fs::create_dir(&backup).unwrap(),
+        }
+
+        let err = PoolStore::open(&db).expect_err("a stray artefact is not a rollback copy");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(&backup.display().to_string()) && msg.contains("not a rollback copy"),
+            "the refusal names the path and why for {what}, got: {msg}",
+        );
+        assert_eq!(
+            user_version(&db),
+            2,
+            "the index must be exactly as it was after {what}",
+        );
+        assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+    }
+}
+
+#[test]
+fn a_backup_symlink_to_an_unrelated_database_is_not_a_rollback_copy() {
+    // SQLite opening it and answering a `PRAGMA` proved only that it is *a*
+    // database. An operator who parked some other SQLite file at that path,
+    // directly or through a link, got the one-way rename run against an index
+    // whose only stated rollback is a database from somewhere else entirely.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let elsewhere = dir.path().join("notes.db");
+    {
+        let c = rusqlite::Connection::open(&elsewhere).unwrap();
+        c.execute_batch("CREATE TABLE notes(a TEXT);").unwrap();
+        c.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
+
+    let err = PoolStore::open(&db).expect_err("another database is not a copy of this one");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a rollback copy") && msg.contains("no root table"),
+        "the refusal says which of this index's tables is missing, got: {msg}",
+    );
+    assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
+    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+    // And nothing was written through the link.
+    let c = rusqlite::Connection::open(&elsewhere).unwrap();
+    let tables: i64 = c
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1, "the unrelated database is untouched");
+}
+
+#[test]
+fn a_backup_symlink_to_the_index_itself_is_refused() {
+    // The state that made the runbook's instruction false. `.pre-v3.bak` as a
+    // symlink to `pool.db` passed every test the copy-aside had: SQLite opened
+    // it, it reported a schema, it was kept, the migration proceeded — and the
+    // file an operator is told to restore to go back *was the migrated v3
+    // database*. The paths are equal only after both are canonicalised, which
+    // is why the check resolves them.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pool.db");
     build_v1_index(&db);
     apply_v2_journal(&db);
 
     let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
-    std::fs::write(&backup, b"not a database, just bytes someone left here").unwrap();
+    std::os::unix::fs::symlink(&db, &backup).unwrap();
 
-    let err = PoolStore::open(&db).expect_err("a stray file is not a rollback copy");
+    let err = PoolStore::open(&db).expect_err("the index is not its own rollback copy");
     let msg = format!("{err}");
     assert!(
-        msg.contains(&backup.display().to_string()) && msg.contains("not a readable database"),
-        "the refusal names the path and why, got: {msg}",
+        msg.contains("not a rollback copy") && msg.contains("resolves to the pool index itself"),
+        "the refusal says the link points back at the index, got: {msg}",
+    );
+    assert_eq!(
+        user_version(&db),
+        2,
+        "the one-way rename must not have run on a self-referential backup",
+    );
+    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+    assert!(
+        std::fs::symlink_metadata(&backup)
+            .expect("the link itself is still there")
+            .file_type()
+            .is_symlink(),
+        "and what the operator left at that path is untouched",
+    );
+}
+
+#[test]
+fn a_backup_from_a_newer_build_is_not_a_rollback_copy() {
+    // The other end of the version window. A copy written by a build whose
+    // schema this one does not understand cannot be rolled back to, and
+    // `SchemaVersion` refuses such a file as the index itself — so keeping it
+    // as the rollback for a one-way migration promises something untrue.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    build_v1_index(&backup);
+    {
+        let c = rusqlite::Connection::open(&backup).unwrap();
+        c.pragma_update(None, "user_version", 999i64).unwrap();
+    }
+
+    let err = PoolStore::open(&db).expect_err("a copy from the future is not a rollback");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a rollback copy") && msg.contains("reports pool schema version 999"),
+        "the refusal names the version it found, got: {msg}",
     );
     assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
-    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
 }
 
 #[test]
