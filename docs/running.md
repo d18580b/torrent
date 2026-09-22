@@ -240,6 +240,17 @@ mutation journal, which a rescan does not reconstruct. The migration is applied
 in one transaction, so a failure part way through leaves the index exactly as
 it was.
 
+**If the migration fails, that copy is not the remedy.** It is taken
+immediately before the steps that failed, so it is a copy of the index as it
+stands — same version, same columns, same tables — and restoring it puts you
+back where you started, to fail again on the next start. A `.pre-v3.bak` is a
+rollback only where it **predates the run that failed**: that is the copy from
+a successful earlier migration, or one you took yourself. Check its timestamp
+before you restore it. Where it does not predate the run, the way out is to
+move the index aside and let `torrentd pool scan` rebuild it, which
+reconstructs everything except the mutation journal — and the error message
+says so.
+
 **That copy is yours to remove, and nothing removes it for you.** Nothing
 deletes it, nothing ages it out, and no later start reclaims its space: keep it
 until the new index has been in service long enough that you would not go back,

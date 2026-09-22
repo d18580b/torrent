@@ -2207,12 +2207,63 @@ fn a_schema_step_that_cannot_run_says_which_index_and_what_to_do() {
     );
     assert!(msg.contains("pool scan"), "and a way out, got: {msg}",);
     assert!(
+        msg.contains("only if it predates this run"),
+        "and the backup remedy qualified, got: {msg}",
+    );
+    assert!(
         msg.contains("table root already exists"),
         "without discarding what SQLite said, got: {msg}",
     );
 
     // Still true, and the reason the remedy is phrased as it is.
     assert_eq!(user_version(&db), 0);
+}
+
+#[test]
+fn a_failed_migration_does_not_offer_its_own_backup_as_the_remedy() {
+    // F16 reopened. On the stepped path `backup_before_v3` runs immediately
+    // before the steps that fail, so the `.pre-v3.bak` beside a wedged index
+    // is a copy of that same wedged index — and the message's first remedy was
+    // "Restore <path>.pre-v3.bak if one is beside it", unqualified. Following
+    // it reproduces the failure exactly.
+    //
+    // The fixture is a file at version 1 whose v2 tables are already present,
+    // so the backup is taken (`found >= 1`) and then `SCHEMA_V2` cannot run.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+
+    let err = PoolStore::open(&db).expect_err("v2's tables cannot be created twice");
+    let msg = format!("{err}");
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    assert!(
+        backup.exists(),
+        "the fixture must reach the path that writes a copy first",
+    );
+    // The copy really is of the wedged index, which is what makes the
+    // unqualified remedy circular.
+    assert_eq!(user_version(&backup), user_version(&db));
+    assert_eq!(torrent_columns(&backup), torrent_columns(&db));
+    assert_eq!(torrent_indexes(&backup), torrent_indexes(&db));
+
+    assert!(
+        msg.contains("only if it predates this run"),
+        "the remedy must say which copies are rollbacks, got: {msg}",
+    );
+    assert!(
+        msg.contains("reproduces this failure"),
+        "and what restoring the other kind does, got: {msg}",
+    );
+    assert!(
+        msg.contains("pool scan"),
+        "while keeping the remedy that works, got: {msg}",
+    );
 }
 
 #[test]
