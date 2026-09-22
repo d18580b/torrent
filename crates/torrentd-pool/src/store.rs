@@ -752,6 +752,13 @@ impl PoolStore {
                 // Not repaired here: nothing in this file can tell which of
                 // those steps ran, and guessing is how an index gets stamped
                 // over a schema that is not the one it claims.
+                //
+                // The remedy naming `.pre-v3.bak` is qualified for a reason
+                // this site is where you can see: `backup_before_v3` ran a few
+                // lines above, immediately before the steps that just failed.
+                // So on this path the copy beside the index is normally one
+                // *this run* took, of the index exactly as it stands, and
+                // restoring it walks the operator back into the same failure.
                 Err(PoolError::MigrationFailed {
                     path: self
                         .conn

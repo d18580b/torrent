@@ -77,15 +77,26 @@ pub enum PoolError {
     ///
     /// The context leads and the SQLite text trails, because that text can run
     /// to the whole of a schema constant and would otherwise bury the remedy.
+    ///
+    /// The backup remedy is qualified, and has to be. On the stepped path the
+    /// copy-aside runs **immediately before** the steps that fail, so the
+    /// `.pre-v3.bak` sitting beside a wedged index is usually a copy this same
+    /// run took of that same wedged index: identical version, identical
+    /// columns, identical table set, demonstrated on two shapes. Offering it
+    /// first and unqualified sent the operator round a loop — restore it,
+    /// start again, fail the same way — while the option that actually works
+    /// is the second one, which costs the journal. A copy that *predates* this
+    /// run is a real rollback; one this run wrote is not.
     #[error(
         "the pool index at {path} could not be migrated from schema version {from} to {to}. \
          The index has not been changed: every step and the version write share one \
          transaction, and this one rolled back. A file written by a build predating that \
          transaction can already carry part of a schema its user_version does not report, \
-         which no version-keyed step can reach. Restore {path}.pre-v3.bak if one is beside \
-         it, or move the index aside and let `torrentd pool scan` rebuild it — which \
-         reconstructs everything except the plan/plan_step mutation journal. The step \
-         failed with: {reason}"
+         which no version-keyed step can reach. Restore {path}.pre-v3.bak only if it \
+         predates this run — a copy taken during it is a copy of the index as it stands, \
+         so restoring it reproduces this failure. Otherwise move the index aside and let \
+         `torrentd pool scan` rebuild it, which reconstructs everything except the \
+         plan/plan_step mutation journal. The step failed with: {reason}"
     )]
     MigrationFailed {
         path: String,
