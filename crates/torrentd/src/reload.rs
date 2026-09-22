@@ -73,36 +73,31 @@ use crate::config::ConfigDiff;
 /// The reloadable keys `diff` carries that `profile`'s patch does not — the
 /// keys [`ConfigDiff::to_settings_patch_for`] withheld from it.
 ///
-/// Read off the built patch rather than re-deriving Safety Rule 6 and the
-/// per-profile `upload_rate_limit` override, so this cannot disagree with
-/// `to_settings_patch_for` about what that function withheld. The five keys
-/// below are exactly the ones a patch can carry; every other field of
-/// `Settings` comes from `..Default::default()` there and is always `None`, so
-/// a key added to the reloadable set and not here reports as withheld from
-/// every profile rather than silently.
+/// Set difference: the keys the diff recorded as changed, less the ones the
+/// operator deleted (reported separately — they reach no profile, for a reason
+/// that is not about this profile), less the ones this profile's patch carries.
+///
+/// This used to be a five-item list of `if diff.x.is_some() && patch.x.is_none()`
+/// over a `Settings` struct with roughly twenty-five fields, and the comment
+/// here claimed a key added to the reloadable set and not to the list "reports
+/// as withheld from every profile rather than silently". The opposite
+/// happened: such a key was carried by the patch, invisible here and invisible
+/// to `ConfigDiff::settings_patch_is_empty`, so it was neither applied nor
+/// mentioned and the reload's whole journal was `received SIGHUP` — the third
+/// silent class this module says does not exist, reintroduced by a one-line
+/// edit with nothing to break. Both helpers now read the field set
+/// `ConfigDiff::to_settings_patch_for` records as it builds the patch, so
+/// there is one place to add a key and no list to keep in step with it.
 fn withheld_reloadable_keys(
     diff: &ConfigDiff,
     profile: &torrentd_engine::ProfileConfig,
 ) -> Vec<&'static str> {
     let patch = diff.to_settings_patch_for(profile);
-    let mut out = Vec::new();
-    if diff.connections_limit.is_some() && patch.connections_limit.is_none() {
-        out.push("connections_limit");
-    }
-    if diff.upload_rate_limit.is_some() && patch.upload_rate_limit.is_none() {
-        out.push("upload_rate_limit");
-    }
-    if diff.max_concurrent_http_announces.is_some() && patch.max_concurrent_http_announces.is_none()
-    {
-        out.push("max_concurrent_http_announces");
-    }
-    if diff.aio_threads.is_some() && patch.aio_threads.is_none() {
-        out.push("aio_threads");
-    }
-    if diff.enable_lsd.is_some() && patch.enable_lsd.is_none() {
-        out.push("enable_lsd");
-    }
-    out
+    diff.reloadable_changes
+        .iter()
+        .copied()
+        .filter(|key| !diff.reloadable_deletions.contains(key) && !patch.fields.contains(key))
+        .collect()
 }
 
 pub async fn run(
@@ -196,7 +191,10 @@ pub async fn run(
                 continue;
             }
             if let Some(eng) = source.engine_for(&profile) {
-                if let Err(e) = eng.apply_settings(&patch).context("apply_settings") {
+                if let Err(e) = eng
+                    .apply_settings(&patch.settings)
+                    .context("apply_settings")
+                {
                     warn!(profile_id = %profile, error.cause = %e, "SIGHUP: apply_settings failed");
                 } else {
                     info!(profile_id = %profile, "SIGHUP: settings applied");
@@ -230,6 +228,22 @@ mod tests {
             allowed_tracker_domains: vec![],
             upload_rate_limit,
         }
+    }
+
+    /// A `ConfigDiff` built the way the pump builds one: from two real
+    /// configs, through `Config::diff`.
+    ///
+    /// A `ConfigDiff` literal cannot stand in. Which keys differed is
+    /// something `Config::diff` *records* — the value alone cannot carry it,
+    /// which is the whole of the deletion case — so a literal would assert the
+    /// record rather than exercise the comparison that produces it.
+    fn diff_of(edit: impl FnOnce(&mut Config)) -> (tempfile::TempDir, ConfigDiff) {
+        let dir = tempfile::tempdir().unwrap();
+        let old = Config::minimal_for_tests(dir.path(), true);
+        let mut new = Config::minimal_for_tests(dir.path(), true);
+        edit(&mut new);
+        let diff = Config::diff(&old, &new);
+        (dir, diff)
     }
 
     fn vpn() -> ProfileConfig {
@@ -269,10 +283,7 @@ mod tests {
 
         // The top-level `upload_rate_limit`, against a profile that sets its
         // own. The override wins at boot and a reload must not overwrite it.
-        let diff = ConfigDiff {
-            upload_rate_limit: Some(2000),
-            ..Default::default()
-        };
+        let (_dir, diff) = diff_of(|c| c.upload_rate_limit = Some(2000));
         assert_eq!(
             withheld_reloadable_keys(&diff, &host(5000)),
             vec!["upload_rate_limit"],
@@ -289,10 +300,7 @@ mod tests {
 
         // `enable_lsd`, against a tunnelled profile. Safety Rule 6 withholds
         // it unconditionally, which is correct and is reported anyway.
-        let diff = ConfigDiff {
-            enable_lsd: Some(true),
-            ..Default::default()
-        };
+        let (_dir, diff) = diff_of(|c| c.enable_lsd = Some(true));
         assert_eq!(
             withheld_reloadable_keys(&diff, &vpn()),
             vec!["enable_lsd"],
@@ -304,10 +312,7 @@ mod tests {
         );
 
         // A key that reaches every profile is not a withholding.
-        let diff = ConfigDiff {
-            connections_limit: Some(20_000),
-            ..Default::default()
-        };
+        let (_dir, diff) = diff_of(|c| c.connections_limit = Some(20_000));
         for profile in [host(0), host(5000), vpn()] {
             assert!(
                 withheld_reloadable_keys(&diff, &profile).is_empty(),
@@ -321,11 +326,10 @@ mod tests {
         // ahead of the patch-emptiness guard rather than inside it: here the
         // patch is non-empty, the pump logs `settings applied`, and without
         // the report `enable_lsd` would be dropped under a success line.
-        let diff = ConfigDiff {
-            connections_limit: Some(20_000),
-            enable_lsd: Some(true),
-            ..Default::default()
-        };
+        let (_dir, diff) = diff_of(|c| {
+            c.connections_limit = Some(20_000);
+            c.enable_lsd = Some(true);
+        });
         assert!(
             !ConfigDiff::settings_patch_is_empty(&diff.to_settings_patch_for(&vpn())),
             "connections_limit is applied to this profile, so the loop reaches apply_settings",
