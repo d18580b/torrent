@@ -947,7 +947,10 @@ pub struct ConfigDiff {
     /// holds a `LogLevel` rather than an `Option` and deleting the key
     /// produces the default value rather than an absence. `Some(..)` on the
     /// field above is therefore always a real difference, which is why
-    /// [`ConfigDiff::is_empty`] can read it directly.
+    /// [`ConfigDiff::is_empty`] can read it directly. It is also not a
+    /// `libtorrent_safe::Settings` key, so `reload::withheld_reloadable_keys`
+    /// — which subtracts a profile's patch field set from this list — must not
+    /// see it.
     pub reloadable_changes: Vec<&'static str>,
     /// The subset of `reloadable_changes` the new file gives no value to,
     /// because the operator deleted the key.
@@ -987,23 +990,45 @@ impl ConfigDiff {
     /// patched every session alike and silently discarded the override until
     /// the next restart. A profile that sets nothing still takes the
     /// top-level value, which is what makes it a default.
-    pub fn to_settings_patch_for(&self, profile: &ProfileConfig) -> libtorrent_safe::Settings {
-        libtorrent_safe::Settings {
-            connections_limit: self.connections_limit,
-            upload_rate_limit: if profile.upload_rate_limit != 0 {
+    pub fn to_settings_patch_for(&self, profile: &ProfileConfig) -> SettingsPatch {
+        // Set one field and name it, in one statement, so the patch and the
+        // record of what it carries cannot be written apart from each other.
+        macro_rules! set {
+            ($patch:expr, $field:ident, $value:expr) => {
+                if let Some(v) = $value {
+                    $patch.settings.$field = Some(v);
+                    $patch.fields.push(stringify!($field));
+                }
+            };
+        }
+
+        let mut patch = SettingsPatch::default();
+        set!(patch, connections_limit, self.connections_limit);
+        set!(
+            patch,
+            upload_rate_limit,
+            if profile.upload_rate_limit != 0 {
                 None
             } else {
                 self.upload_rate_limit
-            },
-            max_concurrent_http_announces: self.max_concurrent_http_announces,
-            aio_threads: self.aio_threads,
-            enable_lsd: if profile.is_vpn() {
+            }
+        );
+        set!(
+            patch,
+            max_concurrent_http_announces,
+            self.max_concurrent_http_announces
+        );
+        set!(patch, aio_threads, self.aio_threads);
+        set!(
+            patch,
+            enable_lsd,
+            if profile.is_vpn() {
                 None
             } else {
                 self.enable_lsd
-            },
-            ..Default::default()
-        }
+            }
+        );
+        patch
     }
 
     /// True when the patch `to_settings_patch_for` built sets nothing, so
@@ -1016,17 +1041,17 @@ impl ConfigDiff {
     /// a positive confirmation that nothing had been applied. A journal read
     /// at the default `info` level shows that line last.
     ///
-    /// This inspects the built patch rather than re-deriving the withholding
-    /// rules, so it cannot disagree with `to_settings_patch_for` about what
-    /// that function withheld. The fields listed are exactly the ones that
-    /// function can set; everything else in `Settings` comes from
-    /// `..Default::default()` and is always `None` here.
-    pub fn settings_patch_is_empty(patch: &libtorrent_safe::Settings) -> bool {
-        patch.connections_limit.is_none()
-            && patch.upload_rate_limit.is_none()
-            && patch.max_concurrent_http_announces.is_none()
-            && patch.aio_threads.is_none()
-            && patch.enable_lsd.is_none()
+    /// This reads [`SettingsPatch::fields`] — the names
+    /// `to_settings_patch_for` recorded as it set them — rather than
+    /// enumerating the fields a patch can carry. An enumeration here was a
+    /// second, hand-maintained copy of the reloadable set: a key added to
+    /// `ConfigDiff`, to `Config::diff` and to `to_settings_patch_for` and not
+    /// to the enumeration made this return `true` over a patch that carried
+    /// it, so the pump skipped `apply_settings` and `withheld_reloadable_keys`
+    /// had nothing to report, and the whole journal for that reload was
+    /// `received SIGHUP`. Nothing about that failed to compile.
+    pub fn settings_patch_is_empty(patch: &SettingsPatch) -> bool {
+        patch.fields.is_empty()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1049,6 +1074,25 @@ impl ConfigDiff {
             self.reloadable_deletions.push(key);
         }
     }
+}
+
+/// A `libtorrent_safe::Settings` patch together with the names of the fields
+/// it sets.
+///
+/// The names are pushed by the same statement that sets the field, in
+/// [`ConfigDiff::to_settings_patch_for`], so there is one place a reloadable
+/// key is written down and nothing downstream re-enumerates the set.
+/// [`ConfigDiff::settings_patch_is_empty`] and
+/// `reload::withheld_reloadable_keys` both read [`SettingsPatch::fields`]; before
+/// they did, each carried its own five-item list over a struct with roughly
+/// twenty-five fields, and a key added to the reloadable set and to neither
+/// list was neither applied nor reported.
+#[derive(Debug, Default)]
+pub struct SettingsPatch {
+    /// What `apply_settings` is handed.
+    pub settings: libtorrent_safe::Settings,
+    /// The `Settings` field names this patch sets, in the order it set them.
+    pub fields: Vec<&'static str>,
 }
 
 impl Config {
@@ -1253,12 +1297,16 @@ listen_interfaces = "0.0.0.0:6881"
             ..Default::default()
         };
         assert_eq!(
-            diff.to_settings_patch_for(&host_profile()).enable_lsd,
+            diff.to_settings_patch_for(&host_profile())
+                .settings
+                .enable_lsd,
             Some(true),
             "a host profile still honours the key",
         );
         assert_eq!(
-            diff.to_settings_patch_for(&vpn_profile()).enable_lsd,
+            diff.to_settings_patch_for(&vpn_profile())
+                .settings
+                .enable_lsd,
             None,
             "a tunnelled profile must not receive it",
         );
@@ -1620,12 +1668,15 @@ listen_interfaces = "0.0.0.0:6882"
         capped.upload_rate_limit = 100_000;
 
         assert_eq!(
-            diff.to_settings_patch_for(&capped).upload_rate_limit,
+            diff.to_settings_patch_for(&capped)
+                .settings
+                .upload_rate_limit,
             None,
             "a profile that set its own must not be patched from the top level",
         );
         assert_eq!(
             diff.to_settings_patch_for(&host_profile())
+                .settings
                 .upload_rate_limit,
             Some(2_000_000),
             "a profile that set nothing still takes the default; that is what makes it one",
