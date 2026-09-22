@@ -26,6 +26,8 @@ use tracing::info;
 use tracing::warn;
 
 use crate::config::Config;
+use crate::config::ProfileChange;
+use crate::config::ProfileChangeKind;
 
 /// What a non-reloadable change is told, when the field is not an identity.
 ///
@@ -44,26 +46,18 @@ const NON_RELOADABLE_WARNING: &str =
 /// it.
 const IDENTITY_WARNING: &str = "SIGHUP: profile identity change requires daemon restart; ignored";
 
-/// The `[[profile]]` keys `Config::diff` reports that are **not** identity.
-///
-/// `diff_profiles` compares the whole network block, `peer_fingerprint_hex`,
-/// `user_agent` and the two store directories — identity, every one — and
-/// these two, which `config.rs` calls "the two keys outside the network
-/// block". They are non-reloadable for their own reason and were reported
-/// through the identity warning because there was only one warning. A key
-/// added to `diff_profiles` that is not identity belongs in this list.
-const NON_IDENTITY_PROFILE_KEYS: [&str; 2] = ["upload_rate_limit", "allowed_tracker_domains"];
-
 /// Which of the two warnings a `profile_changes` entry gets.
 ///
-/// Entries are `"<profile_id>.<key>"`, and a profile id cannot contain `.`.
-/// The one entry with no key — a profile removed from the set — keeps the
-/// identity wording: which accounts exist is as fixed at startup as who they
-/// announce as.
-fn warning_for(change: &str) -> &'static str {
-    match change.rsplit_once('.') {
-        Some((_, key)) if NON_IDENTITY_PROFILE_KEYS.contains(&key) => NON_RELOADABLE_WARNING,
-        _ => IDENTITY_WARNING,
+/// Read off the entry's own class, which `diff_profiles` sets as it records
+/// the change. This was a two-element list of key names here plus a comment
+/// telling whoever edits `diff_profiles` to come back and update it — the
+/// obligation written down instead of enforced, one module away from the
+/// comparison that creates it. A field added there now has to state its class
+/// to compile, and this reads it.
+fn warning_for(change: &ProfileChange) -> &'static str {
+    match change.kind {
+        ProfileChangeKind::Identity => IDENTITY_WARNING,
+        ProfileChangeKind::NonIdentity => NON_RELOADABLE_WARNING,
     }
 }
 
@@ -100,7 +94,7 @@ pub async fn run(
         // privacy case could not tell the two apart, because both emitted one
         // string and differed only in a structured field.
         for sc in &diff.profile_changes {
-            warn!(changed_field = %sc, "{}", warning_for(sc));
+            warn!(changed_field = %sc.what, "{}", warning_for(sc));
         }
         if let Some(level) = diff.log_level {
             match log_handle.set_level(level) {
@@ -129,40 +123,39 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    #[test]
-    fn an_identity_field_is_told_its_identity_changed() {
-        // The case Safety Rule 7's warning exists for, and the one an alert
-        // rule watches: it must keep its own text.
-        for change in [
-            "acct_a.peer_fingerprint_hex",
-            "acct_a.user_agent",
-            "acct_a.network",
-            "acct_a.resume_dir",
-            "acct_a.torrent_dir",
-        ] {
-            assert_eq!(warning_for(change), IDENTITY_WARNING, "for {change}");
+    fn change(what: &str, kind: ProfileChangeKind) -> ProfileChange {
+        ProfileChange {
+            what: what.to_string(),
+            kind,
         }
     }
 
     #[test]
-    fn a_non_identity_field_is_not_told_its_identity_changed() {
+    fn an_identity_change_is_told_its_identity_changed() {
+        // The case Safety Rule 7's warning exists for, and the one an alert
+        // rule watches: it must keep its own text. Which fields are in this
+        // class is `diff_profiles`' statement, pinned in `config.rs`; what
+        // that class is told is this one.
+        let c = change("acct_a.peer_fingerprint_hex", ProfileChangeKind::Identity);
+        assert_eq!(warning_for(&c), IDENTITY_WARNING);
+    }
+
+    #[test]
+    fn a_non_identity_change_is_not_told_its_identity_changed() {
         // An operator who edited an upload cap is told a non-reloadable field
         // changed — in the same words the top-level arm has used all along,
         // not in the words reserved for a privacy event.
-        for change in ["public.upload_rate_limit", "public.allowed_tracker_domains"] {
-            assert_eq!(warning_for(change), NON_RELOADABLE_WARNING, "for {change}");
-            assert_ne!(warning_for(change), IDENTITY_WARNING, "for {change}");
-        }
+        let c = change("public.upload_rate_limit", ProfileChangeKind::NonIdentity);
+        assert_eq!(warning_for(&c), NON_RELOADABLE_WARNING);
+        assert_ne!(warning_for(&c), IDENTITY_WARNING);
     }
 
     #[test]
-    fn a_removed_profile_keeps_the_identity_wording() {
-        // `diff_profiles`'s one entry with no `.key`. Which accounts exist is
-        // as fixed at startup as who they announce as, and the split must not
-        // drop it into the generic arm by accident.
-        assert_eq!(
-            warning_for("acct_a: removed (the profile set is fixed at startup)"),
-            IDENTITY_WARNING,
-        );
+    fn the_two_warnings_are_distinguishable_in_the_message_itself() {
+        // Not only in a structured field. An alert watching for the privacy
+        // event has to be able to match on the line.
+        assert_ne!(IDENTITY_WARNING, NON_RELOADABLE_WARNING);
+        assert!(IDENTITY_WARNING.contains("identity"));
+        assert!(!NON_RELOADABLE_WARNING.contains("identity"));
     }
 }

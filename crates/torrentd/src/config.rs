@@ -614,17 +614,57 @@ impl Config {
     }
 }
 
+/// Which of the two non-reloadable warnings a `[[profile]]` change is owed.
+///
+/// Both classes are equally non-reloadable. They differ in what the operator
+/// is told and in what an alert rule can watch for: Safety Rule 7's warning
+/// exists for the privacy event of an identity changing under a live session,
+/// so a rate-cap edit must not emit it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProfileChangeKind {
+    /// The account a tracker sees: the network block, the peer fingerprint,
+    /// the user agent, the store directories, and the profile set itself.
+    Identity,
+    /// Non-reloadable for its own reason, but nothing a tracker reads.
+    NonIdentity,
+}
+
+/// One `[[profile]]` change a reload cannot apply, with the class it belongs
+/// to.
+///
+/// The class travels with the change rather than being recovered from the
+/// key's name afterwards. `reload.rs` kept a two-element list of the
+/// non-identity key names and a comment saying out loud that a key added to
+/// `diff_profiles` belonged in it — a pairing with nothing enforcing it, one
+/// module away from the comparison that creates the obligation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileChange {
+    /// `"<profile_id>.<key>"`, or a sentence for a profile added or removed.
+    pub what: String,
+    pub kind: ProfileChangeKind,
+}
+
+impl std::fmt::Display for ProfileChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.what)
+    }
+}
+
 /// Result of `Config::diff`. Reloadable fields are populated with the
 /// Report `[[profile]]` changes that a reload cannot apply.
 ///
-/// Every field here is identity-critical: the tunnel a session is bound to,
-/// the port it announces, the peer fingerprint and user agent a tracker sees,
-/// and where its resume and torrent files live. Changing any of them means a
-/// different account identity to the tracker, which is a restart — not
-/// something to swap under a live session. Adding or removing profiles is
+/// Most of what is compared here is identity-critical: the tunnel a session is
+/// bound to, the port it announces, the peer fingerprint and user agent a
+/// tracker sees, and where its resume and torrent files live. Changing any of
+/// them means a different account identity to the tracker, which is a restart —
+/// not something to swap under a live session. Adding or removing profiles is
 /// likewise a restart, since the profile set is fixed when sessions are built.
-fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
+/// The two keys outside the network block are not identity, and say so here.
+fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileChange> {
     use std::collections::BTreeMap;
+
+    use ProfileChangeKind::Identity;
+    use ProfileChangeKind::NonIdentity;
     let index = |v: &[ProfileConfig]| -> BTreeMap<String, ProfileConfig> {
         v.iter()
             .map(|s| (s.id.as_str().to_string(), s.clone()))
@@ -635,47 +675,60 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
 
     for id in n.keys() {
         if !o.contains_key(id) {
-            out.push(format!("{id}: added (the profile set is fixed at startup)"));
+            out.push(ProfileChange {
+                what: format!("{id}: added (the profile set is fixed at startup)"),
+                // Which accounts exist is as fixed at startup as who they
+                // announce as.
+                kind: Identity,
+            });
         }
     }
     for (id, a) in &o {
         let Some(b) = n.get(id) else {
-            out.push(format!(
-                "{id}: removed (the profile set is fixed at startup)"
-            ));
+            out.push(ProfileChange {
+                what: format!("{id}: removed (the profile set is fixed at startup)"),
+                kind: Identity,
+            });
             continue;
         };
-        let mut field = |name: &str, changed: bool| {
+        let mut field = |name: &str, changed: bool, kind: ProfileChangeKind| {
             if changed {
-                out.push(format!("{id}.{name}"));
+                out.push(ProfileChange {
+                    what: format!("{id}.{name}"),
+                    kind,
+                });
             }
         };
         // The whole network block is identity: which tunnel, which port,
         // whether DHT runs. Comparing it as one value means a new field
         // cannot be forgotten here the way `file_pool_size` was forgotten
         // from the top-level diff.
-        field("network", a.network != b.network);
+        field("network", a.network != b.network, Identity);
         field(
             "peer_fingerprint_hex",
             a.peer_fingerprint_hex != b.peer_fingerprint_hex,
+            Identity,
         );
-        field("user_agent", a.user_agent != b.user_agent);
-        field("resume_dir", a.resume_dir != b.resume_dir);
-        field("torrent_dir", a.torrent_dir != b.torrent_dir);
+        field("user_agent", a.user_agent != b.user_agent, Identity);
+        field("resume_dir", a.resume_dir != b.resume_dir, Identity);
+        field("torrent_dir", a.torrent_dir != b.torrent_dir, Identity);
         // The two keys outside the network block. Neither is applied by a
         // reload — the add path reads `ProfileRegistry`'s immutable startup
         // snapshot and nothing rebuilds it — and without them here a SIGHUP
         // that changed only one of them produced an empty diff and logged
         // "SIGHUP: config unchanged" over a file that plainly had. They are
         // exactly the fields the comment above claimed could not be
-        // forgotten.
+        // forgotten — and the third argument is what stops the *class* being
+        // forgotten now that a field can have one.
         field(
             "upload_rate_limit",
             a.upload_rate_limit != b.upload_rate_limit,
+            NonIdentity,
         );
         field(
             "allowed_tracker_domains",
             a.allowed_tracker_domains != b.allowed_tracker_domains,
+            NonIdentity,
         );
     }
     out
@@ -692,12 +745,12 @@ pub struct ConfigDiff {
     pub enable_lsd: Option<bool>,
     pub log_level: Option<LogLevel>,
     pub non_reloadable_changes: Vec<&'static str>,
-    /// Per-profile identity fields that changed and were ignored, as
-    /// `"<profile_id>.<field>"`. Safety Rule 7 requires a warning for these and
-    /// `Config::diff` used to skip `[[profile]]` entirely, so changing a profile's
-    /// VPN interface, port, fingerprint, user agent or directories on SIGHUP
-    /// was swallowed in silence.
-    pub profile_changes: Vec<String>,
+    /// Per-profile fields that changed and were ignored, each carrying the
+    /// class its warning is owed. Safety Rule 7 requires a warning for the
+    /// identity ones and `Config::diff` used to skip `[[profile]]` entirely, so
+    /// changing a profile's VPN interface, port, fingerprint, user agent or
+    /// directories on SIGHUP was swallowed in silence.
+    pub profile_changes: Vec<ProfileChange>,
 }
 
 impl ConfigDiff {
@@ -1498,7 +1551,7 @@ listen_interfaces = "0.0.0.0:6882"
         assert!(
             d.profile_changes
                 .iter()
-                .any(|c| c == "public.upload_rate_limit"),
+                .any(|c| c.what == "public.upload_rate_limit"),
             "got {:?}",
             d.profile_changes,
         );
@@ -1516,10 +1569,77 @@ listen_interfaces = "0.0.0.0:6882"
         assert!(
             d.profile_changes
                 .iter()
-                .any(|c| c == "public.allowed_tracker_domains"),
+                .any(|c| c.what == "public.allowed_tracker_domains"),
             "got {:?}",
             d.profile_changes,
         );
+    }
+
+    #[test]
+    fn every_profile_field_the_diff_reports_states_which_warning_it_is_owed() {
+        // The classification that `reload.rs` used to keep as a list of key
+        // names beside a comment asking whoever edits this function to update
+        // it. Changing every `[[profile]]` field at once pins the whole set:
+        // a field added to `diff_profiles` cannot compile without a class, and
+        // a field that changes class shows up here.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        let p = &mut b.profile[0];
+        p.network = torrentd_engine::ProfileNetwork::Host {
+            listen_interfaces: "0.0.0.0:6899".into(),
+            dht: true,
+        };
+        p.peer_fingerprint_hex = Some("a1b2c3d4e5f60718".into());
+        p.user_agent = Some("ua/1.0".into());
+        p.resume_dir = Some("/var/lib/torrentd/resume-public".into());
+        p.torrent_dir = Some("/var/lib/torrentd/torrents-public".into());
+        p.upload_rate_limit = Some(100_000);
+        p.allowed_tracker_domains = vec!["tracker.example.com".into()];
+
+        let mut got: Vec<(String, ProfileChangeKind)> = Config::diff(&a, &b)
+            .profile_changes
+            .into_iter()
+            .map(|c| (c.what, c.kind))
+            .collect();
+        got.sort_by(|x, y| x.0.cmp(&y.0));
+        let mut want = vec![
+            ("public.network", ProfileChangeKind::Identity),
+            ("public.peer_fingerprint_hex", ProfileChangeKind::Identity),
+            ("public.user_agent", ProfileChangeKind::Identity),
+            ("public.resume_dir", ProfileChangeKind::Identity),
+            ("public.torrent_dir", ProfileChangeKind::Identity),
+            ("public.upload_rate_limit", ProfileChangeKind::NonIdentity),
+            (
+                "public.allowed_tracker_domains",
+                ProfileChangeKind::NonIdentity,
+            ),
+        ]
+        .into_iter()
+        .map(|(w, k)| (w.to_string(), k))
+        .collect::<Vec<_>>();
+        want.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn a_profile_leaving_the_set_is_an_identity_change() {
+        // `diff_profiles`'s entries with no `.key`. Which accounts exist is as
+        // fixed at startup as who they announce as, so both must land in the
+        // class that keeps Safety Rule 7's wording.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        b.profile.clear();
+        let d = Config::diff(&a, &b);
+        assert_eq!(d.profile_changes.len(), 1, "got {:?}", d.profile_changes);
+        assert!(d.profile_changes[0].what.starts_with("public: removed"));
+        assert_eq!(d.profile_changes[0].kind, ProfileChangeKind::Identity);
+
+        let d = Config::diff(&b, &a);
+        assert_eq!(d.profile_changes.len(), 1, "got {:?}", d.profile_changes);
+        assert!(d.profile_changes[0].what.starts_with("public: added"));
+        assert_eq!(d.profile_changes[0].kind, ProfileChangeKind::Identity);
     }
 
     #[test]
