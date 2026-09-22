@@ -32,10 +32,11 @@ torrentd.example.com {
 		# Strip anything the *client* sent under these names before adding
 		# ours. Without this, a client can prepend entries to the chain.
 		# torrentd reads the last entry for the client's address — but the
-		# *first* for the scheme, since that is the hop that terminated TLS —
-		# so a prepended `https` is believed unless it is stripped here, and a
-		# proxy that forwards client-supplied values is a proxy that cannot be
-		# trusted about anything.
+		# *whole chain* for the scheme, since TLS is terminated at the edge
+		# and any hop that says `https` answers it — so a prepended `https` is
+		# believed unless it is stripped here, and a proxy that forwards
+		# client-supplied values is a proxy that cannot be trusted about
+		# anything.
 		header_up -Forwarded
 	}
 
