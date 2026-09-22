@@ -153,6 +153,14 @@ fn subcommand_name(command: &Command) -> &'static str {
 /// config the daemon refuses", and then refusing it for the posture when they
 /// drop the flag as instructed, is the instruction and its contradiction in
 /// two invocations.
+///
+/// `main` calls this **before the config file is opened**, so
+/// `--check-config hash-password` against a path that does not exist reports
+/// the usage error and not the missing file. That is the right order and is
+/// recorded here rather than left incidental: a usage error is not a
+/// statement about a file's contents, and an invocation that will not be
+/// carried out either way should not be diagnosed by reading a file it was
+/// never going to use.
 fn check_config_with_subcommand(cli: &Cli) -> Option<String> {
     if !cli.check_config {
         return None;
