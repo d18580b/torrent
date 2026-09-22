@@ -354,18 +354,26 @@ Per-session series carry a `profile_id` label. Per-*torrent* series are
 deliberately absent — they are unusable at 10K+ torrents, and the HTTP API
 serves per-torrent status on demand.
 
+What follows is the series worth building a panel or an alert on, named so you
+can find them; a scrape of a running daemon is the authoritative list.
 Alongside the libtorrent gauges (`torrentd_libtorrent_*`) there are daemon
 counters for torrent lifecycle, resume writes, disk and hash errors, dropped
-alerts, storage moves and pool verification. Four `profile_id`-labelled series
-cover tunnel health and fencing — `profile_vpn_tunnel_up`,
+alerts, storage moves and pool verification. Tunnel health and fencing are
+carried by the `profile_id`-labelled `profile_vpn_tunnel_up`,
 `profile_torrents_paused_vpn_down`, `profile_vpn_tunnel_ip_changes_total` and
-`profile_vpn_fenced_total` — and they are meaningful only on a tunnelled
+`profile_vpn_fenced_total`, and they are meaningful only on a tunnelled
 profile: a sample carrying the `profile_id` of a profile with no tunnel says
 nothing about any tunnel, so scope a panel or an alert to the profiles you
 actually tunnel rather than aggregating over every profile. Handshake age is
-reported per WireGuard profile, and port-forward state per profile that
-negotiates its port over NAT-PMP. `kill_switch_active` is none of these: it is
-a single unlabelled daemon-wide gauge, seeded at 0 at startup whether or not
+reported per WireGuard profile. Port-forward state is reported per profile that
+negotiates its port over NAT-PMP, and `profile_vpn_gateway_reboots_total`
+counts the gateway restarts a renewal detects on such a profile. Two more
+`profile_id`-labelled series belong to neither group: `listen_failure_active`,
+0 once a profile's listen socket is up and 1 when it fails, and
+`listen_failures_total`, which counts those failures — and a listen failure on
+a daemon left with a single live session is fatal, so on that shape the alert
+that fires is the daemon going away. `kill_switch_active` is none of these: it
+is a single unlabelled daemon-wide gauge, seeded at 0 at startup whether or not
 any kill switch or any `vpn` profile is configured.
 
 > A shipped Grafana dashboard and alert rules are planned rather than present.
