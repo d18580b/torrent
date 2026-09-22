@@ -451,9 +451,33 @@ impl Config {
     pub fn diff(old: &Config, new: &Config) -> ConfigDiff {
         // `new`, destructured exhaustively and with no `..`, so that adding a
         // field to `Config` does not compile until this function reaches it.
-        // Naming the field in the pattern is not enough on its own: an unused
-        // binding is a warning, and the workspace is built with warnings
-        // denied, so the field has to be compared as well.
+        // Naming the field in the pattern is not enough on its own: the field
+        // has to be compared as well.
+        //
+        // The two halves are not enforced by the same thing, and this note
+        // used to run them together:
+        //
+        // * A field **not named** is `error[E0027]: pattern does not mention
+        //   field` — a hard compile error under a bare `cargo build`, with no
+        //   flags and no lint configuration involved.
+        // * A field **named but never compared** is `warning: unused
+        //   variable`, which is a *rustc* lint. `Cargo.toml`'s
+        //   `[workspace.lints.clippy] all = "deny"` does not reach it — that
+        //   denies clippy's lints, not rustc's. It becomes an error under
+        //   `mise run lint` (`cargo clippy … -- -D warnings`) and under any
+        //   build carrying `RUSTFLAGS=-D warnings`, which
+        //   `.github/workflows/ci.yml` sets for the whole workflow. A plain
+        //   local `cargo build` compiles it and prints a warning.
+        //
+        // So the first half is a build error everywhere and the second half
+        // holds wherever warnings are denied, which is the lint task and CI.
+        // Both were demonstrated.
+        //
+        // Neither half sees `field: _`. That binds nothing, so there is no
+        // unused binding to warn about and the field simply leaves the diff —
+        // verified. `diff_profiles` uses `id: _` deliberately, because `id` is
+        // the index key rather than a compared field; it is the one spelling
+        // this invariant cannot detect, and it is not a pattern to copy.
         //
         // This replaces a hand-maintained obligation. `reload.rs` states that
         // no changed key is silently dropped, and the previous note here asked
@@ -910,6 +934,12 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
         // until this loop reaches it. `id` is the key both sides were indexed
         // by, so it is equal here by construction and is the one field with
         // nothing to compare.
+        //
+        // `id: _` is how that is spelled, and it is also the one spelling this
+        // invariant cannot detect: `_` binds nothing, so there is no unused
+        // binding for the second half of the check to catch, and a field given
+        // it leaves the diff in silence. It is correct here and is not to be
+        // copied to a field that has something to compare.
         let ProfileConfig {
             id: _,
             network: new_network,
