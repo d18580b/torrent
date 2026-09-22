@@ -78,7 +78,8 @@ impl AppState {
 
     pub fn profile_vpn_down(&self, profile_id: &ProfileId) -> bool {
         self.profiles
-            .get(profile_id)
+            .resolve(profile_id)
+            .active()
             .map(|e| e.health().status == ProfileStatus::VpnDown)
             .unwrap_or(false)
     }

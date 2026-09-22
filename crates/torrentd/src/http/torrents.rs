@@ -363,8 +363,8 @@ async fn do_add(
     if let AddSource::File(bytes) = &source {
         let domains = s
             .profiles
-            .get(&profile_id)
-            .map(|e| e.config.allowed_tracker_domains.clone())
+            .config(&profile_id)
+            .map(|c| c.allowed_tracker_domains.clone())
             .unwrap_or_default();
         if !domains.is_empty() {
             match libtorrent_safe::torrent_tracker_host_matches(bytes, &domains) {

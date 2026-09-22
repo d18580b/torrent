@@ -125,6 +125,21 @@ pub enum Resolution<'a> {
     Unknown,
 }
 
+impl<'a> Resolution<'a> {
+    /// The live entry, or `None` for the two answers that are not one.
+    ///
+    /// The only way to `&ProfileEntry` from outside this module, and it reads
+    /// as what it is: a caller that discards the other two arms has written
+    /// down that it is doing so. `ProfileRegistry::get`, which used to be that
+    /// way, said nothing.
+    pub fn active(self) -> Option<&'a ProfileEntry> {
+        match self {
+            Resolution::Active(e) => Some(e),
+            Resolution::Failed(_) | Resolution::Unknown => None,
+        }
+    }
+}
+
 /// Build a static WireGuard profile entry with the given id and status, for tests
 /// across the http/app_state modules.
 #[cfg(test)]
@@ -226,9 +241,9 @@ impl ProfileRegistry {
 
     /// Whether `id` names a profile that failed to come up.
     ///
-    /// Half of an answer, like [`ProfileRegistry::get`], and private for the
-    /// same reason: a route that pairs the two by hand is a route that can
-    /// forget to.
+    /// Half of an answer, like [`ProfileRegistry::get`], and private to this
+    /// module for the same reason: a route that pairs the two by hand is a
+    /// route that can forget to.
     fn failed_profile(&self, id: &ProfileId) -> Option<&FailedProfile> {
         self.failed.iter().find(|f| &f.config.id == id)
     }
@@ -245,8 +260,12 @@ impl ProfileRegistry {
     /// two lookups was left to whoever wrote the route.
     ///
     /// It is not left to them here. This returns a value that cannot be read
-    /// without the failed case being named, and [`ProfileRegistry::get`] is
-    /// private to this crate so a new route reaches for this first.
+    /// without the failed case being named, and both halves it is built from —
+    /// [`ProfileRegistry::get`] and [`ProfileRegistry::failed_profile`] — are
+    /// private to this module, so there is no second way to ask from outside
+    /// it. `get` was `pub(crate)` while that claim was being made, and every
+    /// resolution site in this daemon lives in this crate, so the claim bought
+    /// nothing: `http/torrents.rs` was already calling it.
     pub fn resolve(&self, id: &ProfileId) -> Resolution<'_> {
         if let Some(entry) = self.get(id) {
             return Resolution::Active(entry);
@@ -257,24 +276,40 @@ impl ProfileRegistry {
         }
     }
 
-    /// The configuration of a live profile.
+    /// The configuration of a **live** profile, for a caller that has already
+    /// established it is live.
     ///
     /// The add-time flag policy keys off the profile's declared network, so
     /// every add path needs the config and not just the id.
+    ///
+    /// `None` here does not mean "no such profile": a configured profile whose
+    /// tunnel never came up has a config and no entry, and answers `None` like
+    /// a typo does. A route that has to tell those apart — which is every route
+    /// that reports an id back to an operator — calls
+    /// [`ProfileRegistry::resolve`] and reads the arm. Expressed through
+    /// `resolve` rather than through `get` so that is one fact about this type
+    /// rather than two implementations of it.
     pub fn config(&self, id: &ProfileId) -> Option<&ProfileConfig> {
-        self.get(id).map(|e| &e.config)
+        self.resolve(id).active().map(|e| &e.config)
     }
 
     /// The live entry for `id`, or `None` — **including** when `id` names a
     /// configured profile that failed to come up.
     ///
-    /// That second case is why this is not the method a route calls:
-    /// [`ProfileRegistry::resolve`] is. Kept for the callers that have already
-    /// established which case they are in.
-    pub(crate) fn get(&self, id: &ProfileId) -> Option<&ProfileEntry> {
+    /// Half of an answer, like [`ProfileRegistry::failed_profile`], and private
+    /// to this module for the same reason: it is the lookup a route has to
+    /// remember to pair, and the pairing is [`ProfileRegistry::resolve`]'s job.
+    fn get(&self, id: &ProfileId) -> Option<&ProfileEntry> {
         self.entries.iter().find(|e| &e.config.id == id)
     }
 
+    /// Every profile that holds a session, in configured order.
+    ///
+    /// Reviewed alongside `get` and left public: it answers nothing about an
+    /// id, so there is no pairing to forget. A caller walking the live set is
+    /// saying which set it wants, and the one that never came up has its own
+    /// accessor in [`ProfileRegistry::failed`] — which `/profiles` reads
+    /// immediately after this one to build the list an operator sees.
     pub fn iter(&self) -> std::slice::Iter<'_, ProfileEntry> {
         self.entries.iter()
     }
@@ -334,5 +369,39 @@ mod tests {
             r.resolve(&ProfileId::new("typo")),
             Resolution::Unknown
         ));
+    }
+
+    #[test]
+    fn the_public_config_lookup_answers_for_a_live_profile_and_nothing_else() {
+        // `config` is the public half-answer nothing recorded: it collapses
+        // "down" and "not configured" into one `None`, exactly as `get` did,
+        // and it is reachable from every module in this crate. Expressing it
+        // through `resolve` must not have widened it — a caller reading a
+        // failed profile's config here would be reading the config of a
+        // profile that holds no session.
+        let r = registry();
+        assert_eq!(
+            r.config(&ProfileId::new("public")).map(|c| c.id.as_str()),
+            Some("public"),
+        );
+        assert!(
+            r.config(&ProfileId::new("acct_a")).is_none(),
+            "configured and down is not a live profile",
+        );
+        assert!(
+            r.config(&ProfileId::new("typo")).is_none(),
+            "and neither is a typo",
+        );
+    }
+
+    #[test]
+    fn taking_the_live_entry_out_of_a_resolution_names_the_other_two_arms() {
+        // `Resolution::active` is the only way to a `&ProfileEntry` from
+        // outside this module. It must answer for `Active` and for neither of
+        // the others, or it is `get` again under a new name.
+        let r = registry();
+        assert!(r.resolve(&ProfileId::new("public")).active().is_some());
+        assert!(r.resolve(&ProfileId::new("acct_a")).active().is_none());
+        assert!(r.resolve(&ProfileId::new("typo")).active().is_none());
     }
 }
