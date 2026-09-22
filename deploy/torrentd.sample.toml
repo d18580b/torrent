@@ -216,9 +216,10 @@ dht               = true
 # stops, names the backup path and the reason, and leaves the index as it was.
 # Nothing deletes it afterwards and nothing ages it out: remove it yourself
 # once you would not go back. An existing copy at that path is kept as it is and
-# no new one is taken; something that is not a readable database there stops the
-# migration instead, because keeping it would run the one-way rename with no
-# rollback at all.
+# no new one is taken — but only where it really is one: it has to be a pool
+# index, at a schema version this build understands, and not this same `pool.db`
+# reached through a symlink. Anything else stops the migration instead, because
+# keeping it would run the one-way rename with no rollback at all.
 #
 # A `pool.db` from one of this change's own pre-release builds can carry
 # `profile` without v3's indexes, reporting version 2 or version 3 depending on
