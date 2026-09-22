@@ -911,9 +911,48 @@ impl VpnManager for WireguardManager {
 
     fn bring_down(&self, iface: &str) {
         let _ = Command::new("wg-quick").arg("down").arg(iface).status();
-        // The claim goes down with the interface. Leaving it would have the
-        // next boot vouch for a link this one removed — and for whatever took
-        // the name after it.
+        self.drop_record_if_gone(iface, interface_exists);
+    }
+}
+
+impl WireguardManager {
+    /// Drop the raised-interface record, but only once the link is actually
+    /// gone.
+    ///
+    /// The claim goes down **with the interface**, not with the attempt to
+    /// take it down. Leaving a claim over a link this boot removed would have
+    /// the next boot vouch for whatever took the name after it; dropping one
+    /// over a link that is *still standing* is the opposite error, and it
+    /// restores exactly the permanently-dark state the record exists to
+    /// remove.
+    ///
+    /// `wg-quick`'s `cmd_down` runs `execute_hooks "${PRE_DOWN[@]}"` before
+    /// `del_if`, under `set -e`, so a provider-style `PreDown` hook that fails
+    /// — and a `.conf` that has gone missing, which fails one step earlier —
+    /// leaves the command non-zero and the link up, still carrying its key.
+    /// For the keyless `PostUp = wg set %i private-key …` profile the record
+    /// was introduced for, discarding the record there means the next start
+    /// meets a standing link, no record, and no profile key: `Unestablished`,
+    /// then `ForeignInterface`, and the slot is dark until an operator runs
+    /// `ip link delete` by hand. `sweep_raised_records` cannot recover it —
+    /// the sweep only ever deletes records, never writes one.
+    ///
+    /// `exists` is a parameter for the reason
+    /// [`RaisedInterfaces::sweep_with`]'s is: the rule is the whole of the
+    /// defect and `/sys/class/net` is what made it unreachable by a test. The
+    /// exit status of `wg-quick down` is deliberately not consulted — it
+    /// reports what the *command* did, and the question here is what the
+    /// *host* is left holding.
+    fn drop_record_if_gone(&self, iface: &str, exists: impl Fn(&str) -> bool) {
+        if exists(iface) {
+            warn!(
+                target: "torrentd::vpn::wireguard",
+                vpn_iface = %iface,
+                "wg-quick down left the interface standing; keeping this boot's \
+                 raised-interface record so a later start can still adopt it",
+            );
+            return;
+        }
         self.raised.forget(iface);
     }
 }
@@ -1284,6 +1323,56 @@ mod tests {
         assert!(raised.recorded("wg-a", Some(LIVE_KEY)));
         raised.forget("wg-a");
         assert!(!raised.recorded("wg-a", Some(LIVE_KEY)));
+        assert!(!raised.path("wg-a").exists());
+    }
+
+    /// **A teardown that left the link standing keeps the record.**
+    ///
+    /// `bring_down` used to run `wg-quick down` and then `forget` the record
+    /// unconditionally, on the assumption that the command's return means the
+    /// link is gone. `wg-quick`'s `cmd_down` runs `execute_hooks
+    /// "${PRE_DOWN[@]}"` *before* `del_if`, under `set -e`, so a
+    /// provider-style `PreDown` hook that fails — or a `.conf` that has gone
+    /// missing, which fails one step earlier — leaves the command non-zero and
+    /// the link up, still carrying its key.
+    ///
+    /// For the keyless profile the record exists for, discarding it there is
+    /// the whole of the permanently-dark state: the next start meets a
+    /// standing link, no record and no profile key, so `ownership` answers
+    /// `Unestablished`, `bring_up` reports `ForeignInterface`, and the slot is
+    /// dark until an operator runs `ip link delete` by hand.
+    /// `sweep_raised_records` cannot recover it — the sweep only ever deletes
+    /// records, never writes one.
+    ///
+    /// `exists` is the seam, for the reason `sweep_with`'s is: the rule is the
+    /// whole of the defect and `/sys/class/net` is what made it unreachable by
+    /// a test. Make the `forget` unconditional again and the first assertion
+    /// fails.
+    #[test]
+    fn a_teardown_that_left_the_link_standing_keeps_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let raised = raised_in(dir.path(), "one-boot");
+        raised
+            .record("wg-a", Some(LIVE_KEY))
+            .expect("a temporary directory accepts a write");
+        let mgr = WireguardManager::with_raised(raised.clone());
+
+        // `wg-quick down` ran and the link is still there — the failing
+        // `PreDown` hook, and the missing `.conf`.
+        mgr.drop_record_if_gone("wg-a", |_| true);
+        assert!(
+            raised.recorded("wg-a", Some(LIVE_KEY)),
+            "the link is still standing and still ours, so the one thing that \
+             can still adopt it stays on disk",
+        );
+
+        // And the ordinary teardown, where the link really did go.
+        mgr.drop_record_if_gone("wg-a", |_| false);
+        assert!(
+            !raised.recorded("wg-a", Some(LIVE_KEY)),
+            "a claim over a link that is gone would vouch for whatever takes \
+             the name next",
+        );
         assert!(!raised.path("wg-a").exists());
     }
 
