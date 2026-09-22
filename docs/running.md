@@ -424,10 +424,17 @@ is configured; `read` and `metrics` tokens are refused. It reloads exactly what
 `SIGHUP` reloads, and reports the same warnings for a `[[profile]]` field that
 changed and cannot be applied without a restart: the Safety Rule 7 warning
 (`profile identity change requires daemon restart`) where the field is an
-identity — the network block, `peer_fingerprint_hex`, `user_agent`, the two
-store directories — and the ordinary non-reloadable-field warning where it is
-`upload_rate_limit` or `allowed_tracker_domains`, which are not. The field name
-is on the event either way.
+identity — the network block, `peer_fingerprint_hex`, `user_agent` — and the
+ordinary non-reloadable-field warning where it is not: `upload_rate_limit`,
+`allowed_tracker_domains`, and the two store directories. The field name is on
+the event either way.
+
+The store directories are in the second group because nothing a tracker reads
+is not an identity, and no announce or handshake carries where a profile keeps
+its files. They are still not reloadable — the stores are opened once at
+startup — but setting them is exactly what step 3 above tells you to do, and
+the privacy warning is the line an alert rule watches for an account's identity
+changing under a live session.
 
 ## 9. First-run checks
 

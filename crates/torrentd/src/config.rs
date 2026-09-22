@@ -665,9 +665,21 @@ impl Config {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ProfileChangeKind {
     /// The account a tracker sees: the network block, the peer fingerprint,
-    /// the user agent, the store directories, and the profile set itself.
+    /// the user agent, and the profile set itself.
+    ///
+    /// The store directories are deliberately **not** here, though they were.
+    /// The definition below is what decides it: nothing a tracker reads is not
+    /// identity, and no announce, handshake or peer message carries where a
+    /// profile keeps its resume and `.torrent` files. Classing them here made
+    /// `docs/running.md`'s own upgrade step 3 — the documented way to keep
+    /// your library across the move to per-profile subdirectories — emit
+    /// Safety Rule 7's privacy warning, which is the line an alert rule
+    /// watches for an identity changing under a live session.
     Identity,
-    /// Non-reloadable for its own reason, but nothing a tracker reads.
+    /// Non-reloadable for its own reason, but nothing a tracker reads: the
+    /// per-profile rate cap, the tracker-domain list, and the store
+    /// directories, which are fixed at startup because the stores are opened
+    /// then.
     NonIdentity,
 }
 
@@ -696,12 +708,16 @@ impl std::fmt::Display for ProfileChange {
 /// Report `[[profile]]` changes that a reload cannot apply.
 ///
 /// Most of what is compared here is identity-critical: the tunnel a session is
-/// bound to, the port it announces, the peer fingerprint and user agent a
-/// tracker sees, and where its resume and torrent files live. Changing any of
-/// them means a different account identity to the tracker, which is a restart —
-/// not something to swap under a live session. Adding or removing profiles is
-/// likewise a restart, since the profile set is fixed when sessions are built.
-/// The two keys outside the network block are not identity, and say so here.
+/// bound to, the port it announces, and the peer fingerprint and user agent a
+/// tracker sees. Changing any of them means a different account identity to the
+/// tracker, which is a restart — not something to swap under a live session.
+/// Adding or removing profiles is likewise a restart, since the profile set is
+/// fixed when sessions are built.
+///
+/// The rest is non-reloadable without being identity, and says so here: the
+/// per-profile rate cap and tracker-domain list, and the two store
+/// directories, which are fixed at startup because the stores are opened then
+/// and which nothing on the wire carries.
 fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileChange> {
     use std::collections::BTreeMap;
 
@@ -752,8 +768,24 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
             Identity,
         );
         field("user_agent", a.user_agent != b.user_agent, Identity);
-        field("resume_dir", a.resume_dir != b.resume_dir, Identity);
-        field("torrent_dir", a.torrent_dir != b.torrent_dir, Identity);
+        // Not identity. `ProfileChangeKind`'s own definitions decide this:
+        // `Identity` is "the account a tracker sees" and `NonIdentity` is
+        // "nothing a tracker reads" — and where a profile keeps its resume and
+        // `.torrent` files is the second. No announce carries it, no handshake
+        // carries it, and nothing on the wire changes when it moves.
+        //
+        // They are still non-reloadable, for their own reason: the stores are
+        // opened once at startup and the partitioning is fixed with them. What
+        // changes is which of the two warnings the operator gets.
+        // `reload.rs` says the privacy string exists for "the privacy event"
+        // and that "nothing that is not identity may emit it", and it is the
+        // line an alert rule watches. Classing the store directories as
+        // identity made the runbook's own upgrade step 3 — "set that profile's
+        // own `resume_dir` and `torrent_dir` to the old paths", the documented
+        // way to avoid losing the library on upgrade — fire a privacy alert
+        // for doing exactly what the runbook says.
+        field("resume_dir", a.resume_dir != b.resume_dir, NonIdentity);
+        field("torrent_dir", a.torrent_dir != b.torrent_dir, NonIdentity);
         // The two keys outside the network block. Neither is applied by a
         // reload — the add path reads `ProfileRegistry`'s immutable startup
         // snapshot and nothing rebuilds it — and without them here a SIGHUP
@@ -1709,8 +1741,8 @@ listen_interfaces = "0.0.0.0:6882"
             ("public.network", ProfileChangeKind::Identity),
             ("public.peer_fingerprint_hex", ProfileChangeKind::Identity),
             ("public.user_agent", ProfileChangeKind::Identity),
-            ("public.resume_dir", ProfileChangeKind::Identity),
-            ("public.torrent_dir", ProfileChangeKind::Identity),
+            ("public.resume_dir", ProfileChangeKind::NonIdentity),
+            ("public.torrent_dir", ProfileChangeKind::NonIdentity),
             ("public.upload_rate_limit", ProfileChangeKind::NonIdentity),
             (
                 "public.allowed_tracker_domains",
@@ -1722,6 +1754,41 @@ listen_interfaces = "0.0.0.0:6882"
         .collect::<Vec<_>>();
         want.sort_by(|x, y| x.0.cmp(&y.0));
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn the_runbooks_own_upgrade_step_does_not_fire_a_privacy_alert() {
+        // D36/Q23. Upgrade step 3 in `docs/running.md` tells an operator to
+        // "set that profile's own `resume_dir` and `torrent_dir` to the old
+        // paths" — the documented way to keep a library across the move to
+        // per-profile subdirectories. With the store directories classed as
+        // identity, doing exactly that emitted Safety Rule 7's privacy
+        // warning, which `reload.rs` reserves for "the privacy event" and
+        // which is the line an alert rule watches.
+        //
+        // They are still non-reloadable: the stores are opened at startup. The
+        // class is about which of the two warnings the operator is owed, and
+        // nothing a tracker reads carries where a profile keeps its files.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        b.profile[0].resume_dir = Some("/var/lib/torrentd/resume".into());
+        b.profile[0].torrent_dir = Some("/var/lib/torrentd/torrents".into());
+
+        let d = Config::diff(&a, &b);
+        assert_eq!(d.profile_changes.len(), 2, "got {:?}", d.profile_changes);
+        for c in &d.profile_changes {
+            assert_eq!(
+                c.kind,
+                ProfileChangeKind::NonIdentity,
+                "{} must not be reported as an identity change",
+                c.what,
+            );
+        }
+        // Still reported — not reloadable is not the same as not a change.
+        let mut names: Vec<&str> = d.profile_changes.iter().map(|c| c.what.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["public.resume_dir", "public.torrent_dir"]);
     }
 
     #[test]
