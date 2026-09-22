@@ -235,10 +235,16 @@ jobs:
           key: cargo-daemononly-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-daemononly-${{ runner.os }}-
 
+      # mise provides the build task; without it this job would be a second
+      # copy of the command mise.toml already owns.
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+
       # No actions/setup-node here on purpose: this must build on a host with
       # no Node whatsoever, which is what anyone running the headless daemon
       # gets with `--no-default-features`.
-      - run: cargo build -p torrentd --no-default-features
+      - run: mise run daemon-only
 
   container:
     name: container image builds
@@ -266,12 +272,16 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: npm ci
-        working-directory: web
-      # `tsc -b` runs in strict mode with noUnusedLocals/noUnusedParameters, so
-      # this is the type gate as well as the bundle build.
-      - run: npm run build
-        working-directory: web
+      # mise provides the task; without it this job would be a second copy of
+      # the two commands mise.toml already owns. Node still comes from
+      # setup-node above — mise.toml pins no node.
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+      # `[tasks.web]` runs `npm ci` then `npm run build` in `web/`, and stops
+      # at the first failure, so this is the type gate as well as the bundle
+      # build.
+      - run: mise run web
 
   commit-lint:
     name: conventional commits
