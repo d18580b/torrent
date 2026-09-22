@@ -431,6 +431,48 @@ impl Config {
                 // the value: both wrote nothing, so there is nothing to
                 // distinguish and nothing hidden.
                 let inherited = p.peer_fingerprint_hex.is_none();
+                // The default-prefix refusal, on the *effective* fingerprint.
+                //
+                // `ProfileConfig::validate_set` applies it to a declared
+                // `peer_fingerprint_hex` and to nothing else, so a value
+                // written once at the top level reached every session that
+                // inherited it unchecked — and the value it reached them with
+                // was libtorrent's own default prefix, which is what the
+                // refusal exists to stop a config from claiming as a
+                // deliberate identity. `Config::to_settings` seeds every
+                // session from the top-level key and `startup.rs:323`
+                // overrides it only where the profile declared its own, so the
+                // effective value is what announces, and it is what has to
+                // satisfy the rule.
+                //
+                // Demonstrated before this check existed: a top-level
+                // `peer_fingerprint` plus one host profile that writes neither
+                // key printed `config OK`, for the hex spelling and for the
+                // raw one — while the identical string written as the
+                // profile's own `peer_fingerprint_hex` was refused.
+                //
+                // The *length* rule is deliberately not applied here. It is an
+                // encoding rule for the key that names an encoding:
+                // `peer_fingerprint_hex` is sixteen hex characters, while the
+                // top-level `peer_fingerprint` has been documented as a raw
+                // eight-character prefix in every sample this repository has
+                // shipped (`"-LT20C0-"` before this change, `"-XX1234-"`
+                // after). Applying "16 hex chars" to it would refuse the
+                // shipped sample's own value, and unifying the two encodings
+                // is a change to a pre-existing operator-facing key rather
+                // than to anything this change introduced.
+                //
+                // The key named is the one the operator wrote, as it is for
+                // the duplicate errors below.
+                if ProfileConfig::is_libtorrent_default_fingerprint(fp) {
+                    return Err(ProfileConfigError::DefaultFingerprintForbidden {
+                        key: if inherited {
+                            "peer_fingerprint"
+                        } else {
+                            "peer_fingerprint_hex"
+                        },
+                    });
+                }
                 match seen_fp.insert(fp, p.id.as_str()) {
                     Some(prev) if inherited && self.inherits_fingerprint(prev) => {}
                     Some(_) => {
@@ -1145,6 +1187,66 @@ user_agent = "libtorrent/2.0"
             "two host profiles that both write nothing are using the top-level default \
              exactly as it is documented",
         );
+    }
+
+    #[test]
+    fn a_top_level_fingerprint_may_not_be_the_libtorrent_default_either() {
+        // F49. The refusal bound to `peer_fingerprint_hex` and to nothing
+        // else, while `to_settings` hands the top-level `peer_fingerprint` to
+        // every session and `startup.rs:323` overrides it only for a profile
+        // that declared its own. So a host profile that writes neither key
+        // announced whatever the top level said, unchecked — including the one
+        // value the refusal exists for, and `--check-config` printed
+        // `config OK`.
+        //
+        // Both spellings, because the two keys spell those eight bytes
+        // differently and nothing decodes either: `-LT20C0-` is what actually
+        // reaches libtorrent from this key, and it is the value the sample
+        // documented for it before this change.
+        for spelling in ["-LT20C0-", "2d4c54323043302d"] {
+            let msg = refusal(&two_host_profiles_with_top(&format!(
+                "peer_fingerprint = {spelling:?}"
+            )));
+            assert!(
+                msg.contains("must not equal libtorrent default"),
+                "the {spelling:?} spelling must be refused, got: {msg}",
+            );
+            assert!(
+                msg.contains("peer_fingerprint ") && !msg.contains("peer_fingerprint_hex"),
+                "and named as the key the operator actually wrote, got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_top_level_fingerprint_that_is_not_the_default_is_still_accepted() {
+        // The other side: the key is a documented default for profiles that
+        // set none, so the refusal must reach the default prefix and nothing
+        // else. `"-XX1234-"` is the value the shipped sample carries.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(
+            dir.path(),
+            &two_host_profiles_with_top(r#"peer_fingerprint = "-XX1234-""#),
+        );
+        Config::load(&p).expect("the sample's own top-level value must keep loading");
+    }
+
+    /// Two host profiles that declare no identity, under `top`.
+    fn two_host_profiles_with_top(top: &str) -> String {
+        format!(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+{top}
+{}
+"#,
+            two_host_profiles("", "")
+                .split_once("http_listen = \"127.0.0.1:8080\"")
+                .unwrap()
+                .1
+        )
     }
 
     #[test]

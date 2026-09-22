@@ -615,10 +615,18 @@ pub enum ProfileConfigError {
     DuplicateResumeDir(PathBuf),
     #[error("torrent_dir {0:?} appears more than once (after symlink resolution)")]
     DuplicateTorrentDir(PathBuf),
-    #[error("peer_fingerprint_hex must not equal libtorrent default (-LT20C0-)")]
-    DefaultFingerprintForbidden,
-    #[error("peer_fingerprint_hex {0:?} is not 16 hex chars")]
-    BadFingerprintLength(String),
+    /// The value equals libtorrent's own default peer-id prefix.
+    ///
+    /// `key` is the key the *operator wrote*, for the reason
+    /// [`ProfileConfigError::DuplicateFingerprint`] carries one: the same value
+    /// reaches a session from the per-profile `peer_fingerprint_hex` and from
+    /// the top-level `peer_fingerprint` it inherits, and naming the wrong one
+    /// sends the operator hunting a key that appears nowhere in their file.
+    #[error("{key} must not equal libtorrent default (-LT20C0-)")]
+    DefaultFingerprintForbidden { key: &'static str },
+    /// The value is not sixteen hex characters. `key` as above.
+    #[error("{key} {value:?} is not 16 hex chars")]
+    BadFingerprintLength { key: &'static str, value: String },
     #[error(
         "no [[profile]] tables are configured. torrentd has no implicit profile: every \
          profile states how it reaches the network, because the alternative — defaulting \
@@ -679,8 +687,26 @@ impl ProfileConfig {
     /// The hex form of libtorrent's default fingerprint `-LT20C0-` (16 hex
     /// chars). A VPN profile must set a distinct fingerprint so peers cannot
     /// trivially tie it back to the default client identity.
-    fn is_libtorrent_default_fingerprint(hex: &str) -> bool {
-        hex.eq_ignore_ascii_case("2d4c54323043302d")
+    /// Whether `fp` is libtorrent's own default peer-id prefix, in either of
+    /// the two spellings this configuration accepts.
+    ///
+    /// `-LT20C0-` is the eight bytes libtorrent puts at the front of a peer id
+    /// nobody configured. The two keys that can supply those bytes spell them
+    /// differently: `peer_fingerprint_hex` states them as sixteen hex
+    /// characters, and the top-level `peer_fingerprint` states them as
+    /// themselves — `deploy/torrentd.sample.toml` documented that key as
+    /// `peer_fingerprint = "-LT20C0-"` before this change and as
+    /// `"-XX1234-"` after it, and nothing between the config file and
+    /// libtorrent decodes either spelling.
+    ///
+    /// So a test that knew only the hex spelling read straight past the raw
+    /// one — which is both the spelling that actually reaches the wire from
+    /// that key and the one an operator copies out of libtorrent's own
+    /// documentation. Both are refused, and neither is refused *because of*
+    /// its length: that is a separate rule belonging to the key that declares
+    /// an encoding in its name.
+    pub fn is_libtorrent_default_fingerprint(fp: &str) -> bool {
+        fp.eq_ignore_ascii_case("2d4c54323043302d") || fp == "-LT20C0-"
     }
 
     /// The distinct ports a libtorrent `listen_interfaces` string binds.
@@ -925,10 +951,15 @@ impl ProfileConfig {
             // uniqueness rule.
             if let Some(fp) = p.peer_fingerprint_hex.as_deref() {
                 if fp.len() != 16 {
-                    return Err(ProfileConfigError::BadFingerprintLength(fp.to_string()));
+                    return Err(ProfileConfigError::BadFingerprintLength {
+                        key: "peer_fingerprint_hex",
+                        value: fp.to_string(),
+                    });
                 }
                 if Self::is_libtorrent_default_fingerprint(fp) {
-                    return Err(ProfileConfigError::DefaultFingerprintForbidden);
+                    return Err(ProfileConfigError::DefaultFingerprintForbidden {
+                        key: "peer_fingerprint_hex",
+                    });
                 }
             }
         }
@@ -1235,7 +1266,10 @@ mod tests {
         public.peer_fingerprint_hex = Some("abc".to_string());
         assert!(matches!(
             ProfileConfig::validate_set(&[public]),
-            Err(ProfileConfigError::BadFingerprintLength(_))
+            Err(ProfileConfigError::BadFingerprintLength {
+                key: "peer_fingerprint_hex",
+                ..
+            })
         ));
     }
 
@@ -1248,7 +1282,9 @@ mod tests {
         public.peer_fingerprint_hex = Some("2d4c54323043302d".to_string());
         assert!(matches!(
             ProfileConfig::validate_set(&[public]),
-            Err(ProfileConfigError::DefaultFingerprintForbidden)
+            Err(ProfileConfigError::DefaultFingerprintForbidden {
+                key: "peer_fingerprint_hex"
+            })
         ));
     }
 
@@ -1341,7 +1377,9 @@ mod tests {
         )];
         assert!(matches!(
             ProfileConfig::validate_set(&profiles),
-            Err(ProfileConfigError::DefaultFingerprintForbidden)
+            Err(ProfileConfigError::DefaultFingerprintForbidden {
+                key: "peer_fingerprint_hex"
+            })
         ));
     }
 
@@ -1350,7 +1388,10 @@ mod tests {
         let profiles = vec![cfg("a", 6881, "wg0", "abcd", "ua-a")];
         assert!(matches!(
             ProfileConfig::validate_set(&profiles),
-            Err(ProfileConfigError::BadFingerprintLength(_))
+            Err(ProfileConfigError::BadFingerprintLength {
+                key: "peer_fingerprint_hex",
+                ..
+            })
         ));
     }
 
