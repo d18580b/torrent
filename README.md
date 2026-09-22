@@ -27,8 +27,8 @@ which torrents point at data that moved or vanished.
 - [x] **VPN-bound profiles** for multi-account private-tracker seeding —
       source-bound sockets, DHT/PEX/LSD off, tunnel health monitoring, an
       opt-in nftables kill switch, and NAT-PMP port forwarding
-- [x] **Verifiable in isolation**: `torrentd --config … vpn check` exercises a
-      real tunnel with no torrents, no tracker and no session
+- [x] **Verifiable in isolation**: `torrentd --config … vpn check --profile …`
+      exercises a real tunnel with no torrents, no tracker and no session
 - [x] **Secure by default**: it will not start unauthenticated without being
       told to, and never at all on a routable address
 - [x] **Reverse-proxy native**: correct behind a cache, never terminates TLS
@@ -221,10 +221,12 @@ listening port is either static or negotiated over NAT-PMP against the tunnel
 gateway (ProtonVPN/PIA-style ephemeral ports, renewed continuously, with the
 live socket rebinding when it changes).
 
-Verify a tunnel before trusting it, with no torrents involved:
+Verify a tunnel before trusting it, with no torrents involved. `vpn check`
+inspects `vpn` profiles and reaches every profile you do not name, so name a
+`vpn` one unless the configuration is all `vpn`:
 
 ```bash
-torrentd --config … vpn check          # add --bring-up to raise the tunnels
+torrentd --config … vpn check --profile acct_a   # --bring-up also raises it
 ```
 
 ## Security posture
@@ -248,7 +250,7 @@ pre-flight the daemon depends on and reports each part separately, with no
 libtorrent session, no torrents and no tracker contact.
 
 ```bash
-torrentd --config … vpn check                            # every profile
+torrentd --config … vpn check                 # only if every profile is vpn
 torrentd --config … vpn check --profile acct_a --json    # one profile, machine-readable
 torrentd --config … vpn check --egress 1.1.1.1:53      # prove traffic leaves the tunnel
 ```
