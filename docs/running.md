@@ -293,6 +293,17 @@ schema, so a `pool.db` reporting **3** can be missing the index too. The index
 check runs before the version is trusted, for any version this build can open,
 which is why the sentence above holds whichever of those builds you ran.
 
+"Any version" includes **0 and 1**. Those builds ran each schema step as its
+own statement batch and wrote `user_version` afterwards, so a machine that lost
+power between the last schema statement and that write left a file reporting 0
+or 1 over a schema that is already complete v3. It is recognised on the same
+two checks as the rest — the columns are v3's and `torrent_by_profile` is
+there — and stamped, with the journal kept. Before, such a file could not be
+migrated at all: the version-keyed steps tried to create tables that already
+existed, the daemon exited non-zero on every start, and the only remedy the
+message offered that worked was to move the index aside and rescan, which
+costs the `plan`/`plan_step` journal.
+
 **3. Point each profile at its files, or move them.** Resume and `.torrent`
 files used to live directly under `resume_dir` and `torrent_dir`; they now live
 in a per-profile subdirectory, `<resume_dir>/<profile_id>` and

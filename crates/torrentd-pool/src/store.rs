@@ -593,16 +593,33 @@ impl PoolStore {
         // file ends with `torrent_by_profile` and nothing called
         // `torrent_by_slot`.
         //
-        // `found >= 2` because below that there is no `torrent` table to index
-        // yet, and a genuine v2 file still has `slot` to rename; both go down
-        // the stepped path, which the column test sends them to anyway.
+        // Any version this build can open, including 0 and 1. The guard was
+        // `found >= 2`, on the stated reason that "below that there is no
+        // `torrent` table to index yet" — which is false for the population
+        // this arm exists for. A build predating the one-transaction migration
+        // ran the schema steps as separate `execute_batch` calls with the
+        // `PRAGMA` after them, so an interruption between the last DDL commit
+        // and the version write leaves 0 or 1 over a **complete, correct v3
+        // schema**. Both were demonstrated: exit 1, the migration wedged
+        // permanently under `Restart=on-failure`, and the only remedy the
+        // message offered that works destroys the `plan`/`plan_step` journal.
+        //
+        // Those files are a strictly easier case than the ones this arm
+        // already repairs, not a harder one: `carries_v3_columns` and
+        // `has_torrent_index("torrent_by_profile")` both answer true, so the
+        // file's schema is already exactly what this arm would produce, and
+        // nothing is being guessed at. A file at 0 or 1 that is *not* already
+        // v3 still fails the column test — a genuine v1 or v2 index has `slot`
+        // and no `profile`, and an empty file has no `torrent` table for
+        // `PRAGMA table_info` to report — so every one of them goes down the
+        // stepped path exactly as before.
         //
         // Before the backup, and without one: the rename is v3's only
         // irreversible statement and it has already run here, so what is left
         // destroys nothing — an index is derivable from the table it indexes.
         // A stray `.pre-v3.bak` beside a healthy index reads as a failed
         // migration, which the fresh-database test states as a property.
-        if found >= 2 && self.carries_v3_columns()? {
+        if found >= 0 && self.carries_v3_columns()? {
             let indexed = self.has_torrent_index("torrent_by_profile")?;
             if found == SCHEMA_VERSION && indexed {
                 // An ordinary v3 open: the version and the schema agree.
@@ -631,20 +648,23 @@ impl PoolStore {
                     from_version = found,
                     to_version = SCHEMA_VERSION,
                     indexes_repaired = false,
-                    "pool index already carries the v3 schema at user_version = 2; stamping the \
-                     version to match. A superseded build of this change wrote this file with \
-                     v3's schema and v2's version. No schema change was made and no data moved",
+                    "pool index already carries the v3 schema under a user_version that does not \
+                     describe it; stamping the version to match. A superseded build of this \
+                     change wrote this file with v3's schema and an earlier version — either \
+                     stamping 2 deliberately, or dying between the last schema statement and the \
+                     version write, which can leave 0 or 1. No schema change was made and no \
+                     data moved",
                 ),
                 (false, false) => warn!(
                     target: "torrentd_pool::store",
                     from_version = found,
                     to_version = SCHEMA_VERSION,
                     indexes_repaired = true,
-                    "pool index carries the v3 schema at user_version = 2 but not v3's indexes; \
-                     creating torrent_by_profile, dropping torrent_by_slot if it survived the \
-                     rename, and stamping the version to match. A superseded build of this \
-                     change wrote this file with the column rename committed and an index \
-                     statement lost. No data moved",
+                    "pool index carries the v3 schema under a user_version that does not describe \
+                     it, but not v3's indexes; creating torrent_by_profile, dropping \
+                     torrent_by_slot if it survived the rename, and stamping the version to \
+                     match. A superseded build of this change wrote this file with the column \
+                     rename committed and an index statement lost. No data moved",
                 ),
                 (true, false) => warn!(
                     target: "torrentd_pool::store",

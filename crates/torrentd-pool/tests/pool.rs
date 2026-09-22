@@ -1651,6 +1651,97 @@ fn a_stamped_v3_index_still_carrying_torrent_by_slot_is_repaired() {
     );
 }
 
+/// A **complete** v3 schema reporting `version`: what a build predating the
+/// one-transaction migration left when it died between the last schema
+/// statement and the `PRAGMA` that records the version.
+///
+/// Those builds ran `SCHEMA_V1`, `SCHEMA_V2` and `SCHEMA_V3` as separate
+/// `execute_batch` calls with `pragma_update` after them, so the window
+/// between the last DDL commit and the version write is real, and anything
+/// that ends the process inside it leaves this.
+fn build_complete_v3_at_version(db: &Path, version: i64) {
+    build_b28a778_index(db);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.pragma_update(None, "user_version", version).unwrap();
+}
+
+#[test]
+fn a_complete_v3_schema_left_at_version_0_or_1_is_stamped_rather_than_wedged() {
+    // F43 reopened. The recognition arm was guarded on `found >= 2`, on the
+    // stated reason that below that "there is no `torrent` table to index
+    // yet" — which is exactly wrong for the files the arm exists for. A file
+    // at 0 or 1 whose schema is already complete v3 answers both of the arm's
+    // predicates, so it is a *strictly easier* case than the half-applied
+    // shapes it already repairs.
+    //
+    // What happened instead: the version-keyed steps ran from 0 or 1, tried
+    // to create tables that were already there, and the whole migration rolled
+    // back — `exit 1` on every start, permanently, under `Restart=on-failure`.
+    // The only remedy in the message that works is to move the index aside and
+    // rescan, which destroys the `plan`/`plan_step` journal `from_conn`
+    // documents as not reconstructible.
+    for version in [0i64, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        build_complete_v3_at_version(&db, version);
+        assert_eq!(user_version(&db), version, "the fixture reports {version}");
+        let cols = torrent_columns(&db);
+        assert!(
+            cols.iter().any(|c| c == "profile") && !cols.iter().any(|c| c == "slot"),
+            "and its schema is already v3's, got {cols:?}",
+        );
+
+        let store = PoolStore::open(&db).expect("a complete v3 schema must open at any version");
+        drop(store);
+
+        assert_eq!(user_version(&db), 3, "stamped to the version it already is");
+        let idx = torrent_indexes(&db);
+        assert!(
+            idx.iter().any(|n| n == "torrent_by_profile")
+                && !idx.iter().any(|n| n == "torrent_by_slot"),
+            "with v3's indexes as they already were, got {idx:?}",
+        );
+        // The thing worth protecting, and the reason the wedge mattered.
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let steps: i64 = c
+            .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            steps, 1,
+            "the mutation journal survived from version {version}"
+        );
+        drop(c);
+        assert!(
+            !PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+            "and nothing irreversible ran, so nothing was copied aside",
+        );
+        PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+    }
+}
+
+#[test]
+fn a_version_0_index_that_is_not_already_v3_still_takes_the_stepped_path() {
+    // The other side of lowering the guard. Widening it to 0 must not swallow
+    // a file the recognition cannot honestly repair: a build that created v1's
+    // tables and died before the version write leaves `slot`, not `profile`,
+    // so the column test refuses it and it goes down the stepped path with its
+    // message, exactly as before.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.pragma_update(None, "user_version", 0i64).unwrap();
+    }
+
+    let err = PoolStore::open(&db).expect_err("v1's tables still cannot be created twice");
+    assert!(
+        format!("{err}").contains("schema version 0 to 3"),
+        "got: {err}",
+    );
+    assert_eq!(user_version(&db), 0, "and nothing was stamped over it");
+}
+
 #[test]
 fn an_ordinary_v3_index_is_opened_without_touching_it() {
     // The other half of widening the arm past `found == 2`: a healthy v3 file
