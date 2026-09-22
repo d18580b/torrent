@@ -366,6 +366,16 @@ impl PoolStore {
     /// absent, and `VACUUM INTO` then wrote the only rollback copy of the
     /// index *through* it, wherever it pointed. Whatever an operator put at
     /// this path, the answer to "is something already here" is yes.
+    ///
+    /// But "kept" is only the right answer for something that is a copy of the
+    /// index. A dangling symlink, a directory or an unrelated file is not one,
+    /// and keeping it meant the irreversible v3 rename then ran with **no**
+    /// rollback copy at all, while `docs/running.md` tells the operator that
+    /// restoring that file is how they go back. A promise of a rollback that
+    /// does not exist is worse than a refusal naming why, so the migration
+    /// stops instead. Opening it read-only and asking SQLite for its schema
+    /// version is the test: it opens what SQLite can open and it creates
+    /// nothing.
     fn backup_before_v3(&self) -> Result<(), PoolError> {
         // No path: an in-memory store, which has nothing to roll back to.
         let Some(path) = self.conn.path().filter(|p| !p.is_empty()) else {
@@ -373,6 +383,12 @@ impl PoolStore {
         };
         let backup = format!("{path}{}", Self::PRE_V3_BACKUP_SUFFIX);
         if Path::new(&backup).symlink_metadata().is_ok() {
+            if let Err(reason) = Self::readable_database(&backup) {
+                return Err(PoolError::BackupNotADatabase {
+                    path: backup,
+                    reason,
+                });
+            }
             info!(
                 target: "torrentd_pool::store",
                 backup = %backup,
@@ -397,6 +413,23 @@ impl PoolStore {
             "pool database copied aside before the v3 schema migration",
         );
         Ok(())
+    }
+
+    /// Whether SQLite can open `path` read-only and read a schema out of it,
+    /// or the reason it cannot.
+    ///
+    /// Read-only so nothing is created: a path that does not resolve — which
+    /// is what a dangling symlink is — fails to open rather than being made.
+    /// The `PRAGMA` is what separates a database from any other bytes; SQLite
+    /// defers opening the file until the first statement, so the open alone
+    /// proves nothing.
+    fn readable_database(path: &str) -> Result<(), String> {
+        use rusqlite::OpenFlags;
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
+        conn.pragma_query_value(None, "schema_version", |r| r.get::<_, i64>(0))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     /// Whether this file carries v3's `torrent` columns: a `profile` column and

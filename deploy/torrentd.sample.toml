@@ -215,8 +215,10 @@ dht               = true
 # space equal to the size of `pool.db`. If it cannot be written the migration
 # stops, names the backup path and the reason, and leaves the index as it was.
 # Nothing deletes it afterwards and nothing ages it out: remove it yourself
-# once you would not go back. Anything already at that path when a migration
-# starts is kept as it is, and no new copy is taken.
+# once you would not go back. An existing copy at that path is kept as it is and
+# no new one is taken; something that is not a readable database there stops the
+# migration instead, because keeping it would run the one-way rename with no
+# rollback at all.
 #
 # A `pool.db` from one of this change's own pre-release builds can carry
 # `profile` without v3's indexes, reporting version 2 or version 3 depending on
