@@ -53,6 +53,36 @@ pub enum PoolError {
          start again."
     )]
     BackupNotADatabase { path: String, reason: String },
+    /// A version-keyed schema step failed.
+    ///
+    /// Reported as itself rather than as a bare `Sqlite` so the operator is
+    /// told which file, which step, that nothing was changed, and what to do.
+    /// `startup.rs` opens the pool with `?` under `Restart=on-failure`, so a
+    /// raw SQLite code here is the whole of what they get, on a loop — and the
+    /// code is the least informative part: a file a build predating the
+    /// one-transaction migration left with its schema ahead of its
+    /// `user_version` fails with `table root already exists` followed by the
+    /// schema text that could not be applied, naming neither the pool, nor the
+    /// migration, nor a way out.
+    ///
+    /// The context leads and the SQLite text trails, because that text can run
+    /// to the whole of a schema constant and would otherwise bury the remedy.
+    #[error(
+        "the pool index at {path} could not be migrated from schema version {from} to {to}. \
+         The index has not been changed: every step and the version write share one \
+         transaction, and this one rolled back. A file written by a build predating that \
+         transaction can already carry part of a schema its user_version does not report, \
+         which no version-keyed step can reach. Restore {path}.pre-v3.bak if one is beside \
+         it, or move the index aside and let `torrentd pool scan` rebuild it — which \
+         reconstructs everything except the plan/plan_step mutation journal. The step \
+         failed with: {reason}"
+    )]
+    MigrationFailed {
+        path: String,
+        from: i64,
+        to: i64,
+        reason: String,
+    },
     /// Another process holds the pool database's write lock — almost always the
     /// running daemon, or a second `pool scan`.
     #[error(

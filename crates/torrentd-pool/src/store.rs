@@ -651,11 +651,33 @@ impl PoolStore {
                 Ok(())
             }
             Err(e) => {
-                // Report the original failure; a rollback that itself fails
-                // means the connection is unusable either way, and `open`
-                // returns the error that says what went wrong.
+                // Roll back first; a rollback that itself fails means the
+                // connection is unusable either way, and `open` returns the
+                // error that says what went wrong.
                 let _ = self.conn.execute_batch("ROLLBACK");
-                Err(e)
+                // Wrapped, not propagated, for the reason `BackupFailed` is:
+                // `startup.rs` opens the pool with `?` under
+                // `Restart=on-failure`, so whatever comes out of here is the
+                // whole of what the operator sees, on a loop. A bare SQLite
+                // code named no file, no step, and no way out — and the
+                // reachable shape is not a corrupt database but a file a build
+                // predating the one-transaction migration left with its schema
+                // ahead of its `user_version`, where the code that surfaces is
+                // `table root already exists` followed by the schema text.
+                // Not repaired here: nothing in this file can tell which of
+                // those steps ran, and guessing is how an index gets stamped
+                // over a schema that is not the one it claims.
+                Err(PoolError::MigrationFailed {
+                    path: self
+                        .conn
+                        .path()
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or("<in-memory>")
+                        .to_string(),
+                    from: found,
+                    to: SCHEMA_VERSION,
+                    reason: e.to_string(),
+                })
             }
         }
     }
