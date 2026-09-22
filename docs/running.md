@@ -269,9 +269,14 @@ statement, leaving either no index on `profile` at all or the old
 `torrent_by_slot` name over the new column. So the version is stamped only
 together with whatever index work the file is still missing, in one
 transaction: after this open the file has `torrent_by_profile` and nothing
-called `torrent_by_slot`. The log line says which of the two happened. Restoring
+called `torrent_by_slot`. The log line says which of these happened. Restoring
 `<db_path>.pre-v3.bak` is **not** the remedy for such a file: the copy is taken
 from the database as it stands, so it has the same contents.
+
+A pre-release build in between did stamp version 3 over that same incomplete
+schema, so a `pool.db` reporting **3** can be missing the index too. The index
+check runs before the version is trusted, for any version this build can open,
+which is why the sentence above holds whichever of those builds you ran.
 
 **3. Point each profile at its files, or move them.** Resume and `.torrent`
 files used to live directly under `resume_dir` and `torrent_dir`; they now live

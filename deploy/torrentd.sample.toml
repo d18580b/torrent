@@ -218,13 +218,14 @@ dht               = true
 # once you would not go back. Anything already at that path when a migration
 # starts is kept as it is, and no new copy is taken.
 #
-# A `pool.db` from one of this change's own pre-release builds can report
-# version 2 while already carrying `profile`. Such a file is recognised
-# whichever of those builds wrote it: the version is stamped to match the
-# columns, and where v3's indexes did not come with them — no index on
-# `profile`, or the old `torrent_by_slot` name over it — they are put right in
-# the same transaction. No data moves; the `.pre-v3.bak` copy is not a remedy
-# for it, having the same contents.
+# A `pool.db` from one of this change's own pre-release builds can carry
+# `profile` without v3's indexes, reporting version 2 or version 3 depending on
+# which of them wrote it. Such a file is recognised whichever it was, because
+# the indexes are checked before the version is trusted: where they did not come
+# with the columns — no index on `profile`, or the old `torrent_by_slot` name
+# over it — they are put right, and the version stamped, in the same
+# transaction. No data moves; the `.pre-v3.bak` copy is not a remedy for it,
+# having the same contents.
 #
 # [pool]
 # roots       = ["/data/torrents"]        # must not nest

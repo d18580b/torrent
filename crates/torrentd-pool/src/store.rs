@@ -399,8 +399,8 @@ impl PoolStore {
         Ok(())
     }
 
-    /// Whether this file carries v3's `torrent` columns under v2's version:
-    /// a `profile` column and **no** `slot` column.
+    /// Whether this file carries v3's `torrent` columns: a `profile` column and
+    /// **no** `slot` column.
     ///
     /// Not one commit's file. Any superseded build of this change that reached
     /// v3's columns without recording the version writes this shape, and there
@@ -426,6 +426,13 @@ impl PoolStore {
     /// What cannot match: a file with both columns, or with neither, goes down
     /// the ordinary path, and a genuine v2 file has `slot` and no `profile`.
     ///
+    /// Not tied to a version either. It was `carries_v3_columns_at_v2` while
+    /// the arm below was guarded on `found == 2`; the arm now runs the index
+    /// half for any version this build can open, because a build in this
+    /// change's own `e391b72 … 1195546^` window stamped `user_version = 3` and
+    /// ran no index DDL at all — so the same incomplete schema exists at 3, and
+    /// at 3 nothing was even looking.
+    ///
     /// The alternative was to tell the operator this file cannot be migrated
     /// and must be deleted. That is honest and it destroys the `plan` /
     /// `plan_step` journal `from_conn` documents as not reconstructible by
@@ -433,7 +440,7 @@ impl PoolStore {
     /// does not help either: it is a `VACUUM INTO` of the already-broken
     /// database, so the rollback the upgrade note describes restores the same
     /// unopenable file.
-    fn carries_v3_columns_at_v2(&self) -> Result<bool, PoolError> {
+    fn carries_v3_columns(&self) -> Result<bool, PoolError> {
         let mut has_profile = false;
         let mut has_slot = false;
         let mut stmt = self.conn.prepare("PRAGMA table_info(torrent)")?;
@@ -475,9 +482,9 @@ impl PoolStore {
     /// `Restart=on-failure`. `PRAGMA user_version` is journaled and
     /// participates in the transaction.
     ///
-    /// A file those steps cannot reach — v3's columns already, under v2's
-    /// version — is recognised rather than stepped: see
-    /// [`PoolStore::carries_v3_columns_at_v2`].
+    /// A file those steps cannot reach — v3's columns already, under a version
+    /// that does not describe them — is recognised rather than stepped: see
+    /// [`PoolStore::carries_v3_columns`].
     fn migrate(&self) -> Result<(), PoolError> {
         let found: i64 = self
             .conn
@@ -488,25 +495,38 @@ impl PoolStore {
                 expected: SCHEMA_VERSION,
             });
         }
-        if found == SCHEMA_VERSION {
-            return Ok(());
-        }
         // The files no version-keyed step can reach: v3's columns already, so
-        // there is no `slot` to rename, under a version that says otherwise.
-        // Stamped rather than stepped — and where the indexes did not come
-        // with the columns, brought the rest of the way first, because a
-        // version stamped over a schema that is not yet v3's is permanent:
-        // `migrate` returns at `found == SCHEMA_VERSION` on every later open,
-        // so nothing would ever create the index on `profile` that the whole
-        // index exists to carry.
+        // there is no `slot` to rename, under a version that does not describe
+        // them. Stamped rather than stepped — and where the indexes did not
+        // come with the columns, brought the rest of the way first.
+        //
+        // Checked **before** the `found == SCHEMA_VERSION` return below, and
+        // for any version this build can open, not only for 2. That return was
+        // what made an incomplete v3 permanent, and this change's own builds
+        // produced one: in the `e391b72 … 1195546^` window the arm stamped the
+        // version and ran no index DDL, so a `pool.db` any of them opened is at
+        // `user_version = 3` carrying either no index on `profile` or the old
+        // `torrent_by_slot` still sitting over the renamed column. Returning at
+        // the version meant nothing ever looked, nothing ever repaired it, and
+        // nothing ever said so — while both operator-facing texts promise the
+        // file ends with `torrent_by_profile` and nothing called
+        // `torrent_by_slot`.
+        //
+        // `found >= 2` because below that there is no `torrent` table to index
+        // yet, and a genuine v2 file still has `slot` to rename; both go down
+        // the stepped path, which the column test sends them to anyway.
         //
         // Before the backup, and without one: the rename is v3's only
         // irreversible statement and it has already run here, so what is left
         // destroys nothing — an index is derivable from the table it indexes.
         // A stray `.pre-v3.bak` beside a healthy index reads as a failed
         // migration, which the fresh-database test states as a property.
-        if found == 2 && self.carries_v3_columns_at_v2()? {
+        if found >= 2 && self.carries_v3_columns()? {
             let indexed = self.has_torrent_index("torrent_by_profile")?;
+            if found == SCHEMA_VERSION && indexed {
+                // An ordinary v3 open: the version and the schema agree.
+                return Ok(());
+            }
             // One transaction over the index statements and the stamp, for
             // the reason the stepped path has one: a stamp that commits
             // without them is the state this arm exists to end.
@@ -524,8 +544,8 @@ impl PoolStore {
                 return Err(e);
             }
             self.conn.execute_batch("COMMIT")?;
-            if indexed {
-                warn!(
+            match (found == SCHEMA_VERSION, indexed) {
+                (false, true) => warn!(
                     target: "torrentd_pool::store",
                     from_version = found,
                     to_version = SCHEMA_VERSION,
@@ -533,9 +553,8 @@ impl PoolStore {
                     "pool index already carries the v3 schema at user_version = 2; stamping the \
                      version to match. A superseded build of this change wrote this file with \
                      v3's schema and v2's version. No schema change was made and no data moved",
-                );
-            } else {
-                warn!(
+                ),
+                (false, false) => warn!(
                     target: "torrentd_pool::store",
                     from_version = found,
                     to_version = SCHEMA_VERSION,
@@ -545,8 +564,24 @@ impl PoolStore {
                      rename, and stamping the version to match. A superseded build of this \
                      change wrote this file with the column rename committed and an index \
                      statement lost. No data moved",
-                );
+                ),
+                (true, false) => warn!(
+                    target: "torrentd_pool::store",
+                    from_version = found,
+                    to_version = SCHEMA_VERSION,
+                    indexes_repaired = true,
+                    "pool index reports user_version = 3 but does not carry v3's indexes; \
+                     creating torrent_by_profile and dropping torrent_by_slot if it survived the \
+                     rename. A superseded build of this change stamped the version over a schema \
+                     whose index statements had been lost, and the version being correct is why \
+                     nothing repaired it until now. No data moved",
+                ),
+                // Returned above: the version and the schema already agree.
+                (true, true) => unreachable!("an ordinary v3 open returns before the repair"),
             }
+            return Ok(());
+        }
+        if found == SCHEMA_VERSION {
             return Ok(());
         }
         // Outside the transaction: VACUUM cannot run inside one. Only for a
