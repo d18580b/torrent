@@ -56,7 +56,7 @@ behaviour it only points at.
 
 - **The network kill switch** — described in
   [`README.md`](README.md), § *Security posture*, and in
-  [`docs/running.md` § *4. Service user, binary, directories*](docs/running.md#4-service-user-binary-directories).
+  [`docs/running.md` § *11. Drills worth doing once*](docs/running.md#11-drills-worth-doing-once-before-you-trust-it).
   Anything that leaks egress past it, or that turns `CAP_NET_ADMIN` into a
   wider capability than the table it installs, is in scope.
 
