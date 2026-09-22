@@ -291,3 +291,69 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
         "the daemon got far enough to persist session state"
     );
 }
+
+/// The reconciliation warning on a migration boot names the file to edit, not
+/// only the file the entries came from.
+///
+/// A registry that survives the boot check — every id it names is configured —
+/// can still claim torrents no scan loaded, which is the silent total outage
+/// that warning exists to catch. On this one boot the entries were read from
+/// the pre-rename `slot_assignments.json`, and that is the file
+/// `docs/running.md` tells the operator explicitly *not* to edit: the daemon
+/// writes `profile_assignments.json` on the same boot and reads only that one
+/// from here on. Naming the old file alone sent them to the wrong one.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn the_reconciliation_warning_names_both_registry_files() {
+    const HTTP: &str = "127.0.0.1:18094";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, 16894, HTTP);
+
+    // Assignments for the profile that *is* configured, so the boot check
+    // passes and the reconciliation below is reached — and no resume file for
+    // either, so the scan loads none of them.
+    std::fs::write(
+        p.join("slot_assignments.json"),
+        format!(
+            "{{\"0101010101010101010101010101010101010101\":\"{PROFILE}\",
+               \"0202020202020202020202020202020202020202\":\"{PROFILE}\"}}"
+        ),
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+
+    wait_healthy(HTTP);
+    sigterm(&child);
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(30)),
+        "daemon did not exit within 30s of SIGTERM"
+    );
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .unwrap();
+
+    let warning = out
+        .lines()
+        .find(|l| l.contains("the assignment registry claims more torrents"))
+        .unwrap_or_else(|| panic!("the reconciliation warning did not fire; output: {out}"));
+
+    assert!(
+        warning.contains("\"registry_path\":\"") && warning.contains("profile_assignments.json"),
+        "must name the file the operator edits from here on: {warning}",
+    );
+    assert!(
+        warning.contains("\"registry_read_from\":\"") && warning.contains("slot_assignments.json"),
+        "and the file these entries were read from: {warning}",
+    );
+}
