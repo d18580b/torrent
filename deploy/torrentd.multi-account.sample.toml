@@ -33,9 +33,18 @@ upload_rate_limit             = 0
 # Ignored for `network = "vpn"` profiles, which disable LSD unconditionally.
 enable_lsd = false
 
-# No top-level `peer_fingerprint` / `user_agent` here on purpose. Every profile
-# below states its own, so there is nothing for a profile to inherit and no way
-# for two of them to end up announcing one identity.
+# No top-level `peer_fingerprint` / `user_agent` here on purpose. Every `vpn`
+# profile below states its own and has to: the validator refuses a tunnelled
+# profile that leaves either key unwritten, with or without a top-level default
+# to fall back on. So no account behind a tunnel can end up announcing another
+# one's identity, whatever is added above.
+#
+# The `public` profile states neither and takes libtorrent's own defaults. That
+# is allowed because two host profiles announcing alike are one host — they
+# share an address, so there is nothing to correlate that the address does not
+# already give away. Note what follows: the refusal of libtorrent's default
+# peer-id prefix binds to the value a profile *writes down*, so a profile that
+# writes nothing announces exactly that prefix.
 
 # Max age (seconds) of a WireGuard tunnel's latest handshake before the health
 # monitor declares the profile down and pauses it.
@@ -68,8 +77,8 @@ network_kill_switch = false
 #     leave the key unwritten and inherit the same default is accepted: nothing
 #     is hidden from whoever reads the file, and a `vpn` profile must state its
 #     own identity, so such a pair is always two host profiles — which are one
-#     host. (This file sets no top-level identity at all; every profile below
-#     states its own.)
+#     host. (This file sets no top-level identity at all, and the one profile
+#     below that writes neither key is the host profile.)
 #   * Each profile's resume and `.torrent` directories are its own. By default
 #     they are `<resume_dir>/<id>` and `<torrent_dir>/<id>`; an override must
 #     not equal another profile's. One that *contains* another's is fine: each
