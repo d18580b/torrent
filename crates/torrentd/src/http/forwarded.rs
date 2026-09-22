@@ -101,6 +101,23 @@ impl Cidr {
     }
 }
 
+/// A v4-mapped v6 address as its v4 form; anything else unchanged.
+///
+/// `Cidr::contains` already unmaps a peer before matching it, on the grounds
+/// that `::ffff:a.b.c.d` "is the same host as its v4 form". The resolved
+/// client address has to be spelled the same way or the repository holds both
+/// positions at once: demonstrated, `X-Forwarded-For: ::ffff:198.51.100.88`
+/// and `X-Forwarded-For: 198.51.100.88` were two `HashMap<IpAddr, _>` keys,
+/// so eight failures alternating between the spellings never tripped a
+/// lockout where five against one spelling did — and the security log carried
+/// two `client_ip` spellings for one host.
+fn unmap(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
+    }
+}
+
 fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
     let full = (prefix / 8) as usize;
     if a[..full] != b[..full] {
@@ -135,6 +152,18 @@ fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
 /// Whether the proxy appends by extending the existing field line or by
 /// adding another one does not matter — `last_element` reads both the same
 /// way.
+///
+/// **One hop.** `resolve` takes the element the immediate peer contributed
+/// and stops; it does not walk right-to-left past hops that are themselves
+/// listed here. A block wide enough to hold two of your own proxies —
+/// `10.0.0.0/8` validates — therefore does not mean "believe the chain as far
+/// as my own edge". In a two-hop chain the daemon resolves the **inner**
+/// proxy's address as the client, which gives every client behind that edge
+/// one shared throttle bucket and one `client_ip`.
+///
+/// That is a reason to list the one address your proxy connects from, which
+/// is what everything else here asks for anyway. Walking the chain is a
+/// larger design and is not what this does.
 #[derive(Clone, Debug, Default)]
 pub struct TrustedProxies(Vec<Cidr>);
 
@@ -507,7 +536,15 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
             .is_some_and(|p| p.eq_ignore_ascii_case("https"))
     };
 
-    Client { ip, secure }
+    // Unmapped once, here, so every consumer gets one spelling per host. The
+    // address reaches three things — the throttle key, the `client_ip` log
+    // field, and nothing else that compares addresses — and two spellings of
+    // one host is two throttle buckets and two log identities. Trust matching
+    // already unmaps; this is the other half of that position.
+    Client {
+        ip: ip.map(unmap),
+        secure,
+    }
 }
 
 #[cfg(test)]
@@ -981,6 +1018,56 @@ mod tests {
             Some("5.5.5.5".parse().unwrap()),
             "a readable final element is still the answer",
         );
+    }
+
+    #[test]
+    fn a_v4_mapped_client_address_resolves_to_its_v4_form() {
+        // The property: one host is one spelling. `Cidr::contains` unmaps a
+        // v4-mapped peer before matching it, on the grounds that it is the
+        // same host — so the *resolved* address has to be unmapped too, or
+        // the two halves of the module disagree and one host becomes two
+        // throttle buckets and two `client_ip` values in the security log.
+        let v4: IpAddr = "198.51.100.88".parse().unwrap();
+
+        for spelling in ["::ffff:198.51.100.88", "::ffff:c633:6458"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-for", spelling)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert_eq!(
+                c.ip,
+                Some(v4),
+                "{spelling} is the same host as its v4 form, and has to be \
+                 the same key",
+            );
+        }
+
+        // Through `Forwarded` as well, which is a second route to the same
+        // field.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[("forwarded", "for=\"[::ffff:198.51.100.88]\"")],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(c.ip, Some(v4));
+
+        // And for the socket peer, which is what a dual-stack listener
+        // reports for a v4 client.
+        let c = resolve(&req("::ffff:10.1.2.3", &[]), &trusted(&["10.0.0.0/8"]));
+        assert_eq!(
+            c.ip,
+            Some("10.1.2.3".parse::<IpAddr>().unwrap()),
+            "a dual-stack listener's v4-mapped peer is one host too",
+        );
+
+        // A genuine v6 address is not touched.
+        let c = resolve(
+            &req("10.1.2.3", &[("x-forwarded-for", "2001:db8::1")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(c.ip, Some("2001:db8::1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
