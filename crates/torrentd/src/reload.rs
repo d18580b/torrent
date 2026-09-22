@@ -4,10 +4,30 @@
 //! `max_concurrent_http_announces`, `aio_threads`, `enable_lsd`, `log_level`.
 //! Every other key of `Config` triggers a `warn` and is ignored, and
 //! `[[profile]]` identity changes are warned about one field at a time. There
-//! is no third class that is silently dropped — `Config::diff` destructures
-//! `Config` exhaustively, so a field added to the struct does not compile
-//! until `diff` reaches it, and a config file that changed never answers
-//! `SIGHUP: config unchanged`.
+//! is no third class that is silently dropped, and it takes two separate
+//! things to say that:
+//!
+//! - `Config::diff` destructures `Config` exhaustively, so a field added to
+//!   the struct does not compile until `diff` reaches it. That makes every
+//!   field **named**.
+//! - Each reloadable comparison records that its key differed, on
+//!   `ConfigDiff::reloadable_changes`, rather than leaving the assigned value
+//!   to stand for the difference. That makes every difference **reported**.
+//!
+//! The second does not follow from the first, and this module used to claim it
+//! did. All five reloadable settings keys are `Option` on both sides, so
+//! deleting one assigned `None` to the diff and `None` reads as "unchanged":
+//! deleting `connections_limit`, `aio_threads`,
+//! `max_concurrent_http_announces`, `upload_rate_limit` or `enable_lsd`
+//! answered `SIGHUP: config unchanged`, and because that answer `continue`s
+//! before `current = next`, the deletion stayed invisible to every later
+//! reload as well. With the name recorded, a config file that changed never
+//! answers `SIGHUP: config unchanged`.
+//!
+//! A deleted key is reported and not applied. The preset default it falls back
+//! to is chosen when the session is built and a `Settings` patch cannot unset
+//! a value, so the way to get it is a restart; the journal says that rather
+//! than implying the deletion took.
 //!
 //! A reload that touched only ignored keys stops after those warnings: the
 //! per-profile settings loop is skipped when the patch it would apply sets
@@ -114,6 +134,18 @@ pub async fn run(
             warn!(
                 changed_field = %nr,
                 "SIGHUP: change to non-reloadable field requires daemon restart; ignored",
+            );
+        }
+        // A reloadable key the operator deleted. The sample config documents
+        // deletion as the way back to the preset default, and that default is
+        // chosen when the session is built — a `Settings` patch has no way to
+        // unset a value — so this reload cannot deliver it. Reported once,
+        // ahead of the per-profile loop, because it is withheld from every
+        // profile and not for any reason about a profile.
+        for deleted in &diff.reloadable_deletions {
+            warn!(
+                changed_field = %deleted,
+                "SIGHUP: reloadable field deleted; its preset default needs a daemon restart; not applied",
             );
         }
         // Safety Rule 7: identity-critical profile fields cannot change under a
@@ -303,5 +335,51 @@ mod tests {
             vec!["enable_lsd"],
             "a withheld key is named even when the same reload applied another",
         );
+    }
+    #[test]
+    fn a_deleted_reloadable_key_is_reported_and_is_not_a_per_profile_withholding() {
+        // The property: a reloadable key the operator deleted reaches the
+        // pump's own report — `diff.reloadable_deletions`, warned once ahead
+        // of the per-profile loop — and does *not* reach
+        // `withheld_reloadable_keys`, whose warning says "withheld from this
+        // profile" and would be untrue of it.
+        //
+        // Without the deletion being recorded at all, `diff.is_empty()` is
+        // true here and the pump answers `SIGHUP: config unchanged`: the
+        // first `if` in `run` returns before any of this. That is what was
+        // demonstrated on a live daemon for all five keys.
+        let dir = tempfile::tempdir().unwrap();
+        let mut old = Config::minimal_for_tests(dir.path(), true);
+        old.upload_rate_limit = Some(2000);
+        old.enable_lsd = Some(true);
+        let mut new = Config::minimal_for_tests(dir.path(), true);
+        new.enable_lsd = Some(true);
+        // `new` simply omits `upload_rate_limit`, which is what deleting the
+        // line from the file produces.
+        let diff = Config::diff(&old, &new);
+
+        assert!(
+            !diff.is_empty(),
+            "a file that deleted a reloadable key is not an unchanged file",
+        );
+        assert_eq!(
+            diff.reloadable_deletions,
+            vec!["upload_rate_limit"],
+            "the pump's deletion report is what names it",
+        );
+        for profile in [host(0), host(5000), vpn()] {
+            assert!(
+                withheld_reloadable_keys(&diff, &profile).is_empty(),
+                "a deletion is not withheld from {} in particular; it reaches no \
+                 profile, and saying otherwise sends the operator to a per-profile \
+                 override that is not there",
+                profile.id,
+            );
+            assert!(
+                ConfigDiff::settings_patch_is_empty(&diff.to_settings_patch_for(&profile)),
+                "there is no value to apply, so the patch sets nothing for {}",
+                profile.id,
+            );
+        }
     }
 }

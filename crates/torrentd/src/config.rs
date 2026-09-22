@@ -462,21 +462,42 @@ impl Config {
         } = new;
 
         let mut d = ConfigDiff::default();
+        // Assigning the new value is not the same as reporting the
+        // difference. Each of the five below is `Option` on both sides, so
+        // deleting the key assigns `None` — indistinguishable from "this key
+        // did not change" to `is_empty`, which is what read the assignment.
+        // `record_reloadable` is what makes the difference itself the record,
+        // and it is called from the same `if` that assigns, so the two cannot
+        // disagree about whether a key changed.
         if old.connections_limit != *new_connections_limit {
             d.connections_limit = *new_connections_limit;
+            d.record_reloadable("connections_limit", new_connections_limit.is_some());
         }
         if old.upload_rate_limit != *new_upload_rate_limit {
             d.upload_rate_limit = *new_upload_rate_limit;
+            d.record_reloadable("upload_rate_limit", new_upload_rate_limit.is_some());
         }
         if old.max_concurrent_http_announces != *new_max_concurrent_http_announces {
             d.max_concurrent_http_announces = *new_max_concurrent_http_announces;
+            d.record_reloadable(
+                "max_concurrent_http_announces",
+                new_max_concurrent_http_announces.is_some(),
+            );
         }
         if old.aio_threads != *new_aio_threads {
             d.aio_threads = *new_aio_threads;
+            d.record_reloadable("aio_threads", new_aio_threads.is_some());
         }
         if old.enable_lsd != *new_enable_lsd {
             d.enable_lsd = *new_enable_lsd;
+            d.record_reloadable("enable_lsd", new_enable_lsd.is_some());
         }
+        // `log_level` is reloadable but is not one of the five: it has a
+        // serde default, so `Config` holds a `LogLevel` rather than an
+        // `Option`, and deleting the key produces the default value rather
+        // than an absence. `Some(..)` here is therefore always a real
+        // difference, which is why `is_empty` can read it directly. See
+        // `ConfigDiff::reloadable_changes`.
         if old.log_level != *new_log_level {
             d.log_level = Some(*new_log_level);
         }
@@ -489,13 +510,21 @@ impl Config {
         // The list below is the whole of `Config` except the six reloadable
         // keys above and `[[profile]]`, which `diff_profiles` reports
         // separately — so every field of the struct reaches one branch or the
-        // other, and a config file that changed can no longer produce
-        // `SIGHUP: config unchanged`.
+        // other.
         //
         // The destructuring at the top of this function is what keeps that
         // true. It used to be a manual obligation, which is a different
         // claim: adding a field and not a branch reopened the gap and
         // compiled.
+        //
+        // Reaching a branch is not by itself enough to keep a changed file
+        // from answering `SIGHUP: config unchanged`, and this comment used to
+        // say it was. A branch in this list pushes a **name**, which survives
+        // whatever the new value is; the reloadable branches above assign an
+        // `Option`, and an assigned `None` — the operator deleting the key —
+        // is what `is_empty` reads as "did not change". That is why those
+        // branches now record a name too. Neither half is redundant: this one
+        // says the field cannot be applied, that one says the field differed.
         if old.default_save_path != *new_default_save_path {
             d.non_reloadable_changes.push("default_save_path");
         }
@@ -902,6 +931,33 @@ pub struct ConfigDiff {
     pub aio_threads: Option<u32>,
     pub enable_lsd: Option<bool>,
     pub log_level: Option<LogLevel>,
+    /// The reloadable settings keys that **differed**, named independently of
+    /// the value they differ to.
+    ///
+    /// The five `Option` fields above cannot carry that on their own. All five
+    /// are `Option` in `Config` too, so deleting one leaves the comparison
+    /// with nothing to assign but `None` — and `None` is exactly what
+    /// "unchanged" looks like to [`ConfigDiff::is_empty`]. Every one of these
+    /// keys is documented as optional in `deploy/torrentd.sample.toml` ("omit
+    /// any to use the preset's default"), so deleting one is the documented
+    /// way back to the default, and it answered `SIGHUP: config unchanged` on
+    /// all five.
+    ///
+    /// `log_level` is not in this list: it has a serde default, so `Config`
+    /// holds a `LogLevel` rather than an `Option` and deleting the key
+    /// produces the default value rather than an absence. `Some(..)` on the
+    /// field above is therefore always a real difference, which is why
+    /// [`ConfigDiff::is_empty`] can read it directly.
+    pub reloadable_changes: Vec<&'static str>,
+    /// The subset of `reloadable_changes` the new file gives no value to,
+    /// because the operator deleted the key.
+    ///
+    /// Reported on its own: the preset default such a key falls back to is
+    /// chosen when the session is built, and a `Settings` patch has no way to
+    /// say "unset this", so a deletion cannot be applied to a live session at
+    /// all. That is a different fact from a key withheld from one profile by
+    /// Safety Rule 6, and the journal says so in different words.
+    pub reloadable_deletions: Vec<&'static str>,
     pub non_reloadable_changes: Vec<&'static str>,
     /// Per-profile identity fields that changed and were ignored, as
     /// `"<profile_id>.<field>"`. Safety Rule 7 requires a warning for these and
@@ -974,14 +1030,24 @@ impl ConfigDiff {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.connections_limit.is_none()
-            && self.upload_rate_limit.is_none()
-            && self.max_concurrent_http_announces.is_none()
-            && self.aio_threads.is_none()
-            && self.enable_lsd.is_none()
+        // `reloadable_changes` covers the five settings keys, including the
+        // ones a deletion leaves as `None`. `log_level` is read directly; see
+        // the field's own documentation for why it is not in the list.
+        self.reloadable_changes.is_empty()
             && self.log_level.is_none()
             && self.non_reloadable_changes.is_empty()
             && self.profile_changes.is_empty()
+    }
+
+    /// Record that a reloadable settings key differed, whatever it differs to.
+    ///
+    /// `has_value` is false when the new file deletes the key, which is the
+    /// case the assignment alone could not express.
+    fn record_reloadable(&mut self, key: &'static str, has_value: bool) {
+        self.reloadable_changes.push(key);
+        if !has_value {
+            self.reloadable_deletions.push(key);
+        }
     }
 }
 
@@ -2142,6 +2208,84 @@ library_dir = "{d}/library"
                 d.non_reloadable_changes.contains(&field),
                 "the warning for a changed {field} must name it; got {:?}",
                 d.non_reloadable_changes,
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_reloadable_key_is_a_difference_and_is_named() {
+        // The property: a config that **deletes** one reloadable key is not an
+        // unchanged config, and the diff names the key that went away.
+        //
+        // The five below are `Option` on both sides, so the comparison that
+        // reports them had nothing to assign but `None` — and `None` is what
+        // `is_empty()` reads as "this key did not change". Every one of them
+        // answered `SIGHUP: config unchanged` on a live daemon, one deletion
+        // per reload; worse, that answer `continue`s before `current = next`,
+        // so the deletion stayed invisible to every later reload too. The
+        // sample config documents deleting a key as the way back to the
+        // preset default, so this is the documented edit and not an exotic
+        // one.
+        //
+        // Each is exercised on its own: a deletion that only *happens* to
+        // travel with a key that is reported some other way is not this.
+        let dir = tempdir().unwrap();
+        let base = Config::load(&write_cfg(
+            dir.path(),
+            &with_top_level(
+                "aio_threads = 8\nenable_lsd = true\nupload_rate_limit = 1000000\n\
+                 max_concurrent_http_announces = 30",
+            ),
+        ))
+        .unwrap();
+        // The fixture must actually set all five, or a "deletion" below would
+        // be a no-op and the test would pass on nothing.
+        assert!(
+            base.connections_limit.is_some()
+                && base.aio_threads.is_some()
+                && base.enable_lsd.is_some()
+                && base.upload_rate_limit.is_some()
+                && base.max_concurrent_http_announces.is_some(),
+            "the fixture must set every key this test deletes",
+        );
+
+        let mut connections_limit = base.clone();
+        connections_limit.connections_limit = None;
+
+        let mut aio_threads = base.clone();
+        aio_threads.aio_threads = None;
+
+        let mut enable_lsd = base.clone();
+        enable_lsd.enable_lsd = None;
+
+        let mut upload_rate_limit = base.clone();
+        upload_rate_limit.upload_rate_limit = None;
+
+        let mut announces = base.clone();
+        announces.max_concurrent_http_announces = None;
+
+        for (field, edited) in [
+            ("connections_limit", &connections_limit),
+            ("aio_threads", &aio_threads),
+            ("enable_lsd", &enable_lsd),
+            ("upload_rate_limit", &upload_rate_limit),
+            ("max_concurrent_http_announces", &announces),
+        ] {
+            let d = Config::diff(&base, edited);
+            assert!(
+                !d.is_empty(),
+                "a config that deleted {field} must not look unchanged",
+            );
+            assert!(
+                d.reloadable_changes.contains(&field),
+                "the diff must name {field} as changed; got {:?}",
+                d.reloadable_changes,
+            );
+            assert!(
+                d.reloadable_deletions.contains(&field),
+                "the diff must name {field} as deleted, so the pump can say the \
+                 preset default needs a restart; got {:?}",
+                d.reloadable_deletions,
             );
         }
     }
