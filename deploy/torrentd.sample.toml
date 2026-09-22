@@ -253,11 +253,14 @@ dht               = true
 #   torrentd --config /etc/torrentd/torrentd.toml new-token --name ci --scopes read
 #
 # Bootstrapping order: `--config` is read before any subcommand runs, so this
-# file has to exist and parse first — but the subcommands are exempt from the
+# file has to exist and parse first — but `hash-password`, `new-token`, the
+# `pool` subcommands and observe-only `vpn check` are exempt from the
 # authentication posture check, because they construct no session and bind
-# nothing. So write this file without `[auth]` and with whatever `http_listen`
-# the deployment needs, generate the values, then add the section. In a
-# container: `compose run --rm torrentd hash-password`. See docs/running.md §6.
+# nothing. `vpn check --bring-up` is not: it raises a real tunnel on this host,
+# so it takes the daemon's full check. So write this file without `[auth]` and
+# with whatever `http_listen` the deployment needs, generate the values, then
+# add the section. In a container: `compose run --rm torrentd hash-password`.
+# See docs/running.md §6.
 #
 # The token is printed once and is not stored; only its SHA-256 goes below, so
 # a leaked config file cannot be replayed as a credential. The password gets
