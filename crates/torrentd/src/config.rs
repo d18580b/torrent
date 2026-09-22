@@ -414,24 +414,59 @@ impl Config {
     /// Compute a diff against an old config. Used by SIGHUP reload to
     /// apply only the fields that may change without restart.
     pub fn diff(old: &Config, new: &Config) -> ConfigDiff {
+        // `new`, destructured exhaustively and with no `..`, so that adding a
+        // field to `Config` does not compile until this function reaches it.
+        // Naming the field in the pattern is not enough on its own: an unused
+        // binding is a warning, and the workspace is built with warnings
+        // denied, so the field has to be compared as well.
+        //
+        // This replaces a hand-maintained obligation. `reload.rs` states that
+        // no changed key is silently dropped, and the previous note here asked
+        // whoever added a field to remember; a field added and not compared
+        // compiled clean and was absent from the reported set, so the one
+        // compile-time seam this module had protected the test fixture and not
+        // the invariant.
+        let Config {
+            default_save_path: new_default_save_path,
+            resume_dir: new_resume_dir,
+            torrent_dir: new_torrent_dir,
+            http_listen: new_http_listen,
+            allow_unauthenticated: new_allow_unauthenticated,
+            log_level: new_log_level,
+            registry_path: new_registry_path,
+            connections_limit: new_connections_limit,
+            file_pool_size: new_file_pool_size,
+            enable_lsd: new_enable_lsd,
+            aio_threads: new_aio_threads,
+            max_concurrent_http_announces: new_max_concurrent_http_announces,
+            upload_rate_limit: new_upload_rate_limit,
+            peer_fingerprint: new_peer_fingerprint,
+            user_agent: new_user_agent,
+            vpn_handshake_max_age_secs: new_vpn_handshake_max_age_secs,
+            network_kill_switch: new_network_kill_switch,
+            profile: new_profile,
+            auth: new_auth,
+            pool: new_pool,
+        } = new;
+
         let mut d = ConfigDiff::default();
-        if old.connections_limit != new.connections_limit {
-            d.connections_limit = new.connections_limit;
+        if old.connections_limit != *new_connections_limit {
+            d.connections_limit = *new_connections_limit;
         }
-        if old.upload_rate_limit != new.upload_rate_limit {
-            d.upload_rate_limit = new.upload_rate_limit;
+        if old.upload_rate_limit != *new_upload_rate_limit {
+            d.upload_rate_limit = *new_upload_rate_limit;
         }
-        if old.max_concurrent_http_announces != new.max_concurrent_http_announces {
-            d.max_concurrent_http_announces = new.max_concurrent_http_announces;
+        if old.max_concurrent_http_announces != *new_max_concurrent_http_announces {
+            d.max_concurrent_http_announces = *new_max_concurrent_http_announces;
         }
-        if old.aio_threads != new.aio_threads {
-            d.aio_threads = new.aio_threads;
+        if old.aio_threads != *new_aio_threads {
+            d.aio_threads = *new_aio_threads;
         }
-        if old.enable_lsd != new.enable_lsd {
-            d.enable_lsd = new.enable_lsd;
+        if old.enable_lsd != *new_enable_lsd {
+            d.enable_lsd = *new_enable_lsd;
         }
-        if old.log_level != new.log_level {
-            d.log_level = Some(new.log_level);
+        if old.log_level != *new_log_level {
+            d.log_level = Some(*new_log_level);
         }
 
         // Identity-critical / non-reloadable fields. The rule is that a change
@@ -445,30 +480,30 @@ impl Config {
         // other, and a config file that changed can no longer produce
         // `SIGHUP: config unchanged`.
         //
-        // Keeping that true is a manual obligation and not a checked one:
-        // adding a field to `Config` and not to this function silently
-        // reopens the gap. Deriving the set structurally is the better end
-        // state and is a redesign of `ConfigDiff` rather than a repair to it.
-        if old.default_save_path != new.default_save_path {
+        // The destructuring at the top of this function is what keeps that
+        // true. It used to be a manual obligation, which is a different
+        // claim: adding a field and not a branch reopened the gap and
+        // compiled.
+        if old.default_save_path != *new_default_save_path {
             d.non_reloadable_changes.push("default_save_path");
         }
-        if old.resume_dir != new.resume_dir {
+        if old.resume_dir != *new_resume_dir {
             d.non_reloadable_changes.push("resume_dir");
         }
-        if old.torrent_dir != new.torrent_dir {
+        if old.torrent_dir != *new_torrent_dir {
             d.non_reloadable_changes.push("torrent_dir");
         }
-        if old.file_pool_size != new.file_pool_size {
+        if old.file_pool_size != *new_file_pool_size {
             // Not reloadable, and it used to be the one non-reloadable key
             // that was not *reported* either: `diff` skipped it entirely, so a
             // change was neither applied nor mentioned, unlike every other
             // field in this list.
             d.non_reloadable_changes.push("file_pool_size");
         }
-        if old.peer_fingerprint != new.peer_fingerprint {
+        if old.peer_fingerprint != *new_peer_fingerprint {
             d.non_reloadable_changes.push("peer_fingerprint");
         }
-        if old.user_agent != new.user_agent {
+        if old.user_agent != *new_user_agent {
             d.non_reloadable_changes.push("user_agent");
         }
         // The authentication posture and the bind address are settled at boot:
@@ -479,17 +514,19 @@ impl Config {
         // `SIGHUP: config unchanged` from the journal and `202 Accepted` from
         // `POST /api/reload` while the daemon went on authenticating nothing.
         // Silence there reads as confirmation, which is worse than no signal.
-        if old.auth != new.auth {
+        if old.auth != *new_auth {
             d.non_reloadable_changes.push("auth");
         }
-        if old.allow_unauthenticated != new.allow_unauthenticated {
+        if old.allow_unauthenticated != *new_allow_unauthenticated {
             d.non_reloadable_changes.push("allow_unauthenticated");
         }
-        if old.http_listen != new.http_listen {
+        if old.http_listen != *new_http_listen {
             d.non_reloadable_changes.push("http_listen");
         }
-        // These three arrived with the posture check, and the five below with
+        // These three arrived with the posture check, and five more came with
         // it: eight non-reloadable keys `diff` did not look at, not three.
+        // Four of those five are immediately below; the fifth,
+        // `default_save_path`, heads this block.
         // Each is read exactly once and then never consulted again —
         // `registry_path` and `pool` when `startup::boot` opens the registry
         // and the pool, `vpn_handshake_max_age_secs` when the health monitor
@@ -500,19 +537,19 @@ impl Config {
         // turns the fail-closed kill switch on and reloads was told the
         // config was unchanged, and would believe a security control had
         // taken effect that had not.
-        if old.registry_path != new.registry_path {
+        if old.registry_path != *new_registry_path {
             d.non_reloadable_changes.push("registry_path");
         }
-        if old.vpn_handshake_max_age_secs != new.vpn_handshake_max_age_secs {
+        if old.vpn_handshake_max_age_secs != *new_vpn_handshake_max_age_secs {
             d.non_reloadable_changes.push("vpn_handshake_max_age_secs");
         }
-        if old.network_kill_switch != new.network_kill_switch {
+        if old.network_kill_switch != *new_network_kill_switch {
             d.non_reloadable_changes.push("network_kill_switch");
         }
-        if old.pool != new.pool {
+        if old.pool != *new_pool {
             d.non_reloadable_changes.push("pool");
         }
-        d.profile_changes = diff_profiles(&old.profile, &new.profile);
+        d.profile_changes = diff_profiles(&old.profile, new_profile);
         d
     }
 
@@ -791,6 +828,22 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
             ));
             continue;
         };
+        // Destructured exhaustively and with no `..`, for the reason
+        // `Config::diff` is: a field added to `ProfileConfig` does not compile
+        // until this loop reaches it. `id` is the key both sides were indexed
+        // by, so it is equal here by construction and is the one field with
+        // nothing to compare.
+        let ProfileConfig {
+            id: _,
+            network: new_network,
+            peer_fingerprint_hex: new_peer_fingerprint_hex,
+            user_agent: new_user_agent,
+            resume_dir: new_resume_dir,
+            torrent_dir: new_torrent_dir,
+            allowed_tracker_domains: new_allowed_tracker_domains,
+            upload_rate_limit: new_upload_rate_limit,
+        } = b;
+
         let mut field = |name: &str, changed: bool| {
             if changed {
                 out.push(format!("{id}.{name}"));
@@ -798,16 +851,16 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
         };
         // The whole network block is identity: which tunnel, which port,
         // whether DHT runs. Comparing it as one value means a new field
-        // cannot be forgotten here the way `file_pool_size` was forgotten
-        // from the top-level diff.
-        field("network", a.network != b.network);
+        // inside that enum cannot be forgotten here the way `file_pool_size`
+        // was forgotten from the top-level diff.
+        field("network", a.network != *new_network);
         field(
             "peer_fingerprint_hex",
-            a.peer_fingerprint_hex != b.peer_fingerprint_hex,
+            a.peer_fingerprint_hex != *new_peer_fingerprint_hex,
         );
-        field("user_agent", a.user_agent != b.user_agent);
-        field("resume_dir", a.resume_dir != b.resume_dir);
-        field("torrent_dir", a.torrent_dir != b.torrent_dir);
+        field("user_agent", a.user_agent != *new_user_agent);
+        field("resume_dir", a.resume_dir != *new_resume_dir);
+        field("torrent_dir", a.torrent_dir != *new_torrent_dir);
         // The two keys outside the network block. Neither is applied by a
         // reload — the add path reads `ProfileRegistry`'s immutable startup
         // snapshot and nothing rebuilds it — and without them here a SIGHUP
@@ -817,11 +870,11 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
         // forgotten.
         field(
             "upload_rate_limit",
-            a.upload_rate_limit != b.upload_rate_limit,
+            a.upload_rate_limit != *new_upload_rate_limit,
         );
         field(
             "allowed_tracker_domains",
-            a.allowed_tracker_domains != b.allowed_tracker_domains,
+            a.allowed_tracker_domains != *new_allowed_tracker_domains,
         );
     }
     out
