@@ -357,6 +357,17 @@ impl LoginThrottle {
 
     /// A success clears the record; the credential was not being guessed.
     ///
+    /// Clearing is **replacement, never removal**, and that holds on both
+    /// paths. For a client the map already holds, removing the key is how a
+    /// client that has just authenticated correctly *loses* the slot the
+    /// paragraph below exists to give it: an operator who mistyped a password
+    /// once is in the map, and if their successful login deletes their entry
+    /// then their next consult finds no key, reads `global` because the map
+    /// is full, and is locked out by the next failure from anyone else on the
+    /// overflow path. Demonstrated end to end: with the map full, an operator
+    /// in it authenticated correctly, six never-seen addresses then failed
+    /// once each, and the operator's next correct password returned 429.
+    ///
     /// For an identified client the map does not hold, clearing means
     /// *inserting* a cleared entry rather than removing nothing. Once the map
     /// is full `note_failure` routes that client's failures to `global` and
@@ -381,7 +392,11 @@ impl LoginThrottle {
             return;
         };
         let mut g = self.per_client.lock();
-        if g.remove(&ip).is_some() {
+        if let Some(state) = g.get_mut(&ip) {
+            // Replaced in place. `remove` would clear the record by
+            // surrendering the slot, which is the one thing a success must
+            // not cost the client that earned it.
+            *state = ThrottleState::default();
             return;
         }
         if g.len() >= MAX_TRACKED_CLIENTS {
@@ -857,6 +872,63 @@ mod tests {
             t.retry_after(operator).is_none(),
             "a client that has just authenticated must not be locked out by \
              another client's failure on the shared path",
+        );
+    }
+
+    #[test]
+    fn a_success_from_a_client_the_map_holds_keeps_its_slot() {
+        // The other half of the same property, and the half the repair above
+        // did not reach: the client whose entry the map **already holds**.
+        //
+        // An operator who mistypes a password once is in the map. Removing
+        // their entry on a successful login hands the slot back at the exact
+        // moment they proved they are not the attacker — and with the map
+        // full, `retry_after` then routes them to the shared bucket, where
+        // the next failure from anyone else on the overflow path locks them
+        // out. Clearing the record must not cost the record's owner its slot.
+        let t = LoginThrottle::new();
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        let operator = IpAddr::V4(std::net::Ipv4Addr::from(0u32));
+        assert_eq!(
+            t.per_client.lock().len(),
+            MAX_TRACKED_CLIENTS,
+            "the map has to be full for this test to be testing anything",
+        );
+        assert!(
+            t.per_client.lock().contains_key(&operator),
+            "and the operator has to be in it",
+        );
+
+        t.note_success(Some(operator));
+
+        assert!(
+            t.per_client.lock().contains_key(&operator),
+            "a success clears the record without surrendering the slot",
+        );
+        assert_eq!(
+            t.per_client.lock().len(),
+            MAX_TRACKED_CLIENTS,
+            "and does not free capacity for whoever filled the map",
+        );
+
+        // The consequence, which is what makes the slot worth holding. Six
+        // never-seen addresses fail once each; with the map full they are on
+        // the overflow path and the shared bucket locks out after five.
+        for n in 0..6u32 {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::new(
+                198,
+                51,
+                100,
+                n as u8 + 1,
+            ))));
+        }
+        assert!(
+            t.retry_after(Some(operator)).is_none(),
+            "the operator has a slot of its own, so another client's failures \
+             on the shared bucket cannot lock it out moments after it \
+             authenticated",
         );
     }
 
