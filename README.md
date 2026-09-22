@@ -370,13 +370,17 @@ any kill switch or any `vpn` profile is configured.
 
 > A shipped Grafana dashboard and alert rules are planned rather than present.
 > Until then, note that series register on first emission, so anything not yet
-> emitted reads as "no data" rather than zero — the per-profile tunnel and
-> fencing series are seeded at their baseline for exactly this reason, and most
-> others are not, port-forward state among them. The two handshake series
+> emitted reads as "no data" rather than zero. The per-profile families do not
+> wait for one: every family a per-profile monitor owns is pre-registered at
+> its baseline when that monitor starts, so `rate()` and alerting queries over
+> it resolve on a healthy daemon rather than on the first event ever to occur.
+> That is tunnel health and fencing on every profile, and port-forward state —
+> `profile_vpn_gateway_reboots_total` included — on every profile that
+> negotiates over NAT-PMP. The two handshake gauges
 > (`profile_vpn_handshake_age_seconds`, `profile_vpn_handshake_probe_ok`) are
-> not seeded: they exist only for WireGuard profiles and register on the first
-> probe, so an alert on either reads "no data" until the first poll completes,
-> and permanently on a `vpn` profile that is not WireGuard.
+> the exception, because they register on the first probe rather than when the
+> monitor starts: an alert on either reads "no data" until the first poll
+> completes, and permanently on a `vpn` profile that is not WireGuard.
 
 ## Deployment
 
