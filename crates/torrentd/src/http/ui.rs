@@ -127,6 +127,13 @@ fn accepts(headers: &HeaderMap, encoding: &str) -> bool {
             // unreadable, and the line above says an unreadable one is a
             // refusal. The cost of a refusal is the identity encoding, which
             // every client can read.
+            //
+            // The range check is a behaviour change beyond the float
+            // specials, and it is one: `br;q=2` is now a refusal where it was
+            // an acceptance. RFC 9110 §12.4.2 bounds a qvalue to 0-1, so a
+            // value outside that range is not a weight and refusing it is
+            // right — but nothing else in the repository said so, and a
+            // caller who sent it was being served brotli.
             Some(q) if q > 0.0 && q <= 1.0 => accepted = true,
             Some(_) => return false,
             None => accepted = true,
@@ -550,6 +557,15 @@ mod tests {
         // Content-Type the `.br` extension guesses, and under `assets/` with
         // a year-long `immutable`. A sibling is a representation of the path
         // it sits beside, reachable by negotiating for that path.
+        //
+        // This test and its neighbour are the first in the crate to require a
+        // built `web/dist`, which is gitignored and which `build.rs` produces
+        // by shelling out to npm under the default `web-ui` feature. That is
+        // a new coupling between the Rust suite and the web build, and it is
+        // deliberate: the assertion below states the precondition rather than
+        // skipping, so a `web/dist` left over from before this change — the
+        // "using the existing web/dist" fallback path — fails the suite
+        // instead of quietly testing nothing.
         assert!(
             Assets::get("index.html.br").is_some(),
             "the precompressed siblings have to be present for this test to \
