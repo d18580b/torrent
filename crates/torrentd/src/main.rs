@@ -154,21 +154,38 @@ fn check_config_with_subcommand(cli: &Cli) -> Option<String> {
 
 /// Whether this subcommand qualifies for the operator-tool exemption.
 ///
-/// The exemption is justified on the ground that these subcommands "construct
-/// no session and bind nothing", so a check about serving is judging something
-/// they do not do. `vpn check --bring-up` is the one invocation here for which
-/// that is not the whole truth: it raises a real WireGuard tunnel on the host.
-/// A configuration the daemon refuses to start from should not be usable to
-/// mutate the host, so `--bring-up` takes the daemon's full check. Plain `vpn
-/// check` is observe-only and keeps the exemption — it is exactly the
-/// pre-flight an operator runs against the config they are trying to fix.
+/// An **allow-list**, matched exhaustively over [`Command`] with no wildcard
+/// arm. The exemption is from a *security* check, so a subcommand added later
+/// must not inherit it by default: this does not compile until whoever adds
+/// one classifies it. It was a negated `matches!` naming the single exception,
+/// which is the opposite polarity and is not checked by anything.
+///
+/// The rule to classify by: **a subcommand is exempt unless it changes host
+/// network state.** The exemption is justified on the ground that these
+/// subcommands "construct no session and bind nothing", so a check about
+/// serving is judging something they do not do. `pool scan` writes the pool
+/// index, which is a file on this host and not a tunnel, so that ground still
+/// holds for it. `vpn check --bring-up` raises a real WireGuard tunnel, so it
+/// does not: a configuration the daemon refuses to start from should not be
+/// usable to mutate the host, and `--bring-up` takes the daemon's full check.
+/// Plain `vpn check` is observe-only and keeps the exemption — it is exactly
+/// the pre-flight an operator runs against the config they are trying to fix.
 fn is_exempt_operator_tool(command: &Command) -> bool {
-    !matches!(
-        command,
-        Command::Vpn {
-            cmd: cli::VpnCmd::Check { bring_up: true, .. }
-        }
-    )
+    match command {
+        // Reads the torrent library and writes the pool index: files under
+        // paths this config already names, and no network state.
+        Command::Pool { cmd } => match cmd {
+            PoolCmd::Scan | PoolCmd::Status | PoolCmd::Check | PoolCmd::Orphans { .. } => true,
+        },
+        // Derive a hash, mint a token, print it. Neither reads nor writes
+        // anything outside this process.
+        Command::HashPassword | Command::NewToken { .. } => true,
+        Command::Vpn { cmd } => match cmd {
+            // The one arm that changes host network state. Everything else
+            // `vpn check` does is reading interfaces, `wg` state and sysctls.
+            cli::VpnCmd::Check { bring_up, .. } => !*bring_up,
+        },
+    }
 }
 
 /// Load the config with the validation this invocation actually needs.
