@@ -309,8 +309,11 @@ and leaves the running daemon exactly as it was. Use
 > **Bootstrapping order matters.** `--config` is required *before* any
 > subcommand and is read first, so `hash-password` cannot run until a config
 > file exists and parses. What it does *not* have to satisfy is the
-> authentication posture: the subcommands construct no session and bind
-> nothing, so they load a config the daemon itself would refuse to start from.
+> authentication posture: `hash-password`, `new-token`, the `pool` subcommands
+> and observe-only `vpn check` construct no session and bind nothing, so they
+> load a config the daemon itself would refuse to start from. `vpn check
+> --bring-up` is not one of them — it raises a real tunnel on this host, so it
+> takes the daemon's full check.
 > Write the config with the `http_listen` the deployment actually needs and no
 > `[auth]`, generate the values, add the `[auth]` section, then start.
 
