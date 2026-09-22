@@ -297,30 +297,42 @@ impl RaisedInterfaces {
     /// `exists` is a parameter because the sweep is the whole of the rule and
     /// `/sys/class/net` is what made it unreachable by a test.
     ///
-    /// The record asserts "no link of this name was standing when this boot
-    /// called `bring_up`", which is strictly weaker than "the link standing
-    /// there now is the one this boot raised" — and only [`forget`] ever
-    /// narrowed the gap, from the daemon's own teardown or from [`adoptable`]
-    /// happening to observe the name absent. An interface removed by an
-    /// operator (the one remedy this repository's runbook names for a stuck
-    /// tunnel), by another process, or by the kernel leaves the record armed
-    /// and pointing at nothing, inside the same host boot, so the boot-id
-    /// scope does not help. Whatever next takes the name is then claimed, and
-    /// a claim is exactly what licenses `wg-quick down` on it.
+    /// A record names a link this boot raised and the key that link carried,
+    /// and only [`forget`] ever drops a spent one — from the daemon's own
+    /// teardown, or from [`adoptable`] happening to observe an outcome that is
+    /// not an adoption. An interface removed by an operator (the one remedy
+    /// this repository's runbook names for a stuck tunnel), by another
+    /// process, or by the kernel leaves the record on disk pointing at
+    /// nothing, inside the same host boot, so the boot-id scope does not
+    /// help. Sweeping the freed name here is what keeps a *later* `record` for
+    /// that name from having to overwrite a stale one, and what keeps
+    /// `state_dir()` from filling with records for links that are gone.
+    ///
+    /// The sweep is **not** what makes a retaken name safe, and it cannot be:
+    /// it drops a record only when the name is free, and a retaken name is
+    /// occupied. That is [`RaisedInterfaces::recorded`]'s key witness, and it
+    /// is the only thing that reaches the case.
     ///
     /// Running this before any `bring_up` ties the record's lifetime to the
     /// interface rather than to the daemon's own good behaviour, which is the
     /// only thing that can: nothing else in the process is told when a link
     /// goes away.
     ///
+    /// A state directory that is **not there** is no records to sweep — it is
+    /// one of the paths §4 of the runbook lists as tolerated-missing. A state
+    /// directory that is there and cannot be read is a failure and is
+    /// returned: decision 52(c) made `record`'s write failure a reported error
+    /// precisely because a bare swallow silently disables the whole repair,
+    /// and swallowing the read leaves the same repair disabled with nothing
+    /// said.
+    ///
     /// [`forget`]: RaisedInterfaces::forget
     /// [`adoptable`]: WireguardManager::adoptable
-    fn sweep_with(&self, exists: impl Fn(&str) -> bool) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(&self.dir) else {
-            // No state directory yet means no records to sweep. A directory
-            // that cannot be read is reported by the first `record` that tries
-            // to write into it.
-            return Vec::new();
+    fn sweep_with(&self, exists: impl Fn(&str) -> bool) -> std::io::Result<Vec<String>> {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
         };
         let mut dropped = Vec::new();
         for entry in entries.flatten() {
@@ -339,7 +351,7 @@ impl RaisedInterfaces {
                 dropped.push(iface.to_string());
             }
         }
-        dropped
+        Ok(dropped)
     }
 }
 
@@ -353,13 +365,27 @@ impl RaisedInterfaces {
 /// nothing does.
 pub fn sweep_raised_records(state_dir: &Path) {
     let raised = RaisedInterfaces::new(state_dir.to_path_buf());
-    for iface in raised.sweep_with(interface_exists) {
-        info!(
-            target: "torrentd::vpn::wireguard",
-            vpn_iface = %iface,
-            "dropping a raised-interface record whose interface is no longer \
-             standing; it can no longer claim a link that takes the name",
-        );
+    match raised.sweep_with(interface_exists) {
+        Ok(dropped) => {
+            for iface in dropped {
+                info!(
+                    target: "torrentd::vpn::wireguard",
+                    vpn_iface = %iface,
+                    "dropping a raised-interface record whose interface is no longer \
+                     standing",
+                );
+            }
+        }
+        Err(e) => {
+            error!(
+                target: "torrentd::vpn::wireguard",
+                path = %state_dir.display(),
+                error.cause = %e,
+                "could not read the state directory to sweep raised-interface \
+                 records; spent records stay on disk and this boot will write \
+                 over them rather than replace them",
+            );
+        }
     }
 }
 
@@ -1465,7 +1491,9 @@ mod tests {
         // OpenVPN pid file is the neighbour this must not touch.
         std::fs::write(dir.path().join("openvpn-tun0.pid"), "123\n").unwrap();
 
-        let dropped = raised.sweep_with(|iface| iface == "wg-still-here");
+        let dropped = raised
+            .sweep_with(|iface| iface == "wg-still-here")
+            .expect("a readable state directory");
 
         assert_eq!(dropped, vec!["wg-gone".to_string()]);
         assert!(
@@ -1503,6 +1531,45 @@ mod tests {
 
         // A state directory that does not exist yet is not an error to sweep.
         sweep_raised_records(&at_boot.path().join("not-created-yet"));
+    }
+
+    /// An unreadable state directory is **reported**, not read as "no
+    /// records".
+    ///
+    /// Decision 52(c) made `record`'s write failure a returned, reported error
+    /// precisely because a bare swallow silently disables the whole repair.
+    /// The read deserves the same and did not have it: a `read_dir` that
+    /// failed for any reason returned an empty sweep, so a state directory
+    /// whose permissions had gone wrong looked exactly like a fresh
+    /// deployment — every spent record left armed, and nothing said.
+    ///
+    /// "Not there at all" stays a legitimate empty: `Config::state_dir()` is
+    /// one of the paths §4 of the runbook lists as tolerated-missing.
+    ///
+    /// Swallow the error again and the second assertion fails.
+    #[test]
+    fn a_state_directory_that_cannot_be_read_is_reported_rather_than_read_as_empty() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing = dir.path().join("never-created");
+        assert!(raised_in(&missing, "one-boot")
+            .sweep_with(|_| false)
+            .expect("a directory that is not there is no records to sweep")
+            .is_empty(),);
+
+        // A *file* where the state directory should be cannot be read as one,
+        // and that is a failure rather than an emptiness.
+        let blocked = dir.path().join("a-file");
+        std::fs::write(&blocked, "").unwrap();
+        let err = raised_in(&blocked, "one-boot")
+            .sweep_with(|_| false)
+            .expect_err("a state directory that cannot be read is reported");
+        assert_ne!(
+            err.kind(),
+            std::io::ErrorKind::NotFound,
+            "and it is told apart from the tolerated-missing case, or the \
+             report is back to being a swallow with extra steps",
+        );
     }
 
     /// `record` creates the state directory it writes into, and says so when
