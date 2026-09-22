@@ -37,6 +37,22 @@ pub enum PoolError {
          space and start again."
     )]
     BackupFailed { path: String, reason: String },
+    /// Something is already at the pre-v3 backup path and it is not a database.
+    ///
+    /// An existing backup is kept rather than overwritten — it is from an
+    /// earlier attempt at this same migration. That posture only makes sense
+    /// for something that *is* a copy of the index: a dangling symlink, a
+    /// directory or a stray file is not one, and proceeding on it runs the
+    /// irreversible v3 rename with no rollback while the runbook tells the
+    /// operator that restoring this file is how they go back.
+    #[error(
+        "the pre-v3 copy-aside cannot be taken: what is already at {path} is not a readable \
+         database ({reason}). An existing copy is kept rather than overwritten, so this file is \
+         in the way — and it is not a rollback, while the v3 rename this copy exists for cannot \
+         be undone. The index has not been changed; move or remove whatever is at that path and \
+         start again."
+    )]
+    BackupNotADatabase { path: String, reason: String },
     /// Another process holds the pool database's write lock — almost always the
     /// running daemon, or a second `pool scan`.
     #[error(

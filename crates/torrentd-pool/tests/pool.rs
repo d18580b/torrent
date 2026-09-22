@@ -1729,9 +1729,10 @@ fn a_backup_that_cannot_be_written_names_the_backup_and_the_reason() {
     // delete them from a directory it may not write, which is why the mode is
     // dropped before the drop below.
     //
-    // Nothing already at the backup path would do instead: whatever is there,
-    // including a symlink to nothing, is an existing copy to
-    // `backup_before_v3`, which keeps it and takes none.
+    // Nothing already at the backup path would do instead. A real copy there
+    // is kept and no write is attempted, so the failure is never reached; a
+    // dangling symlink or a stray file is refused before the write, with a
+    // different error naming a different problem.
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
@@ -1771,12 +1772,18 @@ fn a_backup_that_cannot_be_written_names_the_backup_and_the_reason() {
 }
 
 #[test]
-fn a_dangling_backup_symlink_is_kept_rather_than_written_through() {
-    // D30. The existence check followed symlinks, so a `.pre-v3.bak` that is a
-    // symlink to nothing read as *absent* — and `VACUUM INTO` then wrote the
-    // index's only rollback copy through it, into whatever path it named,
-    // silently and outside the state directory. The check asks whether
-    // something is at that path, so it must not resolve what is there.
+fn a_dangling_backup_symlink_is_neither_written_through_nor_treated_as_a_rollback() {
+    // D30 and the judgement above it. The existence check followed symlinks,
+    // so a `.pre-v3.bak` that is a symlink to nothing read as *absent* — and
+    // `VACUUM INTO` then wrote the index's only rollback copy through it, into
+    // whatever path it named, silently and outside the state directory. The
+    // check asks whether something is at that path, so it must not resolve
+    // what is there.
+    //
+    // Seeing it is not enough on its own. Keeping it and carrying on ran the
+    // irreversible v3 rename with no rollback copy at all, while the runbook
+    // says restoring that file is how you go back. It is not a copy of
+    // anything, so the migration stops and names it.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pool.db");
     build_v1_index(&db);
@@ -1787,7 +1794,16 @@ fn a_dangling_backup_symlink_is_kept_rather_than_written_through() {
     std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
     assert!(!backup.exists(), "the fixture is a symlink to nothing");
 
-    PoolStore::open(&db).expect("the migration runs; the existing copy is kept");
+    let err = PoolStore::open(&db).expect_err("a dangling link is not a rollback copy");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&backup.display().to_string()),
+        "the refusal names what is in the way, got: {msg}",
+    );
+    assert!(
+        msg.contains("not a readable database"),
+        "and says why it is not the copy it looks like, got: {msg}",
+    );
 
     assert!(
         !elsewhere.exists(),
@@ -1800,9 +1816,62 @@ fn a_dangling_backup_symlink_is_kept_rather_than_written_through() {
             .is_symlink(),
         "and what the operator left at that path is untouched",
     );
-    // The migration itself still ran: keeping an existing copy is not a
-    // failure, and this file's schema really does need v3.
-    assert_eq!(user_version(&db), 3);
+    // Stopped before the one-way step, which is what makes "move it and start
+    // again" a true instruction.
+    assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
+    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+}
+
+#[test]
+fn a_real_backup_already_at_the_path_is_kept_and_the_migration_proceeds() {
+    // The other side of the same check, and the behaviour the refusal must not
+    // have swallowed: a `.pre-v3.bak` that really is a copy of an index is
+    // from an earlier attempt at this same migration, which rolled back, so it
+    // describes the same state a new copy would. It is kept byte for byte —
+    // the older file is the one the operator has had time to notice — and no
+    // second copy is taken.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    let earlier = dir.path().join("earlier.db");
+    build_v1_index(&earlier);
+    std::fs::copy(&earlier, &backup).unwrap();
+    let before = std::fs::read(&backup).unwrap();
+
+    PoolStore::open(&db).expect("the migration runs; the existing copy is kept");
+
+    assert_eq!(user_version(&db), 3, "the migration really ran");
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        before,
+        "the operator's existing copy must not have been overwritten",
+    );
+}
+
+#[test]
+fn a_non_database_at_the_backup_path_stops_the_migration() {
+    // Not only symlinks. Anything an operator left at that path — a note, a
+    // truncated download, a directory — is in the way of the copy and is not a
+    // rollback, and the rename it protects cannot be undone.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::fs::write(&backup, b"not a database, just bytes someone left here").unwrap();
+
+    let err = PoolStore::open(&db).expect_err("a stray file is not a rollback copy");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&backup.display().to_string()) && msg.contains("not a readable database"),
+        "the refusal names the path and why, got: {msg}",
+    );
+    assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
+    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
 }
 
 #[test]

@@ -245,10 +245,17 @@ deletes it, nothing ages it out, and no later start reclaims its space: keep it
 until the new index has been in service long enough that you would not go back,
 then delete it yourself. The daemon cannot make that judgement for you, and
 deleting an operator's only rollback on a timer is not a judgement it should
-be making. If a `.pre-v3.bak` is already at that path when a migration starts —
-whatever it is, including a symlink — the daemon keeps it, says so, and takes
-no new copy: it is from an earlier attempt at this same migration, which rolled
-back, so it describes the same state.
+be making. If a `.pre-v3.bak` is already at that path when a migration starts,
+the daemon keeps it, says so, and takes no new copy: it is from an earlier
+attempt at this same migration, which rolled back, so it describes the same
+state.
+
+That holds for something that is a copy of the index. If what is at that path
+is not a database the daemon can read — a dangling symlink, a directory, a
+stray file — the migration **stops** and names it, without touching the index.
+Keeping it and carrying on would run the one-way rename with no rollback at
+all, while the paragraph above tells you restoring that file is how you go
+back. Move or remove whatever is there and start the daemon again.
 
 The copy is a full second copy of the index, so **the first open on this build
 needs free space on the state volume equal to the size of `pool.db`**. The
