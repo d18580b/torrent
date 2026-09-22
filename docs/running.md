@@ -431,7 +431,7 @@ publishes the API — the systemd path of §8, and any run bound to loopback.
 
 ```bash
 curl -s localhost:8080/healthz            # {"heartbeat_age_secs":0,"ok":true,"profiles":1,"profiles_fenced":0}
-curl -s localhost:8080/api/status | jq    # counts by state, rates, peers
+curl -s localhost:8080/api/status | jq    # counts by phase, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
 
