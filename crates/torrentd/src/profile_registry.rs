@@ -108,6 +108,23 @@ pub struct FailedProfile {
     pub reason: String,
 }
 
+/// What [`ProfileRegistry::resolve`] found: the three answers a profile id can
+/// have, and the only three.
+///
+/// An id that is configured and down is not an unknown id, and the difference
+/// is what an operator reads to decide whether to fix their config file or
+/// their tunnel. Returning it as a value rather than as `Option<&ProfileEntry>`
+/// is what stops a route dropping the distinction: there is no way to take the
+/// live entry out of this without the other two arms being written down.
+pub enum Resolution<'a> {
+    /// Configured, brought up, holding a session.
+    Active(&'a ProfileEntry),
+    /// Configured, and it never got a session. Carries why.
+    Failed(&'a FailedProfile),
+    /// No `[[profile]]` table declares this id.
+    Unknown,
+}
+
 /// Build a static WireGuard profile entry with the given id and status, for tests
 /// across the http/app_state modules.
 #[cfg(test)]
@@ -208,27 +225,36 @@ impl ProfileRegistry {
     }
 
     /// Whether `id` names a profile that failed to come up.
-    pub fn failed_profile(&self, id: &ProfileId) -> Option<&FailedProfile> {
+    ///
+    /// Half of an answer, like [`ProfileRegistry::get`], and private for the
+    /// same reason: a route that pairs the two by hand is a route that can
+    /// forget to.
+    fn failed_profile(&self, id: &ProfileId) -> Option<&FailedProfile> {
         self.failed.iter().find(|f| &f.config.id == id)
     }
 
-    /// Whether `id` names a configured profile **at all** — live or failed.
+    /// What this registry knows about `id`: the one answer every resolution
+    /// site asks for.
     ///
-    /// The one question "is this a typo, or an account that is down?" has to
-    /// be asked in one place. Every resolution site used to ask `get`, which
-    /// searches `entries` only, and so answered 404 "unknown profile_id" for a
-    /// configured profile whose tunnel failed — sending the operator to the
-    /// config file to look for an id that is already in it. A repair that
-    /// fixed the four routes resolving through `engine_for` left the three
-    /// resolving through `get` untouched, which is what this exists to make
-    /// impossible: the pairing is a property of the registry, not something a
-    /// call site has to remember.
+    /// The question "is this a typo, or an account that is down?" has exactly
+    /// one correct answer and it takes two lookups to reach — `entries`, then
+    /// `failed`. A site that asks only `get` answers 404 "unknown profile_id"
+    /// for a configured profile whose tunnel failed, sending the operator to
+    /// the config file to look for an id that is already in it. That went
+    /// wrong once per route, in three separate repairs, because pairing the
+    /// two lookups was left to whoever wrote the route.
     ///
-    /// Callers that need to distinguish the two still ask `get` and
-    /// [`ProfileRegistry::failed_profile`]; this is for the guard that comes
-    /// before them.
-    pub fn is_configured(&self, id: &ProfileId) -> bool {
-        self.get(id).is_some() || self.failed_profile(id).is_some()
+    /// It is not left to them here. This returns a value that cannot be read
+    /// without the failed case being named, and [`ProfileRegistry::get`] is
+    /// private to this crate so a new route reaches for this first.
+    pub fn resolve(&self, id: &ProfileId) -> Resolution<'_> {
+        if let Some(entry) = self.get(id) {
+            return Resolution::Active(entry);
+        }
+        match self.failed_profile(id) {
+            Some(failed) => Resolution::Failed(failed),
+            None => Resolution::Unknown,
+        }
     }
 
     /// The configuration of a live profile.
@@ -239,11 +265,74 @@ impl ProfileRegistry {
         self.get(id).map(|e| &e.config)
     }
 
-    pub fn get(&self, id: &ProfileId) -> Option<&ProfileEntry> {
+    /// The live entry for `id`, or `None` — **including** when `id` names a
+    /// configured profile that failed to come up.
+    ///
+    /// That second case is why this is not the method a route calls:
+    /// [`ProfileRegistry::resolve`] is. Kept for the callers that have already
+    /// established which case they are in.
+    pub(crate) fn get(&self, id: &ProfileId) -> Option<&ProfileEntry> {
         self.entries.iter().find(|e| &e.config.id == id)
     }
 
     pub fn iter(&self) -> std::slice::Iter<'_, ProfileEntry> {
         self.entries.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A registry holding one live profile and one that never came up, which
+    /// is the only state in which the three answers are distinguishable.
+    fn registry() -> ProfileRegistry {
+        ProfileRegistry::new(vec![test_host_entry("public")]).with_failed(vec![
+            test_failed_profile("acct_a", "wg-acct-a did not come up"),
+        ])
+    }
+
+    #[test]
+    fn a_live_profile_resolves_active() {
+        let r = registry();
+        match r.resolve(&ProfileId::new("public")) {
+            Resolution::Active(e) => assert_eq!(e.config.id.as_str(), "public"),
+            _ => panic!("a profile holding a session is Active"),
+        }
+    }
+
+    #[test]
+    fn a_configured_profile_that_never_came_up_resolves_failed_with_its_reason() {
+        // The answer every route got wrong in turn: this id is in the
+        // operator's config file, so an answer calling it unknown sends them
+        // to hunt a typo that is not there. `get` alone still returns `None`
+        // for it — which is why `get` is not what a route calls.
+        let r = registry();
+        match r.resolve(&ProfileId::new("acct_a")) {
+            Resolution::Failed(f) => {
+                assert_eq!(f.config.id.as_str(), "acct_a");
+                assert!(
+                    f.reason.contains("did not come up"),
+                    "the reason is what tells the operator what to fix, got {:?}",
+                    f.reason,
+                );
+            }
+            _ => panic!("a configured profile with no session is Failed, not Unknown"),
+        }
+        assert!(
+            r.get(&ProfileId::new("acct_a")).is_none(),
+            "and the live lookup on its own cannot tell it from a typo",
+        );
+    }
+
+    #[test]
+    fn an_id_no_profile_declares_resolves_unknown() {
+        // The other side of the same distinction: this one really is a typo,
+        // and it must stay distinguishable from an account that is down.
+        let r = registry();
+        assert!(matches!(
+            r.resolve(&ProfileId::new("typo")),
+            Resolution::Unknown
+        ));
     }
 }
