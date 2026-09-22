@@ -369,8 +369,13 @@ curl -sS -X POST localhost:8080/api/reload
 
 It needs a token with the `write` scope (or a logged-in session) where `[auth]`
 is configured; `read` and `metrics` tokens are refused. It reloads exactly what
-`SIGHUP` reloads, and reports the same Safety Rule 7 warning for a
-`[[profile]]` field that changed and cannot be applied without a restart.
+`SIGHUP` reloads, and reports the same warnings for a `[[profile]]` field that
+changed and cannot be applied without a restart: the Safety Rule 7 warning
+(`profile identity change requires daemon restart`) where the field is an
+identity — the network block, `peer_fingerprint_hex`, `user_agent`, the two
+store directories — and the ordinary non-reloadable-field warning where it is
+`upload_rate_limit` or `allowed_tracker_domains`, which are not. The field name
+is on the event either way.
 
 ## 9. First-run checks
 
