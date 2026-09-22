@@ -62,9 +62,17 @@
 //!    paths, because it used to be spelled per path against whether the id
 //!    happened to be `default`, which a config could satisfy by accident.
 //! 7. **SIGHUP cannot change identity-critical fields.** The tunnel
-//!    interface, listen port, peer fingerprint, user agent and per-profile
-//!    directories are what a tracker sees as an account's identity. Changes
-//!    are detected, warned about, and ignored; applying them means a restart.
+//!    interface, listen port, peer fingerprint and user agent are what a
+//!    tracker sees as an account's identity. Changes are detected, warned
+//!    about, and ignored; applying them means a restart.
+//!
+//!    The per-profile `resume_dir` and `torrent_dir` are equally unreloadable
+//!    — the stores are opened at startup — but they are not identity: no
+//!    announce, handshake or peer message carries where a profile keeps its
+//!    files. They get the ordinary non-reloadable warning, so this rule's
+//!    warning stays the privacy event an alert rule can watch for, and the
+//!    upgrade step in `docs/running.md` that tells an operator to set those
+//!    two keys does not fire it.
 //! 8. **Listen ports are unique across profiles.** The port is announced, so two
 //!    profiles sharing one would be correlatable by a tracker operator even from
 //!    different IPs. Enforced for every profile that names its own port — a
