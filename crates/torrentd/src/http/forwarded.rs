@@ -518,10 +518,22 @@ fn node_addr(node: &str) -> Option<IpAddr> {
 
 /// Resolve the client behind `req`.
 pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
+    // Unmapped **here**, at the top, before the trust test and before either
+    // early return. A dual-stack `http_listen` — `[::]:8080`, which
+    // `SocketAddr` accepts, the posture check permits and `docs/running.md`
+    // names as supported — reports every v4 client as `::ffff:a.b.c.d`. Doing
+    // it only on the resolved address left the untrusted branch below
+    // returning before the fold, so one host arriving directly and the same
+    // host named through the trusted proxy were two `client_ip` values and
+    // two throttle buckets in one daemon under one configuration.
+    // Demonstrated: ten failures before both buckets locked, where five
+    // against one spelling locks, and the client picks which route it takes.
+    // Doing it once here also makes the trust decision and the resolved
+    // address agree by construction.
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip());
+        .map(|ci| unmap(ci.0.ip()));
 
     let Some(peer) = peer else {
         return Client {
@@ -644,11 +656,13 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
                 .any(|p| p.eq_ignore_ascii_case("https"))
     };
 
-    // Unmapped once, here, so every consumer gets one spelling per host. The
-    // address reaches three things — the throttle key, the `client_ip` log
-    // field, and nothing else that compares addresses — and two spellings of
-    // one host is two throttle buckets and two log identities. Trust matching
-    // already unmaps; this is the other half of that position.
+    // The peer was unmapped at the top; this is the same fold for an address
+    // a *header* supplied, which can arrive in either spelling too. Between
+    // them every consumer gets one spelling per host. The address reaches
+    // three things — the throttle key, the `client_ip` log field, and nothing
+    // else that compares addresses — and two spellings of one host is two
+    // throttle buckets and two log identities. Trust matching unmaps both
+    // sides as well; these are the three halves of one position.
     Client {
         ip: ip.map(unmap),
         secure,
@@ -1403,6 +1417,48 @@ mod tests {
             &trusted(&["10.0.0.0/8"]),
         );
         assert_eq!(c.ip, Some("2001:db8::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn an_untrusted_v4_mapped_peer_resolves_to_its_v4_form_too() {
+        // The property: one host is one spelling on **every** path out of
+        // `resolve`, not only the one that reaches the fold at the bottom.
+        // The untrusted branch returns before that fold, so on a dual-stack
+        // `[::]` bind a client arriving directly kept its `::ffff:` spelling
+        // while the same host named through the trusted proxy was folded —
+        // two `client_ip` values and two `HashMap<IpAddr, _>` keys for one
+        // host, in one daemon, under one configuration. Demonstrated: ten
+        // failures before both buckets locked, where five against one
+        // spelling locks, with the client choosing which route it takes.
+        let v4: IpAddr = "198.51.100.9".parse().unwrap();
+
+        // Untrusted: the header is ignored and the socket peer stands up —
+        // in its v4 form.
+        let c = resolve(
+            &req("::ffff:198.51.100.9", &[("x-forwarded-for", "6.6.6.6")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some(v4),
+            "an untrusted v4-mapped peer is the same host as its v4 form, and \
+             has to be the same throttle key",
+        );
+
+        // With no trust list at all — the default — the same.
+        let c = resolve(
+            &req("::ffff:198.51.100.9", &[]),
+            &TrustedProxies::parse(&[]).unwrap(),
+        );
+        assert_eq!(c.ip, Some(v4));
+
+        // And the trusted route names the same host by the same spelling, so
+        // the two routes agree rather than merely each being consistent.
+        let c = resolve(
+            &req("10.1.2.3", &[("x-forwarded-for", "::ffff:198.51.100.9")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(c.ip, Some(v4));
     }
 
     #[test]
