@@ -114,7 +114,16 @@ fn subcommand_name(command: &Command) -> &'static str {
             PoolCmd::Orphans { .. } => "pool orphans",
         },
         Command::Vpn { cmd } => match cmd {
-            cli::VpnCmd::Check { .. } => "vpn check",
+            // `--bring-up` is part of the name here, because it is the flag
+            // that decides whether the invocation is exempt from the posture
+            // check. A message that drops it describes the wrong invocation.
+            cli::VpnCmd::Check { bring_up, .. } => {
+                if *bring_up {
+                    "vpn check --bring-up"
+                } else {
+                    "vpn check"
+                }
+            }
         },
         Command::HashPassword => "hash-password",
         Command::NewToken { .. } => "new-token",
@@ -137,19 +146,39 @@ fn subcommand_name(command: &Command) -> &'static str {
 /// satisfy both validations at once, and a `hash-password` refused by the very
 /// config the refusal sends an operator to it to fix is the thing the
 /// exemption exists to prevent.
+///
+/// The exemption clause is keyed on [`is_exempt_operator_tool`] rather than
+/// asserted, because it is false for the one subcommand that does not have
+/// it. Telling an operator that `vpn check --bring-up` "still runs against a
+/// config the daemon refuses", and then refusing it for the posture when they
+/// drop the flag as instructed, is the instruction and its contradiction in
+/// two invocations.
 fn check_config_with_subcommand(cli: &Cli) -> Option<String> {
     if !cli.check_config {
         return None;
     }
-    let name = subcommand_name(cli.command.as_ref()?);
-    Some(format!(
-        "--check-config was given together with the `{name}` subcommand, and they ask for \
-         different things. --check-config answers \"would the daemon start from this file\", \
-         which includes the authentication posture; `{name}` is an operator tool, which is \
-         exempt from that check precisely so it still runs against a config the daemon \
-         refuses. One invocation cannot be both, and this one used to validate as the daemon \
-         and then discard `{name}` without running it. Run one or the other."
-    ))
+    let command = cli.command.as_ref()?;
+    let name = subcommand_name(command);
+    Some(if is_exempt_operator_tool(command) {
+        format!(
+            "--check-config was given together with the `{name}` subcommand, and they ask for \
+             different things. --check-config answers \"would the daemon start from this \
+             file\", which includes the authentication posture; `{name}` is an operator tool, \
+             which is exempt from that check precisely so it still runs against a config the \
+             daemon refuses. One invocation cannot be both, and this one used to validate as \
+             the daemon and then discard `{name}` without running it. Run one or the other."
+        )
+    } else {
+        format!(
+            "--check-config was given together with the `{name}` subcommand, and one \
+             invocation cannot do both. --check-config answers \"would the daemon start from \
+             this file\" and exits; `{name}` changes host network state, so it is held to the \
+             daemon's full validation — the authentication posture included — rather than \
+             being exempt from it as the other operator tools are. The two ask for the same \
+             validation here and still do not combine: the flag answers its question and then \
+             discards `{name}` without running it. Run one or the other."
+        )
+    })
 }
 
 /// Whether this subcommand qualifies for the operator-tool exemption.
@@ -457,6 +486,56 @@ mod tests {
                 "{argv:?} asks for one validation and must not be refused",
             );
         }
+    }
+
+    #[test]
+    fn the_refusal_does_not_promise_an_exemption_the_invocation_does_not_have() {
+        // The property: the refusal describes the invocation the operator
+        // typed. `--check-config vpn check --bring-up` was refused with a
+        // message stating unconditionally that the named subcommand "is an
+        // operator tool, which is exempt from that check precisely so it
+        // still runs against a config the daemon refuses" — and `--bring-up`
+        // is the one invocation for which that is false. An operator who
+        // dropped the flag as instructed, on that understanding, was then
+        // refused by the posture check.
+        //
+        // The name has to carry `--bring-up` too: without it the message
+        // names an invocation that does have the exemption, so it is
+        // accurate about a command nobody ran.
+        let cli = Cli::parse_from([
+            "torrentd",
+            "-c",
+            "x",
+            "--check-config",
+            "vpn",
+            "check",
+            "--bring-up",
+        ]);
+        let msg = check_config_with_subcommand(&cli).expect("must still be refused");
+        assert!(
+            msg.contains("vpn check --bring-up"),
+            "the message must name the invocation that was typed; got: {msg}",
+        );
+        assert!(
+            !msg.contains("still runs against a config the daemon refuses"),
+            "this invocation does not, and the message must not say it does; got: {msg}",
+        );
+        assert!(
+            msg.contains("full validation"),
+            "it must say what this invocation is held to instead; got: {msg}",
+        );
+
+        // The exempt arm keeps the clause, which is true of it.
+        let cli = Cli::parse_from(["torrentd", "-c", "x", "--check-config", "vpn", "check"]);
+        let msg = check_config_with_subcommand(&cli).expect("must still be refused");
+        assert!(
+            msg.contains("still runs against a config the daemon refuses"),
+            "plain `vpn check` does have the exemption; got: {msg}",
+        );
+        assert!(
+            !msg.contains("--bring-up"),
+            "and the message must not name a flag that was not given; got: {msg}",
+        );
     }
 
     #[test]
