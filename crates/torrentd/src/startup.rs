@@ -761,7 +761,16 @@ pub async fn boot(
                 loaded_torrents = loaded,
                 resume_dir = %dirs_of(&cfg, &profile).0.display(),
                 torrent_dir = %dirs_of(&cfg, &profile).1.display(),
-                registry_path = %registry.source_path().display(),
+                // Both files, as the refusal above names both. On the
+                // migration boot `source_path()` is the pre-rename
+                // `slot_assignments.json` — the file `docs/running.md` tells
+                // the operator explicitly not to edit — so naming it alone
+                // pointed at the wrong one. Its own justification for being
+                // the name to quote, that the current file is "by
+                // construction not on disk", stopped holding when the
+                // migration began writing that file unconditionally.
+                registry_path = %cfg.registry_path().display(),
+                registry_read_from = %registry.source_path().display(),
                 "the assignment registry claims more torrents for this profile than the scans \
                  loaded; the files are probably still at the pre-profiles root — point this \
                  profile's resume_dir and torrent_dir at it, or move the files into the \

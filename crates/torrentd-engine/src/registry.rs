@@ -278,9 +278,15 @@ impl AssignmentRegistry {
 
     /// Where the entries in memory were read from.
     ///
-    /// The current path except on the one boot that reads a pre-rename file.
-    /// A message telling an operator to edit "those entries" has to name this
-    /// one.
+    /// The current path except on the one boot that reads a pre-rename file,
+    /// where it is that file. It says where the entries an operator is being
+    /// told about *came from*; it does not say where to edit them, and on the
+    /// boot where the two differ the answer to that is [`Self::path`] — the
+    /// pre-rename file is kept for a rollback and is not read again.
+    ///
+    /// A message about those entries therefore names **both**, as the startup
+    /// refusal does. Quoting this one alone rested on the current file being
+    /// absent on that boot, which the unconditional persist above ended.
     pub fn source_path(&self) -> &Path {
         &self.source
     }
