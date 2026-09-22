@@ -1742,6 +1742,72 @@ fn a_version_0_index_that_is_not_already_v3_still_takes_the_stepped_path() {
     assert_eq!(user_version(&db), 0, "and nothing was stamped over it");
 }
 
+/// A file carrying **both** v3 index names, reporting `version`.
+///
+/// `torrent_by_slot` over the renamed `profile` column is what SQLite leaves
+/// when `SCHEMA_V3`'s `DROP INDEX` is lost, and `torrent_by_profile` beside it
+/// is what a later partial repair adds. Neither operator-facing text allows
+/// the pair to survive an open.
+fn build_both_indexes_at_version(db: &Path, version: i64) {
+    build_b28a778_index(db);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.execute_batch("CREATE INDEX torrent_by_slot ON torrent(profile) WHERE profile IS NOT NULL;")
+        .unwrap();
+    c.pragma_update(None, "user_version", version).unwrap();
+}
+
+#[test]
+fn a_file_carrying_both_v3_indexes_loses_torrent_by_slot_at_any_version() {
+    // C67. The repair was keyed on `torrent_by_profile` being *missing*, so a
+    // file with both names was not a case it recognised. At version 2 it was
+    // stamped to 3 with `torrent_by_slot` still sitting over the renamed
+    // column; at version 3 the ordinary-open return fired first and the file
+    // came out untouched, with no log line at all — both reproduced against
+    // the binary.
+    //
+    // `docs/running.md` makes the promise without a qualifier: "after this
+    // open the file has `torrent_by_profile` and nothing called
+    // `torrent_by_slot`". The index is mislabelled either way, and the drop
+    // statement is already written and idempotent.
+    for version in [2i64, 3] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        build_both_indexes_at_version(&db, version);
+        let before = torrent_indexes(&db);
+        assert!(
+            before.iter().any(|n| n == "torrent_by_profile")
+                && before.iter().any(|n| n == "torrent_by_slot"),
+            "the fixture carries both names at {version}, got {before:?}",
+        );
+
+        PoolStore::open(&db).expect("a file with both indexes must open");
+
+        assert_eq!(user_version(&db), 3);
+        let idx = torrent_indexes(&db);
+        assert!(
+            idx.iter().any(|n| n == "torrent_by_profile"),
+            "v3's index must survive at {version}, got {idx:?}",
+        );
+        assert!(
+            !idx.iter().any(|n| n == "torrent_by_slot"),
+            "and the name the rename left over the new column must be gone at {version}, \
+             got {idx:?}",
+        );
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let steps: i64 = c
+            .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(steps, 1, "the mutation journal survived at {version}");
+        drop(c);
+        PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+        assert_eq!(
+            torrent_indexes(&db),
+            idx,
+            "and is idempotent — nothing is rebuilt at {version}",
+        );
+    }
+}
+
 #[test]
 fn an_ordinary_v3_index_is_opened_without_touching_it() {
     // The other half of widening the arm past `found == 2`: a healthy v3 file
