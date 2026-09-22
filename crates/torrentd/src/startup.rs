@@ -1494,9 +1494,9 @@ mod tests {
     /// walks the tree the same way. Hand-inline a second teardown anywhere in
     /// `crates/torrentd/src/` and it fails.
     ///
-    /// **Scope.** It used to count one literal — the `context(…)` string the
-    /// helper names its join with — in `startup.rs` alone, which is the whole
-    /// of what replaces a test of
+    /// **Scope, and why that sentence is true.** It used to count one literal
+    /// — the `context(…)` string the helper names its join with — in
+    /// `startup.rs` alone, which is the whole of what replaces a test of
     /// `boot`: a fourth teardown written with any other context string, or in
     /// any other module of this crate, passed it in silence. Both halves are
     /// now checked across the crate's sources: the helper is defined and
@@ -1504,12 +1504,20 @@ mod tests {
     /// document why they are not the helper — `Drop for BootCleanup`, which
     /// cannot await, and the shutdown job builder in `run_until_signal`, which
     /// is outside `boot` entirely.
+    ///
+    /// What is excluded is **`#[cfg(test)]` regions**, not a directory. The
+    /// filter used to drop every path under `vpn/`, on the accurate reasoning
+    /// that `vpn/` is where the trait's implementations and their own tests
+    /// live — but `vpn/mod.rs` already holds `for_type` and
+    /// `sweep_raised_records` and is the natural home for a teardown helper,
+    /// so a second teardown shape written there passed in silence while the
+    /// headline above said it would not. Excluding what the compiler excludes
+    /// from a release build makes the two coincide: the counted set is exactly
+    /// the code that ships, wherever in the crate it lives.
     #[test]
     fn boot_has_exactly_one_teardown_shape() {
-        let sources = crate_sources();
+        let sources = shipped_crate_sources();
 
-        // The needle appears escaped in this test's own source, so the only
-        // literal occurrence in `startup.rs` is the real one.
         let wrappers: Vec<_> = sources
             .iter()
             .filter_map(|(path, text)| {
@@ -1531,15 +1539,10 @@ mod tests {
         //
         // Counted rather than located: a line number would have to be moved
         // by every edit above it, and a gate its readers keep re-pinning stops
-        // being read. `vpn/` is where the trait's implementations and their
-        // own tests live, so calls there are the definitions being exercised
-        // and not teardowns `boot` reaches.
-        // Assembled rather than written out, so this test's own source is not
-        // one of the call sites it counts.
+        // being read.
         let call = concat!(".", "bring_down", "(");
         let direct: Vec<_> = sources
             .iter()
-            .filter(|(path, _)| !path.starts_with("vpn/"))
             .filter_map(|(path, text)| {
                 let n = text.matches(call).count();
                 (n > 0).then(|| format!("{path}: {n}"))
@@ -1558,6 +1561,246 @@ mod tests {
              fourth documented site wants this count and its comment moved \
              together",
         );
+    }
+
+    /// Every `.rs` under this crate's `src/` with its `#[cfg(test)]` regions
+    /// removed — the code that actually ships.
+    ///
+    /// This is what makes
+    /// [`boot_has_exactly_one_teardown_shape`]'s "anywhere in
+    /// `crates/torrentd/src/`" true. The census it replaces dropped whole
+    /// paths under `vpn/`, which was one directory narrower than the claim
+    /// above it and left `vpn/mod.rs` — which already holds `for_type` and
+    /// `sweep_raised_records` — outside a gate whose headline said it was
+    /// inside.
+    fn shipped_crate_sources() -> Vec<(String, String)> {
+        let sources = crate_sources();
+        let stripped: Vec<(String, String)> = sources
+            .iter()
+            .map(|(path, text)| (path.clone(), strip_cfg_test_regions(text)))
+            .collect();
+
+        // The stripper is what the gate's scope now rests on, so it is checked
+        // against the tree it just walked rather than trusted. Too little
+        // removed and a test's own call sites are counted as shipped code;
+        // too much and the gate passes on an empty set, which is the failure
+        // the census below it already guards against.
+        let joined_before: usize = sources.iter().map(|(_, t)| t.len()).sum();
+        let joined_after: usize = stripped.iter().map(|(_, t)| t.len()).sum();
+        assert!(
+            joined_after < joined_before,
+            "this crate has `#[cfg(test)]` regions and the stripper removed none",
+        );
+        for (path, text) in &stripped {
+            assert!(
+                !text.contains("#[cfg(test)]"),
+                "{path}: a `#[cfg(test)]` region survived the strip, so the \
+                 census counts test code as shipped code",
+            );
+        }
+        let startup = &stripped
+            .iter()
+            .find(|(p, _)| p == "startup.rs")
+            .expect("this module")
+            .1;
+        assert!(
+            startup.contains("async fn take_down_off_worker")
+                && startup.contains("impl Drop for BootCleanup"),
+            "the stripper removed shipped code: `take_down_off_worker` and \
+             `Drop for BootCleanup` are both outside any `#[cfg(test)]`",
+        );
+        stripped
+    }
+
+    /// Remove every `#[cfg(test)]` item from a Rust source, body and all.
+    ///
+    /// Brace-matched from the first `{` after the attribute, which covers
+    /// every shape this crate uses it in — `mod tests`, `impl`, and a bare
+    /// `fn`. Braces inside string, raw-string, byte-string and character
+    /// literals and inside comments are not braces, so those are skipped
+    /// rather than counted; a naive count would run off the end of a test that
+    /// merely contains a `"{"`.
+    fn strip_cfg_test_regions(text: &str) -> String {
+        const ATTR: &str = "#[cfg(test)]";
+        let bytes = text.as_bytes();
+        let mut out = String::with_capacity(text.len());
+        let mut i = 0;
+        while let Some(rel) = text[i..].find(ATTR) {
+            let attr_at = i + rel;
+            let Some(open) = text[attr_at..].find('{').map(|o| attr_at + o) else {
+                break;
+            };
+            let Some(close) = match_brace(bytes, open) else {
+                break;
+            };
+            out.push_str(&text[i..attr_at]);
+            i = close + 1;
+        }
+        out.push_str(&text[i..]);
+        out
+    }
+
+    /// The index of the `}` closing the `{` at `open`, skipping literals and
+    /// comments.
+    fn match_brace(bytes: &[u8], open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        let mut i = open;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                    i = bytes[i..]
+                        .iter()
+                        .position(|&c| c == b'\n')
+                        .map_or(bytes.len(), |n| i + n);
+                    continue;
+                }
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    let mut nest = 1usize;
+                    i += 2;
+                    while i < bytes.len() && nest > 0 {
+                        if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                            nest += 1;
+                            i += 2;
+                        } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                            nest -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                    continue;
+                }
+                b'r' if matches!(bytes.get(i + 1), Some(b'"') | Some(b'#')) => {
+                    if let Some(end) = skip_raw_string(bytes, i) {
+                        i = end;
+                        continue;
+                    }
+                }
+                b'"' => {
+                    i = skip_quoted(bytes, i, b'"');
+                    continue;
+                }
+                b'\'' => {
+                    // A lifetime (`'a`, `'static`) is not a character
+                    // literal: it has no closing quote. Only treat it as one
+                    // when a matching `'` follows within four bytes, which
+                    // covers `'x'`, `'\n'` and `'\u{7f}'`-free forms.
+                    if let Some(end) = char_literal_end(bytes, i) {
+                        i = end + 1;
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Index just past the closing delimiter of the string starting at
+    /// `bytes[start] == delim`, honouring backslash escapes.
+    fn skip_quoted(bytes: &[u8], start: usize, delim: u8) -> usize {
+        let mut i = start + 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2,
+                c if c == delim => return i + 1,
+                _ => i += 1,
+            }
+        }
+        bytes.len()
+    }
+
+    /// Index just past a raw string beginning at `bytes[start] == b'r'`, or
+    /// `None` if that `r` does not begin one.
+    fn skip_raw_string(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut i = start + 1;
+        let hashes_at = i;
+        while bytes.get(i) == Some(&b'#') {
+            i += 1;
+        }
+        let hashes = i - hashes_at;
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        i += 1;
+        while i < bytes.len() {
+            if bytes[i] == b'"' && bytes[i + 1..].iter().take(hashes).all(|&c| c == b'#') {
+                return Some(i + 1 + hashes);
+            }
+            i += 1;
+        }
+        Some(bytes.len())
+    }
+
+    /// The index of the closing `'` of a character literal at `start`, or
+    /// `None` when that `'` opens a lifetime instead.
+    fn char_literal_end(bytes: &[u8], start: usize) -> Option<usize> {
+        let mut i = start + 1;
+        if bytes.get(i) == Some(&b'\\') {
+            i += 1;
+        }
+        i += 1;
+        (bytes.get(i) == Some(&b'\'')).then_some(i)
+    }
+
+    /// The stripper, against the shapes it has to survive.
+    ///
+    /// Each of these is a way a naive brace count runs off the end and takes
+    /// shipped code with it — which would make the census pass on a set it
+    /// silently emptied.
+    #[test]
+    fn the_census_strips_test_regions_and_nothing_else() {
+        let kept = "fn shipped() { vpn.bring_down(\"a\"); }";
+
+        for (name, src) in [
+            (
+                "a brace inside a string literal",
+                "#[cfg(test)]\nmod tests {\n    fn t() { let s = \"{\"; }\n}\n",
+            ),
+            (
+                "a brace inside a char literal",
+                "#[cfg(test)]\nmod tests {\n    fn t() { let c = '{'; }\n}\n",
+            ),
+            (
+                "a brace inside a raw string",
+                "#[cfg(test)]\nmod tests {\n    fn t() { let s = r#\"{ \"}\"#; }\n}\n",
+            ),
+            (
+                "a brace inside a line comment",
+                "#[cfg(test)]\nmod tests {\n    // }\n    fn t() {}\n}\n",
+            ),
+            (
+                "a brace inside a block comment",
+                "#[cfg(test)]\nmod tests {\n    /* } /* } */ */\n    fn t() {}\n}\n",
+            ),
+            (
+                "a lifetime, which is not a char literal",
+                "#[cfg(test)]\nmod tests {\n    fn t<'a>(x: &'a str) -> &'a str { x }\n}\n",
+            ),
+            (
+                "a bare `#[cfg(test)] fn`, not a module",
+                "#[cfg(test)]\nfn helper() { let _ = 1; }\n",
+            ),
+        ] {
+            let stripped = strip_cfg_test_regions(&format!("{src}{kept}"));
+            assert_eq!(
+                stripped.trim(),
+                kept,
+                "{name}: the strip took shipped code with it, or left test \
+                 code behind",
+            );
+        }
+
+        // And a source with no test region is returned whole.
+        assert_eq!(strip_cfg_test_regions(kept), kept);
     }
 
     /// Every `.rs` under this crate's `src/`, as `(path relative to src/,
