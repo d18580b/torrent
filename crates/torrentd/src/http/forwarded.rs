@@ -81,22 +81,45 @@ impl Cidr {
         self.prefix
     }
 
+    /// Whether `ip` is inside this block.
+    ///
+    /// **Both sides** are folded to their v4 form first. A v4-mapped v6
+    /// address is the same host as its v4 form, and the fold has to run on
+    /// the configured entry as well as on the peer or the two spellings of
+    /// one host stop meeting:
+    ///
+    /// * the peer, because a dual-stack listener reports loopback as
+    ///   `::ffff:127.0.0.1` and not unmapping would silently stop trusting a
+    ///   proxy on the same machine;
+    /// * the entry, because `docs/running.md` teaches the two spellings as
+    ///   equivalent and tells the operator to name the address their proxy
+    ///   connects from — which on a dual-stack host is the mapped one they
+    ///   read out of a log. Demonstrated: a daemon booted with
+    ///   `trusted_proxies = ["::ffff:127.0.0.1"]` logged that trust set,
+    ///   passed `--check-config`, and then trusted **nobody**, standing the
+    ///   peer up for every forwarding header. It fails closed, but the logged
+    ///   set and the effective set disagreed, which is the one thing the boot
+    ///   line exists to prevent.
+    ///
+    /// The mapped range is the `/96` at `::ffff:0:0`, so an entry's prefix
+    /// inside it drops those 96 bits; a prefix shorter than 96 already spans
+    /// the whole mapped range and so spans every v4 address, which is what
+    /// `saturating_sub` says.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match (self.addr, ip) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                prefix_match(&net.octets(), &ip.octets(), self.prefix)
-            }
-            (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                prefix_match(&net.octets(), &ip.octets(), self.prefix)
-            }
-            // A v4-mapped v6 peer is the same host as its v4 form; a dual-stack
-            // listener reports loopback as ::ffff:127.0.0.1, so not unmapping
-            // here would silently stop trusting a proxy on the same machine.
-            (IpAddr::V4(_), IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
-                Some(v4) => self.contains(IpAddr::V4(v4)),
-                None => false,
+        let (net, prefix) = match self.addr {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => (IpAddr::V4(v4), self.prefix.saturating_sub(96)),
+                None => (self.addr, self.prefix),
             },
-            (IpAddr::V6(_), IpAddr::V4(_)) => false,
+            IpAddr::V4(_) => (self.addr, self.prefix),
+        };
+        match (net, unmap(ip)) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => prefix_match(&net.octets(), &ip.octets(), prefix),
+            (IpAddr::V6(net), IpAddr::V6(ip)) => prefix_match(&net.octets(), &ip.octets(), prefix),
+            // One side is a genuine v6 address and the other a v4 one. They
+            // are different hosts in different families; neither fold above
+            // can bring them together.
+            _ => false,
         }
     }
 }
@@ -1686,6 +1709,47 @@ mod tests {
         assert!(Cidr::parse("127.0.0.1")
             .unwrap()
             .contains("::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_v4_mapped_trust_entry_matches_the_v4_peer_it_names() {
+        // The other side of the same fold. `docs/running.md` teaches
+        // `::ffff:198.51.100.9` and `198.51.100.9` as one client and tells
+        // the operator to name the address their proxy connects from, which
+        // on a dual-stack host is the spelling they read out of a log — so
+        // the trust list has to match it. Demonstrated: a daemon booted with
+        // `trusted_proxies = ["::ffff:127.0.0.1"]` logged that trust set,
+        // passed `--check-config`, and then ignored every forwarding header
+        // from 127.0.0.1. It fails closed, but the logged set and the
+        // effective set disagreed.
+        assert!(Cidr::parse("::ffff:127.0.0.1")
+            .unwrap()
+            .contains("127.0.0.1".parse().unwrap()));
+        assert!(Cidr::parse("::ffff:127.0.0.1")
+            .unwrap()
+            .contains("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!Cidr::parse("::ffff:127.0.0.1")
+            .unwrap()
+            .contains("127.0.0.2".parse().unwrap()));
+
+        // A prefix inside the mapped `/96` drops those 96 bits rather than
+        // being read as a v4 prefix length: `/104` is `10.0.0.0/8` and
+        // `/120` is `10.0.0.0/24`.
+        let net = Cidr::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(net.contains("10.1.0.1".parse().unwrap()));
+        assert!(!net.contains("11.0.0.1".parse().unwrap()));
+        let net = Cidr::parse("::ffff:10.0.0.0/120").unwrap();
+        assert!(net.contains("10.0.0.1".parse().unwrap()));
+        assert!(!net.contains("10.0.1.1".parse().unwrap()));
+
+        // A genuine v6 block still does not match a v4 peer, and the
+        // converse.
+        assert!(!Cidr::parse("2001:db8::/32")
+            .unwrap()
+            .contains("10.0.0.1".parse().unwrap()));
+        assert!(!Cidr::parse("10.0.0.0/8")
+            .unwrap()
+            .contains("2001:db8::1".parse().unwrap()));
     }
 
     #[test]
