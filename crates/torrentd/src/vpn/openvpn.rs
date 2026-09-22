@@ -370,10 +370,13 @@ mod tests {
     /// survive the shutdown — the headline defect this pull request exists to
     /// fix, restored by its own runbook.
     ///
-    /// The image itself was never broken, because `util-linux-core` is
-    /// already in the base; nothing recorded that, which is how the table
-    /// came to be wrong and stayed wrong. Name `procps-ng` at either site
-    /// again and this fails.
+    /// The image itself was never broken by *this*, because `util-linux-core`
+    /// is already in the base; nothing recorded that, which is how the table
+    /// came to be wrong and stayed wrong. Name `procps-ng` as the package for
+    /// `kill` again, in the runbook row or in the image, and this fails.
+    /// Whether `procps-ng` belongs in the image at all is a different
+    /// question with a different consumer — see
+    /// [`the_runtime_image_installs_the_package_wg_quick_needs_for_sysctl`].
     #[test]
     fn the_documented_package_is_the_one_that_provides_the_kill_binary() {
         let root = repo_root();
@@ -396,16 +399,6 @@ mod tests {
 
         let containerfile = std::fs::read_to_string(root.join("deploy/Containerfile"))
             .expect("the image this change ships");
-        let install = containerfile
-            .lines()
-            .find(|l| l.contains("openssl ca-certificates curl"))
-            .expect("the runtime stage still installs its package set");
-        assert!(
-            !install.contains("procps-ng"),
-            "nothing in this repository invokes pkill or pgrep since the \
-             pattern-based teardown went, so procps-ng would be installed for \
-             nothing; got: {install}",
-        );
         assert!(
             containerfile.contains("util-linux"),
             "the image must record where /usr/bin/kill comes from, or it keeps \
@@ -414,11 +407,60 @@ mod tests {
         );
     }
 
-    /// The premise the two corrected sites rest on: no source in this
-    /// repository still calls a binary `procps-ng` is the package for.
+    /// The runtime image installs the package `wg-quick` needs, and says so.
     ///
-    /// Re-introduce a `pkill` or `pgrep` call site and this fails, which is
-    /// the signal that the package has to come back into the image with it.
+    /// This is the line, and the reason, that nothing in this repository was
+    /// watching. `wg-quick` line 241, inside `add_default()` and under
+    /// `set -e -o pipefail`, reads
+    /// `[[ $(sysctl -n net.ipv4.conf.all.src_valid_mark) -ne 1 ]] && cmd sysctl -q …=1`.
+    /// `/usr/sbin/sysctl` belongs to `procps-ng`. Drop the package and the
+    /// substitution yields the empty string, the `&&` chain reaches the final
+    /// `cmd sysctl`, that exits 127, and `cmd_up`'s `trap 'del_if; exit' EXIT`
+    /// deletes the link it has just created — so a full-tunnel
+    /// `AllowedIPs = 0.0.0.0/0` profile, the shape every commercial provider
+    /// uses, cannot come up in the image at all and the daemon exits because
+    /// no slot came up.
+    ///
+    /// **What this does and does not establish.** It pins the install list and
+    /// the recorded reason, which is what a `grep` of this repository's own
+    /// source for `pkill`/`pgrep` could never have reached — the consumer is a
+    /// third binary in a tool the daemon execs. It does **not** build the
+    /// image or bring a tunnel up in it; nothing in this repository does, and
+    /// that gap is what let the regression ship. Remove `procps-ng` from the
+    /// install list and this fails.
+    #[test]
+    fn the_runtime_image_installs_the_package_wg_quick_needs_for_sysctl() {
+        let containerfile = std::fs::read_to_string(repo_root().join("deploy/Containerfile"))
+            .expect("the image this change ships");
+        let install = containerfile
+            .lines()
+            .find(|l| l.contains("openssl ca-certificates curl"))
+            .expect("the runtime stage still installs its package set");
+        assert!(
+            install.contains("procps-ng"),
+            "`wg-quick` runs `sysctl` on the IPv4 default-route path under \
+             `set -e`, and /usr/sbin/sysctl is procps-ng's; without it no \
+             full-tunnel WireGuard profile can come up in this image; got: \
+             {install}",
+        );
+        assert!(
+            containerfile.contains("sysctl") && containerfile.contains("wg-quick"),
+            "the install list must record that `wg-quick`'s `sysctl` call is \
+             the consumer, or the next reader searches this repository's \
+             source for `pkill` and drops the package again",
+        );
+    }
+
+    /// No source in this repository calls a binary `procps-ng` is the package
+    /// for — so the package's place in the runtime image rests entirely on
+    /// `wg-quick`, and on nothing this repository could grep for.
+    ///
+    /// That distinction is the whole lesson of the removal this replaces: the
+    /// package was dropped on the evidence that this search comes back empty,
+    /// and it was the wrong surface to search. Re-introduce a `pkill` or
+    /// `pgrep` call site and this fails, which is the signal that
+    /// `docs/running.md` §1's prerequisite table needs a row for it — hosts
+    /// that run the daemon outside this image get no install list at all.
     #[test]
     fn no_source_invokes_the_binaries_procps_ng_provides() {
         let mut offenders = Vec::new();
@@ -451,8 +493,9 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "procps-ng was dropped from the image because nothing calls its \
-             binaries; these do: {offenders:?}",
+            "the runtime image carries procps-ng for `wg-quick`'s `sysctl` and \
+             not for this repository; these call its binaries, so the host \
+             prerequisite table owes them a row: {offenders:?}",
         );
     }
 }

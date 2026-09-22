@@ -69,16 +69,43 @@ FROM registry.fedoraproject.org/fedora-minimal:43
 # is installed for it here. An image working by inheritance rather than by
 # declaration is what let the runbook name the wrong package for two rounds.
 #
-# `procps-ng` is **not** it: that package ships `pgrep` and `pkill` and no
-# `kill`. It was installed here for the earlier pattern-based `pkill`
-# teardown, which a recycled pid made unsafe; that call site is gone, no
-# source in this repository invokes `pkill` or `pgrep`, so the package is
-# not installed either. Note what that also means: this image carries no
-# process-inspection tool at all — no `ps`, `pkill` or `pgrep` — for an
-# operator who `podman exec`s into it. The daemon needs none of them; an
-# operator who does wants a debug image.
+# `procps-ng` is **not** where `kill` comes from: that package ships `pgrep`
+# and `pkill` and no `kill`. It is installed all the same, and the consumer is
+# **`wg-quick`, not this repository's source**.
+#
+# `wg-quick` line 241, inside `add_default()` and under `set -e -o pipefail`:
+#
+#     [[ $proto == -4 ]] && [[ $(sysctl -n net.ipv4.conf.all.src_valid_mark) -ne 1 ]] \
+#         && cmd sysctl -q net.ipv4.conf.all.src_valid_mark=1
+#
+# `/usr/sbin/sysctl` belongs to `procps-ng` — `rpm -qf /usr/sbin/sysctl` in
+# this base prints procps-ng-4.0.4-7.fc43.1. Without it the substitution
+# yields the empty string, `[[ "" -ne 1 ]]` is true, and the final `cmd
+# sysctl` — the command after the last `&&`, which `set -e` does not exempt —
+# exits 127. `cmd_up`'s `trap 'del_if; exit' INT TERM EXIT` then deletes the
+# link it has just created. That path runs for `AllowedIPs = 0.0.0.0/0`, the
+# full-tunnel shape every commercial provider uses and the one
+# `deploy/torrentd.sample.toml` names for ProtonVPN and PIA, so dropping this
+# package means **no WireGuard slot can come up in this image** and the daemon
+# exits because no slot came up. A narrow `AllowedIPs` never reaches
+# `add_default()` and is unaffected, which is what makes the breakage easy to
+# miss.
+#
+# The package was once here for a pattern-based `pkill` teardown that a
+# recycled pid made unsafe; that call site is gone, and it was dropped on the
+# evidence that `grep -rn 'pkill|pgrep' crates/` returns nothing. That search
+# was of **this repository's source**, for two of the package's binaries; the
+# dependency is a third binary, in a tool the daemon execs. The standing
+# lesson, recorded where the next reader meets it: **a runtime dependency of a
+# binary this daemon execs is not discoverable by grepping this repository.**
+# Before removing this package again, establish that nothing the daemon execs
+# — `ip`, `wg`, `wg-quick`, `nft` — needs it.
+#
+# It also happens to restore the process-inspection tools (`ps`, `pgrep`,
+# `pkill`) for an operator who `podman exec`s in. That is a side effect, not
+# the reason.
 RUN microdnf install -y \
-        openssl ca-certificates curl iproute wireguard-tools nftables \
+        openssl ca-certificates curl iproute wireguard-tools nftables procps-ng \
     && microdnf clean all
 
 COPY --from=builder /src/target/release/torrentd /usr/local/bin/torrentd
