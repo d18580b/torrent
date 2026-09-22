@@ -1325,11 +1325,29 @@ fn a_v3_step_that_fails_leaves_the_version_and_the_schema_agreeing() {
     );
 }
 
-/// Build the file `b28a778` left behind: v3's schema under v2's version.
+/// The indexes on `torrent`, as the file on disk reports them.
+fn torrent_indexes(db: &Path) -> Vec<String> {
+    let c = rusqlite::Connection::open(db).unwrap();
+    let mut st = c
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'torrent'")
+        .unwrap();
+    let out = st
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    out
+}
+
+/// Build a **complete** v3 schema under v2's version: the file `b28a778` left
+/// behind.
 ///
 /// That build folded the slot→profile rename into `SCHEMA_V1` at
 /// `SCHEMA_VERSION = 2`, so the file it writes reports 2 and already carries
-/// `profile`. Nothing else produces this shape.
+/// `profile`, with both of v3's indexes in place. A build that applied
+/// `SCHEMA_V3` and died before the `PRAGMA` leaves the same shape;
+/// `build_half_applied_v3_index` builds the shapes where an index statement
+/// was lost as well.
 fn build_b28a778_index(db: &std::path::Path) {
     build_v1_index(db);
     apply_v2_journal(db);
@@ -1362,7 +1380,8 @@ fn a_b28a778_index_opens_and_keeps_its_journal() {
     let db = dir.path().join("pool.db");
     build_b28a778_index(&db);
 
-    let store = PoolStore::open(&db).expect("the one shape that is recognised rather than stepped");
+    let store =
+        PoolStore::open(&db).expect("v3's columns under v2's version are recognised, not stepped");
     drop(store);
 
     assert_eq!(
@@ -1401,11 +1420,151 @@ fn a_b28a778_index_opens_and_keeps_its_journal() {
     PoolStore::open(&db).expect("a second open is an ordinary v3 open");
 }
 
+/// Build a **half-applied** v3 index at `db`: `SCHEMA_V3` replayed statement
+/// by statement and cut off after `statements` of them, with `user_version`
+/// left at 2.
+///
+/// That is what a build applying `SCHEMA_V3` through `execute_batch` with no
+/// explicit transaction around it leaves behind, because that gives one
+/// implicit transaction *per statement*: the rename commits, and a later
+/// statement is lost to `SQLITE_FULL`, `SQLITE_IOERR` or the process dying.
+/// Two cut points matter, and both report `user_version = 2` over a `torrent`
+/// table that already has `profile` and no `slot`:
+///
+/// * `1` — the rename alone, so `torrent_by_slot` survives, mislabelled over
+///   the new column, which is the state `SCHEMA_V3`'s own comment says it
+///   drops the index to avoid.
+/// * `2` — the rename and the drop, so there is **no index on `profile` at
+///   all**, on an index designed to carry one row per file of a
+///   multi-terabyte library.
+fn build_half_applied_v3_index(db: &Path, statements: usize) {
+    build_v1_index(db);
+    apply_v2_journal(db);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.execute_batch(
+        "INSERT INTO plan(id, kind, created_at, status, spec)
+             VALUES (1, 'delete', 0, 'applied', '{}');
+         INSERT INTO plan_step(plan_id, seq, op, src, status)
+             VALUES (1, 0, 'unlink', '/pool/a.bin', 'done');",
+    )
+    .unwrap();
+    // One `execute` per statement, each its own implicit transaction, in
+    // `SCHEMA_V3`'s order.
+    let v3 = [
+        "ALTER TABLE torrent RENAME COLUMN slot TO profile",
+        "DROP INDEX torrent_by_slot",
+        "CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL",
+    ];
+    for s in v3.iter().take(statements) {
+        c.execute(s, []).unwrap();
+    }
+    // The version never moved: the `PRAGMA` is the last thing the step does.
+    assert_eq!(
+        c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2,
+    );
+}
+
+#[test]
+fn a_half_applied_v3_index_gains_the_index_the_lost_statement_would_have_made() {
+    // C52. The recognition matches on columns, and the columns of a file whose
+    // `CREATE INDEX` was lost are indistinguishable from those of a file that
+    // completed: `profile`, no `slot`, `user_version = 2`. Stamping the
+    // version over it is permanent — `migrate` returns at
+    // `found == SCHEMA_VERSION` on every later open — so the index that
+    // carries every per-profile lookup would never be created by anything,
+    // and the operator was told the version was stamped "to match the schema
+    // it already has".
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_half_applied_v3_index(&db, 2);
+    assert!(
+        torrent_indexes(&db)
+            .iter()
+            .all(|n| n != "torrent_by_profile"),
+        "the fixture is the file with the index statement lost",
+    );
+
+    let store = PoolStore::open(&db).expect("a half-applied v3 opens");
+    drop(store);
+
+    assert_eq!(user_version(&db), 3, "the version agrees with the schema");
+    let idx = torrent_indexes(&db);
+    assert!(
+        idx.iter().any(|n| n == "torrent_by_profile"),
+        "the file must end with v3's index on profile, got {idx:?}",
+    );
+
+    // What the index is for, stated as the plan the query takes rather than as
+    // the presence of a name.
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let plan: String = c
+        .query_row(
+            "EXPLAIN QUERY PLAN SELECT infohash FROM torrent WHERE profile = 'acct_a'",
+            [],
+            |r| r.get(3),
+        )
+        .unwrap();
+    assert!(
+        plan.contains("torrent_by_profile"),
+        "the lookup must use the index rather than scan, got {plan:?}",
+    );
+
+    // Nothing moved: the rename had already run, so this is two index
+    // statements and a `PRAGMA`.
+    let torrents: i64 = c
+        .query_row("SELECT count(*) FROM torrent", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(torrents, 1);
+    let steps: i64 = c
+        .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(steps, 1, "the mutation journal survived");
+    drop(c);
+
+    assert!(
+        !PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+        "an index is derivable from its table, so nothing was copied aside",
+    );
+    PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+}
+
+#[test]
+fn a_half_applied_v3_index_loses_the_index_name_the_rename_left_mislabelled() {
+    // C52, the other cut point. Here the `DROP INDEX` was lost, so the file
+    // carries `torrent_by_slot ON torrent(profile)` — SQLite rewrote the
+    // index definition to follow the rename. `SCHEMA_V3`'s comment says that
+    // index is dropped and recreated "rather than left mislabelled"; stamping
+    // the version leaves it mislabelled forever.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_half_applied_v3_index(&db, 1);
+    assert!(
+        torrent_indexes(&db).iter().any(|n| n == "torrent_by_slot"),
+        "the fixture is the file with the drop lost",
+    );
+
+    PoolStore::open(&db).expect("a half-applied v3 opens");
+
+    assert_eq!(user_version(&db), 3);
+    let idx = torrent_indexes(&db);
+    assert!(
+        idx.iter().any(|n| n == "torrent_by_profile"),
+        "v3's index must be present under its own name, got {idx:?}",
+    );
+    assert!(
+        !idx.iter().any(|n| n == "torrent_by_slot"),
+        "and the name the rename left over the new column must be gone, got {idx:?}",
+    );
+}
+
 #[test]
 fn a_genuine_v2_index_is_still_migrated_by_the_version_keyed_step() {
-    // The recognition is bounded to one shape and must not swallow the
-    // ordinary upgrade. A real v2 file has `slot` and no `profile`, so it
-    // cannot match, and it takes the DDL path with its backup.
+    // The recognition matches v3's columns under v2's version and must not
+    // swallow the ordinary upgrade. A real v2 file has `slot` and no
+    // `profile`, so it cannot match, and it takes the DDL path with its
+    // backup.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pool.db");
     build_v1_index(&db);

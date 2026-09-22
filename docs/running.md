@@ -249,11 +249,19 @@ start the daemon again.
 
 If you ran one of this change's own pre-release builds, you may hold a
 `pool.db` that reports schema version 2 but already carries the `profile`
-column. This build recognises that one file, stamps the version to match the
-schema it already has, and runs no migration on it — nothing moves and the
-journal is kept. Restoring `<db_path>.pre-v3.bak` is **not** the remedy for
-that file: the copy is taken from the database as it stands, so it has the same
-contents.
+column. This build recognises that file — whichever pre-release build wrote it
+— and stamps the version to match the columns. No data moves and the journal is
+kept.
+
+Those builds did not all leave the same file. One wrote the rename with both of
+v3's indexes in place; another could commit the rename and lose an index
+statement, leaving either no index on `profile` at all or the old
+`torrent_by_slot` name over the new column. So the version is stamped only
+together with whatever index work the file is still missing, in one
+transaction: after this open the file has `torrent_by_profile` and nothing
+called `torrent_by_slot`. The log line says which of the two happened. Restoring
+`<db_path>.pre-v3.bak` is **not** the remedy for such a file: the copy is taken
+from the database as it stands, so it has the same contents.
 
 **3. Point each profile at its files, or move them.** Resume and `.torrent`
 files used to live directly under `resume_dir` and `torrent_dir`; they now live

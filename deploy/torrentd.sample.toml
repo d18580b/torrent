@@ -212,9 +212,12 @@ dht               = true
 # stops, names the backup path and the reason, and leaves the index as it was.
 #
 # A `pool.db` from one of this change's own pre-release builds can report
-# version 2 while already carrying `profile`. That one file is recognised and
-# its version stamped to match, with no migration and nothing moved; the
-# `.pre-v3.bak` copy is not a remedy for it, having the same contents.
+# version 2 while already carrying `profile`. Such a file is recognised
+# whichever of those builds wrote it: the version is stamped to match the
+# columns, and where v3's indexes did not come with them — no index on
+# `profile`, or the old `torrent_by_slot` name over it — they are put right in
+# the same transaction. No data moves; the `.pre-v3.bak` copy is not a remedy
+# for it, having the same contents.
 #
 # [pool]
 # roots       = ["/data/torrents"]        # must not nest
