@@ -406,7 +406,11 @@ pre-flight, resource limits), a multi-stage `Containerfile`, and a
 
 ## Testing
 
-Every command lives in [`mise.toml`](mise.toml), which is what CI runs.
+Every command below lives in [`mise.toml`](mise.toml), and where CI runs one
+it invokes the task rather than a second copy of the command. What
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) still spells out for
+itself, besides each job's setup, is the field-name grep, the container image
+build, and the `convco` check over a pull request's commit range.
 
 ```bash
 mise run check           # fmt + clippy, warnings denied
