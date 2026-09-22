@@ -235,10 +235,20 @@ the pool index. It prints which file it read and how many entries it took.
 torrent→account column from `slot` to `profile`. A build predating this change
 cannot open the result. Before that step the daemon copies the database aside
 as `<db_path>.pre-v3.bak`; restoring that file is how you go back to a build
-that predates this change. Keep it until you are sure: it is the only copy of
-the `plan`/`plan_step` mutation journal, which a rescan does not reconstruct.
-The migration is applied in one transaction, so a failure part way through
-leaves the index exactly as it was.
+that predates this change. It is the only copy of the `plan`/`plan_step`
+mutation journal, which a rescan does not reconstruct. The migration is applied
+in one transaction, so a failure part way through leaves the index exactly as
+it was.
+
+**That copy is yours to remove, and nothing removes it for you.** Nothing
+deletes it, nothing ages it out, and no later start reclaims its space: keep it
+until the new index has been in service long enough that you would not go back,
+then delete it yourself. The daemon cannot make that judgement for you, and
+deleting an operator's only rollback on a timer is not a judgement it should
+be making. If a `.pre-v3.bak` is already at that path when a migration starts —
+whatever it is, including a symlink — the daemon keeps it, says so, and takes
+no new copy: it is from an earlier attempt at this same migration, which rolled
+back, so it describes the same state.
 
 The copy is a full second copy of the index, so **the first open on this build
 needs free space on the state volume equal to the size of `pool.db`**. The
