@@ -126,9 +126,12 @@ What the daemon does and does not create:
 
 The daemon also writes small state files of its own, beside the resume data, in
 **the parent of `resume_dir`** (`/var/lib/torrentd` under the shipped unit).
-It creates that directory if it is missing. Both kinds are safe
-to delete **while the daemon is stopped**, and neither is safe to delete while
-it is running:
+Each writer that puts a file there creates the directory first, so the
+directory appears the **first time one of those files is written** and not at
+startup: a single-session deployment with no tunnel configured has neither of
+the two files below, and may never have the directory at all. Both kinds are
+safe to delete **while the daemon is stopped**, and neither is safe to delete
+while it is running:
 
 - **`openvpn-<iface>.pid`** — the pid `openvpn --writepid` recorded for an
   OpenVPN slot. It is the only handle the teardown has on that process, and it
