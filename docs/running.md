@@ -427,17 +427,37 @@ joined in order first, exactly as RFC 9110 §5.2-5.3 defines them. A proxy that
 forwards client-supplied values intact is a proxy that cannot be trusted about
 anything.
 
-**The scheme is the exception, and it reads the chain from the other end.**
-"Which client is this" is answered by the nearest hop; "was the original
-request over TLS" is answered by the outermost one, because that is where TLS
-is terminated. So `X-Forwarded-Proto: https, http` — a TLS edge in front of a
-plain-HTTP inner proxy — means the request *was* over TLS and the session
-cookie gets its `Secure` attribute; `https` anywhere in the chain means some
-hop terminated TLS. Reading the last entry there would withhold `Secure` from
+**The scheme is the exception, and it reads the whole chain.** "Which client
+is this" is answered by the nearest hop and by no other; "was the original
+request over TLS" is answered by **any** hop that says `https`, because TLS is
+terminated at the edge and every hop behind it honestly reports plain HTTP. So
+`X-Forwarded-Proto: https, http` — a TLS edge in front of a plain-HTTP inner
+proxy — means the request *was* over TLS and the session cookie gets its
+`Secure` attribute. Reading the last entry there would withhold `Secure` from
 a deployment that really is TLS-fronted, and the browser would then send the
-session cookie in clear to any plain-HTTP origin on the host. If the whole
-`X-Forwarded-Proto` value carries nothing readable it is still unreadable, and
-unreadable is `false`.
+session cookie in clear to any plain-HTTP origin on the host.
+
+`Forwarded`'s `proto=` is read under the same rule, so the same deployment
+gets the same answer whichever name your proxies speak: `Forwarded:
+proto=https, proto=http` and `Forwarded: proto=https, for=198.51.100.9` both
+mean TLS, the second being the ordinary RFC 7239 shape where an inner proxy
+appends only the client it saw because it terminated no TLS.
+
+If the final element of the chain carries nothing readable the header is
+unreadable, and unreadable is `false` however much `https` sits to its left —
+that is the same readability rule the address arm uses, and it is what stops
+an appending proxy's empty contribution promoting a client's earlier entry.
+
+**What this rule gives up, and why.** A client's own earlier `https` does win,
+wherever your proxy appends rather than overwrites. Nothing in a request
+distinguishes "TLS edge, then plain inner proxy, both honest" from "client's
+forgery, then honest appending proxy" — they are the same bytes — so this is a
+choice between two harms. Withholding `Secure` from a genuine TLS edge sends
+your session cookie in clear; honouring a forged `https` marks the forger's
+**own** cookie `Secure`, which the browser then neither stores nor returns over
+`http://`, so the forger breaks their own login and nobody else's. Stripping
+what the client sent, which this section already requires, removes the second
+case entirely.
 
 **The compose stack does not publish the API to the host.** `deploy/compose.yaml`
 publishes only the BitTorrent ports on `torrentd` and 80/443 on `proxy`; the
