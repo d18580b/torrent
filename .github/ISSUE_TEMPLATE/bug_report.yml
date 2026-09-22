@@ -93,7 +93,13 @@ body:
         Either way, please do **not** start a second `torrentd` to collect a
         log: it would contend with the running one for the same tunnels,
         kill-switch table, resume directory and pool index.
-        Redact tracker URLs, passkeys and API tokens before pasting.
+
+        **Redact before you paste, and know where this is going.** Take out the
+        tracker announce URLs — the passkey in one identifies your account on
+        that tracker — and any API token. This tracker is **not** confidential
+        from other people with access to this repository; `SECURITY.md` says so
+        under *Reporting a vulnerability*, and that is the audience a pasted
+        passkey reaches.
 
         A line looks like this:
 
