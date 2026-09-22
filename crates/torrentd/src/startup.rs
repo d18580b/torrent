@@ -505,6 +505,49 @@ pub async fn boot(
                     continue;
                 }};
             }
+            // A bring-up or teardown task that does not join — a panic inside
+            // `spawn_blocking`, or the runtime shutting down under it — fails
+            // **that slot**, and the boot carries on with the rest. Every one
+            // of these sites was a `?`, which aborted the whole boot: one
+            // slot's panicking `wg-quick` wrapper took every other slot's
+            // tunnel down with it, on a daemon whose entire purpose is to keep
+            // the remaining slots seeding. Failing the slot is what the
+            // surrounding code does with every other per-slot failure, it is
+            // what this daemon did before this series, and a failed slot is
+            // still visible: `SlotRegistry::with_failed` keeps it in `/slots`
+            // and `vpn_monitor` emits its fenced series.
+            //
+            // `boot` as a whole still fails when *no* slot comes up, which is
+            // the check twenty lines below.
+            macro_rules! slot_task_failed {
+                ($cfg:expr, $what:literal, $err:expr) => {{
+                    let e = $err;
+                    error!(
+                        slot_id = %$cfg.id,
+                        error.cause = %e,
+                        concat!($what, " task did not join; slot disabled"),
+                    );
+                    fail_slot!($cfg, format!(concat!($what, " task failed: {}"), e));
+                }};
+            }
+            // The teardowns below all run on a slot that is failing anyway, so
+            // a task that does not join is reported against the slot and does
+            // not replace the reason it is failing for. It does not abort the
+            // boot either: the tunnel that may still be standing belongs to
+            // this slot, and taking the other slots down does not remove it.
+            macro_rules! tear_down_or_warn {
+                ($cfg:expr) => {
+                    if let Err(e) = cleanup.take_down_off_worker(&$cfg.vpn_interface).await {
+                        warn!(
+                            slot_id = %$cfg.id,
+                            vpn_iface = %$cfg.vpn_interface,
+                            error.cause = %e,
+                            "VPN teardown task did not join; the slot is disabled \
+                             either way and its tunnel may still be standing",
+                        );
+                    }
+                };
+            }
             for s in &cfg.slot {
                 // 1) Bring the VPN up first. Safety Rule 1: if it
                 //    fails, the slot's lt::session is never constructed
@@ -518,9 +561,10 @@ pub async fn boot(
                 // Recorded before the attempt and torn down on failure — a
                 // half-up tunnel is the one failure path nothing else can
                 // reach. See `BootCleanup::bring_up_tracked`.
-                let brought_up = cleanup
-                    .bring_up_tracked(s.vpn_type, s.vpn_profile())
-                    .await?;
+                let brought_up = match cleanup.bring_up_tracked(s.vpn_type, s.vpn_profile()).await {
+                    Ok(r) => r,
+                    Err(e) => slot_task_failed!(s, "VPN bring-up", e),
+                };
                 let tunnel_ip = match brought_up {
                     Ok(ip) => ip,
                     Err(e) => {
@@ -547,7 +591,7 @@ pub async fn boot(
                         None => {
                             // validate_set should have caught this; be defensive.
                             error!(slot_id = %s.id, "static slot missing listen_port; slot disabled");
-                            cleanup.take_down_off_worker(&s.vpn_interface).await?;
+                            tear_down_or_warn!(s);
                             fail_slot!(s, "static slot has no listen_port".to_string());
                         }
                     },
@@ -557,7 +601,7 @@ pub async fn boot(
                             Ok(ip) => ip,
                             Err(e) => {
                                 error!(slot_id = %s.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; slot disabled");
-                                cleanup.take_down_off_worker(&s.vpn_interface).await?;
+                                tear_down_or_warn!(s);
                                 fail_slot!(s, format!("invalid port_forward_gateway: {e}"));
                             }
                         };
@@ -574,7 +618,7 @@ pub async fn boot(
                             }
                             Err(e) => {
                                 error!(slot_id = %s.id, tunnel_ip = %tunnel_ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; slot disabled (no bare-IP fallback)");
-                                cleanup.take_down_off_worker(&s.vpn_interface).await?;
+                                tear_down_or_warn!(s);
                                 fail_slot!(s, format!("NAT-PMP negotiation failed: {e}"));
                             }
                         }
@@ -632,7 +676,7 @@ pub async fn boot(
                         // the teardown contract — a timeout on the join, a
                         // retry, a metric — applied through the helper missed
                         // this arm silently.
-                        cleanup.take_down_off_worker(&s.vpn_interface).await?;
+                        tear_down_or_warn!(s);
                         failed_slots.push(crate::slot_registry::FailedSlot {
                             config: s.clone(),
                             reason: format!("session construction failed: {e}"),
