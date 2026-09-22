@@ -357,6 +357,17 @@ where
 
 pub struct DaemonHandle {
     cfg: Config,
+    /// Where a VPN manager keeps state a *later* process has to find, as
+    /// `boot` resolved it once at `run_dir`.
+    ///
+    /// Threaded through rather than re-derived from `cfg` in the shutdown
+    /// teardown. A manager built on one path and torn down through a manager
+    /// built on another cannot find the pid file or the raised-interface
+    /// record the first one wrote, and `boot` already resolves this once "so
+    /// bring-up and teardown agree". Re-deriving it here is the second source
+    /// of truth for one path that was rejected one frame further down, taken
+    /// one frame up.
+    run_dir: std::path::PathBuf,
     /// The `--config` path exactly as parsed by clap. Threaded through rather
     /// than re-derived from `std::env::args()`, which mishandles `--config=X`
     /// and the `-c X` short form and so silently disabled SIGHUP reload.
@@ -971,6 +982,7 @@ pub async fn boot(
 
     Ok(DaemonHandle {
         cfg,
+        run_dir,
         config_path,
         state,
         source,
@@ -994,6 +1006,7 @@ impl DaemonHandle {
     pub async fn run_until_signal(self) -> i32 {
         let DaemonHandle {
             cfg,
+            run_dir,
             config_path,
             state,
             source,
@@ -1206,7 +1219,6 @@ impl DaemonHandle {
         // connected to the provider indefinitely. Only on the graceful path —
         // a startup failure already tears down what it created.
         if let Some(slots) = &slot_registry {
-            let run_dir = cfg.state_dir();
             let jobs: Vec<_> = slots
                 .iter()
                 .map(|entry| {
