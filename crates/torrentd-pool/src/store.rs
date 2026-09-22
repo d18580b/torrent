@@ -621,7 +621,23 @@ impl PoolStore {
         // migration, which the fresh-database test states as a property.
         if found >= 0 && self.carries_v3_columns()? {
             let indexed = self.has_torrent_index("torrent_by_profile")?;
-            if found == SCHEMA_VERSION && indexed {
+            // `torrent_by_slot` surviving is a defect in its own right, not
+            // merely a symptom of `torrent_by_profile` being absent. Keying
+            // the repair on the *new* index being missing meant a file
+            // carrying both came out of here still carrying both: at version 2
+            // it was stamped to 3 with the stale name intact, and at version 3
+            // it returned below having had nothing done and nothing said — no
+            // log line at all — while `docs/running.md` promises,
+            // unconditionally, that "after this open the file has
+            // `torrent_by_profile` and nothing called `torrent_by_slot`".
+            // Both demonstrated.
+            //
+            // `SCHEMA_V3_INDEXES` is written to tolerate the work already
+            // being done (`DROP … IF EXISTS`, `CREATE … IF NOT EXISTS`), so
+            // running it for a stale name is the same statement pair either
+            // way.
+            let stale = self.has_torrent_index("torrent_by_slot")?;
+            if found == SCHEMA_VERSION && indexed && !stale {
                 // An ordinary v3 open: the version and the schema agree.
                 return Ok(());
             }
@@ -630,7 +646,7 @@ impl PoolStore {
             // without them is the state this arm exists to end.
             self.conn.execute_batch("BEGIN IMMEDIATE")?;
             let repaired = (|| -> Result<(), PoolError> {
-                if !indexed {
+                if !indexed || stale {
                     self.conn.execute_batch(SCHEMA_V3_INDEXES)?;
                 }
                 self.conn
@@ -642,7 +658,7 @@ impl PoolStore {
                 return Err(e);
             }
             self.conn.execute_batch("COMMIT")?;
-            match (found == SCHEMA_VERSION, indexed) {
+            match (found == SCHEMA_VERSION, indexed && !stale) {
                 (false, true) => warn!(
                     target: "torrentd_pool::store",
                     from_version = found,
@@ -671,11 +687,12 @@ impl PoolStore {
                     from_version = found,
                     to_version = SCHEMA_VERSION,
                     indexes_repaired = true,
-                    "pool index reports user_version = 3 but does not carry v3's indexes; \
-                     creating torrent_by_profile and dropping torrent_by_slot if it survived the \
-                     rename. A superseded build of this change stamped the version over a schema \
-                     whose index statements had been lost, and the version being correct is why \
-                     nothing repaired it until now. No data moved",
+                    "pool index reports user_version = 3 but its indexes are not the set v3 \
+                     describes; creating torrent_by_profile if it is missing and dropping \
+                     torrent_by_slot if it survived the rename. A superseded build of this change \
+                     stamped the version over a schema whose index statements had been lost — or \
+                     left the old index name beside the new one — and the version being correct \
+                     is why nothing repaired it until now. No data moved",
                 ),
                 // Returned above: the version and the schema already agree.
                 (true, true) => unreachable!("an ordinary v3 open returns before the repair"),
