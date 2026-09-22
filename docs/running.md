@@ -416,7 +416,16 @@ address your proxy connects from, which is what this section asks for anyway.
 
 A v4-mapped address is folded to its v4 form, so `::ffff:198.51.100.9` and
 `198.51.100.9` are one client: one throttle bucket, one spelling in the log.
-That matches how the trust list itself matches a v4-mapped peer.
+The fold runs on every path — the socket peer, an address a forwarding header
+supplied, and both sides of a `trusted_proxies` entry — so you may write
+either spelling in the trust list and mean the same host.
+
+**A dual-stack `http_listen` is a supported posture.** `[::]:8080` binds both
+families and reports every v4 client as `::ffff:a.b.c.d`; that is the reason
+the fold exists, and it is why one host reaching the daemon directly and the
+same host named through your proxy are one throttle bucket rather than two.
+The default is still `127.0.0.1:8080`, and a non-loopback bind of either
+family still requires `[auth]` (§6).
 
 Each of these headers is a chain every hop appends to, so torrentd reads the
 *last* entry — the one the trusted proxy added — rather than the first, which
