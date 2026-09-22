@@ -14,6 +14,7 @@ use crate::app_state::AppState;
 use crate::http::torrents::summarize;
 use crate::http::torrents::TorrentSummary;
 use crate::profile_registry::ProfileEntry;
+use crate::profile_registry::Resolution;
 
 #[derive(Serialize)]
 pub struct ProfileSummary {
@@ -147,19 +148,20 @@ pub async fn get(
 ) -> Result<Json<ProfileDetail>, (StatusCode, Json<serde_json::Value>)> {
     let profiles = &s.profiles;
     let profile_id = ProfileId::new(id);
-    let Some(e) = profiles.get(&profile_id) else {
-        // A configured profile that failed to come up is still a profile; answering
-        // 404 would be indistinguishable from a typo in the id.
-        if let Some(f) = profiles.failed_profile(&profile_id) {
+    // A configured profile that failed to come up is still a profile; answering
+    // 404 would be indistinguishable from a typo in the id.
+    let e = match profiles.resolve(&profile_id) {
+        Resolution::Active(e) => e,
+        Resolution::Failed(f) => {
             return Ok(Json(ProfileDetail {
                 summary: summary_of_failed(&s, f),
                 vpn_interface: f.config.vpn_interface().map(str::to_string),
                 allowed_tracker_domains: f.config.allowed_tracker_domains.clone(),
                 paused_for_vpn: 0,
                 port_forward_ok: false,
-            }));
+            }))
         }
-        return Err(no_such_profile());
+        Resolution::Unknown => return Err(no_such_profile()),
     };
     let h = e.health();
     Ok(Json(ProfileDetail {
@@ -186,7 +188,8 @@ pub async fn torrents(
 ) -> Result<Json<Vec<TorrentSummary>>, (StatusCode, Json<serde_json::Value>)> {
     let profiles = &s.profiles;
     let profile_id = ProfileId::new(id);
-    if !profiles.is_configured(&profile_id) {
+    // Active or failed alike: this route reads the registry, not an engine.
+    if matches!(profiles.resolve(&profile_id), Resolution::Unknown) {
         return Err(no_such_profile());
     }
     let items = s
@@ -204,13 +207,12 @@ pub async fn pause_all(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let profiles = &s.profiles;
     let profile_id = ProfileId::new(id);
-    let Some(entry) = profiles.get(&profile_id) else {
+    let entry = match profiles.resolve(&profile_id) {
+        Resolution::Active(e) => e,
         // Configured but never brought up: refuse with the reason rather than
         // deny the id exists.
-        if let Some(f) = profiles.failed_profile(&profile_id) {
-            return Err(profile_failed(&f.reason));
-        }
-        return Err(no_such_profile());
+        Resolution::Failed(f) => return Err(profile_failed(&f.reason)),
+        Resolution::Unknown => return Err(no_such_profile()),
     };
     let mut count = 0usize;
     for h in s.state.handles_for_profile(&profile_id) {
@@ -228,11 +230,10 @@ pub async fn resume_all(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let profiles = &s.profiles;
     let profile_id = ProfileId::new(id);
-    let Some(entry) = profiles.get(&profile_id) else {
-        if let Some(f) = profiles.failed_profile(&profile_id) {
-            return Err(profile_failed(&f.reason));
-        }
-        return Err(no_such_profile());
+    let entry = match profiles.resolve(&profile_id) {
+        Resolution::Active(e) => e,
+        Resolution::Failed(f) => return Err(profile_failed(&f.reason)),
+        Resolution::Unknown => return Err(no_such_profile()),
     };
     // A VpnDown profile is fenced: its torrents were paused because the tunnel is
     // gone. Refuse to resume until the operator restarts.

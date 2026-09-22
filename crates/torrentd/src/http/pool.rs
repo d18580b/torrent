@@ -339,12 +339,13 @@ pub async fn adopt(
         // Configured and failed is not the same as unknown, and telling an
         // operator their id does not exist sends them to the config file for
         // a tunnel problem.
-        return Err(match s.profile_failure_reason(&profile) {
-            Some(reason) => err(
+        return Err(match s.profiles.resolve(&profile) {
+            crate::profile_registry::Resolution::Failed(f) => err(
                 StatusCode::CONFLICT,
-                format_args!("profile failed to start: {reason}"),
+                format_args!("profile failed to start: {}", f.reason),
             ),
-            None => err(StatusCode::BAD_REQUEST, "unknown profile_id"),
+            // `Active` does not reach here: there is no engine for this id.
+            _ => err(StatusCode::BAD_REQUEST, "unknown profile_id"),
         });
     }
     // Adopting into a fenced profile would land every torrent paused and make the

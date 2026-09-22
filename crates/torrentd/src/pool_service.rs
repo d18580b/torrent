@@ -453,9 +453,13 @@ fn unresolved_profile(
     profiles: &crate::profile_registry::ProfileRegistry,
     profile: &ProfileId,
 ) -> String {
-    match profiles.failed_profile(profile) {
-        Some(f) => format!("profile failed to start: {}", f.reason),
-        None => "unknown profile_id".to_string(),
+    match profiles.resolve(profile) {
+        crate::profile_registry::Resolution::Failed(f) => {
+            format!("profile failed to start: {}", f.reason)
+        }
+        // `Active` cannot reach here — the caller got no engine for it — and
+        // `Unknown` is the id nothing declares.
+        _ => "unknown profile_id".to_string(),
     }
 }
 

@@ -814,14 +814,16 @@ fn unresolved_profile(
     s: &AppState,
     profile_id: &ProfileId,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match s.profile_failure_reason(profile_id) {
-        Some(reason) => (
+    match s.profiles.resolve(profile_id) {
+        crate::profile_registry::Resolution::Failed(f) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": format!("profile failed to start: {reason}"),
+                "error": format!("profile failed to start: {}", f.reason),
             })),
         ),
-        None => (
+        // `Active` does not reach here: the caller has already failed to get
+        // an engine for this id, and a live profile has one.
+        _ => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "unknown profile_id"})),
         ),
