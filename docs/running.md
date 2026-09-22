@@ -405,6 +405,19 @@ standardised `Forwarded` work at all, and that proxy is fully supported. The
 price is that the fallback is live in every deployment that sets only some of
 the three, and stripping the ones you do not set is what pays it.
 
+**One hop, not a chain walk.** torrentd reads the entry the peer it is
+talking to contributed and stops there. It does not walk back along the chain
+past hops that are themselves listed in `trusted_proxies`, so listing a range
+does not mean "believe the chain as far as my own edge" — `10.0.0.0/8` is a
+valid value and it does not buy that. Put two proxies in series and the
+address torrentd resolves is the **inner** one's, which gives every client
+behind that edge one shared throttle bucket and one `client_ip`. List the one
+address your proxy connects from, which is what this section asks for anyway.
+
+A v4-mapped address is folded to its v4 form, so `::ffff:198.51.100.9` and
+`198.51.100.9` are one client: one throttle bucket, one spelling in the log.
+That matches how the trust list itself matches a v4-mapped peer.
+
 Each of these headers is a chain every hop appends to, so torrentd reads the
 *last* entry — the one the trusted proxy added — rather than the first, which
 is whatever the original client chose to send. Whether your proxy appends by
@@ -413,6 +426,18 @@ extending the existing field line (nginx, Caddy) or by adding a second one
 joined in order first, exactly as RFC 9110 §5.2-5.3 defines them. A proxy that
 forwards client-supplied values intact is a proxy that cannot be trusted about
 anything.
+
+**The scheme is the exception, and it reads the chain from the other end.**
+"Which client is this" is answered by the nearest hop; "was the original
+request over TLS" is answered by the outermost one, because that is where TLS
+is terminated. So `X-Forwarded-Proto: https, http` — a TLS edge in front of a
+plain-HTTP inner proxy — means the request *was* over TLS and the session
+cookie gets its `Secure` attribute; `https` anywhere in the chain means some
+hop terminated TLS. Reading the last entry there would withhold `Secure` from
+a deployment that really is TLS-fronted, and the browser would then send the
+session cookie in clear to any plain-HTTP origin on the host. If the whole
+`X-Forwarded-Proto` value carries nothing readable it is still unreadable, and
+unreadable is `false`.
 
 **The compose stack does not publish the API to the host.** `deploy/compose.yaml`
 publishes only the BitTorrent ports on `torrentd` and 80/443 on `proxy`; the
