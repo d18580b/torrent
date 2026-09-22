@@ -155,20 +155,44 @@ fn current_boot_id() -> Option<String> {
 /// `ip link delete` by hand.
 ///
 /// A name recorded here is a second way to establish ownership, beside the
-/// key, and it does not depend on the profile carrying one. It lives under
+/// key, and it does not depend on the *profile* carrying one. It lives under
 /// `Config::state_dir()` beside the OpenVPN pid file, for the same reason
 /// that file does: tearing a tunnel down builds a fresh manager, so nothing
 /// the process that raised the tunnel held in memory is still there.
 ///
 /// **The record is scoped to the host's boot id, and that is what makes it
-/// safe.** A file under `/var/lib` outlives a reboot; the interface it names
-/// cannot. Without the scope, a record left by a daemon that died before a
-/// reboot would claim any interface that happened to take the same name
-/// afterwards — which is the destructive direction the key-based exemption
-/// exists to close, reopened one path over. With it, a record is trusted only
-/// while the kernel that carried the link is still running. The same reasoning
-/// `live_pid` applies to the OpenVPN pid file: a record surviving a reboot is
-/// *detected*, not trusted.
+/// safe against a reboot.** A file under `/var/lib` outlives a reboot; the
+/// interface it names cannot. Without the scope, a record left by a daemon
+/// that died before a reboot would claim any interface that happened to take
+/// the same name afterwards — which is the destructive direction the
+/// key-based exemption exists to close, reopened one path over. With it, a
+/// record is trusted only while the kernel that carried the link is still
+/// running. The same reasoning `live_pid` applies to the OpenVPN pid file: a
+/// record surviving a reboot is *detected*, not trusted.
+///
+/// **The record also carries the live link's own public key, and that is what
+/// makes it safe inside one boot.** The boot id alone bounds the record by the
+/// kernel's lifetime, not by the link's, and a name can be freed and retaken
+/// while the same kernel runs: the daemon raises `wg-a` and is killed, an
+/// operator removes the link by hand — the one remedy the runbook names for a
+/// stuck tunnel — and something else takes the name before the restart. The
+/// record then still says "this boot raised `wg-a`", and a record that
+/// establishes ownership on that alone has the daemon bind a slot's sockets to
+/// a stranger's tunnel, with `vpn_monitor` probing address presence and
+/// handshake age and never a key, so the slot reports healthy indefinitely.
+/// The boot sweep cannot close it: the sweep drops a record only when the name
+/// is **free**, and here it is occupied.
+///
+/// So the record names a *link*, not a name: it is written **after**
+/// `wg-quick up` has succeeded, carrying the public key the live interface
+/// carries at that moment, and it establishes ownership only while the link
+/// standing under that name still carries the same key. The witness is
+/// link-derived, which a file under `/var/lib` cannot be on its own.
+///
+/// The cost, stated rather than traded away: a daemon killed **between** a
+/// successful `wg-quick up` and this write leaves an interface with no record,
+/// so a later boot fences the slot instead of adopting it. That window is
+/// narrow, and a fenced slot is the safe side of it.
 #[derive(Debug, Clone)]
 struct RaisedInterfaces {
     dir: std::path::PathBuf,
@@ -195,7 +219,14 @@ impl RaisedInterfaces {
         self.dir.join(format!("wireguard-{iface}.raised"))
     }
 
-    /// Claim `iface` for this boot.
+    /// Claim the link now standing as `iface` for this boot, by the public key
+    /// it carries.
+    ///
+    /// `live_key` is what [`interface_public_key`] read off the interface
+    /// immediately after `wg-quick up` returned success — not anything the
+    /// profile configures, which for the configuration this record exists for
+    /// is nothing at all. A record with no key in it establishes nothing, so a
+    /// link whose key would not read is claimed by nobody rather than by name.
     ///
     /// The parent directory is created first, exactly as the OpenVPN pid
     /// writer does for the file beside this one (`openvpn.rs:155`).
@@ -209,7 +240,7 @@ impl RaisedInterfaces {
     /// reports it against the interface and the path it happened to. Swallowed
     /// inside the writer it is indistinguishable from a record that was never
     /// needed.
-    fn record(&self, iface: &str) -> std::io::Result<()> {
+    fn record(&self, iface: &str, live_key: Option<&str>) -> std::io::Result<()> {
         let Some(boot_id) = self.boot_id.as_deref() else {
             return Ok(());
         };
@@ -217,7 +248,10 @@ impl RaisedInterfaces {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, format!("{boot_id}\n"))
+        std::fs::write(
+            path,
+            format!("{boot_id}\n{}\n", live_key.unwrap_or_default()),
+        )
     }
 
     /// Drop the claim — the interface is down, or was never there.
@@ -225,13 +259,37 @@ impl RaisedInterfaces {
         let _ = std::fs::remove_file(self.path(iface));
     }
 
-    /// Whether `iface` was raised by a daemon running under *this* boot of
-    /// the host.
-    fn recorded(&self, iface: &str) -> bool {
+    /// Whether the link standing as `iface` and carrying `live_key` right now
+    /// is the one a daemon on *this* boot of the host recorded raising.
+    ///
+    /// Two witnesses, and both have to hold. The boot id bounds the record by
+    /// the kernel's lifetime, which is what keeps a record surviving a reboot
+    /// from claiming whatever takes the name afterwards. The key bounds it by
+    /// the *link's* lifetime, which is what keeps a record surviving a hand
+    /// `ip link delete` from claiming whatever takes the name **inside the
+    /// same boot** — the case the sweep cannot reach, because the sweep drops
+    /// a record only when the name is free.
+    ///
+    /// An absent `live_key` — no link, or one whose key would not read — is
+    /// never a match: there is nothing to compare the record against, and a
+    /// record answering "yes" to that question is the name-only claim this
+    /// second witness exists to remove. A record written before this change,
+    /// or by a boot whose `wg show` failed, carries an empty key line and
+    /// likewise matches nothing.
+    fn recorded(&self, iface: &str, live_key: Option<&str>) -> bool {
         let Some(boot_id) = self.boot_id.as_deref() else {
             return false;
         };
-        std::fs::read_to_string(self.path(iface)).is_ok_and(|s| s.trim() == boot_id)
+        let Some(live_key) = live_key.map(str::trim).filter(|k| !k.is_empty()) else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(self.path(iface)) else {
+            return false;
+        };
+        let mut lines = text.lines();
+        let recorded_boot = lines.next().unwrap_or_default().trim();
+        let recorded_key = lines.next().unwrap_or_default().trim();
+        recorded_boot == boot_id && !recorded_key.is_empty() && recorded_key == live_key
     }
 
     /// Drop every record whose interface is not standing, and say which.
@@ -409,12 +467,11 @@ impl WireguardManager {
     /// Ownership has **two** ways to be established, because the key has one
     /// configuration it can never establish it for. [`RaisedInterfaces`] is
     /// the second: a link this host's current boot recorded as raised by the
-    /// daemon is the daemon's **when the profile carries no key to compare**.
-    /// It is consulted *after* the keys and never against them — see
-    /// [`ownership`].
+    /// daemon, **and which still carries the public key that record names**,
+    /// is the daemon's when the profile carries no key to compare. It is
+    /// consulted *after* the keys and never against them — see [`ownership`].
     fn adoptable(&self, profile: &VpnProfile) -> Adoption {
         let exists = interface_exists(&profile.interface);
-        let raised_here = exists && self.raised.recorded(&profile.interface);
         // Both key probes shell out, and neither has anything to adjudicate
         // when there is no link of that name — `wg-quick up` fails for plenty
         // of reasons that leave nothing behind. When there *is* one, both run,
@@ -432,6 +489,13 @@ impl WireguardManager {
         } else {
             (None, None)
         };
+        // The live key is read *before* the record is consulted, because the
+        // record is now read against it: a record establishes ownership only
+        // while the link standing under that name still carries the key the
+        // record was written from. A name that was freed and retaken inside
+        // one host boot therefore establishes nothing, which the boot id alone
+        // could not tell and the sweep cannot reach.
+        let raised_here = exists && self.raised.recorded(&profile.interface, live.as_deref());
         let adoption = match ownership(exists, raised_here, live.as_deref(), expected.as_deref()) {
             Ownership::Absent => Adoption::No,
             Ownership::Unestablished => {
@@ -534,8 +598,22 @@ impl From<Ownership> for Adoption {
 /// this boot can derive, so no boot can ever establish ownership, so an
 /// interface an unclean shutdown left standing is neither adopted nor
 /// removed, for the life of the deployment. [`RaisedInterfaces`] answers the
-/// question the key cannot — "did this daemon, on this boot of this host,
-/// raise the link standing there".
+/// question the key cannot — "is the link standing there the one this daemon
+/// raised, on this boot of this host".
+///
+/// **That is the question it answers, and it takes two witnesses to answer
+/// it.** `raised_here` is true only when a record written by this boot names
+/// this interface *and* names the public key the live link carries right now:
+/// see [`RaisedInterfaces::recorded`]. The name alone was not enough. A name
+/// can be freed and retaken while the same kernel runs — the daemon is killed,
+/// an operator runs the runbook's own `ip link delete`, and something else
+/// takes `wg-a` before the restart — and a record believed on the name alone
+/// then answered `Ours` for a stranger's tunnel, which `first_ipv4` turned
+/// into `Adopt(Ground::RaisedThisBoot)` and the daemon bound a slot's sockets
+/// to. The boot sweep cannot reach that case: it drops a record only when the
+/// name is **free**, and a retaken name is occupied. Comparing the recorded
+/// key against the live one is the only thing that can, because it is the only
+/// witness derived from the link rather than from a file.
 ///
 /// **It answers only that question.** The record is consulted after the keys
 /// and decides exactly the case it was taken for, `profile_key == None`. Ahead
@@ -545,10 +623,9 @@ impl From<Ownership> for Adoption {
 /// rule forces — restarts into `wg-quick up` refusing the surviving link, the
 /// record calling it ours, and the slot rebuilt on the **previous**
 /// credentials and endpoint, reported healthy for as long as the old tunnel
-/// keeps handshaking. What the record asserts is "no link of this name was
-/// standing when this boot called `bring_up`", which is weaker than "the link
-/// standing there now is the one this boot raised"; two keys that disagree are
-/// direct evidence that it is not.
+/// keeps handshaking. Two keys that disagree are direct evidence that the link
+/// is not the one the profile configures, and the record does not outrank
+/// them.
 ///
 /// Note the order: `Absent` first. A record for a link that is not standing
 /// establishes nothing, and [`WireguardManager::adoptable`] discards it — as
@@ -573,7 +650,10 @@ fn ownership(
         }
         // A live WireGuard link of this name whose key the profile does not
         // carry — the `PostUp = wg set %i private-key …` configuration, and
-        // the whole of what the record is for.
+        // the whole of what the record is for. `raised_here` has already
+        // compared the live key against the one the record names, so this is
+        // "the link this boot raised is still standing", not "a link of the
+        // name this boot once raised is standing".
         (Some(_), None) if raised_here => Ownership::Ours,
         // A link whose own key would not read is not a WireGuard device this
         // boot can identify, and no record makes it one.
@@ -697,34 +777,10 @@ enum Adoption {
 
 impl VpnManager for WireguardManager {
     fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, VpnError> {
-        // Claim the interface *before* `wg-quick up` can create it, and only
-        // when no link of that name is standing.
-        //
-        // Before, because `wg-quick up` creates the interface and this then
-        // polls up to 30 seconds for an address: a daemon killed in that
-        // window leaves a link no later boot could establish ownership of,
-        // which is the case the record exists for. `BootCleanup` records a
-        // tunnel before its bring-up attempt for the same reason.
-        //
-        // Only when nothing is standing, because a record written over an
-        // interface this boot did not raise would claim a stranger's tunnel —
-        // and a claim is exactly what licenses `wg-quick down` on it. "No link
-        // of this name existed when this boot ran `wg-quick up`" is the whole
-        // of what the record asserts.
+        // Whether a link of this name was already standing when this attempt
+        // started. It is what tells a refusal from residue further down, and
+        // it is read before anything can create one.
         let standing_before = interface_exists(&profile.interface);
-        if !standing_before {
-            if let Err(e) = self.raised.record(&profile.interface) {
-                error!(
-                    target: "torrentd::vpn::wireguard",
-                    vpn_iface = %profile.interface,
-                    path = %self.raised.path(&profile.interface).display(),
-                    error.cause = %e,
-                    "could not record this interface as raised by this boot; an \
-                     unclean shutdown will leave it unadoptable and the slot dark \
-                     until an operator removes the interface by hand",
-                );
-            }
-        }
         info!(
             target: "torrentd::vpn::wireguard",
             vpn_iface = %profile.interface,
@@ -774,6 +830,44 @@ impl VpnManager for WireguardManager {
                 standing_before,
                 self.adoptable(profile),
                 &format!("wg-quick up exited with {status}"),
+            );
+        }
+
+        // Claim the link this call just raised, by the key it is carrying.
+        //
+        // **After** `wg-quick up`, not before, because there is no link to
+        // read a key from before it. The record used to be written ahead of
+        // the spawn and to carry the boot id alone, so what it asserted was
+        // "no link of this name was standing when this boot called
+        // `bring_up`" — a claim on a *name*. A name can be freed and retaken
+        // inside one host boot: the daemon is killed, an operator removes the
+        // link with the `ip link delete` the runbook sends them to, and
+        // something else takes the name before the restart. The record still
+        // matched, `ownership` answered `Ours` on it, `first_ipv4` succeeded,
+        // and the daemon adopted and bound a slot's sockets to a stranger's
+        // tunnel — reporting it healthy indefinitely, because `vpn_monitor`
+        // probes address presence and handshake age and never a key. The boot
+        // sweep cannot reach that: it drops a record only when the name is
+        // free.
+        //
+        // The cost of moving the write down here is a narrower window in the
+        // opposite direction: a daemon killed between this `wg-quick up` and
+        // this write leaves a link with no record, so a later boot fences the
+        // slot rather than adopting it. A fenced slot is the safe side, and it
+        // is the same direction taken for a link that is ours and carries no
+        // address.
+        if let Err(e) = self.raised.record(
+            &profile.interface,
+            interface_public_key(&profile.interface).as_deref(),
+        ) {
+            error!(
+                target: "torrentd::vpn::wireguard",
+                vpn_iface = %profile.interface,
+                path = %self.raised.path(&profile.interface).display(),
+                error.cause = %e,
+                "could not record this interface as raised by this boot; an \
+                 unclean shutdown will leave it unadoptable and the slot dark \
+                 until an operator removes the interface by hand",
             );
         }
 
@@ -978,6 +1072,14 @@ mod tests {
         RaisedInterfaces::with_boot_id(dir.to_path_buf(), Some(boot_id.to_string()))
     }
 
+    /// The public key the live link carries when a record is written — the
+    /// second of the record's two witnesses. Base64 like a real one, because
+    /// nothing here parses it and everything here compares it.
+    const LIVE_KEY: &str = "SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=";
+
+    /// What something *else* is carrying after it takes the freed name.
+    const STRANGER_KEY: &str = "9i3m82SNQxVlVX9kdCS0bDhGkWJQMi1YxDvNPuUFVXQ=";
+
     /// The two-boot recovery, at the seam that carries it.
     ///
     /// Boot 1 raises `wg-a` and is SIGKILLed, so nothing tears it down. Boot 2
@@ -991,18 +1093,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let boot_one = raised_in(dir.path(), "boot-id-of-this-host");
         boot_one
-            .record("wg-a")
+            .record("wg-a", Some(LIVE_KEY))
             .expect("a temporary directory accepts a write");
         drop(boot_one); // SIGKILL: no teardown, no `forget`.
 
         let boot_two = raised_in(dir.path(), "boot-id-of-this-host");
         assert!(
-            boot_two.recorded("wg-a"),
+            boot_two.recorded("wg-a", Some(LIVE_KEY)),
             "the record outlives the process that wrote it, which is the \
-             point of putting it in the state directory",
+             point of putting it in the state directory — and the link it \
+             named is still carrying the key it was written from",
         );
         assert_eq!(
-            ownership(true, boot_two.recorded("wg-a"), Some("live"), None),
+            ownership(
+                true,
+                boot_two.recorded("wg-a", Some(LIVE_KEY)),
+                Some(LIVE_KEY),
+                None
+            ),
             Ownership::Ours,
         );
     }
@@ -1019,18 +1127,131 @@ mod tests {
     fn a_record_from_an_earlier_boot_of_the_host_is_not_trusted() {
         let dir = tempfile::tempdir().unwrap();
         raised_in(dir.path(), "the-boot-that-raised-it")
-            .record("wg-a")
+            .record("wg-a", Some(LIVE_KEY))
             .expect("a temporary directory accepts a write");
 
         let after_reboot = raised_in(dir.path(), "a-different-boot-entirely");
         assert!(
-            !after_reboot.recorded("wg-a"),
-            "a link this kernel never saw raised is not this daemon's to claim",
+            !after_reboot.recorded("wg-a", Some(LIVE_KEY)),
+            "a link this kernel never saw raised is not this daemon's to \
+             claim, even if the name and the key both happen to match",
         );
         assert_eq!(
-            ownership(true, after_reboot.recorded("wg-a"), Some("live"), None),
+            ownership(
+                true,
+                after_reboot.recorded("wg-a", Some(LIVE_KEY)),
+                Some(LIVE_KEY),
+                None
+            ),
             Ownership::Unestablished,
             "so it falls back to the keys, and is left standing",
+        );
+    }
+
+    /// **The retaken name.** A record whose link was removed and whose name
+    /// something else then took, inside one host boot, establishes nothing.
+    ///
+    /// The sequence, all of it reachable and all of it in the runbook: a
+    /// keyless profile — `PostUp = wg set %i private-key …`, which is the
+    /// whole reason the record exists — is raised as `wg-a` and the daemon is
+    /// SIGKILLed, so nothing tears it down and nothing forgets the record. The
+    /// operator follows the runbook's own remedy and removes the link by hand.
+    /// Something else takes the name `wg-a` before the restart. The boot sweep
+    /// cannot help: it drops a record only when the name is **free**, and this
+    /// name is occupied, so the record stands.
+    ///
+    /// With the record believed on the boot id and the name alone,
+    /// `ownership(exists, raised, Some(stranger), None)` answered `Ours`,
+    /// `first_ipv4` succeeded on the stranger's link, and the daemon adopted
+    /// and bound a slot's sockets to it — reporting the slot healthy
+    /// indefinitely, because `vpn_monitor` probes address presence and
+    /// handshake age and never a key.
+    ///
+    /// Drop the key from `record`/`recorded` — believe the boot id alone —
+    /// and the first two assertions fail.
+    #[test]
+    fn a_record_whose_name_was_retaken_inside_one_boot_establishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let raised = raised_in(dir.path(), "one-boot-throughout");
+        raised
+            .record("wg-a", Some(LIVE_KEY))
+            .expect("a temporary directory accepts a write");
+
+        // The operator deletes the link; something else takes the name. Same
+        // kernel, same boot id, same interface name — a different link.
+        assert!(
+            !raised.recorded("wg-a", Some(STRANGER_KEY)),
+            "the record names a link by the key it carried, not a name; a \
+             link carrying someone else's key is not the one this boot raised",
+        );
+        assert_eq!(
+            ownership(
+                true,
+                raised.recorded("wg-a", Some(STRANGER_KEY)),
+                Some(STRANGER_KEY),
+                None,
+            ),
+            Ownership::Unestablished,
+            "so the keyless profile meets a link it cannot identify, and \
+             `Unestablished` is what stops it being adopted",
+        );
+        assert_eq!(
+            Adoption::from(ownership(
+                true,
+                raised.recorded("wg-a", Some(STRANGER_KEY)),
+                Some(STRANGER_KEY),
+                None,
+            )),
+            Adoption::Foreign,
+            "the slot fences and the stranger's tunnel is left exactly as it \
+             was found — never adopted, never torn down",
+        );
+        assert!(
+            raised.recorded("wg-a", Some(LIVE_KEY)),
+            "and the record still answers for the link it was written from, \
+             or this would close the hole by disabling the recovery",
+        );
+    }
+
+    /// A link whose key will not read is claimed by nobody, and neither is one
+    /// recorded by a boot that could not read a key to record.
+    ///
+    /// Both are the absent-witness case, and both must answer "no": a record
+    /// that matches when there is nothing to compare it against is the
+    /// name-only claim the key witness exists to remove. A record written
+    /// before this change carries an empty key line and reads the same way.
+    #[test]
+    fn a_record_with_no_key_to_compare_establishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let raised = raised_in(dir.path(), "one-boot");
+
+        raised
+            .record("wg-blind", None)
+            .expect("a temporary directory accepts a write");
+        assert!(
+            raised.path("wg-blind").exists(),
+            "the record is written — the boot id is readable",
+        );
+        assert!(
+            !raised.recorded("wg-blind", Some(LIVE_KEY)),
+            "but a record with no key in it names no link",
+        );
+
+        raised
+            .record("wg-a", Some(LIVE_KEY))
+            .expect("a temporary directory accepts a write");
+        assert!(
+            !raised.recorded("wg-a", None),
+            "and a link whose own key will not read cannot be matched against \
+             one",
+        );
+
+        // The on-disk shape a boot before this change left behind.
+        std::fs::write(raised.path("wg-old"), "one-boot\n").unwrap();
+        assert!(
+            !raised.recorded("wg-old", Some(LIVE_KEY)),
+            "a record in the old boot-id-only shape claims nothing, which is \
+             the safe direction across an upgrade",
         );
     }
 
@@ -1042,13 +1263,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blind = RaisedInterfaces::with_boot_id(dir.path().to_path_buf(), None);
         blind
-            .record("wg-a")
+            .record("wg-a", Some(LIVE_KEY))
             .expect("a temporary directory accepts a write");
         assert!(
             !blind.path("wg-a").exists(),
             "a claim with nothing to scope it is not written",
         );
-        assert!(!blind.recorded("wg-a"));
+        assert!(!blind.recorded("wg-a", Some(LIVE_KEY)));
     }
 
     /// Teardown drops the claim with the interface, or the next boot vouches
@@ -1058,11 +1279,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let raised = raised_in(dir.path(), "one-boot");
         raised
-            .record("wg-a")
+            .record("wg-a", Some(LIVE_KEY))
             .expect("a temporary directory accepts a write");
-        assert!(raised.recorded("wg-a"));
+        assert!(raised.recorded("wg-a", Some(LIVE_KEY)));
         raised.forget("wg-a");
-        assert!(!raised.recorded("wg-a"));
+        assert!(!raised.recorded("wg-a", Some(LIVE_KEY)));
         assert!(!raised.path("wg-a").exists());
     }
 
@@ -1146,10 +1367,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let raised = raised_in(dir.path(), "one-boot");
         raised
-            .record("wg-gone")
+            .record("wg-gone", Some(LIVE_KEY))
             .expect("a temporary directory accepts a write");
         raised
-            .record("wg-still-here")
+            .record("wg-still-here", Some(LIVE_KEY))
             .expect("a temporary directory accepts a write");
         // A file that is not a record of ours shares the directory — the
         // OpenVPN pid file is the neighbour this must not touch.
@@ -1213,17 +1434,20 @@ mod tests {
 
         let raised = raised_in(&absent, "one-boot");
         raised
-            .record("wg-a")
+            .record("wg-a", Some(LIVE_KEY))
             .expect("a missing state directory is created, not reported");
 
-        assert!(raised.recorded("wg-a"), "and the record is readable back");
+        assert!(
+            raised.recorded("wg-a", Some(LIVE_KEY)),
+            "and the record is readable back",
+        );
 
         // And a failure is returned rather than swallowed: a *file* where the
         // directory should be cannot be created into.
         let blocked = dir.path().join("a-file");
         std::fs::write(&blocked, "").unwrap();
         let err = raised_in(&blocked.join("state"), "one-boot")
-            .record("wg-a")
+            .record("wg-a", Some(LIVE_KEY))
             .expect_err("a state directory that cannot exist is reported");
         assert!(
             !err.to_string().is_empty(),
@@ -1249,11 +1473,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let raised = raised_in(dir.path(), "one-boot");
         raised
-            .record("lo")
+            .record("lo", Some(LIVE_KEY))
             .expect("a temporary directory accepts a write");
         assert!(
-            raised.recorded("lo"),
-            "the record is in place to be believed"
+            raised.path("lo").exists(),
+            "the record is in place to be believed",
         );
 
         let mgr = WireguardManager::with_raised(raised.clone());
@@ -1272,7 +1496,7 @@ mod tests {
              this link as ours and no record may stand in for one",
         );
         assert!(
-            !raised.recorded("lo"),
+            !raised.path("lo").exists(),
             "and the record that pointed at it is spent, or the next boot \
              makes the same claim again",
         );
@@ -1369,12 +1593,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let raised = raised_in(dir.path(), "one-boot");
         raised
-            .record("wg-a")
+            .record("wg-a", Some(LIVE_KEY))
             .expect("a temporary directory accepts a write");
-        assert!(raised.recorded("wg-a"));
+        assert!(raised.recorded("wg-a", Some(LIVE_KEY)));
         assert!(
-            !raised.recorded("wg-b"),
-            "raising one interface claims one interface",
+            !raised.recorded("wg-b", Some(LIVE_KEY)),
+            "raising one interface claims one interface, whatever key another \
+             link of another name happens to carry",
         );
         assert_eq!(
             raised.path("wg-a"),

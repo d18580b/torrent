@@ -136,13 +136,21 @@ it is running:
   recycled pid is not signalled. Delete it while the daemon is running and the
   tunnel survives the next shutdown.
 - **`wireguard-<iface>.raised`** — a note that *this boot of this host* raised
-  that WireGuard interface. It is what lets a restart after an unclean
-  shutdown adopt the tunnel still standing instead of leaving the slot dark,
-  for profiles that keep the key out of the `.conf`
-  (`PostUp = wg set %i private-key …`). It carries the host's boot id, so it is
-  never believed after a reboot; the daemon discards it at startup if the
-  interface it names is gone, and again whenever it declines to adopt one.
-  Deleting it costs at most one adoption.
+  the link now standing under that name. It is what lets a restart after an
+  unclean shutdown adopt the tunnel still standing instead of leaving the slot
+  dark, for profiles that keep the key out of the `.conf`
+  (`PostUp = wg set %i private-key …`). It carries two things and both have to
+  still hold: the host's **boot id**, so it is never believed after a reboot;
+  and the **public key the interface was carrying** when it came up, so it is
+  never believed for a link that merely has the same name. That second one is
+  what makes it safe to delete a stuck interface by hand and let something else
+  take the name — the record stops applying the moment the link does.
+  It is written once `wg-quick up` has succeeded, so a daemon killed in the
+  moment between leaves no record and the slot fences rather than adopting.
+  The daemon discards it at startup if the interface it names is gone, and
+  again whenever it declines to adopt one; it **keeps** it when a teardown
+  failed and left the interface standing, which is the one case the record is
+  still needed for. Deleting it costs at most one adoption.
 
 > If you point `resume_dir` somewhere else, these move with it — and
 > `ReadWritePaths=` has to list wherever they land, or the daemon logs that it
