@@ -138,6 +138,7 @@ authentication posture, and at least one `[[profile]]`:
 | `resume_dir` | Root of the resume store. Each profile gets a subdirectory named after its id. |
 | `torrent_dir` | Root of the `.torrent` store, same partitioning. |
 | `allow_unauthenticated` | `true` to state that access control belongs to something in front. Required **unless** `[auth]` is configured, and refused alongside it — the daemon will not start having been told neither, and will not start having been told both. §6. |
+| `[auth]` | The other way to state the posture: a `password_hash`, plus any `[[auth.token]]` tables. Required **unless** `allow_unauthenticated = true` is set, and refused alongside it. A non-loopback `http_listen` leaves no choice — it requires this. Generate the values with `torrentd --config <path> hash-password` and `… new-token`, which run against a config the daemon still refuses. §6. |
 
 **Optional, with the defaults actually used:**
 
