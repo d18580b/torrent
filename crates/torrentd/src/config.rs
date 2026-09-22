@@ -757,17 +757,57 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
                 });
             }
         };
+        // Destructured exhaustively, with no `..`, and that is the point.
+        //
+        // The class each field is owed now travels on `ProfileChange`, so a
+        // field compared here cannot be left unclassified — but nothing made a
+        // field added to `ProfileConfig` get compared here *at all*. The
+        // hand-maintained list of key names that used to live in `reload.rs`
+        // was deleted for being an obligation written down rather than
+        // enforced; the set of compared fields was the same list one module
+        // over, and it was still hand-maintained.
+        //
+        // `ProfileNetwork`'s own fields were already safe, because the block is
+        // compared as a single value. These seven were not. Naming every one
+        // of them in a pattern is what makes adding an eighth stop compiling
+        // until somebody says which warning it is owed — which is the
+        // consequence of forgetting, and it is silent: a SIGHUP that changed
+        // only the forgotten key produced an empty diff and logged "SIGHUP:
+        // config unchanged" over a file that plainly had changed.
+        //
+        // `id` is bound and ignored deliberately: it is the map key these two
+        // were matched on, so it cannot differ here.
+        let ProfileConfig {
+            id: _,
+            network,
+            peer_fingerprint_hex,
+            user_agent,
+            resume_dir,
+            torrent_dir,
+            allowed_tracker_domains,
+            upload_rate_limit,
+        } = a;
+        let ProfileConfig {
+            id: _,
+            network: b_network,
+            peer_fingerprint_hex: b_peer_fingerprint_hex,
+            user_agent: b_user_agent,
+            resume_dir: b_resume_dir,
+            torrent_dir: b_torrent_dir,
+            allowed_tracker_domains: b_allowed_tracker_domains,
+            upload_rate_limit: b_upload_rate_limit,
+        } = b;
         // The whole network block is identity: which tunnel, which port,
         // whether DHT runs. Comparing it as one value means a new field
         // cannot be forgotten here the way `file_pool_size` was forgotten
         // from the top-level diff.
-        field("network", a.network != b.network, Identity);
+        field("network", network != b_network, Identity);
         field(
             "peer_fingerprint_hex",
-            a.peer_fingerprint_hex != b.peer_fingerprint_hex,
+            peer_fingerprint_hex != b_peer_fingerprint_hex,
             Identity,
         );
-        field("user_agent", a.user_agent != b.user_agent, Identity);
+        field("user_agent", user_agent != b_user_agent, Identity);
         // Not identity. `ProfileChangeKind`'s own definitions decide this:
         // `Identity` is "the account a tracker sees" and `NonIdentity` is
         // "nothing a tracker reads" — and where a profile keeps its resume and
@@ -784,8 +824,8 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
         // own `resume_dir` and `torrent_dir` to the old paths", the documented
         // way to avoid losing the library on upgrade — fire a privacy alert
         // for doing exactly what the runbook says.
-        field("resume_dir", a.resume_dir != b.resume_dir, NonIdentity);
-        field("torrent_dir", a.torrent_dir != b.torrent_dir, NonIdentity);
+        field("resume_dir", resume_dir != b_resume_dir, NonIdentity);
+        field("torrent_dir", torrent_dir != b_torrent_dir, NonIdentity);
         // The two keys outside the network block. Neither is applied by a
         // reload — the add path reads `ProfileRegistry`'s immutable startup
         // snapshot and nothing rebuilds it — and without them here a SIGHUP
@@ -796,12 +836,12 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
         // forgotten now that a field can have one.
         field(
             "upload_rate_limit",
-            a.upload_rate_limit != b.upload_rate_limit,
+            upload_rate_limit != b_upload_rate_limit,
             NonIdentity,
         );
         field(
             "allowed_tracker_domains",
-            a.allowed_tracker_domains != b.allowed_tracker_domains,
+            allowed_tracker_domains != b_allowed_tracker_domains,
             NonIdentity,
         );
     }
@@ -1713,9 +1753,17 @@ listen_interfaces = "0.0.0.0:6882"
     fn every_profile_field_the_diff_reports_states_which_warning_it_is_owed() {
         // The classification that `reload.rs` used to keep as a list of key
         // names beside a comment asking whoever edits this function to update
-        // it. Changing every `[[profile]]` field at once pins the whole set:
-        // a field added to `diff_profiles` cannot compile without a class, and
-        // a field that changes class shows up here.
+        // it. Changing every `[[profile]]` field at once pins the classes: a
+        // field compared in `diff_profiles` cannot be recorded without one,
+        // and a field that changes class shows up here.
+        //
+        // What this cannot pin is a field added to `ProfileConfig` and never
+        // compared at all — it would not appear in `got`, and `want` would not
+        // ask for it, so no assertion here can notice. That is a compile
+        // property and not a test: `diff_profiles` destructures
+        // `ProfileConfig` exhaustively with no `..`, so a new field is
+        // `error[E0027]: pattern does not mention field` until somebody names
+        // it. No `#[test]` in this crate observes that, and none can.
         let dir = tempdir().unwrap();
         let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
         let mut b = a.clone();
