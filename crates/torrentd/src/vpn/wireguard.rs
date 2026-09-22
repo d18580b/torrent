@@ -1044,6 +1044,22 @@ mod tests {
             Adoption::Foreign,
             "a readable profile key establishes nothing about the live link",
         );
+        // And the same two host answers with a record present. A record is
+        // matched against the key the live link carries, so a link with no
+        // readable key of its own cannot match one — the record is not a
+        // second chance at identifying a link the kernel will not describe.
+        assert_eq!(
+            ownership(true, true, None, None),
+            Ownership::Unestablished,
+            "a link whose own key will not read is not a WireGuard device \
+             this boot can identify, and no record makes it one",
+        );
+        assert_eq!(
+            ownership(true, true, None, Some("expected-key")),
+            Ownership::Unestablished,
+            "and a profile key with nothing on the live side to compare it \
+             against is not evidence either way",
+        );
     }
 
     /// The case the narrow rule did cover, unchanged.
