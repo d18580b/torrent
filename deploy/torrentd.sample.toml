@@ -222,13 +222,13 @@ dht               = true
 # keeping it would run the one-way rename with no rollback at all.
 #
 # A `pool.db` from one of this change's own pre-release builds can carry
-# `profile` without v3's indexes, reporting version 2 or version 3 depending on
-# which of them wrote it. Such a file is recognised whichever it was, because
-# the indexes are checked before the version is trusted: where they did not come
-# with the columns — no index on `profile`, or the old `torrent_by_slot` name
-# over it — they are put right, and the version stamped, in the same
-# transaction. No data moves; the `.pre-v3.bak` copy is not a remedy for it,
-# having the same contents.
+# `profile` without v3's indexes, and can report any version from 0 to 3
+# depending on which of them wrote it and where it stopped. Such a file is
+# recognised whichever it was, because the indexes are checked before the
+# version is trusted: where they did not come with the columns — no index on
+# `profile`, or the old `torrent_by_slot` name over it — they are put right,
+# and the version stamped, in the same transaction. No data moves; the
+# `.pre-v3.bak` copy is not a remedy for it, having the same contents.
 #
 # [pool]
 # roots       = ["/data/torrents"]        # must not nest
