@@ -367,14 +367,21 @@ nothing about any tunnel, so scope a panel or an alert to the profiles you
 actually tunnel rather than aggregating over every profile. Handshake age is
 reported per WireGuard profile. Port-forward state is reported per profile that
 negotiates its port over NAT-PMP, and `profile_vpn_gateway_reboots_total`
-counts the gateway restarts a renewal detects on such a profile. Two more
-`profile_id`-labelled series belong to neither group: `listen_failure_active`,
-0 once a profile's listen socket is up and 1 when it fails, and
-`listen_failures_total`, which counts those failures — and a listen failure on
-a daemon left with a single live session is fatal, so on that shape the alert
-that fires is the daemon going away. `kill_switch_active` is none of these: it
-is a single unlabelled daemon-wide gauge, seeded at 0 at startup whether or not
-any kill switch or any `vpn` profile is configured.
+counts the gateway restarts a renewal detects on such a profile. A
+`profile_id` label marks a series as one session's rather than the daemon's,
+which is why most of those daemon counters carry one too — pool verification is
+daemon-wide and carries none. Outside both VPN groups, these are the labelled
+series worth an alert of their own: `listen_failure_active`, 0 once a profile's
+listen socket is up and 1 when it fails; `listen_failures_total`, which counts
+those failures — and a listen failure on a daemon left with a single live
+session is fatal, so on that shape the alert that fires is the daemon going
+away; and `profile_assignment_registry_errors_total`, which counts the torrents
+a profile's registry refused to take, whether for a duplicate info-hash, a
+resume file found under another profile, or a tracker outside
+`allowed_tracker_domains` — the cross-account contamination profiles exist to
+prevent. `kill_switch_active` is none of these: it is a single unlabelled
+daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
+`vpn` profile is configured.
 
 > A shipped Grafana dashboard and alert rules are planned rather than present.
 > Until then, note that series register on first emission, so anything not yet
