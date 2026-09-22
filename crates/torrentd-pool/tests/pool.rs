@@ -1559,6 +1559,122 @@ fn a_half_applied_v3_index_loses_the_index_name_the_rename_left_mislabelled() {
     );
 }
 
+/// Build a file **stamped to `user_version = 3`** over a schema that is not
+/// yet v3's: `SCHEMA_V3` replayed statement by statement, cut off after
+/// `statements` of them, and then the version written anyway.
+///
+/// This is what a build in the `e391b72 … 1195546^` window left behind. Its
+/// recognition arm stamped the version and ran no index DDL, so whichever
+/// half-applied file it met came out reporting 3 with the index work still
+/// missing — and the version being right is precisely what stopped anything
+/// looking again.
+fn build_stamped_v3_index(db: &Path, statements: usize) {
+    build_half_applied_v3_index(db, statements);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.pragma_update(None, "user_version", 3i64).unwrap();
+}
+
+#[test]
+fn a_stamped_v3_index_with_no_index_on_profile_is_still_repaired() {
+    // F43. `migrate` returned at `found == SCHEMA_VERSION` before it looked at
+    // the schema, so a file this change's own published head stamped to 3
+    // without ever creating `torrent_by_profile` opened silently, exit 0,
+    // unchanged, for ever — while `docs/running.md` promises the file ends
+    // with that index and `deploy/torrentd.sample.toml` says the indexes are
+    // "put right in the same transaction".
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_stamped_v3_index(&db, 2);
+    assert_eq!(
+        user_version(&db),
+        3,
+        "the fixture reports the current version"
+    );
+    assert!(
+        torrent_indexes(&db)
+            .iter()
+            .all(|n| n != "torrent_by_profile"),
+        "and does not carry the index that version claims",
+    );
+
+    PoolStore::open(&db).expect("a stamped v3 opens");
+
+    assert_eq!(user_version(&db), 3);
+    let idx = torrent_indexes(&db);
+    assert!(
+        idx.iter().any(|n| n == "torrent_by_profile"),
+        "the file must end with v3's index on profile, got {idx:?}",
+    );
+
+    // Nothing else moved: this is two index statements on a file whose rename
+    // had already run.
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let steps: i64 = c
+        .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(steps, 1, "the mutation journal survived the repair");
+    drop(c);
+    assert!(
+        !PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+        "an index is derivable from its table, so nothing was copied aside",
+    );
+    PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+}
+
+#[test]
+fn a_stamped_v3_index_still_carrying_torrent_by_slot_is_repaired() {
+    // F43, the other reachable cut point: the `DROP INDEX` was lost before the
+    // version was stamped, so the file reports 3 while `torrent_by_slot` sits
+    // over the renamed `profile` column — the mislabelling `SCHEMA_V3`'s own
+    // comment says it drops the index to avoid, and the exact state
+    // `docs/running.md` says cannot survive an open on this build.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_stamped_v3_index(&db, 1);
+    assert_eq!(user_version(&db), 3);
+    assert!(
+        torrent_indexes(&db).iter().any(|n| n == "torrent_by_slot"),
+        "the fixture is the file with the drop lost",
+    );
+
+    PoolStore::open(&db).expect("a stamped v3 opens");
+
+    assert_eq!(user_version(&db), 3);
+    let idx = torrent_indexes(&db);
+    assert!(
+        idx.iter().any(|n| n == "torrent_by_profile"),
+        "v3's index must be present under its own name, got {idx:?}",
+    );
+    assert!(
+        !idx.iter().any(|n| n == "torrent_by_slot"),
+        "and the name the rename left over the new column must be gone, got {idx:?}",
+    );
+}
+
+#[test]
+fn an_ordinary_v3_index_is_opened_without_touching_it() {
+    // The other half of widening the arm past `found == 2`: a healthy v3 file
+    // reaches the same guard on every open and must come out of it having had
+    // no DDL and no transaction run against it.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+    PoolStore::open(&db).expect("a genuine v2 index migrates forward");
+    let before = torrent_indexes(&db);
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::fs::remove_file(&backup).expect("the v2 migration left its copy aside");
+
+    PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+
+    assert_eq!(user_version(&db), 3);
+    assert_eq!(torrent_indexes(&db), before, "nothing may be rebuilt here");
+    assert!(
+        !backup.exists(),
+        "and an ordinary open is not a migration, so it copies nothing aside",
+    );
+}
+
 #[test]
 fn a_genuine_v2_index_is_still_migrated_by_the_version_keyed_step() {
     // The recognition matches v3's columns under v2's version and must not
