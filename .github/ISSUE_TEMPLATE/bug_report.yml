@@ -17,9 +17,10 @@ body:
         Those are the same machine for anyone who built and installed from
         source by
         [`docs/running.md` § *3. Build*](https://github.com/d18580b/torrent/blob/master/docs/running.md#3-build)
-        and step `4b` of § *4. Service user, binary, directories*. If they are
-        not the same machine for you, the two source-checkout fields below each
-        say what to give instead.
+        and step `4b` of § *4. Service user, binary, directories*. If that is
+        not your deployment — a different machine for any of them, or a
+        container with no systemd unit at all — every required field below
+        whose command depends on where you run it says what to give instead.
 
   - type: textarea
     id: what-happened
@@ -81,10 +82,18 @@ body:
         service: `journalctl -u torrentd` (add `-o cat` for the raw JSON lines).
         If it reproduces, raise the verbosity in place — set `log_level = "debug"`
         in the config and `systemctl reload torrentd`, which sends `SIGHUP`; the
-        level is swapped at runtime and no restart is needed. Please do **not**
-        start a second `torrentd` to collect a log: it would contend with the
-        running one for the same tunnels, kill-switch table, resume directory and
-        pool index. Redact tracker URLs, passkeys and API tokens before pasting.
+        level is swapped at runtime and no restart is needed.
+
+        If there is no systemd unit where you run it — the `Containerfile` and
+        `compose.yaml` in `deploy/` have none — take the log however your
+        deployment collects the daemon's stdout, and raise the verbosity with
+        `RUST_LOG=debug` in the daemon's own environment, which is read once at
+        startup, so restart that same instance.
+
+        Either way, please do **not** start a second `torrentd` to collect a
+        log: it would contend with the running one for the same tunnels,
+        kill-switch table, resume directory and pool index.
+        Redact tracker URLs, passkeys and API tokens before pasting.
 
         A line looks like this:
 
