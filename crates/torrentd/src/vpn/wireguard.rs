@@ -697,17 +697,24 @@ enum Ground {
     /// The live link carries the public key this profile configures.
     MatchingKey,
     /// The profile carries no key this boot can derive, and this boot's own
-    /// record names the link as one it raised.
+    /// record names the link — by the public key it is still carrying — as one
+    /// it raised.
     RaisedThisBoot,
 }
 
 impl Ground {
+    /// A token, not a sentence.
+    ///
+    /// This is consumed as a structured tracing field value, where
+    /// [`ProbeUnavailable::as_str`] one screen up emits `no_tool` / `refused`
+    /// and `DownReason::as_str` emits a Prometheus label. A field an operator
+    /// filters on (`adoption_ground=raised_this_boot`) is not a field that can
+    /// hold an English clause; the explanation belongs in the doc comment and
+    /// in the runbook, which is where both of those keep theirs.
     fn as_str(self) -> &'static str {
         match self {
-            Ground::MatchingKey => "the live interface carries this profile's public key",
-            Ground::RaisedThisBoot => {
-                "this boot recorded raising this interface and the profile carries no key"
-            }
+            Ground::MatchingKey => "matching_key",
+            Ground::RaisedThisBoot => "raised_this_boot",
         }
     }
 }
@@ -1727,19 +1734,38 @@ mod tests {
         );
     }
 
-    /// The adoption log line names the ground it was granted on.
+    /// The adoption log line names the ground it was granted on, as a token an
+    /// operator can filter a log on.
     ///
-    /// It used to assert "the existing tunnel of the same public key" on every
-    /// adoption, including the ones granted on the record alone with no key
-    /// read on either side — the operator told the opposite of what happened.
+    /// Two things, and the first is why this test exists at all. The warn used
+    /// to assert "the existing tunnel of the same public key" on **every**
+    /// adoption, including the ones granted on the record with no key read on
+    /// either side — the operator told the opposite of what happened. So the
+    /// ground has to reach the field, and the two grounds have to be
+    /// distinguishable in it.
+    ///
+    /// The second is the representation. This is a structured tracing field
+    /// value, where `ProbeUnavailable::as_str` one screen up emits `no_tool`
+    /// and `refused` and `DownReason::as_str` emits a Prometheus label, and it
+    /// emitted an English clause with spaces and an apostrophe in it. A field
+    /// nobody can write a filter against is not a field. Put a sentence back
+    /// and the token assertions fail.
     #[test]
     fn the_two_grounds_for_adoption_are_told_apart() {
-        assert_ne!(
-            Ground::MatchingKey.as_str(),
-            Ground::RaisedThisBoot.as_str(),
-        );
-        assert!(Ground::MatchingKey.as_str().contains("public key"));
-        assert!(Ground::RaisedThisBoot.as_str().contains("recorded raising"));
+        assert_eq!(Ground::MatchingKey.as_str(), "matching_key");
+        assert_eq!(Ground::RaisedThisBoot.as_str(), "raised_this_boot");
+        for ground in [Ground::MatchingKey, Ground::RaisedThisBoot] {
+            let token = ground.as_str();
+            assert!(
+                !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "a structured field value is a token an operator filters on, \
+                 as `ProbeUnavailable::as_str` and `DownReason::as_str` emit \
+                 one screen away; got {token:?}",
+            );
+        }
     }
 
     /// The record is per interface, beside the OpenVPN pid file and named so
