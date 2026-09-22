@@ -1885,6 +1885,48 @@ fn a_fresh_database_leaves_no_backup_behind() {
 }
 
 #[test]
+fn a_schema_step_that_cannot_run_says_which_index_and_what_to_do() {
+    // Q19. A build predating the one-transaction migration could create v1's
+    // tables and die before writing `user_version`, leaving a file whose
+    // schema is ahead of the version that describes it. Nothing here can tell
+    // which steps ran, so it is not repaired — but it is the state that wedges
+    // a daemon opening the pool with `?` under `Restart=on-failure`, and what
+    // came out was `table root already exists` followed by the whole of the
+    // schema text, naming neither the pool, nor the migration, nor a way out.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    {
+        // v1's tables, with the version never recorded.
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.pragma_update(None, "user_version", 0i64).unwrap();
+    }
+
+    let err = PoolStore::open(&db).expect_err("v1's tables cannot be created twice");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&db.display().to_string()),
+        "the failure names the index it is about, got: {msg}",
+    );
+    assert!(
+        msg.contains("schema version 0 to 3"),
+        "and which step could not run, got: {msg}",
+    );
+    assert!(
+        msg.contains("has not been changed"),
+        "and that nothing was changed, which is what makes a retry safe, got: {msg}",
+    );
+    assert!(msg.contains("pool scan"), "and a way out, got: {msg}",);
+    assert!(
+        msg.contains("table root already exists"),
+        "without discarding what SQLite said, got: {msg}",
+    );
+
+    // Still true, and the reason the remedy is phrased as it is.
+    assert_eq!(user_version(&db), 0);
+}
+
+#[test]
 fn an_index_from_a_newer_build_is_refused_rather_than_guessed_at() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pool.db");
