@@ -176,7 +176,8 @@ pub struct Client {
 struct HeaderRead<'a> {
     /// Whether any field line carried this name, readable or not.
     present: bool,
-    /// The last readable element across every field line, if there was one.
+    /// The **final** element across every field line — positionally, not the
+    /// last one that happens to be readable — where it carries something.
     last: Option<&'a str>,
 }
 
@@ -198,22 +199,45 @@ struct HeaderRead<'a> {
 /// defect one level up. Joining every line in order and taking the last
 /// element makes the proxy's field-line style stop mattering.
 ///
-/// `present` is reported separately because empty segments and non-UTF-8
-/// bytes are filtered out on the way to `last`. A header that is present and
-/// yields nothing — `X-Forwarded-For:`, `X-Forwarded-For: , `, or a value
-/// that is not UTF-8 — is still a header the trusted proxy wrote, and
-/// `resolve` must not treat it as one the proxy omitted.
+/// `present` is reported separately because an element that carries nothing
+/// readable yields no `last`. A header that is present and yields nothing —
+/// `X-Forwarded-For:`, `X-Forwarded-For: , `, or a value that is not UTF-8 —
+/// is still a header the trusted proxy wrote, and `resolve` must not treat it
+/// as one the proxy omitted.
+///
+/// Which element is *last* is decided **positionally**, at the same
+/// granularity as `present`, and that is the whole of the second rule. Taking
+/// the last element that happens to be readable — filtering emptiness out on
+/// the way and letting `next_back` land wherever it lands — skips past an
+/// unreadable final element and returns an **earlier** one, and the earlier
+/// elements of a chain are the ones the client wrote. So a trusted proxy
+/// whose own appended contribution evaluates empty, which is the ordinary
+/// failure mode of appending a header field that was not there
+/// (`add-header X-Forwarded-For %[hdr(...)]` over an absent inner header),
+/// hands the client's forged first element straight back as the answer:
+/// `X-Forwarded-For: 6.6.6.6,` resolved to `6.6.6.6` rather than to the
+/// socket peer, and that value became the throttle key and the `client_ip`
+/// on the failed-login line.
+///
+/// Deciding positionally makes the two rules one rule again: the final
+/// element of the joined value is the trusted proxy's, whatever it contains,
+/// and where it contains nothing usable the header is unreadable rather than
+/// a licence to read further left.
 fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> HeaderRead<'a> {
     let values = req.headers().get_all(name);
     HeaderRead {
         present: values.iter().next().is_some(),
+        // The last field line's last element. A non-UTF-8 *final* field line
+        // makes the final element unreadable for the same reason an empty one
+        // does — it is where the trusted proxy's contribution would be — so
+        // `to_str` failing here is not a reason to consult the line before it.
         last: values
             .iter()
-            .filter_map(|v| v.to_str().ok())
-            .flat_map(|v| v.split(','))
+            .next_back()
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.split(',').next_back())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .next_back(),
+            .filter(|s| !s.is_empty()),
     }
 }
 
@@ -294,6 +318,12 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     // that case in two, and the half that reaches `Forwarded` takes the
     // client's word for the client's address.
     //
+    // `last_element` decides emptiness at the same granularity, on the final
+    // element and on no other. The two rules have to agree: a `present` that
+    // asks about the header while `last` searches leftward for something
+    // readable puts the client's own entry back in the answer without ever
+    // reaching this arm.
+    //
     // Both arms go through `node_addr`, so they parse one grammar: the bare
     // address, `host:port`, and a bracketed IPv6 literal are read the same on
     // either. Otherwise the *stricter* parser is the one that falls through
@@ -364,6 +394,22 @@ mod tests {
                 HeaderValue::from_str(v).unwrap(),
             );
         }
+        r
+    }
+
+    /// A request whose last field line for `name` is raw bytes that are not
+    /// UTF-8, preceded by whatever `before` lines the case needs.
+    fn req_with_raw_last(peer: &str, name: &str, before: &[&str], raw: &[u8]) -> Request<()> {
+        let mut r = Request::new(());
+        r.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 12345)));
+        let header = axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap();
+        for v in before {
+            r.headers_mut()
+                .append(header.clone(), HeaderValue::from_str(v).unwrap());
+        }
+        r.headers_mut()
+            .append(header, HeaderValue::from_bytes(raw).unwrap());
         r
     }
 
@@ -641,6 +687,121 @@ mod tests {
             resolve(&r, &trusted(&["10.0.0.0/8"])).ip,
             peer,
             "a non-UTF-8 X-Forwarded-For is unreadable, not absent",
+        );
+    }
+
+    #[test]
+    fn an_unreadable_last_x_forwarded_for_element_stands_the_peer_up() {
+        // The property: emptiness is decided on the **final** element, not on
+        // whichever element happens to be readable. The case above makes the
+        // *whole* header yield nothing, which is why it never caught this.
+        //
+        // A trusted proxy that appends rather than overwrites can contribute
+        // an element that evaluates empty — `option forwardfor` style
+        // appending over an inner header that was not there. Searching
+        // leftward for something readable then returns the element before it,
+        // and the elements before the trusted proxy's are the client's. The
+        // client's forged value becomes the resolved address: the throttle
+        // key, and the `client_ip` on the failed-login line.
+        let peer = Some("10.1.2.3".parse().unwrap());
+        let forged = "6.6.6.6";
+
+        for value in ["6.6.6.6,", "6.6.6.6, ", "6.6.6.6, ,", "6.6.6.6,,"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-for", value)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert_eq!(
+                c.ip, peer,
+                "X-Forwarded-For: {value:?} ends in an element the proxy \
+                 wrote and that carries nothing, so the peer stands — \
+                 {forged} is the client's own entry",
+            );
+        }
+
+        // The same shape across field lines: the trusted proxy appended a
+        // whole new line, and its line is the empty one.
+        let c = resolve(
+            &req_appending(
+                "10.1.2.3",
+                &[("x-forwarded-for", "6.6.6.6"), ("x-forwarded-for", "")],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip, peer,
+            "the last field line is the trusted proxy's and it is empty, so \
+             the client's earlier line is not the answer",
+        );
+
+        // And where the trusted proxy's own field line is not UTF-8. `to_str`
+        // failing on the final line is the final element being unreadable,
+        // not a reason to read the line before it.
+        let c = resolve(
+            &req_with_raw_last("10.1.2.3", "x-forwarded-for", &["6.6.6.6"], &[0xff, 0xfe]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip, peer,
+            "a non-UTF-8 last field line is unreadable, and the readable line \
+             before it is the client's",
+        );
+
+        // The control, which must keep working: two readable elements still
+        // resolve to the last one.
+        let c = resolve(
+            &req("10.1.2.3", &[("x-forwarded-for", "6.6.6.6, 5.5.5.5")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some("5.5.5.5".parse().unwrap()),
+            "a readable final element is still the answer",
+        );
+    }
+
+    #[test]
+    fn an_unreadable_last_x_forwarded_proto_element_withholds_secure() {
+        // The scheme arm of the same rule. `X-Forwarded-Proto` is present, so
+        // it decides; its final element is the trusted proxy's, and where
+        // that element carries nothing the header is unreadable and `secure`
+        // is `false`. Reading leftward instead lets a client's own earlier
+        // `https` issue a `Secure` cookie over a plain-HTTP request, which
+        // the browser will neither store nor return — so the caller cannot
+        // log in.
+        for value in ["https,", "https, ", "https, ,", "https,,"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", value)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert!(
+                !c.secure,
+                "X-Forwarded-Proto: {value:?} ends in an element that carries \
+                 nothing, so the header is unreadable and `Secure` is \
+                 withheld",
+            );
+        }
+
+        let c = resolve(
+            &req_appending(
+                "10.1.2.3",
+                &[("x-forwarded-proto", "https"), ("x-forwarded-proto", "")],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            !c.secure,
+            "the trusted proxy's own field line is the empty one; the \
+             client's earlier https is not the answer",
+        );
+
+        let c = resolve(
+            &req_with_raw_last("10.1.2.3", "x-forwarded-proto", &["https"], &[0xff, 0xfe]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            !c.secure,
+            "a non-UTF-8 last field line is unreadable, not absent",
         );
     }
 
