@@ -1274,6 +1274,50 @@ listen_interfaces = "0.0.0.0:6882"
     }
 
     #[test]
+    fn a_contained_profiles_torrents_are_invisible_to_the_outer_profiles_load_all() {
+        // C53. The rule above is dropped for **both** stores —
+        // `validate_effective_store_dirs` says so, and `torrent_dir` is
+        // overridable in exactly the same way `resume_dir` is — but only the
+        // resume store's half was pinned. The torrent-directory inventory scan
+        // is what re-assigns an info-hash whose resume file is gone, so an
+        // outer profile that reached into an inner one's directory here would
+        // adopt another account's torrents under its own fingerprint, user
+        // agent and tunnel address: the same failure the refusal named, by the
+        // path nothing was watching.
+        use torrentd_engine::FsTorrentStore;
+        use torrentd_engine::ProfileId;
+        use torrentd_engine::TorrentStore;
+
+        let dir = tempdir().unwrap();
+        let outer_dir = dir.path().join("torrents");
+        let inner_dir = outer_dir.join("acct_a");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+
+        let outer_ih = "aa".repeat(20);
+        let inner_ih = "bb".repeat(20);
+        std::fs::write(outer_dir.join(format!("{outer_ih}.torrent")), b"outer").unwrap();
+        std::fs::write(inner_dir.join(format!("{inner_ih}.torrent")), b"inner").unwrap();
+
+        // `default` overrides to the old root, `acct_a` derives
+        // `<outer>/acct_a` inside it: the documented upgrade, which the
+        // validator now accepts.
+        let store = FsTorrentStore::new(outer_dir.clone())
+            .with_profile_dir(ProfileId::new("default"), outer_dir.clone());
+
+        let outer = store.load_all(&ProfileId::new("default")).unwrap();
+        assert_eq!(
+            outer.len(),
+            1,
+            "the outer profile must load only its own .torrent, got {outer:?}",
+        );
+        assert_eq!(outer[0].0.to_hex(), outer_ih);
+
+        let inner = store.load_all(&ProfileId::new("acct_a")).unwrap();
+        assert_eq!(inner.len(), 1, "and the inner profile loads only its own");
+        assert_eq!(inner[0].0.to_hex(), inner_ih);
+    }
+
+    #[test]
     fn distinct_derived_store_directories_are_accepted() {
         // The ordinary case, so the new rule cannot pass by refusing
         // everything: neither profile overrides anything and the derived

@@ -100,10 +100,14 @@ listen_interfaces = "0.0.0.0:6881,[::]:6881"
 dht               = true
 
 # Optional per-profile overrides. Every value below is distinct from every
-# other profile's in this file, and has to stay that way: `listen_port` (which
-# shares one namespace with the ports in a host profile's
-# `listen_interfaces`), `peer_fingerprint_hex` and `user_agent` are all
-# refused when two profiles end up with the same one.
+# other profile's in this file, and has to stay that way. `listen_port` shares
+# one namespace with the ports in a host profile's `listen_interfaces`, and two
+# profiles that end up on one port are refused. `peer_fingerprint_hex` and
+# `user_agent` are refused the same way whenever either of the two profiles
+# wrote the value down; two that both omit the key and inherit the default
+# above are accepted, which is what makes it a default. `resume_dir` and
+# `torrent_dir` must not *equal* another profile's — one containing another's
+# is fine, since neither store descends into a subdirectory.
 # resume_dir           = "/var/lib/torrentd/resume/public"
 # torrent_dir          = "/var/lib/torrentd/torrents/public"
 # peer_fingerprint_hex = "b7c6d5e4f3a29180"

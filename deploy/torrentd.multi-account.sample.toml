@@ -61,12 +61,23 @@ network_kill_switch = false
 #     share one namespace. An announced port two profiles share correlates them
 #     to a tracker operator whichever address each announced from.
 #   * `peer_fingerprint_hex` and `user_agent` are what a tracker reads as the
-#     account's client. Two profiles announcing one of them — including by both
-#     inheriting a top-level default — is the cross-account correlation whose
-#     stated consequence is a permanent ban.
+#     account's client. Two profiles that end up announcing one of them are
+#     refused where either of them wrote it down — one profile declaring the
+#     value another takes from a top-level default is the cross-account
+#     correlation whose stated consequence is a permanent ban. A pair that both
+#     leave the key unwritten and inherit the same default is accepted: nothing
+#     is hidden from whoever reads the file, and a `vpn` profile must state its
+#     own identity, so such a pair is always two host profiles — which are one
+#     host. (This file sets no top-level identity at all; every profile below
+#     states its own.)
 #   * Each profile's resume and `.torrent` directories are its own. By default
 #     they are `<resume_dir>/<id>` and `<torrent_dir>/<id>`; an override must
-#     not equal, contain, or sit inside another profile's.
+#     not equal another profile's. One that *contains* another's is fine: each
+#     store lists a single directory and keeps only the `.resume` / `.torrent`
+#     files in it, never descending into a profile subdirectory — which is what
+#     leaves the upgrade from a pre-profiles deployment writable, where one
+#     profile is pointed at the old roots and the rest derive `<root>/<id>`
+#     inside them.
 
 # The untunnelled profile: public trackers and DHT content. Peers and trackers
 # see this machine's address, so nothing that must not be traced here belongs
