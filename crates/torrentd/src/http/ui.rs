@@ -1,7 +1,19 @@
 //! Serving the embedded web client.
 //!
-//! The bundle is compiled into the binary so a deployment is one artifact. It
-//! is mounted last, under a catch-all, so it can never shadow an API route:
+//! In a **release** build the bundle is compiled into the binary, so a
+//! deployment is one artifact. In a debug build it is not: `rust-embed` gates
+//! the embedded impl behind `#[cfg(not(debug_assertions))]` and the
+//! `debug-embed` feature is not taken, so a debug binary holds the absolute
+//! path to `web/dist` and reads each file from disk at request time. That is
+//! a supported way to run this — `Cargo.toml` has `web-ui` on by default so
+//! that a plain `cargo build` serves the UI, and a plain `cargo build` is
+//! debug — and it is worth knowing that there the assets are whatever is on
+//! disk, with `rust-embed`'s own documented symlink escape in play.
+//!
+//! Everything below is true of both: the dynamic path hashes file content the
+//! same way, so the validators and the negotiation behave identically.
+//!
+//! It is mounted last, under a catch-all, so it can never shadow an API route:
 //! anything the router already matched wins, and only unmatched paths fall
 //! through to here.
 //!
@@ -104,8 +116,20 @@ fn accepts(headers: &HeaderMap, encoding: &str) -> bool {
                 .then(|| val.trim().parse::<f32>().unwrap_or(0.0))
         });
         match q {
-            Some(q) if q <= 0.0 => return false,
-            _ => accepted = true,
+            // Written as the acceptance condition rather than as its
+            // negation, and range-checked. A qvalue is a number in 0..=1
+            // (RFC 9110 §12.4.2); `f32::parse` also accepts `nan`, `inf` and
+            // `INFINITY`, and every comparison with NaN is false, so a
+            // `q <= 0.0` refusal let `q=nan` fall through to the arm that
+            // means "no `q` parameter at all" and serve a brotli body — as
+            // did `q=INFINITY`. Stating what is accepted leaves nothing to
+            // fall through: anything that is not a weight in range is
+            // unreadable, and the line above says an unreadable one is a
+            // refusal. The cost of a refusal is the identity encoding, which
+            // every client can read.
+            Some(q) if q > 0.0 && q <= 1.0 => accepted = true,
+            Some(_) => return false,
+            None => accepted = true,
         }
     }
     accepted
@@ -134,8 +158,11 @@ fn negotiated(path: &str, headers: &HeaderMap) -> Option<(rust_embed::EmbeddedFi
 /// `Cache-Control` on a fingerprinted asset promises, and what makes a 304 on
 /// an unchanged `index.html` correct. Established from rust-embed 8.12.0's own
 /// source rather than assumed: `rust_embed_utils::read_file_from_fs` computes
-/// `Sha256::digest(&data)`, and `rust_embed_impl::embed_file` bakes that value
-/// into the binary at compile time.
+/// `Sha256::digest(&data)`, and in a **release** build `rust_embed_impl::embed_file`
+/// bakes that value into the binary at compile time. A debug build computes
+/// the same digest over the same bytes at request time instead, so the
+/// stability argument holds either way — it is content that is hashed, not a
+/// build timestamp.
 ///
 /// This is exactly why `Last-Modified` is not used instead. Its sibling field
 /// there, `last_modified`, is `fs::metadata().modified()` — a filesystem
@@ -220,7 +247,30 @@ fn cache_control(path: &str) -> &'static str {
     }
 }
 
+/// Serve `path`, honouring the request's conditional headers.
 fn respond(path: &str, req_headers: &HeaderMap) -> Option<Response> {
+    respond_inner(path, req_headers, true)
+}
+
+/// Serve `path` and ignore `If-None-Match`.
+///
+/// For the single-page-app fallback, where the path being served is not the
+/// path the client asked for. A validator identifies a representation of the
+/// *requested* URL, and the client has never fetched this one, so comparing
+/// `index.html`'s tag against a conditional request for `/some/deep/link`
+/// answers 304 — an empty body and no document — for a URL nothing was ever
+/// stored under. `If-None-Match: *` reaches it with no stored validator at
+/// all.
+///
+/// A conformant browser keys `If-None-Match` per URL and would not send one
+/// here, but a shared cache revalidating on the operator's behalf is exactly
+/// the deployment this change introduces, and `no-cache` on `index.html`
+/// makes every deep-link load a revalidation.
+fn respond_unconditionally(path: &str, req_headers: &HeaderMap) -> Option<Response> {
+    respond_inner(path, req_headers, false)
+}
+
+fn respond_inner(path: &str, req_headers: &HeaderMap, conditional: bool) -> Option<Response> {
     let file = Assets::get(path)?;
 
     // Negotiation happens *before* the validator, because the validator is
@@ -247,7 +297,7 @@ fn respond(path: &str, req_headers: &HeaderMap) -> Option<Response> {
     // not ask for one.
     headers.insert(header::VARY, HeaderValue::from_static("accept-encoding"));
 
-    if matches_etag(req_headers, &tag) {
+    if conditional && matches_etag(req_headers, &tag) {
         let mut res = StatusCode::NOT_MODIFIED.into_response();
         *res.headers_mut() = headers;
         return Some(res);
@@ -271,6 +321,40 @@ fn respond(path: &str, req_headers: &HeaderMap) -> Option<Response> {
     Some(res)
 }
 
+/// Whether `path` is a precompressed sibling of an asset rather than an asset.
+///
+/// `precompress.mjs` writes `<asset>.br` and `<asset>.gz` beside each asset,
+/// and `Assets` embeds the whole directory, so every sibling is also an
+/// independently addressable URL. Served directly it is compressed bytes with
+/// no `Content-Encoding`, under whatever `Content-Type` the `.br`/`.gz`
+/// extension guesses, and under `assets/` with a year-long `immutable` —
+/// demonstrated: `GET /index.html.br` returned 200,
+/// `application/octet-stream`, raw brotli.
+///
+/// A sibling is a *representation* of the path it sits beside, reachable by
+/// negotiating for that path. It is not a resource, so it does not have a URL.
+fn is_precompressed_sibling(path: &str) -> bool {
+    [".br", ".gz"]
+        .iter()
+        .filter_map(|suffix| path.strip_suffix(suffix))
+        .any(|base| Assets::get(base).is_some())
+}
+
+/// A 404 that a shared cache cannot assign heuristic freshness to.
+///
+/// Neither 404 passes through `respond`, so neither inherited its
+/// `Cache-Control` and both went out with none at all. RFC 9111 §4.2.2 lets a
+/// cache invent freshness for a response that carries no explicit lifetime,
+/// and a fingerprinted asset briefly 404s during a rolling upgrade — long
+/// enough for a caching proxy to pin it.
+fn not_found(message: &'static str) -> Response {
+    let mut res = (StatusCode::NOT_FOUND, message).into_response();
+    security_headers(res.headers_mut());
+    res.headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    res
+}
+
 pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
     let path = uri.path().trim_start_matches('/');
     // A single-page app owns its own routing, so an unknown path is not a 404 —
@@ -279,29 +363,25 @@ pub async fn serve(uri: Uri, headers: HeaderMap) -> Response {
     // answered with HTML.
     let candidate = if path.is_empty() { "index.html" } else { path };
 
+    if is_precompressed_sibling(candidate) {
+        return not_found("not found");
+    }
+
     if let Some(res) = respond(candidate, &headers) {
         return res;
     }
 
     if candidate.contains('.') {
-        let mut res = (StatusCode::NOT_FOUND, "not found").into_response();
-        security_headers(res.headers_mut());
-        return res;
+        return not_found("not found");
     }
 
-    match respond("index.html", &headers) {
+    // The fallback, and the conditional request does not come with it: the
+    // client asked for another URL, so its validator is about another URL.
+    match respond_unconditionally("index.html", &headers) {
         Some(res) => res,
         // Built with the feature on but no bundle present: say so plainly
         // rather than serving a blank page.
-        None => {
-            let mut res = (
-                StatusCode::NOT_FOUND,
-                "the web client was not embedded in this build",
-            )
-                .into_response();
-            security_headers(res.headers_mut());
-            res
-        }
+        None => not_found("the web client was not embedded in this build"),
     }
 }
 
@@ -363,6 +443,147 @@ mod tests {
 
         let h = headers(&[(header::ACCEPT_ENCODING, "br;q=0.001")]);
         assert!(accepts(&h, "br"), "a low quality is still an acceptance");
+    }
+
+    #[test]
+    fn a_q_that_is_not_a_weight_is_a_refusal() {
+        // The property the doc on `accepts` claims: an unreadable `q` is a
+        // refusal. `q=bogus` was refused, which proved the rule was
+        // implemented — and `f32::parse` accepts the float specials, so
+        // `q=nan` and `q=INFINITY` escaped it. Every comparison with NaN is
+        // false, so a refusal written as `q <= 0.0` fell through to the arm
+        // that means "no `q` parameter at all" and served a brotli body to a
+        // client that never asked for one. Demonstrated live before the fix
+        // for all four spellings below.
+        for q in [
+            "nan", "NaN", "inf", "-inf", "INFINITY", "infinity", "bogus", "", "2", "1.5",
+        ] {
+            let h = headers(&[(header::ACCEPT_ENCODING, format!("br;q={q}").as_str())]);
+            assert!(
+                !accepts(&h, "br"),
+                "q={q:?} is not a weight in 0..=1, so it cannot be read as an \
+                 acceptance",
+            );
+        }
+
+        // The controls: real weights on either side of the boundary.
+        for q in ["0.001", "0.5", "1", "1.0", "1.000"] {
+            let h = headers(&[(header::ACCEPT_ENCODING, format!("br;q={q}").as_str())]);
+            assert!(accepts(&h, "br"), "q={q:?} is a weight and an acceptance");
+        }
+    }
+
+    #[test]
+    fn a_404_forbids_a_cache_storing_it() {
+        // Neither 404 branch passes through `respond`, so neither inherited
+        // its `Cache-Control` and both went out with none at all — leaving a
+        // shared cache free to invent freshness (RFC 9111 §4.2.2) for a
+        // fingerprinted asset that 404s for a moment during a rolling
+        // upgrade.
+        let res = not_found("not found");
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            res.headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("no-store"),
+            "a 404 must say it is not to be stored",
+        );
+        assert_eq!(
+            res.headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "and it still carries the security headers it already had",
+        );
+    }
+
+    #[tokio::test]
+    async fn the_spa_fallback_ignores_a_conditional_request_for_another_url() {
+        // `respond` evaluated `If-None-Match` against `index.html`'s
+        // validator whatever URL was asked for, so a deep link the client has
+        // never fetched answered **304 with an empty body** — no document,
+        // for a URL nothing was ever stored under. `If-None-Match: *` reaches
+        // it with no stored validator at all. A shared cache revalidating on
+        // the operator's behalf is exactly the deployment this change
+        // introduces.
+        assert!(
+            Assets::get("index.html").is_some(),
+            "the bundle has to be present for this test to be testing \
+             anything; `web-ui` is a default feature and the build produces it",
+        );
+        let tag = etag_for(&Assets::get("index.html").unwrap(), None);
+
+        for inm in [tag.as_str(), "*"] {
+            let res = serve(
+                "/some/deep/link".parse::<Uri>().unwrap(),
+                headers(&[(header::IF_NONE_MATCH, inm)]),
+            )
+            .await;
+            assert_eq!(
+                res.status(),
+                StatusCode::OK,
+                "If-None-Match: {inm} belongs to /some/deep/link, which the \
+                 client has never fetched, so the fallback owes it a document",
+            );
+        }
+
+        // The control: on the URL the validator *is* about, a conditional
+        // request still gets its 304.
+        let res = serve(
+            "/index.html".parse::<Uri>().unwrap(),
+            headers(&[(header::IF_NONE_MATCH, &tag)]),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::NOT_MODIFIED,
+            "a conditional request for the URL the tag identifies still 304s",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_precompressed_sibling_is_not_a_url_of_its_own() {
+        // Every sibling `precompress.mjs` writes is inside the embedded
+        // directory, so each was independently addressable and served
+        // compressed bytes with no `Content-Encoding`, under whatever
+        // Content-Type the `.br` extension guesses, and under `assets/` with
+        // a year-long `immutable`. A sibling is a representation of the path
+        // it sits beside, reachable by negotiating for that path.
+        assert!(
+            Assets::get("index.html.br").is_some(),
+            "the precompressed siblings have to be present for this test to \
+             be testing anything; the web build writes them",
+        );
+
+        for path in ["/index.html.br", "/index.html.gz"] {
+            let res = serve(path.parse::<Uri>().unwrap(), HeaderMap::new()).await;
+            assert_eq!(
+                res.status(),
+                StatusCode::NOT_FOUND,
+                "{path} is a representation of /index.html, not a resource",
+            );
+        }
+
+        // The control: the path it is a sibling of is still served, and still
+        // negotiates to the sibling's bytes.
+        let res = serve(
+            "/index.html".parse::<Uri>().unwrap(),
+            headers(&[(header::ACCEPT_ENCODING, "br")]),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            res.headers()
+                .get(header::CONTENT_ENCODING)
+                .map(|v| v.to_str().unwrap()),
+            Some("br"),
+            "the brotli bytes are still reachable, by negotiating for them",
+        );
+
+        // And a `.br` path with nothing beside it is an ordinary miss rather
+        // than a sibling.
+        assert!(!is_precompressed_sibling("no-such-asset.js.br"));
     }
 
     #[test]
