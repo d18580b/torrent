@@ -325,7 +325,8 @@ pub async fn run_verify_queue(
             // profile — the one thing fencing exists to prevent. Put it back and
             // wait for the operator.
             if profiles
-                .get(&item.profile)
+                .resolve(&item.profile)
+                .active()
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
             {
                 warn!(

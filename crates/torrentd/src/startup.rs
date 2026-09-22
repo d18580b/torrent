@@ -879,7 +879,8 @@ pub async fn boot(
         let profiles = profile_registry.clone();
         Arc::new(move |id: &torrentd_engine::ProfileId| {
             profiles
-                .get(id)
+                .resolve(id)
+                .active()
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })
