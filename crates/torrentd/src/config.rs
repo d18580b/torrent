@@ -323,9 +323,6 @@ impl Config {
         self.validate_effective_store_dirs()
             .context("[[profile]] validation failed")?;
 
-        if check_auth_posture {
-            self.validate_auth_posture()?;
-        }
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -407,6 +404,21 @@ impl Config {
                     }
                 }
             }
+        }
+
+        // Shape before policy, last of all: every check above names something
+        // the operator must physically change — a duplicate `listen_port`, a
+        // zero `aio_threads`, a `password_hash` that is not a PHC string, two
+        // `[pool]` roots that nest — while a config with no stated posture is
+        // well-formed and not permitted. Running the policy check first meant
+        // a malformed value was reported only once the posture was settled,
+        // and `hash-password`, which the posture refusal names as the way out,
+        // then refused for a reason `--check-config` had never shown the
+        // operator: `load_for_operator_tool` skips this check and runs every
+        // one above it. Last is also the position that makes "shape before
+        // policy" describe the code rather than only the `[[profile]]` block.
+        if check_auth_posture {
+            self.validate_auth_posture()?;
         }
         Ok(())
     }
@@ -1620,6 +1632,59 @@ listen_interfaces = "0.0.0.0:6882"
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("allow_unauthenticated"), "got: {msg}");
         assert!(msg.contains("hash-password"), "the error names the way out");
+    }
+
+    #[test]
+    fn a_malformed_value_is_reported_before_the_posture() {
+        // The property: shape before policy, for every shape check and not
+        // only the `[[profile]]` block. A zero `aio_threads`, a
+        // `password_hash` that is not a PHC string, and two `[pool]` roots
+        // that nest each name something the operator must physically change;
+        // a config with no stated posture is well-formed and not permitted.
+        //
+        // The order matters beyond tidiness. `load_for_operator_tool` skips
+        // the posture check and runs every other one, so while the posture
+        // was reported first, the refusal sent the operator to
+        // `hash-password` — the way out it names — and `hash-password` then
+        // refused for a malformed value `--check-config` had never shown
+        // them. Each configuration here is wrong in two ways at once, which
+        // is the only way to observe an ordering.
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+
+        let cases = [
+            (
+                format!(
+                    "{}aio_threads = 0\n{ONE_HOST_PROFILE}",
+                    top_level_no_opt_out(),
+                ),
+                "aio_threads = 0 is out of range",
+            ),
+            (
+                // `[auth]` beside the opt-out is the policy refusal here.
+                format!("{TOP_LEVEL}\n[auth]\npassword_hash = \"not-a-phc-string\"\n{ONE_HOST_PROFILE}"),
+                "password_hash is not a valid PHC string",
+            ),
+            (
+                format!(
+                    "{}\n[pool]\nroots = [\"{}\", \"{}\"]\nlibrary_dir = \"{}\"\n{ONE_HOST_PROFILE}",
+                    top_level_no_opt_out(),
+                    root.display(),
+                    root.join("inner").display(),
+                    dir.path().join("library").display(),
+                ),
+                "[pool] roots must not nest",
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let msg = refusal(&body);
+            assert!(
+                msg.contains(expected),
+                "the malformed value must be reported before the posture; got: {msg}",
+            );
+        }
     }
 
     #[test]
