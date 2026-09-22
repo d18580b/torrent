@@ -219,8 +219,8 @@ fields have **one** spelling each, because log queries depend on it:
 
 | Field | Notes |
 | --- | --- |
-| `profile_id` | The `id` of a configured `[[profile]]`. Always present — every torrent belongs to exactly one profile, and there is no implicit one. **Never** `slot_id`, its name before profiles; CI fails on that spelling anywhere in `crates/`. |
-| `infohash` | Lowercase hex, 40 chars. **Never** `info_hash` — CI fails on that spelling anywhere in `crates/`. |
+| `profile_id` | The `id` of a configured `[[profile]]`. Always present — every torrent belongs to exactly one profile, and there is no implicit one. **Never** `slot_id`, its name before profiles; CI fails on that spelling in any `.rs` file under `crates/`. |
+| `infohash` | Lowercase hex, 40 chars. **Never** `info_hash` — CI fails on that spelling in any `.rs` file under `crates/`. |
 | `op` | The engine operation: `add_torrent`, `remove_torrent`, `pause_torrent`, `resume_torrent`, `save_resume_data`, `set_upload_limit`, `set_file_priority`, `force_recheck`, `move_storage`, `apply_settings`. |
 | `alert_type` | Lowercase `AlertKind`, e.g. `add_torrent`. |
 | `error.kind` / `error.code` / `error.cause` | Short identifier, OS or libtorrent code, human-readable cause. |
