@@ -214,6 +214,9 @@ dht               = true
 # That copy is a full second copy of the index, so the first open needs free
 # space equal to the size of `pool.db`. If it cannot be written the migration
 # stops, names the backup path and the reason, and leaves the index as it was.
+# Nothing deletes it afterwards and nothing ages it out: remove it yourself
+# once you would not go back. Anything already at that path when a migration
+# starts is kept as it is, and no new copy is taken.
 #
 # A `pool.db` from one of this change's own pre-release builds can report
 # version 2 while already carrying `profile`. Such a file is recognised

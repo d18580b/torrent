@@ -360,13 +360,19 @@ impl PoolStore {
     /// same migration, and that attempt rolled back, so it describes the same
     /// state this one would write — and the older file is the one an operator
     /// has had time to notice.
+    ///
+    /// "Exists" is `symlink_metadata`, not `Path::exists`: the latter follows
+    /// symlinks, so a `.pre-v3.bak` that is a symlink to nothing read as
+    /// absent, and `VACUUM INTO` then wrote the only rollback copy of the
+    /// index *through* it, wherever it pointed. Whatever an operator put at
+    /// this path, the answer to "is something already here" is yes.
     fn backup_before_v3(&self) -> Result<(), PoolError> {
         // No path: an in-memory store, which has nothing to roll back to.
         let Some(path) = self.conn.path().filter(|p| !p.is_empty()) else {
             return Ok(());
         };
         let backup = format!("{path}{}", Self::PRE_V3_BACKUP_SUFFIX);
-        if Path::new(&backup).exists() {
+        if Path::new(&backup).symlink_metadata().is_ok() {
             info!(
                 target: "torrentd_pool::store",
                 backup = %backup,

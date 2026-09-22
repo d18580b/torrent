@@ -1584,6 +1584,18 @@ fn a_genuine_v2_index_is_still_migrated_by_the_version_keyed_step() {
     );
 }
 
+/// Drop the write bit on `dir`, returning the mode to restore afterwards.
+///
+/// Restoring matters: `tempfile::TempDir`'s cleanup cannot remove a file from
+/// a directory it may not write, so leaving the mode set leaks the directory
+/// into the next run.
+fn make_readonly(dir: &Path) -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    let original = std::fs::metadata(dir).unwrap().permissions();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    original
+}
+
 #[test]
 fn a_backup_that_cannot_be_written_names_the_backup_and_the_reason() {
     // C51. `VACUUM INTO` writes a full second copy of an index designed to
@@ -1593,22 +1605,39 @@ fn a_backup_that_cannot_be_written_names_the_backup_and_the_reason() {
     // otherwise-valid migration with no mention of a backup, a path, or why
     // the migration wanted one, on a database `startup.rs` opens with `?`.
     //
-    // The backup path is made unwritable by pointing it at a directory that
-    // does not exist. A plain file or directory in the way would not do it:
-    // `backup_before_v3` checks `exists()` first and keeps an existing copy,
-    // and `exists()` follows symlinks — so a dangling one is absent to that
-    // check and unopenable to `VACUUM INTO`, which is the shape a full volume
-    // presents.
+    // The target is made uncreatable by making the directory holding the index
+    // read-only, which is as close to a full volume as a test gets: the
+    // database itself still opens read-write, and only the new file beside it
+    // cannot be created. That needs the `-wal` and `-shm` siblings to survive
+    // the setup connection's close — SQLite deletes them on close and cannot
+    // delete them from a directory it may not write, which is why the mode is
+    // dropped before the drop below.
+    //
+    // Nothing already at the backup path would do instead: whatever is there,
+    // including a symlink to nothing, is an existing copy to
+    // `backup_before_v3`, which keeps it and takes none.
     let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("pool.db");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let db = state.join("pool.db");
     build_v1_index(&db);
     apply_v2_journal(&db);
 
-    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
-    std::os::unix::fs::symlink(dir.path().join("no/such/dir/backup.db"), &backup).unwrap();
-    assert!(!backup.exists(), "a dangling symlink reads as absent");
+    let setup = rusqlite::Connection::open(&db).unwrap();
+    setup
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("wal");
+    setup
+        .execute_batch("BEGIN IMMEDIATE; CREATE TABLE _wal_touch(x); DROP TABLE _wal_touch; COMMIT")
+        .unwrap();
+    let original = make_readonly(&state);
+    drop(setup);
 
-    let err = PoolStore::open(&db).expect_err("the copy cannot be written here");
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    let outcome = PoolStore::open(&db);
+    std::fs::set_permissions(&state, original).unwrap();
+
+    let err = outcome.expect_err("the copy cannot be written here");
     let msg = format!("{err}");
     assert!(
         msg.contains(&backup.display().to_string()),
@@ -1623,6 +1652,41 @@ fn a_backup_that_cannot_be_written_names_the_backup_and_the_reason() {
     // "free some space and start again" a true instruction.
     assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
     assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+}
+
+#[test]
+fn a_dangling_backup_symlink_is_kept_rather_than_written_through() {
+    // D30. The existence check followed symlinks, so a `.pre-v3.bak` that is a
+    // symlink to nothing read as *absent* — and `VACUUM INTO` then wrote the
+    // index's only rollback copy through it, into whatever path it named,
+    // silently and outside the state directory. The check asks whether
+    // something is at that path, so it must not resolve what is there.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let elsewhere = dir.path().join("elsewhere.db");
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
+    assert!(!backup.exists(), "the fixture is a symlink to nothing");
+
+    PoolStore::open(&db).expect("the migration runs; the existing copy is kept");
+
+    assert!(
+        !elsewhere.exists(),
+        "nothing may be written through the link, and something was",
+    );
+    assert!(
+        std::fs::symlink_metadata(&backup)
+            .expect("the link itself is still there")
+            .file_type()
+            .is_symlink(),
+        "and what the operator left at that path is untouched",
+    );
+    // The migration itself still ran: keeping an existing copy is not a
+    // failure, and this file's schema really does need v3.
+    assert_eq!(user_version(&db), 3);
 }
 
 #[test]
