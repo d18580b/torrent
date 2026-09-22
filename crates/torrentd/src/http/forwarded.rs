@@ -68,6 +68,17 @@ impl Cidr {
         Ok(Self { addr, prefix })
     }
 
+    /// The parsed prefix length.
+    ///
+    /// Exposed because judging the *value* of a block is not the same
+    /// question as matching against it, and the judgement has to be made on
+    /// what `parse` produced. `u8::from_str` accepts a leading `+` and any
+    /// number of leading zeros, so one prefix length has unboundedly many
+    /// spellings and only this number identifies it.
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
+
     pub fn contains(&self, ip: IpAddr) -> bool {
         match (self.addr, ip) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => {

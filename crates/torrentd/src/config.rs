@@ -352,18 +352,32 @@ impl Config {
         // is the bright line — any stricter floor would be a guess about
         // somebody's network, and refusing a legitimate `/8` would be worse
         // than the startup log that now records the parsed set.
+        //
+        // Decided on the **parsed** prefix, never on the entry's text. A
+        // guard that reads `entry.split_once('/')` and compares the text to
+        // `"0"` closes one spelling of a value rather than the value:
+        // `Cidr::parse` reads the prefix with `u8::from_str`, which accepts a
+        // leading `+` and any number of leading zeros, so `0.0.0.0/00`,
+        // `0.0.0.0/000`, `0.0.0.0/+0`, `::/00` and `::/+0` all parse to the
+        // same `prefix == 0` and all reach the same `prefix_match`, which
+        // returns `true` before comparing a byte. The number is the value;
+        // the text is one of its spellings.
         for entry in &self.trusted_proxies {
-            if let Some((_, prefix)) = entry.split_once('/') {
-                if prefix.trim() == "0" {
-                    anyhow::bail!(
-                        "trusted_proxies: {entry:?} trusts every peer there is. Anything listed \
-                         here can claim to be any client, so a /0 prefix makes every forwarding \
-                         header client-controlled: the login throttle keys on a value the caller \
-                         picks, the session cookie's Secure attribute is the caller's choice, and \
-                         the client_ip on the failed-login line is whatever the caller wrote. \
-                         List the address your reverse proxy connects from, and only that."
-                    );
-                }
+            // Re-parsed rather than re-read. `TrustedProxies::parse` above
+            // has already established that every entry parses, so this cannot
+            // fail, and taking the prefix from the parser is the whole point.
+            let prefix = crate::http::forwarded::Cidr::parse(entry)
+                .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?
+                .prefix();
+            if prefix == 0 {
+                anyhow::bail!(
+                    "trusted_proxies: {entry:?} trusts every peer there is. Anything listed \
+                     here can claim to be any client, so a /0 prefix makes every forwarding \
+                     header client-controlled: the login throttle keys on a value the caller \
+                     picks, the session cookie's Secure attribute is the caller's choice, and \
+                     the client_ip on the failed-login line is whatever the caller wrote. \
+                     List the address your reverse proxy connects from, and only that."
+                );
             }
         }
         // Range-check the numeric overrides. These are handed to libtorrent as
@@ -814,9 +828,27 @@ listen_interfaces = "0.0.0.0:6881"
         // the caller's to choose. README.md and docs/running.md §6a both
         // promise this key "fails safe rather than open"; without this
         // refusal the one value that defeats it is the one that validates.
+        //
+        // Every spelling of that value, not the two canonical ones. The
+        // prefix is parsed with `u8::from_str`, which takes a leading `+` and
+        // any number of leading zeros, so `/00`, `/000` and `/+0` are the
+        // same prefix reaching the same `prefix_match` — and a refusal
+        // written against the entry's *text* accepts all of them while
+        // refusing `/0`. That is not a hypothetical spelling: a daemon
+        // booted with `["0.0.0.0/00"]` believes a forged `X-Forwarded-For`
+        // from every caller on earth.
         let dir = tempdir().unwrap();
 
-        for wide in ["0.0.0.0/0", "::/0"] {
+        for wide in [
+            "0.0.0.0/0",
+            "0.0.0.0/00",
+            "0.0.0.0/000",
+            "0.0.0.0/+0",
+            "::/0",
+            "::/00",
+            "::/000",
+            "::/+0",
+        ] {
             let body = with_top_level(&format!("trusted_proxies = [\"{wide}\"]"));
             // `parse` alone, so the refusal is attributed to `validate`
             // rather than to the file being unreadable.
