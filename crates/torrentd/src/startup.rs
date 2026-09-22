@@ -395,18 +395,6 @@ pub async fn boot(
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
 
-    // Discard raised-interface records whose interface is no longer standing,
-    // before anything can consult one.
-    //
-    // A record says "no link of this name was standing when *some* boot called
-    // `bring_up`". Nothing in the process is told when a link later goes away,
-    // so a record for an interface an operator removed by hand — the one
-    // remedy the runbook names for a stuck tunnel — stays armed inside the
-    // same host boot, and claims whatever next takes the name. This is the
-    // only place that can drop it: the record outlives the process that wrote
-    // it, so the process that finds it spent is a later one entirely.
-    crate::vpn::sweep_raised_records(&run_dir);
-
     // Signals, installed before anything that can block or fail.
     //
     // They used to go in after the resume and torrent-dir scans, which left
@@ -428,6 +416,30 @@ pub async fn boot(
     // adjacent statements here any more.
     let (mut boot_shutdown, shutdown_rx) =
         boot_shutdown_receivers_before(&shutdown_tx, || signals::run(channels.clone())).await;
+
+    // Discard raised-interface records whose interface is no longer standing,
+    // before anything can consult one.
+    //
+    // A record names a link this daemon raised. Nothing in the process is told
+    // when a link later goes away, so a record for an interface an operator
+    // removed by hand — the one remedy the runbook names for a stuck tunnel —
+    // stays on disk inside the same host boot. This is the only place that can
+    // drop it: the record outlives the process that wrote it, so the process
+    // that finds it spent is a later one entirely. It runs before any
+    // `bring_up`, and therefore before anything can consult or overwrite one.
+    //
+    // *Below* the signal install, and on `spawn_blocking`, for the two reasons
+    // this file already applies to every other blocking call in `boot`. It
+    // walks a directory and unlinks files, which is synchronous filesystem
+    // I/O on a runtime worker; and "signals first" is structural here, so a
+    // SIGTERM arriving while a slow or wedged state directory is being read is
+    // handled rather than killing the process outright.
+    {
+        let sweep_dir = run_dir.clone();
+        tokio::task::spawn_blocking(move || crate::vpn::sweep_raised_records(&sweep_dir))
+            .await
+            .context("raised-interface record sweep")?;
+    }
 
     // Undoes what boot has raised, for every exit that is not a successful
     // one. Tunnels and the kill-switch table outlive the process, so a `?`
