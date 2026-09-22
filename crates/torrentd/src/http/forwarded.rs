@@ -237,21 +237,105 @@ fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> HeaderRead<'a> {
             .iter()
             .next_back()
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.split(',').next_back())
+            .and_then(|v| split_outside_quotes(v, ',').last())
             .map(str::trim)
             .filter(|s| !s.is_empty()),
     }
 }
 
+/// Split `s` on `sep`, ignoring separators inside a quoted string.
+///
+/// RFC 7239 §4 makes a parameter value either a `token` — which cannot
+/// contain a quote, a comma or a semicolon — or a `quoted-string`, which can
+/// contain all three. Splitting on the bare byte therefore re-frames the
+/// grammar around a value the *client* supplied: the one parameter a proxy
+/// routinely copies from the request is `host=`, quoted precisely because the
+/// client's `Host` may contain characters a token may not.
+///
+/// Demonstrated against a daemon trusting loopback, before this:
+/// `for=198.51.100.9;host="a,for=6.6.6.6"` read as two elements and resolved
+/// to `6.6.6.6`; `host="a;for=6.6.6.6";for=198.51.100.9` read as two
+/// parameters and did the same; `for=198.51.100.9;host="a,proto=https"`
+/// destroyed the proxy's own `for=` *and* set `Secure`. The loss case needs
+/// no attacker at all — a proxy legitimately quoting a separator silently
+/// loses its own claim.
+struct SplitOutsideQuotes<'a> {
+    rest: Option<&'a str>,
+    sep: char,
+}
+
+impl<'a> Iterator for SplitOutsideQuotes<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let s = self.rest?;
+        let mut quoted = false;
+        let mut escaped = false;
+        for (i, c) in s.char_indices() {
+            if escaped {
+                escaped = false;
+            } else if quoted && c == '\\' {
+                // `quoted-pair`: the next character is data whatever it is,
+                // including a closing quote.
+                escaped = true;
+            } else if c == '"' {
+                quoted = !quoted;
+            } else if c == self.sep && !quoted {
+                self.rest = Some(&s[i + c.len_utf8()..]);
+                return Some(&s[..i]);
+            }
+        }
+        self.rest = None;
+        Some(s)
+    }
+}
+
+fn split_outside_quotes(s: &str, sep: char) -> SplitOutsideQuotes<'_> {
+    SplitOutsideQuotes { rest: Some(s), sep }
+}
+
+/// Remove RFC 7239 §4 `quoted-string` quoting from a parameter value.
+///
+/// `trim_matches('"')` is not this. It strips quote characters from either
+/// end whether or not they are a matched pair, it leaves a `quoted-pair`
+/// escape in the value, and on `""` it removes two quotes from one side. A
+/// value that is not a quoted string at all is returned as it arrived.
+fn unquote(v: &str) -> std::borrow::Cow<'_, str> {
+    let Some(inner) = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return std::borrow::Cow::Borrowed(v);
+    };
+    if !inner.contains('\\') {
+        return std::borrow::Cow::Borrowed(inner);
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for c in inner.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// The value of `key` in one RFC 7239 element, e.g. `proto` in
-/// `for=203.0.113.9;proto=https`. Quotes are stripped; the name is
-/// case-insensitive, as RFC 7239 §4 requires.
-fn param<'a>(element: &'a str, key: &str) -> Option<&'a str> {
-    element.split(';').find_map(|p| {
+/// `for=203.0.113.9;proto=https`. Quoting is removed per RFC 7239 §4; the
+/// name is case-insensitive, as the same section requires.
+///
+/// The parameter list is split outside quoted strings, for the reason
+/// [`SplitOutsideQuotes`] gives. Splitting the *name* from the value on the
+/// first `=` needs no such care: a name is a token, so the first `=` in a
+/// parameter is always the one that separates them.
+fn param<'a>(element: &'a str, key: &str) -> Option<std::borrow::Cow<'a, str>> {
+    split_outside_quotes(element, ';').find_map(|p| {
         let (k, v) = p.split_once('=')?;
         k.trim()
             .eq_ignore_ascii_case(key)
-            .then(|| v.trim().trim_matches('"'))
+            .then(|| unquote(v.trim()))
     })
 }
 
@@ -337,7 +421,7 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
         forwarded
             .last
             .and_then(|f| param(f, "for"))
-            .and_then(node_addr)
+            .and_then(|node| node_addr(&node))
             .or(Some(peer))
     };
 
@@ -565,6 +649,71 @@ mod tests {
             "a proxy emitting only the standardised header must still be able \
              to name its client",
         );
+    }
+
+    #[test]
+    fn a_quoted_forwarded_parameter_cannot_reframe_the_grammar() {
+        // The property: RFC 7239 §4 separators inside a quoted string are
+        // data, not structure. The parameter a proxy routinely quotes is
+        // `host=`, because the client's `Host` may hold characters a token
+        // may not — so a naive split hands the client the element boundary
+        // and the parameter list, and the failure direction is toward a
+        // client-controlled address and a client-controlled scheme.
+        let case = |v: &str| {
+            resolve(
+                &req("10.1.2.3", &[("forwarded", v)]),
+                &trusted(&["10.0.0.0/8"]),
+            )
+        };
+        let proxy: Option<IpAddr> = Some("198.51.100.9".parse().unwrap());
+
+        // A comma inside `host=` is not an element boundary.
+        let c = case(r#"for=198.51.100.9;host="a,for=6.6.6.6""#);
+        assert_eq!(
+            c.ip, proxy,
+            "the quoted comma does not start a second element, so the \
+             proxy's own for= still decides",
+        );
+
+        // A semicolon inside `host=` is not a parameter boundary.
+        let c = case(r#"host="a;for=6.6.6.6";for=198.51.100.9"#);
+        assert_eq!(
+            c.ip, proxy,
+            "the quoted semicolon does not introduce a second parameter",
+        );
+
+        // The same, on the scheme: a quoted `proto=` is not a `proto=`.
+        let c = case(r#"for=198.51.100.9;host="a,proto=https""#);
+        assert!(
+            !c.secure,
+            "a quoted proto= is part of host=, and must not set Secure",
+        );
+        assert_eq!(
+            c.ip, proxy,
+            "and the element's own for= survives the quoted comma",
+        );
+        let c = case(r#"host="x;proto=https";proto=http"#);
+        assert!(
+            !c.secure,
+            "the element's own proto=http decides, not the quoted text",
+        );
+
+        // `quoted-pair`: the escaped quote is data, so the string does not
+        // end there and the value keeps the quote.
+        assert_eq!(
+            param(r#"host="a\"b";for=198.51.100.9"#, "host").as_deref(),
+            Some(r#"a"b"#),
+            "a backslash escape is unwrapped rather than left in the value",
+        );
+        assert_eq!(
+            param(r#"host="a\"b";for=198.51.100.9"#, "for").as_deref(),
+            Some("198.51.100.9"),
+            "and the escaped quote does not swallow the rest of the element",
+        );
+
+        // Unquoting is not trimming quote characters off the ends.
+        assert_eq!(param(r#"host="""#, "host").as_deref(), Some(""));
+        assert_eq!(param("host=plain", "host").as_deref(), Some("plain"));
     }
 
     #[test]
