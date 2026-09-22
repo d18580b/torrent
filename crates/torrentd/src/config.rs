@@ -406,17 +406,40 @@ impl Config {
             }
         }
 
+        // The boot rule, which is a pure function of the config file and so
+        // belongs above the policy check with every other one. It used to run
+        // in `main::check_config`, after `Config::load` had already returned —
+        // so two configs differing only in whether a posture was stated gave
+        // "no [auth] section…" for one and "Configure a vpn profile, or unset
+        // network_kill_switch" for the other, and the operator saw the thing
+        // they must physically change only once the policy refusal was
+        // cleared. Demonstrated on both. Running it here also gives it to the
+        // operator subcommands, which `load_for_operator_tool` never ran it
+        // for.
+        self.check_boot_rules()?;
+
         // Shape before policy, last of all: every check above names something
         // the operator must physically change — a duplicate `listen_port`, a
         // zero `aio_threads`, a `password_hash` that is not a PHC string, two
-        // `[pool]` roots that nest — while a config with no stated posture is
-        // well-formed and not permitted. Running the policy check first meant
-        // a malformed value was reported only once the posture was settled,
-        // and `hash-password`, which the posture refusal names as the way out,
+        // `[pool]` roots that nest, a kill switch with no tunnel to confine
+        // egress to — while a config with no stated posture is well-formed and
+        // not permitted. Running the policy check first meant a malformed
+        // value was reported only once the posture was settled, and
+        // `hash-password`, which the posture refusal names as the way out,
         // then refused for a reason `--check-config` had never shown the
         // operator: `load_for_operator_tool` skips this check and runs every
         // one above it. Last is also the position that makes "shape before
-        // policy" describe the code rather than only the `[[profile]]` block.
+        // policy" describe this function end to end, rather than only the
+        // `[[profile]]` block.
+        //
+        // `--check-config` runs one further refusal after this one, and it is
+        // deliberately not here: whether the `nft` binary exists is a fact
+        // about the host, not about the file. `Config::load` is also what the
+        // SIGHUP pump and every operator subcommand call, so a probe of the
+        // host placed here would refuse a reload, and refuse `hash-password`,
+        // on a machine without nftables — demonstrated, including on
+        // `hash-password`, which is the invocation the posture refusal names
+        // as the way out. See `main::check_config`.
         if check_auth_posture {
             self.validate_auth_posture()?;
         }
@@ -635,9 +658,22 @@ impl Config {
     /// `Restart=on-failure` — did not. The configuration that reaches it, a
     /// set of profiles with zero tunnels, is new in this change.
     ///
-    /// Kept separate from [`Config::validate`] because it is a boot rule
-    /// rather than a well-formedness rule: `vpn check` and the `pool`
-    /// subcommands load the same file and have no business refusing it.
+    /// Called from [`Config::validate_inner`], above the authentication
+    /// posture, so it reaches everything that loads a config: the daemon,
+    /// `--check-config`, the SIGHUP pump and the operator subcommands alike.
+    ///
+    /// It was kept out of [`Config::validate`] on the ground that a boot rule
+    /// is not a well-formedness rule and that `vpn check` and the `pool`
+    /// subcommands "have no business refusing it". Two things were wrong with
+    /// that. It *is* a pure function of the config file — this function reads
+    /// nothing else — which is the definition "shape before policy" uses; and
+    /// running it after `Config::load` returned put it below the posture
+    /// check, so the operator was told to configure authentication before
+    /// being told the kill switch had no tunnel to confine egress to.
+    ///
+    /// Refusing an operator subcommand here is the intended consequence: a
+    /// configuration the daemon will not boot from is one `pool scan` should
+    /// not be writing an index from either.
     pub fn check_boot_rules(&self) -> anyhow::Result<()> {
         if self.network_kill_switch && !self.profile.iter().any(|p| p.is_vpn()) {
             anyhow::bail!(
@@ -2022,10 +2058,65 @@ listen_interfaces = "0.0.0.0:6882"
         // rather than under `Restart=on-failure`. This refusal is a pure
         // function of the file and `boot` makes it anyway, so the pre-flight
         // has no reason not to.
+        //
+        // It is a refusal of `Config::load` itself, not of a second pass over
+        // a config that already loaded: being a pure function of the file is
+        // what puts it with the rest of the shape checks.
         let dir = tempdir().unwrap();
         let p = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
-        let cfg = Config::load(&p).expect("it parses and validates; it does not boot");
-        let msg = format!("{:#}", cfg.check_boot_rules().unwrap_err());
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch") && msg.contains("vpn"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_boot_rule_is_reported_before_the_authentication_posture() {
+        // The property: of two configs differing only in whether a posture is
+        // stated, the one that states none must still be told about the thing
+        // it has to physically change. `check_boot_rules` ran in
+        // `main::check_config`, after `Config::load` had returned, so it sat
+        // below the policy check: `--check-config` on a kill switch with no
+        // vpn profile and no posture answered "no [auth] section…", and the
+        // operator saw "Configure a vpn profile, or unset
+        // network_kill_switch" only on the next run. Demonstrated on both
+        // configs.
+        let dir = tempdir().unwrap();
+
+        let stated = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
+        let msg = format!("{:#}", Config::load(&stated).unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch"),
+            "the posture is stated, so the boot rule is what is left; got: {msg}",
+        );
+
+        // The same file with the opt-out line removed, so no posture is
+        // stated and both refusals apply.
+        let body = with_top_level("network_kill_switch = true")
+            .replace("allow_unauthenticated = true\n", "");
+        assert!(!body.contains("allow_unauthenticated"));
+        let sub = dir.path().join("b");
+        fs::create_dir_all(&sub).unwrap();
+        let unstated = write_cfg(&sub, &body);
+        let msg = format!("{:#}", Config::load(&unstated).unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch"),
+            "shape before policy: the kill switch names something the operator \
+             must physically change, and it is reported first; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn an_operator_subcommand_gets_the_boot_rules_too() {
+        // The property: the exemption `load_for_operator_tool` carries is from
+        // the *posture* check and nothing else. A boot rule that is a pure
+        // function of the file is not about serving, so a subcommand is held
+        // to it — demonstrated before this change by `pool status` running
+        // happily against a config `--check-config` refuses.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
+        let msg = format!("{:#}", Config::load_for_operator_tool(&p).unwrap_err());
         assert!(
             msg.contains("network_kill_switch") && msg.contains("vpn"),
             "got: {msg}",

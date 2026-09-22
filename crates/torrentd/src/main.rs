@@ -257,9 +257,17 @@ fn load_config(cli: &Cli) -> anyhow::Result<config::Config> {
 /// check that touched disk state would fail on a host where that directory is
 /// not yet provisioned, which is the pre-flight case this flag exists for. The
 /// flag's own help text says so.
+///
+/// What is left here is exactly one thing, and it is here because it is a
+/// probe of the host rather than of the file. `Config::check_boot_rules` moved
+/// into `Config::validate`, above the authentication posture, where "shape
+/// before policy" puts every refusal that is a pure function of the config
+/// file; this one is not, and `Config::validate` is also what the SIGHUP pump
+/// and every operator subcommand run. Probing `nft` there refuses a reload,
+/// and refuses `hash-password`, on a machine without nftables — demonstrated —
+/// which is the check-about-serving-in-front-of-a-tool-that-serves-nothing
+/// shape this crate has already repaired twice.
 fn check_config(cfg: &config::Config) -> anyhow::Result<()> {
-    // Refusals that are pure functions of the config file.
-    cfg.check_boot_rules()?;
     // The kill switch shells out to `nft`; fail the pre-flight check now
     // rather than aborting startup later.
     if cfg.network_kill_switch && !vpn::killswitch::nft_available() {
@@ -590,15 +598,45 @@ http_listen = "127.0.0.1:8080"
         // `ExecStartPre`. `boot` refuses this configuration, and the
         // pre-flight used to green-light it — so the failure landed at
         // `ExecStart` under `Restart=on-failure` instead of before it.
-        let cfg = cfg_from(&format!(
-            "{TOP}network_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
-             network = \"host\"\nlisten_interfaces = \"0.0.0.0:6881\"\n"
-        ));
-        let msg = format!("{:#}", check_config(&cfg).unwrap_err());
+        //
+        // The refusal now lives in `Config::validate`, above the posture
+        // check, because it is a pure function of the file; `--check-config`
+        // reaches it through `Config::load` like every other shape check.
+        // What is pinned here is that the pre-flight still makes it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("torrentd.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "{TOP}network_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
+                 network = \"host\"\nlisten_interfaces = \"0.0.0.0:6881\"\n"
+            ),
+        )
+        .unwrap();
+        let msg = format!("{:#}", config::Config::load(&p).unwrap_err());
         assert!(
             msg.contains("network_kill_switch") && msg.contains("vpn"),
             "got: {msg}",
         );
+    }
+
+    #[test]
+    fn the_pre_flight_probes_nft_and_config_loading_does_not() {
+        // The property: whether `nft` exists is a fact about the host, so it
+        // is `--check-config`'s to establish and not `Config::load`'s.
+        // `Config::load` is what the SIGHUP pump and every operator
+        // subcommand run; probing the host there refuses a reload, and
+        // refuses `hash-password`, on a machine without nftables.
+        //
+        // The probe's outcome depends on the host, so what is pinned is the
+        // seam: `check_config` is the only caller, and a config with the kill
+        // switch off never reaches it.
+        let cfg = cfg_from(&format!(
+            "{TOP}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
+             listen_interfaces = \"0.0.0.0:6881\"\n"
+        ));
+        assert!(!cfg.network_kill_switch);
+        check_config(&cfg).expect("no kill switch, so no probe and nothing to refuse");
     }
 
     #[test]
