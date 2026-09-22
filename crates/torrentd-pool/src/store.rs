@@ -173,6 +173,28 @@ DROP INDEX torrent_by_slot;
 CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
 "#;
 
+/// [`SCHEMA_V3`]'s two index statements, in the form that may be applied to a
+/// file where either of them has already run.
+///
+/// A build that applied `SCHEMA_V3` with one implicit transaction per statement
+/// could commit the rename and lose an index statement, leaving v3's columns
+/// under `user_version = 2` with either no index on `profile` or the old
+/// `torrent_by_slot` mislabelled over it. [`PoolStore::migrate`]'s recognition
+/// arm brings such a file the rest of the way with these two statements and no
+/// rename, so both have to tolerate the work already being done.
+///
+/// Deliberately **not** `SCHEMA_V3`'s own text. The version-keyed step's
+/// `CREATE INDEX` is bare on purpose: `a_v3_step_that_fails_leaves_the_version
+/// _and_the_schema_agreeing` forces that statement to fail by pre-creating an
+/// index of the name, which is how the one-transaction property is pinned, and
+/// an `IF NOT EXISTS` there would disarm it. The two texts describe the same
+/// two indexes; a change to either index belongs in both.
+const SCHEMA_V3_INDEXES: &str = r#"
+DROP INDEX IF EXISTS torrent_by_slot;
+
+CREATE INDEX IF NOT EXISTS torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
+"#;
+
 pub struct PoolStore {
     conn: Connection,
     /// Nesting depth for [`PoolStore::in_transaction`]; 0 means autocommit.
@@ -371,8 +393,19 @@ impl PoolStore {
         Ok(())
     }
 
-    /// Whether this file is the one `b28a778` wrote: v3's schema under v2's
-    /// version.
+    /// Whether this file carries v3's `torrent` columns under v2's version:
+    /// a `profile` column and **no** `slot` column.
+    ///
+    /// Not one commit's file. Any superseded build of this change that reached
+    /// v3's columns without recording the version writes this shape, and there
+    /// is more than one way it happened: a build that folded the rename into
+    /// `SCHEMA_V1` at `SCHEMA_VERSION = 2` wrote it with both indexes correct,
+    /// and a build that applied `SCHEMA_V3` with one implicit transaction per
+    /// statement wrote it with the rename committed and an index statement
+    /// lost. Naming a commit here claimed a boundary this predicate does not
+    /// have: the column test is true of every one of them, so the arm below
+    /// checks the indexes too and repairs them rather than stamping a version
+    /// over a schema that is not yet v3's.
     ///
     /// **This does not reopen the decision that the migration is keyed on
     /// `user_version`.** That decision rejected keying the *migration* on
@@ -380,14 +413,12 @@ impl PoolStore {
     /// is present — because a schema that inspects itself has two sources of
     /// truth about its own shape. Nothing here keys a migration on anything:
     /// the steps below are unchanged and still run off `found`. This is a
-    /// one-shot repair of one file that a superseded build of this very branch
-    /// wrote with a version its schema does not match, and the transaction
+    /// one-shot repair of files that superseded builds of this very branch
+    /// wrote with a version their schema does not match, and the transaction
     /// around `migrate` means no build after it can produce another.
     ///
-    /// Bounded to that one shape deliberately: `user_version = 2`, a `profile`
-    /// column, and **no** `slot` column. A file with both, or with neither, is
-    /// not this one and goes down the ordinary path. A genuine v2 file has
-    /// `slot` and no `profile`, so it cannot match.
+    /// What cannot match: a file with both columns, or with neither, goes down
+    /// the ordinary path, and a genuine v2 file has `slot` and no `profile`.
     ///
     /// The alternative was to tell the operator this file cannot be migrated
     /// and must be deleted. That is honest and it destroys the `plan` /
@@ -396,7 +427,7 @@ impl PoolStore {
     /// does not help either: it is a `VACUUM INTO` of the already-broken
     /// database, so the rollback the upgrade note describes restores the same
     /// unopenable file.
-    fn is_b28a778_shape(&self) -> Result<bool, PoolError> {
+    fn carries_v3_columns_at_v2(&self) -> Result<bool, PoolError> {
         let mut has_profile = false;
         let mut has_slot = false;
         let mut stmt = self.conn.prepare("PRAGMA table_info(torrent)")?;
@@ -409,6 +440,20 @@ impl PoolStore {
             }
         }
         Ok(has_profile && !has_slot)
+    }
+
+    /// Whether an index called `name` exists on `torrent` in this file.
+    ///
+    /// The other half of the recognition: the columns say the rename ran, and
+    /// this says whether the index statements that follow it ran with it.
+    fn has_torrent_index(&self, name: &str) -> Result<bool, PoolError> {
+        let found: i64 = self.conn.query_row(
+            "SELECT count(*) FROM sqlite_master \
+             WHERE type = 'index' AND tbl_name = 'torrent' AND name = ?1",
+            params![name],
+            |r| r.get(0),
+        )?;
+        Ok(found > 0)
     }
 
     /// Walk the schema forward from whatever the file reports.
@@ -424,8 +469,9 @@ impl PoolStore {
     /// `Restart=on-failure`. `PRAGMA user_version` is journaled and
     /// participates in the transaction.
     ///
-    /// One shape is recognised rather than stepped: see
-    /// [`PoolStore::is_b28a778_shape`].
+    /// A file those steps cannot reach — v3's columns already, under v2's
+    /// version — is recognised rather than stepped: see
+    /// [`PoolStore::carries_v3_columns_at_v2`].
     fn migrate(&self) -> Result<(), PoolError> {
         let found: i64 = self
             .conn
@@ -439,20 +485,62 @@ impl PoolStore {
         if found == SCHEMA_VERSION {
             return Ok(());
         }
-        // The one file no version-keyed step can reach. Stamped, not stepped,
-        // and before the backup: there is nothing destructive to copy aside
-        // when the only write is a `PRAGMA`.
-        if found == 2 && self.is_b28a778_shape()? {
-            self.conn
-                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
-            warn!(
-                target: "torrentd_pool::store",
-                from_version = found,
-                to_version = SCHEMA_VERSION,
-                "pool index already carries the v3 schema at user_version = 2; stamping the \
-                 version to match. This file was written by a superseded build of this change \
-                 that folded the rename into v1. No schema change was made and no data moved",
-            );
+        // The files no version-keyed step can reach: v3's columns already, so
+        // there is no `slot` to rename, under a version that says otherwise.
+        // Stamped rather than stepped — and where the indexes did not come
+        // with the columns, brought the rest of the way first, because a
+        // version stamped over a schema that is not yet v3's is permanent:
+        // `migrate` returns at `found == SCHEMA_VERSION` on every later open,
+        // so nothing would ever create the index on `profile` that the whole
+        // index exists to carry.
+        //
+        // Before the backup, and without one: the rename is v3's only
+        // irreversible statement and it has already run here, so what is left
+        // destroys nothing — an index is derivable from the table it indexes.
+        // A stray `.pre-v3.bak` beside a healthy index reads as a failed
+        // migration, which the fresh-database test states as a property.
+        if found == 2 && self.carries_v3_columns_at_v2()? {
+            let indexed = self.has_torrent_index("torrent_by_profile")?;
+            // One transaction over the index statements and the stamp, for
+            // the reason the stepped path has one: a stamp that commits
+            // without them is the state this arm exists to end.
+            self.conn.execute_batch("BEGIN IMMEDIATE")?;
+            let repaired = (|| -> Result<(), PoolError> {
+                if !indexed {
+                    self.conn.execute_batch(SCHEMA_V3_INDEXES)?;
+                }
+                self.conn
+                    .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                Ok(())
+            })();
+            if let Err(e) = repaired {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+            self.conn.execute_batch("COMMIT")?;
+            if indexed {
+                warn!(
+                    target: "torrentd_pool::store",
+                    from_version = found,
+                    to_version = SCHEMA_VERSION,
+                    indexes_repaired = false,
+                    "pool index already carries the v3 schema at user_version = 2; stamping the \
+                     version to match. A superseded build of this change wrote this file with \
+                     v3's schema and v2's version. No schema change was made and no data moved",
+                );
+            } else {
+                warn!(
+                    target: "torrentd_pool::store",
+                    from_version = found,
+                    to_version = SCHEMA_VERSION,
+                    indexes_repaired = true,
+                    "pool index carries the v3 schema at user_version = 2 but not v3's indexes; \
+                     creating torrent_by_profile, dropping torrent_by_slot if it survived the \
+                     rename, and stamping the version to match. A superseded build of this \
+                     change wrote this file with the column rename committed and an index \
+                     statement lost. No data moved",
+                );
+            }
             return Ok(());
         }
         // Outside the transaction: VACUUM cannot run inside one. Only for a
