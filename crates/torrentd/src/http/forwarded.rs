@@ -160,9 +160,23 @@ impl TrustedProxies {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Client {
     pub ip: Option<IpAddr>,
-    /// Whether the *original* request was over TLS. `false` when unknown,
-    /// which is the safe direction: it only ever withholds the `Secure`
-    /// cookie attribute, never adds it wrongly.
+    /// Whether the *original* request was over TLS — the **outermost** hop's
+    /// answer, not the nearest one's.
+    ///
+    /// The two are different questions and they read the chain from opposite
+    /// ends. `ip` wants the hop the trusted proxy saw, which is the last
+    /// element. TLS is terminated at the edge, so whether the request began
+    /// over TLS is what the *first* element says, and `https` anywhere in a
+    /// readable `X-Forwarded-Proto` chain means some hop terminated it:
+    /// `https, http` is a TLS edge in front of a plain-HTTP inner proxy, and
+    /// the original request there was TLS.
+    ///
+    /// `false` when unknown, which is the safe direction for the *unknown*
+    /// case: it only ever withholds the `Secure` cookie attribute, never adds
+    /// it wrongly. It is not the safe direction for a known TLS deployment —
+    /// withholding `Secure` there sends the session cookie in clear to any
+    /// plain-HTTP origin on the host — which is why "unknown" has to stay
+    /// narrow.
     pub secure: bool,
 }
 
@@ -322,6 +336,23 @@ fn unquote(v: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
+/// Every element of `name`'s value, across every field line, in order.
+///
+/// For the question "did *any* hop say this", where [`last_element`]'s
+/// question is "what did the hop that wrote the header say". A field line
+/// that is not UTF-8 contributes nothing, which is why the caller still asks
+/// `last_element` whether the header is readable at all before believing an
+/// answer from here.
+fn elements<'a, B>(req: &'a Request<B>, name: &str) -> impl Iterator<Item = &'a str> {
+    req.headers()
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| split_outside_quotes(v, ','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 /// The value of `key` in one RFC 7239 element, e.g. `proto` in
 /// `for=203.0.113.9;proto=https`. Quoting is removed per RFC 7239 §4; the
 /// name is case-insensitive, as the same section requires.
@@ -436,10 +467,40 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     // Where `X-Forwarded-Proto` is present and unreadable the answer is
     // `false`, not `Forwarded`'s. `false` is the safe direction here — it
     // only ever withholds `Secure`, and the operator can still log in.
+    //
+    // *Which element* answers is the one thing that differs from the address,
+    // and it differs because the question does. "Last" on the address chain
+    // means the hop the trusted proxy saw, which is the client. The scheme
+    // asks whether the **original** request was over TLS, and that is the
+    // *outermost* hop's answer: a TLS-terminating edge in front of a
+    // plain-HTTP inner proxy, each appending, writes `https, http`, and
+    // taking the last element there returns `false` for a deployment whose
+    // original request genuinely was TLS — so the session cookie ships
+    // without `Secure` and the browser sends it in clear to any plain-HTTP
+    // origin on that host. That is the harm this change exists to remove,
+    // arriving from the rule meant to prevent it.
+    //
+    // So: `https` anywhere in a readable chain means the original request was
+    // over TLS. Every element of the chain was written by a proxy — the one
+    // requirement `TrustedProxies` places on the deployment is that
+    // client-supplied values are stripped or overwritten — so there is no
+    // element here whose `https` is the client's to forge. The two rules
+    // compose: `last` still decides whether the header is *readable*, and the
+    // chain decides what a readable one says.
     let xfp = last_element(req, "x-forwarded-proto");
     let secure = if xfp.present {
-        xfp.last.is_some_and(|p| p.eq_ignore_ascii_case("https"))
+        xfp.last.is_some()
+            && elements(req, "x-forwarded-proto").any(|p| p.eq_ignore_ascii_case("https"))
     } else {
+        // `Forwarded` keeps the last-element rule, deliberately, and this is
+        // the one place the two names differ. An `X-Forwarded-Proto` chain is
+        // a chain of schemes and nothing else; a `Forwarded` element carries
+        // `for=` and `proto=` together, so the element that answers "which
+        // hop" for the address has to be the one that answers it for the
+        // scheme, or one header yields two hops' answers to one request.
+        // `an_earlier_forwarded_element_cannot_supply_the_scheme` pins that,
+        // and a proxy that appends a `Forwarded` element without stripping
+        // the client's leaves the client's element first.
         forwarded
             .last
             .and_then(|f| param(f, "proto"))
@@ -584,20 +645,31 @@ mod tests {
     }
 
     #[test]
-    fn a_second_proto_field_line_wins_over_the_first() {
+    fn a_second_proto_field_line_is_read_at_all() {
+        // Repeated field lines are one comma-joined value (RFC 9110
+        // §5.2-5.3), so both lines have to be read. Reading only
+        // `HeaderMap::get` — the first line — answers `false` here.
+        //
+        // This test previously asserted the opposite pairing: `https` then
+        // `http` across two lines meant *not* secure, on the last-hop rule
+        // the address uses. The scheme does not take its answer from the same
+        // end of the chain — see `Client::secure` — so that expectation was
+        // the defect, not the property. `a_tls_edge_in_front_of_a_plain_inner_proxy_is_still_secure`
+        // pins the corrected direction; this pins that the second line is
+        // read.
         let c = resolve(
             &req_appending(
                 "10.1.2.3",
                 &[
-                    ("x-forwarded-proto", "https"),
                     ("x-forwarded-proto", "http"),
+                    ("x-forwarded-proto", "https"),
                 ],
             ),
             &trusted(&["10.0.0.0/8"]),
         );
         assert!(
-            !c.secure,
-            "the proxy's own line said http; the client's earlier https must not win",
+            c.secure,
+            "the second field line names a TLS hop and must be read",
         );
     }
 
@@ -909,6 +981,57 @@ mod tests {
             Some("5.5.5.5".parse().unwrap()),
             "a readable final element is still the answer",
         );
+    }
+
+    #[test]
+    fn a_tls_edge_in_front_of_a_plain_inner_proxy_is_still_secure() {
+        // The property: `secure` is the **outermost** hop's answer. TLS is
+        // terminated at the edge, so a chain written by a TLS edge in front
+        // of a plain-HTTP inner proxy — each appending — reads `https, http`,
+        // and the original request there was over TLS.
+        //
+        // Taking the last element instead returns `false` and issues the
+        // session cookie without `Secure` on a deployment that really is
+        // TLS-fronted, so the browser sends it in clear to any plain-HTTP
+        // origin on that host. That is the harm this change exists to remove.
+        for value in ["https, http", "https,http", "https, http, http"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", value)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert!(
+                c.secure,
+                "X-Forwarded-Proto: {value:?} begins at a TLS edge, so the \
+                 original request was over TLS",
+            );
+        }
+
+        // The same across field lines, which is how an appending proxy that
+        // adds its own line writes it.
+        let c = resolve(
+            &req_appending(
+                "10.1.2.3",
+                &[
+                    ("x-forwarded-proto", "https"),
+                    ("x-forwarded-proto", "http"),
+                ],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            c.secure,
+            "a second field line saying http is an inner hop, not a \
+             correction of the edge",
+        );
+
+        // The control: a chain with no TLS hop anywhere is not secure.
+        for value in ["http", "http, http"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", value)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert!(!c.secure, "X-Forwarded-Proto: {value:?} names no TLS hop");
+        }
     }
 
     #[test]
