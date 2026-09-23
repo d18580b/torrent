@@ -198,8 +198,15 @@ impl Config {
             100_000,
         )?;
         // upload_rate_limit is a byte/sec cap where 0 means unlimited, so 0 is
-        // valid and only the absurd upper end is worth rejecting.
-        range("upload_rate_limit", self.upload_rate_limit, 0, u32::MAX)?;
+        // valid. The upper end is i32::MAX because the shim hands the value to
+        // libtorrent's int-typed setting through a narrowing cast; anything
+        // larger would arrive there as a negative rate limit.
+        range(
+            "upload_rate_limit",
+            self.upload_rate_limit,
+            0,
+            i32::MAX as u32,
+        )?;
 
         if let Some(auth) = &self.auth {
             auth.validate()?;
@@ -665,6 +672,23 @@ library_dir = "{d}/library"
         let p = write_cfg(dir.path(), &bad);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("aio_threads"), "got: {msg}");
+        assert!(msg.contains("out of range"), "got: {msg}");
+    }
+
+    #[test]
+    fn upload_rate_limit_is_bounded_by_what_libtorrent_can_carry() {
+        let dir = tempdir().unwrap();
+        let at_bound = format!("{SINGLE_SESSION}\nupload_rate_limit = {}\n", i32::MAX);
+        let p = write_cfg(dir.path(), &at_bound);
+        Config::load(&p).expect("i32::MAX fits libtorrent's int setting");
+
+        let past_bound = format!(
+            "{SINGLE_SESSION}\nupload_rate_limit = {}\n",
+            i32::MAX as u32 + 1
+        );
+        let p = write_cfg(dir.path(), &past_bound);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("upload_rate_limit"), "got: {msg}");
         assert!(msg.contains("out of range"), "got: {msg}");
     }
 
