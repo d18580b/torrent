@@ -629,8 +629,11 @@ On a scratch pool, not your real one.
    resumes with 409 until you restart the daemon. It must not restart itself.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
-   interfaces for the daemon's uid. Setting it with no `vpn` profile is a
-   startup error, not a warning.
+   interfaces for the daemon's uid. Setting it with no `vpn` profile, or
+   beside any `host` profile, is a startup error, not a warning: the ruleset
+   matches the daemon's uid and cannot tell a host profile's traffic from a
+   leak, so that profile would send nothing while reporting itself healthy.
+   Run host profiles in a separate daemon without the switch.
 
 ## Troubleshooting
 

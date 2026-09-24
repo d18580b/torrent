@@ -348,10 +348,11 @@ impl Config {
         s
     }
 
-    /// The one boot refusal that is a pure function of the config file.
+    /// The boot refusals that are pure functions of the config file.
     ///
     /// `startup::boot` refuses `network_kill_switch = true` with no tunnel to
-    /// confine egress to, and `--check-config` — which
+    /// confine egress to, or with a host profile the ruleset would silently
+    /// cut off, and `--check-config` — which
     /// `deploy/torrentd.service` runs as its `ExecStartPre`, so that a bad
     /// configuration fails before `ExecStart` rather than under
     /// `Restart=on-failure` — did not. The configuration that reaches it, a
@@ -369,6 +370,31 @@ impl Config {
                  every profile would keep seeding from the host's own address with no \
                  backstop. Configure a vpn profile, or unset network_kill_switch.",
             );
+        }
+        // The ruleset matches on the daemon's uid, which every profile's
+        // sessions share, and admits only loopback and the tunnel interfaces.
+        // A host profile's sockets are bound to the host's own interfaces, so
+        // under the kill switch every packet it sends is dropped while the
+        // profile stays Active and `/healthz` answers 200. Admitting the host
+        // interfaces instead would admit every vpn profile's leak through them
+        // too, which is the one thing the switch exists to stop.
+        if self.network_kill_switch {
+            let host: Vec<&str> = self
+                .profile
+                .iter()
+                .filter(|p| !p.is_vpn())
+                .map(|p| p.id.as_str())
+                .collect();
+            if !host.is_empty() {
+                anyhow::bail!(
+                    "network_kill_switch = true but host profile(s) {} are configured. The \
+                     kill switch confines the whole daemon's egress to its vpn tunnel \
+                     interfaces, so a network = \"host\" profile could send nothing at all \
+                     while reporting itself healthy. Run host profiles in a separate daemon \
+                     without the kill switch, or unset network_kill_switch.",
+                    host.join(", "),
+                );
+            }
         }
         Ok(())
     }
@@ -1603,6 +1629,14 @@ listen_interfaces = "0.0.0.0:6882"
             cfg.peer_fingerprint.is_none() && cfg.user_agent.is_none(),
             "no top-level identity for a profile to inherit",
         );
+        // It ships the kill switch off because it carries a host profile, and
+        // turning it on as written must be refused rather than cut `public`
+        // off while it reports itself healthy.
+        let mut cfg = cfg;
+        cfg.check_boot_rules().unwrap();
+        cfg.network_kill_switch = true;
+        let msg = format!("{:#}", cfg.check_boot_rules().unwrap_err());
+        assert!(msg.contains("public"), "got: {msg}");
     }
 
     #[test]
@@ -2022,6 +2056,30 @@ listen_interfaces = "0.0.0.0:6882"
         );
         let p = write_cfg(dir.path(), &body);
         Config::load(&p).unwrap().check_boot_rules().unwrap();
+    }
+
+    #[test]
+    fn a_kill_switch_beside_a_host_profile_is_refused() {
+        // The ruleset matches the daemon's uid and admits only the tunnel
+        // interfaces, so a host profile under it sends nothing at all while
+        // it stays Active and `/healthz` answers 200.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}\nnetwork_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
+             network = \"host\"\nlisten_interfaces = \"0.0.0.0:6881\"\n\n\
+             [[profile]]\nid = \"acct_a\"\n\
+             network = \"vpn\"\nvpn_type = \"wireguard\"\n\
+             vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
+             listen_port = 6891\npeer_fingerprint_hex = \"a1b2c3d4e5f60718\"\n\
+             user_agent = \"ua-a\"\n"
+        );
+        let p = write_cfg(dir.path(), &body);
+        let cfg = Config::load(&p).expect("it parses and validates; it does not boot");
+        let msg = format!("{:#}", cfg.check_boot_rules().unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch") && msg.contains("public"),
+            "got: {msg}",
+        );
     }
 
     #[test]
