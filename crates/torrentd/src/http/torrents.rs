@@ -363,8 +363,8 @@ async fn do_add(
     if let AddSource::File(bytes) = &source {
         let domains = s
             .profiles
-            .get(&profile_id)
-            .map(|e| e.config.allowed_tracker_domains.clone())
+            .config(&profile_id)
+            .map(|c| c.allowed_tracker_domains.clone())
             .unwrap_or_default();
         if !domains.is_empty() {
             match libtorrent_safe::torrent_tracker_host_matches(bytes, &domains) {
@@ -522,32 +522,37 @@ pub async fn remove(
                 })),
             ));
         }
-        s.registry.remove(&ih).map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("{e}")})),
-            )
-        })?;
-        // And the two stores. Clearing the registry entry alone does not
-        // hold: `startup.rs` re-scans `<resume_dir>/<id>` and
-        // `<torrent_dir>/<id>` at the next start and re-`assign`s every
-        // info-hash it finds, so the operator's clear is silently undone the
-        // first time the daemon restarts. The engine-backed path gets this
-        // for free through `TorrentRemoved` -> `handlers/add.rs`; with no
-        // session there is no alert, so it is done here.
+        // The two stores first, then the registry entry.
+        //
+        // Clearing the registry entry alone does not hold: `startup.rs`
+        // re-scans `<resume_dir>/<id>` and `<torrent_dir>/<id>` at the next
+        // start and re-`assign`s every info-hash it finds, so the operator's
+        // clear is silently undone the first time the daemon restarts. The
+        // engine-backed path gets this for free through `TorrentRemoved` ->
+        // `handlers/add.rs`; with no session there is no alert, so it is done
+        // here.
+        //
+        // The order is what makes the advice below true. Clearing the
+        // registry first and deleting after meant a failed delete returned
+        // 500 telling the operator to "retry the delete" — and the retry hit
+        // `s.registry.lookup(&ih).ok_or_else(404)` above on the entry it had
+        // just cleared, so it answered `not_found` and never reached the
+        // files. The resume file and the `.torrent` stayed on disk and the
+        // next start re-`assign`ed the info-hash, which is the resurrection
+        // this branch exists to prevent. Deleting first leaves `lookup`
+        // resolving, so the retry re-enters and finishes the work.
         //
         // Reported rather than warned: a clear that will resurrect is not a
-        // clear, and this branch exists precisely because the operator had no
-        // other way to make it stick. Both deletes are no-ops on a missing
-        // file, so an error here means the filesystem, not a race.
+        // clear. Both deletes are no-ops on a missing file, so an error here
+        // means the filesystem, not a race.
         let store_err = |what: &str, e: String| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
                     "error": format!(
-                        "the assignment was cleared but the {what} could not be deleted: {e}. \
-                         The startup scan will re-assign this info-hash until it is gone; \
-                         retry the delete."
+                        "the {what} could not be deleted: {e}. The assignment has been left in \
+                         place so this can be retried; until the file is gone the startup scan \
+                         will re-assign this info-hash. Retry the delete."
                     )
                 })),
             )
@@ -558,6 +563,18 @@ pub async fn remove(
         s.torrents
             .delete(&profile, &ih)
             .map_err(|e| store_err(".torrent file", e.to_string()))?;
+        s.registry.remove(&ih).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "the resume and .torrent files were deleted but the assignment could \
+                         not be cleared: {e}. Retry the delete; the two deletes are no-ops on \
+                         a file that is already gone."
+                    )
+                })),
+            )
+        })?;
         tracing::warn!(
             target: "torrentd::http",
             infohash = %ih,
@@ -568,20 +585,38 @@ pub async fn remove(
         );
         return Ok(StatusCode::NO_CONTENT);
     };
-    let st = s.state.get(&ih).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "not_in_state_map"})),
-        )
-    })?;
-    engine
-        .remove_torrent(st.handle, q.delete_files)
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("{e}")})),
-            )
-        })?;
+    // A missing state-map entry is not a missing torrent when the registry
+    // still names one.
+    //
+    // `remove_torrent` succeeding emits `TorrentRemoved`, whose handler does
+    // `ctx.state.remove(&ih)`. If the registry persist below then failed, the
+    // 500 told the operator to "retry the delete" — and the retry arrived
+    // here to find the state entry already gone and answered 404
+    // `not_in_state_map`, so the assignment it was sent to clear stayed
+    // exactly where it was. Proceeding to the clear when the registry has the
+    // entry is what makes that retry reach the work.
+    match s.state.get(&ih) {
+        Some(st) => {
+            engine
+                .remove_torrent(st.handle, q.delete_files)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("{e}")})),
+                    )
+                })?;
+        }
+        None => {
+            tracing::warn!(
+                target: "torrentd::http",
+                infohash = %ih,
+                profile_id = %profile,
+                "no session state for an info-hash the registry still assigns; clearing the \
+                 assignment alone. This is the retry path of a delete whose session removal \
+                 succeeded and whose registry write did not",
+            );
+        }
+    }
     // Report a persist failure rather than discarding it. On a full or
     // read-only state directory the payload is gone and the assignment write
     // fails, and a 204 here said the delete succeeded — so the claim comes
@@ -779,14 +814,16 @@ fn unresolved_profile(
     s: &AppState,
     profile_id: &ProfileId,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match s.profile_failure_reason(profile_id) {
-        Some(reason) => (
+    match s.profiles.resolve(profile_id) {
+        crate::profile_registry::Resolution::Failed(f) => (
             StatusCode::CONFLICT,
             Json(serde_json::json!({
-                "error": format!("profile failed to start: {reason}"),
+                "error": format!("profile failed to start: {}", f.reason),
             })),
         ),
-        None => (
+        // `Active` does not reach here: the caller has already failed to get
+        // an engine for this id, and a live profile has one.
+        _ => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "unknown profile_id"})),
         ),
@@ -901,6 +938,127 @@ mod tests {
         assert!(
             app.torrents.load_all(&profile).unwrap().is_empty(),
             "the .torrent survives, so the torrent-dir scan re-assigns this info-hash",
+        );
+    }
+
+    /// Drop the write bit on `dir`, returning the mode to restore afterwards.
+    ///
+    /// Restoring matters: `tempfile::TempDir`'s cleanup cannot remove a file
+    /// from a directory it may not write, so leaving the mode set leaks the
+    /// directory into the next run.
+    fn make_readonly(dir: &std::path::Path) -> std::fs::Permissions {
+        use std::os::unix::fs::PermissionsExt;
+        let original = std::fs::metadata(dir).unwrap().permissions();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        original
+    }
+
+    #[tokio::test]
+    async fn a_store_delete_that_fails_leaves_the_assignment_for_the_retry() {
+        // C49, the no-engine branch. Both of this branch's error messages tell
+        // the operator to "retry the delete", and with the registry cleared
+        // first the retry could not reach the work: it re-entered `remove`,
+        // hit `registry.lookup(...).ok_or_else(404)` on the entry it had just
+        // cleared, and answered `not_found`. The resume file and the .torrent
+        // stayed on disk and the next start re-assigned the info-hash — the
+        // resurrection this branch exists to prevent, reached through the
+        // repair's own failure path with a remedy that does not work.
+        //
+        // `MemoryResumeStore`'s deletes cannot fail, so this uses the real
+        // filesystem store with its profile directory made read-only, which is
+        // the full or read-only state directory both messages were written
+        // for.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+        let profile = ProfileId::new("gone");
+        let mut app = state_with_a_stale_assignment(dir.path(), ih);
+
+        let resume_root = dir.path().join("resume");
+        let fs_resume: Arc<dyn torrentd_engine::ResumeStore> =
+            Arc::new(torrentd_engine::FsResumeStore::new(resume_root.clone()));
+        fs_resume.write(&profile, &ih, b"resume-bytes").unwrap();
+        app.resume = fs_resume;
+
+        let profile_dir = resume_root.join(profile.as_str());
+        let original = make_readonly(&profile_dir);
+        let outcome = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery {
+                delete_files: false,
+            }),
+        )
+        .await;
+        std::fs::set_permissions(&profile_dir, original).unwrap();
+
+        let err = outcome.expect_err("the resume file cannot be removed from a read-only dir");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = err.1 .0.to_string();
+        assert!(
+            body.contains("resume file") && body.contains("Retry the delete"),
+            "got: {body}",
+        );
+        assert!(
+            app.registry.lookup(&ih).is_some(),
+            "the assignment must still be there, or the retry the message asks for answers \
+             404 and never reaches the file",
+        );
+
+        // And the retry the message promises actually finishes the work once
+        // the directory is writable again.
+        let code = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery {
+                delete_files: false,
+            }),
+        )
+        .await
+        .expect("the retry reaches the deletes");
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        assert!(app.registry.lookup(&ih).is_none());
+        assert!(app.resume.load_all(&profile).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_registry_persist_that_fails_after_the_session_removal_is_retryable() {
+        // C49, the engine branch. `remove_torrent` succeeding emits
+        // `TorrentRemoved`, whose handler clears the state map. If the
+        // registry write then failed, the 500 said "Retry the delete to clear
+        // the assignment" — and the retry hit `s.state.get(&ih)` on the entry
+        // the alert had already removed and answered 404 `not_in_state_map`,
+        // so the assignment it was sent to clear stayed exactly where it was.
+        //
+        // Simulated at the seam that matters: the state map has no entry and
+        // the registry still does, which is precisely what that retry sees.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+        let app = test_state(dir.path());
+        // `p` is the live profile `build_test_state` gives a session to.
+        app.registry.assign(ih, ProfileId::new("p")).unwrap();
+        assert!(
+            app.source.engine_for(&ProfileId::new("p")).is_some(),
+            "fixture is wrong: this is the engine-backed branch",
+        );
+        assert!(
+            app.state.get(&ih).is_none(),
+            "fixture is wrong: the state entry is what the alert already removed",
+        );
+
+        let code = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery {
+                delete_files: false,
+            }),
+        )
+        .await
+        .expect("a retry whose session removal already happened must clear the assignment");
+
+        assert_eq!(code, StatusCode::NO_CONTENT);
+        assert!(
+            app.registry.lookup(&ih).is_none(),
+            "the assignment the retry exists to clear must be gone",
         );
     }
 

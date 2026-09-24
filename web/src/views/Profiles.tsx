@@ -1,7 +1,26 @@
 import { useQuery } from '@tanstack/react-query'
 import { api, type ProfileSummary, type Status } from '../lib/api'
 import { count, rate } from '../lib/format'
-import { Card, ErrorBanner, StatePill } from '../components/Bits'
+import { Card, ErrorBanner } from '../components/Bits'
+
+/// Pill colour for a profile status.
+///
+/// `active`, `vpn_down` and `failed` are the three values `/api/profiles`
+/// returns, and the two non-active ones are not the same thing: a fenced
+/// profile has a session and lost its tunnel, and is the case the banner below
+/// tells the operator how to clear; a failed profile never got a session at
+/// all, so nothing about it will change without a restart. They were both
+/// rendered through one pill, which made them indistinguishable at exactly the
+/// moment an operator is scanning the column to find out which they have.
+///
+/// The severity class and the label are separate here because they say
+/// different things: the class is `styles.css`'s existing palette, the label is
+/// the status itself rather than a word from the pool's adoption vocabulary.
+function statusSeverity(status: string): string {
+  if (status === 'active') return 'adopted'
+  if (status === 'vpn_down') return 'drifted'
+  return 'missing'
+}
 
 /// Session health. Each profile is a libtorrent session with its own network
 /// posture — a VPN tunnel, or the host's own interfaces — and a fenced profile
@@ -55,10 +74,7 @@ export function Profiles() {
                 <tr key={sl.profile_id}>
                   <td><strong>{sl.profile_id}</strong></td>
                   <td>
-                    <StatePill state={sl.status === 'active' ? 'adopted' : 'overlap'} />
-                    {sl.status !== 'active' && (
-                      <span className="muted small" style={{ marginLeft: 6 }}>{sl.status}</span>
-                    )}
+                    <span className={`pill ${statusSeverity(sl.status)}`}>{sl.status}</span>
                   </td>
                   <td className="mono">{sl.tunnel_ip ?? '—'}</td>
                   <td className="num mono">{sl.forwarded_port ?? sl.listen_port ?? '—'}</td>

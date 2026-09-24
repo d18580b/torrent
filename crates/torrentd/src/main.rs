@@ -342,7 +342,14 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(exit_code);
             }
             Err(e) => {
-                error!(error.cause = %e, "startup failed");
+                // `{:#}` rather than `{}`. `{}` Displays the outermost context
+                // alone, so a chain like `load assignment registry: <the
+                // registry's own message naming the file, the id and the
+                // remedy>` reached the operator as four words with nothing
+                // actionable in them — under `Restart=on-failure`, where the
+                // log line is the only thing they get. Every `.context(...)`
+                // on the way up is written to be read; this is what prints it.
+                error!(error.cause = %format_args!("{e:#}"), "startup failed");
                 std::process::exit(70); // EX_SOFTWARE
             }
         }

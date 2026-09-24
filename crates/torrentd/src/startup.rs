@@ -323,8 +323,12 @@ pub async fn boot(
         if let Some(fp) = &p.peer_fingerprint_hex {
             settings.peer_fingerprint = Some(fp.clone());
         }
-        if p.upload_rate_limit > 0 {
-            settings.upload_rate_limit = Some(p.upload_rate_limit);
+        // `is_some()`, not `> 0`. `0` is a legal per-profile value meaning
+        // *unlimited* — the top-level key's own comment says so — and testing
+        // `> 0` read it as "unset" and pushed the daemon-wide cap onto a
+        // session the operator had explicitly uncapped.
+        if let Some(limit) = p.upload_rate_limit {
+            settings.upload_rate_limit = Some(limit);
         }
 
         // What differs between the two postures, and nothing else: where the
@@ -757,7 +761,16 @@ pub async fn boot(
                 loaded_torrents = loaded,
                 resume_dir = %dirs_of(&cfg, &profile).0.display(),
                 torrent_dir = %dirs_of(&cfg, &profile).1.display(),
-                registry_path = %registry.source_path().display(),
+                // Both files, as the refusal above names both. On the
+                // migration boot `source_path()` is the pre-rename
+                // `slot_assignments.json` — the file `docs/running.md` tells
+                // the operator explicitly not to edit — so naming it alone
+                // pointed at the wrong one. Its own justification for being
+                // the name to quote, that the current file is "by
+                // construction not on disk", stopped holding when the
+                // migration began writing that file unconditionally.
+                registry_path = %cfg.registry_path().display(),
+                registry_read_from = %registry.source_path().display(),
                 "the assignment registry claims more torrents for this profile than the scans \
                  loaded; the files are probably still at the pre-profiles root — point this \
                  profile's resume_dir and torrent_dir at it, or move the files into the \
@@ -866,7 +879,8 @@ pub async fn boot(
         let profiles = profile_registry.clone();
         Arc::new(move |id: &torrentd_engine::ProfileId| {
             profiles
-                .get(id)
+                .resolve(id)
+                .active()
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })

@@ -51,6 +51,43 @@ pub enum RegistryError {
         infohash: InfoHash,
         existing: ProfileId,
     },
+
+    /// A pre-profiles registry names an id the charset rule refuses.
+    ///
+    /// The slot era imposed no charset or length rule — `SlotConfig`'s
+    /// validation checked `is_default`, duplicates, ports and interfaces only,
+    /// and `SlotId`'s `Deserialize` was infallible — so `id = "acct.a"` was a
+    /// legal deployment and its `slot_assignments.json` holds that value.
+    /// Deserializing that file straight into `ProfileId` fails it as a serde
+    /// error, on the one boot that reads it, before the reconciliation refusal
+    /// built for exactly this class of mismatch can say anything. The operator
+    /// got a truncated context and no id, no file and no remedy, under
+    /// `Restart=on-failure`.
+    ///
+    /// This carries the same three things that refusal carries: the file, what
+    /// is wrong with it, and both ways out.
+    // `read_from`, not `source`: thiserror reads a field called `source` as
+    // the error's cause and tries to make a `PathBuf` into one.
+    #[error(
+        "the pre-profiles assignment registry at {} assigns {count} torrent(s) to the profile \
+         id {id:?}, which this release cannot use: {reason} The registry is migrated verbatim, \
+         so the ids in it are the ones that deployment used. Either rename that id in {} to one \
+         a [[profile]] table declares — nothing has been written yet, and {} is created from it \
+         once it loads — or remove those entries from {} and re-add the torrents.",
+        read_from.display(),
+        read_from.display(),
+        written_to.display(),
+        read_from.display(),
+    )]
+    LegacyProfileId {
+        /// The pre-rename file the entries were read from.
+        read_from: PathBuf,
+        /// The post-rename file the daemon would have written.
+        written_to: PathBuf,
+        id: String,
+        count: usize,
+        reason: String,
+    },
 }
 
 #[derive(Debug)]
@@ -116,7 +153,7 @@ impl AssignmentRegistry {
             }
             _ => path.clone(),
         };
-        let loaded = Self::load_inner(path, source)?;
+        let loaded = Self::load_inner(path, source, migrated)?;
         if migrated {
             loaded.persist()?;
             info!(
@@ -129,7 +166,15 @@ impl AssignmentRegistry {
         Ok(loaded)
     }
 
-    fn load_inner(path: PathBuf, source: PathBuf) -> Result<Self, RegistryError> {
+    fn load_inner(
+        path: PathBuf,
+        source: PathBuf,
+        // True on the one boot that reads a pre-profiles `slot_assignments.json`.
+        // That file predates the charset rule entirely, so a value in it that
+        // the rule refuses is an upgrade to diagnose rather than a corrupt
+        // file — and it gets a refusal that says so instead of a serde error.
+        migrated: bool,
+    ) -> Result<Self, RegistryError> {
         let map: HashMap<InfoHash, ProfileId> = match fs::read(&source) {
             Ok(bytes) if !bytes.is_empty() => {
                 // Deserialize the value as a `ProfileId`, not as a `String`
@@ -141,7 +186,17 @@ impl AssignmentRegistry {
                 // being skipped: the map cannot be reconstructed, so dropping
                 // an entry quietly loses which torrent belonged to which
                 // account.
-                let raw: HashMap<String, ProfileId> = serde_json::from_slice(&bytes)?;
+                //
+                // Except on the migration path, where the same failure means
+                // something else. Below, the values are converted one at a
+                // time so the refusal can name the file, the id and the
+                // remedy; here, `Deserialize` rejects the whole document and
+                // the operator is told only that a load failed.
+                let raw: HashMap<String, ProfileId> = if migrated {
+                    Self::convert_legacy(&bytes, &source, &path)?
+                } else {
+                    serde_json::from_slice(&bytes)?
+                };
                 let mut out = HashMap::with_capacity(raw.len());
                 for (k, v) in raw {
                     let Some(ih) = InfoHash::from_hex(&k) else {
@@ -173,6 +228,47 @@ impl AssignmentRegistry {
         })
     }
 
+    /// Convert a pre-profiles registry's values one at a time.
+    ///
+    /// The slot era imposed no charset rule on a slot id, so this file can
+    /// legally hold one this release refuses. Deserializing the document
+    /// straight into `ProfileId` turns that into a serde error raised on the
+    /// migration path, before the reconciliation refusal — which exists for
+    /// exactly this class of mismatch — reads anything. Converting per entry
+    /// keeps the same rule and the same door, and lets the failure carry the
+    /// file, the id, how many entries name it, and what to do.
+    ///
+    /// All the offending entries are counted before returning, so an operator
+    /// learns the size of the edit rather than discovering it one boot at a
+    /// time. The first offending id in sort order is the one named, so the
+    /// message does not change between two runs over one file.
+    fn convert_legacy(
+        bytes: &[u8],
+        source: &Path,
+        target: &Path,
+    ) -> Result<HashMap<String, ProfileId>, RegistryError> {
+        let raw: HashMap<String, String> = serde_json::from_slice(bytes)?;
+        let mut bad: BTreeMap<&str, usize> = BTreeMap::new();
+        for id in raw.values() {
+            if !crate::profile::ProfileConfig::is_valid_id(id) {
+                *bad.entry(id.as_str()).or_insert(0) += 1;
+            }
+        }
+        if let Some((id, count)) = bad.into_iter().next() {
+            return Err(RegistryError::LegacyProfileId {
+                read_from: source.to_path_buf(),
+                written_to: target.to_path_buf(),
+                id: id.to_string(),
+                count,
+                reason: crate::profile::ID_CHARSET_RULE.to_string(),
+            });
+        }
+        Ok(raw
+            .into_iter()
+            .map(|(k, v)| (k, ProfileId::new(v)))
+            .collect())
+    }
+
     pub fn len(&self) -> usize {
         self.inner.read().len()
     }
@@ -182,9 +278,15 @@ impl AssignmentRegistry {
 
     /// Where the entries in memory were read from.
     ///
-    /// The current path except on the one boot that reads a pre-rename file.
-    /// A message telling an operator to edit "those entries" has to name this
-    /// one.
+    /// The current path except on the one boot that reads a pre-rename file,
+    /// where it is that file. It says where the entries an operator is being
+    /// told about *came from*; it does not say where to edit them, and on the
+    /// boot where the two differ the answer to that is [`Self::path`] — the
+    /// pre-rename file is kept for a rollback and is not read again.
+    ///
+    /// A message about those entries therefore names **both**, as the startup
+    /// refusal does. Quoting this one alone rested on the current file being
+    /// absent on that boot, which the unconditional persist above ended.
     pub fn source_path(&self) -> &Path {
         &self.source
     }
@@ -445,6 +547,85 @@ mod tests {
         // operator which ones to look at has to be able to say so.
         assert_eq!(r.source_path(), legacy);
         assert_eq!(r.path(), current);
+    }
+
+    #[test]
+    fn a_legacy_id_the_charset_rule_refuses_is_named_rather_than_serde_failed() {
+        // C46. The slot era imposed no charset rule: its validation checked
+        // `is_default`, duplicates, ports and interfaces only, and `SlotId`'s
+        // `Deserialize` was infallible — so `id = "acct.a"` was a legal
+        // deployment and this is what its registry holds.
+        //
+        // Deserializing the document straight into `ProfileId` failed it as a
+        // serde error on the migration path, before the reconciliation
+        // refusal built for this class of mismatch could say anything. With
+        // `startup.rs`'s `.context("load assignment registry")` on top, the
+        // operator got four words under `Restart=on-failure`.
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("slot_assignments.json");
+        let current = dir.path().join("profile_assignments.json");
+        std::fs::write(
+            &legacy,
+            r#"{"aa00000000000000000000000000000000000000":"acct.a",
+                "bb00000000000000000000000000000000000000":"acct.a"}"#,
+        )
+        .unwrap();
+
+        let err = AssignmentRegistry::load_from(&current, Some(legacy.clone()))
+            .expect_err("an id outside [A-Za-z0-9_-] cannot be used as a path component");
+        let msg = err.to_string();
+
+        // The three things the refusal at `startup.rs` carries, which this
+        // path preempts: the offending id, the file it is in, and the remedy.
+        assert!(msg.contains("acct.a"), "names the offending id, got: {msg}");
+        assert!(
+            msg.contains(&legacy.display().to_string()),
+            "names the file the entries were read from, got: {msg}",
+        );
+        assert!(
+            msg.contains("[A-Za-z0-9_-]"),
+            "says what an id may contain, got: {msg}",
+        );
+        assert!(
+            msg.contains("re-add the torrents") && msg.contains("rename"),
+            "states both ways out, got: {msg}",
+        );
+        assert!(
+            msg.contains('2'),
+            "says how many entries name it, so the operator knows the size of the edit, \
+             got: {msg}",
+        );
+
+        // It is a refusal, not a partial load: the map cannot be
+        // reconstructed, so dropping the entry quietly loses which torrent
+        // belonged to which account.
+        assert!(
+            matches!(err, RegistryError::LegacyProfileId { .. }),
+            "a dedicated variant, not a serde error, got: {err:?}",
+        );
+        assert!(
+            !current.exists(),
+            "nothing is written under the new name until the old one loads",
+        );
+    }
+
+    #[test]
+    fn a_legacy_registry_whose_ids_are_all_legal_still_migrates() {
+        // The rule cannot pass by refusing every legacy file: the ordinary
+        // upgrade — every entry saying `default` — is the case the migration
+        // exists for.
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("slot_assignments.json");
+        let current = dir.path().join("profile_assignments.json");
+        std::fs::write(
+            &legacy,
+            r#"{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":"default"}"#,
+        )
+        .unwrap();
+
+        let r = AssignmentRegistry::load_from(&current, Some(legacy)).unwrap();
+        assert_eq!(r.lookup(&InfoHash([0xAA; 20])).unwrap().as_str(), "default");
+        assert!(current.exists());
     }
 
     #[test]

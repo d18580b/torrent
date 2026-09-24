@@ -62,9 +62,17 @@
 //!    paths, because it used to be spelled per path against whether the id
 //!    happened to be `default`, which a config could satisfy by accident.
 //! 7. **SIGHUP cannot change identity-critical fields.** The tunnel
-//!    interface, listen port, peer fingerprint, user agent and per-profile
-//!    directories are what a tracker sees as an account's identity. Changes
-//!    are detected, warned about, and ignored; applying them means a restart.
+//!    interface, listen port, peer fingerprint and user agent are what a
+//!    tracker sees as an account's identity. Changes are detected, warned
+//!    about, and ignored; applying them means a restart.
+//!
+//!    The per-profile `resume_dir` and `torrent_dir` are equally unreloadable
+//!    — the stores are opened at startup — but they are not identity: no
+//!    announce, handshake or peer message carries where a profile keeps its
+//!    files. They get the ordinary non-reloadable warning, so this rule's
+//!    warning stays the privacy event an alert rule can watch for, and the
+//!    upgrade step in `docs/running.md` that tells an operator to set those
+//!    two keys does not fire it.
 //! 8. **Listen ports are unique across profiles.** The port is announced, so two
 //!    profiles sharing one would be correlatable by a tracker operator even from
 //!    different IPs. Enforced for every profile that names its own port — a
@@ -157,15 +165,23 @@ impl<'de> Deserialize<'de> for ProfileId {
         let s = String::deserialize(d)?;
         if !ProfileConfig::is_valid_id(&s) {
             return Err(serde::de::Error::custom(format!(
-                "profile id {s:?} is not usable: an id may be 1-64 characters of [A-Za-z0-9_-] \
-                 only. The id is a path component in three places (<resume_dir>/<id>, \
-                 <torrent_dir>/<id>, session_state-<id>.dat) and a URL path segment, so \
-                 anything else either escapes those directories or cannot be addressed."
+                "profile id {s:?} is not usable: {ID_CHARSET_RULE}"
             )));
         }
         Ok(ProfileId::new(s))
     }
 }
+
+/// Why an id outside `[A-Za-z0-9_-]{1,64}` cannot be used, in one sentence.
+///
+/// Shared rather than written twice. Two doors refuse an id — this module's
+/// `Deserialize`, and the pre-profiles registry conversion in
+/// [`crate::registry`], which has to say the same thing in a message built by
+/// hand. Two spellings of one rule is how the two stop agreeing.
+pub(crate) const ID_CHARSET_RULE: &str =
+    "an id may be 1-64 characters of [A-Za-z0-9_-] only. The id is a path component in three \
+     places (<resume_dir>/<id>, <torrent_dir>/<id>, session_state-<id>.dat) and a URL path \
+     segment, so anything else either escapes those directories or cannot be addressed.";
 
 // ---------------------------------------------------------------------------
 // ProfileConfig — operator-supplied (TOML)
@@ -227,7 +243,17 @@ pub struct ProfileConfig {
     pub resume_dir: Option<PathBuf>,
     pub torrent_dir: Option<PathBuf>,
     pub allowed_tracker_domains: Vec<String>,
-    pub upload_rate_limit: u32,
+    /// Per-profile upload cap in bytes/sec, overriding the daemon-wide key.
+    ///
+    /// `Option`, not a plain `u32`, because `0` means *unlimited* — the
+    /// top-level key's own comment says so — and a plain `u32` made it mean
+    /// "unset" as well. A profile writing `upload_rate_limit = 0` to say "this
+    /// account is uncapped" was silently given the daemon-wide cap at boot and
+    /// again on every reload, with nothing logged and nothing in
+    /// `diff_profiles` to report it, because the two values compare equal.
+    /// Both shipped samples use exactly that line as the illustration of the
+    /// override.
+    pub upload_rate_limit: Option<u32>,
 }
 
 /// Which posture a `[[profile]]` declares.
@@ -294,12 +320,8 @@ struct RawProfile {
     torrent_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_tracker_domains: Vec<String>,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    upload_rate_limit: u32,
-}
-
-fn is_zero(v: &u32) -> bool {
-    *v == 0
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upload_rate_limit: Option<u32>,
 }
 
 impl RawProfile {
@@ -587,36 +609,32 @@ pub enum ProfileConfigError {
     MissingListenPort(String),
     #[error("vpn_interface {0:?} appears more than once")]
     DuplicateInterface(String),
-    #[error("peer_fingerprint_hex {0:?} appears more than once")]
-    DuplicateFingerprint(String),
-    #[error("user_agent {0:?} appears more than once")]
-    DuplicateUserAgent(String),
+    /// Two profiles announce one peer-id prefix.
+    ///
+    /// `key` is the key the *operator wrote*, which is not always the one this
+    /// field is called. A profile that declares nothing takes the top-level
+    /// `peer_fingerprint`, and naming `peer_fingerprint_hex` at it sent the
+    /// operator hunting a key that appears nowhere in their file.
+    #[error("{key} {value:?} appears more than once")]
+    DuplicateFingerprint { key: &'static str, value: String },
+    #[error("{key} {value:?} appears more than once")]
+    DuplicateUserAgent { key: &'static str, value: String },
     #[error("resume_dir {0:?} appears more than once (after symlink resolution)")]
     DuplicateResumeDir(PathBuf),
     #[error("torrent_dir {0:?} appears more than once (after symlink resolution)")]
     DuplicateTorrentDir(PathBuf),
-    /// One profile's effective store directory lies inside another's.
+    /// The value equals libtorrent's own default peer-id prefix.
     ///
-    /// Equality is the [`ProfileConfigError::DuplicateResumeDir`] case; this
-    /// is the nesting one, which the derived `<base>/<id>` layout makes easy
-    /// to write by accident — an override of `<base>` itself contains every
-    /// other profile's derived directory. `load_all` filters on the file name
-    /// only, so a profile pointed at a containing directory loads every other
-    /// profile's state as its own.
-    #[error(
-        "{key} {inner:?} lies inside {outer:?} (after symlink resolution), so both \
-         profiles' sessions would read one store. Each profile's {key} must be \
-         disjoint from every other's."
-    )]
-    NestedProfileDir {
-        key: &'static str,
-        outer: PathBuf,
-        inner: PathBuf,
-    },
-    #[error("peer_fingerprint_hex must not equal libtorrent default (-LT20C0-)")]
-    DefaultFingerprintForbidden,
-    #[error("peer_fingerprint_hex {0:?} is not 16 hex chars")]
-    BadFingerprintLength(String),
+    /// `key` is the key the *operator wrote*, for the reason
+    /// [`ProfileConfigError::DuplicateFingerprint`] carries one: the same value
+    /// reaches a session from the per-profile `peer_fingerprint_hex` and from
+    /// the top-level `peer_fingerprint` it inherits, and naming the wrong one
+    /// sends the operator hunting a key that appears nowhere in their file.
+    #[error("{key} must not equal libtorrent default (-LT20C0-)")]
+    DefaultFingerprintForbidden { key: &'static str },
+    /// The value is not sixteen hex characters. `key` as above.
+    #[error("{key} {value:?} is not 16 hex chars")]
+    BadFingerprintLength { key: &'static str, value: String },
     #[error(
         "no [[profile]] tables are configured. torrentd has no implicit profile: every \
          profile states how it reaches the network, because the alternative — defaulting \
@@ -677,8 +695,26 @@ impl ProfileConfig {
     /// The hex form of libtorrent's default fingerprint `-LT20C0-` (16 hex
     /// chars). A VPN profile must set a distinct fingerprint so peers cannot
     /// trivially tie it back to the default client identity.
-    fn is_libtorrent_default_fingerprint(hex: &str) -> bool {
-        hex.eq_ignore_ascii_case("2d4c54323043302d")
+    /// Whether `fp` is libtorrent's own default peer-id prefix, in either of
+    /// the two spellings this configuration accepts.
+    ///
+    /// `-LT20C0-` is the eight bytes libtorrent puts at the front of a peer id
+    /// nobody configured. The two keys that can supply those bytes spell them
+    /// differently: `peer_fingerprint_hex` states them as sixteen hex
+    /// characters, and the top-level `peer_fingerprint` states them as
+    /// themselves — `deploy/torrentd.sample.toml` documented that key as
+    /// `peer_fingerprint = "-LT20C0-"` before this change and as
+    /// `"-XX1234-"` after it, and nothing between the config file and
+    /// libtorrent decodes either spelling.
+    ///
+    /// So a test that knew only the hex spelling read straight past the raw
+    /// one — which is both the spelling that actually reaches the wire from
+    /// that key and the one an operator copies out of libtorrent's own
+    /// documentation. Both are refused, and neither is refused *because of*
+    /// its length: that is a separate rule belonging to the key that declares
+    /// an encoding in its name.
+    pub fn is_libtorrent_default_fingerprint(fp: &str) -> bool {
+        fp.eq_ignore_ascii_case("2d4c54323043302d") || fp == "-LT20C0-"
     }
 
     /// The distinct ports a libtorrent `listen_interfaces` string binds.
@@ -923,10 +959,15 @@ impl ProfileConfig {
             // uniqueness rule.
             if let Some(fp) = p.peer_fingerprint_hex.as_deref() {
                 if fp.len() != 16 {
-                    return Err(ProfileConfigError::BadFingerprintLength(fp.to_string()));
+                    return Err(ProfileConfigError::BadFingerprintLength {
+                        key: "peer_fingerprint_hex",
+                        value: fp.to_string(),
+                    });
                 }
                 if Self::is_libtorrent_default_fingerprint(fp) {
-                    return Err(ProfileConfigError::DefaultFingerprintForbidden);
+                    return Err(ProfileConfigError::DefaultFingerprintForbidden {
+                        key: "peer_fingerprint_hex",
+                    });
                 }
             }
         }
@@ -982,7 +1023,7 @@ mod tests {
             resume_dir: Some(PathBuf::from(format!("/var/lib/torrentd/resume/{id}"))),
             torrent_dir: Some(PathBuf::from(format!("/var/lib/torrentd/torrents/{id}"))),
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
         }
     }
 
@@ -999,7 +1040,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
         }
     }
 
@@ -1233,7 +1274,10 @@ mod tests {
         public.peer_fingerprint_hex = Some("abc".to_string());
         assert!(matches!(
             ProfileConfig::validate_set(&[public]),
-            Err(ProfileConfigError::BadFingerprintLength(_))
+            Err(ProfileConfigError::BadFingerprintLength {
+                key: "peer_fingerprint_hex",
+                ..
+            })
         ));
     }
 
@@ -1246,7 +1290,9 @@ mod tests {
         public.peer_fingerprint_hex = Some("2d4c54323043302d".to_string());
         assert!(matches!(
             ProfileConfig::validate_set(&[public]),
-            Err(ProfileConfigError::DefaultFingerprintForbidden)
+            Err(ProfileConfigError::DefaultFingerprintForbidden {
+                key: "peer_fingerprint_hex"
+            })
         ));
     }
 
@@ -1339,7 +1385,9 @@ mod tests {
         )];
         assert!(matches!(
             ProfileConfig::validate_set(&profiles),
-            Err(ProfileConfigError::DefaultFingerprintForbidden)
+            Err(ProfileConfigError::DefaultFingerprintForbidden {
+                key: "peer_fingerprint_hex"
+            })
         ));
     }
 
@@ -1348,7 +1396,10 @@ mod tests {
         let profiles = vec![cfg("a", 6881, "wg0", "abcd", "ua-a")];
         assert!(matches!(
             ProfileConfig::validate_set(&profiles),
-            Err(ProfileConfigError::BadFingerprintLength(_))
+            Err(ProfileConfigError::BadFingerprintLength {
+                key: "peer_fingerprint_hex",
+                ..
+            })
         ));
     }
 

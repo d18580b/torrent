@@ -69,6 +69,8 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::config::ConfigDiff;
+use crate::config::ProfileChange;
+use crate::config::ProfileChangeKind;
 
 /// The reloadable keys `diff` carries that `profile`'s patch does not — the
 /// keys [`ConfigDiff::to_settings_patch_for`] withheld from it.
@@ -100,6 +102,38 @@ fn withheld_reloadable_keys(
         .collect()
 }
 
+/// What a non-reloadable change is told, when the field is not an identity.
+///
+/// One text for the top-level arm and the per-profile arm alike: they are the
+/// same event, and the field name says which.
+const NON_RELOADABLE_WARNING: &str =
+    "SIGHUP: change to non-reloadable field requires daemon restart; ignored";
+
+/// What a change to a profile's identity is told.
+///
+/// Safety Rule 7: identity-critical profile fields cannot change under a live
+/// session, and the operator has to be told rather than left believing a
+/// reload took. This is also the line an alert rule watches for — an edited
+/// `peer_fingerprint_hex` or `user_agent` under a live session is the privacy
+/// event this warning exists for — so nothing that is not identity may emit
+/// it.
+const IDENTITY_WARNING: &str = "SIGHUP: profile identity change requires daemon restart; ignored";
+
+/// Which of the two warnings a `profile_changes` entry gets.
+///
+/// Read off the entry's own class, which `diff_profiles` sets as it records
+/// the change. This was a two-element list of key names here plus a comment
+/// telling whoever edits `diff_profiles` to come back and update it — the
+/// obligation written down instead of enforced, one module away from the
+/// comparison that creates it. A field added there now has to state its class
+/// to compile, and this reads it.
+fn warning_for(change: &ProfileChange) -> &'static str {
+    match change.kind {
+        ProfileChangeKind::Identity => IDENTITY_WARNING,
+        ProfileChangeKind::NonIdentity => NON_RELOADABLE_WARNING,
+    }
+}
+
 pub async fn run(
     config_path: PathBuf,
     initial: Config,
@@ -126,10 +160,7 @@ pub async fn run(
             continue;
         }
         for nr in &diff.non_reloadable_changes {
-            warn!(
-                changed_field = %nr,
-                "SIGHUP: change to non-reloadable field requires daemon restart; ignored",
-            );
+            warn!(changed_field = %nr, "{NON_RELOADABLE_WARNING}");
         }
         // A reloadable key the operator deleted. The sample config documents
         // deletion as the way back to the preset default, and that default is
@@ -146,11 +177,13 @@ pub async fn run(
         // Safety Rule 7: identity-critical profile fields cannot change under a
         // live session, and the operator has to be told rather than left
         // believing a reload took.
+        //
+        // Two classes, two texts. An operator who adjusted an upload cap was
+        // told their identity had changed, and an alert watching for the
+        // privacy case could not tell the two apart, because both emitted one
+        // string and differed only in a structured field.
         for sc in &diff.profile_changes {
-            warn!(
-                changed_field = %sc,
-                "SIGHUP: profile identity change requires daemon restart; ignored",
-            );
+            warn!(changed_field = %sc.what, "{}", warning_for(sc));
         }
         if let Some(level) = diff.log_level {
             match log_handle.set_level(level) {
@@ -212,9 +245,9 @@ mod tests {
 
     use super::*;
 
-    /// A host profile taking the top-level `upload_rate_limit`, or overriding
-    /// it when `upload_rate_limit` is non-zero.
-    fn host(upload_rate_limit: u32) -> ProfileConfig {
+    /// A host profile taking the top-level `upload_rate_limit` when
+    /// `upload_rate_limit` is `None`, or overriding it when it is set.
+    fn host(upload_rate_limit: Option<u32>) -> ProfileConfig {
         ProfileConfig {
             id: ProfileId::new("host1"),
             network: torrentd_engine::ProfileNetwork::Host {
@@ -262,7 +295,14 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
+        }
+    }
+
+    fn change(what: &str, kind: ProfileChangeKind) -> ProfileChange {
+        ProfileChange {
+            what: what.to_string(),
+            kind,
         }
     }
 
@@ -285,16 +325,16 @@ mod tests {
         // own. The override wins at boot and a reload must not overwrite it.
         let (_dir, diff) = diff_of(|c| c.upload_rate_limit = Some(2000));
         assert_eq!(
-            withheld_reloadable_keys(&diff, &host(5000)),
+            withheld_reloadable_keys(&diff, &host(Some(5000))),
             vec!["upload_rate_limit"],
             "the profile that overrides the key must be told the edit did not reach it",
         );
         assert!(
-            ConfigDiff::settings_patch_is_empty(&diff.to_settings_patch_for(&host(5000))),
+            ConfigDiff::settings_patch_is_empty(&diff.to_settings_patch_for(&host(Some(5000)))),
             "the patch is empty, so nothing below the report can speak for this reload",
         );
         assert!(
-            withheld_reloadable_keys(&diff, &host(0)).is_empty(),
+            withheld_reloadable_keys(&diff, &host(None)).is_empty(),
             "a profile that sets none takes the top-level value: nothing was withheld",
         );
 
@@ -307,13 +347,13 @@ mod tests {
             "Safety Rule 6 withholds the key; the operator still edited it",
         );
         assert!(
-            withheld_reloadable_keys(&diff, &host(0)).is_empty(),
+            withheld_reloadable_keys(&diff, &host(None)).is_empty(),
             "a host profile honours `enable_lsd`, so nothing was withheld from it",
         );
 
         // A key that reaches every profile is not a withholding.
         let (_dir, diff) = diff_of(|c| c.connections_limit = Some(20_000));
-        for profile in [host(0), host(5000), vpn()] {
+        for profile in [host(None), host(Some(5000)), vpn()] {
             assert!(
                 withheld_reloadable_keys(&diff, &profile).is_empty(),
                 "connections_limit reaches every profile; got a withholding for {}",
@@ -371,7 +411,7 @@ mod tests {
             vec!["upload_rate_limit"],
             "the pump's deletion report is what names it",
         );
-        for profile in [host(0), host(5000), vpn()] {
+        for profile in [host(None), host(Some(5000)), vpn()] {
             assert!(
                 withheld_reloadable_keys(&diff, &profile).is_empty(),
                 "a deletion is not withheld from {} in particular; it reaches no \
@@ -385,5 +425,34 @@ mod tests {
                 profile.id,
             );
         }
+    }
+
+    #[test]
+    fn an_identity_change_is_told_its_identity_changed() {
+        // The case Safety Rule 7's warning exists for, and the one an alert
+        // rule watches: it must keep its own text. Which fields are in this
+        // class is `diff_profiles`' statement, pinned in `config.rs`; what
+        // that class is told is this one.
+        let c = change("acct_a.peer_fingerprint_hex", ProfileChangeKind::Identity);
+        assert_eq!(warning_for(&c), IDENTITY_WARNING);
+    }
+
+    #[test]
+    fn a_non_identity_change_is_not_told_its_identity_changed() {
+        // An operator who edited an upload cap is told a non-reloadable field
+        // changed — in the same words the top-level arm has used all along,
+        // not in the words reserved for a privacy event.
+        let c = change("public.upload_rate_limit", ProfileChangeKind::NonIdentity);
+        assert_eq!(warning_for(&c), NON_RELOADABLE_WARNING);
+        assert_ne!(warning_for(&c), IDENTITY_WARNING);
+    }
+
+    #[test]
+    fn the_two_warnings_are_distinguishable_in_the_message_itself() {
+        // Not only in a structured field. An alert watching for the privacy
+        // event has to be able to match on the line.
+        assert_ne!(IDENTITY_WARNING, NON_RELOADABLE_WARNING);
+        assert!(IDENTITY_WARNING.contains("identity"));
+        assert!(!NON_RELOADABLE_WARNING.contains("identity"));
     }
 }

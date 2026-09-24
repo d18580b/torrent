@@ -86,9 +86,9 @@ pub struct Check {
     pub name: &'static str,
     pub verdict: Verdict,
     pub detail: String,
-    /// Set on an `Unknown` that could not be performed **because this
-    /// invocation lacks a capability**, as distinct from one that could not be
-    /// performed at all.
+    /// Set on an `Unknown` that **no invocation of this command on this host
+    /// could settle** — usually because it lacks a capability — as distinct
+    /// from one a different input, privilege or configuration would answer.
     ///
     /// They are not the same thing and collapsing them made `unknown` the
     /// normal outcome rather than the exceptional one. `docs/running.md`
@@ -149,6 +149,21 @@ impl Check {
             ..Self::unknown(name, detail)
         }
     }
+
+    /// An `Unknown` **nothing this process can be told would settle**, which
+    /// is the same non-colouring class for the same reason. See
+    /// [`Check::needs_capability`].
+    ///
+    /// The capability-bound ones are the common route into it. This is the
+    /// other: an answer that depends on a fact outside this process
+    /// altogether, where no argument, privilege or configuration change
+    /// available to this invocation produces one.
+    fn unknown_unsettleable(name: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            needs_capability: true,
+            ..Self::unknown(name, detail)
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -170,7 +185,9 @@ pub struct Report {
     pub profiles: Vec<ProfileReport>,
 }
 
-/// Everything was established, and everything established was good.
+/// Everything established was good — excluding a check nothing this
+/// invocation could be given would settle, which is reported and does not
+/// colour the status. See [`Check::needs_capability`].
 pub const EXIT_OK: i32 = 0;
 /// At least one check failed.
 pub const EXIT_FAILED: i32 = 1;
@@ -322,6 +339,32 @@ pub trait CheckHost {
     /// interface does, so *when* it is read decides what it says — and
     /// `--bring-up` exists precisely to make an interface that was not there.
     fn read_sysctl(&self, path: &str) -> Option<String>;
+
+    /// Whether an executable answers `probe_arg` with a zero status.
+    fn tool_available(&self, bin: &str, probe_arg: &str) -> bool;
+
+    /// This process's effective uid, or why it could not be read.
+    fn current_uid(&self) -> Result<u32, String>;
+
+    /// Whether this process holds `CAP_NET_ADMIN`.
+    fn has_cap_net_admin(&self) -> bool;
+
+    /// Dry-run a ruleset through `nft --check --file -`.
+    ///
+    /// Behind the trait because the two classes its stderr distinguishes —
+    /// a parse rejection and a netlink cache failure — are what
+    /// [`judge_nft_check`] classifies on, and a test that shells out to the
+    /// real `nft` asserts whatever this machine happens to answer.
+    fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output>;
+
+    /// Whether `iface` is a WireGuard device: `Some(false)` is a positive
+    /// reading that it is not one, and `None` means neither read answered.
+    ///
+    /// Behind the trait for the same reason as the rest, and separate from
+    /// the handshake probe because it is the one question `wg show` cannot
+    /// answer: `wg` refuses a non-WireGuard interface and an interface it
+    /// lacks the capability to read with the same error.
+    fn wireguard_device(&self, iface: &str) -> Option<bool>;
 }
 
 /// `CheckHost` against the actual machine.
@@ -359,6 +402,53 @@ impl CheckHost for RealHost {
 
     fn read_sysctl(&self, path: &str) -> Option<String> {
         std::fs::read_to_string(path).ok()
+    }
+
+    fn tool_available(&self, bin: &str, probe_arg: &str) -> bool {
+        tool_available(bin, probe_arg)
+    }
+
+    fn current_uid(&self) -> Result<u32, String> {
+        vpn::killswitch::current_uid().map_err(|e| e.to_string())
+    }
+
+    fn has_cap_net_admin(&self) -> bool {
+        has_cap_net_admin()
+    }
+
+    fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output> {
+        nft_check(ruleset)
+    }
+
+    fn wireguard_device(&self, iface: &str) -> Option<bool> {
+        // Both reads need no capability. `DEVTYPE=wireguard` in the kernel's
+        // own uevent is the cheap one and needs no subprocess; `ip -d link
+        // show` reports the same link type and is consulted second, because
+        // a device that sets no `DEVTYPE` is only evidence of "not WireGuard"
+        // once something else has looked. Neither answering is `None`, which
+        // leaves the handshake verdict exactly where it was.
+        let uevent =
+            std::fs::read_to_string(Path::new("/sys/class/net").join(iface).join("uevent")).ok();
+        if uevent
+            .as_deref()
+            .is_some_and(|u| u.lines().any(|l| l.trim() == "DEVTYPE=wireguard"))
+        {
+            return Some(true);
+        }
+        let out = std::process::Command::new("ip")
+            .args(["-d", "link", "show", iface])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        // The bare word, not a substring: an interface *named* `wireguard`
+        // prints as `wireguard:` and must not answer this question itself.
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .any(|t| t == "wireguard"),
+        )
     }
 }
 
@@ -478,12 +568,24 @@ fn judge_kill_switch_uid(as_uid: Option<u32>, invoker: Result<u32, String>) -> C
             Ok(i) => format!("this process is uid {i}"),
             Err(e) => format!("this process's own uid could not be read: {e}"),
         };
-        return Check::unknown(
+        // Not counted against the status, and for the same reason the
+        // capability-bound unknowns are not: nothing this invocation can be
+        // told settles it. `--as-uid` names a uid the invoker is not *by
+        // definition*, and this process cannot observe which user the daemon
+        // runs as, so the mismatch is the expected answer on the one
+        // privileged invocation the documentation describes rather than a
+        // sign of anything. Leaving it to colour the status left
+        // `vpn check` on a `network_kill_switch = true` host with no route to
+        // 0 by any argument combination — under `sudo` the subject is 0 and
+        // fails, `--as-uid 0` fails, and `--as-uid <daemon uid>` cost 2 —
+        // which is the trap the three-valued status exists to prevent.
+        return Check::unknown_unsettleable(
             "kill_switch_uid",
             format!(
                 "asked about uid {subject}, but {who}, so whether that uid is the one the \
-                 daemon runs as was not established. The ruleset below is still rendered and \
-                 dry-run for uid {subject}"
+                 daemon runs as was not established — and nothing this command can be given \
+                 would establish it. The ruleset below is still rendered and dry-run for uid \
+                 {subject}"
             ),
         );
     }
@@ -510,11 +612,47 @@ fn ruleset_subject(as_uid: Option<u32>, invoker: Result<u32, String>) -> Option<
 
 /// The verdict `nft --check --file -` implies for a rendered ruleset.
 ///
+/// Classified on **what `nft` reported**, not on who asked. nftables parses
+/// its input before it touches netlink, so the two failures are distinguishable
+/// from an unprivileged shell: a ruleset this build cannot parse prints a
+/// parser diagnostic and no netlink error, while one that parses prints
+/// `netlink: Error: cache initialization failed: Operation not permitted` and
+/// nothing else. A parse diagnostic is therefore a **rejection of the
+/// ruleset** whatever the invoker's capability mask says — the boot would
+/// abort at `killswitch::enable` on exactly that input.
+///
+/// Classifying on the mask instead short-circuited every failure on the one
+/// invocation `docs/running.md` recommends — an operator shell, which does not
+/// hold `CAP_NET_ADMIN` — into the capability class, which
+/// [`Report::incomplete`] excludes from the status. A configuration whose kill
+/// switch cannot install exited `0`.
+///
 /// `privileged` is whether this process holds `CAP_NET_ADMIN`; see
-/// [`has_cap_net_admin`]. Without it `nft` cannot initialise its netlink cache
-/// and so establishes nothing about the ruleset, which is `unknown` bounded by
-/// a capability rather than a rejection. The stderr substrings stay as a
-/// fallback for the case where the capability mask could not be read.
+/// [`has_cap_net_admin`]. It is kept as corroboration in the detail text, not
+/// as the discriminator.
+/// Whether nft's stderr is a **rejection of the ruleset**.
+///
+/// nftables prefixes every netlink failure with `netlink:`. Any other `Error:`
+/// line came out of the parser or the rule evaluator, both of which run before
+/// netlink is touched and need no capability at all — so it is a rejection
+/// whatever mask the invoker holds. An unprivileged run against a ruleset that
+/// does not parse prints *both* lines, which is why this is asked first.
+fn nft_rejected_the_ruleset(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .map(str::trim)
+        .any(|l| l.contains("Error:") && !l.starts_with("netlink:"))
+}
+
+/// Whether nft's stderr says it could not reach the kernel.
+fn nft_reported_netlink_failure(stderr: &str) -> bool {
+    stderr.lines().map(str::trim).any(|l| {
+        l.starts_with("netlink:")
+            || l.contains("Operation not permitted")
+            || l.contains("Permission denied")
+    })
+}
+
 fn judge_nft_check(
     outcome: std::io::Result<std::process::Output>,
     privileged: bool,
@@ -538,15 +676,19 @@ fn judge_nft_check(
         ),
         Ok(o) => {
             let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            let refused_for_want_of_capability = !privileged
-                || err.contains("Operation not permitted")
-                || err.contains("Permission denied");
-            if refused_for_want_of_capability {
+            if nft_reported_netlink_failure(&err) && !nft_rejected_the_ruleset(&err) {
+                let mask = if privileged {
+                    "this process does hold CAP_NET_ADMIN, so the refusal is not a plain \
+                     capability gap"
+                } else {
+                    "this process does not hold CAP_NET_ADMIN, which is what nft needs to \
+                     reach the kernel"
+                };
                 Check::unknown_without_capability(
                     "kill_switch_ruleset",
                     format!(
-                        "`nft --check` needs CAP_NET_ADMIN and did not get it ({err}), so the \
-                         ruleset for uid {uid} was not validated. {caveat}"
+                        "the ruleset for uid {uid} parses, but `nft --check` could not \
+                         validate it against this kernel ({err}); {mask}. {caveat}"
                     ),
                 )
             } else {
@@ -567,15 +709,37 @@ fn judge_nft_check(
 /// `probe` is [`vpn::wireguard_handshake_age`]'s result with its reason
 /// reduced to the string that type already publishes. `privileged` is whether
 /// this process holds `CAP_NET_ADMIN`, which is what `wg show <iface>
-/// latest-handshakes` needs: refused *without* it establishes nothing about
-/// this host and is bounded by the capability, while refused *with* it is a
-/// real gap — the interface is not a WireGuard interface, or `wg` cannot read
-/// it for some other reason.
+/// latest-handshakes` needs.
+///
+/// `is_wireguard_device` is [`CheckHost::wireguard_device`]'s reading, and it
+/// is what settles the one thing the probe cannot. `ProbeUnavailable::Refused`
+/// is documented at `vpn/wireguard.rs` as meaning *either* "not a WireGuard
+/// interface" *or* "no permission", and privilege is the one axis that cannot
+/// separate them: `wg show lo` and `wg show <nonexistent>` return the same
+/// refusal. Resolving it by privilege alone gave a wireguard profile pointed at
+/// a non-WireGuard interface — a configuration `ProfileConfig::validate_set`
+/// accepts, since it constrains only that the interface equals the tunnel
+/// config's file stem — an all-clear `0` and a message asserting the daemon would be
+/// fine. A capability-free read of the link type says otherwise, and that is a
+/// `fail` about the configuration rather than an `unknown` about this shell.
 fn judge_handshake(
+    iface: &str,
     probe: Result<Option<Duration>, &str>,
     max: Duration,
     privileged: bool,
+    is_wireguard_device: Option<bool>,
 ) -> Check {
+    if is_wireguard_device == Some(false) {
+        return Check::fail(
+            "handshake",
+            format!(
+                "{iface} is not a WireGuard device: the kernel reports no wireguard link \
+                 type for it, so `wg show {iface} latest-handshakes` can never answer and \
+                 the daemon's health monitor would fall back to IP presence alone for this \
+                 profile. Point vpn_interface at the profile's own tunnel"
+            ),
+        );
+    }
     match probe {
         Ok(Some(age)) if age <= max => Check::pass(
             "handshake",
@@ -598,12 +762,31 @@ fn judge_handshake(
             "handshake",
             "no peer has handshaked yet; the tunnel may still be coming up",
         ),
-        Err("refused") if !privileged => Check::unknown_without_capability(
-            "handshake",
-            "`wg show <iface> latest-handshakes` was refused and this process does not hold \
-             CAP_NET_ADMIN, which it needs; the daemon has it and would run this probe. Run \
-             as the daemon's user with that capability to settle it",
-        ),
+        Err("refused") if !privileged => {
+            // What was established, and nothing more. The old text finished
+            // "the daemon has it and would run this probe", which is a
+            // prediction about a process this command never looked at — and
+            // it was printed verbatim for an interface `wg` would refuse the
+            // daemon too.
+            let corroboration = match is_wireguard_device {
+                Some(true) => format!(
+                    " {iface} is a WireGuard device, so the missing capability accounts for \
+                     the refusal on its own."
+                ),
+                _ => format!(
+                    " Whether {iface} is a WireGuard device could not be read either, so the \
+                     refusal has two possible causes and this run separated neither."
+                ),
+            };
+            Check::unknown_without_capability(
+                "handshake",
+                format!(
+                    "`wg show {iface} latest-handshakes` was refused and this process does \
+                     not hold CAP_NET_ADMIN, which it needs.{corroboration} Run as a user \
+                     that holds that capability to settle it"
+                ),
+            )
+        }
         Err(why) => Check::unknown(
             "handshake",
             format!("probe unavailable ({why}); the daemon would run on IP presence alone"),
@@ -642,10 +825,22 @@ fn nft_check(ruleset: &str) -> std::io::Result<std::process::Output> {
 /// named `rp_filter` in the same `host` array, which the `--json` contract
 /// cannot express to a consumer keying by name. It lives in
 /// [`profile_checks`] instead.
-fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
+///
+/// Every host touch goes through `host` for the same reason [`profile_checks`]'s
+/// do: the classification this function performs — which `nft --check` failure
+/// is a rejection of the ruleset, and whether an excluded profile's interface
+/// may decide a scoped run — is branch logic, and a test that shells out to the
+/// real `ip` and `nft` asserts whatever the machine it runs on happens to
+/// answer.
+fn host_checks(
+    cfg: &Config,
+    as_uid: Option<u32>,
+    only: Option<&str>,
+    host: &dyn CheckHost,
+) -> Vec<Check> {
     let mut out = Vec::new();
 
-    out.push(if tool_available("ip", "-V") {
+    out.push(if host.tool_available("ip", "-V") {
         Check::pass("iproute2", "`ip` is available")
     } else {
         Check::fail(
@@ -655,7 +850,7 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
     });
 
     if cfg.network_kill_switch {
-        out.push(if vpn::killswitch::nft_available() {
+        out.push(if host.tool_available("nft", "--version") {
             Check::pass("nftables", "`nft` is available")
         } else {
             Check::fail(
@@ -664,7 +859,7 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
             )
         });
 
-        let invoker = vpn::killswitch::current_uid().map_err(|e| e.to_string());
+        let invoker = host.current_uid();
         out.push(judge_kill_switch_uid(as_uid, invoker.clone()));
 
         // The ruleset boot would install, dry-run rather than asserted.
@@ -690,7 +885,13 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
                     .filter_map(|p| p.vpn_interface().map(str::to_string))
                     .collect();
                 let ruleset = vpn::killswitch::render_ruleset(uid, &tunnels);
-                judge_nft_check(nft_check(&ruleset), has_cap_net_admin(), uid, &ruleset)
+                let verdict = judge_nft_check(
+                    host.nft_check(&ruleset),
+                    host.has_cap_net_admin(),
+                    uid,
+                    &ruleset,
+                );
+                attribute_ruleset_rejection(verdict, cfg, only, uid, host)
             }
         });
     } else {
@@ -698,6 +899,82 @@ fn host_checks(cfg: &Config, as_uid: Option<u32>) -> Vec<Check> {
     }
 
     out
+}
+
+/// Keep an excluded profile's interface out of a scoped run's exit status.
+///
+/// The kill-switch table is host-wide — boot installs it whole — so the
+/// rendered ruleset lists every configured vpn profile's interface, and the
+/// caveat in the detail already says so. That justifies *listing* them. It
+/// does not justify letting one decide the verdict of a run the operator
+/// narrowed with `--profile`: `cli.rs` says "Check only this profile." and
+/// `docs/running.md` "Check one profile instead of every configured profile",
+/// and a rejection caused by an interface belonging to a profile that was
+/// excluded is a `fail` and an exit `1` for a profile nobody asked about.
+///
+/// Attribution is by re-rendering: the same ruleset for the selected profile's
+/// interfaces alone, dry-run the same way. If that parses while the full one
+/// did not, the rejection is the excluded profiles' and this run reports it
+/// without colouring the status. If it fails too, the selected profile owns it
+/// and the verdict stands. A host profile has no interface in the table, so an
+/// excluded host profile can own no part of a rejection. Nothing here reads nft's message for interface
+/// names — every name is in it, including the ones that are fine.
+fn attribute_ruleset_rejection(
+    verdict: Check,
+    cfg: &Config,
+    only: Option<&str>,
+    uid: u32,
+    host: &dyn CheckHost,
+) -> Check {
+    // Only a `Fail` can colour a scoped run; the rest are already
+    // non-colouring and are left exactly as they are.
+    if verdict.verdict != Verdict::Fail {
+        return verdict;
+    }
+    let Some(id) = only else {
+        return verdict;
+    };
+    let (kept, excluded): (Vec<&ProfileConfig>, Vec<&ProfileConfig>) = cfg
+        .profile
+        .iter()
+        .filter(|p| p.vpn_interface().is_some())
+        .partition(|p| p.id.as_str() == id);
+    if excluded.is_empty() {
+        return verdict;
+    }
+    let scoped: Vec<String> = kept
+        .iter()
+        .filter_map(|p| p.vpn_interface().map(str::to_string))
+        .collect();
+    let scoped_ruleset = vpn::killswitch::render_ruleset(uid, &scoped);
+    let scoped_parses = match host.nft_check(&scoped_ruleset) {
+        Ok(o) => {
+            o.status.success() || !nft_rejected_the_ruleset(&String::from_utf8_lossy(&o.stderr))
+        }
+        // The probe that would attribute it did not run, so nothing is
+        // attributed and the rejection keeps the status it had.
+        Err(_) => return verdict,
+    };
+    if !scoped_parses {
+        return verdict;
+    }
+    let names: Vec<String> = excluded
+        .iter()
+        .filter_map(|p| {
+            p.vpn_interface()
+                .map(|iface| format!("{iface} (profile {})", p.id.as_str()))
+        })
+        .collect();
+    Check::skip(
+        "kill_switch_ruleset",
+        format!(
+            "{} — but the ruleset for profile {id}'s interfaces alone is accepted, so the \
+             rejection belongs to {}, which --profile {id} excluded. It is reported and it \
+             does not decide this run's status; re-run without --profile to have it do so",
+            verdict.detail,
+            names.join(", "),
+        ),
+    )
 }
 
 /// Prove that a socket **bound to the tunnel address** can send and receive.
@@ -900,17 +1177,33 @@ fn profile_checks(
                     checks.push(Check::pass("bring_up", format!("tunnel came up on {ip}")));
                 }
                 Err(e) => {
+                    // The caveat below belongs to the manager in hand.
+                    // `openvpn --daemon` forks and exits 0 before its own
+                    // address poll, so a failure there can leave a process
+                    // standing that this command cannot see to stop;
+                    // `wg-quick up` leaves no surviving process, and printing
+                    // openvpn's mechanism for a WireGuard profile sent the
+                    // operator looking for an orphan that cannot exist — on
+                    // the one failure path where the report's precision is
+                    // the point.
                     let aftermath = if raised_here {
                         format!(
                             "; {iface} is there even so, so this command raised it and is \
                              lowering it again"
                         )
                     } else {
-                        format!(
-                            "; no {iface} appeared, but a manager that daemonises (openvpn \
-                             forks and exits 0 before its own address poll) may have left a \
-                             process running that this command cannot see to stop"
-                        )
+                        match vpn_type {
+                            VpnType::Openvpn => format!(
+                                "; no {iface} appeared, but openvpn daemonises (it forks and \
+                                 exits 0 before its own address poll) so it may have left a \
+                                 process running that this command cannot see to stop"
+                            ),
+                            VpnType::Wireguard => format!(
+                                "; no {iface} appeared, and `wg-quick up` leaves no process \
+                                 behind, so there is nothing running for this command to \
+                                 have missed"
+                            ),
+                        }
                     };
                     checks.push(Check::fail("bring_up", format!("{e}{aftermath}")));
                     if raised_here {
@@ -969,7 +1262,13 @@ fn profile_checks(
         VpnType::Wireguard => {
             let max = Duration::from_secs(cfg.vpn_handshake_max_age_secs);
             let probe = vpn::wireguard_handshake_age(iface).map_err(|why| why.as_str());
-            checks.push(judge_handshake(probe, max, has_cap_net_admin()));
+            checks.push(judge_handshake(
+                iface,
+                probe,
+                max,
+                host.has_cap_net_admin(),
+                host.wireguard_device(iface),
+            ));
         }
         VpnType::Openvpn => {
             checks.push(Check::skip(
@@ -1196,7 +1495,7 @@ pub fn check(
 ) -> anyhow::Result<i32> {
     let host = RealHost;
     let report = Report {
-        host: host_checks(cfg, as_uid),
+        host: host_checks(cfg, as_uid, only, &host),
         profiles: profile_reports(cfg, only, bring_up, egress, &host)?,
     };
 
@@ -1220,10 +1519,12 @@ pub fn check(
 
 /// The four-character marker in front of a check.
 ///
-/// `?cap` rather than `?   ` for an `Unknown` this invocation could not settle
-/// for want of a capability: it is the one `Unknown` that does not colour the
-/// exit status, so the rendering has to distinguish it too, or a reader
-/// reconciling a `0` against a column of `?` has nothing to go on.
+/// `?cap` rather than `?   ` for an `Unknown` nothing this invocation can be
+/// given would settle: it is the one `Unknown` that does not colour the exit
+/// status, so the rendering has to distinguish it too, or a reader
+/// reconciling a `0` against a column of `?` has nothing to go on. A missing
+/// capability is the common reason and the one the marker is named for; the
+/// footnote states the class, and each line states its own cause.
 fn symbol(c: &Check) -> &'static str {
     match c.verdict {
         Verdict::Pass => "ok  ",
@@ -1247,10 +1548,11 @@ fn print_human(report: &Report) {
     }
     if report.capability_bound() {
         println!(
-            "\n[?cap] marks a check this invocation could not perform for want of \
-             CAP_NET_ADMIN. It is not counted against the exit status — the daemon has the \
-             capability and this shell does not — so the status says nothing about it either \
-             way."
+            "\n[?cap] marks a check nothing this invocation could be given would settle — \
+             usually for want of CAP_NET_ADMIN, which the daemon holds and this shell does \
+             not; each line says which. It is not counted against the exit status, because \
+             no argument to this command would change it, so the status says nothing about \
+             it either way."
         );
     }
 }
@@ -1283,6 +1585,20 @@ mod tests {
         events: Arc<Mutex<Vec<String>>>,
         vpn: MockVpn,
         fwd: MockForwarder,
+        /// Binaries `tool_available` should answer `false` for. Everything
+        /// else is present, which is the ordinary host.
+        missing_tools: Vec<String>,
+        /// What `current_uid` answers.
+        uid: Result<u32, String>,
+        /// What `has_cap_net_admin` answers. `false` is the invocation
+        /// `docs/running.md` recommends.
+        privileged: bool,
+        /// Scripted `nft --check` outcomes as `(exit code, stderr)`, consumed
+        /// in call order. Empty means "accepted".
+        nft: Mutex<Vec<(i32, String)>>,
+        /// Scripted `wireguard_device` answers. An interface not listed reads
+        /// as `None`, which is "neither read answered".
+        wg_devices: Vec<(String, bool)>,
     }
 
     impl FakeHost {
@@ -1295,7 +1611,30 @@ mod tests {
                 events: Arc::new(Mutex::new(Vec::new())),
                 vpn: MockVpn::new(),
                 fwd: MockForwarder::new(),
+                missing_tools: Vec::new(),
+                uid: Ok(2000),
+                privileged: false,
+                nft: Mutex::new(Vec::new()),
+                wg_devices: Vec::new(),
             }
+        }
+
+        /// This process's effective uid, as `current_uid` reports it.
+        fn with_uid(mut self, uid: u32) -> Self {
+            self.uid = Ok(uid);
+            self
+        }
+
+        /// Script `nft --check`, call by call, as `(exit code, stderr)`.
+        fn with_nft(self, seq: impl IntoIterator<Item = (i32, &'static str)>) -> Self {
+            *self.nft.lock().unwrap() = seq.into_iter().map(|(c, e)| (c, e.to_string())).collect();
+            self
+        }
+
+        /// Script what the capability-free link-type read says about `iface`.
+        fn with_wireguard_device(mut self, iface: &str, is_wg: bool) -> Self {
+            self.wg_devices.push((iface.to_string(), is_wg));
+            self
         }
 
         /// `iface` is already present on the host before the command runs.
@@ -1388,6 +1727,47 @@ mod tests {
 
         fn forwarder(&self) -> Arc<dyn PortForwarder> {
             Arc::new(self.fwd.clone())
+        }
+
+        fn tool_available(&self, bin: &str, probe_arg: &str) -> bool {
+            self.record(format!("tool_available {bin} {probe_arg}"));
+            !self.missing_tools.iter().any(|b| b == bin)
+        }
+
+        fn current_uid(&self) -> Result<u32, String> {
+            self.uid.clone()
+        }
+
+        fn has_cap_net_admin(&self) -> bool {
+            self.privileged
+        }
+
+        fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output> {
+            self.record(format!("nft_check {ruleset}"));
+            let mut g = self.nft.lock().unwrap();
+            if g.is_empty() {
+                return Ok(nft_out(0, ""));
+            }
+            let (code, stderr) = g.remove(0);
+            Ok(nft_out(code, &stderr))
+        }
+
+        fn wireguard_device(&self, iface: &str) -> Option<bool> {
+            self.record(format!("wireguard_device {iface}"));
+            self.wg_devices
+                .iter()
+                .find(|(i, _)| i == iface)
+                .map(|(_, v)| *v)
+        }
+    }
+
+    /// Build a finished `nft --check` `Output` with `code` and `stderr`.
+    fn nft_out(code: i32, stderr: &str) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
         }
     }
 
@@ -1517,6 +1897,31 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
 {extra}
 "#
         ))
+    }
+
+    /// `cfg_with_profile`'s config with a second vpn profile, so `--profile`
+    /// has something to exclude and the kill-switch table has more than one
+    /// interface in it.
+    fn cfg_with_two_profiles() -> Config {
+        let mut cfg = cfg_with_profile("");
+        cfg.network_kill_switch = true;
+        let mut b = cfg_with_tables(
+            r#"
+[[profile]]
+id                   = "acct_b"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg-acct-b.conf"
+vpn_interface        = "wg-acct-b"
+listen_port          = 6882
+peer_fingerprint_hex = "b1b2c3d4e5f60718"
+user_agent           = "Transmission/4.0.5"
+resume_dir           = "/tmp/torrentd-test/state/resume/acct_b"
+torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
+"#,
+        );
+        cfg.profile.push(b.profile.remove(0));
+        cfg
     }
 
     fn find<'a>(checks: &'a [Check], name: &str) -> Option<&'a Check> {
@@ -1994,6 +2399,144 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
     }
 
     #[test]
+    fn an_excluded_profile_s_interface_does_not_decide_a_scoped_run() {
+        // C52 / F4, reopened. `rp_filter` moved into the profile when the
+        // same finding was first repaired, and `kill_switch_ruleset` kept
+        // building its interface list from every configured profile, ignoring
+        // `--profile`. A rejection caused by an interface belonging to a
+        // profile the operator excluded was a `fail` and an exit 1 for a
+        // profile that was not being checked, against a flag whose help says
+        // "Check only this profile."
+        //
+        // The table is still rendered whole, because boot installs it whole
+        // and the caveat says so. What changes is the verdict.
+        let cfg = cfg_with_two_profiles();
+        let host = FakeHost::new()
+            // The full table is rejected; the selected profile's alone is not.
+            .with_nft([
+                (
+                    1,
+                    "/dev/stdin:5:39-39: Error: syntax error, unexpected string",
+                ),
+                (0, ""),
+            ]);
+
+        let checks = host_checks(&cfg, Some(2000), Some("acct_a"), &host);
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is still reported");
+
+        assert_ne!(
+            c.verdict,
+            Verdict::Fail,
+            "an excluded profile's interface does not colour a scoped run: {}",
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("wg-acct-b") && c.detail.contains("acct_b"),
+            "the offending interface and the profile it belongs to are both named: {}",
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("syntax error"),
+            "nft's own words still reach the operator: {}",
+            c.detail,
+        );
+        let report = Report {
+            host: checks,
+            profiles: Vec::new(),
+        };
+        assert_eq!(
+            report.exit_code(),
+            EXIT_OK,
+            "a run scoped to a healthy profile is clean",
+        );
+
+        // The complement: when the rejection survives scoping, it is the
+        // selected profile's and it still decides the run.
+        let host = FakeHost::new().with_nft([
+            (
+                1,
+                "/dev/stdin:5:39-39: Error: syntax error, unexpected string",
+            ),
+            (
+                1,
+                "/dev/stdin:4:39-39: Error: syntax error, unexpected string",
+            ),
+        ]);
+        let checks = host_checks(&cfg, Some(2000), Some("acct_a"), &host);
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is still reported");
+        assert_eq!(
+            c.verdict,
+            Verdict::Fail,
+            "a rejection the selected profile owns still fails: {}",
+            c.detail,
+        );
+
+        // And an unscoped run is untouched: nothing was excluded, so there is
+        // nothing to attribute elsewhere.
+        let host = FakeHost::new().with_nft([(
+            1,
+            "/dev/stdin:5:39-39: Error: syntax error, unexpected string",
+        )]);
+        let checks = host_checks(&cfg, Some(2000), None, &host);
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is still reported");
+        assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+    }
+
+    #[test]
+    fn a_uid_mismatch_is_reported_without_colouring_the_exit_status() {
+        // F11, reopened. `--as-uid` names a uid the invoker is not *by
+        // definition* — that is the whole reason the flag exists — and this
+        // process cannot observe which user the daemon runs as. So the
+        // mismatch is unsettleable by any argument, privilege or
+        // configuration this invocation could be given, which is the same
+        // class as the capability-bound unknowns and is excluded from the
+        // status for the same reason.
+        //
+        // Leaving it to colour the status meant every combination of the one
+        // documented privileged invocation landed on 1 or 2: under `sudo`
+        // with no `--as-uid` the subject is 0 and fails, `--as-uid 0` fails,
+        // and `--as-uid <daemon uid>` cost 2. A status nobody can get a 0
+        // from trains both consumers to accept 2, which is what the
+        // three-valued status was introduced to prevent.
+        let c = judge_kill_switch_uid(Some(998), Ok(2000));
+        assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
+        assert!(
+            c.needs_capability,
+            "an unknown nothing can settle does not colour the status: {}",
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("998") && c.detail.contains("2000"),
+            "both uids are named: {}",
+            c.detail,
+        );
+
+        // Through the report: this is the invocation `docs/running.md`
+        // describes, and it has to be able to reach 0.
+        let report = Report {
+            host: vec![
+                Check::pass("iproute2", "`ip` is available"),
+                Check::pass("nftables", "`nft` is available"),
+                judge_kill_switch_uid(Some(998), Ok(2000)),
+            ],
+            profiles: Vec::new(),
+        };
+        assert_eq!(
+            report.exit_code(),
+            EXIT_OK,
+            "--as-uid from a uid that is not the subject is the expected case, not a fault",
+        );
+
+        // The uid check still answers where the answer does not depend on the
+        // observer: uid 0 fails whoever asks.
+        assert_eq!(
+            judge_kill_switch_uid(Some(0), Ok(2000)).verdict,
+            Verdict::Fail,
+            "the non-colouring class does not swallow a decidable failure",
+        );
+    }
+
+    #[test]
     fn a_named_uid_of_zero_is_a_failure_whoever_is_asking() {
         // `killswitch::enable` refuses uid 0 *unconditionally* — it consults
         // neither the invoker nor the config — so "the daemon runs as root"
@@ -2349,8 +2892,12 @@ http_listen = "127.0.0.1:8080"
         // all named `rp_filter`, so `host[]` in the `--json` contract carried
         // duplicate `name` values and a consumer keying by name silently kept
         // one of them.
+        //
+        // Run against a `CheckHost` double rather than the real `ip` and
+        // `nft`: what this asserts is the shape of the block, which must not
+        // depend on what happens to be installed on the machine running it.
         let cfg = cfg_with_profile("");
-        let host = host_checks(&cfg, None);
+        let host = host_checks(&cfg, None, None, &FakeHost::new());
         assert!(
             find(&host, "rp_filter").is_none(),
             "rp_filter is per profile and belongs to the profile: {:?}",
@@ -2364,6 +2911,63 @@ http_listen = "127.0.0.1:8080"
             names.len(),
             before,
             "a consumer keying host[] by name has to get every check: {names:?}",
+        );
+    }
+
+    #[test]
+    fn the_host_block_is_built_from_the_check_host_and_not_from_this_machine() {
+        // D34. `host_checks` was the one unit outside the `CheckHost` seam, so
+        // its only test shelled out to the real `ip` and `nft` and asserted
+        // whatever the machine answered — which is no constraint at all on the
+        // two classifications this block now performs.
+        //
+        // Every host touch is scripted here, and the block's names and
+        // verdicts follow the script rather than the host.
+        let mut cfg = cfg_with_profile("");
+        cfg.network_kill_switch = true;
+        let host = FakeHost::new().with_uid(998).with_nft([(
+            1,
+            "netlink: Error: cache initialization failed: Operation not permitted",
+        )]);
+
+        let checks = host_checks(&cfg, None, None, &host);
+
+        let names: Vec<&str> = checks.iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "iproute2",
+                "nftables",
+                "kill_switch_uid",
+                "kill_switch_ruleset"
+            ],
+            "the host block's shape is the contract `host[]` publishes",
+        );
+        assert!(
+            !names.contains(&"rp_filter"),
+            "no per-profile check belongs in the unscoped host block: {names:?}",
+        );
+
+        // The scripted uid is the one judged, and the scripted `nft` outcome
+        // is the one classified — neither came from this machine.
+        let uid = find(&checks, "kill_switch_uid").expect("the uid check is reported");
+        assert_eq!(uid.verdict, Verdict::Pass, "detail: {}", uid.detail);
+        assert!(uid.detail.contains("998"), "detail: {}", uid.detail);
+        let ruleset = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
+        assert_eq!(
+            ruleset.verdict,
+            Verdict::Unknown,
+            "detail: {}",
+            ruleset.detail
+        );
+        assert!(ruleset.needs_capability, "detail: {}", ruleset.detail);
+
+        // And the calls went through the seam rather than round it.
+        let events = host.events();
+        assert!(
+            events.iter().any(|e| e.starts_with("tool_available ip"))
+                && events.iter().any(|e| e.starts_with("nft_check")),
+            "host_checks reaches the host only through CheckHost: {events:?}",
         );
     }
 
@@ -2412,9 +3016,14 @@ http_listen = "127.0.0.1:8080"
     #[test]
     fn a_bring_up_that_failed_and_left_nothing_standing_says_what_it_cannot_see() {
         // The complement: nothing appeared, so there is nothing to lower and
-        // no teardown is issued. The report still says what the command was
-        // unable to establish, because a manager that daemonises can have left
-        // a process behind that no interface probe can see.
+        // no teardown is issued. What the report says it cannot see depends on
+        // the manager that was asked.
+        //
+        // F17. The caveat was unconditional, so a WireGuard profile's failure
+        // was explained with openvpn's daemonising and the operator was sent
+        // looking for an orphaned process that cannot exist. `openvpn
+        // --daemon` forks and exits 0 before its own address poll and can
+        // leave one; `wg-quick up` cannot.
         let cfg = cfg_with_profile("");
         let host = FakeHost::new().with_exists_seq([false, false]);
 
@@ -2425,8 +3034,34 @@ http_listen = "127.0.0.1:8080"
         let bu = find(&r.checks, "bring_up").expect("a bring_up line");
         assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
         assert!(
-            bu.detail.contains("may have left a process running"),
-            "the one thing it cannot observe is named: {}",
+            !bu.detail.contains("may have left a process running"),
+            "wg-quick leaves no process, so the report must not suggest one: {}",
+            bu.detail,
+        );
+        assert!(
+            bu.detail.contains("leaves no process behind"),
+            "the operator is told what was and was not left standing: {}",
+            bu.detail,
+        );
+
+        // The openvpn profile, where the caveat is true and belongs.
+        let mut cfg = cfg_with_profile("");
+        match &mut cfg.profile[0].network {
+            torrentd_engine::ProfileNetwork::Vpn { vpn_type, .. } => {
+                *vpn_type = VpnType::Openvpn;
+            }
+            torrentd_engine::ProfileNetwork::Host { .. } => unreachable!("a vpn profile"),
+        }
+        let host = FakeHost::new().with_exists_seq([false, false]);
+
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
+
+        let bu = find(&r.checks, "bring_up").expect("a bring_up line");
+        assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
+        assert!(
+            bu.detail.contains("may have left a process running")
+                && bu.detail.contains("openvpn daemonises"),
+            "the one thing it cannot observe is named, for the manager that can do it: {}",
             bu.detail,
         );
     }
@@ -2547,18 +3182,24 @@ http_listen = "127.0.0.1:8080"
     }
 
     #[test]
-    fn nft_check_is_classified_by_the_capability_before_the_error_text() {
-        // F13. The difference between exit 1 and exit 2 rested on nftables'
-        // error wording: `err.contains("Operation not permitted")`. A build,
-        // locale or version whose message differs reported "`nft --check`
-        // rejected the ruleset boot would install" — asserting the boot would
-        // abort when nothing about the ruleset had been established — and the
-        // converse downgraded a genuine rejection whose text happened to carry
-        // the phrase.
+    fn nft_check_is_classified_by_what_nft_reported_not_by_who_asked() {
+        // F13, reopened. This test used to assert the opposite — that the
+        // capability mask classifies before the error text does — and that
+        // premise is refuted by execution: as an unprivileged uid with an
+        // empty `CapEff`, an invalid ruleset prints a parser diagnostic and a
+        // valid one prints only `netlink: Error: cache initialization failed`.
+        // nftables parses before it touches netlink, so the two classes are
+        // distinguishable without the capability.
         //
-        // Unprivileged, with a message this code has never seen: still
-        // capability-bound, because without CAP_NET_ADMIN `nft` cannot reach
-        // the kernel to validate anything.
+        // Classifying on the mask made `!privileged` short-circuit every
+        // failure into the capability class on the one invocation
+        // `docs/running.md` recommends, and since that class does not colour
+        // the status, a configuration whose boot would abort at
+        // `killswitch::enable` exited 0.
+        //
+        // Unprivileged, and nft reports it could not reach the kernel — in a
+        // wording this code has never seen. Capability-bound: the ruleset
+        // parsed.
         let c = judge_nft_check(
             nft_output(1, "netlink: konnte Cache nicht initialisieren"),
             false,
@@ -2567,6 +3208,39 @@ http_listen = "127.0.0.1:8080"
         );
         assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
         assert!(c.needs_capability, "detail: {}", c.detail);
+
+        // Unprivileged, and nft rejected the ruleset. This is the arm the
+        // removed behaviour got wrong, and it is what the command actually
+        // sees: an unprivileged run against a ruleset that does not parse
+        // prints the parser's diagnostic *and* the netlink one, because nft
+        // carries on to the kernel after reporting the parse failure.
+        let c = judge_nft_check(
+            nft_output(
+                1,
+                "/dev/stdin:5:39-39: Error: syntax error, unexpected string, expecting \
+                 comma or '}'\n\t\tmeta skuid 2000 oifname { \"lo\", \"wg\"x\" } accept\n\t\t \
+                 ^\nnetlink: Error: cache initialization failed: Operation not permitted",
+            ),
+            false,
+            2000,
+            "table inet torrentd {}",
+        );
+        assert_eq!(
+            c.verdict,
+            Verdict::Fail,
+            "a ruleset nft will not parse is a rejection whoever asked: {}",
+            c.detail,
+        );
+        assert!(
+            !c.needs_capability,
+            "a rejection is not an unknown, so it colours the status: {}",
+            c.detail,
+        );
+        assert!(
+            c.detail.contains("syntax error"),
+            "nft's own words reach the operator: {}",
+            c.detail,
+        );
 
         // Privileged and rejected: a real failure, and it keeps the exit code.
         let c = judge_nft_check(
@@ -2582,8 +3256,9 @@ http_listen = "127.0.0.1:8080"
             c.detail,
         );
 
-        // The substring stays as a fallback for the case where the capability
-        // mask could not be read at all and `privileged` defaulted to true.
+        // Privileged and nft still could not reach the kernel: the mask is
+        // corroboration, not the discriminator, so what nft reported decides
+        // this one too.
         let c = judge_nft_check(
             nft_output(
                 1,
@@ -2640,9 +3315,10 @@ http_listen = "127.0.0.1:8080"
     fn a_handshake_probe_refused_for_want_of_a_capability_is_told_apart_from_one_that_failed() {
         let max = Duration::from_secs(180);
 
-        // Refused without CAP_NET_ADMIN: the capability the daemon has and
-        // this shell does not. Reported, and not counted against the status.
-        let c = judge_handshake(Err("refused"), max, false);
+        // Refused without CAP_NET_ADMIN on an interface the kernel confirms
+        // *is* a WireGuard device: the capability the daemon has and this
+        // shell does not. Reported, and not counted against the status.
+        let c = judge_handshake("wg-acct-a", Err("refused"), max, false, Some(true));
         assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
         assert!(c.needs_capability, "detail: {}", c.detail);
         assert!(
@@ -2650,34 +3326,114 @@ http_listen = "127.0.0.1:8080"
             "the operator is told what would settle it: {}",
             c.detail,
         );
+        assert!(
+            !c.detail.contains("would run this probe"),
+            "the report does not predict what a process it never looked at would do: {}",
+            c.detail,
+        );
 
-        // Refused *with* the capability is a real gap — not a WireGuard
-        // interface, or `wg` cannot read it — and still colours the status.
-        let c = judge_handshake(Err("refused"), max, true);
+        // Refused *with* the capability is a real gap — `wg` cannot read it —
+        // and still colours the status.
+        let c = judge_handshake("wg-acct-a", Err("refused"), max, true, Some(true));
         assert_eq!(c.verdict, Verdict::Unknown);
         assert!(!c.needs_capability, "detail: {}", c.detail);
 
         // A missing `wg` is not a capability problem at any privilege.
         for privileged in [true, false] {
-            let c = judge_handshake(Err("no_tool"), max, privileged);
+            let c = judge_handshake("wg-acct-a", Err("no_tool"), max, privileged, Some(true));
             assert_eq!(c.verdict, Verdict::Unknown);
             assert!(!c.needs_capability, "detail: {}", c.detail);
         }
 
         // And the verdicts that do not turn on privilege at all.
         assert_eq!(
-            judge_handshake(Ok(Some(Duration::from_secs(30))), max, false).verdict,
+            judge_handshake(
+                "wg-acct-a",
+                Ok(Some(Duration::from_secs(30))),
+                max,
+                false,
+                Some(true),
+            )
+            .verdict,
             Verdict::Pass,
         );
         assert_eq!(
-            judge_handshake(Ok(Some(Duration::from_secs(300))), max, true).verdict,
+            judge_handshake(
+                "wg-acct-a",
+                Ok(Some(Duration::from_secs(300))),
+                max,
+                true,
+                Some(true),
+            )
+            .verdict,
             Verdict::Fail,
         );
-        let c = judge_handshake(Ok(None), max, true);
+        let c = judge_handshake("wg-acct-a", Ok(None), max, true, Some(true));
         assert_eq!(c.verdict, Verdict::Unknown);
         assert!(
             !c.needs_capability,
             "a tunnel still coming up is not a permission problem"
+        );
+
+        // C30's missing arm. The link type could not be read at all, so the
+        // refusal has two causes and the report says so rather than picking
+        // one.
+        let c = judge_handshake("wg-acct-a", Err("refused"), max, false, None);
+        assert_eq!(c.verdict, Verdict::Unknown, "detail: {}", c.detail);
+        assert!(c.needs_capability, "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("could not be read"),
+            "an unread link type is disclosed, not assumed: {}",
+            c.detail,
+        );
+    }
+
+    #[test]
+    fn a_wireguard_profile_pointed_at_a_device_that_is_not_wireguard_fails() {
+        // F14. `ProbeUnavailable::Refused` means *either* "not a WireGuard
+        // interface" *or* "no permission", and privilege is the one axis that
+        // cannot separate them — `wg show lo` and `wg show <nonexistent>`
+        // return the same refusal on this host. Resolving it by privilege gave
+        // a wireguard profile pointed at `lo` — a config `validate_set`
+        // accepts, because it constrains only that the interface equals the
+        // tunnel config's file stem — an all-clear `0` and a line asserting
+        // the daemon would be fine.
+        //
+        // A capability-free read of the link type settles it, and a
+        // misconfigured profile is a `fail` about the configuration.
+        let c = judge_handshake(
+            "lo",
+            Err("refused"),
+            Duration::from_secs(180),
+            false,
+            Some(false),
+        );
+        assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+        assert!(!c.needs_capability, "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("lo"),
+            "the offending interface is named: {}",
+            c.detail,
+        );
+
+        // And through the whole profile: the verdict has to reach the report
+        // and the exit status, not just the judge.
+        let cfg = cfg_with_profile("");
+        let host = FakeHost::new()
+            .with_existing("wg-acct-a")
+            .with_wireguard_device("wg-acct-a", false)
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(127, 0, 0, 1)))]);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
+        let hs = find(&r.checks, "handshake").expect("the handshake line is still reported");
+        assert_eq!(hs.verdict, Verdict::Fail, "detail: {}", hs.detail);
+        let report = Report {
+            host: Vec::new(),
+            profiles: vec![r],
+        };
+        assert_eq!(
+            report.exit_code(),
+            EXIT_FAILED,
+            "a profile whose handshake can never answer is not a clean run",
         );
     }
 }
