@@ -183,6 +183,16 @@ Every profile takes `id` plus `network`, and then:
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
 
+Each `vpn` profile's tunnel must come up with its own address. A session is
+bound to its tunnel by address, so two tunnels sharing one — every Proton
+WireGuard config assigns `10.2.0.2/32` — leave nothing that keeps one account's
+traffic out of the other's tunnel. The address is known only once the tunnel is
+up, so this is checked at startup rather than by `--check-config`: the second
+profile to come up with an address already taken is disabled, with a reason
+naming the other profile, and the rest of the daemon runs. Two accounts behind
+a provider that gives every client the same address cannot share one daemon;
+run the second in a daemon of its own, in its own network namespace.
+
 Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
 `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
 `peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all
