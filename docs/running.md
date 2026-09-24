@@ -151,6 +151,7 @@ authentication posture, and at least one `[[profile]]`:
 | Key | Default |
 | --- | --- |
 | `http_listen` | `127.0.0.1:8080`. A non-loopback value requires `[auth]` — §6. |
+| `trusted_proxies` | `[]`, so no forwarding header is read and the socket's peer address is the client — §6a. Read once, at startup. |
 | `log_level` | `info` |
 | `registry_path` | `<resume_dir>/../profile_assignments.json` |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
@@ -414,10 +415,11 @@ config tells you to do.
 
 `http_listen` defaults to `127.0.0.1:8080`.
 
-**Restart, not reload.** `[auth]`, `allow_unauthenticated` and `http_listen`
-are read once, at startup: the session store is built and the listener bound
-before anything is served, and neither can change under a live server. Editing
-any of them and then sending `SIGHUP` or calling `POST /api/reload` logs
+**Restart, not reload.** `[auth]`, `allow_unauthenticated`, `http_listen` and
+`trusted_proxies` are read once, at startup: the session store is built, the
+listener bound and the trusted-proxy set parsed before anything is served, and
+none of them can change under a live server. Editing any of them and then
+sending `SIGHUP` or calling `POST /api/reload` logs
 
 ```
 SIGHUP: change to non-reloadable field requires daemon restart; ignored
@@ -442,12 +444,13 @@ torrentd --config /etc/torrentd/torrentd.toml hash-password
 torrentd --config /etc/torrentd/torrentd.toml new-token --name prometheus --scopes metrics
 ```
 
-That exemption is what makes a non-loopback deployment migratable at all. A
-container publishes `127.0.0.1:8080:8080` to a daemon bound `0.0.0.0` *inside*
-the namespace, so it cannot bind loopback and cannot write
-`allow_unauthenticated = true` either — the opt-out on a routable address is
-refused outright. Run the subcommands in a throwaway container against the
-same config the service mounts:
+That exemption is what makes a non-loopback deployment migratable at all. In
+`deploy/compose.yaml` the daemon is reached by a *sibling container* — `proxy`,
+over the compose network — so it binds `0.0.0.0` inside its namespace and a
+loopback bind there would be a dead port. Having a routable bind it cannot
+move, it cannot write `allow_unauthenticated = true` either — the opt-out on
+a routable address is refused outright. Run the subcommands in a throwaway
+container against the same config the service mounts:
 
 ```bash
 podman compose -f deploy/compose.yaml run --rm torrentd hash-password
@@ -470,6 +473,160 @@ There is no token-only mode: `[auth]` requires `password_hash`. Scopes are
 
 `POST /api/login` returns 409 with an explanation when the daemon is running
 unauthenticated, rather than the 404 that used to look like a missing route.
+
+## 6a. Reverse proxy
+
+torrentd does not terminate TLS and will not. An HTTP server's TLS
+configuration is a thing to get wrong, there is no certificate handling here,
+and there is a mature implementation one hop away. What the daemon does
+provide is an origin that behaves correctly behind one: ETags and conditional
+requests on the web client's assets, precompressed `.br`/`.gz` variants, and a
+`Vary: accept-encoding` so a shared cache keys on it.
+
+[`deploy/Caddyfile`](../deploy/Caddyfile) and
+[`deploy/compose.yaml`](../deploy/compose.yaml) are a working pair. The
+contract is three headers:
+
+| Header | What torrentd does with it |
+| --- | --- |
+| `X-Forwarded-For` | the client address, for the login throttle and the failed-login log line |
+| `X-Forwarded-Proto` | `https` sets `Secure` on the session cookie |
+| `Forwarded` (RFC 7239) | `for=` supplies the client address where `X-Forwarded-For` is absent; `proto=` supplies the scheme where `X-Forwarded-Proto` is absent |
+
+Each header is named here so that the stripping requirement below can be read
+off the list. A proxy that emits only the standardised `Forwarded` is fully
+supported: it can name its client and its scheme without sending either `X-`
+header. Where both arrive, the `X-` header decides and `Forwarded` is the
+fallback — an explicit `X-Forwarded-Proto: http` from the proxy is not
+overridden by a `proto=https` the client may have sent.
+
+**All are read only from a peer listed in `trusted_proxies`.** That key is
+empty by default, and with it empty no forwarding header is read at all — the
+socket's peer address is the client. Set it to the address your proxy connects
+from and nothing else: anything in that list can claim to be any client.
+
+Getting it wrong fails safe rather than open. An unset `trusted_proxies` means
+no header is read and the socket's peer address is the client. Behind a proxy
+that is the proxy's address for every request, so the login throttle behaves
+as one shared bucket; on a **directly exposed** daemon it is the real client's
+address, so the throttle keys per source IP — which is the better property,
+because one attacker's failures no longer land in the same bucket as yours.
+Either way the cookie loses its `Secure` attribute, and nothing becomes
+forgeable.
+
+Above the per-client buckets sits one daemon-wide ceiling: at most ten
+password verifications back to back, regaining one every three seconds,
+however many addresses the attempts come from. Without it a caller with many
+source addresses — one routed IPv6 /64 supplies more than enough — would get
+a bucket per address, and the Argon2 work and the guessing rate would scale
+with how many they hold. With it, a login that would exceed the ceiling gets
+`429` without running the KDF.
+
+It is not a promise that nobody can lock you out of the login form. A caller
+with enough source addresses can keep that ceiling spent, and while they do
+every login — yours included — is refused, exactly as the single shared
+bucket did before. That costs them nothing but requests: the ~50 ms of Argon2
+behind each attempt is spent by torrentd, not by the caller, which is why the
+ceiling exists. What the per-client key removes is the lockout by a caller
+with one address, or a few.
+
+The proxy must **strip or overwrite client-supplied forwarding headers before
+adding its own** — all three of the names in the table above, not just the two
+`X-` ones. That is the only requirement torrentd places on it, and
+[`deploy/Caddyfile`](../deploy/Caddyfile) is the worked example of meeting it:
+`header_up X-Forwarded-For {remote_host}` and `header_up X-Forwarded-Proto
+{scheme}` overwrite the first two with values Caddy computed, and `header_up
+-Forwarded` removes the third outright. A proxy that strips only the two `X-`
+names leaves `Forwarded` a client-controlled input arriving from a peer this
+daemon believes.
+
+**A proxy that sets only the `X-` names must still strip `Forwarded`.** This
+is the part that is easy to skip, because such a proxy never sends
+`Forwarded` and it is tempting to conclude it has nothing to do about it. It
+does: where an `X-` name is **absent**, the client's `Forwarded` is what the
+daemon reads. Send no `X-Forwarded-Proto` and a client's `Forwarded:
+proto=https` sets `Secure` on the session cookie over a plain-HTTP request,
+which the browser will then neither store nor return — so the operator cannot
+log in. Send no `X-Forwarded-For` and a client's `for=` becomes the throttle
+key and the `client_ip` on the failed-login line.
+
+That fallback is deliberate: it is what makes a proxy emitting only the
+standardised `Forwarded` work at all, and that proxy is fully supported. The
+price is that the fallback is live in every deployment that sets only some of
+the three, and stripping the ones you do not set is what pays it.
+
+**One hop, not a chain walk.** torrentd reads the entry the peer it is
+talking to contributed and stops there. It does not walk back along the chain
+past hops that are themselves listed in `trusted_proxies`, so listing a range
+does not mean "believe the chain as far as my own edge" — `10.0.0.0/8` is a
+valid value and it does not buy that. Put two proxies in series and the
+address torrentd resolves is the **inner** one's, which gives every client
+behind that edge one shared throttle bucket and one `client_ip`. List the one
+address your proxy connects from, which is what this section asks for anyway.
+
+A v4-mapped address is folded to its v4 form, so `::ffff:198.51.100.9` and
+`198.51.100.9` are one client: one throttle bucket, one spelling in the log.
+The fold runs on every path — the socket peer, an address a forwarding header
+supplied, and both sides of a `trusted_proxies` entry — so you may write
+either spelling in the trust list and mean the same host.
+
+**A dual-stack `http_listen` is a supported posture.** `[::]:8080` binds both
+families and reports every v4 client as `::ffff:a.b.c.d`; that is the reason
+the fold exists, and it is why one host reaching the daemon directly and the
+same host named through your proxy are one throttle bucket rather than two.
+The default is still `127.0.0.1:8080`, and a non-loopback bind of either
+family still requires `[auth]` (§6).
+
+Each of these headers is a chain every hop appends to, so torrentd reads the
+*last* entry — the one the trusted proxy added — rather than the first, which
+is whatever the original client chose to send. Whether your proxy appends by
+extending the existing field line (nginx, Caddy) or by adding a second one
+(HAProxy's `option forwardfor`) makes no difference: repeated field lines are
+joined in order first, exactly as RFC 9110 §5.2-5.3 defines them. A proxy that
+forwards client-supplied values intact is a proxy that cannot be trusted about
+anything.
+
+**The scheme is the exception, and it reads the whole chain.** "Which client
+is this" is answered by the nearest hop and by no other; "was the original
+request over TLS" is answered by **any** hop that says `https`, because TLS is
+terminated at the edge and every hop behind it honestly reports plain HTTP. So
+`X-Forwarded-Proto: https, http` — a TLS edge in front of a plain-HTTP inner
+proxy — means the request *was* over TLS and the session cookie gets its
+`Secure` attribute. Reading the last entry there would withhold `Secure` from
+a deployment that really is TLS-fronted, and the browser would then send the
+session cookie in clear to any plain-HTTP origin on the host.
+
+`Forwarded`'s `proto=` is read under the same rule, so the same deployment
+gets the same answer whichever name your proxies speak: `Forwarded:
+proto=https, proto=http` and `Forwarded: proto=https, for=198.51.100.9` both
+mean TLS, the second being the ordinary RFC 7239 shape where an inner proxy
+appends only the client it saw because it terminated no TLS.
+
+If the final element of the chain carries nothing readable the header is
+unreadable, and unreadable is `false` however much `https` sits to its left —
+that is the same readability rule the address arm uses, and it is what stops
+an appending proxy's empty contribution promoting a client's earlier entry.
+
+**What this rule gives up, and why.** A client's own earlier `https` does win,
+wherever your proxy appends rather than overwrites. Nothing in a request
+distinguishes "TLS edge, then plain inner proxy, both honest" from "client's
+forgery, then honest appending proxy" — they are the same bytes — so this is a
+choice between two harms. Withholding `Secure` from a genuine TLS edge sends
+your session cookie in clear; honouring a forged `https` marks the forger's
+**own** cookie `Secure`, which the browser then neither stores nor returns over
+`http://`, so the forger breaks their own login and nobody else's. Stripping
+what the client sent, which this section already requires, removes the second
+case entirely.
+
+**The compose stack does not publish the API to the host.** `deploy/compose.yaml`
+publishes only the BitTorrent ports on `torrentd` and 80/443 on `proxy`; the
+API is reachable over the compose network, by the proxy, and nowhere else.
+That is deliberate — a proxy fronting the daemon is the whole point of this
+section — but it means `localhost:8080` is not an address on that deployment.
+See §9 for what the first-run checks look like there.
+
+One nginx-specific note: `proxy_buffering off` is required on `/api/events`,
+or the SSE stream arrives in one lump at timeout. Caddy streams by default.
 
 ## 7. Limits and sysctls
 
@@ -542,21 +699,38 @@ changing under a live session.
 
 ## 9. First-run checks
 
+These address the daemon directly, so they are written for a deployment that
+publishes the API — the systemd path of §8, and any run bound to loopback.
+
 ```bash
-curl -s localhost:8080/healthz            # {"ok":true,"profiles":1,"heartbeat_age_secs":0}
-curl -s localhost:8080/api/status | jq    # counts by state, rates, peers
+curl -s localhost:8080/healthz            # {"heartbeat_age_secs":0,"ok":true,"profiles":1,"profiles_fenced":0}
+curl -s localhost:8080/api/status | jq    # counts by phase, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
 
+**On the compose stack there is no `localhost:8080`** — §6a explains why — so
+run the same checks from inside the container, or through the proxy:
+
+```bash
+docker compose exec torrentd curl -s localhost:8080/healthz
+curl -s https://your.host/healthz         # through `proxy`, once TLS is up
+```
+
 `/healthz` returns 503 with `{"ok":false,"reason":"no_sessions"}` before a
-session is up, and `{"ok":false,"reason":"alert_loop_stalled",…}` if the alert
-loop stops advancing for 15 seconds.
+session is up, `{"ok":false,"reason":"alert_loop_stalled",…}` if the alert
+loop stops advancing for 15 seconds, and
+`{"ok":false,"reason":"all_profiles_fenced",…}` when every profile is fenced —
+some-but-not-all fenced stays 200, because the remaining profiles are still
+serving.
 
 Confirm settings actually applied rather than trusting the config parsed:
 
 ```bash
 curl -s localhost:8080/metrics | grep torrentd_libtorrent_
 ```
+
+(Compose: `docker compose exec torrentd curl -s localhost:8080/metrics | grep
+torrentd_libtorrent_`.)
 
 Then add one torrent and watch it reach `seeding` in `/api/status`.
 
@@ -567,14 +741,14 @@ my VPN configuration work" can be answered before "does my seeding setup
 work".
 
 ```bash
-torrentd --config /etc/torrentd/torrentd.toml vpn check
+torrentd --config /etc/torrentd/torrentd.toml vpn check   # all-vpn configs only
 torrentd --config /etc/torrentd/torrentd.toml vpn check --profile acct_a --json
 torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
 ```
 
 | Flag | What it adds |
 | --- | --- |
-| `--profile ID` | Check one profile instead of every configured profile. |
+| `--profile ID` | Check one profile instead of every configured profile. Name a `vpn` profile with it unless every configured profile is one: the bare form reaches `host` profiles too, and aborts on the first one it reaches. |
 | `--json` | Emit the report as JSON instead of the human table. |
 | `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
 | `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host, and **the only one that needs root** — see below. |
@@ -676,13 +850,14 @@ curl --interface wg-acct-a -s https://api.ipify.org; echo
 
 ## 10. Migrating a pool from another client
 
-Point `library_dir` at the other client's state directory — for qBittorrent
-that is `BT_backup`, which holds both `<hash>.torrent` and `<hash>.fastresume`,
-and the sidecars supply save-path, category and tag hints. **Copy it somewhere
-scratch first**; scanning only reads, but there is no reason to have the live
-profile open. Note that `library_dir` may not sit inside a managed root — the
-daemon refuses that config, because nothing in the library claims those files
-and a delete plan would treat them as orphans.
+Point `library_dir` at the other client's state directory and scan. The
+walkthrough — what qBittorrent's `BT_backup` holds, which sidecar hints are
+read, and why you copy it somewhere scratch first — sits beside the key it
+configures, in
+[`deploy/torrentd.sample.toml`](../deploy/torrentd.sample.toml). Note that
+`library_dir` may not sit inside a managed root — the daemon refuses that
+config, because nothing in the library claims those files and a delete plan
+would treat them as orphans.
 
 ```bash
 torrentd --config /etc/torrentd/torrentd.toml pool scan      # index + match
@@ -711,6 +886,9 @@ curl -sX POST localhost:8080/api/pool/adopt \
      -d '{"root_id":1,"path":"movies","profile_id":"acct_a"}'
 ```
 
+On the compose stack, prefix this with `docker compose exec torrentd` or send
+it through the proxy — §9 again.
+
 ## 11. Drills worth doing once, before you trust it
 
 On a scratch pool, not your real one.
@@ -727,7 +905,8 @@ On a scratch pool, not your real one.
    not placed. This is derived from live session state, so restarting the
    daemon does not clear it — only a rescan does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
-   /api/pool/plans` and `DELETE /api/torrents/:hash?delete_files=true` both 403.
+   /api/pool/plans` and `DELETE /api/torrents/:infohash?delete_files=true` both
+   403.
 5. **Pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
    profile should pause its torrents, report `vpn_down`, and refuse adds and
    resumes with 409 until you restart the daemon. It must not restart itself.

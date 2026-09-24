@@ -2,6 +2,7 @@
 
 mod auth_routes;
 mod events;
+pub mod forwarded;
 mod healthz;
 mod metrics;
 mod pool;

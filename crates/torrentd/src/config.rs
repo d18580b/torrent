@@ -58,6 +58,34 @@ pub struct Config {
     #[serde(default = "Config::default_http_listen")]
     pub http_listen: SocketAddr,
 
+    /// Peers whose forwarding headers are believed, as IPs or CIDR blocks.
+    ///
+    /// Empty by default, which means no forwarding header is ever read and
+    /// the socket's peer address is the client.
+    ///
+    /// That is not quite the behaviour that existed before this key. The
+    /// login throttle used to be a single shared bucket; it now keys on the
+    /// address resolved here. Behind a proxy that is the proxy's address for
+    /// every request, so it behaves like the shared bucket it was, but a
+    /// directly exposed daemon — a supported posture, since `[auth]` permits
+    /// any bind — now throttles per source IP. That is the better property:
+    /// one attacker's failures no longer land in the same bucket as the
+    /// operator's, and a client the tracked-client map has no room for falls
+    /// back to the shared bucket rather than to nothing.
+    ///
+    /// It is not a guarantee that nobody can lock the operator out. Every
+    /// verification also spends from one daemon-wide budget, so that the
+    /// Argon2 rate does not scale with the addresses a caller holds, and a
+    /// caller with enough distinct source addresses can keep that budget
+    /// spent — which refuses every login, the old behaviour again. See
+    /// `LoginThrottle`.
+    ///
+    /// Set it to the address the reverse proxy connects from, and only that:
+    /// anything in this list can claim to be any client. The proxy must strip
+    /// or overwrite client-supplied forwarding headers before adding its own.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
     /// Permit running with no `[auth]` section.
     ///
     /// Without `[auth]` the daemon authenticates nothing: every route,
@@ -325,6 +353,57 @@ impl Config {
         self.validate_effective_store_dirs()
             .context("[[profile]] validation failed")?;
 
+        // Parsed at startup so a malformed CIDR is a config error rather than
+        // a proxy that silently stops being trusted. Not gated on
+        // `check_auth_posture`: a malformed CIDR is a syntax error in the file,
+        // not a posture judgement, so an operator tool reports it too.
+        crate::http::forwarded::TrustedProxies::parse(&self.trusted_proxies)
+            .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?;
+        // A `/0` prefix is every address there is. Syntax alone accepts it,
+        // and it is the one value that defeats the whole mechanism: with it
+        // set, every caller on earth is a trusted proxy, so every forwarding
+        // header is believed — the throttle keys on a value the caller
+        // chooses and rotates, `Secure` is set or withheld at the caller's
+        // discretion, and the `client_ip` on the failed-login line is
+        // whatever the caller wrote. That is the "a spoofable header is worse
+        // than none" posture this key exists to make impossible, and both
+        // README.md and docs/running.md §6a promise it "fails safe rather
+        // than open".
+        //
+        // Refused rather than warned, for the same reason
+        // `validate_auth_posture` refuses an unauthenticated routable bind: a
+        // silent footgun in a security posture is the daemon's problem. `/0`
+        // is the bright line — any stricter floor would be a guess about
+        // somebody's network, and refusing a legitimate `/8` would be worse
+        // than the startup log that now records the parsed set.
+        //
+        // Decided on the **parsed** prefix, never on the entry's text. A
+        // guard that reads `entry.split_once('/')` and compares the text to
+        // `"0"` closes one spelling of a value rather than the value:
+        // `Cidr::parse` reads the prefix with `u8::from_str`, which accepts a
+        // leading `+` and any number of leading zeros, so `0.0.0.0/00`,
+        // `0.0.0.0/000`, `0.0.0.0/+0`, `::/00` and `::/+0` all parse to the
+        // same `prefix == 0` and all reach the same `prefix_match`, which
+        // returns `true` before comparing a byte. The number is the value;
+        // the text is one of its spellings.
+        for entry in &self.trusted_proxies {
+            // Re-parsed rather than re-read. `TrustedProxies::parse` above
+            // has already established that every entry parses, so this cannot
+            // fail, and taking the prefix from the parser is the whole point.
+            let prefix = crate::http::forwarded::Cidr::parse(entry)
+                .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?
+                .prefix();
+            if prefix == 0 {
+                anyhow::bail!(
+                    "trusted_proxies: {entry:?} trusts every peer there is. Anything listed \
+                     here can claim to be any client, so a /0 prefix makes every forwarding \
+                     header client-controlled: the login throttle keys on a value the caller \
+                     picks, the session cookie's Secure attribute is the caller's choice, and \
+                     the client_ip on the failed-login line is whatever the caller wrote. \
+                     List the address your reverse proxy connects from, and only that."
+                );
+            }
+        }
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -508,6 +587,7 @@ impl Config {
             profile: new_profile,
             auth: new_auth,
             pool: new_pool,
+            trusted_proxies: new_trusted_proxies,
         } = new;
 
         let mut d = ConfigDiff::default();
@@ -612,6 +692,16 @@ impl Config {
         }
         if old.http_listen != *new_http_listen {
             d.non_reloadable_changes.push("http_listen");
+        }
+        // Same again for the trust set: `TrustedProxies` is parsed once into
+        // `AppState` inside `DaemonHandle::boot` and `reload::run` rebuilds no
+        // `AppState`, so a changed value cannot follow a running daemon.
+        // Without this line an operator who decommissions a proxy, deletes its
+        // address and sends SIGHUP is told `config unchanged` while the daemon
+        // goes on believing forwarding headers from the removed address for
+        // the life of the process.
+        if old.trusted_proxies != *new_trusted_proxies {
+            d.non_reloadable_changes.push("trusted_proxies");
         }
         // These three arrived with the posture check, and five more came with
         // it: eight non-reloadable keys `diff` did not look at, not three.
@@ -1444,6 +1534,7 @@ impl Config {
                 import_legacy_registry: false,
                 allow_mutations,
             }),
+            trusted_proxies: vec![],
         }
     }
 }
@@ -1487,6 +1578,76 @@ listen_interfaces = "0.0.0.0:6881"
     /// A valid config with `extra` appended to the top-level keys.
     fn with_top_level(extra: &str) -> String {
         format!("{TOP_LEVEL}{extra}\n{ONE_HOST_PROFILE}")
+    }
+
+    #[test]
+    fn a_trusted_proxies_entry_that_trusts_everyone_is_refused() {
+        // The property: `trusted_proxies` is validated for *posture*, not
+        // only for syntax. A `/0` prefix is every address there is, so it
+        // makes every caller a trusted proxy and every forwarding header
+        // client-controlled — the throttle key, the cookie's `Secure`
+        // attribute and the `client_ip` on the failed-login line all become
+        // the caller's to choose. README.md and docs/running.md §6a both
+        // promise this key "fails safe rather than open"; without this
+        // refusal the one value that defeats it is the one that validates.
+        //
+        // Every spelling of that value, not the two canonical ones. The
+        // prefix is parsed with `u8::from_str`, which takes a leading `+` and
+        // any number of leading zeros, so `/00`, `/000` and `/+0` are the
+        // same prefix reaching the same `prefix_match` — and a refusal
+        // written against the entry's *text* accepts all of them while
+        // refusing `/0`. That is not a hypothetical spelling: a daemon
+        // booted with `["0.0.0.0/00"]` believes a forged `X-Forwarded-For`
+        // from every caller on earth.
+        let dir = tempdir().unwrap();
+
+        for wide in [
+            "0.0.0.0/0",
+            "0.0.0.0/00",
+            "0.0.0.0/000",
+            "0.0.0.0/+0",
+            "::/0",
+            "::/00",
+            "::/000",
+            "::/+0",
+        ] {
+            let body = with_top_level(&format!("trusted_proxies = [\"{wide}\"]"));
+            // `parse` alone, so the refusal is attributed to `validate`
+            // rather than to the file being unreadable.
+            let cfg = Config::parse(&write_cfg(dir.path(), &body)).unwrap();
+            let err = cfg
+                .validate()
+                .expect_err("a /0 prefix trusts every peer and must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(wide),
+                "the refusal must name the offending entry; got {msg}",
+            );
+
+            // And it is not a posture judgement, so the operator subcommands
+            // that skip the posture check — `--check-config` among them — get
+            // it too. That is the command run before a restart.
+            assert!(
+                cfg.validate_without_auth_posture().is_err(),
+                "{wide} must be refused for operator tools as well",
+            );
+
+            // Which means loading the file fails outright.
+            assert!(
+                Config::load(&write_cfg(dir.path(), &body)).is_err(),
+                "{wide} must not produce a daemon that starts",
+            );
+        }
+
+        // The refusal is about breadth, not about prefixes. A real proxy
+        // network still validates, and so does the empty default.
+        for ok in ["\"172.28.0.2\"", "\"10.0.0.0/8\"", "\"2001:db8::/32\""] {
+            let body = with_top_level(&format!("trusted_proxies = [{ok}]"));
+            Config::load(&write_cfg(dir.path(), &body))
+                .unwrap_or_else(|e| panic!("{ok} is a legitimate trust set: {e:#}"));
+        }
+        Config::load(&write_cfg(dir.path(), &single_session()))
+            .expect("the empty default is the safe one and must still load");
     }
 
     #[test]
@@ -1544,6 +1705,23 @@ listen_interfaces = "0.0.0.0:6881"
         assert!(!d.is_empty());
         assert!(
             d.non_reloadable_changes.contains(&"http_listen"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+
+        // And the trust set, settled once in `DaemonHandle::boot`. An
+        // operator who decommissions a proxy and deletes its address here is
+        // otherwise told the config did not change, while the daemon keeps
+        // believing that address's forwarding headers until it restarts.
+        let mut proxied = a.clone();
+        proxied.trusted_proxies = vec!["172.28.0.2".to_string()];
+        let d = Config::diff(&a, &proxied);
+        assert!(
+            !d.is_empty(),
+            "a trusted_proxies-only edit must not look like an unchanged config",
+        );
+        assert!(
+            d.non_reloadable_changes.contains(&"trusted_proxies"),
             "got {:?}",
             d.non_reloadable_changes,
         );

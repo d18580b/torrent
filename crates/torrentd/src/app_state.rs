@@ -59,6 +59,8 @@ pub struct AppState {
     /// Asks the reload pump to re-read the config file. `None` only in tests,
     /// which do not run one.
     pub reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Peers whose forwarding headers are believed. Empty means none are.
+    pub trusted_proxies: crate::http::forwarded::TrustedProxies,
     /// Info-hashes the assignment registry held after the startup scans that
     /// no scan loaded into a session: the only entries known to be held by
     /// no session at all.
@@ -185,6 +187,7 @@ pub(crate) fn build_test_state_with_sessions(
         default_save_path: std::env::temp_dir(),
         torrent_dir: std::env::temp_dir(),
         reload_tx: None,
+        trusted_proxies: Default::default(),
         unloaded_at_boot: Arc::new(Mutex::new(HashSet::new())),
     }
 }

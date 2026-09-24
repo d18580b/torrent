@@ -28,11 +28,11 @@ services:
     ports:
       - "6881:6881/tcp"
       - "6881:6881/udp"
-      # The API is published to the host's loopback only. Note that the
-      # daemon must bind 0.0.0.0:8080 *inside* the container for this mapping
-      # to reach it — a config that binds 127.0.0.1 there is unreachable, and
-      # this is the one place the sample config cannot be copied verbatim.
-      # A non-loopback bind requires [auth]; the daemon refuses otherwise.
+      # The API is NOT published to the host. `proxy` reaches it over the
+      # compose network, which is the only thing that should. Inside the
+      # container the daemon binds 0.0.0.0:8080 — the one place the sample
+      # config cannot be copied verbatim — and a non-loopback bind requires
+      # [auth], which is exactly the posture this stack is in.
       #
       # So torrentd.toml must set the key explicitly:
       #
@@ -41,12 +41,13 @@ services:
       # Say it even though loopback is the default, because here the default
       # fails quietly. `http_listen` has a serde default, so omitting it is no
       # longer a parse error — the daemon starts, binds 127.0.0.1 *inside* the
-      # namespace, and this published mapping reaches nothing. The
-      # Containerfile's HEALTHCHECK curls localhost:8080 from inside the same
-      # namespace, so it succeeds and the container reports healthy while the
-      # API is unreachable from the host. Re-aiming the health check does not
-      # recover the signal: it passes either way.
-      - "127.0.0.1:8080:8080"
+      # namespace, and `proxy` reaches nothing. The Containerfile's
+      # HEALTHCHECK curls localhost:8080 from inside the same namespace, so it
+      # succeeds and the container reports healthy while the API is
+      # unreachable from `proxy`. Re-aiming the health check does not recover
+      # the signal: it passes either way.
+    networks:
+      - front
     volumes:
       - ./torrentd.toml:/etc/torrentd/torrentd.toml:ro
       - torrentd-resume:/var/lib/torrentd/resume
@@ -56,6 +57,66 @@ services:
       # Operator places the actual data here; torrentd reads only.
       - /data/torrents:/data/torrents:ro
 
+  # torrentd does not terminate TLS, by design: an HTTP server's TLS
+  # configuration is a thing to get wrong, and there is a mature one right
+  # here. Caddy terminates it, forwards the API, and passes conditional
+  # responses through, so a client that already holds an asset revalidates it
+  # and gets a 304. The stock caddy:2-alpine image has no HTTP cache module —
+  # that needs the third-party cache-handler plugin, which this stack does not
+  # build in — so every request still reaches torrentd.
+  #
+  # The forwarding headers below are the contract, and `trusted_proxies` in
+  # torrentd.toml has to name the address this service connects from. Compose
+  # assigns that address from the bridge subnet and changes it across
+  # down/up, and `trusted_proxies` takes IPs and CIDRs rather than service
+  # names, so the address is pinned here instead: 172.28.0.2, which is what
+  # the sample config lists as a single /32. Widening it to the whole subnet
+  # would make every sibling container on the host a trusted proxy, and a
+  # trusted proxy can claim to be any client.
+  #
+  # Get it wrong and the daemon ignores the headers, which is the safe
+  # direction rather than a broken one: it falls back to the socket peer,
+  # which on this network is this proxy, so the login throttle behaves as one
+  # shared bucket and the session cookie loses its `Secure` attribute.
+  proxy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - torrentd
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      front:
+        ipv4_address: 172.28.0.2
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+# An explicit subnet, because the one value `trusted_proxies` can hold is a
+# fixed address and compose will not hand out a stable one otherwise. Change
+# the subnet if 172.28.0.0/24 collides with something on your host, and change
+# `proxy`'s address and torrentd.toml's `trusted_proxies` with it.
+#
+# `ip_range` is what keeps the pin usable. Dynamic allocation hands out the
+# lowest free address in the pool, and `torrentd` is unpinned on this network
+# and created *first* — `proxy` declares `depends_on: [torrentd]` — so without
+# a confined range it takes 172.28.0.2 before `proxy` asks for it and the
+# stack fails to come up with that address already in use. So the bottom half
+# is reserved and nothing dynamic lands in it: .1 is the gateway, .2 is
+# `proxy`, .3-.127 are spare for anything else this file pins by hand, and
+# every unpinned service is allocated from 172.28.0.128/25.
+networks:
+  front:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+          ip_range: 172.28.0.128/25
+
 volumes:
   torrentd-resume:
   torrentd-torrents:
+  caddy-data:
+  caddy-config:
