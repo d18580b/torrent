@@ -1261,6 +1261,1011 @@ fn a_v2_index_migrates_its_slot_column_to_profile() {
     assert_eq!(store.torrent_count().unwrap(), 2);
 }
 
+/// The columns of `torrent`, as the file on disk reports them.
+fn torrent_columns(db: &Path) -> Vec<String> {
+    let c = rusqlite::Connection::open(db).unwrap();
+    let mut st = c
+        .prepare("SELECT name FROM pragma_table_info('torrent')")
+        .unwrap();
+    let out = st
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    out
+}
+
+fn user_version(db: &Path) -> i64 {
+    rusqlite::Connection::open(db)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn a_v3_step_that_fails_leaves_the_version_and_the_schema_agreeing() {
+    // `execute_batch` without an explicit transaction gives one implicit
+    // transaction *per statement*, and `SCHEMA_V3`'s first statement is
+    // irreversible. Let the last statement fail — here because an index of
+    // that name already exists, which stands in for the `SQLITE_FULL` /
+    // `SQLITE_IOERR` / process-death cases — and without one transaction
+    // around the whole step the `RENAME COLUMN` has already committed while
+    // `user_version` is still 2. Every later open then re-runs v3, fails on
+    // its own completed work with `no such column: "slot"`, and wedges a
+    // daemon that opens this file with `?` under `Restart=on-failure`.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch("CREATE INDEX torrent_by_profile ON torrent(slot)")
+            .unwrap();
+    }
+
+    let err = PoolStore::open(&db).expect_err("the v3 step cannot complete here");
+    assert!(
+        format!("{err}").contains("torrent_by_profile"),
+        "the failure names what went wrong, got: {err}",
+    );
+
+    // The whole point: the file is exactly as it was. `user_version` says 2
+    // and the schema is a v2 schema, so the two agree and a build that can
+    // migrate it still can.
+    assert_eq!(user_version(&db), 2, "the version must not have moved");
+    let cols = torrent_columns(&db);
+    assert!(
+        cols.iter().any(|c| c == "slot"),
+        "the rename must have rolled back with the rest of the step, got {cols:?}",
+    );
+    assert!(
+        !cols.iter().any(|c| c == "profile"),
+        "a half-applied v3 is the state this transaction exists to prevent, got {cols:?}",
+    );
+}
+
+/// The indexes on `torrent`, as the file on disk reports them.
+fn torrent_indexes(db: &Path) -> Vec<String> {
+    let c = rusqlite::Connection::open(db).unwrap();
+    let mut st = c
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'torrent'")
+        .unwrap();
+    let out = st
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    out
+}
+
+/// Build a **complete** v3 schema under v2's version: the file `b28a778` left
+/// behind.
+///
+/// That build folded the slot→profile rename into `SCHEMA_V1` at
+/// `SCHEMA_VERSION = 2`, so the file it writes reports 2 and already carries
+/// `profile`, with both of v3's indexes in place. A build that applied
+/// `SCHEMA_V3` and died before the `PRAGMA` leaves the same shape;
+/// `build_half_applied_v3_index` builds the shapes where an index statement
+/// was lost as well.
+fn build_b28a778_index(db: &std::path::Path) {
+    build_v1_index(db);
+    apply_v2_journal(db);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.execute_batch(
+        "ALTER TABLE torrent RENAME COLUMN slot TO profile;
+         DROP INDEX torrent_by_slot;
+         CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
+         INSERT INTO plan(id, kind, created_at, status, spec)
+             VALUES (1, 'delete', 0, 'applied', '{}');
+         INSERT INTO plan_step(plan_id, seq, op, src, status)
+             VALUES (1, 0, 'unlink', '/pool/a.bin', 'done');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_b28a778_index_opens_and_keeps_its_journal() {
+    // The file an earlier build of this branch produced: `user_version = 2`
+    // over a schema that already *is* v3. No version-keyed step can reach it —
+    // there is no `slot` column to rename — so every open re-ran v3 and failed
+    // with `no such column: "slot"`, permanently, on a database `startup.rs`
+    // opens with `?` under `Restart=on-failure`.
+    //
+    // The copy-aside did not answer it: `.pre-v3.bak` is a `VACUUM INTO` of
+    // the already-broken file, so the rollback both operator-facing texts
+    // described restored the same unopenable database. The version is stamped
+    // to match the schema instead, which is a `PRAGMA` and no DDL.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_b28a778_index(&db);
+
+    let store =
+        PoolStore::open(&db).expect("v3's columns under v2's version are recognised, not stepped");
+    drop(store);
+
+    assert_eq!(
+        user_version(&db),
+        3,
+        "the version must now agree with the schema the file already had",
+    );
+    let cols = torrent_columns(&db);
+    assert!(
+        cols.iter().any(|c| c == "profile") && !cols.iter().any(|c| c == "slot"),
+        "and no DDL ran, so the columns are untouched, got {cols:?}",
+    );
+
+    // The whole point of not telling the operator to delete the file: the
+    // mutation journal this crate documents as not reconstructible by
+    // rescanning is still there, in the live database rather than in a backup.
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let steps: i64 = c
+        .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(steps, 1, "the mutation journal survived the repair");
+    let torrents: i64 = c
+        .query_row("SELECT count(*) FROM torrent", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(torrents, 1);
+    drop(c);
+
+    // Nothing destructive happened, so nothing was copied aside. A stray
+    // `.pre-v3.bak` here would read as a failed migration.
+    assert!(
+        !PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+        "a PRAGMA is not a destructive step and needs no copy",
+    );
+
+    // And it opens again, which is what "recoverable" has to mean.
+    PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+}
+
+/// Build a **half-applied** v3 index at `db`: `SCHEMA_V3` replayed statement
+/// by statement and cut off after `statements` of them, with `user_version`
+/// left at 2.
+///
+/// That is what a build applying `SCHEMA_V3` through `execute_batch` with no
+/// explicit transaction around it leaves behind, because that gives one
+/// implicit transaction *per statement*: the rename commits, and a later
+/// statement is lost to `SQLITE_FULL`, `SQLITE_IOERR` or the process dying.
+/// Two cut points matter, and both report `user_version = 2` over a `torrent`
+/// table that already has `profile` and no `slot`:
+///
+/// * `1` — the rename alone, so `torrent_by_slot` survives, mislabelled over
+///   the new column, which is the state `SCHEMA_V3`'s own comment says it
+///   drops the index to avoid.
+/// * `2` — the rename and the drop, so there is **no index on `profile` at
+///   all**, on an index designed to carry one row per file of a
+///   multi-terabyte library.
+fn build_half_applied_v3_index(db: &Path, statements: usize) {
+    build_v1_index(db);
+    apply_v2_journal(db);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.execute_batch(
+        "INSERT INTO plan(id, kind, created_at, status, spec)
+             VALUES (1, 'delete', 0, 'applied', '{}');
+         INSERT INTO plan_step(plan_id, seq, op, src, status)
+             VALUES (1, 0, 'unlink', '/pool/a.bin', 'done');",
+    )
+    .unwrap();
+    // One `execute` per statement, each its own implicit transaction, in
+    // `SCHEMA_V3`'s order.
+    let v3 = [
+        "ALTER TABLE torrent RENAME COLUMN slot TO profile",
+        "DROP INDEX torrent_by_slot",
+        "CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL",
+    ];
+    for s in v3.iter().take(statements) {
+        c.execute(s, []).unwrap();
+    }
+    // The version never moved: the `PRAGMA` is the last thing the step does.
+    assert_eq!(
+        c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+            .unwrap(),
+        2,
+    );
+}
+
+#[test]
+fn a_half_applied_v3_index_gains_the_index_the_lost_statement_would_have_made() {
+    // C52. The recognition matches on columns, and the columns of a file whose
+    // `CREATE INDEX` was lost are indistinguishable from those of a file that
+    // completed: `profile`, no `slot`, `user_version = 2`. Stamping the
+    // version over it is permanent — `migrate` returns at
+    // `found == SCHEMA_VERSION` on every later open — so the index that
+    // carries every per-profile lookup would never be created by anything,
+    // and the operator was told the version was stamped "to match the schema
+    // it already has".
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_half_applied_v3_index(&db, 2);
+    assert!(
+        torrent_indexes(&db)
+            .iter()
+            .all(|n| n != "torrent_by_profile"),
+        "the fixture is the file with the index statement lost",
+    );
+
+    let store = PoolStore::open(&db).expect("a half-applied v3 opens");
+    drop(store);
+
+    assert_eq!(user_version(&db), 3, "the version agrees with the schema");
+    let idx = torrent_indexes(&db);
+    assert!(
+        idx.iter().any(|n| n == "torrent_by_profile"),
+        "the file must end with v3's index on profile, got {idx:?}",
+    );
+
+    // What the index is for, stated as the plan the query takes rather than as
+    // the presence of a name.
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let plan: String = c
+        .query_row(
+            "EXPLAIN QUERY PLAN SELECT infohash FROM torrent WHERE profile = 'acct_a'",
+            [],
+            |r| r.get(3),
+        )
+        .unwrap();
+    assert!(
+        plan.contains("torrent_by_profile"),
+        "the lookup must use the index rather than scan, got {plan:?}",
+    );
+
+    // Nothing moved: the rename had already run, so this is two index
+    // statements and a `PRAGMA`.
+    let torrents: i64 = c
+        .query_row("SELECT count(*) FROM torrent", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(torrents, 1);
+    let steps: i64 = c
+        .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(steps, 1, "the mutation journal survived");
+    drop(c);
+
+    assert!(
+        !PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+        "an index is derivable from its table, so nothing was copied aside",
+    );
+    PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+}
+
+#[test]
+fn a_half_applied_v3_index_loses_the_index_name_the_rename_left_mislabelled() {
+    // C52, the other cut point. Here the `DROP INDEX` was lost, so the file
+    // carries `torrent_by_slot ON torrent(profile)` — SQLite rewrote the
+    // index definition to follow the rename. `SCHEMA_V3`'s comment says that
+    // index is dropped and recreated "rather than left mislabelled"; stamping
+    // the version leaves it mislabelled forever.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_half_applied_v3_index(&db, 1);
+    assert!(
+        torrent_indexes(&db).iter().any(|n| n == "torrent_by_slot"),
+        "the fixture is the file with the drop lost",
+    );
+
+    PoolStore::open(&db).expect("a half-applied v3 opens");
+
+    assert_eq!(user_version(&db), 3);
+    let idx = torrent_indexes(&db);
+    assert!(
+        idx.iter().any(|n| n == "torrent_by_profile"),
+        "v3's index must be present under its own name, got {idx:?}",
+    );
+    assert!(
+        !idx.iter().any(|n| n == "torrent_by_slot"),
+        "and the name the rename left over the new column must be gone, got {idx:?}",
+    );
+}
+
+/// Build a file **stamped to `user_version = 3`** over a schema that is not
+/// yet v3's: `SCHEMA_V3` replayed statement by statement, cut off after
+/// `statements` of them, and then the version written anyway.
+///
+/// This is what a build in the `e391b72 … 1195546^` window left behind. Its
+/// recognition arm stamped the version and ran no index DDL, so whichever
+/// half-applied file it met came out reporting 3 with the index work still
+/// missing — and the version being right is precisely what stopped anything
+/// looking again.
+fn build_stamped_v3_index(db: &Path, statements: usize) {
+    build_half_applied_v3_index(db, statements);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.pragma_update(None, "user_version", 3i64).unwrap();
+}
+
+#[test]
+fn a_stamped_v3_index_with_no_index_on_profile_is_still_repaired() {
+    // F43. `migrate` returned at `found == SCHEMA_VERSION` before it looked at
+    // the schema, so a file this change's own published head stamped to 3
+    // without ever creating `torrent_by_profile` opened silently, exit 0,
+    // unchanged, for ever — while `docs/running.md` promises the file ends
+    // with that index and `deploy/torrentd.sample.toml` says the indexes are
+    // "put right in the same transaction".
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_stamped_v3_index(&db, 2);
+    assert_eq!(
+        user_version(&db),
+        3,
+        "the fixture reports the current version"
+    );
+    assert!(
+        torrent_indexes(&db)
+            .iter()
+            .all(|n| n != "torrent_by_profile"),
+        "and does not carry the index that version claims",
+    );
+
+    PoolStore::open(&db).expect("a stamped v3 opens");
+
+    assert_eq!(user_version(&db), 3);
+    let idx = torrent_indexes(&db);
+    assert!(
+        idx.iter().any(|n| n == "torrent_by_profile"),
+        "the file must end with v3's index on profile, got {idx:?}",
+    );
+
+    // Nothing else moved: this is two index statements on a file whose rename
+    // had already run.
+    let c = rusqlite::Connection::open(&db).unwrap();
+    let steps: i64 = c
+        .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(steps, 1, "the mutation journal survived the repair");
+    drop(c);
+    assert!(
+        !PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+        "an index is derivable from its table, so nothing was copied aside",
+    );
+    PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+}
+
+#[test]
+fn a_stamped_v3_index_still_carrying_torrent_by_slot_is_repaired() {
+    // F43, the other reachable cut point: the `DROP INDEX` was lost before the
+    // version was stamped, so the file reports 3 while `torrent_by_slot` sits
+    // over the renamed `profile` column — the mislabelling `SCHEMA_V3`'s own
+    // comment says it drops the index to avoid, and the exact state
+    // `docs/running.md` says cannot survive an open on this build.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_stamped_v3_index(&db, 1);
+    assert_eq!(user_version(&db), 3);
+    assert!(
+        torrent_indexes(&db).iter().any(|n| n == "torrent_by_slot"),
+        "the fixture is the file with the drop lost",
+    );
+
+    PoolStore::open(&db).expect("a stamped v3 opens");
+
+    assert_eq!(user_version(&db), 3);
+    let idx = torrent_indexes(&db);
+    assert!(
+        idx.iter().any(|n| n == "torrent_by_profile"),
+        "v3's index must be present under its own name, got {idx:?}",
+    );
+    assert!(
+        !idx.iter().any(|n| n == "torrent_by_slot"),
+        "and the name the rename left over the new column must be gone, got {idx:?}",
+    );
+}
+
+/// A **complete** v3 schema reporting `version`: what a build predating the
+/// one-transaction migration left when it died between the last schema
+/// statement and the `PRAGMA` that records the version.
+///
+/// Those builds ran `SCHEMA_V1`, `SCHEMA_V2` and `SCHEMA_V3` as separate
+/// `execute_batch` calls with `pragma_update` after them, so the window
+/// between the last DDL commit and the version write is real, and anything
+/// that ends the process inside it leaves this.
+fn build_complete_v3_at_version(db: &Path, version: i64) {
+    build_b28a778_index(db);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.pragma_update(None, "user_version", version).unwrap();
+}
+
+#[test]
+fn a_complete_v3_schema_left_at_version_0_or_1_is_stamped_rather_than_wedged() {
+    // F43 reopened. The recognition arm was guarded on `found >= 2`, on the
+    // stated reason that below that "there is no `torrent` table to index
+    // yet" — which is exactly wrong for the files the arm exists for. A file
+    // at 0 or 1 whose schema is already complete v3 answers both of the arm's
+    // predicates, so it is a *strictly easier* case than the half-applied
+    // shapes it already repairs.
+    //
+    // What happened instead: the version-keyed steps ran from 0 or 1, tried
+    // to create tables that were already there, and the whole migration rolled
+    // back — `exit 1` on every start, permanently, under `Restart=on-failure`.
+    // The only remedy in the message that works is to move the index aside and
+    // rescan, which destroys the `plan`/`plan_step` journal `from_conn`
+    // documents as not reconstructible.
+    for version in [0i64, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        build_complete_v3_at_version(&db, version);
+        assert_eq!(user_version(&db), version, "the fixture reports {version}");
+        let cols = torrent_columns(&db);
+        assert!(
+            cols.iter().any(|c| c == "profile") && !cols.iter().any(|c| c == "slot"),
+            "and its schema is already v3's, got {cols:?}",
+        );
+
+        let store = PoolStore::open(&db).expect("a complete v3 schema must open at any version");
+        drop(store);
+
+        assert_eq!(user_version(&db), 3, "stamped to the version it already is");
+        let idx = torrent_indexes(&db);
+        assert!(
+            idx.iter().any(|n| n == "torrent_by_profile")
+                && !idx.iter().any(|n| n == "torrent_by_slot"),
+            "with v3's indexes as they already were, got {idx:?}",
+        );
+        // The thing worth protecting, and the reason the wedge mattered.
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let steps: i64 = c
+            .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            steps, 1,
+            "the mutation journal survived from version {version}"
+        );
+        drop(c);
+        assert!(
+            !PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+            "and nothing irreversible ran, so nothing was copied aside",
+        );
+        PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+    }
+}
+
+#[test]
+fn a_version_0_index_that_is_not_already_v3_still_takes_the_stepped_path() {
+    // The other side of lowering the guard. Widening it to 0 must not swallow
+    // a file the recognition cannot honestly repair: a build that created v1's
+    // tables and died before the version write leaves `slot`, not `profile`,
+    // so the column test refuses it and it goes down the stepped path with its
+    // message, exactly as before.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.pragma_update(None, "user_version", 0i64).unwrap();
+    }
+
+    let err = PoolStore::open(&db).expect_err("v1's tables still cannot be created twice");
+    assert!(
+        format!("{err}").contains("schema version 0 to 3"),
+        "got: {err}",
+    );
+    assert_eq!(user_version(&db), 0, "and nothing was stamped over it");
+}
+
+/// A file carrying **both** v3 index names, reporting `version`.
+///
+/// `torrent_by_slot` over the renamed `profile` column is what SQLite leaves
+/// when `SCHEMA_V3`'s `DROP INDEX` is lost, and `torrent_by_profile` beside it
+/// is what a later partial repair adds. Neither operator-facing text allows
+/// the pair to survive an open.
+fn build_both_indexes_at_version(db: &Path, version: i64) {
+    build_b28a778_index(db);
+    let c = rusqlite::Connection::open(db).unwrap();
+    c.execute_batch("CREATE INDEX torrent_by_slot ON torrent(profile) WHERE profile IS NOT NULL;")
+        .unwrap();
+    c.pragma_update(None, "user_version", version).unwrap();
+}
+
+#[test]
+fn a_file_carrying_both_v3_indexes_loses_torrent_by_slot_at_any_version() {
+    // C67. The repair was keyed on `torrent_by_profile` being *missing*, so a
+    // file with both names was not a case it recognised. At version 2 it was
+    // stamped to 3 with `torrent_by_slot` still sitting over the renamed
+    // column; at version 3 the ordinary-open return fired first and the file
+    // came out untouched, with no log line at all — both reproduced against
+    // the binary.
+    //
+    // `docs/running.md` makes the promise without a qualifier: "after this
+    // open the file has `torrent_by_profile` and nothing called
+    // `torrent_by_slot`". The index is mislabelled either way, and the drop
+    // statement is already written and idempotent.
+    for version in [2i64, 3] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        build_both_indexes_at_version(&db, version);
+        let before = torrent_indexes(&db);
+        assert!(
+            before.iter().any(|n| n == "torrent_by_profile")
+                && before.iter().any(|n| n == "torrent_by_slot"),
+            "the fixture carries both names at {version}, got {before:?}",
+        );
+
+        PoolStore::open(&db).expect("a file with both indexes must open");
+
+        assert_eq!(user_version(&db), 3);
+        let idx = torrent_indexes(&db);
+        assert!(
+            idx.iter().any(|n| n == "torrent_by_profile"),
+            "v3's index must survive at {version}, got {idx:?}",
+        );
+        assert!(
+            !idx.iter().any(|n| n == "torrent_by_slot"),
+            "and the name the rename left over the new column must be gone at {version}, \
+             got {idx:?}",
+        );
+        let c = rusqlite::Connection::open(&db).unwrap();
+        let steps: i64 = c
+            .query_row("SELECT count(*) FROM plan_step", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(steps, 1, "the mutation journal survived at {version}");
+        drop(c);
+        PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+        assert_eq!(
+            torrent_indexes(&db),
+            idx,
+            "and is idempotent — nothing is rebuilt at {version}",
+        );
+    }
+}
+
+#[test]
+fn an_ordinary_v3_index_is_opened_without_touching_it() {
+    // The other half of widening the arm past `found == 2`: a healthy v3 file
+    // reaches the same guard on every open and must come out of it having had
+    // no DDL and no transaction run against it.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+    PoolStore::open(&db).expect("a genuine v2 index migrates forward");
+    let before = torrent_indexes(&db);
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::fs::remove_file(&backup).expect("the v2 migration left its copy aside");
+
+    PoolStore::open(&db).expect("a second open is an ordinary v3 open");
+
+    assert_eq!(user_version(&db), 3);
+    assert_eq!(torrent_indexes(&db), before, "nothing may be rebuilt here");
+    assert!(
+        !backup.exists(),
+        "and an ordinary open is not a migration, so it copies nothing aside",
+    );
+}
+
+#[test]
+fn a_genuine_v2_index_is_still_migrated_by_the_version_keyed_step() {
+    // The recognition matches v3's columns under v2's version and must not
+    // swallow the ordinary upgrade. A real v2 file has `slot` and no
+    // `profile`, so it cannot match, and it takes the DDL path with its
+    // backup.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    PoolStore::open(&db).expect("a genuine v2 index migrates forward");
+
+    assert_eq!(user_version(&db), 3);
+    let cols = torrent_columns(&db);
+    assert!(
+        cols.iter().any(|c| c == "profile") && !cols.iter().any(|c| c == "slot"),
+        "the rename really ran, got {cols:?}",
+    );
+    assert!(
+        PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists(),
+        "the destructive path still copies the database aside first",
+    );
+}
+
+/// Drop the write bit on `dir`, returning the mode to restore afterwards.
+///
+/// Restoring matters: `tempfile::TempDir`'s cleanup cannot remove a file from
+/// a directory it may not write, so leaving the mode set leaks the directory
+/// into the next run.
+fn make_readonly(dir: &Path) -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    let original = std::fs::metadata(dir).unwrap().permissions();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+    original
+}
+
+#[test]
+fn a_backup_that_cannot_be_written_names_the_backup_and_the_reason() {
+    // C51. `VACUUM INTO` writes a full second copy of an index designed to
+    // carry one row per file of a multi-terabyte library, so a state volume
+    // with less free space than the database fails here — and this step is one
+    // the operator never asked for. Propagating the raw SQLite code aborted an
+    // otherwise-valid migration with no mention of a backup, a path, or why
+    // the migration wanted one, on a database `startup.rs` opens with `?`.
+    //
+    // The target is made uncreatable by making the directory holding the index
+    // read-only, which is as close to a full volume as a test gets: the
+    // database itself still opens read-write, and only the new file beside it
+    // cannot be created. That needs the `-wal` and `-shm` siblings to survive
+    // the setup connection's close — SQLite deletes them on close and cannot
+    // delete them from a directory it may not write, which is why the mode is
+    // dropped before the drop below.
+    //
+    // Nothing already at the backup path would do instead. A real copy there
+    // is kept and no write is attempted, so the failure is never reached; a
+    // dangling symlink or a stray file is refused before the write, with a
+    // different error naming a different problem.
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let db = state.join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let setup = rusqlite::Connection::open(&db).unwrap();
+    setup
+        .pragma_update(None, "journal_mode", "WAL")
+        .expect("wal");
+    setup
+        .execute_batch("BEGIN IMMEDIATE; CREATE TABLE _wal_touch(x); DROP TABLE _wal_touch; COMMIT")
+        .unwrap();
+    let original = make_readonly(&state);
+    drop(setup);
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    let outcome = PoolStore::open(&db);
+    std::fs::set_permissions(&state, original).unwrap();
+
+    let err = outcome.expect_err("the copy cannot be written here");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&backup.display().to_string()),
+        "the failure names the backup it could not write, got: {msg}",
+    );
+    assert!(
+        msg.contains("copied aside") && msg.contains("free space"),
+        "and says what the step is and what it needs, got: {msg}",
+    );
+
+    // The migration aborted before touching anything, which is what makes
+    // "free some space and start again" a true instruction.
+    assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
+    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+}
+
+#[test]
+fn a_dangling_backup_symlink_is_neither_written_through_nor_treated_as_a_rollback() {
+    // D30 and the judgement above it. The existence check followed symlinks,
+    // so a `.pre-v3.bak` that is a symlink to nothing read as *absent* — and
+    // `VACUUM INTO` then wrote the index's only rollback copy through it, into
+    // whatever path it named, silently and outside the state directory. The
+    // check asks whether something is at that path, so it must not resolve
+    // what is there.
+    //
+    // Seeing it is not enough on its own. Keeping it and carrying on ran the
+    // irreversible v3 rename with no rollback copy at all, while the runbook
+    // says restoring that file is how you go back. It is not a copy of
+    // anything, so the migration stops and names it.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let elsewhere = dir.path().join("elsewhere.db");
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
+    assert!(!backup.exists(), "the fixture is a symlink to nothing");
+
+    let err = PoolStore::open(&db).expect_err("a dangling link is not a rollback copy");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&backup.display().to_string()),
+        "the refusal names what is in the way, got: {msg}",
+    );
+    assert!(
+        msg.contains("not a rollback copy"),
+        "and says why it is not the copy it looks like, got: {msg}",
+    );
+
+    assert!(
+        !elsewhere.exists(),
+        "nothing may be written through the link, and something was",
+    );
+    assert!(
+        std::fs::symlink_metadata(&backup)
+            .expect("the link itself is still there")
+            .file_type()
+            .is_symlink(),
+        "and what the operator left at that path is untouched",
+    );
+    // Stopped before the one-way step, which is what makes "move it and start
+    // again" a true instruction.
+    assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
+    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+}
+
+#[test]
+fn a_real_backup_already_at_the_path_is_kept_and_the_migration_proceeds() {
+    // The other side of the same check, and the behaviour the refusal must not
+    // have swallowed: a `.pre-v3.bak` that really is a copy of an index is
+    // from an earlier attempt at this same migration, which rolled back, so it
+    // describes the same state a new copy would. It is kept byte for byte —
+    // the older file is the one the operator has had time to notice — and no
+    // second copy is taken.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    // A real `std::fs::copy` of `db`, not an independently built index. The
+    // fixture *is* the property: "kept" is the right answer for a copy of this
+    // database, and a separately built file that merely has the same shape
+    // pinned the weaker predicate the copy-aside used to apply.
+    std::fs::copy(&db, &backup).unwrap();
+    let before = std::fs::read(&backup).unwrap();
+
+    PoolStore::open(&db).expect("the migration runs; the existing copy is kept");
+
+    assert_eq!(user_version(&db), 3, "the migration really ran");
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        before,
+        "the operator's existing copy must not have been overwritten",
+    );
+    assert_eq!(
+        user_version(&backup),
+        2,
+        "and it is still the pre-migration database, which is what makes it a rollback",
+    );
+}
+
+#[test]
+fn a_non_database_at_the_backup_path_stops_the_migration() {
+    // Not only symlinks. Anything an operator left at that path — a note, a
+    // truncated download, a directory — is in the way of the copy and is not a
+    // rollback, and the rename it protects cannot be undone.
+    //
+    // All three, because the comment used to claim three and the fixture was
+    // only the note. The truncated download is the one that mattered: a
+    // zero-byte file is a *valid empty database* to SQLite, so it opened, it
+    // answered `PRAGMA schema_version`, it was kept, the one-way rename ran —
+    // and the "rollback copy" left beside the migrated index had no `torrent`
+    // table at all.
+    for (what, place) in [
+        ("a note", 0usize),
+        ("a truncated download", 1),
+        ("a directory", 2),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        build_v1_index(&db);
+        apply_v2_journal(&db);
+
+        let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+        match place {
+            0 => std::fs::write(&backup, b"not a database, just bytes someone left here").unwrap(),
+            1 => std::fs::write(&backup, b"").unwrap(),
+            _ => std::fs::create_dir(&backup).unwrap(),
+        }
+
+        let err = PoolStore::open(&db).expect_err("a stray artefact is not a rollback copy");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(&backup.display().to_string()) && msg.contains("not a rollback copy"),
+            "the refusal names the path and why for {what}, got: {msg}",
+        );
+        assert_eq!(
+            user_version(&db),
+            2,
+            "the index must be exactly as it was after {what}",
+        );
+        assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+    }
+}
+
+#[test]
+fn a_backup_symlink_to_an_unrelated_database_is_not_a_rollback_copy() {
+    // SQLite opening it and answering a `PRAGMA` proved only that it is *a*
+    // database. An operator who parked some other SQLite file at that path,
+    // directly or through a link, got the one-way rename run against an index
+    // whose only stated rollback is a database from somewhere else entirely.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let elsewhere = dir.path().join("notes.db");
+    {
+        let c = rusqlite::Connection::open(&elsewhere).unwrap();
+        c.execute_batch("CREATE TABLE notes(a TEXT);").unwrap();
+        c.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::os::unix::fs::symlink(&elsewhere, &backup).unwrap();
+
+    let err = PoolStore::open(&db).expect_err("another database is not a copy of this one");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a rollback copy") && msg.contains("no root table"),
+        "the refusal says which of this index's tables is missing, got: {msg}",
+    );
+    assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
+    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+    // And nothing was written through the link.
+    let c = rusqlite::Connection::open(&elsewhere).unwrap();
+    let tables: i64 = c
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1, "the unrelated database is untouched");
+}
+
+#[test]
+fn a_backup_symlink_to_the_index_itself_is_refused() {
+    // The state that made the runbook's instruction false. `.pre-v3.bak` as a
+    // symlink to `pool.db` passed every test the copy-aside had: SQLite opened
+    // it, it reported a schema, it was kept, the migration proceeded — and the
+    // file an operator is told to restore to go back *was the migrated v3
+    // database*. The paths are equal only after both are canonicalised, which
+    // is why the check resolves them.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::os::unix::fs::symlink(&db, &backup).unwrap();
+
+    let err = PoolStore::open(&db).expect_err("the index is not its own rollback copy");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a rollback copy") && msg.contains("resolves to the pool index itself"),
+        "the refusal says the link points back at the index, got: {msg}",
+    );
+    assert_eq!(
+        user_version(&db),
+        2,
+        "the one-way rename must not have run on a self-referential backup",
+    );
+    assert!(torrent_columns(&db).iter().any(|c| c == "slot"));
+    assert!(
+        std::fs::symlink_metadata(&backup)
+            .expect("the link itself is still there")
+            .file_type()
+            .is_symlink(),
+        "and what the operator left at that path is untouched",
+    );
+}
+
+#[test]
+fn a_backup_from_a_newer_build_is_not_a_rollback_copy() {
+    // The other end of the version window. A copy written by a build whose
+    // schema this one does not understand cannot be rolled back to, and
+    // `SchemaVersion` refuses such a file as the index itself — so keeping it
+    // as the rollback for a one-way migration promises something untrue.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    build_v1_index(&backup);
+    {
+        let c = rusqlite::Connection::open(&backup).unwrap();
+        c.pragma_update(None, "user_version", 999i64).unwrap();
+    }
+
+    let err = PoolStore::open(&db).expect_err("a copy from the future is not a rollback");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a rollback copy") && msg.contains("reports pool schema version 999"),
+        "the refusal names the version it found, got: {msg}",
+    );
+    assert_eq!(user_version(&db), 2, "the index must be exactly as it was");
+}
+
+#[test]
+fn a_fresh_database_leaves_no_backup_behind() {
+    // Nothing to preserve in a file the call is about to create, and a stray
+    // `.pre-v3.bak` beside every new pool would read as a failed migration.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    PoolStore::open(&db).unwrap();
+    assert!(!PathBuf::from(format!("{}.pre-v3.bak", db.display())).exists());
+}
+
+#[test]
+fn a_schema_step_that_cannot_run_says_which_index_and_what_to_do() {
+    // Q19. A build predating the one-transaction migration could create v1's
+    // tables and die before writing `user_version`, leaving a file whose
+    // schema is ahead of the version that describes it. Nothing here can tell
+    // which steps ran, so it is not repaired — but it is the state that wedges
+    // a daemon opening the pool with `?` under `Restart=on-failure`, and what
+    // came out was `table root already exists` followed by the whole of the
+    // schema text, naming neither the pool, nor the migration, nor a way out.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    {
+        // v1's tables, with the version never recorded.
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.pragma_update(None, "user_version", 0i64).unwrap();
+    }
+
+    let err = PoolStore::open(&db).expect_err("v1's tables cannot be created twice");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains(&db.display().to_string()),
+        "the failure names the index it is about, got: {msg}",
+    );
+    assert!(
+        msg.contains("schema version 0 to 3"),
+        "and which step could not run, got: {msg}",
+    );
+    assert!(
+        msg.contains("has not been changed"),
+        "and that nothing was changed, which is what makes a retry safe, got: {msg}",
+    );
+    assert!(msg.contains("pool scan"), "and a way out, got: {msg}",);
+    assert!(
+        msg.contains("only if it predates this run"),
+        "and the backup remedy qualified, got: {msg}",
+    );
+    assert!(
+        msg.contains("table root already exists"),
+        "without discarding what SQLite said, got: {msg}",
+    );
+
+    // Still true, and the reason the remedy is phrased as it is.
+    assert_eq!(user_version(&db), 0);
+}
+
+#[test]
+fn a_failed_migration_does_not_offer_its_own_backup_as_the_remedy() {
+    // F16 reopened. On the stepped path `backup_before_v3` runs immediately
+    // before the steps that fail, so the `.pre-v3.bak` beside a wedged index
+    // is a copy of that same wedged index — and the message's first remedy was
+    // "Restore <path>.pre-v3.bak if one is beside it", unqualified. Following
+    // it reproduces the failure exactly.
+    //
+    // The fixture is a file at version 1 whose v2 tables are already present,
+    // so the backup is taken (`found >= 1`) and then `SCHEMA_V2` cannot run.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    apply_v2_journal(&db);
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+
+    let err = PoolStore::open(&db).expect_err("v2's tables cannot be created twice");
+    let msg = format!("{err}");
+
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    assert!(
+        backup.exists(),
+        "the fixture must reach the path that writes a copy first",
+    );
+    // The copy really is of the wedged index, which is what makes the
+    // unqualified remedy circular.
+    assert_eq!(user_version(&backup), user_version(&db));
+    assert_eq!(torrent_columns(&backup), torrent_columns(&db));
+    assert_eq!(torrent_indexes(&backup), torrent_indexes(&db));
+
+    assert!(
+        msg.contains("only if it predates this run"),
+        "the remedy must say which copies are rollbacks, got: {msg}",
+    );
+    assert!(
+        msg.contains("reproduces this failure"),
+        "and what restoring the other kind does, got: {msg}",
+    );
+    assert!(
+        msg.contains("pool scan"),
+        "while keeping the remedy that works, got: {msg}",
+    );
+}
+
 #[test]
 fn an_index_from_a_newer_build_is_refused_rather_than_guessed_at() {
     let dir = tempfile::tempdir().unwrap();

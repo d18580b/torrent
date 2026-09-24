@@ -131,7 +131,15 @@ usage = '''
 arg "<config>" help="Path to the torrentd config to check"
 arg "<flags>" var=#true required=#false help="Flags for `vpn check`, e.g. --bring-up --json"
 '''
-run = 'cargo run --quiet -p torrentd -- --config "$usage_config" vpn check $usage_flags'
+run = '''
+# mise shell-quotes each forwarded argument into $usage_flags, so
+# `--profile "a b"` arrives as `--profile 'a b'`. A bare $usage_flags word-splits that on the space
+# and hands the subcommand `'a` and `b'`; quoting it as "$usage_flags" passes
+# the whole group as one argument, which is no better. `eval set --` re-parses
+# mise's own quoting, which is the only form that round-trips both.
+eval "set -- $usage_flags"
+cargo run --quiet -p torrentd -- --config "$usage_config" vpn check "$@"
+'''
 
 # `depends` here, not the sequential `run` list `test-all` uses: mise schedules
 # these two in parallel and that is safe, which is the boundary between the two

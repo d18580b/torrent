@@ -216,9 +216,18 @@ pub struct Auth {
 ///
 /// Note that this is *not* the previous behaviour with no trusted proxies
 /// configured. The socket peer is an address, so the empty default now keys
-/// per source IP rather than sharing one bucket. That is the better property —
-/// one attacker can no longer lock every operator out — and both overflow
-/// paths degrade to the shared bucket rather than to no throttle at all.
+/// per source IP rather than sharing one bucket. That removes the *single*
+/// shared bucket, and both overflow paths degrade to a shared bucket rather
+/// than to no throttle at all.
+///
+/// It does not make locking every operator out impossible, and nothing here
+/// should be read as claiming it does. A caller with enough distinct source
+/// addresses — `auth.rs`'s own note that one routed IPv6 /64 supplies 1024 of
+/// them applies here — can fill the map with live entries, and from then on
+/// every client the map has no room for is back on the shared bucket and
+/// locked out by that caller's failures. What the per-client key buys is that
+/// this now costs a real failed attempt per entry per penalty window, at
+/// ~50 ms of Argon2 each, instead of five requests every thirty seconds.
 #[derive(Debug)]
 pub struct LoginThrottle {
     /// The fallback, for requests whose client cannot be established.
@@ -259,8 +268,22 @@ impl Default for ThrottleState {
 
 impl ThrottleState {
     /// How long the caller must wait, or `None` if an attempt is allowed.
+    ///
+    /// Deliberately **not** a liveness touch. This is a consult, and a
+    /// consult is not an attempt: the throttle is asked before the request
+    /// body has been read, so a request that never becomes an attempt — one
+    /// whose body is unparseable, or larger than the cap — reaches here and
+    /// then ends in a 400. Refreshing `last_seen` on the way made that 400 a
+    /// way to hold a map entry alive at **zero** KDF cost, and the map is
+    /// bounded, so holding every entry alive is what pushes every other
+    /// client onto the shared bucket.
+    ///
+    /// Measured: 1024 real failed logins took 31.6 s of Argon2 to create
+    /// 1024 entries, and a full pass refreshing all 1024 with an unparseable
+    /// body took **0.07 s**. `note_failure` and `note_success` are where an
+    /// attempt is recorded, and both touch `last_seen`, so an entry that is
+    /// being used is still live.
     fn retry_after(&mut self) -> Option<Duration> {
-        self.last_seen = Instant::now();
         match self.locked_until {
             Some(until) if Instant::now() < until => Some(until - Instant::now()),
             Some(_) => {
@@ -367,13 +390,84 @@ impl LoginThrottle {
     }
 
     /// A success clears the record; the credential was not being guessed.
+    ///
+    /// Clearing is **replacement, never removal**, and that holds on both
+    /// paths. For a client the map already holds, removing the key is how a
+    /// client that has just authenticated correctly *loses* the slot the
+    /// paragraph below exists to give it: an operator who mistyped a password
+    /// once is in the map, and if their successful login deletes their entry
+    /// then their next consult finds no key, reads `global` because the map
+    /// is full, and is locked out by the next failure from anyone else on the
+    /// overflow path. Demonstrated end to end: with the map full, an operator
+    /// in it authenticated correctly, six never-seen addresses then failed
+    /// once each, and the operator's next correct password returned 429.
+    ///
+    /// For an identified client the map does not hold, clearing means
+    /// *inserting* a cleared entry rather than removing nothing. Once the map
+    /// is full `note_failure` routes that client's failures to `global` and
+    /// `retry_after` reads `global` back for it, so without a slot of its own
+    /// a client that has just authenticated correctly is locked out by the
+    /// next failure from anyone else on the overflow path — immediately after
+    /// proving it is not the attacker who filled the map. Where the map is
+    /// full the entry evicted to make room is the least recently seen one
+    /// that is **not** currently locked out — evicting a locked entry would
+    /// clear that client's lockout, which is the one thing the sweep above
+    /// deliberately preserves. Where every entry is locked, nothing is
+    /// inserted and this client stays on the overflow path until a slot
+    /// frees.
+    ///
+    /// `global` itself is **not** cleared. A caller holding one valid
+    /// credential could otherwise wipe the shared bucket between guesses at
+    /// another and never trip the lockout, which is a bypass rather than a
+    /// repair.
     pub fn note_success(&self, client: Option<IpAddr>) {
-        match client {
-            None => *self.global.lock() = ThrottleState::default(),
-            Some(ip) => {
-                self.per_client.lock().remove(&ip);
+        let Some(ip) = client else {
+            *self.global.lock() = ThrottleState::default();
+            return;
+        };
+        let mut g = self.per_client.lock();
+        if let Some(state) = g.get_mut(&ip) {
+            // Replaced in place. `remove` would clear the record by
+            // surrendering the slot, which is the one thing a success must
+            // not cost the client that earned it.
+            *state = ThrottleState::default();
+            return;
+        }
+        if g.len() >= MAX_TRACKED_CLIENTS {
+            g.retain(|_, st| st.is_live(self.penalty));
+        }
+        if g.len() >= MAX_TRACKED_CLIENTS {
+            // Never a locked one. `retain(is_live)` one line above deliberately
+            // keeps entries that are still locking someone out; picking the
+            // stalest by `last_seen` alone would then delete exactly what that
+            // line took care to preserve, and deleting a locked entry *clears
+            // that client's lockout*. Making room for a client who has just
+            // authenticated must not hand someone else their burst back.
+            let now = Instant::now();
+            let stalest = g
+                .iter()
+                .filter(|(_, st)| st.locked_until.is_none_or(|u| u <= now))
+                .min_by_key(|(_, st)| st.last_seen)
+                .map(|(addr, _)| *addr);
+            match stalest {
+                Some(addr) => {
+                    g.remove(&addr);
+                }
+                // Every tracked entry is locked out. There is nothing to
+                // discard that would not clear a live lockout, so no insertion
+                // is made and this client keeps the overflow path — the global
+                // bucket — until a slot frees. That is the same degradation
+                // the map's own capacity limit already has, and it lasts as
+                // long as the entries holding the map do: an entry stays live
+                // while it is locked, and beyond that only while something
+                // keeps touching it. Since a consult is no longer a touch,
+                // holding one costs a real failed attempt — ~50 ms of Argon2
+                // — per entry per penalty window, rather than the penalty
+                // window being a bound anyone gets for free.
+                None => return,
             }
         }
+        g.insert(ip, ThrottleState::default());
     }
 }
 
@@ -448,10 +542,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Memory cost in KiB, iterations, and parallelism for Argon2id here.
 ///
-/// Pinned rather than taken from `Argon2::default()`. These are OWASP's
-/// current recommendation for Argon2id and they are also what the `argon2`
-/// crate happens to default to at the version `Cargo.lock` holds — which is
-/// the problem: `README.md` quotes the numbers, so leaving them at a
+/// Pinned rather than taken from `Argon2::default()`. They are what the
+/// `argon2` crate happens to default to at the version `Cargo.lock` holds —
+/// which is the problem: `README.md` quotes the numbers, so leaving them at a
 /// dependency's discretion made a documented security parameter true by
 /// coincidence, and a routine `cargo update` past a release that revised those
 /// defaults would move the cost of the credential KDF in either direction with
@@ -748,6 +841,50 @@ mod tests {
     }
 
     #[test]
+    fn a_consult_that_never_becomes_an_attempt_cannot_hold_the_map_open() {
+        // The property: `retry_after` is a consult, not an attempt, and only
+        // an attempt keeps a tracked entry alive.
+        //
+        // The throttle is asked before the login body is read, so a request
+        // with an unparseable body reaches the consult and then ends in a 400
+        // having done no Argon2 work at all. While that consult refreshed
+        // `last_seen`, the 400 was a free way to hold an entry live — and
+        // holding all 1024 live means the sweep reclaims nothing and every
+        // other client is routed to the shared bucket. Measured against a
+        // live daemon: 31.6 s of Argon2 to create the entries, 0.07 s per
+        // full pass to keep them.
+        let penalty = Duration::from_millis(50);
+        let t = LoginThrottle::with_penalty(penalty);
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        assert_eq!(t.per_client.lock().len(), MAX_TRACKED_CLIENTS);
+
+        // Idle past the window, then consult every entry — the refresh pass
+        // an attacker gets for the price of a malformed body.
+        std::thread::sleep(Duration::from_millis(150));
+        for n in 0..MAX_TRACKED_CLIENTS {
+            let addr = Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32)));
+            assert!(
+                t.retry_after(addr).is_none(),
+                "none of these is locked out; the consult is the whole point",
+            );
+        }
+
+        // A never-seen client now fails once. The insert sweeps, and what the
+        // sweep finds decides whether this client gets a slot of its own or
+        // the shared bucket.
+        let newcomer = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+        t.note_failure(Some(newcomer));
+        assert!(
+            t.per_client.lock().contains_key(&newcomer),
+            "entries touched only by consults have gone idle and the sweep \
+             reclaims them, so a client arriving afterwards is tracked rather \
+             than pushed onto the shared bucket",
+        );
+    }
+
+    #[test]
     fn a_rotating_client_is_still_throttled_once_the_map_is_full() {
         // The property that matters is not that the map stayed small, it is
         // that filling the map is not a way to stop being throttled. Once it
@@ -778,6 +915,188 @@ mod tests {
         assert!(
             t.retry_after(fresh(99)).is_some(),
             "a rotating client must still be throttled once the map is full",
+        );
+    }
+
+    #[test]
+    fn a_success_from_an_overflow_client_is_not_undone_by_someone_else() {
+        // With the map full, this client's failures went to the shared bucket
+        // and `retry_after` reads that same bucket back for it. Removing an
+        // absent key clears nothing, so without a slot of its own the operator
+        // authenticates correctly and is then locked out by the next failure
+        // from anyone else on the overflow path — the attacker who filled the
+        // map in the first place.
+        let t = LoginThrottle::new();
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        assert_eq!(
+            t.per_client.lock().len(),
+            MAX_TRACKED_CLIENTS,
+            "the map has to be full for this test to be testing anything",
+        );
+
+        // Neither address is in the map: both are on the overflow path.
+        let operator = ip(1);
+        let other = ip(2);
+        for _ in 0..4 {
+            t.note_failure(operator);
+        }
+        t.note_success(operator);
+
+        // The fifth failure on the shared path trips its lockout.
+        t.note_failure(other);
+        assert!(
+            t.retry_after(other).is_some(),
+            "the shared bucket must still lock out the overflow path",
+        );
+        assert!(
+            t.retry_after(operator).is_none(),
+            "a client that has just authenticated must not be locked out by \
+             another client's failure on the shared path",
+        );
+    }
+
+    #[test]
+    fn a_success_from_a_client_the_map_holds_keeps_its_slot() {
+        // The other half of the same property, and the half the repair above
+        // did not reach: the client whose entry the map **already holds**.
+        //
+        // An operator who mistypes a password once is in the map. Removing
+        // their entry on a successful login hands the slot back at the exact
+        // moment they proved they are not the attacker — and with the map
+        // full, `retry_after` then routes them to the shared bucket, where
+        // the next failure from anyone else on the overflow path locks them
+        // out. Clearing the record must not cost the record's owner its slot.
+        let t = LoginThrottle::new();
+        for n in 0..MAX_TRACKED_CLIENTS {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32))));
+        }
+        let operator = IpAddr::V4(std::net::Ipv4Addr::from(0u32));
+        assert_eq!(
+            t.per_client.lock().len(),
+            MAX_TRACKED_CLIENTS,
+            "the map has to be full for this test to be testing anything",
+        );
+        assert!(
+            t.per_client.lock().contains_key(&operator),
+            "and the operator has to be in it",
+        );
+
+        t.note_success(Some(operator));
+
+        assert!(
+            t.per_client.lock().contains_key(&operator),
+            "a success clears the record without surrendering the slot",
+        );
+        assert_eq!(
+            t.per_client.lock().len(),
+            MAX_TRACKED_CLIENTS,
+            "and does not free capacity for whoever filled the map",
+        );
+
+        // The consequence, which is what makes the slot worth holding. Six
+        // never-seen addresses fail once each; with the map full they are on
+        // the overflow path and the shared bucket locks out after five.
+        for n in 0..6u32 {
+            t.note_failure(Some(IpAddr::V4(std::net::Ipv4Addr::new(
+                198,
+                51,
+                100,
+                n as u8 + 1,
+            ))));
+        }
+        assert!(
+            t.retry_after(Some(operator)).is_none(),
+            "the operator has a slot of its own, so another client's failures \
+             on the shared bucket cannot lock it out moments after it \
+             authenticated",
+        );
+    }
+
+    #[test]
+    fn making_room_for_a_successful_client_never_clears_a_live_lockout() {
+        // The property: the entry `note_success` evicts to make room is the
+        // least recently seen one that is *not* locked out.
+        //
+        // `retain(is_live)` keeps a locked entry on purpose. A `min_by_key` on
+        // `last_seen` alone ignores `locked_until`, so the line that makes
+        // room can delete exactly what the line above it preserved — and
+        // deleting a locked entry clears that client's lockout. An attacker
+        // who holds one valid credential can then free a locked victim, or
+        // free themselves, by authenticating from an address the map does not
+        // hold.
+        let t = LoginThrottle::new();
+
+        // Fill the map with entries that are all locked out. `0.0.0.x` here
+        // cannot collide with the `198.51.100.n` helper below.
+        for n in 0..MAX_TRACKED_CLIENTS {
+            let addr = Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32)));
+            for _ in 0..5 {
+                t.note_failure(addr);
+            }
+        }
+        assert_eq!(t.per_client.lock().len(), MAX_TRACKED_CLIENTS);
+
+        // The stalest entry is the first one filled, and it is locked.
+        let victim = IpAddr::V4(std::net::Ipv4Addr::from(0u32));
+        assert!(
+            t.retry_after(Some(victim)).is_some(),
+            "the victim has to be locked out for this test to be testing \
+             anything",
+        );
+
+        // A client the map does not hold authenticates successfully.
+        let client = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+        t.note_success(Some(client));
+
+        assert!(
+            t.retry_after(Some(victim)).is_some(),
+            "another client's success must not clear a live lockout to make \
+             room for itself",
+        );
+        assert_eq!(
+            t.per_client.lock().len(),
+            MAX_TRACKED_CLIENTS,
+            "with every entry locked there is nothing evictable, so no \
+             insertion is made and the successful client keeps the overflow \
+             path",
+        );
+        assert!(
+            !t.per_client.lock().contains_key(&client),
+            "no slot is taken by force",
+        );
+    }
+
+    #[test]
+    fn an_unlocked_entry_is_still_evicted_to_make_room() {
+        // The other half: the refusal above is about *locked* entries, not
+        // about eviction. With something evictable present, a successful
+        // client still gets its slot — which is what decision 21's repair is
+        // for, and what stops this becoming a way to deny one.
+        let t = LoginThrottle::new();
+
+        // One entry that is merely seen, and the rest locked out.
+        let idle = IpAddr::V4(std::net::Ipv4Addr::from(0u32));
+        t.per_client.lock().insert(idle, ThrottleState::default());
+        for n in 1..MAX_TRACKED_CLIENTS {
+            let addr = Some(IpAddr::V4(std::net::Ipv4Addr::from(n as u32)));
+            for _ in 0..5 {
+                t.note_failure(addr);
+            }
+        }
+        assert_eq!(t.per_client.lock().len(), MAX_TRACKED_CLIENTS);
+
+        let client = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, 1));
+        t.note_success(Some(client));
+
+        assert!(
+            t.per_client.lock().contains_key(&client),
+            "the successful client takes the slot of the unlocked entry",
+        );
+        assert!(
+            !t.per_client.lock().contains_key(&idle),
+            "and the unlocked entry is the one that went",
         );
     }
 

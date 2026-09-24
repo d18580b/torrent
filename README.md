@@ -150,7 +150,7 @@ layer.)
 | `POST /api/login` \| `/api/logout` | **none** | Session cookie in, revocation out. 409 if the daemon runs unauthenticated. |
 | `GET /api/status` | read | Counts by phase, aggregate rates, peers. |
 | `GET /api/events` | read | SSE change stream — a bare tick; the client refetches. |
-| `POST /api/reload` | write | Re-read the config file, as SIGHUP does. |
+| `POST /api/reload` | write | Re-read the config file, as SIGHUP does. 202 accepted, 429 if a reload is already running, 503 if the daemon is shutting down or was built without the reload channel. |
 | `GET /api/torrents` | read | `?after=<infohash>&limit=<n>` (default 100, max 1000) → `{"items":[…],"next_cursor":…}`. |
 | `POST /api/torrents` | write | `{"profile_id":…}` plus `{"magnet":…}`, `{"torrent_path":…}`, or a multipart `.torrent` in a field named `torrent`. `save_path` is optional and defaults to `default_save_path`. 409 on a duplicate info-hash. |
 | `GET`/`DELETE` `/api/torrents/:infohash` | read/write | `?delete_files=true` requires `[pool] allow_mutations`. |
@@ -184,11 +184,22 @@ reload may not hand one back.
 set a value, because then the file and the running daemon could disagree with
 nothing recording which had won.
 
+`GET /api/profiles` lists **live profiles in the order their `[[profile]]`
+tables appear in the config file, then the profiles that failed to come up**,
+in config order among themselves. That order is the contract; it is not a
+substitute for reading `status`, since the first entry is an `active` profile
+only when at least one came up. A client choosing a profile to act on filters
+on `status == "active"` — a failed profile has no session, and every route that
+needs one answers 409 naming the failure reason.
+
 ## Profiles
 
 One config file drives everything; unknown keys are a fatal error, inside
 `[[profile]]` tables too. See
-[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml).
+[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml), which documents
+every key, and
+[`deploy/torrentd.multi-account.sample.toml`](deploy/torrentd.multi-account.sample.toml),
+a complete two-account configuration with nothing commented out.
 
 A **profile** is one libtorrent session with its own network posture, identity
 and directories. At least one is required, and there is no default profile:
@@ -260,11 +271,26 @@ summary cannot quietly mean "mostly not checked", and the exit status carries
 the same distinction: `0` clean, `1` any failure, `2` nothing failed but
 something could not be checked.
 
-Safe to run while the daemon is up. The default path reads state and asks the
-gateway for a NAT-PMP mapping with the daemon's own short lease, which it
-leaves to expire; `--bring-up` is the only option that raises a tunnel, and it
-lowers again only what it raised. What a pass does and does not establish is
-set out in [docs/running.md](docs/running.md#9-first-run-checks).
+With one exception, which a `0` depends on. An `unknown` that *nothing this
+invocation could be given would settle* — most often because the check needs
+`CAP_NET_ADMIN` and an operator shell does not hold it — is printed `[?cap]`,
+marked `"needs_capability": true` in the JSON, and **not** counted towards `2`.
+Otherwise a host where nothing is wrong would exit `2` every time, and both
+consumers of the status would learn to accept it. So a `0` means "nothing
+failed and nothing was left unsettled that this invocation could have
+settled", which is less than it sounds: on the recommended unprivileged run
+the handshake and the kill-switch ruleset are two of those. [What a pass
+establishes](docs/running.md#9-first-run-checks) says which, line by line.
+
+The default path makes no host change and deletes nothing: it reads state and
+asks the gateway for a NAT-PMP mapping with the daemon's own short lease,
+which it leaves to expire. Against a running daemon that request is its only
+interaction, sent from the same NAT-PMP client identity; whether a gateway
+coalesces it with the daemon's existing mapping is gateway-dependent and is
+not tested here. `--bring-up` is the only option that raises a tunnel, and it
+lowers again only what it was observed to have raised. What a pass does and
+does not establish is set out in
+[docs/running.md](docs/running.md#9-first-run-checks).
 
 The eight rules this is built on, and why each exists, are documented on the
 `torrentd-engine::profile` module — where the code that enforces them is. The
@@ -288,16 +314,19 @@ to arrive at by omission. The opt-out does not extend to a routable address
 either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
 and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
 inert and reads as though the daemon authenticates nothing. `http_listen`
-defaults to `127.0.0.1:8080`. All three are read once, at startup: changing
-them takes a restart, not a `SIGHUP`.
+defaults to `127.0.0.1:8080`. All three, and `trusted_proxies` alongside them,
+are read once, at startup: changing any of the four takes a restart, not a
+`SIGHUP`. A `SIGHUP` that changes one says so — "requires daemon restart;
+ignored" — rather than reporting the config unchanged.
 
 Two credential kinds, hashed differently on purpose. The **operator password**
-is human-chosen and therefore low-entropy, so it gets Argon2id — `m=19456,
-t=2, p=1`, which is OWASP's current recommendation, pinned in `auth.rs` rather
+is human-chosen and therefore low-entropy, so it gets Argon2id at `m=19456,
+t=2, p=1` — pinned in `crates/torrentd/src/auth.rs` and held by a test, rather
 than inherited from the `argon2` crate's defaults so that a dependency bump
-cannot quietly move it — verified once at login and rate-limited. **API tokens** are 256 bits this daemon generated, so there
-is nothing to guess and SHA-256 is correct; Argon2 on every Prometheus scrape
-would burn ~50 ms of CPU per request by design.
+cannot quietly move it — verified once at login and rate-limited. **API
+tokens** are 256 bits this daemon generated, so there is nothing to guess and
+SHA-256 is correct; Argon2 on every Prometheus scrape would burn ~50 ms of CPU
+per request by design.
 
 ```bash
 torrentd --config … hash-password
@@ -331,6 +360,15 @@ Updates arrive over SSE: the daemon emits a tick when something visible
 changes and the client refetches only the panels it has mounted. Polling every
 15s is the fallback when the stream drops.
 
+Routes use the fragment (`#/pool`). The compatibility aliases that once made
+`/pool` and `/torrents` real API paths are gone — every route is under `/api`
+now — so the reason is no longer a collision. It is that the client is served
+as a static bundle from the router's fallback: a bare `/pool` answers 200 with
+the SPA whatever the path is, which means a path-routed client would be
+indistinguishable from a typo, and a reload of a deep link would depend on the
+server knowing every client-side route. The fragment keeps that knowledge on
+the client.
+
 ```bash
 cd web && npm run dev     # dev server, proxying the API to :8080
 mise run screenshot       # regenerate the image above from a fixture
@@ -339,12 +377,15 @@ mise run screenshot       # regenerate the image above from a fixture
 ## Reverse proxy
 
 torrentd does not terminate TLS and will not; `deploy/Caddyfile` and
-`deploy/compose.yaml` are a working pair that does. `X-Forwarded-For` and
-`X-Forwarded-Proto` are read **only** from peers listed in `trusted_proxies`
-— empty by default, meaning no forwarding header is read at all and the
-socket's peer address is the client. They feed exactly two things: a per-client
-login throttle instead of one shared bucket, and `Secure` on the session
-cookie when the original request was over TLS.
+`deploy/compose.yaml` are a working pair that does. `X-Forwarded-For`,
+`X-Forwarded-Proto` and RFC 7239 `Forwarded` — all three, which is what your
+proxy has to strip or overwrite — are read **only** from peers listed in
+`trusted_proxies`, empty by default, meaning no forwarding header is read at
+all and the socket's peer address is the client. They feed three things: a per-client
+login throttle instead of one shared bucket, `Secure` on the session cookie
+when the original request was over TLS, and the `client_ip` field on the login
+log lines — the record of who tried, which is the consumer this support exists
+to create.
 
 ## Metrics
 

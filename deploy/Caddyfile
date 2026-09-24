@@ -13,20 +13,30 @@
 torrentd.example.com {
 	encode zstd gzip
 
-	# The headers torrentd reads, and the only two it needs. It reads them
+	# The headers torrentd reads: X-Forwarded-For, X-Forwarded-Proto and
+	# RFC 7239 Forwarded. All three, which is why there are three
+	# `header_up` lines below and not two. It reads them
 	# **only** from a peer listed in `trusted_proxies`, so set that to this
 	# container's address on the compose network — 172.28.0.2, which
 	# `deploy/compose.yaml` pins so there is a fixed address to name. Get it
 	# wrong and they are ignored and the daemon falls back to the socket peer.
+	#
+	# Adapting this to nginx or Traefik means carrying all three across.
+	# Setting only the two `X-` names leaves `Forwarded` a client-controlled
+	# input arriving from a peer this daemon believes, and where an `X-` name
+	# is absent the client's `Forwarded` is what the daemon reads.
 	reverse_proxy torrentd:8080 {
 		header_up X-Forwarded-For {remote_host}
 		header_up X-Forwarded-Proto {scheme}
 
 		# Strip anything the *client* sent under these names before adding
-		# ours. Without this, a client can prepend entries to the chain, and
-		# although torrentd reads the last entry rather than the first, a proxy
-		# that forwards client-supplied values is a proxy that cannot be
-		# trusted about anything.
+		# ours. Without this, a client can prepend entries to the chain.
+		# torrentd reads the last entry for the client's address — but the
+		# *whole chain* for the scheme, since TLS is terminated at the edge
+		# and any hop that says `https` answers it — so a prepended `https` is
+		# believed unless it is stripped here, and a proxy that forwards
+		# client-supplied values is a proxy that cannot be trusted about
+		# anything.
 		header_up -Forwarded
 	}
 

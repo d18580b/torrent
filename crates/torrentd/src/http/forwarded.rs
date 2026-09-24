@@ -1,8 +1,10 @@
 //! Resolving the real client behind a reverse proxy.
 //!
 //! The daemon does not terminate TLS and is expected to sit behind a proxy, so
-//! the socket's peer address is usually the proxy's. Two things need the real
-//! client: the login throttle, and the log line that records a failed attempt.
+//! the socket's peer address is usually the proxy's. Three things need the
+//! real client: the login throttle, the `Secure` attribute on the session
+//! cookie, and the `client_ip` field on the log line that records a failed
+//! attempt.
 //!
 //! Neither could have it before. `axum::serve` was called without
 //! `into_make_service_with_connect_info`, so no handler could see even the
@@ -23,9 +25,11 @@
 //! and now it keys on whatever address this returns. Behind a proxy that is
 //! the proxy's address for every request, so the effect is the shared bucket
 //! again; on a directly exposed daemon it is the real client, so the throttle
-//! keys per source IP. That is the better property — one attacker can no
-//! longer lock every operator out — and it is the behaviour the daemon has,
-//! so it is what is written down here.
+//! keys per source IP. That is the better property — one attacker's failures
+//! no longer share a bucket with the operator's, though a caller with enough
+//! distinct addresses can still fill the tracked-client map and put everyone
+//! back on the shared one — and it is the behaviour the daemon has, so it is
+//! what is written down here.
 
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -66,23 +70,74 @@ impl Cidr {
         Ok(Self { addr, prefix })
     }
 
+    /// The parsed prefix length.
+    ///
+    /// Exposed because judging the *value* of a block is not the same
+    /// question as matching against it, and the judgement has to be made on
+    /// what `parse` produced. `u8::from_str` accepts a leading `+` and any
+    /// number of leading zeros, so one prefix length has unboundedly many
+    /// spellings and only this number identifies it.
+    pub fn prefix(&self) -> u8 {
+        self.prefix
+    }
+
+    /// Whether `ip` is inside this block.
+    ///
+    /// **Both sides** are folded to their v4 form first. A v4-mapped v6
+    /// address is the same host as its v4 form, and the fold has to run on
+    /// the configured entry as well as on the peer or the two spellings of
+    /// one host stop meeting:
+    ///
+    /// * the peer, because a dual-stack listener reports loopback as
+    ///   `::ffff:127.0.0.1` and not unmapping would silently stop trusting a
+    ///   proxy on the same machine;
+    /// * the entry, because `docs/running.md` teaches the two spellings as
+    ///   equivalent and tells the operator to name the address their proxy
+    ///   connects from — which on a dual-stack host is the mapped one they
+    ///   read out of a log. Demonstrated: a daemon booted with
+    ///   `trusted_proxies = ["::ffff:127.0.0.1"]` logged that trust set,
+    ///   passed `--check-config`, and then trusted **nobody**, standing the
+    ///   peer up for every forwarding header. It fails closed, but the logged
+    ///   set and the effective set disagreed, which is the one thing the boot
+    ///   line exists to prevent.
+    ///
+    /// The mapped range is the `/96` at `::ffff:0:0`, so an entry's prefix
+    /// inside it drops those 96 bits; a prefix shorter than 96 already spans
+    /// the whole mapped range and so spans every v4 address, which is what
+    /// `saturating_sub` says.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        match (self.addr, ip) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                prefix_match(&net.octets(), &ip.octets(), self.prefix)
-            }
-            (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                prefix_match(&net.octets(), &ip.octets(), self.prefix)
-            }
-            // A v4-mapped v6 peer is the same host as its v4 form; a dual-stack
-            // listener reports loopback as ::ffff:127.0.0.1, so not unmapping
-            // here would silently stop trusting a proxy on the same machine.
-            (IpAddr::V4(_), IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {
-                Some(v4) => self.contains(IpAddr::V4(v4)),
-                None => false,
+        let (net, prefix) = match self.addr {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => (IpAddr::V4(v4), self.prefix.saturating_sub(96)),
+                None => (self.addr, self.prefix),
             },
-            (IpAddr::V6(_), IpAddr::V4(_)) => false,
+            IpAddr::V4(_) => (self.addr, self.prefix),
+        };
+        match (net, unmap(ip)) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => prefix_match(&net.octets(), &ip.octets(), prefix),
+            (IpAddr::V6(net), IpAddr::V6(ip)) => prefix_match(&net.octets(), &ip.octets(), prefix),
+            // One side is a genuine v6 address and the other a v4 one. They
+            // are different hosts in different families; neither fold above
+            // can bring them together.
+            _ => false,
         }
+    }
+}
+
+/// A v4-mapped v6 address as its v4 form; anything else unchanged.
+///
+/// `Cidr::contains` already unmaps a peer before matching it, on the grounds
+/// that `::ffff:a.b.c.d` "is the same host as its v4 form". The resolved
+/// client address has to be spelled the same way or the repository holds both
+/// positions at once: demonstrated, `X-Forwarded-For: ::ffff:198.51.100.88`
+/// and `X-Forwarded-For: 198.51.100.88` were two `HashMap<IpAddr, _>` keys,
+/// so eight failures alternating between the spellings never tripped a
+/// lockout where five against one spelling did — and the security log carried
+/// two `client_ip` spellings for one host.
+fn unmap(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+        v4 => v4,
     }
 }
 
@@ -105,9 +160,33 @@ fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
 /// the reverse proxy connects from and only that. The one thing required of
 /// the proxy itself is that it **strips or overwrites** client-supplied
 /// forwarding headers rather than passing them through: a value this daemon
-/// believes must be one the proxy wrote. Whether the proxy appends by
-/// extending the existing field line or by adding another one does not
-/// matter — `last_element` reads both the same way.
+/// believes must be one the proxy wrote.
+///
+/// There are **three** such headers and all three have to be covered, not
+/// just the two an operator thinks of: `X-Forwarded-For`,
+/// `X-Forwarded-Proto` and RFC 7239 `Forwarded`. `resolve` reads `Forwarded`
+/// for both the address and the scheme, so a proxy that overwrites the two
+/// `X-` names while forwarding `Forwarded` verbatim — nginx's default for a
+/// header it does not know about — is handing a client-controlled value to a
+/// peer this daemon believes. `deploy/Caddyfile` is the worked example of
+/// covering all three: two `header_up` lines overwrite the `X-` pair and
+/// `header_up -Forwarded` removes the third outright.
+///
+/// Whether the proxy appends by extending the existing field line or by
+/// adding another one does not matter — `last_element` reads both the same
+/// way.
+///
+/// **One hop.** `resolve` takes the element the immediate peer contributed
+/// and stops; it does not walk right-to-left past hops that are themselves
+/// listed here. A block wide enough to hold two of your own proxies —
+/// `10.0.0.0/8` validates — therefore does not mean "believe the chain as far
+/// as my own edge". In a two-hop chain the daemon resolves the **inner**
+/// proxy's address as the client, which gives every client behind that edge
+/// one shared throttle bucket and one `client_ip`.
+///
+/// That is a reason to list the one address your proxy connects from, which
+/// is what everything else here asks for anyway. Walking the chain is a
+/// larger design and is not what this does.
 #[derive(Clone, Debug, Default)]
 pub struct TrustedProxies(Vec<Cidr>);
 
@@ -133,15 +212,60 @@ impl TrustedProxies {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Client {
     pub ip: Option<IpAddr>,
-    /// Whether the *original* request was over TLS. `false` when unknown,
-    /// which is the safe direction: it only ever withholds the `Secure`
-    /// cookie attribute, never adds it wrongly.
+    /// Whether the *original* request was over TLS: **`https` anywhere in a
+    /// readable chain**, under either header name.
+    ///
+    /// This and `ip` are different questions and they read the chain
+    /// differently. `ip` wants the hop the trusted proxy saw, which is the
+    /// last element and only the last element. TLS is terminated at the edge,
+    /// so whether the request *began* over TLS is answered by any element
+    /// that says `https`: `https, http` is a TLS edge in front of a
+    /// plain-HTTP inner proxy, and the original request there was TLS.
+    /// `X-Forwarded-Proto` and `Forwarded`'s `proto=` are read under the one
+    /// rule, so a deployment gets the same answer whichever name its proxies
+    /// speak.
+    ///
+    /// **A property a test used to pin is given up here, deliberately.** A
+    /// client's own earlier `https` does now win, wherever a trusted proxy
+    /// appends rather than overwrites. Nothing in a request distinguishes
+    /// "TLS edge, then plain inner proxy, both honest" from "client's forgery,
+    /// then honest appending proxy" — they are the same bytes — so this is a
+    /// choice between two harms rather than a fix. Taking the last element
+    /// withholds `Secure` from a genuine TLS edge and sends the session
+    /// cookie in clear to any plain-HTTP origin on the host: a real weakening
+    /// of a correct deployment. Taking any element lets a client's forged
+    /// `https` mark **its own** cookie `Secure`, which the browser will then
+    /// neither store nor return over `http://` — self-inflicted, and bounded
+    /// to the requester's own session. The rule follows the harm.
+    ///
+    /// `false` when unknown, which is the safe direction for the *unknown*
+    /// case: it only ever withholds the `Secure` cookie attribute, never adds
+    /// it wrongly. It is not the safe direction for a known TLS deployment,
+    /// which is why "unknown" has to stay narrow.
     pub secure: bool,
 }
 
-/// The last element of `name`'s value, across every field line it arrived on.
+/// What reading a forwarding header yielded.
 ///
-/// Two rules, and they are the same rule at two levels.
+/// The two questions are separate and must stay separate. *Was the name
+/// there at all* decides which source `resolve` consults; *did it carry a
+/// readable element* decides what that source says. Collapsing them into one
+/// `Option` — the obvious shape — makes a header the proxy wrote but that
+/// carries nothing readable indistinguishable from a header the proxy never
+/// wrote, and those two have opposite safe answers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeaderRead<'a> {
+    /// Whether any field line carried this name, readable or not.
+    present: bool,
+    /// The **final** element across every field line — positionally, not the
+    /// last one that happens to be readable — where it carries something.
+    last: Option<&'a str>,
+}
+
+/// The last element of `name`'s value, across every field line it arrived on,
+/// and whether the name was present at all.
+///
+/// Two rules for the element, and they are the same rule at two levels.
 ///
 /// A forwarding header is a chain appended to by each hop, so the entry the
 /// *trusted* proxy added is the last one, not the first. Taking the first —
@@ -155,26 +279,248 @@ pub struct Client {
 /// line — hands the choice straight back to the client, which is the same
 /// defect one level up. Joining every line in order and taking the last
 /// element makes the proxy's field-line style stop mattering.
-fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> Option<&'a str> {
+///
+/// `present` is reported separately because an element that carries nothing
+/// readable yields no `last`. A header that is present and yields nothing —
+/// `X-Forwarded-For:`, `X-Forwarded-For: , `, or a value that is not UTF-8 —
+/// is still a header the trusted proxy wrote, and `resolve` must not treat it
+/// as one the proxy omitted.
+///
+/// Which element is *last* is decided **positionally**, at the same
+/// granularity as `present`, and that is the whole of the second rule. Taking
+/// the last element that happens to be readable — filtering emptiness out on
+/// the way and letting `next_back` land wherever it lands — skips past an
+/// unreadable final element and returns an **earlier** one, and the earlier
+/// elements of a chain are the ones the client wrote. So a trusted proxy
+/// whose own appended contribution evaluates empty, which is the ordinary
+/// failure mode of appending a header field that was not there
+/// (`add-header X-Forwarded-For %[hdr(...)]` over an absent inner header),
+/// hands the client's forged first element straight back as the answer:
+/// `X-Forwarded-For: 6.6.6.6,` resolved to `6.6.6.6` rather than to the
+/// socket peer, and that value became the throttle key and the `client_ip`
+/// on the failed-login line.
+///
+/// Deciding positionally makes the two rules one rule again: the final
+/// element of the joined value is the trusted proxy's, whatever it contains,
+/// and where it contains nothing usable the header is unreadable rather than
+/// a licence to read further left.
+fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> HeaderRead<'a> {
+    let values = req.headers().get_all(name);
+    HeaderRead {
+        present: values.iter().next().is_some(),
+        // The last field line's last element. A non-UTF-8 *final* field line
+        // makes the final element unreadable for the same reason an empty one
+        // does — it is where the trusted proxy's contribution would be — so
+        // `to_str` failing here is not a reason to consult the line before it.
+        last: values
+            .iter()
+            .next_back()
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| split_elements(name, v, ',').last())
+            .map(str::trim)
+            .filter(|s| !s.is_empty()),
+    }
+}
+
+/// Whether `name`'s grammar makes a `"` a quoted-string delimiter.
+///
+/// Only `Forwarded` does. RFC 7239 §4 makes a parameter value either a
+/// `token` — which cannot contain a quote, a comma or a semicolon — or a
+/// `quoted-string`, which can contain all three. `X-Forwarded-For` and
+/// `X-Forwarded-Proto` are de-facto headers with no grammar beyond a
+/// comma-separated list: nothing defines a quoted string in either, so a `"`
+/// in one of their values is ordinary data the client happened to send.
+///
+/// Sharing one quote-aware splitter across all three names is not tidiness,
+/// it is a hole. A client that plants **one unbalanced quote** makes the
+/// trusted proxy's own appended element part of a single quoted segment, so
+/// the positional last element is the client's text and `node_addr` reads the
+/// client's address straight out of it. Demonstrated behind an appending
+/// proxy — the `$proxy_add_x_forwarded_for` shape nginx documents, which is
+/// raw concatenation of the client's header with the peer's address —
+/// `[6.6.6.6]"`, `6.6.6.6:80"` and `[6.6.6.6]:80"` each resolved to
+/// `6.6.6.6`. End to end on one daemon: eight failed logins each planting a
+/// quote returned `401` eight times and were never throttled, while eight
+/// honest ones locked out at the sixth and stayed locked, and the security
+/// log recorded eight addresses the client chose. On `X-Forwarded-Proto` the
+/// same byte runs the other way: a lone `"` merged a TLS edge's own `https`
+/// into one unmatchable element and the session cookie shipped without
+/// `Secure`.
+///
+/// A proxy that adds a *second field line* rather than extending the existing
+/// one — HAProxy's `option forwardfor` — is unaffected either way, which is
+/// what makes this precise rather than universal.
+fn has_quoted_strings(name: &str) -> bool {
+    name.eq_ignore_ascii_case("forwarded")
+}
+
+/// Whether every `quoted-string` opened in `s` is closed.
+///
+/// RFC 7239 §4's `quoted-string` production requires the closing `DQUOTE`, so
+/// a value carrying an unterminated one is not a `Forwarded` value at all.
+/// Honouring the opening quote anyway is the same hole one name over: a
+/// client's `Forwarded: for=6.6.6.6:80"` leaves the quote open, the trusted
+/// proxy's appended `, for=203.0.113.1` falls inside it, and the element that
+/// answers is the client's — demonstrated live behind an appending proxy,
+/// resolving to `6.6.6.6`.
+///
+/// So quoting is honoured only where the grammar it comes from is satisfied,
+/// and an unterminated quote is data. The alternative — calling the whole
+/// value unreadable — discards an element the trusted proxy wrote correctly
+/// because the client sent a stray byte, and puts every client behind that
+/// proxy in one throttle bucket on client-controlled input.
+fn quotes_terminated(s: &str) -> bool {
+    let mut quoted = false;
+    let mut escaped = false;
+    for c in s.chars() {
+        if escaped {
+            escaped = false;
+        } else if quoted && c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        }
+    }
+    !quoted
+}
+
+/// Split `s` on `sep`, ignoring separators inside a quoted string.
+///
+/// Splitting on the bare byte where the grammar *does* have a quoted string
+/// re-frames that grammar around a value the *client* supplied: the one
+/// parameter a proxy routinely copies from the request is `host=`, quoted
+/// precisely because the client's `Host` may contain characters a token may
+/// not.
+///
+/// Demonstrated against a daemon trusting loopback, before this:
+/// `for=198.51.100.9;host="a,for=6.6.6.6"` read as two elements and resolved
+/// to `6.6.6.6`; `host="a;for=6.6.6.6";for=198.51.100.9` read as two
+/// parameters and did the same; `for=198.51.100.9;host="a,proto=https"`
+/// destroyed the proxy's own `for=` *and* set `Secure`. The loss case needs
+/// no attacker at all — a proxy legitimately quoting a separator silently
+/// loses its own claim.
+struct SplitList<'a> {
+    rest: Option<&'a str>,
+    sep: char,
+    /// Whether a `"` opens a quoted string, or is ordinary data.
+    quoted_strings: bool,
+}
+
+impl<'a> Iterator for SplitList<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let s = self.rest?;
+        let mut quoted = false;
+        let mut escaped = false;
+        for (i, c) in s.char_indices() {
+            if !self.quoted_strings {
+                if c == self.sep {
+                    self.rest = Some(&s[i + c.len_utf8()..]);
+                    return Some(&s[..i]);
+                }
+            } else if escaped {
+                escaped = false;
+            } else if quoted && c == '\\' {
+                // `quoted-pair`: the next character is data whatever it is,
+                // including a closing quote.
+                escaped = true;
+            } else if c == '"' {
+                quoted = !quoted;
+            } else if c == self.sep && !quoted {
+                self.rest = Some(&s[i + c.len_utf8()..]);
+                return Some(&s[..i]);
+            }
+        }
+        self.rest = None;
+        Some(s)
+    }
+}
+
+/// Split one `Forwarded` element's parameter list on `sep`.
+///
+/// The only caller is [`param`], which is reached from `Forwarded` and from
+/// nowhere else, so the grammar is known without being passed.
+fn split_outside_quotes(s: &str, sep: char) -> SplitList<'_> {
+    SplitList {
+        rest: Some(s),
+        sep,
+        quoted_strings: quotes_terminated(s),
+    }
+}
+
+/// Split `name`'s value on `sep` under `name`'s own grammar.
+///
+/// Quote-aware for `Forwarded`, and then only for a value whose quoted
+/// strings are closed; a bare split otherwise. [`has_quoted_strings`] and
+/// [`quotes_terminated`] each say what their half is protecting against.
+fn split_elements<'a>(name: &str, s: &'a str, sep: char) -> SplitList<'a> {
+    SplitList {
+        rest: Some(s),
+        sep,
+        quoted_strings: has_quoted_strings(name) && quotes_terminated(s),
+    }
+}
+
+/// Remove RFC 7239 §4 `quoted-string` quoting from a parameter value.
+///
+/// `trim_matches('"')` is not this. It strips quote characters from either
+/// end whether or not they are a matched pair, it leaves a `quoted-pair`
+/// escape in the value, and on `""` it removes two quotes from one side. A
+/// value that is not a quoted string at all is returned as it arrived.
+fn unquote(v: &str) -> std::borrow::Cow<'_, str> {
+    let Some(inner) = v.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else {
+        return std::borrow::Cow::Borrowed(v);
+    };
+    if !inner.contains('\\') {
+        return std::borrow::Cow::Borrowed(inner);
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut escaped = false;
+    for c in inner.chars() {
+        if escaped {
+            out.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Every element of `name`'s value, across every field line, in order.
+///
+/// For the question "did *any* hop say this", where [`last_element`]'s
+/// question is "what did the hop that wrote the header say". A field line
+/// that is not UTF-8 contributes nothing, which is why the caller still asks
+/// `last_element` whether the header is readable at all before believing an
+/// answer from here.
+fn elements<'a, B>(req: &'a Request<B>, name: &'a str) -> impl Iterator<Item = &'a str> {
     req.headers()
         .get_all(name)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
+        .flat_map(move |v| split_elements(name, v, ','))
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .next_back()
 }
 
 /// The value of `key` in one RFC 7239 element, e.g. `proto` in
-/// `for=203.0.113.9;proto=https`. Quotes are stripped; the name is
-/// case-insensitive, as RFC 7239 §4 requires.
-fn param<'a>(element: &'a str, key: &str) -> Option<&'a str> {
-    element.split(';').find_map(|p| {
+/// `for=203.0.113.9;proto=https`. Quoting is removed per RFC 7239 §4; the
+/// name is case-insensitive, as the same section requires.
+///
+/// The parameter list is split outside quoted strings, for the reason
+/// [`SplitOutsideQuotes`] gives. Splitting the *name* from the value on the
+/// first `=` needs no such care: a name is a token, so the first `=` in a
+/// parameter is always the one that separates them.
+fn param<'a>(element: &'a str, key: &str) -> Option<std::borrow::Cow<'a, str>> {
+    split_outside_quotes(element, ';').find_map(|p| {
         let (k, v) = p.split_once('=')?;
         k.trim()
             .eq_ignore_ascii_case(key)
-            .then(|| v.trim().trim_matches('"'))
+            .then(|| unquote(v.trim()))
     })
 }
 
@@ -195,10 +541,22 @@ fn node_addr(node: &str) -> Option<IpAddr> {
 
 /// Resolve the client behind `req`.
 pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
+    // Unmapped **here**, at the top, before the trust test and before either
+    // early return. A dual-stack `http_listen` — `[::]:8080`, which
+    // `SocketAddr` accepts, the posture check permits and `docs/running.md`
+    // names as supported — reports every v4 client as `::ffff:a.b.c.d`. Doing
+    // it only on the resolved address left the untrusted branch below
+    // returning before the fold, so one host arriving directly and the same
+    // host named through the trusted proxy were two `client_ip` values and
+    // two throttle buckets in one daemon under one configuration.
+    // Demonstrated: ten failures before both buckets locked, where five
+    // against one spelling locks, and the client picks which route it takes.
+    // Doing it once here also makes the trust decision and the resolved
+    // address agree by construction.
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip());
+        .map(|ci| unmap(ci.0.ip()));
 
     let Some(peer) = peer else {
         return Client {
@@ -223,19 +581,115 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     // RFC 7239 is the standardised form, so a proxy that emits only
     // `Forwarded` has to be able to supply the address too — otherwise its
     // client is silently discarded in favour of the proxy's socket address.
-    // `X-Forwarded-For` is tried first because it is the near-universal one.
-    let ip = last_element(req, "x-forwarded-for")
-        .and_then(|s| s.parse::<IpAddr>().ok())
-        .or_else(|| forwarded.and_then(|f| param(f, "for")).and_then(node_addr))
-        .or(Some(peer));
+    // `X-Forwarded-For` is the near-universal one, so it decides wherever it
+    // is present and `Forwarded` is read only where it is absent.
+    //
+    // Present-but-unreadable falls back to the socket peer, never to
+    // `Forwarded`. The trusted proxy wrote `X-Forwarded-For`; it did not
+    // write `Forwarded`, and treating a header it did not write as a second
+    // opinion on one it did hands the client address to whoever sent it. A
+    // proxy that *overwrites* `X-Forwarded-For` — the near-universal minimum
+    // — while forwarding `Forwarded` verbatim is exactly the configuration
+    // where that path is the only reachable one, and the address ends up in
+    // the throttle key and in `client_ip` on the failed-login line.
+    //
+    // Unreadable means *anything* the grammar cannot use, and which arm runs
+    // is decided by `present` rather than by whether an element came back. A
+    // value that does not parse, a value that is empty, a value that is only
+    // separators, and a value that is not UTF-8 are one case: the proxy wrote
+    // the header, so the peer stands. Deciding on the element instead splits
+    // that case in two, and the half that reaches `Forwarded` takes the
+    // client's word for the client's address.
+    //
+    // `last_element` decides emptiness at the same granularity, on the final
+    // element and on no other. The two rules have to agree: a `present` that
+    // asks about the header while `last` searches leftward for something
+    // readable puts the client's own entry back in the answer without ever
+    // reaching this arm.
+    //
+    // Both arms go through `node_addr`, so they parse one grammar: the bare
+    // address, `host:port`, and a bracketed IPv6 literal are read the same on
+    // either. Otherwise the *stricter* parser is the one that falls through
+    // to the *less* trustworthy source, which is how the asymmetry bit.
+    let xff = last_element(req, "x-forwarded-for");
+    let ip = if xff.present {
+        xff.last.and_then(node_addr).or(Some(peer))
+    } else {
+        forwarded
+            .last
+            .and_then(|f| param(f, "for"))
+            .and_then(|node| node_addr(&node))
+            .or(Some(peer))
+    };
 
-    let secure = last_element(req, "x-forwarded-proto")
-        .is_some_and(|p| p.eq_ignore_ascii_case("https"))
-        || forwarded
-            .and_then(|f| param(f, "proto"))
-            .is_some_and(|p| p.eq_ignore_ascii_case("https"));
+    // The same precedence, and the same presence rule, for the scheme. An
+    // `||` across the two headers lets a client-supplied `proto=https`
+    // override the trusted proxy's explicit `X-Forwarded-Proto: http`, which
+    // issues the session cookie `Secure` over a plain-HTTP request: the
+    // browser then neither stores nor returns it over http:// and the
+    // operator cannot log in at all. One function must not carry two opposite
+    // rules.
+    //
+    // Where `X-Forwarded-Proto` is present and unreadable the answer is
+    // `false`, not `Forwarded`'s. `false` is the safe direction here — it
+    // only ever withholds `Secure`, and the operator can still log in.
+    //
+    // *Which element* answers is the one thing that differs from the address,
+    // and it differs because the question does. "Last" on the address chain
+    // means the hop the trusted proxy saw, which is the client. The scheme
+    // asks whether the **original** request was over TLS, and any element
+    // that says `https` answers it: a TLS-terminating edge in front of a
+    // plain-HTTP inner proxy, each appending, writes `https, http`, and
+    // taking the last element there returns `false` for a deployment whose
+    // original request genuinely was TLS — so the session cookie ships
+    // without `Secure` and the browser sends it in clear to any plain-HTTP
+    // origin on that host. That is the harm this change exists to remove,
+    // arriving from the rule meant to prevent it.
+    //
+    // So: `https` anywhere in a readable chain means the original request was
+    // over TLS. The two rules compose: `last` still decides whether the
+    // header is *readable*, and the chain decides what a readable one says.
+    //
+    // **The same rule for both names.** `Forwarded`'s `proto=` used to keep
+    // the last-element rule, on the reasoning that a `Forwarded` element
+    // carries `for=` and `proto=` together so one element should answer both.
+    // That reasoning does not survive contact with the `X-` names, which
+    // already answer the two questions from different ends of the chain
+    // without difficulty — and the cost of keeping it was that the same
+    // two-hop TLS deployment got opposite answers depending on which header
+    // its proxies speak. Demonstrated live: `X-Forwarded-Proto: https, http`
+    // set `Secure` while `Forwarded: proto=https, proto=http` did not, as did
+    // the ordinary RFC 7239 chain `proto=https, for=1.2.3.4` — a TLS edge
+    // naming the scheme, an inner proxy appending only `for=` because it
+    // terminated no TLS. On the standardised name that is F23's original
+    // harm, live.
+    //
+    // What is given up to get there is recorded on `Client::secure`: a
+    // client's own earlier `https` now wins wherever a trusted proxy appends
+    // rather than overwrites. The two harms are the same bytes and nothing in
+    // a request separates them, so the rule follows the smaller harm.
+    let xfp = last_element(req, "x-forwarded-proto");
+    let secure = if xfp.present {
+        xfp.last.is_some()
+            && elements(req, "x-forwarded-proto").any(|p| p.eq_ignore_ascii_case("https"))
+    } else {
+        forwarded.last.is_some()
+            && elements(req, "forwarded")
+                .filter_map(|e| param(e, "proto"))
+                .any(|p| p.eq_ignore_ascii_case("https"))
+    };
 
-    Client { ip, secure }
+    // The peer was unmapped at the top; this is the same fold for an address
+    // a *header* supplied, which can arrive in either spelling too. Between
+    // them every consumer gets one spelling per host. The address reaches
+    // three things — the throttle key, the `client_ip` log field, and nothing
+    // else that compares addresses — and two spellings of one host is two
+    // throttle buckets and two log identities. Trust matching unmaps both
+    // sides as well; these are the three halves of one position.
+    Client {
+        ip: ip.map(unmap),
+        secure,
+    }
 }
 
 #[cfg(test)]
@@ -269,6 +723,22 @@ mod tests {
                 HeaderValue::from_str(v).unwrap(),
             );
         }
+        r
+    }
+
+    /// A request whose last field line for `name` is raw bytes that are not
+    /// UTF-8, preceded by whatever `before` lines the case needs.
+    fn req_with_raw_last(peer: &str, name: &str, before: &[&str], raw: &[u8]) -> Request<()> {
+        let mut r = Request::new(());
+        r.extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 12345)));
+        let header = axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap();
+        for v in before {
+            r.headers_mut()
+                .append(header.clone(), HeaderValue::from_str(v).unwrap());
+        }
+        r.headers_mut()
+            .append(header, HeaderValue::from_bytes(raw).unwrap());
         r
     }
 
@@ -357,25 +827,39 @@ mod tests {
     }
 
     #[test]
-    fn a_second_proto_field_line_wins_over_the_first() {
+    fn a_second_proto_field_line_is_read_at_all() {
+        // Repeated field lines are one comma-joined value (RFC 9110
+        // §5.2-5.3), so both lines have to be read. Reading only
+        // `HeaderMap::get` — the first line — answers `false` here.
+        //
+        // This test previously asserted the opposite pairing: `https` then
+        // `http` across two lines meant *not* secure, on the last-hop rule
+        // the address uses. The scheme does not take its answer from the same
+        // end of the chain — see `Client::secure` — so that expectation was
+        // the defect, not the property. `a_tls_edge_in_front_of_a_plain_inner_proxy_is_still_secure`
+        // pins the corrected direction; this pins that the second line is
+        // read.
         let c = resolve(
             &req_appending(
                 "10.1.2.3",
                 &[
-                    ("x-forwarded-proto", "https"),
                     ("x-forwarded-proto", "http"),
+                    ("x-forwarded-proto", "https"),
                 ],
             ),
             &trusted(&["10.0.0.0/8"]),
         );
         assert!(
-            !c.secure,
-            "the proxy's own line said http; the client's earlier https must not win",
+            c.secure,
+            "the second field line names a TLS hop and must be read",
         );
     }
 
     #[test]
     fn a_second_forwarded_field_line_wins_over_the_first() {
+        // The address takes the last field line — the trusted proxy's — and
+        // the scheme reads every element of the joined chain, which is the
+        // same pair of rules `X-Forwarded-For` and `X-Forwarded-Proto` follow.
         let c = resolve(
             &req_appending(
                 "10.1.2.3",
@@ -386,16 +870,37 @@ mod tests {
             ),
             &trusted(&["10.0.0.0/8"]),
         );
-        assert!(!c.secure, "the last field line is the trusted proxy's");
+        assert_eq!(
+            c.ip,
+            Some("203.0.113.4".parse().unwrap()),
+            "the last field line is the trusted proxy's, and it names the client",
+        );
+        assert!(
+            c.secure,
+            "an earlier line naming a TLS hop is an outer hop, not a stale \
+             claim the inner one corrects",
+        );
     }
 
     #[test]
-    fn an_earlier_forwarded_element_cannot_supply_the_scheme() {
-        // The same last-hop rule as X-Forwarded-For, one level down: a proxy
-        // that appends rather than strips leaves the client's element first.
-        // Splitting the whole header on `;` accepted that element's
-        // `proto=https` over a plain-HTTP request, which issues the session
-        // cookie `Secure` and stops the browser returning it over http://.
+    fn an_earlier_forwarded_element_supplies_the_scheme_too() {
+        // Inverted deliberately, and the property it used to pin — "a
+        // client's earlier element cannot supply the scheme" — is given up
+        // rather than moved; `Client::secure` records which property and why.
+        //
+        // `Forwarded` now answers the scheme the way `X-Forwarded-Proto`
+        // does: `https` anywhere in a readable chain. The case that forced it
+        // is the ordinary RFC 7239 one — a TLS edge that names the scheme and
+        // an inner proxy that appends only `for=` because it terminated no
+        // TLS — where the last element has no `proto=` at all and the
+        // last-element rule withheld `Secure` from a deployment that really
+        // was TLS-fronted.
+        //
+        // What is conceded is the other reading of the same bytes: a client
+        // that plants `proto=https` in front of an appending proxy now marks
+        // its **own** session cookie `Secure`, which the browser will neither
+        // store nor return over `http://`. That breaks the forger's own
+        // login and nobody else's.
         let c = resolve(
             &req(
                 "10.1.2.3",
@@ -404,9 +909,77 @@ mod tests {
             &trusted(&["10.0.0.0/8"]),
         );
         assert!(
-            !c.secure,
-            "only the last element's proto counts; an earlier one is another hop's",
+            c.secure,
+            "an element saying https is a hop that terminated TLS, whichever \
+             end of the chain it sits at",
         );
+        assert_eq!(
+            c.ip,
+            Some("203.0.113.9".parse().unwrap()),
+            "and the address still comes from the last element only",
+        );
+
+        // The TLS edge whose inner hop appends no `proto=` at all. This is
+        // the shape the last-element rule could not answer: it read the final
+        // element, found no scheme, and said `false`.
+        let c = resolve(
+            &req("10.1.2.3", &[("forwarded", "proto=https, for=1.2.3.4")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            c.secure,
+            "an inner proxy that terminated no TLS appends no proto=; that is \
+             not the edge withdrawing its own https",
+        );
+
+        // The control: a chain with no TLS hop anywhere is not secure.
+        let c = resolve(
+            &req("10.1.2.3", &[("forwarded", "proto=http, proto=http")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(!c.secure, "no element names a TLS hop");
+
+        // And readability still gates the chain, exactly as it does for
+        // `X-Forwarded-Proto`: a final element the trusted proxy wrote and
+        // that carries nothing makes the header unreadable, and unreadable is
+        // `false` however much `https` sits to its left.
+        let c = resolve(
+            &req("10.1.2.3", &[("forwarded", "proto=https,")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            !c.secure,
+            "the proxy's own final element carries nothing, so the header is \
+             unreadable",
+        );
+    }
+
+    #[test]
+    fn the_scheme_rule_is_the_same_under_either_header_name() {
+        // The property: a deployment gets the same answer whichever name its
+        // proxies speak. Before this, the same two-hop TLS chain set `Secure`
+        // on `X-Forwarded-Proto` and withheld it on `Forwarded`, so the
+        // standardised header was the one that shipped the session cookie in
+        // clear.
+        let case = |headers: &[(&str, &str)]| {
+            resolve(&req("10.1.2.3", headers), &trusted(&["10.0.0.0/8"])).secure
+        };
+
+        for (xfp, fwd) in [
+            ("https, http", "proto=https, proto=http"),
+            ("https", "proto=https"),
+            ("http, https", "proto=http, proto=https"),
+            ("http", "proto=http"),
+            ("http, http", "proto=http, proto=http"),
+            ("https,", "proto=https,"),
+        ] {
+            assert_eq!(
+                case(&[("x-forwarded-proto", xfp)]),
+                case(&[("forwarded", fwd)]),
+                "X-Forwarded-Proto: {xfp:?} and Forwarded: {fwd:?} are the \
+                 same chain and must give the same answer",
+            );
+        }
     }
 
     #[test]
@@ -422,6 +995,206 @@ mod tests {
             "a proxy emitting only the standardised header must still be able \
              to name its client",
         );
+    }
+
+    #[test]
+    fn a_quoted_forwarded_parameter_cannot_reframe_the_grammar() {
+        // The property: RFC 7239 §4 separators inside a quoted string are
+        // data, not structure. The parameter a proxy routinely quotes is
+        // `host=`, because the client's `Host` may hold characters a token
+        // may not — so a naive split hands the client the element boundary
+        // and the parameter list, and the failure direction is toward a
+        // client-controlled address and a client-controlled scheme.
+        let case = |v: &str| {
+            resolve(
+                &req("10.1.2.3", &[("forwarded", v)]),
+                &trusted(&["10.0.0.0/8"]),
+            )
+        };
+        let proxy: Option<IpAddr> = Some("198.51.100.9".parse().unwrap());
+
+        // A comma inside `host=` is not an element boundary.
+        let c = case(r#"for=198.51.100.9;host="a,for=6.6.6.6""#);
+        assert_eq!(
+            c.ip, proxy,
+            "the quoted comma does not start a second element, so the \
+             proxy's own for= still decides",
+        );
+
+        // A semicolon inside `host=` is not a parameter boundary.
+        let c = case(r#"host="a;for=6.6.6.6";for=198.51.100.9"#);
+        assert_eq!(
+            c.ip, proxy,
+            "the quoted semicolon does not introduce a second parameter",
+        );
+
+        // The same, on the scheme: a quoted `proto=` is not a `proto=`.
+        let c = case(r#"for=198.51.100.9;host="a,proto=https""#);
+        assert!(
+            !c.secure,
+            "a quoted proto= is part of host=, and must not set Secure",
+        );
+        assert_eq!(
+            c.ip, proxy,
+            "and the element's own for= survives the quoted comma",
+        );
+        let c = case(r#"host="x;proto=https";proto=http"#);
+        assert!(
+            !c.secure,
+            "the element's own proto=http decides, not the quoted text",
+        );
+
+        // `quoted-pair`: the escaped quote is data, so the string does not
+        // end there and the value keeps the quote.
+        assert_eq!(
+            param(r#"host="a\"b";for=198.51.100.9"#, "host").as_deref(),
+            Some(r#"a"b"#),
+            "a backslash escape is unwrapped rather than left in the value",
+        );
+        assert_eq!(
+            param(r#"host="a\"b";for=198.51.100.9"#, "for").as_deref(),
+            Some("198.51.100.9"),
+            "and the escaped quote does not swallow the rest of the element",
+        );
+
+        // Unquoting is not trimming quote characters off the ends.
+        assert_eq!(param(r#"host="""#, "host").as_deref(), Some(""));
+        assert_eq!(param("host=plain", "host").as_deref(), Some("plain"));
+    }
+
+    #[test]
+    fn one_unbalanced_quote_cannot_swallow_the_proxys_own_element() {
+        // The property: a `"` may re-frame a value only where the value's own
+        // grammar says it is structure, and even there only where the quoted
+        // string it opens is closed. Every value below is what the daemon
+        // sees *after* an appending proxy has added its own contribution to
+        // the client's text — `$proxy_add_x_forwarded_for` is raw
+        // concatenation, so the client owns everything left of the comma.
+        //
+        // Applying RFC 7239 §4's quoting to all three names put the trusted
+        // proxy's own appended element inside the client's quoted segment, so
+        // the positional last element became the client's text. Demonstrated
+        // end to end: eight failed logins each planting one quote returned
+        // `401` eight times and were never throttled, while eight honest ones
+        // locked out at the sixth and were still locked afterwards, and the
+        // security log carried eight addresses the client chose.
+        let proxy: Option<IpAddr> = Some("203.0.113.1".parse().unwrap());
+        let case = |name: &str, v: &str| {
+            resolve(&req("10.1.2.3", &[(name, v)]), &trusted(&["10.0.0.0/8"])).ip
+        };
+
+        // `X-Forwarded-For` has no quoted-string grammar, so a `"` is data.
+        for v in [
+            r#"[6.6.6.6]", 203.0.113.1"#,
+            r#"6.6.6.6:80", 203.0.113.1"#,
+            r#"[6.6.6.6]:80", 203.0.113.1"#,
+            r#""6.6.6.6, 203.0.113.1"#,
+            r#"6.6.6.6";q=", 203.0.113.1"#,
+        ] {
+            assert_eq!(
+                case("x-forwarded-for", v),
+                proxy,
+                "X-Forwarded-For: {v:?} — a quote is ordinary data here, so \
+                 the proxy's own trailing element is still the last one",
+            );
+        }
+
+        // `Forwarded` does have the grammar, but an *unterminated* quoted
+        // string is not a quoted string: RFC 7239 §4 requires the closing
+        // DQUOTE, and honouring the opening one lets the client's element
+        // swallow the proxy's.
+        for v in [
+            r#"for=6.6.6.6:80", for=203.0.113.1"#,
+            r#"host="a, for=203.0.113.1"#,
+            r#"for=6.6.6.6;host="a;x, for=203.0.113.1"#,
+        ] {
+            assert_eq!(
+                case("forwarded", v),
+                proxy,
+                "Forwarded: {v:?} leaves a quote open, so it is not a quoted \
+                 string and the proxy's own element still decides",
+            );
+        }
+
+        // The control that must keep working: a *closed* quoted string on
+        // `Forwarded` is still structure, which is the whole of the repair
+        // that introduced this hole.
+        assert_eq!(
+            case("forwarded", r#"for=203.0.113.1;host="a,for=6.6.6.6""#),
+            proxy,
+            "a closed quoted string still hides its comma",
+        );
+
+        // And on the scheme, where the same byte runs the other way: merging
+        // a TLS edge's own `https` into one unmatchable element withholds
+        // `Secure` from a deployment that really is TLS-fronted, and the
+        // session cookie then travels in clear.
+        let secure = |v: &str| {
+            resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", v)]),
+                &trusted(&["10.0.0.0/8"]),
+            )
+            .secure
+        };
+        assert!(
+            secure(r#"", https"#),
+            "the client's lone quote is data; the TLS edge's own https still \
+             names a hop that terminated TLS",
+        );
+        assert!(
+            !secure(r#"", http"#),
+            "and the control still names no TLS hop",
+        );
+
+        // The per-name half of the rule, asserted where it lives. Once an
+        // unterminated quote is data, no value an *appending* proxy can
+        // produce separates the two splitters at `resolve`: for the final
+        // comma to fall inside a terminated quoted string there must be a
+        // quote to the right of it, and everything to the right of it is the
+        // proxy's own contribution, which has none. So the rule that a
+        // grammar belongs only to the header that defines it is pinned at the
+        // splitter rather than through an outcome it cannot change.
+        assert_eq!(
+            split_elements("x-forwarded-for", r#""a,b", 1.2.3.4"#, ',').collect::<Vec<_>>(),
+            vec![r#""a"#, r#"b""#, " 1.2.3.4"],
+            "X-Forwarded-For has no quoted-string production, so every comma \
+             is a separator",
+        );
+        assert_eq!(
+            split_elements("x-forwarded-proto", r#""https,http", https"#, ',').collect::<Vec<_>>(),
+            vec![r#""https"#, r#"http""#, " https"],
+        );
+        assert_eq!(
+            split_elements("forwarded", r#"host="a,b", for=1.2.3.4"#, ',').collect::<Vec<_>>(),
+            vec![r#"host="a,b""#, " for=1.2.3.4"],
+            "Forwarded does have one, and a closed quoted string still hides \
+             its comma",
+        );
+    }
+
+    #[test]
+    fn a_bracketed_ipv4_literal_is_read_as_an_address() {
+        // Half of the primitive the quote spelling above needs: `node_addr`
+        // takes everything between the brackets, and `[6.6.6.6]` parses as an
+        // address even though the brackets exist for IPv6 literals. That is
+        // what let `[6.6.6.6]", 203.0.113.1` — one element, once the quote
+        // was honoured — yield `6.6.6.6` rather than nothing.
+        //
+        // It is pinned rather than changed: rejecting it would not have
+        // closed the hole (`6.6.6.6:80"` needs no brackets and resolved the
+        // same way), and a bracketed literal is how RFC 7239 §6 spells a node
+        // whether or not the address inside is v6.
+        assert_eq!(
+            node_addr("[6.6.6.6]"),
+            Some("6.6.6.6".parse().unwrap()),
+            "the brackets are the node syntax, not a family declaration",
+        );
+        assert_eq!(node_addr("[6.6.6.6]:80"), Some("6.6.6.6".parse().unwrap()),);
+        assert_eq!(
+            node_addr("[2001:db8::1]:443"),
+            Some("2001:db8::1".parse().unwrap()),
+        );
+        assert_eq!(node_addr("[not-an-ip]"), None);
     }
 
     #[test]
@@ -458,6 +1231,460 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_x_forwarded_for_falls_back_to_the_peer_not_to_forwarded() {
+        // The trusted proxy wrote `X-Forwarded-For` and did not write
+        // `Forwarded`. Reading `Forwarded` when the header the proxy *did*
+        // write fails to parse hands the client address to whoever sent it —
+        // and a proxy that overwrites `X-Forwarded-For` while forwarding
+        // `Forwarded` verbatim is the near-universal minimum, so that path is
+        // the only one an attacker needs. The address reached here is the
+        // throttle key and the `client_ip` on the failed-login line.
+        let attacker = ("forwarded", "for=203.0.113.99");
+
+        // A port-suffixed value is not unreadable. Both arms parse one
+        // grammar, so the proxy's own value is read rather than discarded.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[("x-forwarded-for", "198.51.100.7:52014"), attacker],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some("198.51.100.7".parse().unwrap()),
+            "the stricter parser must not be the one that falls through: \
+             host:port is an address on this arm too",
+        );
+
+        // Unreadable by any grammar: the socket peer stands, and the header
+        // the proxy never wrote is not consulted at all.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[("x-forwarded-for", "not-an-address"), attacker],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some("10.1.2.3".parse().unwrap()),
+            "an unreadable X-Forwarded-For stands the peer up; `Forwarded` is \
+             not a second opinion on a header the proxy did write",
+        );
+    }
+
+    #[test]
+    fn a_present_but_empty_x_forwarded_for_stands_the_peer_up_too() {
+        // "Unreadable" is decided on the header's *presence*, not on whether
+        // an element survived parsing. Emptiness, separators-only and
+        // non-UTF-8 bytes are all values the trusted proxy wrote, so each
+        // stands the socket peer up exactly as an unparseable one does.
+        //
+        // Deciding on the surviving element instead splits the unreadable
+        // case in two and sends half of it to `Forwarded` — the one header
+        // the proxy did not write — which hands the client address, the
+        // throttle key and the `client_ip` on the failed-login line to
+        // whoever sent it.
+        let attacker = ("forwarded", "for=203.0.113.98");
+        let peer = Some("10.1.2.3".parse().unwrap());
+
+        for empty in ["", "  ", ",", " ,  , "] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-for", empty), attacker]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert_eq!(
+                c.ip, peer,
+                "X-Forwarded-For: {empty:?} is present and carries nothing \
+                 readable, so the peer stands rather than the client's \
+                 `Forwarded`",
+            );
+        }
+
+        // Non-UTF-8 is the same case. `to_str` fails, no element survives,
+        // and the name was still present.
+        let mut r = Request::new(());
+        r.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "10.1.2.3".parse().unwrap(),
+            12345,
+        )));
+        r.headers_mut().insert(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        r.headers_mut()
+            .insert("forwarded", HeaderValue::from_static("for=203.0.113.98"));
+        assert_eq!(
+            resolve(&r, &trusted(&["10.0.0.0/8"])).ip,
+            peer,
+            "a non-UTF-8 X-Forwarded-For is unreadable, not absent",
+        );
+    }
+
+    #[test]
+    fn an_unreadable_last_x_forwarded_for_element_stands_the_peer_up() {
+        // The property: emptiness is decided on the **final** element, not on
+        // whichever element happens to be readable. The case above makes the
+        // *whole* header yield nothing, which is why it never caught this.
+        //
+        // A trusted proxy that appends rather than overwrites can contribute
+        // an element that evaluates empty — `option forwardfor` style
+        // appending over an inner header that was not there. Searching
+        // leftward for something readable then returns the element before it,
+        // and the elements before the trusted proxy's are the client's. The
+        // client's forged value becomes the resolved address: the throttle
+        // key, and the `client_ip` on the failed-login line.
+        let peer = Some("10.1.2.3".parse().unwrap());
+        let forged = "6.6.6.6";
+
+        for value in ["6.6.6.6,", "6.6.6.6, ", "6.6.6.6, ,", "6.6.6.6,,"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-for", value)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert_eq!(
+                c.ip, peer,
+                "X-Forwarded-For: {value:?} ends in an element the proxy \
+                 wrote and that carries nothing, so the peer stands — \
+                 {forged} is the client's own entry",
+            );
+        }
+
+        // The same shape across field lines: the trusted proxy appended a
+        // whole new line, and its line is the empty one.
+        let c = resolve(
+            &req_appending(
+                "10.1.2.3",
+                &[("x-forwarded-for", "6.6.6.6"), ("x-forwarded-for", "")],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip, peer,
+            "the last field line is the trusted proxy's and it is empty, so \
+             the client's earlier line is not the answer",
+        );
+
+        // And where the trusted proxy's own field line is not UTF-8. `to_str`
+        // failing on the final line is the final element being unreadable,
+        // not a reason to read the line before it.
+        let c = resolve(
+            &req_with_raw_last("10.1.2.3", "x-forwarded-for", &["6.6.6.6"], &[0xff, 0xfe]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip, peer,
+            "a non-UTF-8 last field line is unreadable, and the readable line \
+             before it is the client's",
+        );
+
+        // The control, which must keep working: two readable elements still
+        // resolve to the last one.
+        let c = resolve(
+            &req("10.1.2.3", &[("x-forwarded-for", "6.6.6.6, 5.5.5.5")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some("5.5.5.5".parse().unwrap()),
+            "a readable final element is still the answer",
+        );
+    }
+
+    #[test]
+    fn a_v4_mapped_client_address_resolves_to_its_v4_form() {
+        // The property: one host is one spelling. `Cidr::contains` unmaps a
+        // v4-mapped peer before matching it, on the grounds that it is the
+        // same host — so the *resolved* address has to be unmapped too, or
+        // the two halves of the module disagree and one host becomes two
+        // throttle buckets and two `client_ip` values in the security log.
+        let v4: IpAddr = "198.51.100.88".parse().unwrap();
+
+        for spelling in ["::ffff:198.51.100.88", "::ffff:c633:6458"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-for", spelling)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert_eq!(
+                c.ip,
+                Some(v4),
+                "{spelling} is the same host as its v4 form, and has to be \
+                 the same key",
+            );
+        }
+
+        // Through `Forwarded` as well, which is a second route to the same
+        // field.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[("forwarded", "for=\"[::ffff:198.51.100.88]\"")],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(c.ip, Some(v4));
+
+        // And for the socket peer, which is what a dual-stack listener
+        // reports for a v4 client.
+        let c = resolve(&req("::ffff:10.1.2.3", &[]), &trusted(&["10.0.0.0/8"]));
+        assert_eq!(
+            c.ip,
+            Some("10.1.2.3".parse::<IpAddr>().unwrap()),
+            "a dual-stack listener's v4-mapped peer is one host too",
+        );
+
+        // A genuine v6 address is not touched.
+        let c = resolve(
+            &req("10.1.2.3", &[("x-forwarded-for", "2001:db8::1")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(c.ip, Some("2001:db8::1".parse::<IpAddr>().unwrap()));
+    }
+
+    #[test]
+    fn an_untrusted_v4_mapped_peer_resolves_to_its_v4_form_too() {
+        // The property: one host is one spelling on **every** path out of
+        // `resolve`, not only the one that reaches the fold at the bottom.
+        // The untrusted branch returns before that fold, so on a dual-stack
+        // `[::]` bind a client arriving directly kept its `::ffff:` spelling
+        // while the same host named through the trusted proxy was folded —
+        // two `client_ip` values and two `HashMap<IpAddr, _>` keys for one
+        // host, in one daemon, under one configuration. Demonstrated: ten
+        // failures before both buckets locked, where five against one
+        // spelling locks, with the client choosing which route it takes.
+        let v4: IpAddr = "198.51.100.9".parse().unwrap();
+
+        // Untrusted: the header is ignored and the socket peer stands up —
+        // in its v4 form.
+        let c = resolve(
+            &req("::ffff:198.51.100.9", &[("x-forwarded-for", "6.6.6.6")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some(v4),
+            "an untrusted v4-mapped peer is the same host as its v4 form, and \
+             has to be the same throttle key",
+        );
+
+        // With no trust list at all — the default — the same.
+        let c = resolve(
+            &req("::ffff:198.51.100.9", &[]),
+            &TrustedProxies::parse(&[]).unwrap(),
+        );
+        assert_eq!(c.ip, Some(v4));
+
+        // And the trusted route names the same host by the same spelling, so
+        // the two routes agree rather than merely each being consistent.
+        let c = resolve(
+            &req("10.1.2.3", &[("x-forwarded-for", "::ffff:198.51.100.9")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(c.ip, Some(v4));
+    }
+
+    #[test]
+    fn a_tls_edge_in_front_of_a_plain_inner_proxy_is_still_secure() {
+        // The property: `secure` is the **outermost** hop's answer. TLS is
+        // terminated at the edge, so a chain written by a TLS edge in front
+        // of a plain-HTTP inner proxy — each appending — reads `https, http`,
+        // and the original request there was over TLS.
+        //
+        // Taking the last element instead returns `false` and issues the
+        // session cookie without `Secure` on a deployment that really is
+        // TLS-fronted, so the browser sends it in clear to any plain-HTTP
+        // origin on that host. That is the harm this change exists to remove.
+        for value in ["https, http", "https,http", "https, http, http"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", value)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert!(
+                c.secure,
+                "X-Forwarded-Proto: {value:?} begins at a TLS edge, so the \
+                 original request was over TLS",
+            );
+        }
+
+        // The same across field lines, which is how an appending proxy that
+        // adds its own line writes it.
+        let c = resolve(
+            &req_appending(
+                "10.1.2.3",
+                &[
+                    ("x-forwarded-proto", "https"),
+                    ("x-forwarded-proto", "http"),
+                ],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            c.secure,
+            "a second field line saying http is an inner hop, not a \
+             correction of the edge",
+        );
+
+        // The control: a chain with no TLS hop anywhere is not secure.
+        for value in ["http", "http, http"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", value)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert!(!c.secure, "X-Forwarded-Proto: {value:?} names no TLS hop");
+        }
+    }
+
+    #[test]
+    fn an_unreadable_last_x_forwarded_proto_element_withholds_secure() {
+        // The scheme arm of the same rule. `X-Forwarded-Proto` is present, so
+        // it decides; its final element is the trusted proxy's, and where
+        // that element carries nothing the header is unreadable and `secure`
+        // is `false`. Reading leftward instead lets a client's own earlier
+        // `https` issue a `Secure` cookie over a plain-HTTP request, which
+        // the browser will neither store nor return — so the caller cannot
+        // log in.
+        for value in ["https,", "https, ", "https, ,", "https,,"] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", value)]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert!(
+                !c.secure,
+                "X-Forwarded-Proto: {value:?} ends in an element that carries \
+                 nothing, so the header is unreadable and `Secure` is \
+                 withheld",
+            );
+        }
+
+        let c = resolve(
+            &req_appending(
+                "10.1.2.3",
+                &[("x-forwarded-proto", "https"), ("x-forwarded-proto", "")],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            !c.secure,
+            "the trusted proxy's own field line is the empty one; the \
+             client's earlier https is not the answer",
+        );
+
+        let c = resolve(
+            &req_with_raw_last("10.1.2.3", "x-forwarded-proto", &["https"], &[0xff, 0xfe]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            !c.secure,
+            "a non-UTF-8 last field line is unreadable, not absent",
+        );
+    }
+
+    #[test]
+    fn a_present_but_empty_x_forwarded_proto_does_not_let_forwarded_decide() {
+        // The scheme arm, at the same spelling. `X-Forwarded-Proto` decides
+        // wherever it is *present*; present and unreadable means `false`,
+        // which only ever withholds `Secure`. Letting the client's
+        // `Forwarded: proto=https` decide instead issues a `Secure` cookie
+        // over a plain-HTTP request, which the browser will neither store nor
+        // return — so the operator cannot log in at all.
+        let attacker = ("forwarded", "proto=https");
+
+        for empty in ["", "  ", ",", " ,  , "] {
+            let c = resolve(
+                &req("10.1.2.3", &[("x-forwarded-proto", empty), attacker]),
+                &trusted(&["10.0.0.0/8"]),
+            );
+            assert!(
+                !c.secure,
+                "X-Forwarded-Proto: {empty:?} is present, so it decides, and \
+                 it does not say https",
+            );
+        }
+
+        let mut r = Request::new(());
+        r.extensions_mut().insert(ConnectInfo(SocketAddr::new(
+            "10.1.2.3".parse().unwrap(),
+            12345,
+        )));
+        r.headers_mut().insert(
+            "x-forwarded-proto",
+            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        r.headers_mut()
+            .insert("forwarded", HeaderValue::from_static("proto=https"));
+        assert!(
+            !resolve(&r, &trusted(&["10.0.0.0/8"])).secure,
+            "a non-UTF-8 X-Forwarded-Proto is unreadable, not absent",
+        );
+    }
+
+    #[test]
+    fn an_absent_x_forwarded_for_still_reads_forwarded() {
+        // Only the *unreadable* case changed. Where the proxy sent no
+        // `X-Forwarded-For` at all — the RFC 7239-only deployment — its
+        // `for=` still names the client, and the scheme arm is independent
+        // of the address arm.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[
+                    ("x-forwarded-proto", "https"),
+                    ("forwarded", "for=198.51.100.7"),
+                ],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert_eq!(
+            c.ip,
+            Some("198.51.100.7".parse().unwrap()),
+            "a proxy emitting only the standardised header must still be able \
+             to name its client",
+        );
+        assert!(c.secure);
+    }
+
+    #[test]
+    fn an_explicit_x_forwarded_proto_is_not_overridden_by_forwarded() {
+        // The scheme follows the same precedence as the address. The trusted
+        // proxy terminated plain HTTP and said so; a client whose `Forwarded`
+        // the proxy passed through verbatim — nginx's default for a header it
+        // does not know — must not turn that into https. It would issue the
+        // session cookie `Secure` over a plain-HTTP request, and the browser
+        // then neither stores nor returns it over http://, so the operator
+        // cannot log in at all.
+        let c = resolve(
+            &req(
+                "10.1.2.3",
+                &[("x-forwarded-proto", "http"), ("forwarded", "proto=https")],
+            ),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            !c.secure,
+            "X-Forwarded-Proto decides where it is present; Forwarded is the \
+             fallback, not a second opinion",
+        );
+    }
+
+    #[test]
+    fn a_single_forwarded_element_still_supplies_the_scheme() {
+        // The other direction of the same rule, so precedence is pinned both
+        // ways: with no `X-Forwarded-Proto` there is nothing to take
+        // precedence over, and a proxy emitting only RFC 7239 still sets
+        // `Secure`. One element, so last-wins has nothing to discard either.
+        let c = resolve(
+            &req("10.1.2.3", &[("forwarded", "proto=https")]),
+            &trusted(&["10.0.0.0/8"]),
+        );
+        assert!(
+            c.secure,
+            "Forwarded is the fallback where X-Forwarded-Proto is absent, and \
+             a fallback that never fires is not a fallback",
+        );
+    }
+
+    #[test]
     fn x_forwarded_for_is_preferred_over_forwarded() {
         // Both name a client; the near-universal header is the one to trust
         // first, and the choice has to be fixed rather than incidental.
@@ -482,6 +1709,47 @@ mod tests {
         assert!(Cidr::parse("127.0.0.1")
             .unwrap()
             .contains("::ffff:127.0.0.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_v4_mapped_trust_entry_matches_the_v4_peer_it_names() {
+        // The other side of the same fold. `docs/running.md` teaches
+        // `::ffff:198.51.100.9` and `198.51.100.9` as one client and tells
+        // the operator to name the address their proxy connects from, which
+        // on a dual-stack host is the spelling they read out of a log — so
+        // the trust list has to match it. Demonstrated: a daemon booted with
+        // `trusted_proxies = ["::ffff:127.0.0.1"]` logged that trust set,
+        // passed `--check-config`, and then ignored every forwarding header
+        // from 127.0.0.1. It fails closed, but the logged set and the
+        // effective set disagreed.
+        assert!(Cidr::parse("::ffff:127.0.0.1")
+            .unwrap()
+            .contains("127.0.0.1".parse().unwrap()));
+        assert!(Cidr::parse("::ffff:127.0.0.1")
+            .unwrap()
+            .contains("::ffff:127.0.0.1".parse().unwrap()));
+        assert!(!Cidr::parse("::ffff:127.0.0.1")
+            .unwrap()
+            .contains("127.0.0.2".parse().unwrap()));
+
+        // A prefix inside the mapped `/96` drops those 96 bits rather than
+        // being read as a v4 prefix length: `/104` is `10.0.0.0/8` and
+        // `/120` is `10.0.0.0/24`.
+        let net = Cidr::parse("::ffff:10.0.0.0/104").unwrap();
+        assert!(net.contains("10.1.0.1".parse().unwrap()));
+        assert!(!net.contains("11.0.0.1".parse().unwrap()));
+        let net = Cidr::parse("::ffff:10.0.0.0/120").unwrap();
+        assert!(net.contains("10.0.0.1".parse().unwrap()));
+        assert!(!net.contains("10.0.1.1".parse().unwrap()));
+
+        // A genuine v6 block still does not match a v4 peer, and the
+        // converse.
+        assert!(!Cidr::parse("2001:db8::/32")
+            .unwrap()
+            .contains("10.0.0.1".parse().unwrap()));
+        assert!(!Cidr::parse("10.0.0.0/8")
+            .unwrap()
+            .contains("2001:db8::1".parse().unwrap()));
     }
 
     #[test]
