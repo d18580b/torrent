@@ -15,6 +15,7 @@ use anyhow::Context;
 use parking_lot::Mutex;
 use torrentd_engine::AddParams;
 use torrentd_engine::AlertSource;
+use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
@@ -250,6 +251,7 @@ pub async fn run_verify_queue(
     state: Arc<StateMap>,
     metrics: Arc<crate::metrics_sink::PromSink>,
     profiles: Arc<crate::profile_registry::ProfileRegistry>,
+    registry: Arc<AssignmentRegistry>,
     mut shutdown: tokio::sync::broadcast::Receiver<torrentd_engine::ShutdownReason>,
 ) {
     use torrentd_engine::MetricsSink;
@@ -340,6 +342,7 @@ pub async fn run_verify_queue(
             }
             let Some(engine) = source.engine_for(&item.profile) else {
                 warn!(target: "torrentd::pool", profile_id = %item.profile, "no engine for profile; dropping verify");
+                release_dropped_claim(&registry, &item);
                 continue;
             };
             let bytes = match std::fs::read(&item.torrent_path) {
@@ -352,6 +355,7 @@ pub async fn run_verify_queue(
                         "cannot read .torrent; dropping verify",
                     );
                     q.failed.fetch_add(1, Ordering::Relaxed);
+                    release_dropped_claim(&registry, &item);
                     continue;
                 }
             };
@@ -365,6 +369,7 @@ pub async fn run_verify_queue(
                     "verify queue holds an item for a profile that is not live; dropping",
                 );
                 q.failed.fetch_add(1, Ordering::Relaxed);
+                release_dropped_claim(&registry, &item);
                 continue;
             };
             let flags = torrentd_engine::verify_flags(profile_cfg);
@@ -385,6 +390,7 @@ pub async fn run_verify_queue(
                 Err(e) => {
                     q.failed.fetch_add(1, Ordering::Relaxed);
                     warn!(target: "torrentd::pool", infohash = %item.infohash, error.cause = %e, "verify add failed");
+                    release_dropped_claim(&registry, &item);
                 }
             }
         }
@@ -400,6 +406,34 @@ pub async fn run_verify_queue(
         if failed > 0 {
             metrics.add_counter("pool_verify_failed_total", failed, &[]);
         }
+    }
+}
+
+/// Release the registry claim of a verify item the worker is dropping.
+///
+/// `POST /api/pool/adopt` claims the info-hash before it queues the item, and
+/// releases the claim itself only when `execute_adopt` fails synchronously. An
+/// item dropped here never reaches a session, so no `AddTorrent` alert will
+/// ever give it a state-map entry, and it is not in `unloaded_at_boot` either:
+/// a claim left behind made `DELETE` answer 409 "still being added" and refused
+/// every re-add or re-adopt until a restart. The claim is released only while
+/// it still names the item's profile, so a claim someone else has since taken
+/// is left alone.
+fn release_dropped_claim(registry: &AssignmentRegistry, item: &PendingVerify) {
+    let Some(ih) = libtorrent_safe::InfoHash::from_hex(&item.infohash) else {
+        return;
+    };
+    if registry.lookup(&ih).as_ref() != Some(&item.profile) {
+        return;
+    }
+    if let Err(e) = registry.remove(&ih) {
+        warn!(
+            target: "torrentd::pool",
+            infohash = %item.infohash,
+            profile_id = %item.profile,
+            error.cause = %e,
+            "could not release the registry claim of a dropped verify",
+        );
     }
 }
 
@@ -653,6 +687,40 @@ mod tests {
     fn a_just_checked_torrent_is_given_time_to_report_seeding() {
         let s = st(TorrentPhase::Checking, Some(Duration::from_millis(10)));
         assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Waiting);
+    }
+
+    fn pending(ih: InfoHash, profile: &str) -> super::PendingVerify {
+        super::PendingVerify {
+            infohash: ih.to_hex(),
+            torrent_path: "/nonexistent.torrent".into(),
+            save_path: "/nonexistent".into(),
+            profile: ProfileId::new(profile),
+        }
+    }
+
+    /// A verify item the worker drops never reaches a session, so its claim
+    /// must go with it: left behind, `DELETE` answered 409 and every re-adopt
+    /// was refused until a restart.
+    #[test]
+    fn a_dropped_verify_releases_its_registry_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let ih = InfoHash([0x22; 20]);
+        reg.assign(ih, ProfileId::new("p")).unwrap();
+        super::release_dropped_claim(&reg, &pending(ih, "p"));
+        assert_eq!(reg.lookup(&ih), None);
+    }
+
+    /// A claim that no longer names the item's profile is not the item's to
+    /// release.
+    #[test]
+    fn a_dropped_verify_leaves_another_profiles_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let ih = InfoHash([0x33; 20]);
+        reg.assign(ih, ProfileId::new("other")).unwrap();
+        super::release_dropped_claim(&reg, &pending(ih, "p"));
+        assert_eq!(reg.lookup(&ih), Some(ProfileId::new("other")));
     }
 
     #[test]
