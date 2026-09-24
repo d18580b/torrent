@@ -137,7 +137,7 @@ fn resume_without_info_dict_needs_the_torrent_file() {
     };
 
     // (a) Resume alone: no metadata, so the torrent cannot seed. With DHT, PEX
-    //     and LSD disabled — a private slot's configuration — there is nowhere
+    //     and LSD disabled — a private profile's configuration — there is nowhere
     //     to fetch it from, and it would sit idle forever.
     {
         let s2 = Session::new(&support::local_seed_settings()).unwrap();

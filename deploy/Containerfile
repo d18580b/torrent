@@ -50,9 +50,9 @@ RUN --mount=type=cache,target=/root/.cache/torrentd,sharing=locked \
 FROM registry.fedoraproject.org/fedora-minimal:43
 
 # **This runtime layer is WireGuard-only.** No `openvpn` binary is installed
-# and none ever has been, so a slot configured `vpn_type = "openvpn"` cannot
-# come up in this image: bring-up fails, the slot is fenced, and with no other
-# slot the daemon exits. Install `openvpn` here, or run that configuration on
+# and none ever has been, so a profile configured `vpn_type = "openvpn"` cannot
+# come up in this image: bring-up fails, the profile is fenced, and with no other
+# profile the daemon exits. Install `openvpn` here, or run that configuration on
 # a host, if you need it. `ip`, `wg`, `wg-quick` and `nft` are the whole of
 # what the daemon shells out to in this image.
 #
@@ -86,8 +86,8 @@ FROM registry.fedoraproject.org/fedora-minimal:43
 # link it has just created. That path runs for `AllowedIPs = 0.0.0.0/0`, the
 # full-tunnel shape every commercial provider uses and the one
 # `deploy/torrentd.sample.toml` names for ProtonVPN and PIA, so dropping this
-# package means **no WireGuard slot can come up in this image** and the daemon
-# exits because no slot came up. A narrow `AllowedIPs` never reaches
+# package means **no WireGuard profile can come up in this image** and the daemon
+# exits because no profile came up. A narrow `AllowedIPs` never reaches
 # `add_default()` and is unaffected, which is what makes the breakage easy to
 # miss.
 #

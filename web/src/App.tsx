@@ -4,19 +4,20 @@ import { api, Unauthorized, type Status } from './lib/api'
 import { Login } from './views/Login'
 import { Pool } from './views/Pool'
 import { Torrents } from './views/Torrents'
-import { Slots } from './views/Slots'
+import { Profiles } from './views/Profiles'
 
-type View = 'pool' | 'torrents' | 'slots'
+type View = 'pool' | 'torrents' | 'profiles'
 
-const VIEWS: View[] = ['pool', 'torrents', 'slots']
+const VIEWS: View[] = ['pool', 'torrents', 'profiles']
 
 /// Hash routing, not path routing.
 ///
-/// The daemon still serves the pre-`/api` aliases for backwards compatibility,
-/// so `/pool`, `/torrents` and `/slots` are all real API endpoints. A path-based
-/// client route would collide with them and get a 401 instead of the app. A
-/// fragment is never sent to the server, so `#/pool` cannot collide with
-/// anything, and views stay bookmarkable and back-button friendly.
+/// The daemon serves its whole API under `/api`, so `/api/pool`,
+/// `/api/torrents` and `/api/profiles` are the endpoints and the bare paths
+/// they used to be aliased at are gone. A path-based client route still has to
+/// stay clear of them, and a fragment is never sent to the server, so `#/pool`
+/// cannot collide with anything — and views stay bookmarkable and back-button
+/// friendly.
 function viewFromHash(): View {
   const raw = window.location.hash.replace(/^#\/?/, '')
   return (VIEWS as string[]).includes(raw) ? (raw as View) : 'pool'
@@ -84,8 +85,8 @@ export function App() {
         <button aria-current={view === 'torrents' ? 'page' : undefined} onClick={() => setView('torrents')}>
           Torrents
         </button>
-        <button aria-current={view === 'slots' ? 'page' : undefined} onClick={() => setView('slots')}>
-          Slots
+        <button aria-current={view === 'profiles' ? 'page' : undefined} onClick={() => setView('profiles')}>
+          Profiles
         </button>
         <div style={{ marginTop: 20 }}>
           <button
@@ -102,7 +103,7 @@ export function App() {
       <main>
         {view === 'pool' && <Pool />}
         {view === 'torrents' && <Torrents />}
-        {view === 'slots' && <Slots />}
+        {view === 'profiles' && <Profiles />}
       </main>
     </div>
   )
