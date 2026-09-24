@@ -1028,6 +1028,7 @@ impl DaemonHandle {
                 state.clone(),
                 metrics.clone(),
                 profile_registry.clone(),
+                registry.clone(),
                 shutdown_tx.subscribe(),
             ));
         }
