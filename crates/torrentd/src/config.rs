@@ -87,7 +87,8 @@ pub struct Config {
     /// Install a fail-closed nftables kill switch (multi-slot mode) that
     /// confines the daemon's egress to loopback + the slots' tunnel interfaces.
     /// Off by default; requires `CAP_NET_ADMIN` and that torrentd runs as its own
-    /// user. See `vpn::killswitch`.
+    /// non-root user. WireGuard slots only: `validate` refuses it beside an
+    /// OpenVPN slot. See `vpn::killswitch` for what that leaves runnable.
     #[serde(default)]
     pub network_kill_switch: bool,
 
@@ -176,6 +177,27 @@ impl Config {
         if !self.slot.is_empty() {
             SlotConfig::validate_set(&self.slot).context("[[slot]] validation failed")?;
         }
+        // The kill switch matches the daemon's traffic by uid, and the daemon
+        // spawns `openvpn` under its own uid, so the ruleset drops the
+        // OpenVPN client's own connection to the provider: the slot can never
+        // come up. Refused here, where `--check-config` sees it, rather than
+        // discovered as a fenced slot.
+        if self.network_kill_switch {
+            if let Some(s) = self
+                .slot
+                .iter()
+                .find(|s| s.vpn_type == torrentd_engine::VpnType::Openvpn)
+            {
+                anyhow::bail!(
+                    "network_kill_switch = true cannot be used with an OpenVPN slot \
+                     ([[slot]] id = \"{}\"): the kill switch matches the daemon's uid, \
+                     `openvpn` runs under that uid, and its connection to the provider \
+                     leaves by the physical interface, so the ruleset drops it and the \
+                     tunnel never comes up. The kill switch supports WireGuard slots only.",
+                    s.id,
+                );
+            }
+        }
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -198,8 +220,15 @@ impl Config {
             100_000,
         )?;
         // upload_rate_limit is a byte/sec cap where 0 means unlimited, so 0 is
-        // valid and only the absurd upper end is worth rejecting.
-        range("upload_rate_limit", self.upload_rate_limit, 0, u32::MAX)?;
+        // valid. The upper end is i32::MAX because the shim hands the value to
+        // libtorrent's int-typed setting through a narrowing cast; anything
+        // larger would arrive there as a negative rate limit.
+        range(
+            "upload_rate_limit",
+            self.upload_rate_limit,
+            0,
+            i32::MAX as u32,
+        )?;
 
         if let Some(auth) = &self.auth {
             auth.validate()?;
@@ -313,6 +342,12 @@ impl Config {
             d.non_reloadable_changes.push("session_state_path");
         }
         d.slot_changes = diff_slots(&old.slot, &new.slot);
+        d.slots_with_own_upload_limit = new
+            .slot
+            .iter()
+            .filter(|s| s.upload_rate_limit.is_some())
+            .map(|s| s.id.clone())
+            .collect();
         d
     }
 
@@ -383,12 +418,19 @@ impl Config {
 /// Result of `Config::diff`. Reloadable fields are populated with the
 /// Report `[[slot]]` changes that a reload cannot apply.
 ///
-/// Every field here is identity-critical: the tunnel a session is bound to,
+/// Most fields here are identity-critical: the tunnel a session is bound to,
 /// the port it announces, the peer fingerprint and user agent a tracker sees,
 /// and where its resume and torrent files live. Changing any of them means a
 /// different account identity to the tracker, which is a restart — not
 /// something to swap under a live session. Adding or removing slots is
 /// likewise a restart, since the slot set is fixed when sessions are built.
+///
+/// `upload_rate_limit` is the exception: it is not identity-critical, it is
+/// merely not reloadable per slot (the reload path patches settings by slot
+/// id, not by slot config). It is listed for the reason stated on
+/// `ConfigDiff::non_reloadable_changes` — a change that is neither applied
+/// nor reported leaves the operator believing a SIGHUP took when it did not,
+/// which is the exact defect this same change fixes for `file_pool_size`.
 fn diff_slots(old: &[SlotConfig], new: &[SlotConfig]) -> Vec<String> {
     use std::collections::BTreeMap;
     let index = |v: &[SlotConfig]| -> BTreeMap<String, SlotConfig> {
@@ -430,6 +472,10 @@ fn diff_slots(old: &[SlotConfig], new: &[SlotConfig]) -> Vec<String> {
             "port_forward_gateway",
             a.port_forward_gateway != b.port_forward_gateway,
         );
+        field(
+            "upload_rate_limit",
+            a.upload_rate_limit != b.upload_rate_limit,
+        );
     }
     out
 }
@@ -451,6 +497,17 @@ pub struct ConfigDiff {
     /// VPN interface, port, fingerprint, user agent or directories on SIGHUP
     /// was swallowed in silence.
     pub slot_changes: Vec<String>,
+    /// Slots that state their own `[[slot]] upload_rate_limit`.
+    ///
+    /// The top-level reloadable value is withheld from these, the way
+    /// `enable_lsd` is withheld from every non-default slot. A slot's own
+    /// limit is applied once, at boot; without this filter the first SIGHUP
+    /// that changed the *global* limit overwrote every slot's, logged
+    /// `SIGHUP: settings applied`, and left nothing to restore it but a
+    /// restart.
+    ///
+    /// Not part of `is_empty`: it describes the current config, not a change.
+    pub slots_with_own_upload_limit: Vec<SlotId>,
 }
 
 impl ConfigDiff {
@@ -465,10 +522,19 @@ impl ConfigDiff {
     /// local peer discovery on exactly the sessions that must never have it.
     /// The daemon still honours the key for the public single session, which
     /// is the only place it means anything.
+    ///
+    /// `upload_rate_limit` is withheld on the same principle, for a different
+    /// reason: a slot that states its own limit had it applied at boot, and a
+    /// top-level reload has no business silently replacing it. See
+    /// `slots_with_own_upload_limit`.
     pub fn to_settings_patch_for(&self, slot: &SlotId) -> libtorrent_safe::Settings {
         libtorrent_safe::Settings {
             connections_limit: self.connections_limit,
-            upload_rate_limit: self.upload_rate_limit,
+            upload_rate_limit: if self.slots_with_own_upload_limit.contains(slot) {
+                None
+            } else {
+                self.upload_rate_limit
+            },
             max_concurrent_http_announces: self.max_concurrent_http_announces,
             aio_threads: self.aio_threads,
             enable_lsd: if slot.is_default() {
@@ -558,6 +624,137 @@ connections_limit = 10000
             d.non_reloadable_changes.contains(&"file_pool_size"),
             "got {:?}",
             d.non_reloadable_changes,
+        );
+    }
+
+    /// A `[[slot]]` with its own upload cap, for the two tests below.
+    fn slot_with_limit(id: &str, limit: Option<u32>) -> SlotConfig {
+        SlotConfig {
+            id: SlotId::new(id),
+            vpn_profile: PathBuf::from(format!("/etc/wireguard/wg-{id}.conf")),
+            vpn_type: torrentd_engine::VpnType::Wireguard,
+            vpn_interface: format!("wg-{id}"),
+            listen_port: Some(6881),
+            peer_fingerprint_hex: "a1b2c3d4e5f60718".to_string(),
+            user_agent: format!("ua-{id}"),
+            resume_dir: PathBuf::from(format!("/var/lib/torrentd/resume/{id}")),
+            torrent_dir: PathBuf::from(format!("/var/lib/torrentd/torrents/{id}")),
+            allowed_tracker_domains: vec![],
+            upload_rate_limit: limit,
+            port_forward: torrentd_engine::PortForwardMode::Static,
+            port_forward_gateway: None,
+        }
+    }
+
+    /// `openvpn` runs under the daemon's uid, so the kill switch drops its
+    /// connection to the provider; the combination is refused at load, and a
+    /// WireGuard-only set with the kill switch is not.
+    #[test]
+    fn the_kill_switch_is_refused_beside_an_openvpn_slot() {
+        let dir = tempdir().unwrap();
+        let mut cfg = Config::load(&write_cfg(dir.path(), SINGLE_SESSION)).unwrap();
+        cfg.network_kill_switch = true;
+        cfg.slot = vec![slot_with_limit("acct_a", None)];
+        cfg.validate()
+            .expect("the kill switch beside WireGuard slots only is accepted");
+
+        let mut ovpn = slot_with_limit("acct_b", None);
+        ovpn.vpn_type = torrentd_engine::VpnType::Openvpn;
+        ovpn.vpn_profile = PathBuf::from("/etc/openvpn/acct_b.conf");
+        ovpn.vpn_interface = "tun-b".to_string();
+        ovpn.listen_port = Some(6882);
+        ovpn.peer_fingerprint_hex = "b1b2c3d4e5f60718".to_string();
+        cfg.slot.push(ovpn);
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("OpenVPN slot") && err.contains("acct_b"),
+            "got: {err}"
+        );
+
+        cfg.network_kill_switch = false;
+        cfg.validate()
+            .expect("an OpenVPN slot without the kill switch is accepted");
+    }
+
+    #[test]
+    fn a_top_level_reload_cannot_overwrite_a_slots_own_upload_limit() {
+        // The operator caps `acct_a` at 500 KB/s and leaves the top level
+        // alone. Later they set a global 20 MB/s and SIGHUP. Without the
+        // filter, `to_settings_patch_for` carries the top-level value to
+        // every slot alike: `acct_a` starts uploading at 20 MB/s, `SIGHUP:
+        // settings applied` is logged as a success, and nothing restores the
+        // slot's own limit short of a restart.
+        let dir = tempdir().unwrap();
+        let mut a = Config::load(&write_cfg(dir.path(), SINGLE_SESSION)).unwrap();
+        a.slot = vec![
+            slot_with_limit("acct_a", Some(500_000)),
+            slot_with_limit("acct_b", None),
+        ];
+        let mut b = a.clone();
+        b.upload_rate_limit = Some(20_000_000);
+
+        let d = Config::diff(&a, &b);
+        assert_eq!(d.upload_rate_limit, Some(20_000_000));
+        assert_eq!(
+            d.to_settings_patch_for(&SlotId::new("acct_a"))
+                .upload_rate_limit,
+            None,
+            "a slot that states its own limit keeps it",
+        );
+        assert_eq!(
+            d.to_settings_patch_for(&SlotId::new("acct_b"))
+                .upload_rate_limit,
+            Some(20_000_000),
+            "a slot that states none still inherits the top-level limit",
+        );
+    }
+
+    #[test]
+    fn a_slot_upload_rate_limit_change_is_reported_rather_than_swallowed() {
+        // The key became real at boot with this change. Per-slot settings
+        // patching is not something the reload path can do, so the change is
+        // not applied — but `is_empty()` would otherwise be true, reload
+        // would log `SIGHUP: config unchanged`, and the operator would be
+        // told their edit took effect when it did not.
+        let dir = tempdir().unwrap();
+        let mut a = Config::load(&write_cfg(dir.path(), SINGLE_SESSION)).unwrap();
+        a.slot = vec![slot_with_limit("acct_a", Some(500_000))];
+        let mut b = a.clone();
+        b.slot = vec![slot_with_limit("acct_a", Some(900_000))];
+
+        let d = Config::diff(&a, &b);
+        assert!(
+            d.slot_changes
+                .contains(&"acct_a.upload_rate_limit".to_string()),
+            "got {:?}",
+            d.slot_changes,
+        );
+        assert!(!d.is_empty(), "a reported change is not an empty diff");
+    }
+
+    #[test]
+    fn an_explicit_slot_zero_is_unlimited_rather_than_inherited() {
+        // `Some(0)` and `None` are different configurations: `0` is what the
+        // identically named top-level key means by unlimited, and a slot that
+        // simply omits the key inherits. Collapsing them — which a plain
+        // `u32` field forces — leaves no way to state that one slot is
+        // uncapped under a global cap.
+        let explicit = slot_with_limit("acct_a", Some(0));
+        let inherited = slot_with_limit("acct_a", None);
+        assert_ne!(explicit.upload_rate_limit, inherited.upload_rate_limit);
+
+        let dir = tempdir().unwrap();
+        let mut a = Config::load(&write_cfg(dir.path(), SINGLE_SESSION)).unwrap();
+        a.upload_rate_limit = Some(1_000_000);
+        a.slot = vec![explicit];
+        let mut b = a.clone();
+        b.upload_rate_limit = Some(2_000_000);
+        let d = Config::diff(&a, &b);
+        assert_eq!(
+            d.to_settings_patch_for(&SlotId::new("acct_a"))
+                .upload_rate_limit,
+            None,
+            "an explicitly unlimited slot is not re-capped by a global change",
         );
     }
 
@@ -686,6 +883,23 @@ library_dir = "{d}/library"
         let p = write_cfg(dir.path(), &bad);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("aio_threads"), "got: {msg}");
+        assert!(msg.contains("out of range"), "got: {msg}");
+    }
+
+    #[test]
+    fn upload_rate_limit_is_bounded_by_what_libtorrent_can_carry() {
+        let dir = tempdir().unwrap();
+        let at_bound = format!("{SINGLE_SESSION}\nupload_rate_limit = {}\n", i32::MAX);
+        let p = write_cfg(dir.path(), &at_bound);
+        Config::load(&p).expect("i32::MAX fits libtorrent's int setting");
+
+        let past_bound = format!(
+            "{SINGLE_SESSION}\nupload_rate_limit = {}\n",
+            i32::MAX as u32 + 1
+        );
+        let p = write_cfg(dir.path(), &past_bound);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("upload_rate_limit"), "got: {msg}");
         assert!(msg.contains("out of range"), "got: {msg}");
     }
 

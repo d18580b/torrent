@@ -268,7 +268,7 @@ fn sanity_check_submodules(boost: &Path, lt: &Path) {
             error: libtorrent-sys build prerequisites missing:\n\n  - {}\n\n\
             Run from the workspace root:\n    \
                 mise run native\n\
-            (or `git submodule update --init --recursive --depth 1`)\n\
+            (or `git -c 'submodule.simulation/libsimulator.update=none' submodule update --init --recursive --depth 1`)\n\
             See CONTRIBUTING.md for full prerequisites.\n",
             missing.join("\n  - ")
         );

@@ -161,8 +161,21 @@ pub struct SlotConfig {
     pub torrent_dir: PathBuf,
     #[serde(default)]
     pub allowed_tracker_domains: Vec<String>,
+    /// This slot's own upload cap, in bytes/sec.
+    ///
+    /// Absent means "inherit the top-level `upload_rate_limit`"; `Some(0)`
+    /// means *explicitly unlimited*, which is what `0` means for the
+    /// identically named top-level key and everywhere else in this
+    /// configuration. A plain `u32` could express only one of those two, and
+    /// reading `0` as "inherit" — as this key briefly did — left no way to
+    /// state that one slot is uncapped under a global cap while the key name
+    /// meant two opposite things one table apart.
+    ///
+    /// Applied at boot. A change to it is **not** reloadable, but it is
+    /// reported on SIGHUP (`Config::diff`), and a top-level reload is
+    /// withheld from any slot that sets it.
     #[serde(default)]
-    pub upload_rate_limit: u32,
+    pub upload_rate_limit: Option<u32>,
     /// How this slot's listening port is chosen (default: static).
     #[serde(default)]
     pub port_forward: PortForwardMode,
@@ -176,6 +189,25 @@ impl SlotConfig {
     /// The NAT-PMP gateway for this slot, defaulting to ProtonVPN's WireGuard
     /// gateway. Only meaningful when `port_forward == Natpmp`.
     pub const DEFAULT_NATPMP_GATEWAY: &'static str = "10.2.0.1";
+
+    /// The largest `upload_rate_limit` a slot may state, in bytes/sec.
+    ///
+    /// Not a policy about bandwidth — a slot may legally exceed the top-level
+    /// `upload_rate_limit`, which is a default rather than a cap — but the
+    /// point past which the number stops meaning what it says. Settings reach
+    /// libtorrent's `settings_pack` through a `static_cast<int>`, so a value
+    /// above `i32::MAX` arrives as a *negative* rate limit: the slot is
+    /// configured for 3 GB/s and seeds at whatever libtorrent makes of a
+    /// negative cap. Refused at validation, where the operator can still read
+    /// what they typed.
+    pub const MAX_UPLOAD_RATE_LIMIT: u32 = i32::MAX as u32;
+
+    /// The only directory a WireGuard `vpn_profile` may live in.
+    ///
+    /// `wg-quick`'s own default, and the only one it will resolve a bare
+    /// interface name against at teardown. torrentd never sets
+    /// `WG_CONFIG_DIR`, so this is not configurable here either.
+    pub const WG_CONFIG_DIR: &'static str = "/etc/wireguard";
 
     pub fn port_forward_gateway_or_default(&self) -> &str {
         self.port_forward_gateway
@@ -225,15 +257,24 @@ pub enum SlotConfigError {
     )]
     ReservedId(String),
     #[error(
-        "slot {slot:?}: vpn_interface {iface:?} must equal the file stem of vpn_profile \
-         ({profile:?}); wg-quick derives the interface name from the file name, so these \
-         cannot differ"
+        "slot {slot:?}: a wireguard vpn_profile must be {dir}/{iface}.conf, not {profile:?}. \
+         `wg-quick up <path>` names the interface after the file, and `wg-quick down <iface>` \
+         resolves that bare name only against {dir} (or $WG_CONFIG_DIR, which torrentd does \
+         not set) — so a profile under any other name, or in any other directory, brings up a \
+         tunnel that can never be torn down"
     )]
     InterfaceProfileMismatch {
         slot: String,
         iface: String,
         profile: String,
+        dir: &'static str,
     },
+    #[error(
+        "slot {slot:?}: upload_rate_limit = {value} is out of range (0..={max}). A slot may \
+         exceed the top-level upload_rate_limit, but the value reaches libtorrent as a C int, \
+         so anything above {max} would be applied as a negative rate limit"
+    )]
+    UploadRateLimitOutOfRange { slot: String, value: u32, max: u32 },
 }
 
 impl SlotConfig {
@@ -296,22 +337,48 @@ impl SlotConfig {
                 return Err(SlotConfigError::DuplicateInterface(s.vpn_interface.clone()));
             }
             // `wg-quick up <path>` names the interface after the file, and
-            // `wg-quick down <iface>` looks the file back up from the name.
-            // A slot whose two fields disagree therefore brings a tunnel up
-            // under one name, waits 30s for an address on another, fails, and
-            // — if it ever did come up — could never be torn down. Refuse the
-            // config instead of discovering it at the timeout.
+            // `wg-quick down <iface>` looks the file back up from the name —
+            // resolving a bare name *only* against `WG_CONFIG_DIR`, default
+            // `/etc/wireguard`. A slot whose two fields disagree therefore
+            // brings a tunnel up under one name, waits 30s for an address on
+            // another, fails, and — if it ever did come up — could never be
+            // torn down. So does a slot whose profile lives anywhere else,
+            // even with a matching stem: `wg-quick down` dies looking for the
+            // file before it ever reaches `del_if`, and that surviving tunnel
+            // is the headline defect this validation exists to make
+            // unreachable. `bring_down` is handed only the interface name
+            // (`VpnManager::bring_down(&self, iface: &str)`), so the
+            // directory has to be pinned here rather than threaded through.
+            // Refuse the config instead of discovering it at the timeout.
             if s.vpn_type == VpnType::Wireguard {
                 let stem = s
                     .vpn_profile
                     .file_stem()
                     .map(|f| f.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                if stem != s.vpn_interface {
+                let dir = s.vpn_profile.parent();
+                if stem != s.vpn_interface || dir != Some(std::path::Path::new(Self::WG_CONFIG_DIR))
+                {
                     return Err(SlotConfigError::InterfaceProfileMismatch {
                         slot: s.id.as_str().to_string(),
                         iface: s.vpn_interface.clone(),
                         profile: s.vpn_profile.display().to_string(),
+                        dir: Self::WG_CONFIG_DIR,
+                    });
+                }
+            }
+            // A slot's own limit is range-checked the way the top-level key
+            // of the same name is, and is *not* bounded by it: clamping a
+            // slot to the global default would remove the main reason to
+            // give one its own limit. The bound that matters is the one the
+            // value has to survive on its way to libtorrent — see
+            // `MAX_UPLOAD_RATE_LIMIT`.
+            if let Some(v) = s.upload_rate_limit {
+                if v > Self::MAX_UPLOAD_RATE_LIMIT {
+                    return Err(SlotConfigError::UploadRateLimitOutOfRange {
+                        slot: s.id.as_str().to_string(),
+                        value: v,
+                        max: Self::MAX_UPLOAD_RATE_LIMIT,
                     });
                 }
             }
@@ -387,7 +454,7 @@ mod tests {
     fn cfg(id: &str, port: u16, iface: &str, fp: &str, ua: &str) -> SlotConfig {
         SlotConfig {
             id: SlotId::new(id),
-            vpn_profile: PathBuf::from(format!("/etc/wg/{iface}.conf")),
+            vpn_profile: PathBuf::from(format!("{}/{iface}.conf", SlotConfig::WG_CONFIG_DIR)),
             vpn_type: VpnType::Wireguard,
             vpn_interface: iface.to_string(),
             listen_port: Some(port),
@@ -396,9 +463,40 @@ mod tests {
             resume_dir: PathBuf::from(format!("/var/lib/torrentd/resume/{id}")),
             torrent_dir: PathBuf::from(format!("/var/lib/torrentd/torrents/{id}")),
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
             port_forward: PortForwardMode::Static,
             port_forward_gateway: None,
+        }
+    }
+
+    #[test]
+    fn a_slot_upload_rate_limit_libtorrent_cannot_hold_is_refused() {
+        // The value is handed to `settings_pack` through a
+        // `static_cast<int>`, so `u32::MAX` arrives as -1 and the slot the
+        // operator configured for 4 GB/s seeds under a negative cap. The
+        // sibling top-level key is range-checked; this one was not checked
+        // at all.
+        let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+        s.upload_rate_limit = Some(u32::MAX);
+        assert!(matches!(
+            SlotConfig::validate_set(&[s]),
+            Err(SlotConfigError::UploadRateLimitOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn a_slot_may_exceed_the_top_level_upload_rate_limit() {
+        // The top-level key is a default, not a ceiling: giving one account
+        // more bandwidth than the rest is the main reason to set a per-slot
+        // limit, so the check bounds the representable range and nothing
+        // else. `0` -- explicitly unlimited -- is in range too.
+        for v in [0, 1, SlotConfig::MAX_UPLOAD_RATE_LIMIT] {
+            let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+            s.upload_rate_limit = Some(v);
+            assert!(
+                SlotConfig::validate_set(&[s]).is_ok(),
+                "upload_rate_limit = {v} is a legal slot limit",
+            );
         }
     }
 
@@ -406,6 +504,34 @@ mod tests {
     fn wireguard_interface_must_match_its_profile_file() {
         let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
         s.vpn_profile = PathBuf::from("/etc/wireguard/something-else.conf");
+        assert!(matches!(
+            SlotConfig::validate_set(&[s]),
+            Err(SlotConfigError::InterfaceProfileMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wireguard_profile_outside_etc_wireguard_is_refused() {
+        // The stem matches here; only the directory does not. `wg-quick up`
+        // takes the full path and brings the tunnel up regardless, but
+        // `wg-quick down wg-a` resolves the bare name against /etc/wireguard,
+        // finds nothing, and dies before `del_if` — so the tunnel survives
+        // graceful shutdown and every restart, which is the very defect the
+        // rest of this change exists to fix.
+        let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+        s.vpn_profile = PathBuf::from("/etc/torrentd/wg-a.conf");
+        assert!(matches!(
+            SlotConfig::validate_set(&[s]),
+            Err(SlotConfigError::InterfaceProfileMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wireguard_profile_with_no_parent_directory_is_refused() {
+        // `file_stem()` alone accepts a bare relative name; `wg-quick down`
+        // still has only /etc/wireguard to look in.
+        let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+        s.vpn_profile = PathBuf::from("wg-a.conf");
         assert!(matches!(
             SlotConfig::validate_set(&[s]),
             Err(SlotConfigError::InterfaceProfileMismatch { .. })
