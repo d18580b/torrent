@@ -155,6 +155,8 @@ pub struct DaemonHandle {
     kill_switch_active: bool,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: torrentd_engine::AlertLoopHandle,
+    /// Registry entries no startup scan loaded; see `AppState::unloaded_at_boot`.
+    unloaded_at_boot: std::collections::HashSet<libtorrent_safe::InfoHash>,
 }
 
 pub async fn boot(
@@ -556,6 +558,11 @@ pub async fn boot(
     // scans. Compared against the registry's claim once both have run.
     let mut loaded_by_profile: std::collections::HashMap<ProfileId, usize> =
         std::collections::HashMap::new();
+    // Which info-hashes a session accepted. Every registry entry outside this
+    // set once both scans have run is held by no session, and is the one kind
+    // of entry `DELETE` may clear without a state-map entry to remove.
+    let mut loaded: std::collections::HashSet<libtorrent_safe::InfoHash> =
+        std::collections::HashSet::new();
 
     // Resume scan: load every saved resume file per profile. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
@@ -648,7 +655,10 @@ pub async fn boot(
                 flags_set,
                 flags_clear,
             }) {
-                Ok(_) => added_from_resume += 1,
+                Ok(_) => {
+                    added_from_resume += 1;
+                    loaded.insert(ih);
+                }
                 Err(e) => {
                     warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed")
                 }
@@ -714,6 +724,7 @@ pub async fn boot(
             }) {
                 Ok(_) => {
                     added += 1;
+                    loaded.insert(ih);
                 }
                 Err(e) => {
                     // Release the claim so a later run can retry the add.
@@ -793,6 +804,13 @@ pub async fn boot(
             );
         }
     }
+
+    let unloaded_at_boot: std::collections::HashSet<libtorrent_safe::InfoHash> = registry
+        .entries()
+        .into_iter()
+        .map(|(ih, _)| ih)
+        .filter(|ih| !loaded.contains(ih))
+        .collect();
 
     // Subscribe now, not when the HTTP server starts: a broadcast sent with no
     // live receiver is discarded, so a SIGTERM during the resume scan would
@@ -913,6 +931,7 @@ pub async fn boot(
         kill_switch_active,
         log_handle,
         alert_loop,
+        unloaded_at_boot,
     })
 }
 
@@ -938,6 +957,7 @@ impl DaemonHandle {
             kill_switch_active,
             log_handle,
             alert_loop,
+            unloaded_at_boot,
         } = self;
 
         // VPN health monitor (multi-profile only). Spawned before AppState
@@ -998,6 +1018,7 @@ impl DaemonHandle {
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),
             reload_tx: Some(reload_tx.clone()),
+            unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
         };
 
         let app: Router = http::router(app_state);
