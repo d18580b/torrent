@@ -106,20 +106,21 @@ pub struct FailedSlot {
     pub reason: String,
 }
 
-/// Build a static WireGuard slot entry with the given id and status, for tests
-/// across the http/app_state modules.
+/// Build a static WireGuard slot config with the given id, for tests across
+/// the http/app_state modules.
 #[cfg(test)]
-pub(crate) fn test_entry(id: &str, status: SlotStatus) -> SlotEntry {
-    use std::net::Ipv4Addr;
+pub(crate) fn test_config(id: &str) -> SlotConfig {
     use std::path::PathBuf;
 
-    use torrentd_engine::MockEngine;
     use torrentd_engine::PortForwardMode;
     use torrentd_engine::VpnType;
 
-    let config = SlotConfig {
+    SlotConfig {
         id: SlotId::new(id),
-        vpn_profile: PathBuf::from(format!("/etc/wg/{id}.conf")),
+        vpn_profile: PathBuf::from(format!(
+            "{}/wg-{id}.conf",
+            torrentd_engine::SlotConfig::WG_CONFIG_DIR
+        )),
         vpn_type: VpnType::Wireguard,
         vpn_interface: format!("wg-{id}"),
         listen_port: Some(6881),
@@ -128,13 +129,23 @@ pub(crate) fn test_entry(id: &str, status: SlotStatus) -> SlotEntry {
         resume_dir: PathBuf::from("/tmp/torrentd-test/resume"),
         torrent_dir: PathBuf::from("/tmp/torrentd-test/torrents"),
         allowed_tracker_domains: vec![],
-        upload_rate_limit: 0,
+        upload_rate_limit: None,
         port_forward: PortForwardMode::Static,
         port_forward_gateway: None,
-    };
+    }
+}
+
+/// Build a static WireGuard slot entry with the given id and status, for tests
+/// across the http/app_state modules.
+#[cfg(test)]
+pub(crate) fn test_entry(id: &str, status: SlotStatus) -> SlotEntry {
+    use std::net::Ipv4Addr;
+
+    use torrentd_engine::MockEngine;
+
     let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
     let entry = SlotEntry::new(
-        config,
+        test_config(id),
         engine,
         IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)),
         None,
@@ -142,6 +153,16 @@ pub(crate) fn test_entry(id: &str, status: SlotStatus) -> SlotEntry {
     );
     entry.update_health(|h| h.status = status);
     entry
+}
+
+/// A slot that never got a session, for tests that need the other half of the
+/// configured set — the half `iter()` does not walk.
+#[cfg(test)]
+pub(crate) fn test_failed_slot(id: &str) -> FailedSlot {
+    FailedSlot {
+        config: test_config(id),
+        reason: "VPN bring-up failed".to_string(),
+    }
 }
 
 impl SlotRegistry {

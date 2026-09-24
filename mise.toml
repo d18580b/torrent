@@ -98,7 +98,13 @@ depends = ["fmt", "lint"]
 [tasks.native]
 description = "Provision the shared libtorrent/Boost prefix (first run: 5-15 min)"
 run = [
-  "git submodule update --init --recursive --depth 1",
+  # Skipping libsimulator is not an optimisation: it builds libtorrent's
+  # simulation tests, which nothing here consumes, and libtorrent pins a
+  # commit that is not the tip of libsimulator's default branch -- which is
+  # all a --depth 1 fetch can reach. Without this the nested checkout lands
+  # on whatever that tip was, and vendor/libtorrent reads as
+  # "(modified content)" in every `git status` from then on.
+  "git -c 'submodule.simulation/libsimulator.update=none' submodule update --init --recursive --depth 1",
   "cargo build -p libtorrent-sys",
   # Honours LIBTORRENT_SYS_CACHE_DIR, which build.rs checks before XDG, and
   # tolerates the glob not matching rather than failing a 15-minute task.

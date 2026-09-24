@@ -53,10 +53,13 @@ runs:
           native-v1-${{ runner.os }}-${{ steps.ids.outputs.lt }}-${{ steps.ids.outputs.boost }}-
 
     # ~4 minutes per job. vendor/boost is a 165-sub-repo superproject and is
-    # needed only to *build* the prefix, never to consume one.
+    # needed only to *build* the prefix, never to consume one. libtorrent's
+    # own libsimulator submodule is skipped: it serves the simulation tests,
+    # which nothing here builds, and its pin is unreachable at --depth 1, so
+    # fetching it only dirties vendor/libtorrent.
     - if: steps.cache.outputs.cache-hit != 'true'
       shell: bash
-      run: git submodule update --init --recursive --depth 1 vendor/libtorrent vendor/boost
+      run: git -c 'submodule.simulation/libsimulator.update=none' submodule update --init --recursive --depth 1 vendor/libtorrent vendor/boost
 
     - if: inputs.fixtures == 'true' && steps.cache.outputs.cache-hit == 'true'
       shell: bash

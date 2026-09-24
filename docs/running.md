@@ -35,10 +35,21 @@ runtime and are easy to miss because nothing checks for them at startup:
 | --- | --- | --- |
 | `ip` | `iproute2` / `iproute` | Any multi-slot deployment. Polled every 30s per slot for the tunnel IP. |
 | `wg`, `wg-quick` | `wireguard-tools` | WireGuard slots — bring-up, teardown, handshake age. |
-| `openvpn`, `pkill` | `openvpn`, `procps-ng` | OpenVPN slots. `pkill` is how teardown stops the process. |
+| `openvpn`, `kill` | `openvpn`, `util-linux` (`util-linux-core` on Fedora) | OpenVPN slots. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. `kill` is spawned as a binary and not as a shell builtin, so `/usr/bin/kill` has to be on the host: that is `util-linux`, not `procps-ng`, which ships `pgrep` and `pkill` and no `kill`. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
 
 Single-session mode needs none of them.
+
+**The shipped container image is WireGuard-only.** `deploy/Containerfile`'s
+runtime layer installs `iproute`, `wireguard-tools`, `nftables` and
+`procps-ng`, and no `openvpn`, so a slot configured `vpn_type = "openvpn"`
+cannot come up in it — bring-up fails, the slot is fenced, and with no other
+slot the daemon exits. Run that configuration on a host, or add `openvpn` to
+the runtime stage yourself. `procps-ng` is there for the `sysctl` that
+`wg-quick` runs when it raises a full-tunnel (`AllowedIPs = 0.0.0.0/0`)
+profile; the daemon itself calls none of its binaries, and the `ps`, `pgrep`
+and `pkill` it also ships are what a `podman exec` into the image has for
+process inspection.
 
 ## 2. Submodules
 
@@ -116,6 +127,41 @@ What the daemon does and does not create:
 - **Must already exist:** `[pool] roots` and `library_dir`. Missing roots are a
   scan-time error, not a config error.
 
+The daemon also writes small state files of its own, beside the resume data, in
+**the parent of `resume_dir`** (`/var/lib/torrentd` under the shipped unit).
+Each writer that puts a file there creates the directory first, so the
+directory appears the **first time one of those files is written** and not at
+startup: a single-session deployment with no tunnel configured has neither of
+the two files below, and may never have the directory at all. Both kinds are
+safe to delete **while the daemon is stopped**, and neither is safe to delete
+while it is running:
+
+- **`openvpn-<iface>.pid`** — the pid `openvpn --writepid` recorded for an
+  OpenVPN slot. It is the only handle the teardown has on that process, and it
+  is verified against `/proc/<pid>/cmdline` before anything is signalled, so a
+  recycled pid is not signalled. Delete it while the daemon is running and the
+  tunnel survives the next shutdown.
+- **`wireguard-<iface>.raised`** — a note that *this boot of this host* raised
+  the link now standing under that name. It is what lets a restart after an
+  unclean shutdown adopt the tunnel still standing instead of leaving the slot
+  dark, for profiles that keep the key out of the `.conf`
+  (`PostUp = wg set %i private-key …`). It carries two things and both have to
+  still hold: the host's **boot id**, so it is never believed after a reboot;
+  and the **public key the interface was carrying** when it came up, so it is
+  never believed for a link that merely has the same name. That second one is
+  what makes it safe to delete a stuck interface by hand and let something else
+  take the name — the record stops applying the moment the link does.
+  It is written once `wg-quick up` has succeeded, so a daemon killed in the
+  moment between leaves no record and the slot fences rather than adopting.
+  The daemon discards it at startup if the interface it names is gone, and
+  again whenever it declines to adopt one; it **keeps** it when a teardown
+  failed and left the interface standing, which is the one case the record is
+  still needed for. Deleting it costs at most one adoption.
+
+> If you point `resume_dir` somewhere else, these move with it — and
+> `ReadWritePaths=` has to list wherever they land, or the daemon logs that it
+> could not record a raised interface and the adoption above stops working.
+
 > **`ProtectSystem=strict` will refuse to start the unit** if anything in
 > `ReadWritePaths=` does not exist. The shipped unit lists
 > `/var/lib/torrentd /data/torrents`. If you point any path at somewhere else,
@@ -147,7 +193,7 @@ typo is caught rather than ignored.
 | `registry_path` | `<resume_dir>/../slot_assignments.json` |
 | `session_state_path` | `<resume_dir>/../session_state.dat` |
 | `vpn_handshake_max_age_secs` | `180` |
-| `network_kill_switch` | `false` |
+| `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN slot**; see §11.6 |
 | `connections_limit`, `file_pool_size`, `enable_lsd`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
 | `peer_fingerprint`, `user_agent` | libtorrent's own |
 
@@ -169,6 +215,33 @@ chars, must not be libtorrent's default), `user_agent`, `resume_dir` and
 `port_forward = "static"`. `id`, `listen_port`, `vpn_interface`,
 `peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all be
 unique across slots.
+
+**A WireGuard slot's `vpn_profile` must be `/etc/wireguard/<vpn_interface>.conf`
+— exactly that directory, and a file name matching the interface.** This is
+refused at startup, and by `--check-config`, rather than discovered later.
+`wg-quick up <path>` names the interface after the file, and `wg-quick down
+<iface>` resolves that bare name only against `/etc/wireguard`; a profile with
+a different stem, or in any other directory, brings up a tunnel that no
+shutdown or restart can ever take down. OpenVPN slots are unaffected —
+torrentd passes `--dev` explicitly, so their profile name carries no meaning.
+
+**Upgrading:** this rule is new, and it is a hard refusal, so a daemon that
+has been running for months with a WireGuard profile somewhere else will not
+start after the upgrade. That is deliberate — such a tunnel comes up and can
+never be torn down, which is the defect the rule exists to make unreachable —
+and it is catchable before the running daemon stops: `--check-config` refuses
+the same config, and `deploy/torrentd.service` runs it as `ExecStartPre`. Move
+the file to `/etc/wireguard/<vpn_interface>.conf` and update `vpn_profile`.
+
+**`[[slot]] upload_rate_limit`** (optional, bytes/sec) is applied to that
+slot's session at boot. **Omit it to inherit the top-level
+`upload_rate_limit`; set it to `0` to make that slot explicitly unlimited**
+under a global cap. A slot may set a limit **above** the top-level one — that
+key is a default, not a ceiling — up to `2147483647`, past which libtorrent
+would read the value as a negative rate limit and the config is refused. It is
+not reloadable: a change to it is reported on SIGHUP and ignored until a
+restart, and a SIGHUP that changes the *top-level* limit is withheld from any
+slot that sets its own.
 
 Validate without starting anything:
 
@@ -239,14 +312,26 @@ tunnels down, and exits.
 ## 9. First-run checks
 
 ```bash
-curl -s localhost:8080/healthz            # {"ok":true,"slots":1,"heartbeat_age_secs":0}
+curl -s localhost:8080/healthz            # {"ok":true,"slots":1,"slots_fenced":0,"heartbeat_age_secs":0}
 curl -s localhost:8080/status | jq        # counts by state, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
 
-`/healthz` returns 503 with `{"ok":false,"reason":"no_sessions"}` before a
-session is up, and `{"ok":false,"reason":"alert_loop_stalled",…}` if the alert
-loop stops advancing for 15 seconds.
+`slots` is the number of **configured** slots — including any whose tunnel
+never came up at boot. It is the same denominator in every response, so
+`slots_fenced / slots` reads as one fraction whether the daemon is healthy or
+not. A slot that failed at boot counts in `slots_fenced` too: it has no session
+at all, which is worse than a fenced one, and a denominator that quietly shrank
+by the slots you have lost would report `0/2` on the morning one of three
+accounts is dark. In single-session mode it is always `1`.
+
+`/healthz` returns 503 with one of three reasons:
+
+| `reason` | Meaning |
+| --- | --- |
+| `no_sessions` | No session is up yet. |
+| `alert_loop_stalled` | The alert loop stopped advancing for 15 seconds. |
+| `all_slots_fenced` | Every configured slot is out of service: its tunnel is down and its torrents are paused, or it never came up at boot. Some-but-not-all stays **200** — the remaining slots are still serving — with the count in `slots_fenced`. |
 
 Confirm settings actually applied rather than trusting the config parsed:
 
@@ -420,7 +505,31 @@ On a scratch pool, not your real one.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
    interfaces for the daemon's uid. Setting it in single-session mode is a
-   startup error, not a warning.
+   startup error, not a warning. **So is running as root**: the ruleset matches
+   the daemon's traffic by uid, and `meta skuid 0` would drop every root-owned
+   socket on the host — the package manager, the NTP client, sshd's replies —
+   and the WireGuard tunnels' own encrypted traffic with them, since the
+   kernel's WireGuard socket belongs to the uid that raised the link. The
+   daemon refuses to install it rather than take the host off the network.
+
+   Because the ruleset confines everything the daemon's uid owns, a tunnel's
+   connection to its provider has to belong to some other uid, and that
+   decides what the kill switch can run with:
+
+   - **OpenVPN slots: not at all.** The daemon spawns `openvpn` under its own
+     uid, so the provider connection is dropped. The config is refused at load
+     (and by `--check-config`).
+   - **WireGuard slots: only with the links raised by root before the daemon
+     starts.** A daemon running as its own user cannot raise them itself:
+     `wg-quick` re-execs through `sudo` unless it runs as uid 0, and the
+     packaged unit sets `NoNewPrivileges=yes`, so that `sudo` cannot elevate.
+     Raise each slot's link as root first (for example `wg-quick up <iface>`
+     from a root unit ordered before `torrentd.service`), with the profile
+     readable by the daemon's user: its `wg-quick up` then fails and it adopts
+     the standing link because the profile's public key matches the live one
+     (see the "already up and is not this slot's" row below for the refusals).
+     The shipped container image runs the daemon as uid 1000 and raises no
+     links, so it cannot run the kill switch with a working tunnel either.
 
 ## Troubleshooting
 
@@ -430,6 +539,11 @@ On a scratch pool, not your real one.
 | Build panics mentioning `npm` | Node missing; install it or use `--no-default-features` (§3). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
+| `/healthz` 503 `all_slots_fenced` | Every configured slot is out of service — its tunnel is down, or it never came up at boot — so the daemon is seeding nothing. Check `/slots`, which lists both kinds, bring the tunnels back, then restart — fenced slots do not resume themselves by design. |
+| Daemon refuses to start, "vpn_profile must be /etc/wireguard/…" | A WireGuard slot's profile is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
+| Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Running as `torrentd` with `CAP_NET_ADMIN` is necessary and not sufficient: that user cannot run `wg-quick`, so each WireGuard slot's link has to be raised by root before the daemon starts (§11.6). Otherwise unset `network_kill_switch`. |
+| Config refused, "cannot be used with an OpenVPN slot" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` slot. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
+| One slot fenced at boot, log says "an interface of this name is already up and is not this slot's" | A link named by that slot's `vpn_interface` was standing when the slot tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it will not `wg-quick down` something it cannot vouch for, because that would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the profile, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this slot's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a slot can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 and `vpn_down` | The slot is fenced. An operator restart is required by design. |
 | Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
 | Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole slot when its tunnel drops. Check `/slots`, then `POST /slots/<id>/resume-all`. |
