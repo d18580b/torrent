@@ -934,15 +934,18 @@ fn attribute_ruleset_rejection(
     let Some(id) = only else {
         return verdict;
     };
-    let (kept, excluded): (Vec<(&str, &str)>, Vec<(&str, &str)>) = cfg
+    let (kept, excluded): (Vec<&ProfileConfig>, Vec<&ProfileConfig>) = cfg
         .profile
         .iter()
-        .filter_map(|p| p.vpn_interface().map(|iface| (p.id.as_str(), iface)))
-        .partition(|(pid, _)| *pid == id);
+        .filter(|p| p.vpn_interface().is_some())
+        .partition(|p| p.id.as_str() == id);
     if excluded.is_empty() {
         return verdict;
     }
-    let scoped: Vec<String> = kept.iter().map(|(_, iface)| iface.to_string()).collect();
+    let scoped: Vec<String> = kept
+        .iter()
+        .filter_map(|p| p.vpn_interface().map(str::to_string))
+        .collect();
     let scoped_ruleset = vpn::killswitch::render_ruleset(uid, &scoped);
     let scoped_parses = match host.nft_check(&scoped_ruleset) {
         Ok(o) => {
@@ -957,7 +960,10 @@ fn attribute_ruleset_rejection(
     }
     let names: Vec<String> = excluded
         .iter()
-        .map(|(pid, iface)| format!("{iface} (profile {pid})"))
+        .filter_map(|p| {
+            p.vpn_interface()
+                .map(|iface| format!("{iface} (profile {})", p.id.as_str()))
+        })
         .collect();
     Check::skip(
         "kill_switch_ruleset",
