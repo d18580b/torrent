@@ -23,6 +23,6 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     ctx.metrics.add_counter(
         "alerts_dropped_total",
         u64::from(total),
-        &[("slot_id", ctx.slot_id.as_str())],
+        &[("profile_id", ctx.profile_id.as_str())],
     );
 }

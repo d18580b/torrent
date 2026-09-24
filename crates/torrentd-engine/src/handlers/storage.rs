@@ -33,7 +33,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             );
             ctx.metrics.inc_counter(
                 "torrents_checked_total",
-                &[("slot_id", ctx.slot_id.as_str())],
+                &[("profile_id", ctx.profile_id.as_str())],
             );
         }
         Alert::StorageMoved { hdr, path } => {
@@ -51,8 +51,10 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 save_path = %path,
                 "storage moved",
             );
-            ctx.metrics
-                .inc_counter("storage_moves_total", &[("slot_id", ctx.slot_id.as_str())]);
+            ctx.metrics.inc_counter(
+                "storage_moves_total",
+                &[("profile_id", ctx.profile_id.as_str())],
+            );
         }
         Alert::StorageMovedFailed {
             hdr,
@@ -85,7 +87,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             );
             ctx.metrics.inc_counter(
                 "storage_move_failures_total",
-                &[("slot_id", ctx.slot_id.as_str())],
+                &[("profile_id", ctx.profile_id.as_str())],
             );
         }
         _ => unreachable!("storage::handle called with non-storage alert"),

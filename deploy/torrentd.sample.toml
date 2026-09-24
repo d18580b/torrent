@@ -1,62 +1,246 @@
 # Sample torrentd configuration file.
 #
 # Copy to /etc/torrentd/torrentd.toml and edit. Unknown keys are a fatal
-# startup error. Every key is documented in docs/running.md.
+# startup error, in `[[profile]]` tables too, so a typo is caught rather than
+# ignored. Every key is documented here; docs/running.md covers the deployment
+# around them.
 
 # ---------------------------------------------------------------------------
-# Single-session example
+# Daemon-wide
 # ---------------------------------------------------------------------------
-listen_interfaces = "0.0.0.0:6881,[::]:6881"
 default_save_path = "/data/torrents"
 resume_dir        = "/var/lib/torrentd/resume"
 torrent_dir       = "/var/lib/torrentd/torrents"
-http_listen       = "127.0.0.1:8080"
-log_level         = "info"   # error | warn | info | debug (reloadable on SIGHUP)
+http_listen       = "127.0.0.1:8080"   # loopback by default
+log_level         = "info"   # error | warn | info | debug (reloadable)
 
-# Optional daemon paths (defaults derived from resume_dir's parent):
-#   - DHT/session state, persisted across restarts (single-session mode only).
-#   - torrent -> slot assignment registry.
-# session_state_path = "/var/lib/torrentd/session_state.dat"
-# registry_path      = "/var/lib/torrentd/slot_assignments.json"
+# The daemon refuses to start unless you either configure [auth] (see the
+# bottom of this file) or say here that you do not want authentication. This
+# sample takes the second option because it binds loopback, where access
+# control is the reverse proxy's job. Delete this line and configure [auth]
+# before exposing the API anywhere — a non-loopback bind without [auth] is
+# refused outright.
+#
+# Read once, at startup, like [auth], http_listen and trusted_proxies: editing
+# any of the four takes effect on restart, not on SIGHUP. A reload after such an
+# edit warns "requires daemon restart; ignored" and changes nothing.
+allow_unauthenticated = true
 
-# libtorrent settings overrides (applied on top of high_performance_seed
+# Peers whose forwarding headers are believed, as IPs or CIDR blocks. There
+# are three such headers and all three are read: X-Forwarded-For,
+# X-Forwarded-Proto and RFC 7239 Forwarded. Empty by default, which means no
+# forwarding header is ever read and the socket's peer address is the client.
+#
+# The proxy must strip or overwrite all three before adding its own. That is
+# the only requirement torrentd places on it, and it covers Forwarded too, not
+# just the two X- names: where an X- name is absent, the client's Forwarded is
+# what the daemon reads. `deploy/Caddyfile` is the worked example.
+#
+# A /0 prefix is refused at startup. It would make every caller a trusted
+# proxy, which makes every forwarding header client-controlled.
+#
+# Set this to the address your reverse proxy connects from, and only that:
+# anything listed here can claim to be any client. Three things use it — the
+# login throttle, which becomes per-client instead of one shared bucket; the
+# `Secure` attribute on the session cookie, which is set when the original
+# request was over TLS; and the `client_ip` field on the login log lines,
+# including the one that records a failed attempt.
+#
+# One address, not a range. `deploy/compose.yaml` pins its `proxy` service to
+# 172.28.0.2 on an explicit subnet precisely so a single /32 can be named here;
+# a range such as 172.16.0.0/12 would trust every container on every Docker
+# network on the host.
+#
+# Read once, at startup, like [auth], http_listen and allow_unauthenticated:
+# the trust set is parsed before anything is served and does not follow a
+# running daemon. Editing this key and sending SIGHUP warns "requires daemon
+# restart; ignored" and changes nothing — decommission a proxy here and the
+# daemon keeps believing its headers until you restart.
+#
+# torrentd never terminates TLS itself. See deploy/Caddyfile.
+# trusted_proxies = ["172.28.0.2"]
+
+# `resume_dir` and `torrent_dir` are roots: each profile gets its own
+# subdirectory under them, named after the profile id. A profile may override
+# either with an absolute path of its own — which is also how you point a
+# profile at directories from a pre-profiles deployment, where resume files
+# lived directly under the root.
+#
+# Optional. Defaults to <resume_dir>/../profile_assignments.json, which records
+# which profile owns which info-hash.
+# registry_path = "/var/lib/torrentd/profile_assignments.json"
+
+# libtorrent settings overrides (applied on top of the high_performance_seed
 # preset). All optional; omit any to use the preset's default.
 connections_limit             = 10000
 file_pool_size                = 1000
-enable_lsd                    = false
 aio_threads                   = 8
 max_concurrent_http_announces = 200
 upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 
-# Optional session identity. Set both to disguise the client to peers
-# and trackers. Non-reloadable (changing requires daemon restart).
-# peer_fingerprint = "-LT20C0-"
+# Local Service Discovery announces to the local network segment. It is
+# ignored for `network = "vpn"` profiles, which disable it unconditionally.
+enable_lsd = false
+
+# Default peer identity for profiles that do not set their own. A `vpn`
+# profile must set its own — see below.
+#
+# These are defaults, not a shared identity: two profiles that both end up
+# with the same effective `peer_fingerprint` / `user_agent` — one inheriting
+# these, one spelling them out — are refused, because that is one peer-id
+# prefix on the wire from two postures.
+# peer_fingerprint = "-XX1234-"
 # user_agent       = "libtorrent/2.0"
 
+# Liveness: max age (seconds) of a WireGuard tunnel's latest handshake before
+# the health monitor declares the profile down and pauses it. Catches a tunnel
+# that keeps its address but has silently stopped handshaking. Default 180.
+# vpn_handshake_max_age_secs = 180
+
+# Defence-in-depth kill switch. When true, torrentd installs a fail-closed
+# nftables table (`torrentd_ks`) confining the daemon's own egress to loopback
+# and its vpn profiles' tunnel interfaces — so if a tunnel drops, the kernel
+# drops the traffic regardless of libtorrent's socket bind or the 30s monitor.
+# Also forces tracker DNS through the tunnel. Removed cleanly on SIGTERM.
+#
+# Requires `nft`, CAP_NET_ADMIN, at least one `network = "vpn"` profile, no
+# `network = "host"` profile (the ruleset would drop its egress while it
+# reported itself healthy, so the daemon refuses the mix), and a dedicated
+# non-root user: the ruleset matches on the daemon's uid, and as root
+# it would drop every root-owned process's traffic on the host, so the daemon
+# refuses to start rather than install it. The packaged systemd unit uses
+# User=torrentd.
+#
+# WireGuard profiles only: `openvpn` runs under the daemon's uid, so the
+# ruleset would drop its own connection to the provider, and the daemon
+# refuses the kill switch beside an OpenVPN profile. And a non-root daemon
+# cannot run `wg-quick` itself, so each profile's link must be raised by root
+# before the daemon starts — docs/running.md §11.6.
+#
+# Verify the whole tunnel setup before trusting it, without seeding anything:
+#   torrentd --config /etc/torrentd/torrentd.toml vpn check
+# network_kill_switch = false
+
 # ---------------------------------------------------------------------------
-# Authentication (optional)
+# Profiles — at least one is required
 # ---------------------------------------------------------------------------
-# Omit this section entirely to keep the original posture: no authentication,
-# bound to loopback, access control delegated to a reverse proxy.
+# Everything below this line belongs to a `[[profile]]` table. TOML binds a
+# key written after a `[[table]]` header to that table, so a daemon-wide key
+# added down here is rejected as an unknown `[[profile]]` field — put it in
+# the "Daemon-wide" block above.
+# A profile is one libtorrent session with its own network posture, identity
+# and directories. There is no default profile and no implicit one: every
+# profile states how it reaches the network, because the alternative —
+# defaulting to the host's own interfaces with DHT on — is the least private
+# posture the daemon has, and it should not be what you get by writing
+# nothing.
 #
-# Generate the values — never write a password or token here by hand:
-#   torrentd --config /etc/torrentd/torrentd.toml hash-password
-#   torrentd --config /etc/torrentd/torrentd.toml new-token --name ci --scopes read
+# `POST /api/torrents` therefore always requires `profile_id`.
 #
-# The token is printed once and is not stored; only its SHA-256 goes below, so
-# a leaked config file cannot be replayed as a credential.
+#   network = "host"  binds the host's own interfaces. Peers and trackers see
+#                     this machine's address. Right for public trackers and DHT
+#                     content, and for nothing that must not be traced here.
 #
-# Scopes: read (safe methods), write (anything that mutates), metrics
-# (/metrics and nothing else — keeps a scrape credential out of the API).
+#   network = "vpn"   binds a tunnel. Every socket in the profile is
+#                     source-bound to the tunnel address, and DHT, PEX and LSD
+#                     are disabled unconditionally — there is no key that turns
+#                     them back on.
+
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6881,[::]:6881"
+# DHT is a public, global announcement of what this host holds. Off unless you
+# write it.
+dht               = true
+
+# Optional per-profile overrides. Every value below is distinct from every
+# other profile's in this file, and has to stay that way. `listen_port` shares
+# one namespace with the ports in a host profile's `listen_interfaces`, and two
+# profiles that end up on one port are refused. `peer_fingerprint_hex` and
+# `user_agent` are refused the same way whenever either of the two profiles
+# wrote the value down; two that both omit the key and inherit the default
+# above are accepted, which is what makes it a default. `resume_dir` and
+# `torrent_dir` must not *equal* another profile's — one containing another's
+# is fine, since neither store descends into a subdirectory.
+# resume_dir           = "/var/lib/torrentd/resume/public"
+# torrent_dir          = "/var/lib/torrentd/torrents/public"
+# peer_fingerprint_hex = "b7c6d5e4f3a29180"
+# user_agent           = "libtorrent/2.0"
+# Per-profile upload cap in bytes/sec, overriding the daemon-wide key above.
+# `0` here means *unlimited* for this profile, not "unset": writing it is how
+# you uncap one account while the daemon-wide key caps the rest. Omit the key
+# entirely to take the daemon-wide value.
+# upload_rate_limit    = 0
+
+# ---------------------------------------------------------------------------
+# VPN profiles — multi-account private-tracker seeding
+# ---------------------------------------------------------------------------
+# Private trackers ban permanently for cross-contamination between accounts, so
+# each account gets its own profile, its own tunnel, and its own identity.
+# `peer_fingerprint_hex` and `user_agent` are required here and must be unique
+# across profiles: they are what a tracker sees as the account's client.
 #
-# [auth]
-# password_hash    = "$argon2id$v=19$m=19456,t=2,p=1$...$..."
-# session_ttl_secs = 43200
+# A wireguard profile's `vpn_config` must be
+# /etc/wireguard/<vpn_interface>.conf — wg-quick derives the interface from the
+# file name on the way up and resolves the name back to that directory on the
+# way down, so anything else brings up a tunnel that can never be torn down.
+# Refused at startup.
 #
-# [[auth.token]]
-# name   = "prometheus"
-# sha256 = "0870bd54c89de51c..."
-# scopes = ["metrics"]
+# The eight rules this is built on, and why each exists, are documented on the
+# `torrentd-engine::profile` module.
+#
+# `allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds —
+# it catches loading one account's torrent into another — not an egress
+# control. It is empty by default, which disables the check entirely.
+
+# The port here shares one namespace with the ports `public` binds above, so
+# it is 6891 rather than 6881: an announced port that two profiles share is
+# what correlates them to a tracker operator, whichever address each announced
+# from.
+#
+# [[profile]]
+# id                       = "account_a"
+# network                  = "vpn"
+# vpn_type                 = "wireguard"
+# vpn_config               = "/etc/wireguard/wg-acct-a.conf"
+# vpn_interface            = "wg-acct-a"
+# listen_port              = 6891
+# peer_fingerprint_hex     = "a1b2c3d4e5f60718"
+# user_agent               = "qBittorrent/5.0.3"
+# resume_dir               = "/var/lib/torrentd/resume/account_a"
+# torrent_dir              = "/var/lib/torrentd/torrents/account_a"
+# allowed_tracker_domains  = ["tracker.example.com"]
+# `0` means unlimited for this profile, overriding the daemon-wide cap; omit
+# the key to inherit it.
+# upload_rate_limit        = 0
+
+# Dynamic port forwarding (ProtonVPN / PIA-style ephemeral ports). Providers
+# like these don't give you a static forwarded port: it is negotiated at
+# runtime over NAT-PMP against the tunnel gateway, and its ~60s lease is
+# renewed continuously. Set `port_forward = "natpmp"`; `listen_port` is then
+# omitted, and the negotiated port is surfaced via `GET /api/profiles/<id>`
+# (`forwarded_port`) plus the `torrentd_profile_forwarded_port` and
+# `torrentd_profile_port_forward_up` metrics.
+#
+# [[profile]]
+# id                       = "proton_a"
+# network                  = "vpn"
+# vpn_type                 = "wireguard"
+# vpn_config               = "/etc/wireguard/proton-a.conf"
+# vpn_interface            = "proton-a"
+# port_forward             = "natpmp"
+# port_forward_gateway     = "10.2.0.1"   # ProtonVPN WireGuard gateway (default)
+# peer_fingerprint_hex     = "3c2d1e0f4a5b6c7d"
+# user_agent               = "Transmission/4.0.6"
+# resume_dir               = "/var/lib/torrentd/resume/proton_a"
+# torrent_dir              = "/var/lib/torrentd/torrents/proton_a"
+# allowed_tracker_domains  = ["tracker.example.com"]
+
+# A two-account deployment, live and uncommented, is in
+# deploy/torrentd.multi-account.sample.toml. Both files are parsed and
+# validated by this repository's own test suite, so what ships here is a
+# configuration the daemon accepts rather than one that merely reads well.
 
 # ---------------------------------------------------------------------------
 # Managed pool (optional)
@@ -69,88 +253,104 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # Migrating from another client is not a special mode: set `library_dir` to
 # that client's state directory and scan. qBittorrent's BT_backup holds both
 # `<hash>.torrent` and `<hash>.fastresume`, and the sidecars are read for their
-# save-path, category and tag hints.
-#
-# Copy BT_backup somewhere scratch first rather than pointing at the live
-# profile. Scanning only reads, but there is no reason to have the other
-# client's state directory open at all.
+# save-path, category and tag hints. Copy it somewhere scratch first — scanning
+# only reads, but there is no reason to have the other client's live state
+# directory open at all.
 #
 #   torrentd --config /etc/torrentd/torrentd.toml pool scan
 #   torrentd --config /etc/torrentd/torrentd.toml pool status
 #   torrentd --config /etc/torrentd/torrentd.toml pool orphans
 #
+# The index schema moves forward one way. The first open on this build
+# migrates the torrent→account column from `slot` to `profile`, and a build
+# predating that change cannot open the result. The pre-migration database is
+# left beside it as `<db_path>.pre-v3.bak`; restoring that file is how you go
+# back to a build that predates this change. It is the only copy of the
+# `plan` / `plan_step` mutation journal, which a rescan does not reconstruct.
+#
+# That copy is a full second copy of the index, so the first open needs free
+# space equal to the size of `pool.db`. If it cannot be written the migration
+# stops, names the backup path and the reason, and leaves the index as it was.
+# Nothing deletes it afterwards and nothing ages it out: remove it yourself
+# once you would not go back. An existing copy at that path is kept as it is and
+# no new one is taken — but only where it really is one: it has to be a pool
+# index, at a schema version this build understands, and not this same `pool.db`
+# reached through a symlink. Anything else stops the migration instead, because
+# keeping it would run the one-way rename with no rollback at all.
+#
+# A `pool.db` from one of this change's own pre-release builds can carry
+# `profile` without v3's indexes, and can report any version from 0 to 3
+# depending on which of them wrote it and where it stopped. Such a file is
+# recognised whichever it was, because the indexes are checked before the
+# version is trusted: where they did not come with the columns — no index on
+# `profile`, or the old `torrent_by_slot` name over it — they are put right,
+# and the version stamped, in the same transaction. No data moves; the
+# `.pre-v3.bak` copy is not a remedy for it, having the same contents.
+#
 # [pool]
 # roots       = ["/data/torrents"]        # must not nest
 # library_dir = "/var/lib/torrentd/library"
 # db_path     = "/var/lib/torrentd/pool.db"   # default: alongside resume_dir
-# import_legacy_registry = true              # fold slot_assignments.json in
-
-# ---------------------------------------------------------------------------
-# Multi-slot example — uncomment and adjust the [[slot]] tables below.
-# Presence of any [[slot]] entry switches the daemon into multi-slot
-# mode; in that case POST /torrents requires `slot_id`.
-# ---------------------------------------------------------------------------
-
-# Liveness: max age (seconds) of a WireGuard tunnel's latest handshake before
-# the health monitor declares the slot down and pauses it. Catches a tunnel
-# that keeps its IP but has silently stopped handshaking. Default 180.
-# vpn_handshake_max_age_secs = 180
-
-# Defence-in-depth kill switch (multi-slot only). When true, torrentd installs a
-# fail-closed nftables table (`torrentd_ks`) that confines the daemon's own
-# egress to loopback + the slots' tunnel interfaces — so if a tunnel drops, the
-# kernel drops the traffic regardless of libtorrent's socket bind or the 30s
-# monitor. Requires CAP_NET_ADMIN, the `nft` binary, and that torrentd runs as a
-# dedicated user (the packaged systemd unit uses User=torrentd). Also forces
-# tracker DNS through the tunnel. Removed cleanly on SIGTERM.
-# network_kill_switch = false
-
-# [[slot]]
-# id                       = "account_a"
-# vpn_profile              = "/etc/wireguard/wg-acct-a.conf"
-# vpn_type                 = "wireguard"
-# vpn_interface            = "wg-acct-a"
-# listen_port              = 6881
-# peer_fingerprint_hex     = "a1b2c3d4e5f60718"
-# user_agent               = "qBittorrent/5.0.3"
-# resume_dir               = "/var/lib/torrentd/resume/account_a"
-# torrent_dir              = "/var/lib/torrentd/torrents/account_a"
-# allowed_tracker_domains  = ["tracker.example.com"]
-# upload_rate_limit        = 0
-
-# [[slot]]
-# id                       = "account_b"
-# vpn_profile              = "/etc/wireguard/wg-acct-b.conf"
-# vpn_type                 = "wireguard"
-# vpn_interface            = "wg-acct-b"
-# listen_port              = 6882
-# peer_fingerprint_hex     = "9f8e7d6c5b4a3210"
-# user_agent               = "Transmission/4.0.6"
-# resume_dir               = "/var/lib/torrentd/resume/account_b"
-# torrent_dir              = "/var/lib/torrentd/torrents/account_b"
-# allowed_tracker_domains  = ["tracker.example.com"]
-# upload_rate_limit        = 0
-
-# ---------------------------------------------------------------------------
-# Dynamic port forwarding (ProtonVPN / PIA-style ephemeral ports)
-# ---------------------------------------------------------------------------
-# Providers like ProtonVPN don't give you a static forwarded port — it is
-# negotiated at runtime over NAT-PMP against the tunnel gateway, is ephemeral,
-# and its ~60s lease is renewed continuously. Set `port_forward = "natpmp"`;
-# `listen_port` is then ignored (omit it) and the negotiated port is bound and
-# surfaced via `GET /slots/<id>` (`forwarded_port`) plus the `slot_forwarded_port`
-# / `slot_port_forward_up` metrics.
+# import_legacy_registry = true               # fold an old assignment file in
+# max_concurrent_verify  = 4                  # bounded so a bulk adopt cannot
+#                                             # starve what is already seeding
 #
-# [[slot]]
-# id                       = "proton_a"
-# vpn_profile              = "/etc/wireguard/proton-a.conf"
-# vpn_type                 = "wireguard"
-# vpn_interface            = "proton-a"
-# port_forward             = "natpmp"
-# port_forward_gateway     = "10.2.0.1"   # ProtonVPN WireGuard gateway (default)
-# peer_fingerprint_hex     = "3c2d1e0f4a5b6c7d"
-# user_agent               = "qBittorrent/5.0.3"
-# resume_dir               = "/var/lib/torrentd/resume/proton_a"
-# torrent_dir              = "/var/lib/torrentd/torrents/proton_a"
-# allowed_tracker_domains  = ["tracker.example.com"]
-# upload_rate_limit        = 0
+# **This is the one key that lets torrentd move and delete files inside your
+# roots.** Off by default; leave it off until you actually want that. The
+# index, matching, adoption and reporting are all read-only without it, and
+# every mutation is planned, journaled and re-checked at apply time even with
+# it on.
+# allow_mutations = false
+
+# ---------------------------------------------------------------------------
+# Authentication — required, one way or the other
+# ---------------------------------------------------------------------------
+# The daemon refuses to start unless you have either configured `[auth]` or
+# written `allow_unauthenticated = true`. Without `[auth]` it authenticates
+# nothing: every route, including every mutating one, is open to anyone who can
+# reach the port. That is a legitimate posture behind a reverse proxy that does
+# its own access control — but not one to arrive at by omission, which is what
+# it used to be.
+#
+# The opt-out does not extend to a routable address: `allow_unauthenticated`
+# with a non-loopback `http_listen` is refused, because that is an
+# unauthenticated mutating API on the network. So the two safe shapes are:
+#
+#   loopback + allow_unauthenticated   access control is the proxy's job
+#   any bind + [auth]                  the daemon authenticates itself
+#
+# This sample ships the first, because it binds loopback: see
+# `allow_unauthenticated` in the daemon-wide block at the top. Configure [auth]
+# below and delete that line before exposing the API anywhere.
+# Generate the values — never write a password or token here by hand:
+#   torrentd --config /etc/torrentd/torrentd.toml hash-password
+#   torrentd --config /etc/torrentd/torrentd.toml new-token --name ci --scopes read
+#
+# Bootstrapping order: `--config` is read before any subcommand runs, so this
+# file has to exist and parse first — but `hash-password`, `new-token`, the
+# `pool` subcommands and observe-only `vpn check` are exempt from the
+# authentication posture check, because they construct no session and bind
+# nothing. `vpn check --bring-up` is not: it raises a real tunnel on this host,
+# so it takes the daemon's full check. So write this file without `[auth]` and
+# with whatever `http_listen` the deployment needs, generate the values, then
+# add the section. In a container: `compose run --rm torrentd hash-password`.
+# See docs/running.md §6.
+#
+# The token is printed once and is not stored; only its SHA-256 goes below, so
+# a leaked config file cannot be replayed as a credential. The password gets
+# Argon2id because a human chose it; a 256-bit token this daemon generated has
+# nothing to guess, and Argon2 on every Prometheus scrape would burn ~50ms of
+# CPU per request by design.
+#
+# Scopes: read (safe methods), write (anything that mutates), metrics
+# (/metrics and nothing else — keeps a scrape credential out of the API).
+# /healthz is never authenticated.
+#
+# [auth]
+# password_hash    = "$argon2id$v=19$m=19456,t=2,p=1$...$..."
+# session_ttl_secs = 43200
+#
+# [[auth.token]]
+# name   = "prometheus"
+# sha256 = "0870bd54c89de51c..."
+# scopes = ["metrics"]

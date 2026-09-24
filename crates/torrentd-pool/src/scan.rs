@@ -176,9 +176,9 @@ pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanSta
             declared_save_path: hints.save_path,
             category: hints.category,
             tags: hints.tags,
-            // Never inferred here; slot assignment is the daemon's decision and
+            // Never inferred here; profile assignment is the daemon's decision and
             // upsert_torrent preserves any existing value.
-            slot: None,
+            profile: None,
         };
         store.upsert_torrent(&torrent, now_secs())?;
 
