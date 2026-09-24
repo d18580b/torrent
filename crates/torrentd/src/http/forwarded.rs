@@ -106,13 +106,7 @@ impl Cidr {
     /// the whole mapped range and so spans every v4 address, which is what
     /// `saturating_sub` says.
     pub fn contains(&self, ip: IpAddr) -> bool {
-        let (net, prefix) = match self.addr {
-            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => (IpAddr::V4(v4), self.prefix.saturating_sub(96)),
-                None => (self.addr, self.prefix),
-            },
-            IpAddr::V4(_) => (self.addr, self.prefix),
-        };
+        let (net, prefix) = self.effective();
         match (net, unmap(ip)) {
             (IpAddr::V4(net), IpAddr::V4(ip)) => prefix_match(&net.octets(), &ip.octets(), prefix),
             (IpAddr::V6(net), IpAddr::V6(ip)) => prefix_match(&net.octets(), &ip.octets(), prefix),
@@ -121,6 +115,51 @@ impl Cidr {
             // can bring them together.
             _ => false,
         }
+    }
+
+    /// The block [`contains`](Self::contains) actually matches against: a
+    /// v4-mapped entry folded to its v4 form with the mapped `/96` taken out
+    /// of its prefix, anything else as written.
+    fn effective(&self) -> (IpAddr, u8) {
+        match self.addr {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => (IpAddr::V4(v4), self.prefix.saturating_sub(96)),
+                None => (self.addr, self.prefix),
+            },
+            IpAddr::V4(_) => (self.addr, self.prefix),
+        }
+    }
+}
+
+/// The **effective** block, not the entry as the operator wrote it: folded as
+/// [`Cidr::contains`] folds it, and with the host bits the prefix ignores
+/// cleared. So `::ffff:0:0/96` prints as `0.0.0.0/0` and `10.1.2.3/8` as
+/// `10.0.0.0/8` — which is what the startup log exists to show, since the
+/// spelling an operator wrote can hide how much it trusts.
+impl std::fmt::Display for Cidr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (net, prefix) = self.effective();
+        let net = match net {
+            IpAddr::V4(v4) => {
+                let mut o = v4.octets();
+                mask(&mut o, prefix);
+                IpAddr::from(o)
+            }
+            IpAddr::V6(v6) => {
+                let mut o = v6.octets();
+                mask(&mut o, prefix);
+                IpAddr::from(o)
+            }
+        };
+        write!(f, "{net}/{prefix}")
+    }
+}
+
+/// Clear every bit of `octets` past the first `prefix`.
+fn mask(octets: &mut [u8], prefix: u8) {
+    for (i, b) in octets.iter_mut().enumerate() {
+        let kept = (prefix as usize).saturating_sub(i * 8).min(8);
+        *b &= if kept == 0 { 0 } else { 0xffu8 << (8 - kept) };
     }
 }
 
@@ -205,6 +244,20 @@ impl TrustedProxies {
 
     fn trusts(&self, peer: IpAddr) -> bool {
         self.0.iter().any(|c| c.contains(peer))
+    }
+}
+
+/// Every block in its effective form (see [`Cidr`]'s `Display`), joined
+/// with `", "`.
+impl std::fmt::Display for TrustedProxies {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (i, c) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
+            }
+            write!(f, "{c}")?;
+        }
+        Ok(())
     }
 }
 
@@ -512,7 +565,7 @@ fn elements<'a, B>(req: &'a Request<B>, name: &'a str) -> impl Iterator<Item = &
 /// name is case-insensitive, as the same section requires.
 ///
 /// The parameter list is split outside quoted strings, for the reason
-/// [`SplitOutsideQuotes`] gives. Splitting the *name* from the value on the
+/// [`SplitList`] gives. Splitting the *name* from the value on the
 /// first `=` needs no such care: a name is a token, so the first `=` in a
 /// parameter is always the one that separates them.
 fn param<'a>(element: &'a str, key: &str) -> Option<std::borrow::Cow<'a, str>> {
@@ -1760,6 +1813,29 @@ mod tests {
         assert!(Cidr::parse("0.0.0.0/0")
             .unwrap()
             .contains("1.2.3.4".parse().unwrap()));
+    }
+
+    /// The startup log prints this form, so it has to be the block the
+    /// matcher uses rather than the spelling the operator wrote.
+    #[test]
+    fn a_trust_set_displays_its_effective_blocks() {
+        let set = TrustedProxies::parse(&[
+            "::ffff:0:0/96".to_string(),
+            "10.1.2.3/8".to_string(),
+            "::ffff:127.0.0.1".to_string(),
+            "2001:db8::1/64".to_string(),
+            "172.28.0.2".to_string(),
+            "10.0.0.0/00".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            set.to_string(),
+            "0.0.0.0/0, 10.0.0.0/8, 127.0.0.1/32, 2001:db8::/64, 172.28.0.2/32, 0.0.0.0/0"
+        );
+        // And what it prints is what it matches.
+        let every_v4 = Cidr::parse("::ffff:0:0/96").unwrap();
+        assert!(every_v4.contains("203.0.113.9".parse().unwrap()));
+        assert_eq!(TrustedProxies::default().to_string(), "");
     }
 
     #[test]
