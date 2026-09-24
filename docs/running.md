@@ -198,7 +198,7 @@ reporting are all read-only without it.
 
 ### Upgrading from a pre-profiles deployment
 
-Four things changed at once, and three of them will stop an upgraded daemon
+Several things changed at once, and most of them will stop an upgraded daemon
 serving your library. Do all of this before you start it.
 
 **1. Remove the two top-level keys that no longer exist.** `session_state_path`
@@ -207,6 +207,27 @@ existing config file is now a fatal startup error naming whichever it reaches
 first. `listen_interfaces` moved onto each `network = "host"` profile; session
 state moved to `session_state-<profile_id>.dat` beside the old file and needs no
 key.
+
+**1a. Rewrite each `[[slot]]` table as a `[[profile]]`.** `[[slot]]` is gone,
+and a file with no `[[profile]]` at all is refused: a single-session deployment
+that had no `[[slot]]` needs one `network = "host"` profile carrying the
+`listen_interfaces` it used to set at the top level. For each old slot:
+
+- Rename the header to `[[profile]]` and add `network = "vpn"`.
+- Rename `vpn_profile` to `vpn_config`. The value is the same file.
+- `resume_dir` and `torrent_dir` were required on a slot and are optional now,
+  defaulting to `<resume_dir>/<id>` and `<torrent_dir>/<id>` under the
+  top-level roots. Keeping the slot's own values is fine, and is how step 3 is
+  done for that profile.
+- **Delete `upload_rate_limit = 0`, do not carry it over.** On a slot, `0`
+  meant "no override — inherit the daemon-wide cap". On a profile it means
+  **unlimited**, the same as the top-level key's `0`, so a slot that wrote `0`
+  to inherit the cap becomes an uncapped profile, and nothing warns: the file
+  is valid either way. Leave the key out to inherit; any other value carries
+  over unchanged.
+- Every other key — `id`, `vpn_type`, `vpn_interface`, `listen_port`,
+  `peer_fingerprint_hex`, `user_agent`, `allowed_tracker_domains`,
+  `port_forward`, `port_forward_gateway` — keeps its name and meaning.
 
 **2. Give a profile the id your registry already uses, or clear the entries.**
 The assignment registry — which torrent belongs to which account — is migrated
@@ -422,8 +443,8 @@ curl -sS -X POST localhost:8080/api/reload
 
 | Status | Meaning |
 | --- | --- |
-| `202` | Accepted. The reload runs asynchronously; watch the journal for its result. |
-| `429` | A reload is already in flight. Retry. |
+| `202` | Accepted. The reload runs asynchronously; watch the journal for its result. A request made while another reload is running is queued behind it and also gets `202`. |
+| `429` | The reload queue, which `SIGHUP` shares and which holds eight pending requests, is full. Retry once the queued reloads have run. |
 | `503` | The daemon is shutting down, or was built without the reload channel wired up. |
 
 It needs a token with the `write` scope (or a logged-in session) where `[auth]`
