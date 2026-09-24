@@ -256,10 +256,13 @@ deletes it, nothing ages it out, and no later start reclaims its space: keep it
 until the new index has been in service long enough that you would not go back,
 then delete it yourself. The daemon cannot make that judgement for you, and
 deleting an operator's only rollback on a timer is not a judgement it should
-be making. If a `.pre-v3.bak` is already at that path when a migration starts,
-the daemon keeps it, says so, and takes no new copy: it is from an earlier
-attempt at this same migration, which rolled back, so it describes the same
-state.
+be making. If a `.pre-v3.bak` is already at that path when a migration starts
+— from an earlier attempt, or from an earlier successful migration you rolled
+back by copying it over the index — it need not describe the index as it
+stands now, so the daemon takes a fresh copy beside it as
+`<db_path>.pre-v3.bak.new`. When the migration commits, the fresh copy replaces
+the old one; when it fails, the fresh copy is discarded and the old one stays,
+because it is the copy that predates the run that failed.
 
 That holds for something that is a copy of the index, and the daemon checks
 that it is one. What is at that path has to be a pool index, at a schema

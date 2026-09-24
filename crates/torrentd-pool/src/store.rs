@@ -356,10 +356,19 @@ impl PoolStore {
     /// `VACUUM INTO` rather than a file copy: the database runs in WAL mode,
     /// so the bytes at `path` are not by themselves a complete database.
     ///
-    /// An existing backup is left alone. It is from an earlier attempt at this
-    /// same migration, and that attempt rolled back, so it describes the same
-    /// state this one would write — and the older file is the one an operator
-    /// has had time to notice.
+    /// An existing backup does not describe the state this run is about to
+    /// change. It can be from an earlier attempt that rolled back, but it can
+    /// equally be from an earlier **successful** migration that the operator
+    /// rolled back by copying it over the index, leaving it in place — and
+    /// every change made since then is in the index and not in the copy.
+    /// Keeping it and taking no new one meant a second rollback after the
+    /// re-upgrade silently discarded those changes. So a fresh copy is taken
+    /// beside it, as `<backup>.new`, and replaces it only once the migration
+    /// commits: until then the older file stays, because if the migration
+    /// fails the fresh copy is of the index that just failed, and the older
+    /// one is the copy that predates the run — the one the failure message
+    /// tells the operator they may restore. The caller does the replacing, in
+    /// [`PoolStore::promote_fresh_backup`].
     ///
     /// "Exists" is `symlink_metadata`, not `Path::exists`: the latter follows
     /// symlinks, so a `.pre-v3.bak` that is a symlink to nothing read as
@@ -367,19 +376,23 @@ impl PoolStore {
     /// index *through* it, wherever it pointed. Whatever an operator put at
     /// this path, the answer to "is something already here" is yes.
     ///
-    /// But "kept" is only the right answer for something that is a copy of the
-    /// index. A dangling symlink, a directory or an unrelated file is not one,
-    /// and keeping it meant the irreversible v3 rename then ran with **no**
+    /// But keeping it through a failed run is only the right answer for
+    /// something that is a copy of the index. A dangling symlink, a directory
+    /// or an unrelated file is not one, and keeping it meant the irreversible v3 rename then ran with **no**
     /// rollback copy at all, while `docs/running.md` tells the operator that
     /// restoring that file is how they go back. A promise of a rollback that
     /// does not exist is worse than a refusal naming why, so the migration
     /// stops instead. [`PoolStore::rollback_copy_of_an_index`] is that test,
     /// and it asks what the sentence above claims rather than the weaker
     /// question of whether SQLite can open the bytes.
-    fn backup_before_v3(&self) -> Result<(), PoolError> {
+    ///
+    /// Returns the `(fresh, existing)` pair when a fresh copy was taken beside
+    /// an existing one, for the caller to promote after the commit or discard
+    /// after a failure.
+    fn backup_before_v3(&self) -> Result<Option<(String, String)>, PoolError> {
         // No path: an in-memory store, which has nothing to roll back to.
         let Some(path) = self.conn.path().filter(|p| !p.is_empty()) else {
-            return Ok(());
+            return Ok(None);
         };
         let backup = format!("{path}{}", Self::PRE_V3_BACKUP_SUFFIX);
         if Path::new(&backup).symlink_metadata().is_ok() {
@@ -389,12 +402,29 @@ impl PoolStore {
                     reason,
                 });
             }
+            let fresh = format!("{backup}.new");
+            // A leftover from a run that died before promoting or discarding
+            // it. `remove_file` removes a symlink itself, never its target.
+            if Path::new(&fresh).symlink_metadata().is_ok() {
+                std::fs::remove_file(&fresh).map_err(|e| PoolError::BackupFailed {
+                    path: fresh.clone(),
+                    reason: e.to_string(),
+                })?;
+            }
+            self.conn
+                .execute("VACUUM INTO ?1", params![fresh])
+                .map_err(|e| PoolError::BackupFailed {
+                    path: fresh.clone(),
+                    reason: e.to_string(),
+                })?;
             info!(
                 target: "torrentd_pool::store",
                 backup = %backup,
-                "pool schema v3 backup already exists; keeping it",
+                fresh = %fresh,
+                "pool schema v3 backup already exists; took a fresh copy beside it, which \
+                 replaces it once the migration commits",
             );
-            return Ok(());
+            return Ok(Some((fresh, backup)));
         }
         // Wrapped, not propagated. A bare `PoolError::Sqlite` here aborted an
         // otherwise-valid migration with a SQLite code and no mention of a
@@ -412,7 +442,48 @@ impl PoolStore {
             backup = %backup,
             "pool database copied aside before the v3 schema migration",
         );
-        Ok(())
+        Ok(None)
+    }
+
+    /// Settle a fresh copy [`PoolStore::backup_before_v3`] took beside an
+    /// existing one: after a commit it replaces the older copy, because it is
+    /// the state the migration just changed; after a failure it is discarded,
+    /// because it is a copy of the index that failed and the older one is the
+    /// rollback that predates the run.
+    ///
+    /// Neither outcome fails the open. The migration has already committed or
+    /// already failed; a copy that cannot be settled is reported with both
+    /// paths so the operator can settle it by hand.
+    fn promote_fresh_backup(pair: Option<(String, String)>, committed: bool) {
+        let Some((fresh, backup)) = pair else {
+            return;
+        };
+        if committed {
+            match std::fs::rename(&fresh, &backup) {
+                Ok(()) => info!(
+                    target: "torrentd_pool::store",
+                    backup = %backup,
+                    "replaced the earlier pre-v3 backup with the copy taken before this migration",
+                ),
+                Err(e) => warn!(
+                    target: "torrentd_pool::store",
+                    backup = %backup,
+                    fresh = %fresh,
+                    error.cause = %e,
+                    "the migration committed but its fresh pre-v3 copy could not replace the \
+                     earlier one; the fresh copy is the rollback for this migration — move it \
+                     over the earlier one by hand",
+                ),
+            }
+        } else if let Err(e) = std::fs::remove_file(&fresh) {
+            warn!(
+                target: "torrentd_pool::store",
+                fresh = %fresh,
+                error.cause = %e,
+                "could not discard the fresh pre-v3 copy of an index whose migration failed; \
+                 it is a copy of that same index and not a rollback — delete it by hand",
+            );
+        }
     }
 
     /// Whether what is at `path` can be a rollback copy of the index at
@@ -734,11 +805,16 @@ impl PoolStore {
         // Outside the transaction: VACUUM cannot run inside one. Only for a
         // database that already exists — `found >= 1` — because there is
         // nothing to preserve in a file this call is about to create.
-        if found >= 1 {
-            self.backup_before_v3()?;
-        }
+        let fresh_backup = if found >= 1 {
+            self.backup_before_v3()?
+        } else {
+            None
+        };
 
-        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        if let Err(e) = self.conn.execute_batch("BEGIN IMMEDIATE") {
+            Self::promote_fresh_backup(fresh_backup, false);
+            return Err(e.into());
+        }
         let stepped = (|| -> Result<(), PoolError> {
             if found < 1 {
                 self.conn.execute_batch(SCHEMA_V1)?;
@@ -753,9 +829,13 @@ impl PoolStore {
                 .pragma_update(None, "user_version", SCHEMA_VERSION)?;
             Ok(())
         })();
+        // Settled whichever way the transaction ends, before any `?` below
+        // can return past it.
+        let stepped =
+            stepped.and_then(|()| self.conn.execute_batch("COMMIT").map_err(PoolError::from));
+        Self::promote_fresh_backup(fresh_backup, stepped.is_ok());
         match stepped {
             Ok(()) => {
-                self.conn.execute_batch("COMMIT")?;
                 info!(
                     target: "torrentd_pool::store",
                     from_version = found,
