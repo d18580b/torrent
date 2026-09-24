@@ -87,7 +87,8 @@ pub struct Config {
     /// Install a fail-closed nftables kill switch (multi-slot mode) that
     /// confines the daemon's egress to loopback + the slots' tunnel interfaces.
     /// Off by default; requires `CAP_NET_ADMIN` and that torrentd runs as its own
-    /// user. See `vpn::killswitch`.
+    /// non-root user. WireGuard slots only: `validate` refuses it beside an
+    /// OpenVPN slot. See `vpn::killswitch` for what that leaves runnable.
     #[serde(default)]
     pub network_kill_switch: bool,
 
@@ -175,6 +176,27 @@ impl Config {
     pub fn validate(&self) -> anyhow::Result<()> {
         if !self.slot.is_empty() {
             SlotConfig::validate_set(&self.slot).context("[[slot]] validation failed")?;
+        }
+        // The kill switch matches the daemon's traffic by uid, and the daemon
+        // spawns `openvpn` under its own uid, so the ruleset drops the
+        // OpenVPN client's own connection to the provider: the slot can never
+        // come up. Refused here, where `--check-config` sees it, rather than
+        // discovered as a fenced slot.
+        if self.network_kill_switch {
+            if let Some(s) = self
+                .slot
+                .iter()
+                .find(|s| s.vpn_type == torrentd_engine::VpnType::Openvpn)
+            {
+                anyhow::bail!(
+                    "network_kill_switch = true cannot be used with an OpenVPN slot \
+                     ([[slot]] id = \"{}\"): the kill switch matches the daemon's uid, \
+                     `openvpn` runs under that uid, and its connection to the provider \
+                     leaves by the physical interface, so the ruleset drops it and the \
+                     tunnel never comes up. The kill switch supports WireGuard slots only.",
+                    s.id,
+                );
+            }
         }
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
@@ -622,6 +644,36 @@ connections_limit = 10000
             port_forward: torrentd_engine::PortForwardMode::Static,
             port_forward_gateway: None,
         }
+    }
+
+    /// `openvpn` runs under the daemon's uid, so the kill switch drops its
+    /// connection to the provider; the combination is refused at load, and a
+    /// WireGuard-only set with the kill switch is not.
+    #[test]
+    fn the_kill_switch_is_refused_beside_an_openvpn_slot() {
+        let dir = tempdir().unwrap();
+        let mut cfg = Config::load(&write_cfg(dir.path(), SINGLE_SESSION)).unwrap();
+        cfg.network_kill_switch = true;
+        cfg.slot = vec![slot_with_limit("acct_a", None)];
+        cfg.validate()
+            .expect("the kill switch beside WireGuard slots only is accepted");
+
+        let mut ovpn = slot_with_limit("acct_b", None);
+        ovpn.vpn_type = torrentd_engine::VpnType::Openvpn;
+        ovpn.vpn_profile = PathBuf::from("/etc/openvpn/acct_b.conf");
+        ovpn.vpn_interface = "tun-b".to_string();
+        ovpn.listen_port = Some(6882);
+        ovpn.peer_fingerprint_hex = "b1b2c3d4e5f60718".to_string();
+        cfg.slot.push(ovpn);
+        let err = format!("{:#}", cfg.validate().unwrap_err());
+        assert!(
+            err.contains("OpenVPN slot") && err.contains("acct_b"),
+            "got: {err}"
+        );
+
+        cfg.network_kill_switch = false;
+        cfg.validate()
+            .expect("an OpenVPN slot without the kill switch is accepted");
     }
 
     #[test]
