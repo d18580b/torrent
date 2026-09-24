@@ -17,12 +17,18 @@
 //! anything the router already matched wins, and only unmatched paths fall
 //! through to here.
 //!
-//! This is an origin server sitting behind a caching reverse proxy, which is
-//! what makes the response metadata matter. Without a validator, `no-cache`
-//! on `index.html` means every single load re-ships the document — the proxy
-//! has nothing to revalidate *with*, so it cannot answer 304 and neither
-//! could this. Without `Content-Encoding` negotiation, a 226 KB bundle is
-//! sent raw to every cold client. Both were the case.
+//! This is the origin every request reaches. The shipped reverse proxy
+//! (`deploy/Caddyfile`, on the stock `caddy:2-alpine` image, which has no
+//! HTTP cache module) terminates TLS and forwards; it stores nothing and
+//! answers no 304 itself. What it does do is pass conditional requests and
+//! their answers through, so the browser's own cache is the one that
+//! revalidates — and that is what makes the response metadata matter here.
+//! Without a validator, `no-cache` on `index.html` means every single load
+//! re-ships the document: the browser has nothing to revalidate *with*, so
+//! this cannot answer 304. Without `Content-Encoding` negotiation, a 226 KB
+//! bundle is sent raw to every cold client. Both were the case. The same
+//! headers keep the responses correct for any shared cache an operator puts
+//! in front, but none ships with this repository.
 
 use axum::body::Body;
 use axum::http::header;
@@ -272,9 +278,9 @@ fn respond(path: &str, req_headers: &HeaderMap) -> Option<Response> {
 /// all.
 ///
 /// A conformant browser keys `If-None-Match` per URL and would not send one
-/// here, but a shared cache revalidating on the operator's behalf is exactly
-/// the deployment this change introduces, and `no-cache` on `index.html`
-/// makes every deep-link load a revalidation.
+/// here, but a client or a shared cache an operator adds in front is not
+/// bound to behave that way, and `no-cache` on `index.html` makes every
+/// deep-link load a revalidation.
 fn respond_unconditionally(path: &str, req_headers: &HeaderMap) -> Option<Response> {
     respond_inner(path, req_headers, false)
 }
@@ -535,9 +541,9 @@ mod tests {
         // validator whatever URL was asked for, so a deep link the client has
         // never fetched answered **304 with an empty body** — no document,
         // for a URL nothing was ever stored under. `If-None-Match: *` reaches
-        // it with no stored validator at all. A shared cache revalidating on
-        // the operator's behalf is exactly the deployment this change
-        // introduces.
+        // it with no stored validator at all. A conformant browser would not
+        // send one, but nothing guarantees every client, or a shared cache an
+        // operator adds, is conformant.
         assert!(
             Assets::get("index.html").is_some(),
             "the bundle has to be present for this test to be testing \
