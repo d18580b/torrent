@@ -2,9 +2,12 @@
 #
 # torrentd deliberately does not speak TLS: it has no certificate handling, no
 # renewal, and no HTTP server configuration surface to get wrong. What it does
-# have is an origin that behaves correctly behind a cache — ETags, conditional
-# requests, precompressed assets, and a `Vary` on Accept-Encoding — so a proxy
-# in front can serve the web client's bundle without asking twice.
+# have is an origin that serves its assets correctly — ETags, conditional
+# requests, precompressed assets, and a `Vary` on Accept-Encoding. This proxy
+# terminates TLS, forwards, and passes conditional responses through, so a
+# browser that already holds an asset revalidates it and gets a 304. The stock
+# caddy:2-alpine image has no HTTP cache module, so every request still
+# reaches torrentd.
 #
 # Replace the site address with your own. `torrentd.example.com` gets an
 # automatic certificate; `:80` alone serves plain HTTP, which is fine on a
