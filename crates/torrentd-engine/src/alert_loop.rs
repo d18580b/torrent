@@ -127,17 +127,25 @@ impl AlertLoopBuilder {
         }
     }
 
-    /// Treat `listen_failed_alert` as fatal: correct in single-session mode,
-    /// where nothing else is listening and seeding would just stop silently.
-    /// In multi-profile mode only the affected profile is marked failed and the
-    /// daemon keeps running.
+    /// Treat `listen_failed_alert` as fatal.
+    ///
+    /// Set when there is exactly **one live session**, whatever the config
+    /// declares: nothing else is listening, so seeding would otherwise stop
+    /// silently. The condition is live sessions and not configured profiles
+    /// precisely so that a daemon configured with two profiles and reduced to
+    /// one by a bring-up failure has the same exposure as one configured with
+    /// one.
+    ///
+    /// With two or more live sessions the failure is not fatal: the affected
+    /// profile logs, counts and warns, and the others keep serving.
     pub fn fatal_listen_failure(mut self, yes: bool) -> Self {
         self.fatal_listen_failure = yes;
         self
     }
 
-    /// Supply the fenced-profile predicate. Without one, no profile is ever fenced,
-    /// which is correct for single-session mode and for tests.
+    /// Supply the fenced-profile predicate. Without one, no profile is ever
+    /// fenced, which is correct where nothing fences — a deployment of host
+    /// profiles alone, and tests.
     pub fn profile_fenced(mut self, f: ProfileFenced) -> Self {
         self.profile_fenced = Some(f);
         self
@@ -367,13 +375,25 @@ fn run(
         let was_empty = drained.is_empty();
         let mut fatal = false;
         for (profile, alert) in drained {
-            // A listen socket that fails in
-            // single-session mode is fatal — there is no other session to
-            // carry the load, so seeding silently stops. Note it, finish
-            // dispatching the batch (so the failure is logged and counted),
-            // then unwind.
-            if hooks.fatal_listen_failure && matches!(alert, Alert::ListenFailed { .. }) {
-                fatal = true;
+            // A listen socket that fails when this is the only live session
+            // is fatal — there is no other session to carry the load, so
+            // seeding silently stops. Note it, finish dispatching the batch
+            // (so the failure is logged and counted), then unwind.
+            if matches!(alert, Alert::ListenFailed { .. }) {
+                if hooks.fatal_listen_failure {
+                    fatal = true;
+                } else {
+                    // Not fatal, and previously visible only as a Prometheus
+                    // counter. A session that accepts no incoming connections
+                    // is worth a line in the journal too, naming which
+                    // account it is.
+                    warn!(
+                        target: "torrentd_engine::alert_loop",
+                        profile_id = %profile,
+                        "listen socket failed; this profile accepts no incoming connections. \
+                         Other sessions are still live, so the daemon keeps running",
+                    );
+                }
             }
             dispatch_alert(
                 profile, alert, &source, &state, &resume, &torrents, &metrics, &clock,
@@ -383,7 +403,7 @@ fn run(
             hooks.listen_failed.store(true, Ordering::Relaxed);
             error!(
                 target: "torrentd_engine::alert_loop",
-                "listen socket failed in single-session mode; shutting down",
+                "the only live session's listen socket failed; shutting down",
             );
             if let Some(cb) = &hooks.on_fatal {
                 cb(ShutdownReason::ListenFailed);

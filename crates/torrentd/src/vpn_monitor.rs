@@ -73,11 +73,22 @@ pub async fn run(
     handshake_max_age: Duration,
     mut shutdown: broadcast::Receiver<ShutdownReason>,
 ) {
-    // Profiles start healthy (their session was constructed on a confirmed IP).
-    // Pre-register every per-profile series at its baseline so `rate()`/alerting
-    // queries resolve from a cold start instead of reading "no data" until the
-    // first tunnel event ever occurs.
-    for e in profiles.iter() {
+    // Live tunnelled profiles start healthy (their session was constructed on
+    // a confirmed IP). Pre-register every per-profile series at its baseline
+    // so `rate()`/alerting queries resolve from a cold start instead of
+    // reading "no data" until the first tunnel event ever occurs.
+    //
+    // A profile with no tunnel is skipped, exactly as the tick loop below
+    // skips it. Seeding `profile_vpn_tunnel_up = 1` for a host profile
+    // asserted a live tunnel that does not exist and can never move, because
+    // the only writer that would clear it skips the profile: on the shipped
+    // sample — a host-only deployment — the daemon emitted
+    // `torrentd_profile_vpn_tunnel_up{profile_id="public"} 1` forever, and a
+    // dashboard counting live tunnels over-reported them.
+    for e in profiles
+        .iter()
+        .filter(|e| e.config.vpn_interface().is_some())
+    {
         let labels = [("profile_id", e.id().as_str())];
         metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
         metrics.set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
@@ -89,6 +100,23 @@ pub async fn run(
                 &[("profile_id", e.id().as_str()), ("reason", reason.as_str())],
             );
         }
+    }
+
+    // A configured vpn profile that never came up. The series has to exist and
+    // be *false*, not be absent: `docs/running.md` points operators at
+    // `torrentd_profile_vpn_tunnel_up` as the per-profile tunnel signal, and
+    // an absent series is what made a failed account invisible to it — the
+    // same anti-pattern this change fixed for `kill_switch_active`, where the
+    // metric was simply absent and an alert for exactly that condition could
+    // never fire.
+    for f in profiles
+        .failed()
+        .iter()
+        .filter(|f| f.config.vpn_interface().is_some())
+    {
+        let labels = [("profile_id", f.config.id.as_str())];
+        metrics.set_gauge("profile_vpn_tunnel_up", 0.0, &labels);
+        metrics.set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
     }
 
     loop {

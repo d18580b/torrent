@@ -34,6 +34,16 @@ fn main() {
         "cargo:rerun-if-changed={}",
         web.join("vite.config.ts").display()
     );
+    // `npm run build` invokes this after vite, and it is what writes the
+    // precompressed `.br`/`.gz` siblings the binary embeds. A build input the
+    // build does not watch is the same defect class as a hand-maintained
+    // list, and this one serves stale bytes rather than failing: edit the
+    // script alone without this line and the bundle is not rebuilt, so the
+    // embedded siblings keep whatever the last run produced.
+    println!(
+        "cargo:rerun-if-changed={}",
+        web.join("scripts/precompress.mjs").display()
+    );
 
     if !web.join("package.json").exists() {
         // A source tree without the web directory (a vendored crate, say) still

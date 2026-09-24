@@ -12,6 +12,18 @@
     "pending_resume_count": 0,
     "profile_count": 1
   },
+  "/api/profiles": [
+    {
+      "profile_id": "public",
+      "status": "active",
+      "tunnel_ip": null,
+      "torrent_count": 184,
+      "listen_port": 6881,
+      "port_forward": "static",
+      "forwarded_port": 6881,
+      "user_agent": null
+    }
+  ],
   "/api/pool": {
     "roots": [
       {
