@@ -36,12 +36,26 @@ ReadWritePaths=/var/lib/torrentd /data/torrents
 StateDirectory=torrentd
 StateDirectoryMode=0750
 
-# WireGuard / tunnel control. A `vpn` profile brings up its own tunnel (and,
-# with network_kill_switch = true, installs an nftables table), and both need
-# NET_ADMIN. A deployment whose profiles are all `network = "host"` needs
-# neither: remove both lines in that case.
-AmbientCapabilities=CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_ADMIN
+# WireGuard / tunnel control. A `network = "vpn"` profile brings up its own
+# tunnel (and, with `network_kill_switch = true`, installs an nftables table),
+# and needs NET_ADMIN.
+#
+# The two directives pull in opposite directions and are treated differently
+# here. `AmbientCapabilities=` is a grant, so it is commented out by default: a
+# capability granted to a deployment that does not need it is a capability
+# granted for nothing. `CapabilityBoundingSet=` is a ceiling, so commenting it
+# out grants rather than withholds — it replaces a bounding set of exactly
+# CAP_NET_ADMIN with systemd's full default set, and every binary the daemon
+# execs (`nft`, `wg`, `wg-quick`, `pkill`) can then acquire whatever file
+# capabilities it carries. It is therefore active and empty below: nothing this
+# unit runs can hold any capability at all.
+#
+# For a `vpn` profile, uncomment both lines. They come after the empty set, so
+# the bounding set ends up as exactly {CAP_NET_ADMIN} without deleting
+# anything.
+CapabilityBoundingSet=
+# AmbientCapabilities=CAP_NET_ADMIN
+# CapabilityBoundingSet=CAP_NET_ADMIN
 
 User=torrentd
 Group=torrentd

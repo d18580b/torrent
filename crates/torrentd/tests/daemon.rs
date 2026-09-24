@@ -78,6 +78,7 @@ fn write_config(p: &std::path::Path, listen_port: u16, http_addr: &str) -> std::
              torrent_dir = \"{d}/torrents\"\n\
              http_listen = \"{http_addr}\"\n\
              log_level = \"warn\"\n\
+             allow_unauthenticated = true\n\
              enable_lsd = false\n\
              \n\
              [[profile]]\n\

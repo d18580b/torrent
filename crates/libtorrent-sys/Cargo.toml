@@ -23,8 +23,10 @@ default = ["bundled"]
 # configurations, and `--no-default-features` type-checks the whole workspace.
 bundled = []
 
-# Layer 2 ASAN test harness (compiled separately from the real shim; lands
-# in Phase 3 T22).
+# Layer 2: the FFI shim's own tests, in `tests/shim.rs`. Gated because they
+# read `.torrent` fixtures out of the vendored libtorrent checkout, so they
+# need the submodule on disk even when a cached native prefix would otherwise
+# make it unnecessary. `mise run test-shim`.
 shim-tests = []
 
 [dependencies]
