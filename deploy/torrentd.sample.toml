@@ -69,8 +69,10 @@ enable_lsd = false
 # drops the traffic regardless of libtorrent's socket bind or the 30s monitor.
 # Also forces tracker DNS through the tunnel. Removed cleanly on SIGTERM.
 #
-# Requires `nft`, CAP_NET_ADMIN, at least one `network = "vpn"` profile, and a
-# dedicated non-root user: the ruleset matches on the daemon's uid, and as root
+# Requires `nft`, CAP_NET_ADMIN, at least one `network = "vpn"` profile, no
+# `network = "host"` profile (the ruleset would drop its egress while it
+# reported itself healthy, so the daemon refuses the mix), and a dedicated
+# non-root user: the ruleset matches on the daemon's uid, and as root
 # it would drop every root-owned process's traffic on the host. The packaged
 # systemd unit uses User=torrentd.
 #
