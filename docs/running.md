@@ -703,8 +703,8 @@ These address the daemon directly, so they are written for a deployment that
 publishes the API — the systemd path of §8, and any run bound to loopback.
 
 ```bash
-curl -s localhost:8080/healthz            # {"ok":true,"profiles":1,"heartbeat_age_secs":0}
-curl -s localhost:8080/api/status | jq    # counts by state, rates, peers
+curl -s localhost:8080/healthz            # {"heartbeat_age_secs":0,"ok":true,"profiles":1,"profiles_fenced":0}
+curl -s localhost:8080/api/status | jq    # counts by phase, rates, peers
 curl -s localhost:8080/metrics | head     # torrentd_* series
 ```
 
@@ -717,8 +717,11 @@ curl -s https://your.host/healthz         # through `proxy`, once TLS is up
 ```
 
 `/healthz` returns 503 with `{"ok":false,"reason":"no_sessions"}` before a
-session is up, and `{"ok":false,"reason":"alert_loop_stalled",…}` if the alert
-loop stops advancing for 15 seconds.
+session is up, `{"ok":false,"reason":"alert_loop_stalled",…}` if the alert
+loop stops advancing for 15 seconds, and
+`{"ok":false,"reason":"all_profiles_fenced",…}` when every profile is fenced —
+some-but-not-all fenced stays 200, because the remaining profiles are still
+serving.
 
 Confirm settings actually applied rather than trusting the config parsed:
 
@@ -738,14 +741,14 @@ my VPN configuration work" can be answered before "does my seeding setup
 work".
 
 ```bash
-torrentd --config /etc/torrentd/torrentd.toml vpn check
+torrentd --config /etc/torrentd/torrentd.toml vpn check   # all-vpn configs only
 torrentd --config /etc/torrentd/torrentd.toml vpn check --profile acct_a --json
 torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
 ```
 
 | Flag | What it adds |
 | --- | --- |
-| `--profile ID` | Check one profile instead of every configured profile. |
+| `--profile ID` | Check one profile instead of every configured profile. Name a `vpn` profile with it unless every configured profile is one: the bare form reaches `host` profiles too, and aborts on the first one it reaches. |
 | `--json` | Emit the report as JSON instead of the human table. |
 | `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
 | `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host, and **the only one that needs root** — see below. |
@@ -847,13 +850,14 @@ curl --interface wg-acct-a -s https://api.ipify.org; echo
 
 ## 10. Migrating a pool from another client
 
-Point `library_dir` at the other client's state directory — for qBittorrent
-that is `BT_backup`, which holds both `<hash>.torrent` and `<hash>.fastresume`,
-and the sidecars supply save-path, category and tag hints. **Copy it somewhere
-scratch first**; scanning only reads, but there is no reason to have the live
-profile open. Note that `library_dir` may not sit inside a managed root — the
-daemon refuses that config, because nothing in the library claims those files
-and a delete plan would treat them as orphans.
+Point `library_dir` at the other client's state directory and scan. The
+walkthrough — what qBittorrent's `BT_backup` holds, which sidecar hints are
+read, and why you copy it somewhere scratch first — sits beside the key it
+configures, in
+[`deploy/torrentd.sample.toml`](../deploy/torrentd.sample.toml). Note that
+`library_dir` may not sit inside a managed root — the daemon refuses that
+config, because nothing in the library claims those files and a delete plan
+would treat them as orphans.
 
 ```bash
 torrentd --config /etc/torrentd/torrentd.toml pool scan      # index + match
@@ -901,7 +905,8 @@ On a scratch pool, not your real one.
    not placed. This is derived from live session state, so restarting the
    daemon does not clear it — only a rescan does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
-   /api/pool/plans` and `DELETE /api/torrents/:hash?delete_files=true` both 403.
+   /api/pool/plans` and `DELETE /api/torrents/:infohash?delete_files=true` both
+   403.
 5. **Pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
    profile should pause its torrents, report `vpn_down`, and refuse adds and
    resumes with 409 until you restart the daemon. It must not restart itself.
