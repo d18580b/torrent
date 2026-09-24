@@ -21,8 +21,8 @@ pub struct Cli {
     /// `ExecStartPre=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config`.
     ///
     /// Checks everything decidable from the file itself, including the boot
-    /// refusal for `network_kill_switch = true` with no `network = "vpn"`
-    /// profile. It does NOT read the state directory, so the one boot check
+    /// refusals for `network_kill_switch = true` with no `network = "vpn"`
+    /// profile or with any `network = "host"` one. It does NOT read the state directory, so the one boot check
     /// that does — the assignment registry naming a profile no `[[profile]]`
     /// table declares — still happens at startup and can still fail there. A
     /// config check that touched disk state would fail on a host whose state

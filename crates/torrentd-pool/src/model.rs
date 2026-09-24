@@ -40,8 +40,9 @@ pub enum PoolError {
     /// Something is already at the pre-v3 backup path and it is not a copy of
     /// this index.
     ///
-    /// An existing backup is kept rather than overwritten — it is from an
-    /// earlier attempt at this same migration. That posture only makes sense
+    /// An existing backup is kept until the migration commits, and replaced
+    /// then by the fresh copy taken beside it — so if the migration fails it
+    /// is still there as the copy that predates the run. That posture only makes sense
     /// for something that *is* a copy of the index: a dangling symlink, a
     /// directory or a stray file is not one, and proceeding on it runs the
     /// irreversible v3 rename with no rollback while the runbook tells the
@@ -57,8 +58,8 @@ pub enum PoolError {
     /// this index under another name.
     #[error(
         "the pre-v3 copy-aside cannot be taken: what is already at {path} is not a rollback copy \
-         of this pool index ({reason}). An existing copy is kept rather than overwritten, so this \
-         file is in the way — and it is not a rollback, while the v3 rename this copy exists for \
+         of this pool index ({reason}). An existing copy is kept until the migration commits, so \
+         this file is in the way — and it is not a rollback, while the v3 rename this copy exists for \
          cannot be undone. The index has not been changed; move or remove whatever is at that \
          path and start again."
     )]
