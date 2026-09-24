@@ -314,6 +314,15 @@ pub async fn boot(
         }};
     }
 
+    // Which profile holds each tunnel address. A vpn session is bound by
+    // address, listening and outgoing alike, so two tunnels that come up with
+    // one address (every Proton WireGuard config assigns 10.2.0.2/32) leave
+    // nothing — neither the bind nor a source-address routing rule — that can
+    // keep one account's traffic out of the other's tunnel. Only known after
+    // bring-up, since OpenVPN's address is pushed by the server.
+    let mut tunnel_owner: std::collections::HashMap<IpAddr, ProfileId> =
+        std::collections::HashMap::new();
+
     for p in &cfg.profile {
         // A shutdown asked for during a previous profile's bring-up is
         // honoured here rather than after every remaining tunnel is raised.
@@ -389,6 +398,25 @@ pub async fn boot(
                         fail_profile!(p, format!("VPN bring-up failed: {e}"));
                     }
                 };
+                if let Some(owner) = tunnel_owner.get(&ip) {
+                    error!(
+                        profile_id = %p.id,
+                        tunnel_ip = %ip,
+                        other_profile_id = %owner,
+                        "tunnel came up with an address another profile's tunnel already has; \
+                         profile disabled, since a session bound by address cannot be kept \
+                         out of the other account's tunnel",
+                    );
+                    cleanup.take_down(iface);
+                    fail_profile!(
+                        p,
+                        format!(
+                            "tunnel address {ip} is also profile {owner}'s, so neither \
+                             session can be kept out of the other's tunnel"
+                        )
+                    );
+                }
+                tunnel_owner.insert(ip, p.id.clone());
 
                 // The listening port. A static profile binds the operator's
                 // `listen_port`; a natpmp profile negotiates an ephemeral one
