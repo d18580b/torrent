@@ -2011,38 +2011,89 @@ fn a_dangling_backup_symlink_is_neither_written_through_nor_treated_as_a_rollbac
 }
 
 #[test]
-fn a_real_backup_already_at_the_path_is_kept_and_the_migration_proceeds() {
+fn a_real_backup_already_at_the_path_is_replaced_by_a_fresh_copy_once_the_migration_commits() {
     // The other side of the same check, and the behaviour the refusal must not
-    // have swallowed: a `.pre-v3.bak` that really is a copy of an index is
-    // from an earlier attempt at this same migration, which rolled back, so it
-    // describes the same state a new copy would. It is kept byte for byte —
-    // the older file is the one the operator has had time to notice — and no
-    // second copy is taken.
+    // have swallowed: a `.pre-v3.bak` that really is a copy of an index lets
+    // the migration proceed.
+    //
+    // But it need not describe the index as it stands. The fixture is the
+    // re-upgrade after a copy-restore rollback: the copy is of an older state,
+    // and the index has changed since. Keeping the old copy and taking no new
+    // one meant a second rollback silently discarded every change in between.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pool.db");
     build_v1_index(&db);
     apply_v2_journal(&db);
 
     let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
-    // A real `std::fs::copy` of `db`, not an independently built index. The
-    // fixture *is* the property: "kept" is the right answer for a copy of this
-    // database, and a separately built file that merely has the same shape
-    // pinned the weaker predicate the copy-aside used to apply.
+    // A real `std::fs::copy` of `db`, not an independently built index, so the
+    // predicate that lets the migration proceed is the one that matters.
     std::fs::copy(&db, &backup).unwrap();
-    let before = std::fs::read(&backup).unwrap();
+    // The change made after the rollback, which only a fresh copy carries.
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute(
+            "INSERT INTO plan (kind, created_at, status, spec) VALUES ('adopt', 1, 'draft', '{}')",
+            [],
+        )
+        .unwrap();
+    }
+    let plans = |p: &Path| -> i64 {
+        rusqlite::Connection::open(p)
+            .unwrap()
+            .query_row("SELECT count(*) FROM plan", [], |r| r.get(0))
+            .unwrap()
+    };
+    let before = plans(&backup);
 
-    PoolStore::open(&db).expect("the migration runs; the existing copy is kept");
+    PoolStore::open(&db).expect("the migration runs");
 
     assert_eq!(user_version(&db), 3, "the migration really ran");
     assert_eq!(
-        std::fs::read(&backup).unwrap(),
-        before,
-        "the operator's existing copy must not have been overwritten",
-    );
-    assert_eq!(
         user_version(&backup),
         2,
-        "and it is still the pre-migration database, which is what makes it a rollback",
+        "the copy is still of the pre-migration database, which is what makes it a rollback",
+    );
+    assert_eq!(
+        plans(&backup),
+        before + 1,
+        "and it carries the change made since the older copy was taken",
+    );
+    assert!(
+        !PathBuf::from(format!("{}.new", backup.display())).exists(),
+        "the fresh copy was promoted, not left beside it",
+    );
+}
+
+#[test]
+fn a_failed_migration_keeps_the_older_backup_and_discards_its_fresh_copy() {
+    // The reason the fresh copy waits for the commit: taken immediately
+    // before the steps that fail, it is a copy of the failing index, and the
+    // older copy is the rollback that predates the run.
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    build_v1_index(&db);
+    let backup = PathBuf::from(format!("{}.pre-v3.bak", db.display()));
+    std::fs::copy(&db, &backup).unwrap();
+    let before = std::fs::read(&backup).unwrap();
+    // Wedge the index as `a_failed_migration_does_not_offer_its_own_backup_as_the_remedy`
+    // does: v2's tables present under version 1.
+    apply_v2_journal(&db);
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.pragma_update(None, "user_version", 1i64).unwrap();
+    }
+
+    PoolStore::open(&db).expect_err("v2's tables cannot be created twice");
+
+    assert_eq!(
+        std::fs::read(&backup).unwrap(),
+        before,
+        "the copy that predates the failed run must be kept byte for byte",
+    );
+    assert!(
+        !PathBuf::from(format!("{}.new", backup.display())).exists(),
+        "and the copy of the failing index is discarded",
     );
 }
 
