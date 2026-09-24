@@ -42,6 +42,7 @@ session_state-*.dat
 *.db-wal
 *.db-shm
 *.pre-v3.bak
+*.pre-v3.bak.new
 
 # Environment
 .env
