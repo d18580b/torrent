@@ -112,14 +112,22 @@ listen_interfaces = "0.0.0.0:6881,[::]:6881"
 dht               = true
 
 # Optional per-profile overrides. Every value below is distinct from every
-# other profile's in this file, and has to stay that way: `listen_port` (which
-# shares one namespace with the ports in a host profile's
-# `listen_interfaces`), `peer_fingerprint_hex` and `user_agent` are all
-# refused when two profiles end up with the same one.
+# other profile's in this file, and has to stay that way. `listen_port` shares
+# one namespace with the ports in a host profile's `listen_interfaces`, and two
+# profiles that end up on one port are refused. `peer_fingerprint_hex` and
+# `user_agent` are refused the same way whenever either of the two profiles
+# wrote the value down; two that both omit the key and inherit the default
+# above are accepted, which is what makes it a default. `resume_dir` and
+# `torrent_dir` must not *equal* another profile's — one containing another's
+# is fine, since neither store descends into a subdirectory.
 # resume_dir           = "/var/lib/torrentd/resume/public"
 # torrent_dir          = "/var/lib/torrentd/torrents/public"
 # peer_fingerprint_hex = "b7c6d5e4f3a29180"
 # user_agent           = "libtorrent/2.0"
+# Per-profile upload cap in bytes/sec, overriding the daemon-wide key above.
+# `0` here means *unlimited* for this profile, not "unset": writing it is how
+# you uncap one account while the daemon-wide key caps the rest. Omit the key
+# entirely to take the daemon-wide value.
 # upload_rate_limit    = 0
 
 # ---------------------------------------------------------------------------
@@ -158,6 +166,8 @@ dht               = true
 # resume_dir               = "/var/lib/torrentd/resume/account_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/account_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
+# `0` means unlimited for this profile, overriding the daemon-wide cap; omit
+# the key to inherit it.
 # upload_rate_limit        = 0
 
 # Dynamic port forwarding (ProtonVPN / PIA-style ephemeral ports). Providers
@@ -209,9 +219,28 @@ dht               = true
 # The index schema moves forward one way. The first open on this build
 # migrates the torrent→account column from `slot` to `profile`, and a build
 # predating that change cannot open the result. The pre-migration database is
-# left beside it as `<db_path>.pre-v3.bak` — restore that file to roll back.
-# It is the only copy of the `plan` / `plan_step` mutation journal, which a
-# rescan does not reconstruct.
+# left beside it as `<db_path>.pre-v3.bak`; restoring that file is how you go
+# back to a build that predates this change. It is the only copy of the
+# `plan` / `plan_step` mutation journal, which a rescan does not reconstruct.
+#
+# That copy is a full second copy of the index, so the first open needs free
+# space equal to the size of `pool.db`. If it cannot be written the migration
+# stops, names the backup path and the reason, and leaves the index as it was.
+# Nothing deletes it afterwards and nothing ages it out: remove it yourself
+# once you would not go back. An existing copy at that path is kept as it is and
+# no new one is taken — but only where it really is one: it has to be a pool
+# index, at a schema version this build understands, and not this same `pool.db`
+# reached through a symlink. Anything else stops the migration instead, because
+# keeping it would run the one-way rename with no rollback at all.
+#
+# A `pool.db` from one of this change's own pre-release builds can carry
+# `profile` without v3's indexes, and can report any version from 0 to 3
+# depending on which of them wrote it and where it stopped. Such a file is
+# recognised whichever it was, because the indexes are checked before the
+# version is trusted: where they did not come with the columns — no index on
+# `profile`, or the old `torrent_by_slot` name over it — they are put right,
+# and the version stamped, in the same transaction. No data moves; the
+# `.pre-v3.bak` copy is not a remedy for it, having the same contents.
 #
 # [pool]
 # roots       = ["/data/torrents"]        # must not nest

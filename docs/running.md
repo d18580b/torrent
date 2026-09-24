@@ -129,6 +129,12 @@ Copy [`deploy/torrentd.sample.toml`](../deploy/torrentd.sample.toml) to
 `/etc/torrentd/torrentd.toml`. Unknown keys are a fatal startup error, so a
 typo is caught rather than ignored.
 
+[`deploy/torrentd.multi-account.sample.toml`](../deploy/torrentd.multi-account.sample.toml)
+is the other one to look at: a complete two-account file — one tunnelled
+profile and one host profile — with every key live rather than commented, so it
+is a configuration the daemon accepts as it stands. Both files are loaded and
+validated by the test suite.
+
 **Required** — the daemon will not start without the first three, a stated
 authentication posture, and at least one `[[profile]]`:
 
@@ -230,10 +236,86 @@ the pool index. It prints which file it read and how many entries it took.
 `[pool]` section, the first open on this build renames the index's
 torrent→account column from `slot` to `profile`. A build predating this change
 cannot open the result. Before that step the daemon copies the database aside
-as `<db_path>.pre-v3.bak` — restore that file to roll back. Keep it until you
-are sure: it is the only copy of the `plan`/`plan_step` mutation journal, which
-a rescan does not reconstruct. The migration is applied in one transaction, so
-a failure part way through leaves the index exactly as it was.
+as `<db_path>.pre-v3.bak`; restoring that file is how you go back to a build
+that predates this change. It is the only copy of the `plan`/`plan_step`
+mutation journal, which a rescan does not reconstruct. The migration is applied
+in one transaction, so a failure part way through leaves the index exactly as
+it was.
+
+**If the migration fails, that copy is not the remedy.** It is taken
+immediately before the steps that failed, so it is a copy of the index as it
+stands — same version, same columns, same tables — and restoring it puts you
+back where you started, to fail again on the next start. A `.pre-v3.bak` is a
+rollback only where it **predates the run that failed**: that is the copy from
+a successful earlier migration, or one you took yourself. Check its timestamp
+before you restore it. Where it does not predate the run, the way out is to
+move the index aside and let `torrentd pool scan` rebuild it, which
+reconstructs everything except the mutation journal — and the error message
+says so.
+
+**That copy is yours to remove, and nothing removes it for you.** Nothing
+deletes it, nothing ages it out, and no later start reclaims its space: keep it
+until the new index has been in service long enough that you would not go back,
+then delete it yourself. The daemon cannot make that judgement for you, and
+deleting an operator's only rollback on a timer is not a judgement it should
+be making. If a `.pre-v3.bak` is already at that path when a migration starts,
+the daemon keeps it, says so, and takes no new copy: it is from an earlier
+attempt at this same migration, which rolled back, so it describes the same
+state.
+
+That holds for something that is a copy of the index, and the daemon checks
+that it is one. What is at that path has to be a pool index, at a schema
+version this build understands, and not this same `pool.db` reached by another
+name. Anything else — a dangling symlink, a directory, a stray file, an empty
+file, an unrelated database, a symlink pointing back at `pool.db` itself — the
+migration **stops** and names it, without touching the index. Keeping it and
+carrying on would run the one-way rename with no rollback at all, while the
+paragraph above tells you restoring that file is how you go back; and a
+`.pre-v3.bak` that resolves to `pool.db` would leave you restoring the migrated
+file over itself. Move or remove whatever is there and start the daemon again.
+
+What the daemon cannot tell you is whether a file that passes those checks is a
+copy of *this* index or of another deployment's: two pool indexes have the same
+shape. Keep `<db_path>.pre-v3.bak` for this index and nothing else.
+
+The copy is a full second copy of the index, so **the first open on this build
+needs free space on the state volume equal to the size of `pool.db`**. The
+index carries one row per file, so on a large library that is not small. If the
+volume cannot take it the migration stops and says so, naming the backup path
+and the reason, and the index is left exactly as it was — free some space and
+start the daemon again.
+
+If you ran one of this change's own pre-release builds, you may hold a
+`pool.db` that reports schema version 2 but already carries the `profile`
+column. This build recognises that file — whichever pre-release build wrote it
+— and stamps the version to match the columns. No data moves and the journal is
+kept.
+
+Those builds did not all leave the same file. One wrote the rename with both of
+v3's indexes in place; another could commit the rename and lose an index
+statement, leaving either no index on `profile` at all or the old
+`torrent_by_slot` name over the new column. So the version is stamped only
+together with whatever index work the file is still missing, in one
+transaction: after this open the file has `torrent_by_profile` and nothing
+called `torrent_by_slot`. The log line says which of these happened. Restoring
+`<db_path>.pre-v3.bak` is **not** the remedy for such a file: the copy is taken
+from the database as it stands, so it has the same contents.
+
+A pre-release build in between did stamp version 3 over that same incomplete
+schema, so a `pool.db` reporting **3** can be missing the index too. The index
+check runs before the version is trusted, for any version this build can open,
+which is why the sentence above holds whichever of those builds you ran.
+
+"Any version" includes **0 and 1**. Those builds ran each schema step as its
+own statement batch and wrote `user_version` afterwards, so a machine that lost
+power between the last schema statement and that write left a file reporting 0
+or 1 over a schema that is already complete v3. It is recognised on the same
+two checks as the rest — the columns are v3's and `torrent_by_profile` is
+there — and stamped, with the journal kept. Before, such a file could not be
+migrated at all: the version-keyed steps tried to create tables that already
+existed, the daemon exited non-zero on every start, and the only remedy the
+message offered that worked was to move the index aside and rescan, which
+costs the `plan`/`plan_step` journal.
 
 **3. Point each profile at its files, or move them.** Resume and `.torrent`
 files used to live directly under `resume_dir` and `torrent_dir`; they now live
@@ -405,8 +487,20 @@ curl -sS -X POST localhost:8080/api/reload
 
 It needs a token with the `write` scope (or a logged-in session) where `[auth]`
 is configured; `read` and `metrics` tokens are refused. It reloads exactly what
-`SIGHUP` reloads, and reports the same Safety Rule 7 warning for a
-`[[profile]]` field that changed and cannot be applied without a restart.
+`SIGHUP` reloads, and reports the same warnings for a `[[profile]]` field that
+changed and cannot be applied without a restart: the Safety Rule 7 warning
+(`profile identity change requires daemon restart`) where the field is an
+identity — the network block, `peer_fingerprint_hex`, `user_agent` — and the
+ordinary non-reloadable-field warning where it is not: `upload_rate_limit`,
+`allowed_tracker_domains`, and the two store directories. The field name is on
+the event either way.
+
+The store directories are in the second group because nothing a tracker reads
+is not an identity, and no announce or handshake carries where a profile keeps
+its files. They are still not reloadable — the stores are opened once at
+startup — but setting them is exactly what step 3 above tells you to do, and
+the privacy warning is the line an alert rule watches for an account's identity
+changing under a live session.
 
 ## 9. First-run checks
 
@@ -445,7 +539,7 @@ torrentd --config /etc/torrentd/torrentd.toml vpn check --egress 1.1.1.1:53
 | `--profile ID` | Check one profile instead of every configured profile. |
 | `--json` | Emit the report as JSON instead of the human table. |
 | `--egress IP:PORT` | Send a DNS query from a socket bound to the tunnel address and require a reply. Without it the check confirms the tunnel has an address, not that anything leaves through it. |
-| `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host. |
+| `--bring-up` | Raise a tunnel that is not already up, check it, and lower it again. The only option that changes the host, and **the only one that needs root** — see below. |
 | `--as-uid UID` | Render and dry-run the kill-switch ruleset for this uid instead of this process's own. |
 
 Exit status: `0` clean, `1` any check failed, `2` nothing failed but at least
@@ -453,14 +547,24 @@ one check could not be performed — an unreadable sysctl, a `wg` probe that
 failed. A caller that treats only `0` as success gets the strict reading; one
 that accepts `0` and `2` gets "nothing is known to be broken".
 
-A check that could not be performed *because this invocation lacks
-`CAP_NET_ADMIN`* is reported `[?cap]` and does **not** raise the status to
-`2`. The daemon holds that capability and an operator shell usually does not,
-so `wg show <iface> latest-handshakes` and `nft --check` are routinely refused
-on a host where nothing is wrong; counting those would make `2` the normal
-answer everywhere and the distinction the exit code carries would mean
-nothing. They are still printed, and the `--json` report marks them with
-`"needs_capability": true`.
+A check that *nothing this invocation could be given would settle* is reported
+`[?cap]` and does **not** raise the status to `2`. Counting it would make `2`
+the normal answer on a host where nothing is wrong, and the distinction the
+exit code carries would mean nothing. Two things land in that class:
+
+- **A missing `CAP_NET_ADMIN`**, which is the common one and the one the marker
+  is named for. The daemon holds it and an operator shell usually does not, so
+  `wg show <iface> latest-handshakes` and `nft --check`'s kernel validation are
+  routinely refused on a healthy host.
+- **The `kill_switch_uid` mismatch.** `--as-uid` names a uid the invoker is not
+  by definition, and nothing here can observe which user the daemon runs as, so
+  no argument, privilege or configuration settles it. Raising privileges only
+  moves the problem: as root the subject becomes `0`, which fails outright.
+
+Each line says which of the two it is. They are still printed, and the `--json`
+report marks them with `"needs_capability": true`. An `unknown` a different
+input *would* settle — an unreadable sysctl, a `wg` probe that failed for a
+reason other than permission — still raises the status to `2`.
 
 **No host change, and nothing deleted.** The default path reads state and
 writes none. Its one interaction with a running daemon is the NAT-PMP check,
@@ -476,6 +580,18 @@ that changes the host: it skips an interface that already exists and lowers
 again only what it was observed to have raised, because `wg-quick down` on a
 live profile's tunnel fences that profile until the daemon is restarted.
 
+**`--bring-up` needs root, and it is not usable unattended without arranging
+for that.** `wg-quick` re-execs itself under `sudo` when it is not uid 0
+(`[[ $UID == 0 ]] || exec sudo -p … -- "$BASH" -- "$SELF" …`), so on a
+TTY-less invocation with no askpass helper configured it prompts for a
+password it cannot read and the bring-up fails. Run it under `sudo` yourself,
+or from a unit that already runs as root. If you put `vpn check` in a systemd
+`ExecStartPre`, that suggestion applies **only with `--bring-up` omitted, or
+with the unit running as root** — an `ExecStartPre` under `User=torrentd`
+with `--bring-up` hangs on the prompt and then fails the unit start. Without
+the flag the command changes nothing and needs no privilege at all, which is
+the form worth automating.
+
 **Run it as the daemon's user** where you can, so the `wg` probes describe the
 process that will actually run them. The kill-switch pair is the one place
 that is not enough: with `sudo` (which `--bring-up` usually needs) pass
@@ -487,13 +603,25 @@ you gave either way. The exception is uid `0`, which fails whoever asks,
 because the kill switch refuses to install for root unconditionally.
 
 **What a pass establishes**, for a WireGuard profile with
-`port_forward = "natpmp"`: the tunnel config is readable; `wg` and `wg-quick`
-run;
-the interface holds an IPv4 address; the latest handshake is inside
-`vpn_handshake_max_age_secs`; the gateway hands out a forwarded port when
-asked over the tunnel; the effective `rp_filter` for that interface is not
-strict; and, with the kill switch on, that `nft --check` accepts the ruleset
-boot would install for the uid given.
+`port_forward = "natpmp"`, depends on what the invocation could reach. Each
+line below names the capability it needs; anything marked `[?cap]` in the
+report was *not* established, and a `0` does not carry it.
+
+| A pass establishes | Needs |
+| --- | --- |
+| the tunnel config is readable | nothing beyond read access to it |
+| `wg`, `wg-quick` and `ip` are executable | nothing — it is a binary-presence probe, and says nothing about the configuration |
+| the interface holds an IPv4 address | nothing |
+| the effective `rp_filter` for that interface is not strict | nothing |
+| the gateway hands out a forwarded port when asked over the tunnel | a live tunnel and a live gateway; this is the strongest thing the command does |
+| the latest handshake is inside `vpn_handshake_max_age_secs` | **`CAP_NET_ADMIN`.** Without it `wg show <iface> latest-handshakes` is refused, the check reports `[?cap]`, and a `0` says nothing about handshake liveness |
+| `nft --check` accepts the ruleset boot would install for the uid given | **`CAP_NET_ADMIN`.** Without it `nft` cannot initialise its netlink cache and the check reports `[?cap]`. A ruleset that does not *parse* is still reported as a failure without the capability, because nftables parses before it touches netlink |
+| the uid named is the one the daemon runs as | nothing establishes this. `--as-uid` names a uid the invoker is not, and no process here can observe the daemon's; the line reports `[?cap]` and does not colour the status |
+
+So on the invocation this page recommends — the daemon's user, in an operator
+shell without `CAP_NET_ADMIN` — a `0` carries the first five rows and not the
+last three. That is materially less than "the VPN is working", and it is the
+honest content of a pass.
 
 **What it does not.** It does not establish that any port is reachable from
 the public internet — there is no inbound test — nor that the port a session

@@ -40,9 +40,18 @@ upload_rate_limit             = 0
 # Ignored for `network = "vpn"` profiles, which disable LSD unconditionally.
 enable_lsd = false
 
-# No top-level `peer_fingerprint` / `user_agent` here on purpose. Every profile
-# below states its own, so there is nothing for a profile to inherit and no way
-# for two of them to end up announcing one identity.
+# No top-level `peer_fingerprint` / `user_agent` here on purpose. Every `vpn`
+# profile below states its own and has to: the validator refuses a tunnelled
+# profile that leaves either key unwritten, with or without a top-level default
+# to fall back on. So no account behind a tunnel can end up announcing another
+# one's identity, whatever is added above.
+#
+# The `public` profile states neither and takes libtorrent's own defaults. That
+# is allowed because two host profiles announcing alike are one host — they
+# share an address, so there is nothing to correlate that the address does not
+# already give away. Note what follows: the refusal of libtorrent's default
+# peer-id prefix binds to the value a profile *writes down*, so a profile that
+# writes nothing announces exactly that prefix.
 
 # Max age (seconds) of a WireGuard tunnel's latest handshake before the health
 # monitor declares the profile down and pauses it.
@@ -68,12 +77,23 @@ network_kill_switch = false
 #     share one namespace. An announced port two profiles share correlates them
 #     to a tracker operator whichever address each announced from.
 #   * `peer_fingerprint_hex` and `user_agent` are what a tracker reads as the
-#     account's client. Two profiles announcing one of them — including by both
-#     inheriting a top-level default — is the cross-account correlation whose
-#     stated consequence is a permanent ban.
+#     account's client. Two profiles that end up announcing one of them are
+#     refused where either of them wrote it down — one profile declaring the
+#     value another takes from a top-level default is the cross-account
+#     correlation whose stated consequence is a permanent ban. A pair that both
+#     leave the key unwritten and inherit the same default is accepted: nothing
+#     is hidden from whoever reads the file, and a `vpn` profile must state its
+#     own identity, so such a pair is always two host profiles — which are one
+#     host. (This file sets no top-level identity at all, and the one profile
+#     below that writes neither key is the host profile.)
 #   * Each profile's resume and `.torrent` directories are its own. By default
 #     they are `<resume_dir>/<id>` and `<torrent_dir>/<id>`; an override must
-#     not equal, contain, or sit inside another profile's.
+#     not equal another profile's. One that *contains* another's is fine: each
+#     store lists a single directory and keeps only the `.resume` / `.torrent`
+#     files in it, never descending into a profile subdirectory — which is what
+#     leaves the upgrade from a pre-profiles deployment writable, where one
+#     profile is pointed at the old roots and the rest derive `<root>/<id>`
+#     inside them.
 
 # The untunnelled profile: public trackers and DHT content. Peers and trackers
 # see this machine's address, so nothing that must not be traced here belongs

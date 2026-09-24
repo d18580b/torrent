@@ -743,23 +743,120 @@ impl Config {
     ///
     /// Both keys reach one `libtorrent_safe::Settings` field in one encoding,
     /// so the collision is expressible however it is spelled.
+    ///
+    /// **A pair that both inherit the top-level default is exempt.** The
+    /// collision this guards is one profile inheriting while another declares,
+    /// across postures — that is the shape where an operator cannot see from
+    /// the file that two sessions share an identity. Two profiles that both
+    /// write nothing are using the key exactly as the sample documents it
+    /// ("Default peer identity for profiles that do not set their own"), and
+    /// refusing them contradicts the recorded answer to "require identity
+    /// fields on host profiles too?" — No, because two host profiles are one
+    /// host and requiring them to differ would be theatre. Before the check
+    /// moved to *effective* values only explicit ones entered the sets, so
+    /// two omitting profiles could not collide; the exemption restores that.
+    ///
+    /// The error names the key the operator actually wrote. When the value
+    /// came from the top level that is `peer_fingerprint`, not
+    /// `peer_fingerprint_hex` — a key that appears nowhere in their file.
     fn validate_effective_identities(&self) -> Result<(), ProfileConfigError> {
         let mut seen_fp: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         let mut seen_ua: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for p in &self.profile {
             let (fp, ua) = self.effective_identity(p);
             if let Some(fp) = fp {
-                if seen_fp.insert(fp, p.id.as_str()).is_some() {
-                    return Err(ProfileConfigError::DuplicateFingerprint(fp.to_string()));
+                // Inherited by this profile *and* by the one already holding
+                // the value: both wrote nothing, so there is nothing to
+                // distinguish and nothing hidden.
+                let inherited = p.peer_fingerprint_hex.is_none();
+                // The default-prefix refusal, on the *effective* fingerprint.
+                //
+                // `ProfileConfig::validate_set` applies it to a declared
+                // `peer_fingerprint_hex` and to nothing else, so a value
+                // written once at the top level reached every session that
+                // inherited it unchecked — and the value it reached them with
+                // was libtorrent's own default prefix, which is what the
+                // refusal exists to stop a config from claiming as a
+                // deliberate identity. `Config::to_settings` seeds every
+                // session from the top-level key and `startup.rs:323`
+                // overrides it only where the profile declared its own, so the
+                // effective value is what announces, and it is what has to
+                // satisfy the rule.
+                //
+                // Demonstrated before this check existed: a top-level
+                // `peer_fingerprint` plus one host profile that writes neither
+                // key printed `config OK`, for the hex spelling and for the
+                // raw one — while the identical string written as the
+                // profile's own `peer_fingerprint_hex` was refused.
+                //
+                // The *length* rule is deliberately not applied here. It is an
+                // encoding rule for the key that names an encoding:
+                // `peer_fingerprint_hex` is sixteen hex characters, while the
+                // top-level `peer_fingerprint` has been documented as a raw
+                // eight-character prefix in every sample this repository has
+                // shipped (`"-LT20C0-"` before this change, `"-XX1234-"`
+                // after). Applying "16 hex chars" to it would refuse the
+                // shipped sample's own value, and unifying the two encodings
+                // is a change to a pre-existing operator-facing key rather
+                // than to anything this change introduced.
+                //
+                // The key named is the one the operator wrote, as it is for
+                // the duplicate errors below.
+                if ProfileConfig::is_libtorrent_default_fingerprint(fp) {
+                    return Err(ProfileConfigError::DefaultFingerprintForbidden {
+                        key: if inherited {
+                            "peer_fingerprint"
+                        } else {
+                            "peer_fingerprint_hex"
+                        },
+                    });
+                }
+                match seen_fp.insert(fp, p.id.as_str()) {
+                    Some(prev) if inherited && self.inherits_fingerprint(prev) => {}
+                    Some(_) => {
+                        return Err(ProfileConfigError::DuplicateFingerprint {
+                            key: if inherited {
+                                "peer_fingerprint"
+                            } else {
+                                "peer_fingerprint_hex"
+                            },
+                            value: fp.to_string(),
+                        })
+                    }
+                    None => {}
                 }
             }
             if let Some(ua) = ua {
-                if seen_ua.insert(ua, p.id.as_str()).is_some() {
-                    return Err(ProfileConfigError::DuplicateUserAgent(ua.to_string()));
+                let inherited = p.user_agent.is_none();
+                match seen_ua.insert(ua, p.id.as_str()) {
+                    Some(prev) if inherited && self.inherits_user_agent(prev) => {}
+                    Some(_) => {
+                        return Err(ProfileConfigError::DuplicateUserAgent {
+                            key: "user_agent",
+                            value: ua.to_string(),
+                        })
+                    }
+                    None => {}
                 }
             }
         }
         Ok(())
+    }
+
+    /// Whether the profile named `id` declares no `peer_fingerprint_hex`.
+    fn inherits_fingerprint(&self, id: &str) -> bool {
+        self.profile
+            .iter()
+            .find(|p| p.id.as_str() == id)
+            .is_some_and(|p| p.peer_fingerprint_hex.is_none())
+    }
+
+    /// Whether the profile named `id` declares no `user_agent`.
+    fn inherits_user_agent(&self, id: &str) -> bool {
+        self.profile
+            .iter()
+            .find(|p| p.id.as_str() == id)
+            .is_some_and(|p| p.user_agent.is_none())
     }
 
     /// A profile's effective resume and `.torrent` directories — its own
@@ -782,7 +879,7 @@ impl Config {
         )
     }
 
-    /// Refuse two profiles that would share, or nest, a store directory.
+    /// Refuse two profiles that would share a store directory.
     ///
     /// `validate_set` de-duplicates only the *explicit* overrides against each
     /// other and cannot see a derived path, so an override set to another
@@ -791,11 +888,24 @@ impl Config {
     /// info-hash it finds there and seeds another account's torrents under its
     /// own fingerprint, user agent and tunnel address.
     ///
-    /// Containment is refused as well as equality: `load_all` filters on the
-    /// file name alone, so a profile pointed at a directory that *contains*
-    /// another's loads that profile's state as its own. An override of the
-    /// top-level root itself is exactly that shape, and the upgrade note tells
-    /// operators to hand-write these overrides.
+    /// **Equality only.** This rule also refused *containment*, on the stated
+    /// ground that "`load_all` filters on the file name alone, so a profile
+    /// pointed at a directory that contains another's loads that profile's
+    /// state as its own". That is not true of either store:
+    /// `FsResumeStore::load_all` and `FsTorrentStore::load_all` both walk one
+    /// level with `fs::read_dir` and skip any entry whose name does not end in
+    /// `.resume` / `.torrent`, which a sibling `<id>/` directory never does. A
+    /// contained profile's files sit in a subdirectory the outer profile's
+    /// scan does not descend into, so containment costs nothing.
+    ///
+    /// It was not free, though: the documented upgrade is to point the
+    /// pre-profiles profile's `resume_dir` and `torrent_dir` at the old roots
+    /// (`docs/running.md` step 3, and `deploy/torrentd.sample.toml` says an
+    /// override is "also how you point a profile at directories from a
+    /// pre-profiles deployment"). Every other profile's derived
+    /// `<base>/<id>` is inside those roots, so a deployment adding its second
+    /// account — the whole subject of this change — was refused for following
+    /// the two places that tell it what to write.
     fn validate_effective_store_dirs(&self) -> Result<(), ProfileConfigError> {
         let dirs: Vec<(&str, PathBuf, PathBuf)> = self
             .profile
@@ -816,20 +926,6 @@ impl Config {
                         return Err(match key {
                             "resume_dir" => ProfileConfigError::DuplicateResumeDir(a.clone()),
                             _ => ProfileConfigError::DuplicateTorrentDir(a.clone()),
-                        });
-                    }
-                    if a.starts_with(b) {
-                        return Err(ProfileConfigError::NestedProfileDir {
-                            key,
-                            outer: b.clone(),
-                            inner: a.clone(),
-                        });
-                    }
-                    if b.starts_with(a) {
-                        return Err(ProfileConfigError::NestedProfileDir {
-                            key,
-                            outer: a.clone(),
-                            inner: b.clone(),
                         });
                     }
                 }
@@ -898,17 +994,73 @@ impl Config {
     }
 }
 
+/// Which of the two non-reloadable warnings a `[[profile]]` change is owed.
+///
+/// Both classes are equally non-reloadable. They differ in what the operator
+/// is told and in what an alert rule can watch for: Safety Rule 7's warning
+/// exists for the privacy event of an identity changing under a live session,
+/// so a rate-cap edit must not emit it.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ProfileChangeKind {
+    /// The account a tracker sees: the network block, the peer fingerprint,
+    /// the user agent, and the profile set itself.
+    ///
+    /// The store directories are deliberately **not** here, though they were.
+    /// The definition below is what decides it: nothing a tracker reads is not
+    /// identity, and no announce, handshake or peer message carries where a
+    /// profile keeps its resume and `.torrent` files. Classing them here made
+    /// `docs/running.md`'s own upgrade step 3 — the documented way to keep
+    /// your library across the move to per-profile subdirectories — emit
+    /// Safety Rule 7's privacy warning, which is the line an alert rule
+    /// watches for an identity changing under a live session.
+    Identity,
+    /// Non-reloadable for its own reason, but nothing a tracker reads: the
+    /// per-profile rate cap, the tracker-domain list, and the store
+    /// directories, which are fixed at startup because the stores are opened
+    /// then.
+    NonIdentity,
+}
+
+/// One `[[profile]]` change a reload cannot apply, with the class it belongs
+/// to.
+///
+/// The class travels with the change rather than being recovered from the
+/// key's name afterwards. `reload.rs` kept a two-element list of the
+/// non-identity key names and a comment saying out loud that a key added to
+/// `diff_profiles` belonged in it — a pairing with nothing enforcing it, one
+/// module away from the comparison that creates the obligation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProfileChange {
+    /// `"<profile_id>.<key>"`, or a sentence for a profile added or removed.
+    pub what: String,
+    pub kind: ProfileChangeKind,
+}
+
+impl std::fmt::Display for ProfileChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.what)
+    }
+}
+
 /// Result of `Config::diff`. Reloadable fields are populated with the
 /// Report `[[profile]]` changes that a reload cannot apply.
 ///
-/// Every field here is identity-critical: the tunnel a session is bound to,
-/// the port it announces, the peer fingerprint and user agent a tracker sees,
-/// and where its resume and torrent files live. Changing any of them means a
-/// different account identity to the tracker, which is a restart — not
-/// something to swap under a live session. Adding or removing profiles is
-/// likewise a restart, since the profile set is fixed when sessions are built.
-fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
+/// Most of what is compared here is identity-critical: the tunnel a session is
+/// bound to, the port it announces, and the peer fingerprint and user agent a
+/// tracker sees. Changing any of them means a different account identity to the
+/// tracker, which is a restart — not something to swap under a live session.
+/// Adding or removing profiles is likewise a restart, since the profile set is
+/// fixed when sessions are built.
+///
+/// The rest is non-reloadable without being identity, and says so here: the
+/// per-profile rate cap and tracker-domain list, and the two store
+/// directories, which are fixed at startup because the stores are opened then
+/// and which nothing on the wire carries.
+fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileChange> {
     use std::collections::BTreeMap;
+
+    use ProfileChangeKind::Identity;
+    use ProfileChangeKind::NonIdentity;
     let index = |v: &[ProfileConfig]| -> BTreeMap<String, ProfileConfig> {
         v.iter()
             .map(|s| (s.id.as_str().to_string(), s.clone()))
@@ -919,21 +1071,50 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
 
     for id in n.keys() {
         if !o.contains_key(id) {
-            out.push(format!("{id}: added (the profile set is fixed at startup)"));
+            out.push(ProfileChange {
+                what: format!("{id}: added (the profile set is fixed at startup)"),
+                // Which accounts exist is as fixed at startup as who they
+                // announce as.
+                kind: Identity,
+            });
         }
     }
     for (id, a) in &o {
         let Some(b) = n.get(id) else {
-            out.push(format!(
-                "{id}: removed (the profile set is fixed at startup)"
-            ));
+            out.push(ProfileChange {
+                what: format!("{id}: removed (the profile set is fixed at startup)"),
+                kind: Identity,
+            });
             continue;
         };
-        // Destructured exhaustively and with no `..`, for the reason
-        // `Config::diff` is: a field added to `ProfileConfig` does not compile
-        // until this loop reaches it. `id` is the key both sides were indexed
-        // by, so it is equal here by construction and is the one field with
-        // nothing to compare.
+        let mut field = |name: &str, changed: bool, kind: ProfileChangeKind| {
+            if changed {
+                out.push(ProfileChange {
+                    what: format!("{id}.{name}"),
+                    kind,
+                });
+            }
+        };
+        // Destructured exhaustively, with no `..`, and that is the point.
+        //
+        // The class each field is owed now travels on `ProfileChange`, so a
+        // field compared here cannot be left unclassified — but nothing made a
+        // field added to `ProfileConfig` get compared here *at all*. The
+        // hand-maintained list of key names that used to live in `reload.rs`
+        // was deleted for being an obligation written down rather than
+        // enforced; the set of compared fields was the same list one module
+        // over, and it was still hand-maintained.
+        //
+        // `ProfileNetwork`'s own fields were already safe, because the block is
+        // compared as a single value. These seven were not. Naming every one
+        // of them in a pattern is what makes adding an eighth stop compiling
+        // until somebody says which warning it is owed — which is the
+        // consequence of forgetting, and it is silent: a SIGHUP that changed
+        // only the forgotten key produced an empty diff and logged "SIGHUP:
+        // config unchanged" over a file that plainly had changed.
+        //
+        // `id` is bound and ignored deliberately: it is the map key these two
+        // were matched on, so it cannot differ here.
         //
         // `id: _` is how that is spelled, and it is also the one spelling this
         // invariant cannot detect: `_` binds nothing, so there is no unused
@@ -942,46 +1123,70 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<String> {
         // copied to a field that has something to compare.
         let ProfileConfig {
             id: _,
-            network: new_network,
-            peer_fingerprint_hex: new_peer_fingerprint_hex,
-            user_agent: new_user_agent,
-            resume_dir: new_resume_dir,
-            torrent_dir: new_torrent_dir,
-            allowed_tracker_domains: new_allowed_tracker_domains,
-            upload_rate_limit: new_upload_rate_limit,
+            network,
+            peer_fingerprint_hex,
+            user_agent,
+            resume_dir,
+            torrent_dir,
+            allowed_tracker_domains,
+            upload_rate_limit,
+        } = a;
+        let ProfileConfig {
+            id: _,
+            network: b_network,
+            peer_fingerprint_hex: b_peer_fingerprint_hex,
+            user_agent: b_user_agent,
+            resume_dir: b_resume_dir,
+            torrent_dir: b_torrent_dir,
+            allowed_tracker_domains: b_allowed_tracker_domains,
+            upload_rate_limit: b_upload_rate_limit,
         } = b;
-
-        let mut field = |name: &str, changed: bool| {
-            if changed {
-                out.push(format!("{id}.{name}"));
-            }
-        };
         // The whole network block is identity: which tunnel, which port,
         // whether DHT runs. Comparing it as one value means a new field
-        // inside that enum cannot be forgotten here the way `file_pool_size`
-        // was forgotten from the top-level diff.
-        field("network", a.network != *new_network);
+        // cannot be forgotten here the way `file_pool_size` was forgotten
+        // from the top-level diff.
+        field("network", network != b_network, Identity);
         field(
             "peer_fingerprint_hex",
-            a.peer_fingerprint_hex != *new_peer_fingerprint_hex,
+            peer_fingerprint_hex != b_peer_fingerprint_hex,
+            Identity,
         );
-        field("user_agent", a.user_agent != *new_user_agent);
-        field("resume_dir", a.resume_dir != *new_resume_dir);
-        field("torrent_dir", a.torrent_dir != *new_torrent_dir);
+        field("user_agent", user_agent != b_user_agent, Identity);
+        // Not identity. `ProfileChangeKind`'s own definitions decide this:
+        // `Identity` is "the account a tracker sees" and `NonIdentity` is
+        // "nothing a tracker reads" — and where a profile keeps its resume and
+        // `.torrent` files is the second. No announce carries it, no handshake
+        // carries it, and nothing on the wire changes when it moves.
+        //
+        // They are still non-reloadable, for their own reason: the stores are
+        // opened once at startup and the partitioning is fixed with them. What
+        // changes is which of the two warnings the operator gets.
+        // `reload.rs` says the privacy string exists for "the privacy event"
+        // and that "nothing that is not identity may emit it", and it is the
+        // line an alert rule watches. Classing the store directories as
+        // identity made the runbook's own upgrade step 3 — "set that profile's
+        // own `resume_dir` and `torrent_dir` to the old paths", the documented
+        // way to avoid losing the library on upgrade — fire a privacy alert
+        // for doing exactly what the runbook says.
+        field("resume_dir", resume_dir != b_resume_dir, NonIdentity);
+        field("torrent_dir", torrent_dir != b_torrent_dir, NonIdentity);
         // The two keys outside the network block. Neither is applied by a
         // reload — the add path reads `ProfileRegistry`'s immutable startup
         // snapshot and nothing rebuilds it — and without them here a SIGHUP
         // that changed only one of them produced an empty diff and logged
         // "SIGHUP: config unchanged" over a file that plainly had. They are
         // exactly the fields the comment above claimed could not be
-        // forgotten.
+        // forgotten — and the third argument is what stops the *class* being
+        // forgotten now that a field can have one.
         field(
             "upload_rate_limit",
-            a.upload_rate_limit != *new_upload_rate_limit,
+            upload_rate_limit != b_upload_rate_limit,
+            NonIdentity,
         );
         field(
             "allowed_tracker_domains",
-            a.allowed_tracker_domains != *new_allowed_tracker_domains,
+            allowed_tracker_domains != b_allowed_tracker_domains,
+            NonIdentity,
         );
     }
     out
@@ -1028,12 +1233,12 @@ pub struct ConfigDiff {
     /// Safety Rule 6, and the journal says so in different words.
     pub reloadable_deletions: Vec<&'static str>,
     pub non_reloadable_changes: Vec<&'static str>,
-    /// Per-profile identity fields that changed and were ignored, as
-    /// `"<profile_id>.<field>"`. Safety Rule 7 requires a warning for these and
-    /// `Config::diff` used to skip `[[profile]]` entirely, so changing a profile's
-    /// VPN interface, port, fingerprint, user agent or directories on SIGHUP
-    /// was swallowed in silence.
-    pub profile_changes: Vec<String>,
+    /// Per-profile fields that changed and were ignored, each carrying the
+    /// class its warning is owed. Safety Rule 7 requires a warning for the
+    /// identity ones and `Config::diff` used to skip `[[profile]]` entirely, so
+    /// changing a profile's VPN interface, port, fingerprint, user agent or
+    /// directories on SIGHUP was swallowed in silence.
+    pub profile_changes: Vec<ProfileChange>,
 }
 
 impl ConfigDiff {
@@ -1073,7 +1278,7 @@ impl ConfigDiff {
         set!(
             patch,
             upload_rate_limit,
-            if profile.upload_rate_limit != 0 {
+            if profile.upload_rate_limit.is_some() {
                 None
             } else {
                 self.upload_rate_limit
@@ -1328,7 +1533,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
         }
     }
 
@@ -1348,7 +1553,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
-            upload_rate_limit: 0,
+            upload_rate_limit: None,
         }
     }
 
@@ -1499,7 +1704,13 @@ user_agent = "qBittorrent/5.0.3""#,
             "",
         ));
         assert!(
-            msg.contains("peer_fingerprint_hex") && msg.contains("a1b2c3d4e5f60718"),
+            msg.contains("a1b2c3d4e5f60718"),
+            "the colliding value is named, got: {msg}",
+        );
+        // The key named is the one the *inheriting* profile would have to
+        // change — `peer_fingerprint`, which is what this operator wrote.
+        assert!(
+            msg.contains("peer_fingerprint") && !msg.contains("peer_fingerprint_hex"),
             "got: {msg}",
         );
     }
@@ -1534,6 +1745,135 @@ listen_interfaces = "0.0.0.0:6882"
 "#,
         );
         assert!(msg.contains("user_agent"), "got: {msg}");
+    }
+
+    #[test]
+    fn two_host_profiles_both_inheriting_the_top_level_identity_are_accepted() {
+        // C48. Two host profiles are one host, so requiring them to differ is
+        // theatre — the recorded answer to "require identity fields on host
+        // profiles too?" is No, and `validate_set`'s own doc says the same.
+        //
+        // Checking *effective* values put them in one set by construction:
+        // neither writes a key, so both take the top-level default and the
+        // pair collided. The operator's only remedies were to delete the
+        // top-level keys the sample documents as "Default peer identity for
+        // profiles that do not set their own", or to give the pair the
+        // distinct values the record calls theatre.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+peer_fingerprint = "-XX1234-"
+user_agent = "libtorrent/2.0"
+{}
+"#,
+            two_host_profiles("", "")
+                .split_once("http_listen = \"127.0.0.1:8080\"")
+                .unwrap()
+                .1
+        );
+        let p = write_cfg(dir.path(), &body);
+        Config::load(&p).expect(
+            "two host profiles that both write nothing are using the top-level default \
+             exactly as it is documented",
+        );
+    }
+
+    #[test]
+    fn a_top_level_fingerprint_may_not_be_the_libtorrent_default_either() {
+        // F49. The refusal bound to `peer_fingerprint_hex` and to nothing
+        // else, while `to_settings` hands the top-level `peer_fingerprint` to
+        // every session and `startup.rs:323` overrides it only for a profile
+        // that declared its own. So a host profile that writes neither key
+        // announced whatever the top level said, unchecked — including the one
+        // value the refusal exists for, and `--check-config` printed
+        // `config OK`.
+        //
+        // Both spellings, because the two keys spell those eight bytes
+        // differently and nothing decodes either: `-LT20C0-` is what actually
+        // reaches libtorrent from this key, and it is the value the sample
+        // documented for it before this change.
+        for spelling in ["-LT20C0-", "2d4c54323043302d"] {
+            let msg = refusal(&two_host_profiles_with_top(&format!(
+                "peer_fingerprint = {spelling:?}"
+            )));
+            assert!(
+                msg.contains("must not equal libtorrent default"),
+                "the {spelling:?} spelling must be refused, got: {msg}",
+            );
+            assert!(
+                msg.contains("peer_fingerprint ") && !msg.contains("peer_fingerprint_hex"),
+                "and named as the key the operator actually wrote, got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_top_level_fingerprint_that_is_not_the_default_is_still_accepted() {
+        // The other side: the key is a documented default for profiles that
+        // set none, so the refusal must reach the default prefix and nothing
+        // else. `"-XX1234-"` is the value the shipped sample carries.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(
+            dir.path(),
+            &two_host_profiles_with_top(r#"peer_fingerprint = "-XX1234-""#),
+        );
+        Config::load(&p).expect("the sample's own top-level value must keep loading");
+    }
+
+    /// Two host profiles that declare no identity, under `top`.
+    fn two_host_profiles_with_top(top: &str) -> String {
+        format!(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+{top}
+{}
+"#,
+            two_host_profiles("", "")
+                .split_once("http_listen = \"127.0.0.1:8080\"")
+                .unwrap()
+                .1
+        )
+    }
+
+    #[test]
+    fn the_exemption_does_not_reach_a_profile_that_declares_the_value() {
+        // The collision the rule guards is one profile inheriting while
+        // another declares — the shape where the file does not show that two
+        // sessions share an identity. The exemption must not swallow it.
+        let msg = refusal(&vpn_plus_host(
+            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+user_agent = "qBittorrent/5.0.3""#,
+            "",
+        ));
+        assert!(msg.contains("a1b2c3d4e5f60718"), "got: {msg}");
+    }
+
+    #[test]
+    fn an_inherited_collision_names_the_key_the_operator_wrote() {
+        // The message named `peer_fingerprint_hex` — a key that appears
+        // nowhere in a file whose author wrote `peer_fingerprint` at the top
+        // level — so it described a line the operator could not find.
+        let msg = refusal(&vpn_plus_host(
+            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+user_agent = "qBittorrent/5.0.3""#,
+            "",
+        ));
+        assert!(
+            !msg.contains("peer_fingerprint_hex"),
+            "naming peer_fingerprint_hex sends the operator to a key that appears nowhere \
+             in this file, got: {msg}",
+        );
+        assert!(
+            msg.contains("peer_fingerprint"),
+            "and the key it does name is the one they wrote, got: {msg}",
+        );
     }
 
     #[test]
@@ -1618,18 +1958,112 @@ listen_interfaces = "0.0.0.0:6882"
     }
 
     #[test]
-    fn an_override_containing_another_profiles_resume_dir_is_refused() {
-        // Containment, not equality. `load_all` filters on the file name
-        // alone, so a profile pointed at the top-level root loads every other
-        // profile's `<base>/<id>` state as its own — and the root is the
-        // easiest value to write here by accident, because it is the one the
-        // upgrade note tells operators their files are currently under.
-        let msg = refusal(&two_host_profiles(
-            r#"resume_dir = "/var/lib/torrentd/resume""#,
-            "",
-        ));
-        assert!(msg.contains("resume_dir"), "got: {msg}");
-        assert!(msg.contains("lies inside"), "got: {msg}");
+    fn an_override_containing_another_profiles_resume_dir_is_accepted() {
+        // C47, first half. This is the documented upgrade: `docs/running.md`
+        // step 3 tells an operator to point the pre-profiles profile's
+        // `resume_dir` at the old root, and every other profile's derived
+        // `<base>/<id>` is inside that root by construction. Refusing
+        // containment made that configuration unwritable for any deployment
+        // with more than one profile — which is every deployment this change
+        // exists for.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(
+            dir.path(),
+            &two_host_profiles(r#"resume_dir = "/var/lib/torrentd/resume""#, ""),
+        );
+        Config::load(&p).expect(
+            "an outer resume_dir containing an inner one is the documented upgrade, and \
+             neither store descends into a subdirectory",
+        );
+    }
+
+    #[test]
+    fn a_contained_profiles_files_are_invisible_to_the_outer_profiles_load_all() {
+        // C47, second half — the property the refusal claimed to protect,
+        // pinned rather than assumed. The refusal asserted that "both
+        // profiles' sessions would read one store" because "`load_all`
+        // filters on the file name alone". Both stores walk exactly one level
+        // with `fs::read_dir` and keep only names ending in `.resume`, so the
+        // inner profile's directory — whose name is its id — is skipped, and
+        // the file inside it is never reached.
+        //
+        // Without this, dropping the containment rule rests on reading the
+        // stores correctly today and nothing notices when that stops being
+        // true.
+        use torrentd_engine::FsResumeStore;
+        use torrentd_engine::ProfileId;
+        use torrentd_engine::ResumeStore;
+
+        let dir = tempdir().unwrap();
+        let outer_dir = dir.path().join("resume");
+        let inner_dir = outer_dir.join("acct_a");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+
+        let outer_ih = "aa".repeat(20);
+        let inner_ih = "bb".repeat(20);
+        std::fs::write(outer_dir.join(format!("{outer_ih}.resume")), b"outer").unwrap();
+        std::fs::write(inner_dir.join(format!("{inner_ih}.resume")), b"inner").unwrap();
+
+        // `default` overrides to the outer root; `acct_a` derives
+        // `<outer>/acct_a` — exactly the contained pair above.
+        let store = FsResumeStore::new(outer_dir.clone())
+            .with_profile_dir(ProfileId::new("default"), outer_dir.clone());
+
+        let outer = store.load_all(&ProfileId::new("default")).unwrap();
+        assert_eq!(
+            outer.len(),
+            1,
+            "the outer profile must load only its own file, got {outer:?}",
+        );
+        assert_eq!(outer[0].0.to_hex(), outer_ih);
+
+        let inner = store.load_all(&ProfileId::new("acct_a")).unwrap();
+        assert_eq!(inner.len(), 1, "and the inner profile loads only its own");
+        assert_eq!(inner[0].0.to_hex(), inner_ih);
+    }
+
+    #[test]
+    fn a_contained_profiles_torrents_are_invisible_to_the_outer_profiles_load_all() {
+        // C53. The rule above is dropped for **both** stores —
+        // `validate_effective_store_dirs` says so, and `torrent_dir` is
+        // overridable in exactly the same way `resume_dir` is — but only the
+        // resume store's half was pinned. The torrent-directory inventory scan
+        // is what re-assigns an info-hash whose resume file is gone, so an
+        // outer profile that reached into an inner one's directory here would
+        // adopt another account's torrents under its own fingerprint, user
+        // agent and tunnel address: the same failure the refusal named, by the
+        // path nothing was watching.
+        use torrentd_engine::FsTorrentStore;
+        use torrentd_engine::ProfileId;
+        use torrentd_engine::TorrentStore;
+
+        let dir = tempdir().unwrap();
+        let outer_dir = dir.path().join("torrents");
+        let inner_dir = outer_dir.join("acct_a");
+        std::fs::create_dir_all(&inner_dir).unwrap();
+
+        let outer_ih = "aa".repeat(20);
+        let inner_ih = "bb".repeat(20);
+        std::fs::write(outer_dir.join(format!("{outer_ih}.torrent")), b"outer").unwrap();
+        std::fs::write(inner_dir.join(format!("{inner_ih}.torrent")), b"inner").unwrap();
+
+        // `default` overrides to the old root, `acct_a` derives
+        // `<outer>/acct_a` inside it: the documented upgrade, which the
+        // validator now accepts.
+        let store = FsTorrentStore::new(outer_dir.clone())
+            .with_profile_dir(ProfileId::new("default"), outer_dir.clone());
+
+        let outer = store.load_all(&ProfileId::new("default")).unwrap();
+        assert_eq!(
+            outer.len(),
+            1,
+            "the outer profile must load only its own .torrent, got {outer:?}",
+        );
+        assert_eq!(outer[0].0.to_hex(), outer_ih);
+
+        let inner = store.load_all(&ProfileId::new("acct_a")).unwrap();
+        assert_eq!(inner.len(), 1, "and the inner profile loads only its own");
+        assert_eq!(inner[0].0.to_hex(), inner_ih);
     }
 
     #[test]
@@ -1731,7 +2165,7 @@ listen_interfaces = "0.0.0.0:6882"
             ..Default::default()
         };
         let mut capped = host_profile();
-        capped.upload_rate_limit = 100_000;
+        capped.upload_rate_limit = Some(100_000);
 
         assert_eq!(
             diff.to_settings_patch_for(&capped)
@@ -1750,20 +2184,75 @@ listen_interfaces = "0.0.0.0:6882"
     }
 
     #[test]
+    fn a_per_profile_upload_rate_limit_of_zero_means_unlimited_not_unset() {
+        // F40. `0` is the value both shipped samples use to illustrate this
+        // override, and the top-level key's own comment defines it as
+        // "unlimited". While the field was a plain `u32` the reload guard and
+        // the boot path both read an explicit `0` as an absent key and pushed
+        // the daemon-wide cap onto a session the operator had uncapped — with
+        // nothing logged, and nothing in `diff_profiles` to report it, because
+        // the two values compared equal.
+        let diff = ConfigDiff {
+            upload_rate_limit: Some(2_000_000),
+            ..Default::default()
+        };
+        let mut uncapped = host_profile();
+        uncapped.upload_rate_limit = Some(0);
+
+        assert_eq!(
+            diff.to_settings_patch_for(&uncapped)
+                .settings
+                .upload_rate_limit,
+            None,
+            "an explicit 0 is a value the profile set, so the reload must not overwrite it",
+        );
+
+        // And the two are distinguishable at the type, which is what the boot
+        // path keys on.
+        assert_ne!(uncapped.upload_rate_limit, host_profile().upload_rate_limit);
+        assert_eq!(
+            host_profile().upload_rate_limit,
+            None,
+            "absent stays absent"
+        );
+    }
+
+    #[test]
+    fn an_explicit_zero_upload_rate_limit_round_trips_through_toml() {
+        // The distinction has to survive the parser, or the field is `Option`
+        // for nothing: `#[serde(default)]` over a `u32` turned a written `0`
+        // and an absent key into the same value before it ever reached a
+        // guard.
+        let dir = tempdir().unwrap();
+        let body = two_host_profiles(r#"upload_rate_limit = 0"#, "");
+        let p = write_cfg(dir.path(), &body);
+        let cfg = Config::load(&p).unwrap();
+        assert_eq!(
+            cfg.profile[0].upload_rate_limit,
+            Some(0),
+            "a written 0 is a value",
+        );
+        assert_eq!(
+            cfg.profile[1].upload_rate_limit, None,
+            "and an unwritten key is not",
+        );
+    }
+
+    #[test]
     fn a_profile_only_upload_rate_limit_change_is_reported_rather_than_swallowed() {
         // `ConfigDiff::is_empty()` was true for this edit, so `reload.rs`
         // logged "SIGHUP: config unchanged" over a file that plainly had.
         let dir = tempdir().unwrap();
         let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
         let mut b = a.clone();
-        b.profile[0].upload_rate_limit = 100_000;
+        b.profile[0].upload_rate_limit = Some(100_000);
 
         let d = Config::diff(&a, &b);
         assert!(!d.is_empty(), "the file changed and the daemon must say so");
         assert!(
             d.profile_changes
                 .iter()
-                .any(|c| c == "public.upload_rate_limit"),
+                .any(|c| c.what == "public.upload_rate_limit"),
             "got {:?}",
             d.profile_changes,
         );
@@ -1781,10 +2270,120 @@ listen_interfaces = "0.0.0.0:6882"
         assert!(
             d.profile_changes
                 .iter()
-                .any(|c| c == "public.allowed_tracker_domains"),
+                .any(|c| c.what == "public.allowed_tracker_domains"),
             "got {:?}",
             d.profile_changes,
         );
+    }
+
+    #[test]
+    fn every_profile_field_the_diff_reports_states_which_warning_it_is_owed() {
+        // The classification that `reload.rs` used to keep as a list of key
+        // names beside a comment asking whoever edits this function to update
+        // it. Changing every `[[profile]]` field at once pins the classes: a
+        // field compared in `diff_profiles` cannot be recorded without one,
+        // and a field that changes class shows up here.
+        //
+        // What this cannot pin is a field added to `ProfileConfig` and never
+        // compared at all — it would not appear in `got`, and `want` would not
+        // ask for it, so no assertion here can notice. That is a compile
+        // property and not a test: `diff_profiles` destructures
+        // `ProfileConfig` exhaustively with no `..`, so a new field is
+        // `error[E0027]: pattern does not mention field` until somebody names
+        // it. No `#[test]` in this crate observes that, and none can.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        let p = &mut b.profile[0];
+        p.network = torrentd_engine::ProfileNetwork::Host {
+            listen_interfaces: "0.0.0.0:6899".into(),
+            dht: true,
+        };
+        p.peer_fingerprint_hex = Some("a1b2c3d4e5f60718".into());
+        p.user_agent = Some("ua/1.0".into());
+        p.resume_dir = Some("/var/lib/torrentd/resume-public".into());
+        p.torrent_dir = Some("/var/lib/torrentd/torrents-public".into());
+        p.upload_rate_limit = Some(100_000);
+        p.allowed_tracker_domains = vec!["tracker.example.com".into()];
+
+        let mut got: Vec<(String, ProfileChangeKind)> = Config::diff(&a, &b)
+            .profile_changes
+            .into_iter()
+            .map(|c| (c.what, c.kind))
+            .collect();
+        got.sort_by(|x, y| x.0.cmp(&y.0));
+        let mut want = vec![
+            ("public.network", ProfileChangeKind::Identity),
+            ("public.peer_fingerprint_hex", ProfileChangeKind::Identity),
+            ("public.user_agent", ProfileChangeKind::Identity),
+            ("public.resume_dir", ProfileChangeKind::NonIdentity),
+            ("public.torrent_dir", ProfileChangeKind::NonIdentity),
+            ("public.upload_rate_limit", ProfileChangeKind::NonIdentity),
+            (
+                "public.allowed_tracker_domains",
+                ProfileChangeKind::NonIdentity,
+            ),
+        ]
+        .into_iter()
+        .map(|(w, k)| (w.to_string(), k))
+        .collect::<Vec<_>>();
+        want.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn the_runbooks_own_upgrade_step_does_not_fire_a_privacy_alert() {
+        // D36/Q23. Upgrade step 3 in `docs/running.md` tells an operator to
+        // "set that profile's own `resume_dir` and `torrent_dir` to the old
+        // paths" — the documented way to keep a library across the move to
+        // per-profile subdirectories. With the store directories classed as
+        // identity, doing exactly that emitted Safety Rule 7's privacy
+        // warning, which `reload.rs` reserves for "the privacy event" and
+        // which is the line an alert rule watches.
+        //
+        // They are still non-reloadable: the stores are opened at startup. The
+        // class is about which of the two warnings the operator is owed, and
+        // nothing a tracker reads carries where a profile keeps its files.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        b.profile[0].resume_dir = Some("/var/lib/torrentd/resume".into());
+        b.profile[0].torrent_dir = Some("/var/lib/torrentd/torrents".into());
+
+        let d = Config::diff(&a, &b);
+        assert_eq!(d.profile_changes.len(), 2, "got {:?}", d.profile_changes);
+        for c in &d.profile_changes {
+            assert_eq!(
+                c.kind,
+                ProfileChangeKind::NonIdentity,
+                "{} must not be reported as an identity change",
+                c.what,
+            );
+        }
+        // Still reported — not reloadable is not the same as not a change.
+        let mut names: Vec<&str> = d.profile_changes.iter().map(|c| c.what.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["public.resume_dir", "public.torrent_dir"]);
+    }
+
+    #[test]
+    fn a_profile_leaving_the_set_is_an_identity_change() {
+        // `diff_profiles`'s entries with no `.key`. Which accounts exist is as
+        // fixed at startup as who they announce as, so both must land in the
+        // class that keeps Safety Rule 7's wording.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut b = a.clone();
+        b.profile.clear();
+        let d = Config::diff(&a, &b);
+        assert_eq!(d.profile_changes.len(), 1, "got {:?}", d.profile_changes);
+        assert!(d.profile_changes[0].what.starts_with("public: removed"));
+        assert_eq!(d.profile_changes[0].kind, ProfileChangeKind::Identity);
+
+        let d = Config::diff(&b, &a);
+        assert_eq!(d.profile_changes.len(), 1, "got {:?}", d.profile_changes);
+        assert!(d.profile_changes[0].what.starts_with("public: added"));
+        assert_eq!(d.profile_changes[0].kind, ProfileChangeKind::Identity);
     }
 
     #[test]

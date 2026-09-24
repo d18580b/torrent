@@ -9,6 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
+use torrentd_engine::ProfileId;
 use torrentd_pool::model::AdoptionState;
 use torrentd_pool::PoolStore;
 
@@ -215,8 +216,19 @@ fn import_legacy(store: &mut PoolStore, registry_path: &Path) -> anyhow::Result<
         println!("  {} is empty — nothing to import", registry_path.display());
         return Ok(());
     }
-    let raw: HashMap<String, String> = serde_json::from_slice(&bytes)
+    // Parse the values through `ProfileId`, exactly as the daemon does.
+    //
+    // Reading them as bare `String` here meant the scan succeeded on a file
+    // `AssignmentRegistry::load_inner` refuses to boot on, so the two commands
+    // disagreed about whether one file was loadable — and the one that said
+    // yes wrote those ids into the pool index. The same door, or it is not a
+    // door.
+    let parsed: HashMap<String, ProfileId> = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse {}", registry_path.display()))?;
+    let raw: HashMap<String, String> = parsed
+        .into_iter()
+        .map(|(ih, id)| (ih, id.as_str().to_string()))
+        .collect();
     let n = store.import_legacy_registry(&raw)?;
     if n > 0 {
         println!(

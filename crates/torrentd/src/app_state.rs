@@ -78,7 +78,8 @@ impl AppState {
 
     pub fn profile_vpn_down(&self, profile_id: &ProfileId) -> bool {
         self.profiles
-            .get(profile_id)
+            .resolve(profile_id)
+            .active()
             .map(|e| e.health().status == ProfileStatus::VpnDown)
             .unwrap_or(false)
     }
@@ -87,22 +88,6 @@ impl AppState {
     /// configured.
     pub fn profile_config(&self, profile_id: &ProfileId) -> Option<&ProfileConfig> {
         self.profiles.config(profile_id)
-    }
-
-    /// Why `profile_id` has no engine, when it is configured and failed to
-    /// come up.
-    ///
-    /// `None` means the id names nothing at all. The distinction is the whole
-    /// point of the failed list: `http/profiles.rs` already argues it — "a
-    /// configured-but-failed profile... answering 404 would be
-    /// indistinguishable from a typo in the id" — and it was applied at one of
-    /// five profile-resolution sites. At the other four an operator whose
-    /// tunnel had failed was told the id did not exist, and went to check the
-    /// config file.
-    pub fn profile_failure_reason(&self, profile_id: &ProfileId) -> Option<&str> {
-        self.profiles
-            .failed_profile(profile_id)
-            .map(|f| f.reason.as_str())
     }
 
     /// `(fenced, total)` over the configured profiles.

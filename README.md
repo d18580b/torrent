@@ -153,7 +153,10 @@ needs one answers 409 naming the failure reason.
 
 One config file drives everything; unknown keys are a fatal error, inside
 `[[profile]]` tables too. See
-[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml).
+[`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml), which documents
+every key, and
+[`deploy/torrentd.multi-account.sample.toml`](deploy/torrentd.multi-account.sample.toml),
+a complete two-account configuration with nothing commented out.
 
 A **profile** is one libtorrent session with its own network posture, identity
 and directories. At least one is required, and there is no default profile:
@@ -223,6 +226,17 @@ Verdicts are four-valued — `pass`, `fail`, `skip`, `unknown` — so a green
 summary cannot quietly mean "mostly not checked", and the exit status carries
 the same distinction: `0` clean, `1` any failure, `2` nothing failed but
 something could not be checked.
+
+With one exception, which a `0` depends on. An `unknown` that *nothing this
+invocation could be given would settle* — most often because the check needs
+`CAP_NET_ADMIN` and an operator shell does not hold it — is printed `[?cap]`,
+marked `"needs_capability": true` in the JSON, and **not** counted towards `2`.
+Otherwise a host where nothing is wrong would exit `2` every time, and both
+consumers of the status would learn to accept it. So a `0` means "nothing
+failed and nothing was left unsettled that this invocation could have
+settled", which is less than it sounds: on the recommended unprivileged run
+the handshake and the kill-switch ruleset are two of those. [What a pass
+establishes](docs/running.md#9-first-run-checks) says which, line by line.
 
 The default path makes no host change and deletes nothing: it reads state and
 asks the gateway for a NAT-PMP mapping with the daemon's own short lease,
