@@ -41,12 +41,15 @@ runtime and are easy to miss because nothing checks for them at startup:
 Single-session mode needs none of them.
 
 **The shipped container image is WireGuard-only.** `deploy/Containerfile`'s
-runtime layer installs `iproute`, `wireguard-tools` and `nftables` and no
-`openvpn`, so a slot configured `vpn_type = "openvpn"` cannot come up in it —
-bring-up fails, the slot is fenced, and with no other slot the daemon exits.
-Run that configuration on a host, or add `openvpn` to the runtime stage
-yourself. The image also carries no `ps`, `pkill` or `pgrep`: the daemon calls
-none of them, so a `podman exec` into it has no process-inspection tool.
+runtime layer installs `iproute`, `wireguard-tools`, `nftables` and
+`procps-ng`, and no `openvpn`, so a slot configured `vpn_type = "openvpn"`
+cannot come up in it — bring-up fails, the slot is fenced, and with no other
+slot the daemon exits. Run that configuration on a host, or add `openvpn` to
+the runtime stage yourself. `procps-ng` is there for the `sysctl` that
+`wg-quick` runs when it raises a full-tunnel (`AllowedIPs = 0.0.0.0/0`)
+profile; the daemon itself calls none of its binaries, and the `ps`, `pgrep`
+and `pkill` it also ships are what a `podman exec` into the image has for
+process inspection.
 
 ## 2. Submodules
 
@@ -190,7 +193,7 @@ typo is caught rather than ignored.
 | `registry_path` | `<resume_dir>/../slot_assignments.json` |
 | `session_state_path` | `<resume_dir>/../session_state.dat` |
 | `vpn_handshake_max_age_secs` | `180` |
-| `network_kill_switch` | `false` — **refused as uid 0**; see §11.6 |
+| `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN slot**; see §11.6 |
 | `connections_limit`, `file_pool_size`, `enable_lsd`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
 | `peer_fingerprint`, `user_agent` | libtorrent's own |
 
@@ -387,10 +390,29 @@ On a scratch pool, not your real one.
    interfaces for the daemon's uid. Setting it in single-session mode is a
    startup error, not a warning. **So is running as root**: the ruleset matches
    the daemon's traffic by uid, and `meta skuid 0` would drop every root-owned
-   socket on the host — the package manager, the NTP client, sshd's replies.
-   The daemon refuses to install it rather than take the host off the network,
-   so run it as its own user with `CAP_NET_ADMIN`, which is what the packaged
-   unit's `User=torrentd` does.
+   socket on the host — the package manager, the NTP client, sshd's replies —
+   and the WireGuard tunnels' own encrypted traffic with them, since the
+   kernel's WireGuard socket belongs to the uid that raised the link. The
+   daemon refuses to install it rather than take the host off the network.
+
+   Because the ruleset confines everything the daemon's uid owns, a tunnel's
+   connection to its provider has to belong to some other uid, and that
+   decides what the kill switch can run with:
+
+   - **OpenVPN slots: not at all.** The daemon spawns `openvpn` under its own
+     uid, so the provider connection is dropped. The config is refused at load
+     (and by `--check-config`).
+   - **WireGuard slots: only with the links raised by root before the daemon
+     starts.** A daemon running as its own user cannot raise them itself:
+     `wg-quick` re-execs through `sudo` unless it runs as uid 0, and the
+     packaged unit sets `NoNewPrivileges=yes`, so that `sudo` cannot elevate.
+     Raise each slot's link as root first (for example `wg-quick up <iface>`
+     from a root unit ordered before `torrentd.service`), with the profile
+     readable by the daemon's user: its `wg-quick up` then fails and it adopts
+     the standing link because the profile's public key matches the live one
+     (see the "already up and is not this slot's" row below for the refusals).
+     The shipped container image runs the daemon as uid 1000 and raises no
+     links, so it cannot run the kill switch with a working tunnel either.
 
 ## Troubleshooting
 
@@ -402,7 +424,8 @@ On a scratch pool, not your real one.
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
 | `/healthz` 503 `all_slots_fenced` | Every configured slot is out of service — its tunnel is down, or it never came up at boot — so the daemon is seeding nothing. Check `/slots`, which lists both kinds, bring the tunnels back, then restart — fenced slots do not resume themselves by design. |
 | Daemon refuses to start, "vpn_profile must be /etc/wireguard/…" | A WireGuard slot's profile is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
-| Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run as `torrentd` with `CAP_NET_ADMIN`. |
+| Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Running as `torrentd` with `CAP_NET_ADMIN` is necessary and not sufficient: that user cannot run `wg-quick`, so each WireGuard slot's link has to be raised by root before the daemon starts (§11.6). Otherwise unset `network_kill_switch`. |
+| Config refused, "cannot be used with an OpenVPN slot" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` slot. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One slot fenced at boot, log says "an interface of this name is already up and is not this slot's" | A link named by that slot's `vpn_interface` was standing when the slot tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it will not `wg-quick down` something it cannot vouch for, because that would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the profile, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this slot's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a slot can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 and `vpn_down` | The slot is fenced. An operator restart is required by design. |
 | Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
