@@ -210,7 +210,9 @@ the isolation is layered — and honest about its limits.
 - **Network kill switch** (opt-in, `network_kill_switch = true`) — a
   fail-closed nftables table confining the daemon's egress to loopback and the
   tunnel interfaces, so a dropped tunnel fails closed at the kernel regardless
-  of socket binds or poll timing. Needs `CAP_NET_ADMIN` and a dedicated user.
+  of socket binds or poll timing. Needs `CAP_NET_ADMIN` and a dedicated user,
+  and is refused beside a `network = "host"` profile, whose egress it would
+  drop.
 
 **Checking a tunnel without seeding anything** — `vpn check` runs the VPN
 pre-flight the daemon depends on and reports each part separately, with no

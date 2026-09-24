@@ -163,6 +163,10 @@ pub async fn boot(
     log_handle: crate::tracing_init::LogReloadHandle,
 ) -> anyhow::Result<DaemonHandle> {
     info!("starting torrentd");
+    // Refusals that are pure functions of the file, before any tunnel is
+    // raised: among them a host profile beside `network_kill_switch`, whose
+    // egress the ruleset would drop while it reported itself Active.
+    cfg.check_boot_rules()?;
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();

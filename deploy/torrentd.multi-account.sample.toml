@@ -51,9 +51,14 @@ enable_lsd = false
 vpn_handshake_max_age_secs = 180
 
 # Fail-closed nftables kill switch. Requires `nft`, CAP_NET_ADMIN, at least one
-# `network = "vpn"` profile, and a dedicated non-root user — the packaged
-# systemd unit uses User=torrentd. Off here; turn it on once `vpn check` is
-# clean.
+# `network = "vpn"` profile, no `network = "host"` profile, and a dedicated
+# non-root user — the packaged systemd unit uses User=torrentd. The ruleset
+# matches the daemon's uid and admits only the tunnel interfaces, so it cannot
+# tell a host profile's traffic from a leak: this file's `public` profile would
+# send nothing at all while reporting itself healthy, and the daemon refuses
+# that mix at startup and in `--check-config`. It stays off here for that
+# reason. To use it, run the vpn profiles in a daemon of their own and turn it
+# on there once `vpn check` is clean.
 network_kill_switch = false
 
 # ---------------------------------------------------------------------------
