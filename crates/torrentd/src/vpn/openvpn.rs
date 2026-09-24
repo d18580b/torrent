@@ -16,6 +16,25 @@
 //! The pid is verified against `/proc/<pid>/cmdline` before it is signalled, so
 //! a stale pid file whose number has been recycled cannot make the daemon kill
 //! an unrelated process.
+//!
+//! # Where the pid file lives
+//!
+//! `Config::state_dir()` — `resume_dir`'s parent, `/var/lib/torrentd` under
+//! the packaged unit — as `openvpn-<iface>.pid`.
+//!
+//! `/run/torrentd` would be the conventional home for a pid file, and it is
+//! tmpfs so nothing survives a reboot. It is not used because the packaged
+//! `deploy/torrentd.service` declares `StateDirectory=torrentd` and names
+//! `/var/lib/torrentd` in `ReadWritePaths=`, and declares no
+//! `RuntimeDirectory=`: `/run/torrentd` does not exist on a host running the
+//! shipped unit, and the daemon could not create it under that unit's
+//! sandboxing. Putting the pid file there means changing the packaged unit.
+//!
+//! What that alternative would buy — a file that cannot outlive the process
+//! it names — `live_pid` already provides by other means: it verifies the pid
+//! against `/proc/<pid>/cmdline` before signalling, so a pid file surviving a
+//! reboot is *detected*, not trusted. A dedicated config key was also
+//! rejected: a new operator-facing key for a file no operator reads.
 
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -32,6 +51,13 @@ use tracing::warn;
 
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// How long openvpn gets to unwind its routes and remove its interface after
+/// SIGTERM. Comfortably inside the shutdown path's own budget, and well under
+/// the packaged unit's `TimeoutStopSec`, so systemd never has to arbitrate.
+const TERM_GRACE: Duration = Duration::from_secs(5);
+/// How long a SIGKILLed process gets to be reaped before the pid file is left
+/// standing for the next teardown.
+const KILL_GRACE: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub struct OpenvpnManager {
@@ -67,6 +93,56 @@ impl OpenvpnManager {
             .filter_map(|a| std::str::from_utf8(a).ok())
             .any(|a| a == iface);
         (is_openvpn && names_iface).then_some(pid)
+    }
+
+    /// Send one signal. `false` means it could not be delivered, and the
+    /// caller must not treat the process as gone.
+    ///
+    /// `kill` rather than libc, matching the kill switch's reason for reading
+    /// /proc directly: one fewer dependency for one syscall.
+    fn signal(&self, iface: &str, pid: u32, sig: &str) -> bool {
+        match Command::new("kill").arg(sig).arg(pid.to_string()).status() {
+            Ok(st) if st.success() => true,
+            Ok(st) => {
+                warn!(
+                    target: "torrentd::vpn::openvpn",
+                    vpn_iface = %iface,
+                    pid,
+                    signal = sig,
+                    "kill exited with {st}",
+                );
+                false
+            }
+            Err(e) => {
+                warn!(
+                    target: "torrentd::vpn::openvpn",
+                    vpn_iface = %iface,
+                    pid,
+                    signal = sig,
+                    error.cause = %e,
+                    "could not signal openvpn",
+                );
+                false
+            }
+        }
+    }
+
+    /// Poll until `live_pid` reports the process gone, or `grace` elapses.
+    ///
+    /// `live_pid` and not a bare `/proc/<pid>` existence check, so a pid
+    /// recycled by an unrelated process inside the grace period still reads
+    /// as gone rather than as openvpn refusing to die.
+    fn wait_for_exit(&self, iface: &str, grace: Duration) -> bool {
+        let deadline = Instant::now() + grace;
+        loop {
+            if self.live_pid(iface).is_none() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            thread::sleep(POLL_INTERVAL);
+        }
     }
 }
 
@@ -137,6 +213,19 @@ impl VpnManager for OpenvpnManager {
         Ok(IpAddr::V4(v4))
     }
 
+    /// Stop the openvpn daemon running `iface`, and only then drop its pid
+    /// file.
+    ///
+    /// SIGTERM first: a VPN client killed hard leaves its routes and its
+    /// interface behind, which is the residue this whole path exists to
+    /// remove. Then wait for the process to actually go, escalating to
+    /// SIGKILL once if it outlives the grace period.
+    ///
+    /// The pid file is removed only once `live_pid` reports the process gone,
+    /// never on `kill`'s exit status. `kill` exits 0 the moment the signal is
+    /// *delivered*; removing the file there discards the only handle on a
+    /// process that is still running, and the next boot's `live_pid` then
+    /// finds nothing — leaving an orphan no code path can ever reach again.
     fn bring_down(&self, iface: &str) {
         let Some(pid) = self.live_pid(iface) else {
             // No pid file, or it does not describe a live openvpn on this
@@ -155,29 +244,36 @@ impl VpnManager for OpenvpnManager {
             pid,
             "terminating openvpn",
         );
-        // `kill` rather than libc, matching the kill switch's reason for
-        // reading /proc directly: one fewer dependency for one syscall.
-        match Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.to_string())
-            .status()
-        {
-            Ok(st) if st.success() => {
-                let _ = std::fs::remove_file(self.pid_file(iface));
-            }
-            Ok(st) => warn!(
+        if !self.signal(iface, pid, "-TERM") {
+            return;
+        }
+        if self.wait_for_exit(iface, TERM_GRACE) {
+            let _ = std::fs::remove_file(self.pid_file(iface));
+            return;
+        }
+        warn!(
+            target: "torrentd::vpn::openvpn",
+            vpn_iface = %iface,
+            pid,
+            grace_secs = TERM_GRACE.as_secs(),
+            "openvpn did not exit on SIGTERM; escalating to SIGKILL",
+        );
+        if !self.signal(iface, pid, "-KILL") {
+            return;
+        }
+        if self.wait_for_exit(iface, KILL_GRACE) {
+            let _ = std::fs::remove_file(self.pid_file(iface));
+        } else {
+            // Unreachable short of an uninterruptible-sleep kernel wedge.
+            // The pid file stays: it is the only handle a later process has
+            // on whatever is still running, and a stale one is harmless
+            // because `live_pid` re-verifies it against /proc.
+            warn!(
                 target: "torrentd::vpn::openvpn",
                 vpn_iface = %iface,
                 pid,
-                "kill exited with {st}",
-            ),
-            Err(e) => warn!(
-                target: "torrentd::vpn::openvpn",
-                vpn_iface = %iface,
-                pid,
-                error.cause = %e,
-                "could not signal openvpn",
-            ),
+                "openvpn outlived SIGKILL; leaving the pid file for the next teardown",
+            );
         }
     }
 }
@@ -225,5 +321,182 @@ mod tests {
         // Far above the default pid_max; nothing is running here.
         std::fs::write(m.pid_file("tun0"), "4294967294").unwrap();
         assert_eq!(m.live_pid("tun0"), None);
+    }
+
+    #[test]
+    fn a_process_that_is_already_gone_is_not_waited_for() {
+        let (_d, m) = mgr();
+        let t = Instant::now();
+        assert!(m.wait_for_exit("tun0", TERM_GRACE));
+        assert!(
+            t.elapsed() < TERM_GRACE,
+            "teardown must not spend the grace period on a tunnel that is down",
+        );
+    }
+
+    #[test]
+    fn a_stale_pid_file_is_not_signalled_and_is_left_standing() {
+        // Nothing to signal, so nothing is signalled — and the file is not
+        // removed either: it costs nothing, `live_pid` re-verifies it against
+        // /proc on every read, and the next bring-up overwrites it.
+        let (_d, m) = mgr();
+        std::fs::write(m.pid_file("tun0"), "4294967294").unwrap();
+        m.bring_down("tun0");
+        assert!(m.pid_file("tun0").exists());
+    }
+
+    /// The repository root, for the two operator-facing files below.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    }
+
+    /// The package the operator-facing record names for `kill` is the package
+    /// that actually provides the binary [`OpenvpnManager::signal`] spawns.
+    ///
+    /// `signal` runs `Command::new("kill")`. `Command` spawns no shell, so the
+    /// shell builtin is unreachable and `/usr/bin/kill` has to be installed as
+    /// a file. On the image `deploy/Containerfile` itself pins —
+    /// `registry.fedoraproject.org/fedora-minimal:43` — `rpm -qf /usr/bin/kill`
+    /// prints `util-linux-core`; `procps-ng` ships `pgrep` and `pkill` and no
+    /// `kill` at all.
+    ///
+    /// Naming `procps-ng` in the prerequisite table is not cosmetic.
+    /// `docs/running.md` §1 introduces that table as the binaries that are
+    /// "easy to miss because nothing checks for them at startup", so an
+    /// operator provisioning a host installs exactly what it names. Without
+    /// `/usr/bin/kill`, `signal` returns `false`, `bring_down` returns
+    /// *before* removing the pid file, and the openvpn process and its routes
+    /// survive the shutdown — the headline defect this pull request exists to
+    /// fix, restored by its own runbook.
+    ///
+    /// The image itself was never broken by *this*, because `util-linux-core`
+    /// is already in the base; nothing recorded that, which is how the table
+    /// came to be wrong and stayed wrong. Name `procps-ng` as the package for
+    /// `kill` again, in the runbook row or in the image, and this fails.
+    /// Whether `procps-ng` belongs in the image at all is a different
+    /// question with a different consumer — see
+    /// [`the_runtime_image_installs_the_package_wg_quick_needs_for_sysctl`].
+    #[test]
+    fn the_documented_package_is_the_one_that_provides_the_kill_binary() {
+        let root = repo_root();
+        let runbook = std::fs::read_to_string(root.join("docs/running.md"))
+            .expect("the runbook this daemon ships with");
+        let row = runbook
+            .lines()
+            .find(|l| l.contains("`openvpn`, `kill`"))
+            .expect("the prerequisite table still has a row for the teardown's binaries");
+        assert!(
+            row.contains("util-linux"),
+            "the prerequisite row for `kill` must name the package that provides \
+             /usr/bin/kill; got: {row}",
+        );
+        assert!(
+            !row.contains("`procps-ng` /"),
+            "procps-ng provides pgrep and pkill and no kill, so naming it as the \
+             package for `kill` sends an operator to install the wrong one; got: {row}",
+        );
+
+        let containerfile = std::fs::read_to_string(root.join("deploy/Containerfile"))
+            .expect("the image this change ships");
+        assert!(
+            containerfile.contains("util-linux"),
+            "the image must record where /usr/bin/kill comes from, or it keeps \
+             working by inheritance from its base with nothing saying so — which \
+             is what let the runbook name the wrong package for two rounds",
+        );
+    }
+
+    /// The runtime image installs the package `wg-quick` needs, and says so.
+    ///
+    /// This is the line, and the reason, that nothing in this repository was
+    /// watching. `wg-quick` line 241, inside `add_default()` and under
+    /// `set -e -o pipefail`, reads
+    /// `[[ $(sysctl -n net.ipv4.conf.all.src_valid_mark) -ne 1 ]] && cmd sysctl -q …=1`.
+    /// `/usr/sbin/sysctl` belongs to `procps-ng`. Drop the package and the
+    /// substitution yields the empty string, the `&&` chain reaches the final
+    /// `cmd sysctl`, that exits 127, and `cmd_up`'s `trap 'del_if; exit' EXIT`
+    /// deletes the link it has just created — so a full-tunnel
+    /// `AllowedIPs = 0.0.0.0/0` profile, the shape every commercial provider
+    /// uses, cannot come up in the image at all and the daemon exits because
+    /// no profile came up.
+    ///
+    /// **What this does and does not establish.** It pins the install list and
+    /// the recorded reason, which is what a `grep` of this repository's own
+    /// source for `pkill`/`pgrep` could never have reached — the consumer is a
+    /// third binary in a tool the daemon execs. It does **not** build the
+    /// image or bring a tunnel up in it; nothing in this repository does, and
+    /// that gap is what let the regression ship. Remove `procps-ng` from the
+    /// install list and this fails.
+    #[test]
+    fn the_runtime_image_installs_the_package_wg_quick_needs_for_sysctl() {
+        let containerfile = std::fs::read_to_string(repo_root().join("deploy/Containerfile"))
+            .expect("the image this change ships");
+        let install = containerfile
+            .lines()
+            .find(|l| l.contains("openssl ca-certificates curl"))
+            .expect("the runtime stage still installs its package set");
+        assert!(
+            install.contains("procps-ng"),
+            "`wg-quick` runs `sysctl` on the IPv4 default-route path under \
+             `set -e`, and /usr/sbin/sysctl is procps-ng's; without it no \
+             full-tunnel WireGuard profile can come up in this image; got: \
+             {install}",
+        );
+        assert!(
+            containerfile.contains("sysctl") && containerfile.contains("wg-quick"),
+            "the install list must record that `wg-quick`'s `sysctl` call is \
+             the consumer, or the next reader searches this repository's \
+             source for `pkill` and drops the package again",
+        );
+    }
+
+    /// No source in this repository calls a binary `procps-ng` is the package
+    /// for — so the package's place in the runtime image rests entirely on
+    /// `wg-quick`, and on nothing this repository could grep for.
+    ///
+    /// That distinction is the whole lesson of the removal this replaces: the
+    /// package was dropped on the evidence that this search comes back empty,
+    /// and it was the wrong surface to search. Re-introduce a `pkill` or
+    /// `pgrep` call site and this fails, which is the signal that
+    /// `docs/running.md` §1's prerequisite table needs a row for it — hosts
+    /// that run the daemon outside this image get no install list at all.
+    #[test]
+    fn no_source_invokes_the_binaries_procps_ng_provides() {
+        let mut offenders = Vec::new();
+        let mut stack = vec![repo_root().join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    if path.file_name().is_some_and(|n| n == "target") {
+                        continue;
+                    }
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|x| x != "rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for tool in ["pkill", "pgrep"] {
+                    if text.contains(&format!("Command::new(\"{tool}\")")) {
+                        offenders.push(format!("{} invokes {tool}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the runtime image carries procps-ng for `wg-quick`'s `sysctl` and \
+             not for this repository; these call its binaries, so the host \
+             prerequisite table owes them a row: {offenders:?}",
+        );
     }
 }

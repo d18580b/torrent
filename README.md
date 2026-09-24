@@ -255,7 +255,9 @@ a `vpn` profile's isolation is layered:
 - **Kill switch** (opt-in) — a fail-closed nftables table confining the
   daemon's egress to loopback and its tunnel interfaces, so a dropped tunnel
   fails closed at the kernel regardless of socket binds or poll timing. It is
-  refused beside a `network = "host"` profile, whose egress it would drop.
+  refused beside a `network = "host"` profile, whose egress it would drop, and
+  beside an OpenVPN profile, whose own connection to the provider it would
+  drop; WireGuard links must be raised by root before the daemon starts.
 
 **Checking a tunnel without seeding anything** — `vpn check` runs the VPN
 pre-flight the daemon depends on and reports each part separately, with no
@@ -435,11 +437,15 @@ daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 > it resolve on a healthy daemon rather than on the first event ever to occur.
 > That is tunnel health and fencing on every profile, and port-forward state —
 > `profile_vpn_gateway_reboots_total` included — on every profile that
-> negotiates over NAT-PMP. The two handshake gauges
-> (`profile_vpn_handshake_age_seconds`, `profile_vpn_handshake_probe_ok`) are
-> the exception, because they register on the first probe rather than when the
-> monitor starts: an alert on either reads "no data" until the first poll
-> completes, and permanently on a `vpn` profile that is not WireGuard.
+> negotiates over NAT-PMP. `profile_vpn_handshake_probe_ok` is seeded at 1 on
+> every live WireGuard profile, so an alert on it reads "no" from a cold start;
+> it is never seeded on a profile that is not WireGuard, nor on one whose tunnel
+> never came up, where a 0 would wrongly blame the host's `wg` tooling.
+> `profile_vpn_handshake_age_seconds` is the exception, because it registers on
+> the first probe rather than when the monitor starts: an alert on it reads "no
+> data" until the first poll completes, and permanently on a `vpn` profile that
+> is not WireGuard. A `vpn` profile whose tunnel never came up at boot carries
+> `profile_vpn_tunnel_up` at 0 and none of the other per-profile series.
 
 ## Deployment
 

@@ -107,8 +107,15 @@ enable_lsd = false
 # `network = "host"` profile (the ruleset would drop its egress while it
 # reported itself healthy, so the daemon refuses the mix), and a dedicated
 # non-root user: the ruleset matches on the daemon's uid, and as root
-# it would drop every root-owned process's traffic on the host. The packaged
-# systemd unit uses User=torrentd.
+# it would drop every root-owned process's traffic on the host, so the daemon
+# refuses to start rather than install it. The packaged systemd unit uses
+# User=torrentd.
+#
+# WireGuard profiles only: `openvpn` runs under the daemon's uid, so the
+# ruleset would drop its own connection to the provider, and the daemon
+# refuses the kill switch beside an OpenVPN profile. And a non-root daemon
+# cannot run `wg-quick` itself, so each profile's link must be raised by root
+# before the daemon starts — docs/running.md §11.6.
 #
 # Verify the whole tunnel setup before trusting it, without seeding anything:
 #   torrentd --config /etc/torrentd/torrentd.toml vpn check
@@ -174,9 +181,11 @@ dht               = true
 # `peer_fingerprint_hex` and `user_agent` are required here and must be unique
 # across profiles: they are what a tracker sees as the account's client.
 #
-# `vpn_interface` must equal `vpn_config`'s file name without its extension.
-# wg-quick derives one from the other in both directions, so they cannot
-# differ.
+# A wireguard profile's `vpn_config` must be
+# /etc/wireguard/<vpn_interface>.conf — wg-quick derives the interface from the
+# file name on the way up and resolves the name back to that directory on the
+# way down, so anything else brings up a tunnel that can never be torn down.
+# Refused at startup.
 #
 # The eight rules this is built on, and why each exists, are documented on the
 # `torrentd-engine::profile` module.
