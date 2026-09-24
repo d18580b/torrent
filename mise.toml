@@ -1,11 +1,15 @@
 # Developer tooling for the torrentd workspace.
 #
-# Single source of truth for the fmt / lint / test commands: `hk` git hooks and
-# CI both call `mise run <task>` so the commands live in exactly one place.
+# Single source of truth for the fmt, lint and test commands, and for the test
+# and benchmark entry points layered above them: `hk` hooks, CI and the docs
+# all call `mise run <task>`, so each command lives in exactly one place.
 #
-#   mise install        # provision the tools below
-#   mise run setup       # install nightly rustfmt + activate git hooks (once)
+#   mise install         # provision the tools below
+#   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|lint|test|check
+#   mise run test-shim|test-lifecycle|test-daemon|test-all
+#   mise run web|daemon-only
+#   mise run bench -- <subcommand>
 
 [tools]
 hk = "1.48.0"
@@ -41,10 +45,59 @@ run = "cargo clippy --fix --workspace --all-targets --allow-dirty --allow-staged
 description = "Workspace tests (default features; parity with CI)"
 run = "cargo test --workspace"
 
+# The layers above `test`, each needing something `test` does not. The rule at
+# the top of this file — that a command lives in exactly one place — now covers
+# these too; until it did, the four were spelled out longhand in CI *and* in
+# the README, so there were three copies of each and nothing kept them in step.
+
+[tasks.test-shim]
+description = "Layer 2: FFI shim tests (needs the vendored libtorrent fixtures)"
+run = "cargo test -p libtorrent-sys --features shim-tests"
+
+[tasks.test-lifecycle]
+description = "Layer 3: real libtorrent sessions against real disk (no network)"
+run = "cargo test -p torrentd-engine --test lifecycle -- --ignored"
+
+[tasks.test-daemon]
+description = "Layer 3: spawns the built binary and drives it over HTTP"
+run = "cargo test -p torrentd --test daemon -- --ignored"
+
+[tasks.test-all]
+description = "Every automated test, including the ignored integration layers"
+# Sequential `run`, not `depends`: mise schedules dependencies in parallel
+# (`--jobs` defaults to 4, exactly the number of layers here). `test` and
+# `test-shim` resolve `libtorrent-sys` features differently against one
+# `target/`, so run together they thrash cargo's build-directory lock; and the
+# two Layer 3 suites are wall-clock tests — a 15s seeding budget and a 30s
+# daemon health deadline — which contention alone can miss, producing a red run
+# that says nothing about the code. Ordering is the whole intent, so it is
+# spelled out where a reader of the task can see it.
+run = [
+  "mise run test",
+  "mise run test-shim",
+  "mise run test-lifecycle",
+  "mise run test-daemon",
+]
+
+[tasks.bench]
+description = "Layer 4: memory and throughput at scale (manual; minutes, GBs of RAM). --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having."
+run = "cargo run --release -p torrentd-bench --"
+
+# `npm run build` is `tsc -b`, then the bundler, then the precompressor. `tsc
+# -b` runs in strict mode with noUnusedLocals/noUnusedParameters, so this task
+# is the web client's type gate as well as its build.
 [tasks.web]
 description = "Type-check and bundle the web client"
 dir = "web"
 run = ["npm ci", "npm run build"]
+
+# The headless build. No `--release`: this exists to prove the daemon still
+# compiles with `web-ui` off and no Node on the host, which a debug build
+# proves as well and in a fraction of the time. `docs/running.md` §3 is where
+# an operator is told to add `--release`.
+[tasks.daemon-only]
+description = "Build the daemon without the web client (no Node required)"
+run = "cargo build -p torrentd --no-default-features"
 
 [tasks.screenshot]
 description = "Screenshot the pool browser against a mocked API (docs/img/pool.png)"
@@ -88,6 +141,12 @@ eval "set -- $usage_flags"
 cargo run --quiet -p torrentd -- --config "$usage_config" vpn check "$@"
 '''
 
+# `depends` here, not the sequential `run` list `test-all` uses: mise schedules
+# these two in parallel and that is safe, which is the boundary between the two
+# forms. `fmt` is `cargo fmt --check` and never touches `target/`, so `lint` is
+# the only member taking cargo's build-directory lock and has nothing to
+# contend with; and neither task carries a wall-clock deadline. A composed task
+# whose members share `target/` or race a timeout gets an ordered `run` list.
 [tasks.check]
 description = "Formatting + clippy"
 depends = ["fmt", "lint"]

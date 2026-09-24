@@ -1039,6 +1039,8 @@ impl DaemonHandle {
             ));
         }
 
+        let trusted_proxies = crate::http::forwarded::TrustedProxies::parse(&cfg.trusted_proxies)
+            .expect("validated at startup");
         let app_state = AppState {
             source: source.clone(),
             registry: registry.clone(),
@@ -1053,8 +1055,34 @@ impl DaemonHandle {
             default_save_path: cfg.default_save_path.clone(),
             torrent_dir: cfg.torrent_dir.clone(),
             reload_tx: Some(reload_tx.clone()),
+            trusted_proxies: trusted_proxies.clone(),
             unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
         };
+
+        // What the daemon decided to believe, in the journal, once. Anything
+        // in this set can claim to be any client, and the key is read only at
+        // startup — so an operator who edits it and reloads is told the
+        // change requires a restart, and the running value can differ from
+        // the file indefinitely. Without this line there is no evidence
+        // anywhere of which value the process is actually running.
+        //
+        // `trusted_proxies` is the parsed set in its effective form, which is
+        // what the matcher uses: `::ffff:0:0/96` is logged as `0.0.0.0/0`,
+        // because that is every IPv4 peer. `configured` is the text as
+        // written, so the line still reads back against the file.
+        if trusted_proxies.is_empty() {
+            info!(
+                target: "torrentd::auth",
+                "trusted_proxies is empty: no forwarding header is read and the socket peer is the client",
+            );
+        } else {
+            info!(
+                target: "torrentd::auth",
+                trusted_proxies = %trusted_proxies,
+                configured = %cfg.trusted_proxies.join(", "),
+                "forwarding headers are believed from these peers, and read once at startup",
+            );
+        }
 
         let app: Router = http::router(app_state);
         let http_listen = cfg.http_listen;
@@ -1124,7 +1152,14 @@ impl DaemonHandle {
         }
 
         let mut shutdown_rx = shutdown_rx;
-        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        // `into_make_service_with_connect_info` is what makes the peer address
+        // reach a handler at all. Without it nothing downstream — the login
+        // throttle, the auth failure log — could see who was calling.
+        let server = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
             let _ = shutdown_rx.recv().await;
         });
 
