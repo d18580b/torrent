@@ -55,6 +55,21 @@ pub struct NatpmpForwarder {
     gateway_port: u16,
     /// Retransmission schedule: one read timeout per attempt.
     timeouts: Vec<Duration>,
+    /// Whether `map` releases a UDP mapping the gateway put on a different
+    /// port from the TCP one.
+    ///
+    /// That release is `delete_one`, i.e. RFC 6886 §3.4's *wildcard* delete:
+    /// internal port 0, lifetime 0, which removes **every** mapping the
+    /// requesting address holds for the protocol. On the daemon's own paths
+    /// that is what is wanted — the orphan is the daemon's and a UDP mapping
+    /// on a port libtorrent cannot bind is useless to it. For a client that is
+    /// only *asking what the gateway would do*, it is not: the socket is bound
+    /// to the tunnel address, which is the daemon's NAT-PMP identity, so the
+    /// wildcard delete destroys the running daemon's live UDP forward.
+    ///
+    /// A wrapper around `map` cannot prevent this, because the delete is
+    /// inside `map`. It has to be a property of the client.
+    release_divergent_udp: bool,
 }
 
 impl Default for NatpmpForwarder {
@@ -66,19 +81,43 @@ impl Default for NatpmpForwarder {
 impl NatpmpForwarder {
     /// Client for steady-state renewals (snappy retransmit budget).
     pub fn new() -> Self {
-        Self::with_timeouts_ms(RENEWAL_TIMEOUTS_MS)
+        Self::with_timeouts_ms(RENEWAL_TIMEOUTS_MS, true)
     }
 
     /// Client for the one-shot startup negotiate (longer budget: failure here
     /// disables the profile).
     pub fn for_startup() -> Self {
-        Self::with_timeouts_ms(STARTUP_TIMEOUTS_MS)
+        Self::with_timeouts_ms(STARTUP_TIMEOUTS_MS, true)
     }
 
-    fn with_timeouts_ms(ms: &[u64]) -> Self {
+    /// Client for a read-only pre-flight — `torrentd vpn check` — which must
+    /// not delete anything on any branch.
+    ///
+    /// Same retransmit budget as [`Self::for_startup`], because it is asking
+    /// the same one-shot question, but it leaves a divergent UDP mapping to
+    /// expire with its lease instead of issuing the wildcard delete. A
+    /// diagnostic that can take a running daemon's forward down is not a
+    /// diagnostic.
+    pub fn for_probe() -> Self {
+        Self::with_timeouts_ms(STARTUP_TIMEOUTS_MS, false)
+    }
+
+    /// Whether this client will issue NAT-PMP's wildcard delete for a
+    /// divergent UDP mapping. False for [`Self::for_probe`] and true for the
+    /// two clients the daemon itself uses.
+    ///
+    /// Test-only: which client a call site picked is a property worth holding
+    /// in place, and it is not one any caller should branch on at runtime.
+    #[cfg(test)]
+    pub fn deletes_divergent_udp(&self) -> bool {
+        self.release_divergent_udp
+    }
+
+    fn with_timeouts_ms(ms: &[u64], release_divergent_udp: bool) -> Self {
         Self {
             gateway_port: NATPMP_PORT,
             timeouts: ms.iter().map(|&m| Duration::from_millis(m)).collect(),
+            release_divergent_udp,
         }
     }
 
@@ -174,13 +213,29 @@ impl PortForwarder for NatpmpForwarder {
                 // Gateway wouldn't honour the suggestion. A UDP mapping on a
                 // different port is useless (we can't split the listen port), so
                 // release it rather than leave it orphaned until the lease ends.
-                warn!(
-                    target: "torrentd::vpn::natpmp",
-                    udp_port,
-                    tcp_port,
-                    "NAT-PMP gateway assigned divergent UDP/TCP ports; releasing the UDP mapping and binding TCP",
-                );
-                let _ = self.delete_one(&sock, OP_MAP_UDP, req.gateway);
+                //
+                // Except for a probe client: the release is the wildcard
+                // delete, and it is issued from the tunnel address, which is
+                // the *daemon's* NAT-PMP identity. Tidying an orphan is worth
+                // a wildcard delete on the paths that own the mapping; it is
+                // never worth one on a path whose contract is that it changes
+                // nothing.
+                if self.release_divergent_udp {
+                    warn!(
+                        target: "torrentd::vpn::natpmp",
+                        udp_port,
+                        tcp_port,
+                        "NAT-PMP gateway assigned divergent UDP/TCP ports; releasing the UDP mapping and binding TCP",
+                    );
+                    let _ = self.delete_one(&sock, OP_MAP_UDP, req.gateway);
+                } else {
+                    warn!(
+                        target: "torrentd::vpn::natpmp",
+                        udp_port,
+                        tcp_port,
+                        "NAT-PMP gateway assigned divergent UDP/TCP ports; leaving the UDP mapping to expire (this client deletes nothing)",
+                    );
+                }
             }
             Err(e) => {
                 // UDP is best-effort for a seeder; TCP already succeeded.
@@ -371,6 +426,15 @@ mod tests {
         NatpmpForwarder {
             gateway_port,
             timeouts: vec![Duration::from_millis(500), Duration::from_millis(500)],
+            release_divergent_udp: true,
+        }
+    }
+
+    /// The same fast client with the probe client's delete policy.
+    fn test_probe_forwarder(gateway_port: u16) -> NatpmpForwarder {
+        NatpmpForwarder {
+            release_divergent_udp: false,
+            ..test_forwarder(gateway_port)
         }
     }
 
@@ -461,6 +525,77 @@ mod tests {
         assert!(
             saw_udp_delete.load(Ordering::SeqCst),
             "divergent UDP mapping should have been released",
+        );
+    }
+
+    #[test]
+    fn a_probe_client_issues_no_delete_on_the_divergent_udp_branch() {
+        // The check's contract is that the flagless path deletes nothing. The
+        // call site cannot hold that: the delete lives *inside* `map`, on the
+        // branch where the gateway ignores the suggested UDP port, and the
+        // socket it is sent from is bound to the tunnel address — the running
+        // daemon's own NAT-PMP identity. `delete_one` is the RFC 6886 §3.4
+        // wildcard form, so what it removes is every mapping that address
+        // holds, i.e. the daemon's live UDP (uTP/DHT) forward.
+        //
+        // Same gateway script as `loopback_divergent_udp_is_released_and_tcp_bound`,
+        // which asserts the opposite for the daemon's own clients: TCP 40001,
+        // UDP insists on 40002. The gateway then waits for a third datagram
+        // that must not come.
+        let gw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        gw.set_read_timeout(Some(Duration::from_millis(750)))
+            .unwrap();
+        let gw_port = gw.local_addr().unwrap().port();
+        let saw_a_third_request = Arc::new(AtomicBool::new(false));
+        let flag = saw_a_third_request.clone();
+        let server = thread::spawn(move || {
+            let mut buf = [0u8; 12];
+            // 1) TCP map → 40001
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[1], OP_MAP_TCP);
+            gw.send_to(&success_response(buf[1], 40001), peer).unwrap();
+            // 2) UDP map, suggested 40001 → gateway insists on 40002
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[1], OP_MAP_UDP);
+            gw.send_to(&success_response(buf[1], 40002), peer).unwrap();
+            // 3) Nothing. A datagram here is the wildcard delete.
+            if gw.recv_from(&mut buf).is_ok() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let fwd = test_probe_forwarder(gw_port);
+        let req = PortMapRequest {
+            gateway: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            internal_port: 0,
+            lifetime_secs: 60,
+        };
+        // The TCP port is still what the caller gets: refusing to delete does
+        // not cost the answer the check exists to obtain.
+        assert_eq!(fwd.map(&req).unwrap().port, 40001);
+        server.join().unwrap();
+        assert!(
+            !saw_a_third_request.load(Ordering::SeqCst),
+            "a probe client sent a request after the two mappings; the only thing it could \
+             be is the wildcard delete this client exists to not send",
+        );
+    }
+
+    #[test]
+    fn only_the_daemon_s_own_clients_delete_anything() {
+        // Which client the check picks is the whole repair, so the property is
+        // asserted on the constructors rather than inferred from a call site.
+        assert!(NatpmpForwarder::new().deletes_divergent_udp());
+        assert!(NatpmpForwarder::for_startup().deletes_divergent_udp());
+        assert!(!NatpmpForwarder::for_probe().deletes_divergent_udp());
+    }
+
+    #[test]
+    fn the_probe_client_keeps_the_startup_retransmit_budget() {
+        assert_eq!(
+            NatpmpForwarder::for_probe().timeouts,
+            NatpmpForwarder::for_startup().timeouts,
         );
     }
 

@@ -33,6 +33,19 @@ services:
       # container the daemon binds 0.0.0.0:8080 — the one place the sample
       # config cannot be copied verbatim — and a non-loopback bind requires
       # [auth], which is exactly the posture this stack is in.
+      #
+      # So torrentd.toml must set the key explicitly:
+      #
+      #     http_listen = "0.0.0.0:8080"
+      #
+      # Say it even though loopback is the default, because here the default
+      # fails quietly. `http_listen` has a serde default, so omitting it is no
+      # longer a parse error — the daemon starts, binds 127.0.0.1 *inside* the
+      # namespace, and `proxy` reaches nothing. The Containerfile's
+      # HEALTHCHECK curls localhost:8080 from inside the same namespace, so it
+      # succeeds and the container reports healthy while the API is
+      # unreachable from `proxy`. Re-aiming the health check does not recover
+      # the signal: it passes either way.
     networks:
       - front
     volumes:
