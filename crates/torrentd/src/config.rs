@@ -51,8 +51,10 @@ pub struct Config {
     /// claim true: an omitted `http_listen` used to fail to parse with
     /// `missing field http_listen`, and now binds loopback silently. That is
     /// the right default everywhere but inside a network namespace, where the
-    /// bind succeeds and the published port reaches nothing — see
-    /// `deploy/compose.yaml`, which therefore sets the key explicitly.
+    /// bind succeeds and the published port reaches nothing. Nothing here
+    /// guards against that: `deploy/compose.yaml` only documents it, telling
+    /// the operator to set `http_listen = "0.0.0.0:8080"` in the mounted
+    /// `torrentd.toml` themselves.
     #[serde(default = "Config::default_http_listen")]
     pub http_listen: SocketAddr,
 
