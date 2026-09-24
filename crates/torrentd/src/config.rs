@@ -73,11 +73,12 @@ pub struct Config {
     /// operator's, and a client the tracked-client map has no room for falls
     /// back to the shared bucket rather than to nothing.
     ///
-    /// It is not a guarantee that nobody can lock the operator out. The map
-    /// tracks a bounded number of clients, so a caller with enough distinct
-    /// source addresses can fill it and push everyone else onto the shared
-    /// bucket — which is the old behaviour again, at the cost of one real
-    /// failed login per tracked entry per penalty window.
+    /// It is not a guarantee that nobody can lock the operator out. Every
+    /// verification also spends from one daemon-wide budget, so that the
+    /// Argon2 rate does not scale with the addresses a caller holds, and a
+    /// caller with enough distinct source addresses can keep that budget
+    /// spent — which refuses every login, the old behaviour again. See
+    /// `LoginThrottle`.
     ///
     /// Set it to the address the reverse proxy connects from, and only that:
     /// anything in this list can claim to be any client. The proxy must strip

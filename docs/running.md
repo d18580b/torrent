@@ -514,14 +514,21 @@ because one attacker's failures no longer land in the same bucket as yours.
 Either way the cookie loses its `Secure` attribute, and nothing becomes
 forgeable.
 
-It is not a promise that nobody can lock you out of the login form. The
-daemon tracks a bounded number of clients — 1024 — and a caller with that many
-distinct source addresses, which one routed IPv6 /64 supplies, can fill the
-map and push every other client onto the shared bucket, where their failures
-lock everyone out exactly as before. Holding it there costs them one real
-failed login per tracked address per 30-second penalty window, at ~50 ms of
-Argon2 each; it is a rate to make expensive, not an attack the per-client key
-removes.
+Above the per-client buckets sits one daemon-wide ceiling: at most ten
+password verifications back to back, regaining one every three seconds,
+however many addresses the attempts come from. Without it a caller with many
+source addresses — one routed IPv6 /64 supplies more than enough — would get
+a bucket per address, and the Argon2 work and the guessing rate would scale
+with how many they hold. With it, a login that would exceed the ceiling gets
+`429` without running the KDF.
+
+It is not a promise that nobody can lock you out of the login form. A caller
+with enough source addresses can keep that ceiling spent, and while they do
+every login — yours included — is refused, exactly as the single shared
+bucket did before. That costs them nothing but requests: the ~50 ms of Argon2
+behind each attempt is spent by torrentd, not by the caller, which is why the
+ceiling exists. What the per-client key removes is the lockout by a caller
+with one address, or a few.
 
 The proxy must **strip or overwrite client-supplied forwarding headers before
 adding its own** — all three of the names in the table above, not just the two
