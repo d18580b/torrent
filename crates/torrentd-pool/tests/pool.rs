@@ -1742,6 +1742,37 @@ fn a_version_0_index_that_is_not_already_v3_still_takes_the_stepped_path() {
     assert_eq!(user_version(&db), 0, "and nothing was stamped over it");
 }
 
+#[test]
+fn v3_columns_without_v2_tables_below_version_3_are_not_stamped() {
+    // A build that folded the rename into `SCHEMA_V1` and wrote the version
+    // after its steps, interrupted between `SCHEMA_V1` and `SCHEMA_V2`, left
+    // v3's `torrent` columns and indexes with no `plan` or `plan_step` at all.
+    // The recognition arm checked only the columns and index names, stamped
+    // the file 3, and the first plan query failed with `no such table`.
+    for version in [0i64, 1] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        build_complete_v3_at_version(&db, version);
+        {
+            let c = rusqlite::Connection::open(&db).unwrap();
+            c.execute_batch("DROP TABLE plan_step; DROP TABLE plan;")
+                .unwrap();
+        }
+
+        let err = PoolStore::open(&db)
+            .expect_err("a file missing v2's tables is not a complete v3 schema");
+        assert!(
+            format!("{err}").contains(&format!("schema version {version} to 3")),
+            "it takes the stepped path and says so, got: {err}",
+        );
+        assert_eq!(
+            user_version(&db),
+            version,
+            "and nothing was stamped over it"
+        );
+    }
+}
+
 /// A file carrying **both** v3 index names, reporting `version`.
 ///
 /// `torrent_by_slot` over the renamed `profile` column is what SQLite leaves
