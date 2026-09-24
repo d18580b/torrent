@@ -209,14 +209,31 @@ pub struct Auth {
 /// shared bucket, and both overflow paths degrade to a shared bucket rather
 /// than to no throttle at all.
 ///
+/// Per-client buckets alone multiply the rate the daemon verifies at by the
+/// number of addresses a caller holds: 1024 tracked clients at five attempts
+/// per thirty seconds each is ~170 Argon2id runs a second, ~8.5 CPU-seconds
+/// every second on the async workers, and a guessing rate ~1000 times the one
+/// the single global bucket allowed. One routed IPv6 /64 supplies those
+/// addresses. So every verification, whichever bucket admitted it, also
+/// spends from one daemon-wide budget ([`KdfBudget`]), and when that is spent
+/// the route answers 429 without running the KDF. The per-client buckets
+/// decide *who* is throttled below that ceiling; the ceiling alone bounds how
+/// much Argon2 the route can be made to run and how fast the password can be
+/// guessed, however many addresses the caller has.
+///
 /// It does not make locking every operator out impossible, and nothing here
 /// should be read as claiming it does. A caller with enough distinct source
-/// addresses — `auth.rs`'s own note that one routed IPv6 /64 supplies 1024 of
-/// them applies here — can fill the map with live entries, and from then on
-/// every client the map has no room for is back on the shared bucket and
-/// locked out by that caller's failures. What the per-client key buys is that
-/// this now costs a real failed attempt per entry per penalty window, at
-/// ~50 ms of Argon2 each, instead of five requests every thirty seconds.
+/// addresses can spend the daemon-wide budget, and while they keep it spent
+/// every login — the operator's included — is refused, which is the old
+/// global bucket's lockout. The same budget bounds the per-client map: an
+/// entry is created only by a verification the budget admitted and stays
+/// live for a penalty window after its last one, so at the production
+/// constants a few dozen entries at most are live at once, far short of
+/// [`MAX_TRACKED_CLIENTS`]. Neither costs the caller more than sending requests:
+/// the ~50 ms of Argon2 each failed attempt takes is spent by *this* process,
+/// not by whoever sent it, so it is a cost to bound rather than a price the
+/// attacker pays. What the per-client key buys is that a caller with one
+/// address, or a few, no longer locks everyone else out.
 #[derive(Debug)]
 pub struct LoginThrottle {
     /// The fallback, for requests whose client cannot be established.
@@ -224,8 +241,74 @@ pub struct LoginThrottle {
     /// Per client. Bounded, and swept of entries idle beyond the penalty
     /// window on insert, so a rotating source cannot grow it without limit.
     per_client: Mutex<HashMap<IpAddr, ThrottleState>>,
+    /// The daemon-wide ceiling on password verifications, across every
+    /// bucket above.
+    kdf: Mutex<KdfBudget>,
     max_burst: u32,
     penalty: Duration,
+}
+
+/// The most password verifications the daemon runs back to back before the
+/// budget has to refill.
+const KDF_BURST: u32 = 10;
+
+/// How long the budget takes to regain one verification. With [`KDF_BURST`]
+/// that is at most ten verifications in any thirty seconds once the burst is
+/// spent — twice the old global bucket's five failures per thirty seconds,
+/// and well under 1% of one core at ~50 ms each.
+const KDF_REFILL: Duration = Duration::from_secs(3);
+
+/// A token bucket over Argon2id runs, shared by every client.
+///
+/// Charged for every verification, successful or not: a correct password
+/// costs the same CPU as a wrong one, and a ceiling that only counted
+/// failures would let a caller holding the password keep the KDF busy.
+#[derive(Debug)]
+struct KdfBudget {
+    tokens: u32,
+    /// When the next token accrues, measured from the last refill.
+    refilled_at: Instant,
+    burst: u32,
+    refill: Duration,
+}
+
+impl KdfBudget {
+    fn new(burst: u32, refill: Duration) -> Self {
+        Self {
+            tokens: burst,
+            refilled_at: Instant::now(),
+            burst,
+            refill,
+        }
+    }
+
+    /// Take one verification, or say how long until one is available.
+    fn take(&mut self) -> Result<(), Duration> {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(self.refilled_at);
+        let accrued = (elapsed.as_nanos() / self.refill.as_nanos().max(1)) as u64;
+        if accrued > 0 {
+            let room = u64::from(self.burst - self.tokens);
+            self.tokens += accrued.min(room) as u32;
+            self.refilled_at = if self.tokens == self.burst {
+                now
+            } else {
+                // Keep the fraction of a refill interval already served.
+                self.refilled_at + self.refill * accrued as u32
+            };
+        }
+        if self.tokens > 0 {
+            if self.tokens == self.burst {
+                // A full bucket accrues nothing, so its refill clock starts
+                // from the first token taken out of it.
+                self.refilled_at = now;
+            }
+            self.tokens -= 1;
+            Ok(())
+        } else {
+            Err((self.refilled_at + self.refill).saturating_duration_since(now))
+        }
+    }
 }
 
 /// Cap on distinct clients tracked at once. A real deployment has a handful of
@@ -311,19 +394,45 @@ impl LoginThrottle {
         Self {
             global: Mutex::new(ThrottleState::default()),
             per_client: Mutex::new(HashMap::new()),
+            kdf: Mutex::new(KdfBudget::new(KDF_BURST, KDF_REFILL)),
             max_burst: 5,
             penalty: Duration::from_secs(30),
         }
     }
 
     /// The same throttle with a shorter penalty, so a test can observe the
-    /// idle sweep without sleeping for the production window.
+    /// idle sweep without sleeping for the production window. The
+    /// daemon-wide budget is lifted out of the way: these tests drive the
+    /// per-client buckets and never run the KDF.
     #[cfg(test)]
     fn with_penalty(penalty: Duration) -> Self {
         Self {
             penalty,
+            kdf: Mutex::new(KdfBudget::new(u32::MAX, Duration::from_nanos(1))),
             ..Self::new()
         }
+    }
+
+    /// The same throttle with a daemon-wide budget a test can exhaust and
+    /// watch refill.
+    #[cfg(test)]
+    pub(crate) fn with_kdf_budget(burst: u32, refill: Duration) -> Self {
+        Self {
+            kdf: Mutex::new(KdfBudget::new(burst, refill)),
+            ..Self::new()
+        }
+    }
+
+    /// Spend one password verification from the daemon-wide budget, or say
+    /// how long until one is available.
+    ///
+    /// Called immediately before the KDF runs and after every per-client
+    /// check has passed, so a request refused anywhere earlier — by its
+    /// media type, its bucket, or an unparseable body — never spends from it.
+    /// Unlike [`Self::retry_after`] this is not keyed at all: it is the
+    /// ceiling that holds however many addresses the attempts arrive from.
+    pub fn admit_verification(&self) -> Result<(), Duration> {
+        self.kdf.lock().take()
     }
 
     /// How long `client` must wait, or `None` if an attempt is allowed.
@@ -450,9 +559,10 @@ impl LoginThrottle {
                 // long as the entries holding the map do: an entry stays live
                 // while it is locked, and beyond that only while something
                 // keeps touching it. Since a consult is no longer a touch,
-                // holding one costs a real failed attempt — ~50 ms of Argon2
-                // — per entry per penalty window, rather than the penalty
-                // window being a bound anyone gets for free.
+                // holding one takes a real failed attempt per entry per
+                // penalty window — an attempt the daemon-wide KDF budget
+                // admits — rather than the penalty window being a bound
+                // anyone gets for a malformed body.
                 None => return,
             }
         }
@@ -1101,5 +1211,64 @@ mod tests {
         t.note_success(ip(1));
         assert!(t.retry_after(ip(1)).is_none());
         assert!(t.retry_after(ip(2)).is_some());
+    }
+
+    #[test]
+    fn many_addresses_share_one_ceiling_on_verifications() {
+        // The property: the number of KDF runs the route admits does not
+        // scale with the number of addresses the attempts come from. Every
+        // address below is fresh, so every per-client consult says "go"; the
+        // daemon-wide budget is what stops the eleventh.
+        let t = LoginThrottle::new();
+        let mut admitted = 0;
+        for n in 0..MAX_TRACKED_CLIENTS as u32 {
+            let addr = Some(IpAddr::V4(std::net::Ipv4Addr::from(0xc000_0000 + n)));
+            assert!(
+                t.retry_after(addr).is_none(),
+                "a never-seen address is not throttled per client",
+            );
+            if t.admit_verification().is_ok() {
+                admitted += 1;
+                t.note_failure(addr);
+            }
+        }
+        assert_eq!(
+            admitted, KDF_BURST,
+            "1024 addresses get the same burst of verifications as one",
+        );
+        let wait = t
+            .admit_verification()
+            .expect_err("the budget is spent until it refills");
+        assert!(
+            wait <= KDF_REFILL,
+            "the wait names the next refill: {wait:?}"
+        );
+    }
+
+    #[test]
+    fn the_verification_budget_refills_one_at_a_time() {
+        let refill = Duration::from_millis(40);
+        let t = LoginThrottle::with_kdf_budget(2, refill);
+        assert!(t.admit_verification().is_ok());
+        assert!(t.admit_verification().is_ok());
+        assert!(t.admit_verification().is_err(), "burst of two is spent");
+
+        std::thread::sleep(refill + Duration::from_millis(10));
+        assert!(
+            t.admit_verification().is_ok(),
+            "one refill interval, one run"
+        );
+        assert!(
+            t.admit_verification().is_err(),
+            "and only one: the budget accrues, it does not reset",
+        );
+
+        std::thread::sleep(refill * 4);
+        assert!(t.admit_verification().is_ok());
+        assert!(t.admit_verification().is_ok());
+        assert!(
+            t.admit_verification().is_err(),
+            "idle time accrues no more than the burst",
+        );
     }
 }

@@ -183,6 +183,26 @@ async fn authenticate(
             .into_response());
     };
 
+    // The daemon-wide ceiling, spent only by a request that is about to run
+    // the KDF. The per-client consult above cannot bound this on its own:
+    // every address a caller holds brings a bucket of its own, so without
+    // one shared budget the Argon2 rate — and the guessing rate — scale with
+    // the number of addresses. See `LoginThrottle`.
+    if let Err(wait) = auth.throttle.admit_verification() {
+        warn!(
+            target: "torrentd::auth",
+            client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default(),
+            retry_after_secs = wait.as_secs(),
+            "login refused: daemon-wide password verification budget spent",
+        );
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", wait.as_secs().max(1).to_string())],
+            Json(serde_json::json!({"error": "too many login attempts; try again shortly"})),
+        )
+            .into_response());
+    }
+
     if !auth.verify_password(&login_req.password) {
         auth.throttle.note_failure(client.ip);
         // No detail about which part was wrong, and no username to enumerate.
@@ -460,6 +480,41 @@ mod tests {
         )
         .await
         .expect("the documented content type and the correct password");
+    }
+
+    #[tokio::test]
+    async fn a_spent_verification_budget_refuses_before_the_password_is_checked() {
+        // A fresh address passes its per-client consult, so the only thing
+        // that can refuse it is the daemon-wide ceiling. Refused there, the
+        // KDF never runs: the correct password is not accepted, and no
+        // failure is recorded against the client.
+        let mut auth = test_auth();
+        auth.throttle = std::sync::Arc::new(crate::auth::LoginThrottle::with_kdf_budget(
+            1,
+            std::time::Duration::from_secs(3600),
+        ));
+        assert!(
+            auth.throttle.admit_verification().is_ok(),
+            "spend the one run"
+        );
+
+        let client = a_client();
+        let res = authenticate(
+            &auth,
+            client,
+            login_req(
+                "application/json",
+                r#"{"password":"correct-horse-battery"}"#,
+            ),
+        )
+        .await
+        .expect_err("the budget is spent");
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(res.headers().contains_key("retry-after"));
+        assert!(
+            auth.throttle.retry_after(client.ip).is_none(),
+            "a refusal by the ceiling is not a failed attempt by this client",
+        );
     }
 
     #[test]
