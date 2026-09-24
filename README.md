@@ -150,7 +150,7 @@ layer.)
 | `POST /api/login` \| `/api/logout` | **none** | Session cookie in, revocation out. 409 if the daemon runs unauthenticated. |
 | `GET /api/status` | read | Counts by phase, aggregate rates, peers. |
 | `GET /api/events` | read | SSE change stream — a bare tick; the client refetches. |
-| `POST /api/reload` | write | Re-read the config file, as SIGHUP does. 202 accepted, 429 if a reload is already running, 503 if the daemon is shutting down or was built without the reload channel. |
+| `POST /api/reload` | write | Re-read the config file, as SIGHUP does. 202 accepted (queued behind any reload already running), 429 if the eight-deep reload queue is full, 503 if the daemon is shutting down or was built without the reload channel. |
 | `GET /api/torrents` | read | `?after=<infohash>&limit=<n>` (default 100, max 1000) → `{"items":[…],"next_cursor":…}`. |
 | `POST /api/torrents` | write | `{"profile_id":…}` plus `{"magnet":…}`, `{"torrent_path":…}`, or a multipart `.torrent` in a field named `torrent`. `save_path` is optional and defaults to `default_save_path`. 409 on a duplicate info-hash. |
 | `GET`/`DELETE` `/api/torrents/:infohash` | read/write | `?delete_files=true` requires `[pool] allow_mutations`. |
@@ -254,7 +254,8 @@ a `vpn` profile's isolation is layered:
   `add`/`resume` return 409 until an operator intervenes.
 - **Kill switch** (opt-in) — a fail-closed nftables table confining the
   daemon's egress to loopback and its tunnel interfaces, so a dropped tunnel
-  fails closed at the kernel regardless of socket binds or poll timing.
+  fails closed at the kernel regardless of socket binds or poll timing. It is
+  refused beside a `network = "host"` profile, whose egress it would drop.
 
 **Checking a tunnel without seeding anything** — `vpn check` runs the VPN
 pre-flight the daemon depends on and reports each part separately, with no

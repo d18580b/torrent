@@ -155,6 +155,8 @@ pub struct DaemonHandle {
     kill_switch_active: bool,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: torrentd_engine::AlertLoopHandle,
+    /// Registry entries no startup scan loaded; see `AppState::unloaded_at_boot`.
+    unloaded_at_boot: std::collections::HashSet<libtorrent_safe::InfoHash>,
 }
 
 pub async fn boot(
@@ -163,6 +165,10 @@ pub async fn boot(
     log_handle: crate::tracing_init::LogReloadHandle,
 ) -> anyhow::Result<DaemonHandle> {
     info!("starting torrentd");
+    // Refusals that are pure functions of the file, before any tunnel is
+    // raised: among them a host profile beside `network_kill_switch`, whose
+    // egress the ruleset would drop while it reported itself Active.
+    cfg.check_boot_rules()?;
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
@@ -308,6 +314,15 @@ pub async fn boot(
         }};
     }
 
+    // Which profile holds each tunnel address. A vpn session is bound by
+    // address, listening and outgoing alike, so two tunnels that come up with
+    // one address (every Proton WireGuard config assigns 10.2.0.2/32) leave
+    // nothing — neither the bind nor a source-address routing rule — that can
+    // keep one account's traffic out of the other's tunnel. Only known after
+    // bring-up, since OpenVPN's address is pushed by the server.
+    let mut tunnel_owner: std::collections::HashMap<IpAddr, ProfileId> =
+        std::collections::HashMap::new();
+
     for p in &cfg.profile {
         // A shutdown asked for during a previous profile's bring-up is
         // honoured here rather than after every remaining tunnel is raised.
@@ -383,6 +398,28 @@ pub async fn boot(
                         fail_profile!(p, format!("VPN bring-up failed: {e}"));
                     }
                 };
+                if let Some(owner) = tunnel_owner.get(&ip) {
+                    error!(
+                        profile_id = %p.id,
+                        tunnel_ip = %ip,
+                        other_profile_id = %owner,
+                        "tunnel came up with an address another profile's tunnel already has; \
+                         profile disabled, since a session bound by address cannot be kept \
+                         out of the other account's tunnel",
+                    );
+                    cleanup.take_down(iface);
+                    fail_profile!(
+                        p,
+                        format!(
+                            "tunnel address {ip} is also profile {owner}'s, so neither \
+                             session can be kept out of the other's tunnel"
+                        )
+                    );
+                }
+                // Recorded only once this profile's session is built (below):
+                // a profile that fails a later step has its tunnel taken
+                // down, and still owning the address then disabled a later
+                // profile over a tunnel that no longer exists.
 
                 // The listening port. A static profile binds the operator's
                 // `listen_port`; a natpmp profile negotiates an ephemeral one
@@ -460,6 +497,9 @@ pub async fn boot(
                     dht = p.dht_enabled(),
                     "profile engine up",
                 );
+                if let Some(ip) = tunnel_ip {
+                    tunnel_owner.insert(ip, p.id.clone());
+                }
                 profile_entries.push(ProfileEntry::new(
                     p.clone(),
                     Arc::new(engine),
@@ -552,6 +592,11 @@ pub async fn boot(
     // scans. Compared against the registry's claim once both have run.
     let mut loaded_by_profile: std::collections::HashMap<ProfileId, usize> =
         std::collections::HashMap::new();
+    // Which info-hashes a session accepted. Every registry entry outside this
+    // set once both scans have run is held by no session, and is the one kind
+    // of entry `DELETE` may clear without a state-map entry to remove.
+    let mut loaded: std::collections::HashSet<libtorrent_safe::InfoHash> =
+        std::collections::HashSet::new();
 
     // Resume scan: load every saved resume file per profile. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
@@ -644,7 +689,10 @@ pub async fn boot(
                 flags_set,
                 flags_clear,
             }) {
-                Ok(_) => added_from_resume += 1,
+                Ok(_) => {
+                    added_from_resume += 1;
+                    loaded.insert(ih);
+                }
                 Err(e) => {
                     warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed")
                 }
@@ -710,6 +758,7 @@ pub async fn boot(
             }) {
                 Ok(_) => {
                     added += 1;
+                    loaded.insert(ih);
                 }
                 Err(e) => {
                     // Release the claim so a later run can retry the add.
@@ -789,6 +838,13 @@ pub async fn boot(
             );
         }
     }
+
+    let unloaded_at_boot: std::collections::HashSet<libtorrent_safe::InfoHash> = registry
+        .entries()
+        .into_iter()
+        .map(|(ih, _)| ih)
+        .filter(|ih| !loaded.contains(ih))
+        .collect();
 
     // Subscribe now, not when the HTTP server starts: a broadcast sent with no
     // live receiver is discarded, so a SIGTERM during the resume scan would
@@ -909,6 +965,7 @@ pub async fn boot(
         kill_switch_active,
         log_handle,
         alert_loop,
+        unloaded_at_boot,
     })
 }
 
@@ -934,6 +991,7 @@ impl DaemonHandle {
             kill_switch_active,
             log_handle,
             alert_loop,
+            unloaded_at_boot,
         } = self;
 
         // VPN health monitor (multi-profile only). Spawned before AppState
@@ -976,6 +1034,7 @@ impl DaemonHandle {
                 state.clone(),
                 metrics.clone(),
                 profile_registry.clone(),
+                registry.clone(),
                 shutdown_tx.subscribe(),
             ));
         }
@@ -996,6 +1055,7 @@ impl DaemonHandle {
             reload_tx: Some(reload_tx.clone()),
             trusted_proxies: crate::http::forwarded::TrustedProxies::parse(&cfg.trusted_proxies)
                 .expect("validated at startup"),
+            unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
         };
 
         // What the daemon decided to believe, in the journal, once. Anything

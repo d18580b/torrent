@@ -1,9 +1,12 @@
 //! Shared state passed to axum handlers via extractors.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use libtorrent_safe::InfoHash;
+use parking_lot::Mutex;
 use torrentd_engine::AlertSource;
 use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::ProfileConfig;
@@ -58,6 +61,16 @@ pub struct AppState {
     pub reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
     /// Peers whose forwarding headers are believed. Empty means none are.
     pub trusted_proxies: crate::http::forwarded::TrustedProxies,
+    /// Info-hashes the assignment registry held after the startup scans that
+    /// no scan loaded into a session: the only entries known to be held by
+    /// no session at all.
+    ///
+    /// `DELETE /api/torrents/:hash` on a live profile with no state-map entry
+    /// clears the assignment alone only for these. Any other entry without
+    /// state was assigned in this process and handed to a session whose
+    /// `AddTorrent` alert has not arrived yet, so clearing it would leave the
+    /// torrent seeding unassigned and free to be added to a second profile.
+    pub unloaded_at_boot: Arc<Mutex<HashSet<InfoHash>>>,
 }
 
 impl AppState {
@@ -175,6 +188,7 @@ pub(crate) fn build_test_state_with_sessions(
         torrent_dir: std::env::temp_dir(),
         reload_tx: None,
         trusted_proxies: Default::default(),
+        unloaded_at_boot: Arc::new(Mutex::new(HashSet::new())),
     }
 }
 
