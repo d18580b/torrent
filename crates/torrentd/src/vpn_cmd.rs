@@ -343,6 +343,17 @@ pub trait CheckHost {
     /// Whether an executable answers `probe_arg` with a zero status.
     fn tool_available(&self, bin: &str, probe_arg: &str) -> bool;
 
+    /// Stat the slot's VPN profile, or say why it could not be.
+    fn profile_metadata(&self, path: &Path) -> std::io::Result<()>;
+
+    /// [`vpn::wireguard_handshake_age`], with its reason reduced to the string
+    /// that type already publishes.
+    ///
+    /// Behind the trait so [`judge_handshake`]'s fresh and stale arms are
+    /// reachable through [`slot_checks`] without a live tunnel, and so a slot's
+    /// checks reach the host through this seam and nothing else.
+    fn handshake_age(&self, iface: &str) -> Result<Option<Duration>, &'static str>;
+
     /// This process's effective uid, or why it could not be read.
     fn current_uid(&self) -> Result<u32, String>;
 
@@ -408,6 +419,14 @@ impl CheckHost for RealHost {
         tool_available(bin, probe_arg)
     }
 
+    fn profile_metadata(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::metadata(path).map(|_| ())
+    }
+
+    fn handshake_age(&self, iface: &str) -> Result<Option<Duration>, &'static str> {
+        vpn::wireguard_handshake_age(iface).map_err(|why| why.as_str())
+    }
+
     fn current_uid(&self) -> Result<u32, String> {
         vpn::killswitch::current_uid().map_err(|e| e.to_string())
     }
@@ -442,13 +461,27 @@ impl CheckHost for RealHost {
         if !out.status.success() {
             return None;
         }
-        // The bare word, not a substring: an interface *named* `wireguard`
-        // prints as `wireguard:` and must not answer this question itself.
-        Some(
-            String::from_utf8_lossy(&out.stdout)
-                .split_whitespace()
-                .any(|t| t == "wireguard"),
-        )
+        link_type_is_wireguard(&String::from_utf8_lossy(&out.stdout))
+    }
+}
+
+/// Read `ip -d link show <iface>`'s output for whether the link is WireGuard.
+///
+/// Matched on bare words, not substrings: an interface *named* `wireguard` or
+/// `tun` prints as `wireguard:` or `tun:` and must not answer this itself.
+///
+/// A `tun` link is `None`, not `Some(false)`: `wireguard-go`, the userspace
+/// implementation `wg-quick` falls back to without the kernel module, is a
+/// `tun` device, so its link type separates nothing and only the handshake
+/// probe can say what is behind it.
+fn link_type_is_wireguard(ip_detail: &str) -> Option<bool> {
+    let has = |word: &str| ip_detail.split_whitespace().any(|t| t == word);
+    if has("wireguard") {
+        Some(true)
+    } else if has("tun") {
+        None
+    } else {
+        Some(false)
     }
 }
 
@@ -722,6 +755,13 @@ fn judge_nft_check(
 /// file stem — an all-clear `0` and a message asserting the daemon would be
 /// fine. A capability-free read of the link type says otherwise, and that is a
 /// `fail` about the configuration rather than an `unknown` about this shell.
+///
+/// That reading only settles a probe that did **not** answer. A probe that
+/// returned a handshake (or none yet) is `wg` itself reading a WireGuard
+/// implementation behind `iface`, which is stronger evidence than the link
+/// type: a userspace tunnel (`wireguard-go`, which `wg-quick` falls back to
+/// without the kernel module) is a `tun` device and carries no wireguard link
+/// type at all.
 fn judge_handshake(
     iface: &str,
     probe: Result<Option<Duration>, &str>,
@@ -729,7 +769,7 @@ fn judge_handshake(
     privileged: bool,
     is_wireguard_device: Option<bool>,
 ) -> Check {
-    if is_wireguard_device == Some(false) {
+    if probe.is_err() && is_wireguard_device == Some(false) {
         return Check::fail(
             "handshake",
             format!(
@@ -1064,7 +1104,7 @@ fn slot_checks(
     let iface = slot.vpn_interface.as_str();
 
     // 1. The profile the daemon would hand to wg-quick / openvpn.
-    checks.push(match std::fs::metadata(&slot.vpn_profile) {
+    checks.push(match host.profile_metadata(&slot.vpn_profile) {
         Ok(_) => Check::pass(
             "profile",
             format!("{} is readable", slot.vpn_profile.display()),
@@ -1075,7 +1115,7 @@ fn slot_checks(
     // 2. The tools that slot's type needs.
     match slot.vpn_type {
         VpnType::Wireguard => {
-            checks.push(if tool_available("wg", "--version") {
+            checks.push(if host.tool_available("wg", "--version") {
                 Check::pass("wireguard_tools", "`wg` is available")
             } else {
                 Check::fail(
@@ -1084,14 +1124,14 @@ fn slot_checks(
                      cannot run, and the daemon would fall back to IP presence alone",
                 )
             });
-            checks.push(if tool_available("wg-quick", "--help") {
+            checks.push(if host.tool_available("wg-quick", "--help") {
                 Check::pass("wg_quick", "`wg-quick` is available")
             } else {
                 Check::unknown("wg_quick", "`wg-quick --help` did not exit cleanly")
             });
         }
         VpnType::Openvpn => {
-            checks.push(if tool_available("openvpn", "--version") {
+            checks.push(if host.tool_available("openvpn", "--version") {
                 Check::pass("openvpn", "`openvpn` is available")
             } else {
                 Check::fail("openvpn", "`openvpn` is not executable")
@@ -1231,7 +1271,7 @@ fn slot_checks(
     match slot.vpn_type {
         VpnType::Wireguard => {
             let max = Duration::from_secs(cfg.vpn_handshake_max_age_secs);
-            let probe = vpn::wireguard_handshake_age(iface).map_err(|why| why.as_str());
+            let probe = host.handshake_age(iface);
             checks.push(judge_handshake(
                 iface,
                 probe,
@@ -1520,6 +1560,9 @@ mod tests {
         /// Scripted `wireguard_device` answers. An interface not listed reads
         /// as `None`, which is "neither read answered".
         wg_devices: Vec<(String, bool)>,
+        /// What `handshake_age` answers for every interface. Defaults to a
+        /// refusal, which is what an unprivileged `wg show` returns.
+        handshake: Result<Option<Duration>, &'static str>,
     }
 
     impl FakeHost {
@@ -1537,7 +1580,20 @@ mod tests {
                 privileged: false,
                 nft: Mutex::new(Vec::new()),
                 wg_devices: Vec::new(),
+                handshake: Err("refused"),
             }
+        }
+
+        /// Script what the `wg show <iface> latest-handshakes` probe answers.
+        fn with_handshake(mut self, probe: Result<Option<Duration>, &'static str>) -> Self {
+            self.handshake = probe;
+            self
+        }
+
+        /// `bin` is not executable on this host.
+        fn with_missing_tool(mut self, bin: &str) -> Self {
+            self.missing_tools.push(bin.to_string());
+            self
         }
 
         /// This process's effective uid, as `current_uid` reports it.
@@ -1653,6 +1709,16 @@ mod tests {
         fn tool_available(&self, bin: &str, probe_arg: &str) -> bool {
             self.record(format!("tool_available {bin} {probe_arg}"));
             !self.missing_tools.iter().any(|b| b == bin)
+        }
+
+        fn profile_metadata(&self, path: &Path) -> std::io::Result<()> {
+            self.record(format!("profile_metadata {}", path.display()));
+            Ok(())
+        }
+
+        fn handshake_age(&self, iface: &str) -> Result<Option<Duration>, &'static str> {
+            self.record(format!("handshake_age {iface}"));
+            self.handshake
         }
 
         fn current_uid(&self) -> Result<u32, String> {
@@ -3213,5 +3279,112 @@ http_listen = "127.0.0.1:8080"
             EXIT_FAILED,
             "a slot whose handshake can never answer is not a clean run",
         );
+    }
+
+    #[test]
+    fn a_handshake_that_answered_outranks_the_link_type() {
+        // A userspace WireGuard tunnel (`wireguard-go`, `wg-quick`'s fallback
+        // without the kernel module) is a `tun` device: no DEVTYPE, and
+        // `ip -d link` says `tun`. `wg show` still answers for it, and an
+        // answer is `wg` itself reading WireGuard behind the interface.
+        let max = Duration::from_secs(180);
+        let fresh = judge_handshake(
+            "wg-acct-a",
+            Ok(Some(Duration::from_secs(30))),
+            max,
+            true,
+            Some(false),
+        );
+        assert_eq!(fresh.verdict, Verdict::Pass, "detail: {}", fresh.detail);
+        let stale = judge_handshake(
+            "wg-acct-a",
+            Ok(Some(Duration::from_secs(300))),
+            max,
+            true,
+            Some(false),
+        );
+        assert_eq!(stale.verdict, Verdict::Fail, "detail: {}", stale.detail);
+        assert!(
+            !stale.detail.contains("not a WireGuard device"),
+            "a stale handshake is not a misconfigured interface: {}",
+            stale.detail,
+        );
+        let pending = judge_handshake("wg-acct-a", Ok(None), max, true, Some(false));
+        assert_eq!(
+            pending.verdict,
+            Verdict::Unknown,
+            "detail: {}",
+            pending.detail
+        );
+
+        // And through the whole slot, to the exit status.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new()
+            .with_existing("wg-acct-a")
+            .with_wireguard_device("wg-acct-a", false)
+            .with_handshake(Ok(Some(Duration::from_secs(30))))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(127, 0, 0, 1)))]);
+        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        let hs = find(&r.checks, "handshake").expect("the handshake line is reported");
+        assert_eq!(hs.verdict, Verdict::Pass, "detail: {}", hs.detail);
+    }
+
+    #[test]
+    fn a_tun_link_is_not_read_as_proof_that_the_interface_is_not_wireguard() {
+        let kernel = "7: wg-acct-a: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1420\n    \
+                      link/none  promiscuity 0\n    wireguard addrgenmode none";
+        assert_eq!(link_type_is_wireguard(kernel), Some(true));
+        let userspace = "7: wg-acct-a: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1420\n    \
+                         link/none  promiscuity 0\n    tun type tun pi off vnet_hdr off";
+        assert_eq!(link_type_is_wireguard(userspace), None);
+        let loopback = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536\n    \
+                        link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00";
+        assert_eq!(link_type_is_wireguard(loopback), Some(false));
+        // An interface merely *named* after either type answers nothing.
+        assert_eq!(
+            link_type_is_wireguard("4: tun: <UP> mtu 1500\n    link/ether 00:11:22:33:44:55"),
+            Some(false),
+        );
+        assert_eq!(
+            link_type_is_wireguard("4: wireguard: <UP> mtu 1500\n    link/ether 00:11:22:33:44:55"),
+            Some(false),
+        );
+    }
+
+    #[test]
+    fn a_slot_s_checks_reach_the_host_only_through_the_check_host() {
+        // C1. Decision 32 put `host_checks` behind `CheckHost`; `slot_checks`
+        // still stat'ed the profile, ran the tool probes and the handshake
+        // probe against this machine directly. Every one is scripted here,
+        // and the verdicts follow the script.
+        let cfg = cfg_with_slot("");
+        let host = FakeHost::new()
+            .with_missing_tool("wg")
+            .with_handshake(Ok(Some(Duration::from_secs(10_000))))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(127, 0, 0, 1)))]);
+        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+
+        let profile = find(&r.checks, "profile").expect("the profile line is reported");
+        assert_eq!(profile.verdict, Verdict::Pass, "detail: {}", profile.detail);
+        let wg = find(&r.checks, "wireguard_tools").expect("the wg line is reported");
+        assert_eq!(wg.verdict, Verdict::Fail, "detail: {}", wg.detail);
+        let quick = find(&r.checks, "wg_quick").expect("the wg-quick line is reported");
+        assert_eq!(quick.verdict, Verdict::Pass, "detail: {}", quick.detail);
+        let hs = find(&r.checks, "handshake").expect("the handshake line is reported");
+        assert_eq!(hs.verdict, Verdict::Fail, "detail: {}", hs.detail);
+        assert!(hs.detail.contains("10000s"), "detail: {}", hs.detail);
+
+        let events = host.events();
+        for expected in [
+            "profile_metadata /etc/wireguard/wg-acct-a.conf",
+            "tool_available wg --version",
+            "tool_available wg-quick --help",
+            "handshake_age wg-acct-a",
+        ] {
+            assert!(
+                events.iter().any(|e| e == expected),
+                "{expected} went through the seam: {events:?}",
+            );
+        }
     }
 }
