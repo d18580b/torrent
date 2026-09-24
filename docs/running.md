@@ -309,7 +309,11 @@ own statement batch and wrote `user_version` afterwards, so a machine that lost
 power between the last schema statement and that write left a file reporting 0
 or 1 over a schema that is already complete v3. It is recognised on the same
 two checks as the rest — the columns are v3's and `torrent_by_profile` is
-there — and stamped, with the journal kept. Before, such a file could not be
+there — plus a third below version 3, that the `plan` and `plan_step` tables
+exist, and stamped, with the journal kept. A file that lost power before those
+two tables were created is not complete v3 and is not stamped: it fails to
+migrate, and moving it aside for `torrentd pool scan` to rebuild costs nothing,
+because it never had a journal. Before, such a file could not be
 migrated at all: the version-keyed steps tried to create tables that already
 existed, the daemon exited non-zero on every start, and the only remedy the
 message offered that worked was to move the index aside and rescan, which

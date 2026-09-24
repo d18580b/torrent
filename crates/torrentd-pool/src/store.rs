@@ -536,6 +536,24 @@ impl PoolStore {
         Ok(has_profile && !has_slot)
     }
 
+    /// Whether both tables `SCHEMA_V2` creates exist in this file.
+    ///
+    /// The columns and indexes say v1's half of the schema is v3's; this says
+    /// v2's half was ever applied. A build that folded the rename into
+    /// `SCHEMA_V1` and wrote the version after its steps, interrupted between
+    /// `SCHEMA_V1` and `SCHEMA_V2`, left v3's `torrent` columns and indexes at
+    /// version 0 with no `plan` or `plan_step` at all. Stamping that file
+    /// opened it cleanly and failed later with `no such table: plan`.
+    fn has_v2_tables(&self) -> Result<bool, PoolError> {
+        let found: i64 = self.conn.query_row(
+            "SELECT count(*) FROM sqlite_master \
+             WHERE type = 'table' AND name IN ('plan', 'plan_step')",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(found == 2)
+    }
+
     /// Whether an index called `name` exists on `torrent` in this file.
     ///
     /// The other half of the recognition: the columns say the rename ran, and
@@ -619,7 +637,18 @@ impl PoolStore {
         // destroys nothing — an index is derivable from the table it indexes.
         // A stray `.pre-v3.bak` beside a healthy index reads as a failed
         // migration, which the fresh-database test states as a property.
-        if found >= 0 && self.carries_v3_columns()? {
+        //
+        // Below v3 the file must also carry v2's tables, or it is not the
+        // complete v3 schema this arm stamps: a build interrupted between
+        // `SCHEMA_V1` and `SCHEMA_V2` left v3's columns and indexes with no
+        // `plan` / `plan_step`. That file goes down the stepped path, which
+        // fails on `SCHEMA_V1` and says to rebuild with `pool scan` — which
+        // costs nothing here, because the journal it would lose was never
+        // created.
+        if found >= 0
+            && self.carries_v3_columns()?
+            && (found == SCHEMA_VERSION || self.has_v2_tables()?)
+        {
             let indexed = self.has_torrent_index("torrent_by_profile")?;
             // `torrent_by_slot` surviving is a defect in its own right, not
             // merely a symptom of `torrent_by_profile` being absent. Keying
