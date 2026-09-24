@@ -80,12 +80,14 @@ pub enum VpnCmd {
     ///
     /// Exit status: 0 when every check passed, 1 when any check failed, and 2
     /// when nothing failed but at least one check could not be performed. A
-    /// check that could not be performed because this invocation lacks
-    /// CAP_NET_ADMIN is reported `?cap` and does not raise the status to 2 —
-    /// the daemon holds that capability and an operator shell usually does
-    /// not, so counting it would make 2 the normal answer on a healthy host. A
-    /// caller that treats only 0 as success gets the strict reading; one that
-    /// accepts 0 and 2 gets "nothing is known to be broken".
+    /// check that nothing this invocation could be given would settle is
+    /// reported `?cap` and does not raise the status to 2 — usually for want
+    /// of CAP_NET_ADMIN, which the daemon holds and an operator shell usually
+    /// does not, and also for the `kill_switch_uid` mismatch, which no
+    /// argument or privilege resolves. Counting either would make 2 the normal
+    /// answer on a healthy host. A caller that treats only 0 as success gets
+    /// the strict reading; one that accepts 0 and 2 gets "nothing is known to
+    /// be broken".
     Check {
         /// Check only this profile. Default: every configured profile.
         #[arg(long, value_name = "ID")]
@@ -98,6 +100,12 @@ pub enum VpnCmd {
         /// belongs to something else — usually a running daemon — and is
         /// checked and left alone. This is the only option here that modifies
         /// the host.
+        ///
+        /// Needs root: `wg-quick` re-execs itself under `sudo` when it is not
+        /// uid 0, so on a TTY-less invocation with no askpass helper it
+        /// prompts for a password it cannot read and the bring-up fails. Run
+        /// it under `sudo`, or from something already running as root. Every
+        /// other flag here works unprivileged.
         #[arg(long)]
         bring_up: bool,
         /// Prove the tunnel carries traffic: send a DNS query from a socket
