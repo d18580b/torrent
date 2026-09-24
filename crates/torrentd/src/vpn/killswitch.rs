@@ -1,8 +1,8 @@
 //! Network-layer VPN kill switch (nftables) — defence-in-depth backstop.
 //!
-//! Multi-slot isolation's primary guard is that every slot's libtorrent sockets
+//! Multi-profile isolation's primary guard is that every profile's libtorrent sockets
 //! are source-bound to the tunnel IP (`startup.rs`), and [`crate::vpn_monitor`]
-//! pauses a slot within ~30s of tunnel loss. Both live at the application layer:
+//! pauses a profile within ~30s of tunnel loss. Both live at the application layer:
 //! the "no bare-IP leak" guarantee ultimately rests on libtorrent honouring the
 //! bind and on the poll reacting in time.
 //!
@@ -24,7 +24,7 @@
 //!
 //! - **OpenVPN: never.** The daemon spawns `openvpn` under its own uid, so the
 //!   ruleset drops the client's connection to the provider. `Config::validate`
-//!   refuses the kill switch beside an OpenVPN slot.
+//!   refuses the kill switch beside an OpenVPN profile.
 //! - **WireGuard as uid 0: never.** The kernel's WireGuard socket is owned by
 //!   the uid that raised the link, so `meta skuid 0 counter drop` drops the
 //!   tunnel's own encrypted UDP along with every other root-owned socket on
@@ -50,7 +50,7 @@ pub const TABLE: &str = "torrentd_ks";
 /// Render the fail-closed nftables ruleset confining uid `uid`'s egress to
 /// loopback + `tunnels`. Pure (no I/O) so it can be asserted byte-for-byte in
 /// tests. Interface names are de-duplicated and sorted so the output is
-/// deterministic regardless of slot ordering.
+/// deterministic regardless of profile ordering.
 ///
 /// The chain policy stays `accept` (we must not touch other uids' traffic); we
 /// only `drop` packets owned by `uid` that don't egress loopback or a tunnel.
@@ -128,12 +128,12 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
     // It would not even protect the daemon: the kernel's WireGuard socket is
     // owned by the uid that raised the link, so as root the tunnel's own
     // encrypted UDP to the provider matches too and is dropped, and no
-    // WireGuard slot can carry traffic. Refusing costs no working shape.
+    // WireGuard profile can carry traffic. Refusing costs no working shape.
     //
     // `wg-quick` is usually a root tool, so reaching here as root is an easy
     // mistake to make. Running as a dedicated uid is necessary but not
     // sufficient: `wg-quick` re-execs through `sudo` unless its uid is 0, so
-    // that daemon only runs a WireGuard slot whose link root raised first —
+    // that daemon only runs a WireGuard profile whose link root raised first —
     // see this module's documentation.
     (uid == 0).then(|| {
         io::Error::other(

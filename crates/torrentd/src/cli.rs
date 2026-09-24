@@ -19,7 +19,16 @@ pub struct Cli {
 
     /// Validate the config file and exit. Useful for systemd
     /// `ExecStartPre=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config`.
-    #[arg(long)]
+    ///
+    /// Checks everything decidable from the file itself, including the boot
+    /// refusals for `network_kill_switch = true` with no `network = "vpn"`
+    /// profile or with any `network = "host"` one. It does NOT read the state directory, so the one boot check
+    /// that does — the assignment registry naming a profile no `[[profile]]`
+    /// table declares — still happens at startup and can still fail there. A
+    /// config check that touched disk state would fail on a host whose state
+    /// directory is not yet provisioned, which is the pre-flight case this
+    /// flag exists for.
+    #[arg(long, verbatim_doc_comment)]
     pub check_config: bool,
 
     /// Optional subcommand. Omit it to run the daemon.
@@ -59,10 +68,10 @@ pub enum VpnCmd {
     ///
     /// Observe-only unless `--bring-up` is given: it reads interfaces, `wg`
     /// state and sysctls, makes no host change, and deletes nothing. A NAT-PMP
-    /// slot's mapping is negotiated with the same short lease the daemon uses
-    /// and left to expire — NAT-PMP's delete removes every mapping the tunnel
-    /// address holds, which would include a running daemon's, so the client
-    /// used here issues none on any branch. No libtorrent session is
+    /// profile's mapping is negotiated with the same short lease the daemon
+    /// uses and left to expire — NAT-PMP's delete removes every mapping the
+    /// tunnel address holds, which would include a running daemon's, so the
+    /// client used here issues none on any branch. No libtorrent session is
     /// constructed and no tracker is contacted, so this is safe to run against
     /// real credentials. Against a live daemon its one interaction is that
     /// NAT-PMP request, from the same client identity the daemon uses; whether
@@ -80,9 +89,9 @@ pub enum VpnCmd {
     /// the strict reading; one that accepts 0 and 2 gets "nothing is known to
     /// be broken".
     Check {
-        /// Check only this slot. Default: every configured slot.
+        /// Check only this profile. Default: every configured profile.
         #[arg(long, value_name = "ID")]
-        slot: Option<String>,
+        profile: Option<String>,
         /// Emit the report as JSON.
         #[arg(long)]
         json: bool,
@@ -97,7 +106,15 @@ pub enum VpnCmd {
         /// prompts for a password it cannot read and the bring-up fails. Run
         /// it under `sudo`, or from something already running as root. Every
         /// other flag here works unprivileged.
-        #[arg(long)]
+        ///
+        /// Because it modifies the host, this is also the one `vpn check`
+        /// invocation that is NOT exempt from the authentication-posture
+        /// check: it takes the daemon's full validation, so a configuration
+        /// the daemon refuses to start from cannot be used to bring a tunnel
+        /// up either. Observe-only `vpn check` keeps the exemption and still
+        /// runs against a config the daemon refuses, which is the pre-flight
+        /// it exists for.
+        #[arg(long, verbatim_doc_comment)]
         bring_up: bool,
         /// Prove the tunnel carries traffic: send a DNS query from a socket
         /// bound to the tunnel address and require a reply, e.g. `1.1.1.1:53`.

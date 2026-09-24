@@ -26,7 +26,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 );
                 ctx.metrics.inc_counter(
                     "torrent_add_errors_total",
-                    &[("slot_id", ctx.slot_id.as_str())],
+                    &[("profile_id", ctx.profile_id.as_str())],
                 );
                 return;
             }
@@ -40,15 +40,17 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             let now = ctx.clock.now();
             ctx.state.insert(
                 handle.infohash,
-                TorrentState::newly_added(handle, ctx.slot_id.clone(), now),
+                TorrentState::newly_added(handle, ctx.profile_id.clone(), now),
             );
             info!(
                 target: "torrentd_engine::handler::add",
                 infohash = %handle.infohash,
                 "torrent added",
             );
-            ctx.metrics
-                .inc_counter("torrents_added_total", &[("slot_id", ctx.slot_id.as_str())]);
+            ctx.metrics.inc_counter(
+                "torrents_added_total",
+                &[("profile_id", ctx.profile_id.as_str())],
+            );
         }
         Alert::TorrentRemoved { hdr } => {
             let _enter = ctx.span.enter();
@@ -58,7 +60,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 // resurrect from disk on the next startup scan. This fires
                 // after libtorrent has fully removed the torrent, so it can't
                 // race a still-pending save_resume_data write.
-                if let Err(e) = ctx.resume.delete(&ctx.slot_id, &ih) {
+                if let Err(e) = ctx.resume.delete(&ctx.profile_id, &ih) {
                     warn!(
                         target: "torrentd_engine::handler::add",
                         infohash = %ih,
@@ -66,7 +68,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                         "failed to delete resume file on remove",
                     );
                 }
-                if let Err(e) = ctx.torrents.delete(&ctx.slot_id, &ih) {
+                if let Err(e) = ctx.torrents.delete(&ctx.profile_id, &ih) {
                     warn!(
                         target: "torrentd_engine::handler::add",
                         infohash = %ih,
@@ -81,7 +83,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 );
                 ctx.metrics.inc_counter(
                     "torrents_removed_total",
-                    &[("slot_id", ctx.slot_id.as_str())],
+                    &[("profile_id", ctx.profile_id.as_str())],
                 );
             }
         }
@@ -104,9 +106,9 @@ mod tests {
     use crate::engine::TorrentEngine;
     use crate::metrics::NoopSink;
     use crate::mock::MockEngine;
+    use crate::profile::ProfileId;
     use crate::resume_store::MemoryResumeStore;
     use crate::resume_store::ResumeStore;
-    use crate::slot::SlotId;
     use crate::state::StateMap;
     use crate::state::TorrentState;
     use crate::torrent_store::MemoryTorrentStore;
@@ -115,7 +117,7 @@ mod tests {
     #[test]
     fn removed_torrent_deletes_resume_and_torrent_files() {
         let ih = InfoHash([0x77; 20]);
-        let slot = SlotId::default_single();
+        let profile = ProfileId::new("p");
         let state = StateMap::new();
         let resume = MemoryResumeStore::new();
         let torrents = MemoryTorrentStore::new();
@@ -128,9 +130,12 @@ mod tests {
             id: 1,
             infohash: ih,
         };
-        state.insert(ih, TorrentState::newly_added(th, slot.clone(), clock.now()));
-        resume.write(&slot, &ih, b"resume-bytes").unwrap();
-        torrents.write(&slot, &ih, b"torrent-bytes").unwrap();
+        state.insert(
+            ih,
+            TorrentState::newly_added(th, profile.clone(), clock.now()),
+        );
+        resume.write(&profile, &ih, b"resume-bytes").unwrap();
+        torrents.write(&profile, &ih, b"torrent-bytes").unwrap();
 
         let alert = Alert::TorrentRemoved {
             hdr: AlertHeader {
@@ -147,7 +152,7 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
-            slot_id: slot.clone(),
+            profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };
 
@@ -155,7 +160,7 @@ mod tests {
 
         // No resurrection: state, resume file, and .torrent are all gone.
         assert!(!state.contains(&ih));
-        assert!(resume.snapshot(&slot).is_empty());
-        assert!(torrents.load_all(&slot).unwrap().is_empty());
+        assert!(resume.snapshot(&profile).is_empty());
+        assert!(torrents.load_all(&profile).unwrap().is_empty());
     }
 }

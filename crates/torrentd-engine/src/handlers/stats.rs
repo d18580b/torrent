@@ -8,7 +8,7 @@
 //! counter is exported as a **gauge carrying libtorrent's absolute value**:
 //! the monotonic ones (e.g. `net.sent_bytes`) are handled by PromQL `rate()`
 //! at query time, the instantaneous ones (e.g. `peer.num_peers_connected`)
-//! read directly. Every gauge gains a `slot_id` label so multi-slot mode
+//! read directly. Every gauge gains a `profile_id` label so multi-profile mode
 //! disambiguates sessions.
 
 use std::sync::OnceLock;
@@ -92,10 +92,11 @@ pub fn handle_with(alert: &Alert, ctx: &mut HandlerCtx<'_>, metrics: &StatsMetri
         unreachable!("stats::handle called with non-session_stats alert");
     };
     let _enter = ctx.span.enter();
-    let slot = ctx.slot_id.as_str();
+    let profile = ctx.profile_id.as_str();
     for (name, idx) in &metrics.resolved {
         if let Some(v) = counters.get(*idx) {
-            ctx.metrics.set_gauge(name, *v as f64, &[("slot_id", slot)]);
+            ctx.metrics
+                .set_gauge(name, *v as f64, &[("profile_id", profile)]);
         }
     }
 }
@@ -113,8 +114,8 @@ mod tests {
     use crate::metrics::MetricCall;
     use crate::metrics::RecordingSink;
     use crate::mock::MockEngine;
+    use crate::profile::ProfileId;
     use crate::resume_store::MemoryResumeStore;
-    use crate::slot::SlotId;
     use crate::state::StateMap;
     use crate::torrent_store::MemoryTorrentStore;
 
@@ -145,7 +146,7 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
-            slot_id: SlotId::default_single(),
+            profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
         handle_with(&session_stats(counters), &mut ctx, table);
@@ -153,7 +154,7 @@ mod tests {
     }
 
     #[test]
-    fn emits_gauge_for_resolved_metric_with_slot_label() {
+    fn emits_gauge_for_resolved_metric_with_profile_label() {
         let table = StatsMetrics::from_pairs(&[("libtorrent_net_sent_bytes", 2)]);
         let calls = run(&table, vec![10, 20, 4242, 30]);
         let found = calls.iter().any(|c| {
@@ -161,7 +162,7 @@ mod tests {
                 MetricCall::SetGauge { name, value, labels }
                 if name == "libtorrent_net_sent_bytes"
                     && *value == 4242.0
-                    && labels.iter().any(|(k, v)| k == "slot_id" && v == "default"))
+                    && labels.iter().any(|(k, v)| k == "profile_id" && v == "p"))
         });
         assert!(found, "expected gauge for index 2, got {calls:?}");
     }

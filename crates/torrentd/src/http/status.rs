@@ -23,7 +23,7 @@ pub struct StatusResponse {
     upload_rate_total: i64,
     download_rate_total: i64,
     pending_resume_count: u64,
-    slot_count: usize,
+    profile_count: usize,
 }
 
 pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
@@ -67,6 +67,6 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         upload_rate_total: up,
         download_rate_total: down,
         pending_resume_count: s.state.pending_resume_count(),
-        slot_count: s.source.slots().len(),
+        profile_count: s.source.profiles().len(),
     })
 }

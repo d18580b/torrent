@@ -1,0 +1,140 @@
+# Sample torrentd configuration: two private-tracker accounts, one public
+# profile, live and uncommented.
+#
+# deploy/torrentd.sample.toml documents every key. This file exists because a
+# commented-out example is unreachable by any test and by `--check-config`, so
+# nothing establishes that the multi-account case the other file describes is a
+# configuration the daemon actually accepts. This one is parsed and validated
+# by the test suite.
+#
+# Copy to /etc/torrentd/torrentd.toml and edit. Every path, interface, port and
+# identity below is an example; what must survive your edits is that they stay
+# distinct from each other.
+#
+# Before starting the daemon:
+#   torrentd --config /etc/torrentd/torrentd.toml --check-config
+#   torrentd --config /etc/torrentd/torrentd.toml vpn check
+
+# ---------------------------------------------------------------------------
+# Daemon-wide
+# ---------------------------------------------------------------------------
+default_save_path = "/data/torrents"
+resume_dir        = "/var/lib/torrentd/resume"
+torrent_dir       = "/var/lib/torrentd/torrents"
+http_listen       = "127.0.0.1:8080"
+log_level         = "info"
+
+# This sample binds loopback, so it states the opt-out rather than configuring
+# [auth]: the daemon refuses to start unless one of the two is stated. Delete
+# this line and configure [auth] — see deploy/torrentd.sample.toml — before
+# exposing the API anywhere. Read once, at startup, like [auth] and
+# http_listen: editing it takes a restart, not a SIGHUP.
+allow_unauthenticated = true
+
+connections_limit             = 10000
+file_pool_size                = 1000
+aio_threads                   = 8
+max_concurrent_http_announces = 200
+upload_rate_limit             = 0
+
+# Ignored for `network = "vpn"` profiles, which disable LSD unconditionally.
+enable_lsd = false
+
+# No top-level `peer_fingerprint` / `user_agent` here on purpose. Every `vpn`
+# profile below states its own and has to: the validator refuses a tunnelled
+# profile that leaves either key unwritten, with or without a top-level default
+# to fall back on. So no account behind a tunnel can end up announcing another
+# one's identity, whatever is added above.
+#
+# The `public` profile states neither and takes libtorrent's own defaults. That
+# is allowed because two host profiles announcing alike are one host — they
+# share an address, so there is nothing to correlate that the address does not
+# already give away. Note what follows: the refusal of libtorrent's default
+# peer-id prefix binds to the value a profile *writes down*, so a profile that
+# writes nothing announces exactly that prefix.
+
+# Max age (seconds) of a WireGuard tunnel's latest handshake before the health
+# monitor declares the profile down and pauses it.
+vpn_handshake_max_age_secs = 180
+
+# Fail-closed nftables kill switch. Requires `nft`, CAP_NET_ADMIN, at least one
+# `network = "vpn"` profile, no `network = "host"` profile, and a dedicated
+# non-root user — the packaged systemd unit uses User=torrentd. The ruleset
+# matches the daemon's uid and admits only the tunnel interfaces, so it cannot
+# tell a host profile's traffic from a leak: this file's `public` profile would
+# send nothing at all while reporting itself healthy, and the daemon refuses
+# that mix at startup and in `--check-config`. It stays off here for that
+# reason. To use it, run the vpn profiles in a daemon of their own and turn it
+# on there once `vpn check` is clean.
+network_kill_switch = false
+
+# ---------------------------------------------------------------------------
+# Profiles
+# ---------------------------------------------------------------------------
+# Everything past this point belongs to a `[[profile]]` table: TOML binds a key
+# written after a `[[table]]` header to that table, so a daemon-wide key added
+# down here is rejected as an unknown `[[profile]]` field.
+#
+# Three uniqueness rules decide most of what follows, and all three are
+# enforced across every profile whatever its posture:
+#
+#   * `listen_port` and the ports inside a host profile's `listen_interfaces`
+#     share one namespace. An announced port two profiles share correlates them
+#     to a tracker operator whichever address each announced from.
+#   * `peer_fingerprint_hex` and `user_agent` are what a tracker reads as the
+#     account's client. Two profiles that end up announcing one of them are
+#     refused where either of them wrote it down — one profile declaring the
+#     value another takes from a top-level default is the cross-account
+#     correlation whose stated consequence is a permanent ban. A pair that both
+#     leave the key unwritten and inherit the same default is accepted: nothing
+#     is hidden from whoever reads the file, and a `vpn` profile must state its
+#     own identity, so such a pair is always two host profiles — which are one
+#     host. (This file sets no top-level identity at all, and the one profile
+#     below that writes neither key is the host profile.)
+#   * Each profile's resume and `.torrent` directories are its own. By default
+#     they are `<resume_dir>/<id>` and `<torrent_dir>/<id>`; an override must
+#     not equal another profile's. One that *contains* another's is fine: each
+#     store lists a single directory and keeps only the `.resume` / `.torrent`
+#     files in it, never descending into a profile subdirectory — which is what
+#     leaves the upgrade from a pre-profiles deployment writable, where one
+#     profile is pointed at the old roots and the rest derive `<root>/<id>`
+#     inside them.
+
+# The untunnelled profile: public trackers and DHT content. Peers and trackers
+# see this machine's address, so nothing that must not be traced here belongs
+# in it.
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6881,[::]:6881"
+dht               = true
+
+# First private-tracker account. A static forwarded port, which the provider
+# assigns once and the tracker sees on every announce.
+[[profile]]
+id                      = "acct_a"
+network                 = "vpn"
+vpn_type                = "wireguard"
+vpn_config              = "/etc/wireguard/wg-acct-a.conf"
+vpn_interface           = "wg-acct-a"
+listen_port             = 6891
+peer_fingerprint_hex    = "a1b2c3d4e5f60718"
+user_agent              = "qBittorrent/5.0.3"
+allowed_tracker_domains = ["tracker-a.example.com"]
+
+# Second account, on a provider that hands out an ephemeral forwarded port over
+# NAT-PMP instead (ProtonVPN, PIA). `listen_port` is not written for these: the
+# gateway assigns it at runtime and renews the ~60s lease continuously. The
+# negotiated value is reported by `GET /api/profiles/acct_b` as
+# `forwarded_port`, and by the `torrentd_profile_forwarded_port` metric.
+[[profile]]
+id                      = "acct_b"
+network                 = "vpn"
+vpn_type                = "wireguard"
+vpn_config              = "/etc/wireguard/proton-b.conf"
+vpn_interface           = "proton-b"
+port_forward            = "natpmp"
+port_forward_gateway    = "10.2.0.1"
+peer_fingerprint_hex    = "3c2d1e0f4a5b6c7d"
+user_agent              = "Transmission/4.0.6"
+allowed_tracker_domains = ["tracker-b.example.com"]

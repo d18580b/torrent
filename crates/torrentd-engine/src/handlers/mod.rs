@@ -20,8 +20,8 @@ use tracing::Span;
 use crate::clock::Clock;
 use crate::engine::TorrentEngine;
 use crate::metrics::MetricsSink;
+use crate::profile::ProfileId;
 use crate::resume_store::ResumeStore;
-use crate::slot::SlotId;
 use crate::state::StateMap;
 use crate::torrent_store::TorrentStore;
 
@@ -35,14 +35,14 @@ pub struct HandlerCtx<'a> {
     pub metrics: &'a dyn MetricsSink,
     pub clock: &'a dyn Clock,
     pub engine: &'a Arc<dyn TorrentEngine>,
-    pub slot_id: SlotId,
+    pub profile_id: ProfileId,
     pub span: Span,
 }
 
 impl<'a> std::fmt::Debug for HandlerCtx<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HandlerCtx")
-            .field("slot_id", &self.slot_id)
+            .field("profile_id", &self.profile_id)
             .finish_non_exhaustive()
     }
 }
