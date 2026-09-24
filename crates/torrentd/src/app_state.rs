@@ -105,11 +105,13 @@ impl AppState {
         self.profiles.config(profile_id)
     }
 
-    /// `(fenced, total)` over the configured profiles.
+    /// `(fenced, total)` over the profiles that came up.
     ///
     /// Counted from the profile registry rather than the alert source: the
     /// source counts live sessions, and a profile the VPN monitor fenced still
-    /// has one.
+    /// has one. A profile whose tunnel never came up at boot is in neither
+    /// number; `/healthz` reports it as `profiles_failed`, from
+    /// [`ProfileRegistry::failed`].
     pub fn fenced_profiles(&self) -> (usize, usize) {
         let total = self.profiles.iter().len();
         let fenced = self

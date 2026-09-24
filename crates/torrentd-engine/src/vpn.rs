@@ -40,6 +40,14 @@ pub enum VpnError {
     NoAddress { iface: String },
     #[error("vpn process spawn failed: {0}")]
     Spawn(String),
+    /// An interface of this name already exists and is **not** this profile's.
+    ///
+    /// Distinct from `Spawn` because it is the one bring-up failure whose
+    /// residue the daemon did not create and must not remove: the caller's
+    /// teardown-on-failure path skips this variant, where for every other
+    /// failure it tears the interface down.
+    #[error("vpn interface {iface} exists but belongs to something else")]
+    ForeignInterface { iface: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -69,6 +77,7 @@ pub struct MockVpn {
 #[derive(Debug, Default)]
 struct MockVpnInner {
     ips: HashMap<String, IpAddr>,
+    foreign: Vec<String>,
     bring_up_calls: Vec<String>,
     bring_down_calls: Vec<String>,
 }
@@ -83,6 +92,14 @@ impl MockVpn {
         self.inner.lock().ips.insert(iface.to_string(), ip);
     }
 
+    /// Pre-seed an interface as somebody else's, so `bring_up` fails the way
+    /// a real bring-up does when an interface of that name already exists
+    /// and carries a different key: refused, with nothing of ours left
+    /// behind to clean up.
+    pub fn set_foreign(&self, iface: &str) {
+        self.inner.lock().foreign.push(iface.to_string());
+    }
+
     pub fn bring_up_calls(&self) -> Vec<String> {
         self.inner.lock().bring_up_calls.clone()
     }
@@ -95,6 +112,11 @@ impl VpnManager for MockVpn {
     fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError> {
         let mut g = self.inner.lock();
         g.bring_up_calls.push(profile.interface.clone());
+        if g.foreign.contains(&profile.interface) {
+            return Err(VpnError::ForeignInterface {
+                iface: profile.interface.clone(),
+            });
+        }
         match g.ips.get(&profile.interface) {
             Some(ip) => Ok(*ip),
             None => Err(VpnError::BringUpTimeout {

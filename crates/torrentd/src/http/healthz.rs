@@ -78,6 +78,13 @@ pub async fn healthz(State(s): State<AppState>) -> impl IntoResponse {
     // serving, and taking the daemon out of rotation would stop them too. The
     // count is reported either way, and `torrentd_profile_vpn_tunnel_up` is the
     // per-profile signal to alert on.
+    //
+    // A profile whose tunnel never came up at boot is not in this fraction —
+    // it has no session to fence — and is reported as `profiles_failed`
+    // instead. The threshold still reads every configured profile: failed
+    // profiles serve nothing, so "every live profile fenced" is "every
+    // configured profile out of service", and "no live profile" is the
+    // `no_sessions` answer above.
     let (fenced, total) = s.fenced_profiles();
     if total > 0 && fenced == total {
         return (
@@ -222,6 +229,10 @@ mod tests {
             .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
         let resp = healthz(State(s)).await.into_response();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let b = body_of(resp).await;
+        assert_eq!(b["reason"], "all_profiles_fenced");
+        assert_eq!(b["profiles"], 2);
+        assert_eq!(b["profiles_fenced"], 2);
     }
 
     #[tokio::test]
@@ -250,18 +261,73 @@ mod tests {
 
         use torrentd_engine::ProfileStatus;
 
+        use crate::app_state::build_test_state_with_sessions;
         use crate::profile_registry::test_entry;
+        use crate::profile_registry::test_failed_profile;
         use crate::profile_registry::ProfileRegistry;
 
-        let reg = Arc::new(ProfileRegistry::new(vec![
-            test_entry("a", ProfileStatus::VpnDown),
-            test_entry("b", ProfileStatus::Active),
-        ]));
-        let s = build_test_state(Some(reg));
+        // Three profiles configured, and `c`'s tunnel failed at boot, so it
+        // never got a session at all. The fixture has a failed profile so the
+        // dark account has to be visible in the body, not only in the status.
+        let reg = Arc::new(
+            ProfileRegistry::new(vec![
+                test_entry("a", ProfileStatus::VpnDown),
+                test_entry("b", ProfileStatus::Active),
+            ])
+            .with_failed(vec![test_failed_profile("c", "wg-c did not come up")]),
+        );
+        let s = build_test_state_with_sessions(Some(reg), &["a", "b"]);
         s.alert_heartbeat
             .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
         let resp = healthz(State(s)).await.into_response();
         assert_eq!(resp.status(), StatusCode::OK);
+        let b = body_of(resp).await;
+        assert_eq!(b["ok"], true);
+        assert_eq!(b["profiles"], 2, "the live count, as documented");
+        assert_eq!(b["profiles_fenced"], 1);
+        assert_eq!(b["profiles_failed"], 1, "the dark account is visible");
+    }
+
+    /// One live profile fenced and one that never came up is *every*
+    /// configured profile out of service, and a load balancer that keeps
+    /// sending traffic to it has nowhere for the traffic to go.
+    #[tokio::test]
+    async fn a_fenced_profile_beside_a_profile_that_never_came_up_is_unready() {
+        use std::sync::Arc;
+
+        use torrentd_engine::ProfileStatus;
+
+        use crate::app_state::build_test_state_with_sessions;
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::test_failed_profile;
+        use crate::profile_registry::ProfileRegistry;
+
+        let reg = Arc::new(
+            ProfileRegistry::new(vec![test_entry("a", ProfileStatus::VpnDown)])
+                .with_failed(vec![test_failed_profile("b", "wg-b did not come up")]),
+        );
+        let s = build_test_state_with_sessions(Some(reg), &["a"]);
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        let resp = healthz(State(s)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let b = body_of(resp).await;
+        assert_eq!(b["reason"], "all_profiles_fenced");
+        assert_eq!(b["profiles_fenced"], 1);
+        assert_eq!(b["profiles_failed"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_healthy_single_session_reports_its_one_profile_unfenced() {
+        let s = build_test_state(None);
+        s.alert_heartbeat
+            .store(millis_ago(std::time::Duration::ZERO), Ordering::Relaxed);
+        let resp = healthz(State(s)).await.into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = body_of(resp).await;
+        assert_eq!(b["profiles"], 1);
+        assert_eq!(b["profiles_fenced"], 0);
+        assert_eq!(b["profiles_failed"], 0);
     }
 
     #[tokio::test]

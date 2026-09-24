@@ -503,6 +503,25 @@ impl ProfileConfig {
     /// WireGuard gateway. Only meaningful for a VPN profile in natpmp mode.
     pub const DEFAULT_NATPMP_GATEWAY: &'static str = "10.2.0.1";
 
+    /// The largest `upload_rate_limit` a profile may state, in bytes/sec.
+    ///
+    /// Not a policy about bandwidth — a profile may legally exceed the
+    /// top-level `upload_rate_limit`, which is a default rather than a cap —
+    /// but the point past which the number stops meaning what it says.
+    /// Settings reach libtorrent's `settings_pack` through a
+    /// `static_cast<int>`, so a value above `i32::MAX` arrives as a *negative*
+    /// rate limit: the profile is configured for 3 GB/s and seeds at whatever
+    /// libtorrent makes of a negative cap. Refused at validation, where the
+    /// operator can still read what they typed.
+    pub const MAX_UPLOAD_RATE_LIMIT: u32 = i32::MAX as u32;
+
+    /// The only directory a WireGuard `vpn_config` may live in.
+    ///
+    /// `wg-quick`'s own default, and the only one it will resolve a bare
+    /// interface name against at teardown. torrentd never sets
+    /// `WG_CONFIG_DIR`, so this is not configurable here either.
+    pub const WG_CONFIG_DIR: &'static str = "/etc/wireguard";
+
     /// Whether this profile's traffic leaves through a tunnel.
     ///
     /// This is what the discovery guards branch on. It replaces branching on
@@ -663,14 +682,27 @@ pub enum ProfileConfigError {
         listen_interfaces: String,
     },
     #[error(
-        "profile {profile:?}: vpn_interface {iface:?} must equal the file stem of vpn_config \
-         ({vpn_config:?}); wg-quick derives the interface name from the file name, so these \
-         cannot differ"
+        "profile {profile:?}: a wireguard vpn_config must be {dir}/{iface}.conf, not \
+         {vpn_config:?}. `wg-quick up <path>` names the interface after the file, and \
+         `wg-quick down <iface>` resolves that bare name only against {dir} (or \
+         $WG_CONFIG_DIR, which torrentd does not set) — so a config under any other name, or \
+         in any other directory, brings up a tunnel that can never be torn down"
     )]
     InterfaceConfigMismatch {
         profile: String,
         iface: String,
         vpn_config: String,
+        dir: &'static str,
+    },
+    #[error(
+        "profile {profile:?}: upload_rate_limit = {value} is out of range (0..={max}). A \
+         profile may exceed the top-level upload_rate_limit, but the value reaches libtorrent \
+         as a C int, so anything above {max} would be applied as a negative rate limit"
+    )]
+    UploadRateLimitOutOfRange {
+        profile: String,
+        value: u32,
+        max: u32,
     },
 }
 
@@ -902,20 +934,33 @@ impl ProfileConfig {
                     }
                     // `wg-quick up <path>` names the interface after the file,
                     // and `wg-quick down <iface>` looks the file back up from
-                    // the name. A profile whose two fields disagree brings a
-                    // tunnel up under one name, waits 30s for an address on
-                    // another, fails, and could never be torn down if it
-                    // somehow succeeded.
+                    // the name — resolving a bare name *only* against
+                    // `WG_CONFIG_DIR`, default `/etc/wireguard`. A profile
+                    // whose two fields disagree brings a tunnel up under one
+                    // name, waits 30s for an address on another, fails, and
+                    // could never be torn down if it somehow succeeded. So
+                    // does a profile whose config lives anywhere else, even
+                    // with a matching stem: `wg-quick down` dies looking for
+                    // the file before it ever reaches `del_if`, and that
+                    // surviving tunnel is the defect this validation exists to
+                    // make unreachable. `bring_down` is handed only the
+                    // interface name (`VpnManager::bring_down(&self, iface:
+                    // &str)`), so the directory has to be pinned here rather
+                    // than threaded through.
                     if *vpn_type == VpnType::Wireguard {
                         let stem = vpn_config
                             .file_stem()
                             .map(|f| f.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        if stem != *vpn_interface {
+                        let dir = vpn_config.parent();
+                        if stem != *vpn_interface
+                            || dir != Some(std::path::Path::new(Self::WG_CONFIG_DIR))
+                        {
                             return Err(ProfileConfigError::InterfaceConfigMismatch {
                                 profile: p.id.as_str().to_string(),
                                 iface: vpn_interface.clone(),
                                 vpn_config: vpn_config.display().to_string(),
+                                dir: Self::WG_CONFIG_DIR,
                             });
                         }
                     }
@@ -936,6 +981,22 @@ impl ProfileConfig {
                             field: "user_agent",
                         });
                     }
+                }
+            }
+
+            // A profile's own limit is range-checked the way the top-level
+            // key of the same name is, and is *not* bounded by it: clamping a
+            // profile to the global default would remove the main reason to
+            // give one its own limit. The bound that matters is the one the
+            // value has to survive on its way to libtorrent — see
+            // `MAX_UPLOAD_RATE_LIMIT`.
+            if let Some(v) = p.upload_rate_limit {
+                if v > Self::MAX_UPLOAD_RATE_LIMIT {
+                    return Err(ProfileConfigError::UploadRateLimitOutOfRange {
+                        profile: p.id.as_str().to_string(),
+                        value: v,
+                        max: Self::MAX_UPLOAD_RATE_LIMIT,
+                    });
                 }
             }
 
@@ -1012,7 +1073,7 @@ mod tests {
             id: ProfileId::new(id),
             network: ProfileNetwork::Vpn {
                 vpn_type: VpnType::Wireguard,
-                vpn_config: PathBuf::from(format!("/etc/wg/{iface}.conf")),
+                vpn_config: PathBuf::from(format!("{}/{iface}.conf", ProfileConfig::WG_CONFIG_DIR)),
                 vpn_interface: iface.to_string(),
                 listen_port: Some(port),
                 port_forward: PortForwardMode::Static,
@@ -1057,6 +1118,76 @@ mod tests {
             |n| {
                 if let ProfileNetwork::Vpn { vpn_config, .. } = n {
                     *vpn_config = PathBuf::from("/etc/wireguard/something-else.conf");
+                }
+            },
+        );
+        assert!(matches!(
+            ProfileConfig::validate_set(&[s]),
+            Err(ProfileConfigError::InterfaceConfigMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_profile_upload_rate_limit_libtorrent_cannot_hold_is_refused() {
+        // The value is handed to `settings_pack` through a
+        // `static_cast<int>`, so `u32::MAX` arrives as -1 and the profile the
+        // operator configured for 4 GB/s seeds under a negative cap. The
+        // sibling top-level key is range-checked; this one was not checked
+        // at all.
+        let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+        s.upload_rate_limit = Some(u32::MAX);
+        assert!(matches!(
+            ProfileConfig::validate_set(&[s]),
+            Err(ProfileConfigError::UploadRateLimitOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn a_profile_may_exceed_the_top_level_upload_rate_limit() {
+        // The top-level key is a default, not a ceiling: giving one account
+        // more bandwidth than the rest is the main reason to set a
+        // per-profile limit, so the check bounds the representable range and
+        // nothing else. `0` -- explicitly unlimited -- is in range too.
+        for v in [0, 1, ProfileConfig::MAX_UPLOAD_RATE_LIMIT] {
+            let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+            s.upload_rate_limit = Some(v);
+            assert!(
+                ProfileConfig::validate_set(&[s]).is_ok(),
+                "upload_rate_limit = {v} is a legal profile limit",
+            );
+        }
+    }
+
+    #[test]
+    fn a_wireguard_config_outside_etc_wireguard_is_refused() {
+        // The stem matches here; only the directory does not. `wg-quick up`
+        // takes the full path and brings the tunnel up regardless, but
+        // `wg-quick down wg-a` resolves the bare name against /etc/wireguard,
+        // finds nothing, and dies before `del_if` — so the tunnel survives
+        // graceful shutdown and every restart.
+        let s = with_vpn(
+            cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0"),
+            |n| {
+                if let ProfileNetwork::Vpn { vpn_config, .. } = n {
+                    *vpn_config = PathBuf::from("/etc/torrentd/wg-a.conf");
+                }
+            },
+        );
+        assert!(matches!(
+            ProfileConfig::validate_set(&[s]),
+            Err(ProfileConfigError::InterfaceConfigMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_wireguard_config_with_no_parent_directory_is_refused() {
+        // `file_stem()` alone accepts a bare relative name; `wg-quick down`
+        // still has only /etc/wireguard to look in.
+        let s = with_vpn(
+            cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0"),
+            |n| {
+                if let ProfileNetwork::Vpn { vpn_config, .. } = n {
+                    *vpn_config = PathBuf::from("wg-a.conf");
                 }
             },
         );

@@ -132,7 +132,8 @@ pub struct Config {
     /// Install a fail-closed nftables kill switch that
     /// confines the daemon's egress to loopback + the profiles' tunnel interfaces.
     /// Off by default; requires `CAP_NET_ADMIN` and that torrentd runs as its own
-    /// user. See `vpn::killswitch`.
+    /// non-root user. WireGuard profiles only: `validate` refuses it beside an
+    /// OpenVPN profile. See `vpn::killswitch` for what that leaves runnable.
     #[serde(default)]
     pub network_kill_switch: bool,
 
@@ -426,8 +427,15 @@ impl Config {
             100_000,
         )?;
         // upload_rate_limit is a byte/sec cap where 0 means unlimited, so 0 is
-        // valid and only the absurd upper end is worth rejecting.
-        range("upload_rate_limit", self.upload_rate_limit, 0, u32::MAX)?;
+        // valid. The upper end is i32::MAX because the shim hands the value to
+        // libtorrent's int-typed setting through a narrowing cast; anything
+        // larger would arrive there as a negative rate limit.
+        range(
+            "upload_rate_limit",
+            self.upload_rate_limit,
+            0,
+            i32::MAX as u32,
+        )?;
 
         if let Some(auth) = &self.auth {
             auth.validate()?;
@@ -823,6 +831,27 @@ impl Config {
                      while reporting itself healthy. Run host profiles in a separate daemon \
                      without the kill switch, or unset network_kill_switch.",
                     host.join(", "),
+                );
+            }
+        }
+        // The kill switch matches the daemon's traffic by uid, and the daemon
+        // spawns `openvpn` under its own uid, so the ruleset drops the
+        // OpenVPN client's own connection to the provider: the profile can
+        // never come up. Refused here, where `--check-config` sees it, rather
+        // than discovered as a fenced profile.
+        if self.network_kill_switch {
+            if let Some(p) = self
+                .profile
+                .iter()
+                .find(|p| p.vpn_type() == Some(torrentd_engine::VpnType::Openvpn))
+            {
+                anyhow::bail!(
+                    "network_kill_switch = true cannot be used with an OpenVPN profile \
+                     ([[profile]] id = \"{}\"): the kill switch matches the daemon's uid, \
+                     `openvpn` runs under that uid, and its connection to the provider \
+                     leaves by the physical interface, so the ruleset drops it and the \
+                     tunnel never comes up. The kill switch supports WireGuard profiles only.",
+                    p.id.as_str(),
                 );
             }
         }
@@ -2966,6 +2995,36 @@ listen_interfaces = "0.0.0.0:6882"
         );
     }
 
+    /// `openvpn` runs under the daemon's uid, so the kill switch drops its
+    /// connection to the provider; the combination is refused at load, and a
+    /// WireGuard-only set with the kill switch is not.
+    #[test]
+    fn the_kill_switch_is_refused_beside_an_openvpn_profile() {
+        let dir = tempdir().unwrap();
+        let wg = "[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
+                  vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
+                  listen_port = 6891\npeer_fingerprint_hex = \"a1b2c3d4e5f60718\"\n\
+                  user_agent = \"ua-a\"\n";
+        let ovpn = "[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\nvpn_type = \"openvpn\"\n\
+                    vpn_config = \"/etc/openvpn/acct_b.conf\"\nvpn_interface = \"tun-b\"\n\
+                    listen_port = 6892\npeer_fingerprint_hex = \"b1b2c3d4e5f60718\"\n\
+                    user_agent = \"ua-b\"\n";
+
+        let body = format!("{TOP_LEVEL}\nnetwork_kill_switch = true\n\n{wg}\n{ovpn}");
+        let msg = format!(
+            "{:#}",
+            Config::load(&write_cfg(dir.path(), &body)).unwrap_err()
+        );
+        assert!(
+            msg.contains("OpenVPN profile") && msg.contains("acct_b"),
+            "got: {msg}"
+        );
+
+        let body = format!("{TOP_LEVEL}\n{wg}\n{ovpn}");
+        Config::load(&write_cfg(dir.path(), &body))
+            .expect("an OpenVPN profile without the kill switch is accepted");
+    }
+
     #[test]
     fn a_kill_switch_with_a_vpn_profile_passes_the_pre_flight() {
         let dir = tempdir().unwrap();
@@ -3131,6 +3190,20 @@ library_dir = "{d}/library"
         let p = write_cfg(dir.path(), &bad);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("aio_threads"), "got: {msg}");
+        assert!(msg.contains("out of range"), "got: {msg}");
+    }
+
+    #[test]
+    fn upload_rate_limit_is_bounded_by_what_libtorrent_can_carry() {
+        let dir = tempdir().unwrap();
+        let at_bound = with_top_level(&format!("upload_rate_limit = {}", i32::MAX));
+        let p = write_cfg(dir.path(), &at_bound);
+        Config::load(&p).expect("i32::MAX fits libtorrent's int setting");
+
+        let past_bound = with_top_level(&format!("upload_rate_limit = {}", i32::MAX as u32 + 1));
+        let p = write_cfg(dir.path(), &past_bound);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("upload_rate_limit"), "got: {msg}");
         assert!(msg.contains("out of range"), "got: {msg}");
     }
 
