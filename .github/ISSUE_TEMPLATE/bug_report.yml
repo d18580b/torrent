@@ -1,0 +1,113 @@
+name: Bug report
+description: Report a defect in torrentd, with the four facts CONTRIBUTING.md asks for
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This form restates [`CONTRIBUTING.md` § *Reporting bugs*](https://github.com/d18580b/torrent/blob/master/CONTRIBUTING.md#reporting-bugs),
+        which stays the authority on what a bug report contains. Every command you
+        need is given with the field that wants its output.
+
+        Each command below names the machine it is run on: `journalctl -u
+        torrentd` and `systemctl reload torrentd` on the **deployment host**,
+        `uname -srm` on the **host that failed**, and `git submodule status
+        vendor/libtorrent` and `cargo --version` inside a **source checkout**.
+        Those are the same machine for anyone who built and installed from
+        source by
+        [`docs/running.md` § *3. Build*](https://github.com/d18580b/torrent/blob/master/docs/running.md#3-build)
+        and step `4b` of § *4. Service user, binary, directories*. If that is
+        not your deployment — a different machine for any of them, or a
+        container with no systemd unit at all — every required field below
+        whose command depends on where you run it says what to give instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect?
+      description: >-
+        The behaviour you saw and the behaviour you expected instead. Include the
+        exact request or command if there was one, and say whether it reproduces.
+      placeholder: |
+        POST /torrents with a magnet returned 201, but GET /torrents kept
+        reporting "phase":"checking" for that info-hash and it never became
+        "seeding". Reproduces on every start.
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel version
+      description: "Output of `uname -srm`."
+      placeholder: "Linux 6.11.3-200.fc40.x86_64 x86_64"
+    validations:
+      required: true
+
+  - type: input
+    id: libtorrent-sha
+    attributes:
+      label: libtorrent submodule SHA
+      description: >-
+        Output of `git submodule status vendor/libtorrent`, run inside a source
+        checkout. Paste the whole line, including any leading `-` or `+` — it
+        says whether the submodule is checked out and whether it matches the
+        pin. If you have no checkout because you installed a distributed binary
+        or image, give that package or image version instead and say which it
+        is.
+      placeholder: "-0123456789abcdef0123456789abcdef01234567 vendor/libtorrent"
+    validations:
+      required: true
+
+  - type: input
+    id: cargo-version
+    attributes:
+      label: Cargo version
+      description: >-
+        Output of `cargo --version`, run inside the same source checkout. If
+        you have no checkout because you installed a distributed binary or
+        image, give that package or image version instead and say which it
+        is — the same answer as the field above.
+      placeholder: "cargo 1.90.0 (840b83a10 2025-07-30)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: JSON log output
+      description: |
+        The daemon's JSON log around the failure, taken from the **running**
+        service: `journalctl -u torrentd` (add `-o cat` for the raw JSON lines).
+        If it reproduces, raise the verbosity in place — set `log_level = "debug"`
+        in the config and `systemctl reload torrentd`, which sends `SIGHUP`; the
+        level is swapped at runtime and no restart is needed.
+
+        If there is no systemd unit where you run it — the `Containerfile` and
+        `compose.yaml` in `deploy/` have none — take the log however your
+        deployment collects the daemon's stdout, and raise the verbosity with
+        `RUST_LOG=debug` in the daemon's own environment, which is read once at
+        startup, so restart that same instance.
+
+        Either way, please do **not** start a second `torrentd` to collect a
+        log: it would contend with the running one for the same tunnels,
+        kill-switch table, resume directory and pool index.
+
+        **Redact before you paste, and know where this is going.** Take out the
+        tracker announce URLs — the passkey in one identifies your account on
+        that tracker — and any API token. This tracker is **not** confidential
+        from other people with access to this repository; `SECURITY.md` says so
+        under *Reporting a vulnerability*, and that is the audience a pasted
+        passkey reaches.
+
+        A line looks like this:
+
+        `{"timestamp":"2026-09-21T09:14:02.881234567+00:00","level":"ERROR","message":"failed to persist resume data","infohash":"0123456789abcdef0123456789abcdef01234567", …}`
+
+        That is an excerpt, not a whole line — the formatter emits more keys than
+        these, and which ones it emits changes with the code. Paste the real lines
+        whole.
+      render: text
+    validations:
+      required: true
