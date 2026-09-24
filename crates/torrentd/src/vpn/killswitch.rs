@@ -16,6 +16,26 @@
 //! systemd unit already grants it). The daemon's traffic is matched by its
 //! runtime uid, so torrentd must run as a dedicated user (the unit uses
 //! `User=torrentd`).
+//!
+//! **What that leaves runnable.** Matching by uid confines every socket that
+//! uid owns, and a tunnel's own connection to its provider leaves by the
+//! physical interface, so the tunnel's transport must be owned by a
+//! *different* uid:
+//!
+//! - **OpenVPN: never.** The daemon spawns `openvpn` under its own uid, so the
+//!   ruleset drops the client's connection to the provider. `Config::validate`
+//!   refuses the kill switch beside an OpenVPN slot.
+//! - **WireGuard as uid 0: never.** The kernel's WireGuard socket is owned by
+//!   the uid that raised the link, so `meta skuid 0 counter drop` drops the
+//!   tunnel's own encrypted UDP along with every other root-owned socket on
+//!   the host. [`refusal_for_uid`] refuses it.
+//! - **WireGuard as a dedicated uid: only with the links raised by root.**
+//!   `wg-quick` re-execs itself through `sudo` unless its uid is 0, and the
+//!   packaged unit sets `NoNewPrivileges=yes`, so the daemon cannot raise a
+//!   WireGuard link itself in that shape. It can adopt one root raised before
+//!   it started, when the profile's key matches the live link's (see
+//!   `vpn::wireguard`), and that link's socket is root's, outside the
+//!   ruleset. Neither shipped deployment arranges that on its own.
 
 use std::io;
 use std::io::Write;
@@ -105,15 +125,24 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
     // on the host — the package manager, the NTP client, sshd's replies —
     // matches `meta skuid 0` and gets dropped. Refuse rather than install it.
     //
+    // It would not even protect the daemon: the kernel's WireGuard socket is
+    // owned by the uid that raised the link, so as root the tunnel's own
+    // encrypted UDP to the provider matches too and is dropped, and no
+    // WireGuard slot can carry traffic. Refusing costs no working shape.
+    //
     // `wg-quick` is usually a root tool, so reaching here as root is an easy
-    // mistake to make; the packaged unit's `User=torrentd` plus
-    // `AmbientCapabilities=CAP_NET_ADMIN` is the supported shape.
+    // mistake to make. Running as a dedicated uid is necessary but not
+    // sufficient: `wg-quick` re-execs through `sudo` unless its uid is 0, so
+    // that daemon only runs a WireGuard slot whose link root raised first —
+    // see this module's documentation.
     (uid == 0).then(|| {
         io::Error::other(
             "network_kill_switch = true requires a dedicated non-root user: the ruleset \
              confines the daemon's uid to loopback and its tunnels, and as uid 0 that \
-             would drop every root-owned process's traffic on this host. Run torrentd as \
-             its own user with CAP_NET_ADMIN (see deploy/torrentd.service).",
+             would drop every root-owned process's traffic on this host, the WireGuard \
+             tunnels' own traffic included. A non-root daemon cannot run `wg-quick` \
+             itself, so the WireGuard links must be raised by root before it starts \
+             (see docs/running.md, \"Kill switch\"); otherwise unset network_kill_switch.",
         )
     })
 }

@@ -104,7 +104,9 @@ upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
 # dedicated user (the packaged systemd unit uses User=torrentd) — as uid 0 the
 # ruleset would drop every root-owned socket on the host, so the daemon refuses
 # to start rather than install it. Also forces tracker DNS through the tunnel.
-# Removed cleanly on SIGTERM.
+# Removed cleanly on SIGTERM. WireGuard slots only (refused beside an OpenVPN
+# slot), and a non-root daemon cannot run `wg-quick` itself, so each slot's link
+# must be raised by root before the daemon starts — docs/running.md §11.6.
 # network_kill_switch = false
 
 # A wireguard slot's vpn_profile must be /etc/wireguard/<vpn_interface>.conf
