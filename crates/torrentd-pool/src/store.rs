@@ -378,8 +378,8 @@ impl PoolStore {
     ///
     /// But keeping it through a failed run is only the right answer for
     /// something that is a copy of the index. A dangling symlink, a directory
-    /// or an unrelated file is not one, and keeping it meant the irreversible v3 rename then ran with **no**
-    /// rollback copy at all, while `docs/running.md` tells the operator that
+    /// or an unrelated file is not one, and keeping it meant the irreversible
+    /// v3 rename then ran with **no** rollback copy at all, while `docs/running.md` tells the operator that
     /// restoring that file is how they go back. A promise of a rollback that
     /// does not exist is worse than a refusal naming why, so the migration
     /// stops instead. [`PoolStore::rollback_copy_of_an_index`] is that test,
