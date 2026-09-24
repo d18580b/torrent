@@ -149,6 +149,33 @@ fn daemon_end_to_end() {
     );
 }
 
+/// An HTTP bind failure happens after `boot` has handed teardown to the
+/// shutdown path, so it must run that path rather than return past it: exit
+/// 70, and drain exactly as a SIGTERM does. The session state is the
+/// observable half of that drain in single-session mode; the kill switch and
+/// tunnel teardown that follow it in the same fall-through need a VPN and are
+/// not reachable here.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn daemon_http_bind_failure_still_drains() {
+    const HTTP: &str = "127.0.0.1:18093";
+    let _occupied = std::net::TcpListener::bind(HTTP).expect("occupy the HTTP port");
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let mut child = spawn_daemon(p, 16893, HTTP);
+
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(30)),
+        "daemon did not exit within 30s of failing to bind its HTTP listener"
+    );
+    let status = child.wait().expect("reap daemon");
+    assert_eq!(status.code(), Some(70), "bind failure must exit 70");
+    assert!(
+        p.join("session_state.dat").exists(),
+        "a bind failure must run the shutdown drain, which writes session state"
+    );
+}
+
 /// Graceful shutdown must stay graceful under load: with many torrents added,
 /// a SIGTERM still drains and exits within the timeout and persists session
 /// state. Guards against a shutdown coordinator that hangs as torrent count

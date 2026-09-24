@@ -1099,66 +1099,31 @@ impl DaemonHandle {
             log_handle,
         ));
 
+        // A bind failure does not return from here: `boot` has already
+        // disarmed its cleanup guard, so this function is the only thing left
+        // that removes the kill switch and brings the tunnels down. It skips
+        // the server and falls through to the same drain and teardown a
+        // signalled shutdown runs, exiting 70.
         let listener = match tokio::net::TcpListener::bind(http_listen).await {
-            Ok(l) => l,
+            Ok(l) => Some(l),
             Err(e) => {
                 error!(addr = %http_listen, error.cause = %e, "bind HTTP listener");
-                return 70;
+                None
             }
         };
-        info!(addr = %http_listen, "HTTP server listening");
-
-        // The unit is `Type=notify`: systemd holds it in `activating` until
-        // READY=1, so this must come after the listener is actually bound.
-        sd_notify::ready();
-        sd_notify::status(&format!("seeding; API on {http_listen}"));
-        if let Some(interval) = sd_notify::watchdog_interval() {
-            info!(
-                interval_secs = interval.as_secs(),
-                "systemd watchdog enabled"
-            );
-            let mut wd_shutdown = shutdown_tx.subscribe();
-            let wd_heartbeat = alert_loop.heartbeat();
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(interval) => {
-                            // Ping only while the alert loop is still making
-                            // progress. This task is independent of that
-                            // thread, so an unconditional ping tells systemd
-                            // the daemon is healthy for as long as the process
-                            // is alive — including when the loop has died and
-                            // seeding, resume saves and status updates have all
-                            // stopped. `/healthz` reports that correctly, and
-                            // nothing reads `/healthz`.
-                            let age = torrentd_engine::heartbeat_age(&wd_heartbeat);
-                            if age > WATCHDOG_MAX_HEARTBEAT_AGE {
-                                error!(
-                                    heartbeat_age_secs = age.as_secs(),
-                                    "alert loop is not making progress; withholding the \
-                                     systemd watchdog ping so the unit is restarted",
-                                );
-                            } else {
-                                sd_notify::watchdog();
-                            }
-                        }
-                        _ = wd_shutdown.recv() => return,
-                    }
-                }
-            });
-        }
-
-        let mut shutdown_rx = shutdown_rx;
-        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-            let _ = shutdown_rx.recv().await;
-        });
-
-        let mut exit_code = match server.await {
-            Ok(()) => 0,
-            Err(e) => {
-                error!(error.cause = %e, "HTTP server exited with error");
-                70
+        let mut exit_code = match listener {
+            Some(listener) => {
+                serve_until_shutdown(
+                    listener,
+                    app,
+                    http_listen,
+                    &shutdown_tx,
+                    shutdown_rx,
+                    &alert_loop,
+                )
+                .await
             }
+            None => 70,
         };
 
         // Tell systemd we're stopping before the resume drain, which may take
@@ -1216,8 +1181,9 @@ impl DaemonHandle {
         // Then bring the tunnels down, after the sessions are gone. The daemon
         // brought them up, so it owns tearing them down; leaving them up meant
         // every restart accumulated interfaces and left an idle tunnel
-        // connected to the provider indefinitely. Only on the graceful path —
-        // a startup failure already tears down what it created.
+        // connected to the provider indefinitely. This runs on every exit from
+        // `run_until_signal`, the HTTP bind failure included — a failure
+        // inside `boot` is torn down by `BootCleanup` instead.
         if let Some(slots) = &slot_registry {
             let jobs: Vec<_> = slots
                 .iter()
@@ -1236,6 +1202,75 @@ impl DaemonHandle {
 
         info!("torrentd: clean exit");
         exit_code
+    }
+}
+
+/// Serve the API on a bound listener until a shutdown is signalled, returning
+/// the exit code the server's own outcome implies.
+///
+/// Split out of `run_until_signal` so that function has no early return
+/// between `boot`'s `disarm` and its teardown: a failure to bind skips this
+/// and nothing else.
+async fn serve_until_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    http_listen: std::net::SocketAddr,
+    shutdown_tx: &broadcast::Sender<ShutdownReason>,
+    mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
+    alert_loop: &torrentd_engine::AlertLoopHandle,
+) -> i32 {
+    info!(addr = %http_listen, "HTTP server listening");
+
+    // The unit is `Type=notify`: systemd holds it in `activating` until
+    // READY=1, so this must come after the listener is actually bound.
+    sd_notify::ready();
+    sd_notify::status(&format!("seeding; API on {http_listen}"));
+    if let Some(interval) = sd_notify::watchdog_interval() {
+        info!(
+            interval_secs = interval.as_secs(),
+            "systemd watchdog enabled"
+        );
+        let mut wd_shutdown = shutdown_tx.subscribe();
+        let wd_heartbeat = alert_loop.heartbeat();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {
+                        // Ping only while the alert loop is still making
+                        // progress. This task is independent of that
+                        // thread, so an unconditional ping tells systemd
+                        // the daemon is healthy for as long as the process
+                        // is alive — including when the loop has died and
+                        // seeding, resume saves and status updates have all
+                        // stopped. `/healthz` reports that correctly, and
+                        // nothing reads `/healthz`.
+                        let age = torrentd_engine::heartbeat_age(&wd_heartbeat);
+                        if age > WATCHDOG_MAX_HEARTBEAT_AGE {
+                            error!(
+                                heartbeat_age_secs = age.as_secs(),
+                                "alert loop is not making progress; withholding the \
+                                 systemd watchdog ping so the unit is restarted",
+                            );
+                        } else {
+                            sd_notify::watchdog();
+                        }
+                    }
+                    _ = wd_shutdown.recv() => return,
+                }
+            }
+        });
+    }
+
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = shutdown_rx.recv().await;
+    });
+
+    match server.await {
+        Ok(()) => 0,
+        Err(e) => {
+            error!(error.cause = %e, "HTTP server exited with error");
+            70
+        }
     }
 }
 
