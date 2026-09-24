@@ -325,7 +325,8 @@ pub async fn run_verify_queue(
             // profile — the one thing fencing exists to prevent. Put it back and
             // wait for the operator.
             if profiles
-                .get(&item.profile)
+                .resolve(&item.profile)
+                .active()
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
             {
                 warn!(
@@ -444,6 +445,25 @@ fn verify_outcome(
     }
 }
 
+/// Why a `profile_id` resolved to no engine.
+///
+/// A configured profile that failed to come up carries no engine by
+/// construction, so "unknown profile_id" was this path's answer for it too —
+/// which reads as a typo in the id rather than as a tunnel that did not rise.
+fn unresolved_profile(
+    profiles: &crate::profile_registry::ProfileRegistry,
+    profile: &ProfileId,
+) -> String {
+    match profiles.resolve(profile) {
+        crate::profile_registry::Resolution::Failed(f) => {
+            format!("profile failed to start: {}", f.reason)
+        }
+        // `Active` cannot reach here — the caller got no engine for it — and
+        // `Unknown` is the id nothing declares.
+        _ => "unknown profile_id".to_string(),
+    }
+}
+
 /// Adopt one torrent: execute whatever `torrentd_pool::adopt::plan` decided.
 ///
 /// The fast path adds immediately in seed mode. The verify path only enqueues —
@@ -469,7 +489,7 @@ pub fn execute_adopt(
         } => {
             let engine = source
                 .engine_for(&profile)
-                .ok_or_else(|| "unknown profile_id".to_string())?;
+                .ok_or_else(|| unresolved_profile(profiles, &profile))?;
             let resume = match std::fs::read(&resume_path) {
                 Ok(b) => b,
                 Err(e) => {

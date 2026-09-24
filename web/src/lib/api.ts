@@ -117,15 +117,27 @@ export interface Status {
   profile_count: number
 }
 
+/// One row of `GET /api/profiles`.
+///
+/// Mirrors `crates/torrentd/src/http/profiles.rs`'s `ProfileSummary`, which is
+/// the contract. The list is live profiles in configured order, then the ones
+/// that failed to come up — but a client that needs an adoptable profile
+/// filters on `status === 'active'` rather than taking the first row.
 export interface ProfileSummary {
   profile_id: string
+  /// `active` | `vpn_down` | `failed`.
   status: string
   tunnel_ip: string | null
   torrent_count: number
   listen_port: number | null
   port_forward: string
   forwarded_port: number | null
-  user_agent: string
+  /// `Option<String>` on the wire: null for a host profile that did not
+  /// override it, which is every profile in the shipped sample.
+  user_agent: string | null
+  /// Why the profile has no session. Present only when `status` is `failed` —
+  /// the field is skipped entirely otherwise.
+  failure_reason?: string
 }
 
 /// The body `POST /api/pool/adopt` requires.

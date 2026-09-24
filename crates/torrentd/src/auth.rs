@@ -531,10 +531,9 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Memory cost in KiB, iterations, and parallelism for Argon2id here.
 ///
-/// Pinned rather than taken from `Argon2::default()`. These are OWASP's
-/// current recommendation for Argon2id and they are also what the `argon2`
-/// crate happens to default to at the version `Cargo.lock` holds — which is
-/// the problem: `README.md` quotes the numbers, so leaving them at a
+/// Pinned rather than taken from `Argon2::default()`. They are what the
+/// `argon2` crate happens to default to at the version `Cargo.lock` holds —
+/// which is the problem: `README.md` quotes the numbers, so leaving them at a
 /// dependency's discretion made a documented security parameter true by
 /// coincidence, and a routine `cargo update` past a release that revised those
 /// defaults would move the cost of the credential KDF in either direction with
