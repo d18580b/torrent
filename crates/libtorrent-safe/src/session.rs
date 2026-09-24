@@ -137,7 +137,7 @@ impl Session {
         })
     }
 
-    /// Apply settings on a running session. Used by SIGHUP reload and per-slot
+    /// Apply settings on a running session. Used by SIGHUP reload and per-profile
     /// startup overrides.
     pub fn apply_settings(&self, settings: &Settings) -> Result<()> {
         let json = settings.to_shim_json()?;
@@ -471,7 +471,7 @@ pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
 }
 
 /// Check whether any tracker host in a `.torrent` buffer matches one of
-/// `domains` (exact or subdomain). Misconfiguration guard for slot assignment
+/// `domains` (exact or subdomain). Misconfiguration guard for profile assignment
 ///. Returns `Ok(false)` for an empty buffer
 /// or empty domain list.
 pub fn torrent_tracker_host_matches(bytes: &[u8], domains: &[String]) -> Result<bool> {

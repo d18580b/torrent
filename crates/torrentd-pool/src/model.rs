@@ -22,6 +22,89 @@ pub enum PoolError {
     /// means every indexed file reads as unclaimed.
     #[error("refusing to clear claims outside a transaction")]
     ClaimsClearedOutsideTransaction,
+    /// The pre-v3 copy-aside could not be written.
+    ///
+    /// Reported as itself rather than as a bare `Sqlite`: the copy is a step
+    /// the operator did not ask for and has no reason to expect, so a raw
+    /// SQLite code here named no backup, no path, and no reason the migration
+    /// wanted one. `VACUUM INTO` writes a full second copy of an index that
+    /// carries one row per file, so `database or disk is full` on a volume
+    /// with less free space than the database is the ordinary way to reach it.
+    #[error(
+        "the pool index could not be copied aside to {path} before the one-way v3 schema \
+         migration: {reason}. That copy is a full second copy of the index, so this needs free \
+         space equal to the size of the database. The index has not been changed; free some \
+         space and start again."
+    )]
+    BackupFailed { path: String, reason: String },
+    /// Something is already at the pre-v3 backup path and it is not a copy of
+    /// this index.
+    ///
+    /// An existing backup is kept until the migration commits, and replaced
+    /// then by the fresh copy taken beside it — so if the migration fails it
+    /// is still there as the copy that predates the run. That posture only makes sense
+    /// for something that *is* a copy of the index: a dangling symlink, a
+    /// directory or a stray file is not one, and proceeding on it runs the
+    /// irreversible v3 rename with no rollback while the runbook tells the
+    /// operator that restoring this file is how they go back.
+    ///
+    /// "A database SQLite can read a schema out of" was too weak a test for
+    /// that sentence. An empty file is one — a zero-byte `.pre-v3.bak` opens,
+    /// answers a `PRAGMA`, and has no `torrent` table at all — and so is a
+    /// symlink pointing at something else SQLite wrote, including **the pool
+    /// index itself**, after which the file the runbook says to restore is the
+    /// migrated v3 database. The test is therefore what the sentence claims:
+    /// a pool index, at a schema version this build understands, that is not
+    /// this index under another name.
+    #[error(
+        "the pre-v3 copy-aside cannot be taken: what is already at {path} is not a rollback copy \
+         of this pool index ({reason}). An existing copy is kept until the migration commits, so \
+         this file is in the way — and it is not a rollback, while the v3 rename this copy exists for \
+         cannot be undone. The index has not been changed; move or remove whatever is at that \
+         path and start again."
+    )]
+    BackupNotARollbackCopy { path: String, reason: String },
+    /// A version-keyed schema step failed.
+    ///
+    /// Reported as itself rather than as a bare `Sqlite` so the operator is
+    /// told which file, which step, that nothing was changed, and what to do.
+    /// `startup.rs` opens the pool with `?` under `Restart=on-failure`, so a
+    /// raw SQLite code here is the whole of what they get, on a loop — and the
+    /// code is the least informative part: a file a build predating the
+    /// one-transaction migration left with its schema ahead of its
+    /// `user_version` fails with `table root already exists` followed by the
+    /// schema text that could not be applied, naming neither the pool, nor the
+    /// migration, nor a way out.
+    ///
+    /// The context leads and the SQLite text trails, because that text can run
+    /// to the whole of a schema constant and would otherwise bury the remedy.
+    ///
+    /// The backup remedy is qualified, and has to be. On the stepped path the
+    /// copy-aside runs **immediately before** the steps that fail, so the
+    /// `.pre-v3.bak` sitting beside a wedged index is usually a copy this same
+    /// run took of that same wedged index: identical version, identical
+    /// columns, identical table set, demonstrated on two shapes. Offering it
+    /// first and unqualified sent the operator round a loop — restore it,
+    /// start again, fail the same way — while the option that actually works
+    /// is the second one, which costs the journal. A copy that *predates* this
+    /// run is a real rollback; one this run wrote is not.
+    #[error(
+        "the pool index at {path} could not be migrated from schema version {from} to {to}. \
+         The index has not been changed: every step and the version write share one \
+         transaction, and this one rolled back. A file written by a build predating that \
+         transaction can already carry part of a schema its user_version does not report, \
+         which no version-keyed step can reach. Restore {path}.pre-v3.bak only if it \
+         predates this run — a copy taken during it is a copy of the index as it stands, \
+         so restoring it reproduces this failure. Otherwise move the index aside and let \
+         `torrentd pool scan` rebuild it, which reconstructs everything except the \
+         plan/plan_step mutation journal. The step failed with: {reason}"
+    )]
+    MigrationFailed {
+        path: String,
+        from: i64,
+        to: i64,
+        reason: String,
+    },
     /// Another process holds the pool database's write lock — almost always the
     /// running daemon, or a second `pool scan`.
     #[error(
@@ -122,8 +205,8 @@ pub struct PoolTorrent {
     pub declared_save_path: Option<String>,
     pub category: Option<String>,
     pub tags: Vec<String>,
-    /// Which slot owns it. Absorbs the old `slot_assignments.json`.
-    pub slot: Option<String>,
+    /// Which profile owns it. Absorbs the old `profile_assignments.json`.
+    pub profile: Option<String>,
 }
 
 impl PoolTorrent {

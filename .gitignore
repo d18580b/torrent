@@ -25,13 +25,24 @@ Thumbs.db
 # Resume data / runtime artifacts
 *.resume
 *.resume.tmp
+profile_assignments.json
+# The pre-profiles names, kept deliberately. A daemon that read one of these
+# leaves it on disk rather than deleting it — the assignment registry stays
+# intact so a rollback has something to go back to, and the orphaned session
+# state is the operator's to delete — so a tree that ran an older build still
+# has them and must not start reporting them.
 slot_assignments.json
 session_state.dat
+# Session state is per profile now: `session_state-<profile_id>.dat`.
+session_state-*.dat
 # Pool index (SQLite, WAL mode) — a `pool scan` against a repo-local config
-# drops all three of these in the tree.
+# drops all four of these in the tree. `*.db` matches names *ending* in `.db`,
+# so the copy the v3 migration takes aside needs its own pattern.
 *.db
 *.db-wal
 *.db-shm
+*.pre-v3.bak
+*.pre-v3.bak.new
 
 # Environment
 .env

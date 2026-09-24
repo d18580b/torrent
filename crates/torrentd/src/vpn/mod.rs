@@ -11,6 +11,7 @@ mod natpmp;
 mod openvpn;
 mod wireguard;
 
+use std::path::Path;
 use std::sync::Arc;
 
 pub use ip_lookup::first_ipv4;
@@ -19,12 +20,20 @@ pub use openvpn::OpenvpnManager;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
 pub use wireguard::latest_handshake_age as wireguard_handshake_age;
+pub use wireguard::sweep_raised_records;
 pub use wireguard::WireguardManager;
 
 /// Build the matching real implementation for a `VpnType`.
-pub fn for_type(t: VpnType) -> Arc<dyn VpnManager> {
+///
+/// `run_dir` is where a manager may keep the small amount of state it needs to
+/// find again in a *later* process: OpenVPN's pid file, and WireGuard's record
+/// of the interfaces this boot raised. It has to be passed in rather than
+/// derived: tearing a tunnel down builds a fresh manager, so anything held in
+/// memory by the one that brought the tunnel up is gone by then — which is
+/// also why the WireGuard record is a file and not a field.
+pub fn for_type(t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager> {
     match t {
-        VpnType::Wireguard => Arc::new(WireguardManager::new()),
-        VpnType::Openvpn => Arc::new(OpenvpnManager::new()),
+        VpnType::Wireguard => Arc::new(WireguardManager::new(run_dir.to_path_buf())),
+        VpnType::Openvpn => Arc::new(OpenvpnManager::new(run_dir.to_path_buf())),
     }
 }

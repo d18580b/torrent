@@ -1,0 +1,61 @@
+# Reverse proxy for torrentd. TLS terminates here and nowhere else.
+#
+# torrentd deliberately does not speak TLS: it has no certificate handling, no
+# renewal, and no HTTP server configuration surface to get wrong. What it does
+# have is an origin that serves its assets correctly — ETags, conditional
+# requests, precompressed assets, and a `Vary` on Accept-Encoding. This proxy
+# terminates TLS, forwards, and passes conditional responses through, so a
+# browser that already holds an asset revalidates it and gets a 304. The stock
+# caddy:2-alpine image has no HTTP cache module, so every request still
+# reaches torrentd.
+#
+# Replace the site address with your own. `torrentd.example.com` gets an
+# automatic certificate; `:80` alone serves plain HTTP, which is fine on a
+# private network and is not fine anywhere else.
+
+torrentd.example.com {
+	encode zstd gzip
+
+	# The headers torrentd reads: X-Forwarded-For, X-Forwarded-Proto and
+	# RFC 7239 Forwarded. All three, which is why there are three
+	# `header_up` lines below and not two. It reads them
+	# **only** from a peer listed in `trusted_proxies`, so set that to this
+	# container's address on the compose network — 172.28.0.2, which
+	# `deploy/compose.yaml` pins so there is a fixed address to name. Get it
+	# wrong and they are ignored and the daemon falls back to the socket peer.
+	#
+	# Adapting this to nginx or Traefik means carrying all three across.
+	# Setting only the two `X-` names leaves `Forwarded` a client-controlled
+	# input arriving from a peer this daemon believes, and where an `X-` name
+	# is absent the client's `Forwarded` is what the daemon reads.
+	reverse_proxy torrentd:8080 {
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+
+		# Strip anything the *client* sent under these names before adding
+		# ours. Without this, a client can prepend entries to the chain.
+		# torrentd reads the last entry for the client's address — but the
+		# *whole chain* for the scheme, since TLS is terminated at the edge
+		# and any hop that says `https` answers it — so a prepended `https` is
+		# believed unless it is stripped here, and a proxy that forwards
+		# client-supplied values is a proxy that cannot be trusted about
+		# anything.
+		header_up -Forwarded
+	}
+
+	# Nothing here for /api/events, deliberately. The SSE stream must not be
+	# buffered or it arrives in one lump at timeout, and Caddy already
+	# disables buffering for a `text/event-stream` response, so the stream
+	# works by default rather than by configuration.
+	#
+	# A second `reverse_proxy @events` block would in any case be dead: Caddy
+	# preserves source order between two instances of one directive in a site
+	# block, and the block above carries no matcher, so it matches
+	# /api/events first and terminates the handler chain. Were it ever made
+	# reachable it would proxy /api/events *without* the `header_up` rules
+	# above, i.e. with client-supplied forwarding headers intact to a peer
+	# torrentd trusts.
+	#
+	# A hand-rolled nginx config is the common place this does go wrong:
+	# there it needs `proxy_buffering off` on /api/events.
+}

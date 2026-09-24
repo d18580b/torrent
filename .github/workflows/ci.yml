@@ -103,6 +103,13 @@ jobs:
             echo "::error::Field name must be 'infohash' (no underscore)."
             exit 1
           fi
+          # The log field is `profile_id`. `slot_id` was its name before
+          # profiles replaced slots, and a stray one silently splits every log
+          # query in two.
+          if grep -RnE --include='*.rs' '\bslot_id\b' crates/; then
+            echo "::error::use profile_id, not slot_id"
+            exit 1
+          fi
           # Free-standing log lines that emit `infohash =` outside an
           # instrument-decorated function aren't strictly forbidden, but
           # we want the parent span to carry the field. Soft warn only.
@@ -144,9 +151,15 @@ jobs:
           key: cargo-shimtests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-shimtests-${{ runner.os }}-
 
+      # mise provides the test tasks; without it these jobs would be a second
+      # copy of the commands mise.toml already owns.
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+
       # Layer 2: struct marshalling, exception isolation,
       # null-handle safety, and buffer ownership across the C ABI boundary.
-      - run: cargo test -p libtorrent-sys --features shim-tests
+      - run: mise run test-shim
 
   integration:
     name: daemon integration (Layer 3)
@@ -180,9 +193,15 @@ jobs:
           key: cargo-integration-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-integration-${{ runner.os }}-
 
+      # mise provides the test tasks; without it these jobs would be a second
+      # copy of the commands mise.toml already owns.
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+
       # Layer 3: real daemon + libtorrent, driven over HTTP.
-      - run: cargo test -p torrentd-engine --test lifecycle -- --ignored
-      - run: cargo test -p torrentd --test daemon -- --ignored
+      - run: mise run test-lifecycle
+      - run: mise run test-daemon
 
   daemon-only:
     name: daemon without the web UI
@@ -216,10 +235,16 @@ jobs:
           key: cargo-daemononly-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-daemononly-${{ runner.os }}-
 
+      # mise provides the build task; without it this job would be a second
+      # copy of the command mise.toml already owns.
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+
       # No actions/setup-node here on purpose: this must build on a host with
       # no Node whatsoever, which is what anyone running the headless daemon
       # gets with `--no-default-features`.
-      - run: cargo build -p torrentd --no-default-features
+      - run: mise run daemon-only
 
   container:
     name: container image builds
@@ -247,12 +272,16 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - run: npm ci
-        working-directory: web
-      # `tsc -b` runs in strict mode with noUnusedLocals/noUnusedParameters, so
-      # this is the type gate as well as the bundle build.
-      - run: npm run build
-        working-directory: web
+      # mise provides the task; without it this job would be a second copy of
+      # the two commands mise.toml already owns. Node still comes from
+      # setup-node above — mise.toml pins no node.
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+      # `[tasks.web]` runs `npm ci` then `npm run build` in `web/`, and stops
+      # at the first failure, so this is the type gate as well as the bundle
+      # build.
+      - run: mise run web
 
   commit-lint:
     name: conventional commits

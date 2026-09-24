@@ -6,8 +6,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context;
+use torrentd_engine::ProfileId;
 use torrentd_pool::model::AdoptionState;
 use torrentd_pool::PoolStore;
 
@@ -63,7 +65,7 @@ fn scan_inner(
     errors += lib.errors;
 
     if pool_cfg.import_legacy_registry {
-        import_legacy(store, &cfg.registry_path())?;
+        import_legacy(store, &legacy_import_path(cfg))?;
     }
 
     let m = torrentd_pool::match_all(store)?;
@@ -177,20 +179,67 @@ pub fn orphans(cfg: &Config, limit: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Which assignment file `pool scan` folds into the index.
+///
+/// The pre-rename file where that is the only one present, and the current one
+/// otherwise. An operator upgrading a slot-era deployment runs `pool scan`
+/// before ever starting the new daemon — it is the documented first migration
+/// step — so `slot_assignments.json` is on disk and `profile_assignments.json`
+/// is not, and may never be. Passing the post-rename name folded zero
+/// assignments in, reported success, and left every row in `GET /api/pool`
+/// with no owning profile, recoverable only by booting the daemon once to
+/// trigger the rename and re-scanning.
+///
+/// `legacy_registry_path` already encodes the precedence rule
+/// (`legacy.exists() && !registry_path().exists()`); a second, differently
+/// worded copy of it here is the duplication this change removes elsewhere.
+fn legacy_import_path(cfg: &Config) -> PathBuf {
+    cfg.legacy_registry_path()
+        .unwrap_or_else(|| cfg.registry_path())
+}
+
+/// Fold an assignment file into the index.
+///
+/// Says what it did in every case. Returning `Ok(())` in silence when the
+/// file was absent or held nothing is indistinguishable, from the operator's
+/// side, from a successful import — and the case that produces it is an
+/// upgrade where the assignments really are somewhere else.
 fn import_legacy(store: &mut PoolStore, registry_path: &Path) -> anyhow::Result<()> {
     let Ok(bytes) = std::fs::read(registry_path) else {
+        println!(
+            "  no assignment file at {} — nothing to import",
+            registry_path.display(),
+        );
         return Ok(());
     };
     if bytes.is_empty() {
+        println!("  {} is empty — nothing to import", registry_path.display());
         return Ok(());
     }
-    let raw: HashMap<String, String> = serde_json::from_slice(&bytes)
+    // Parse the values through `ProfileId`, exactly as the daemon does.
+    //
+    // Reading them as bare `String` here meant the scan succeeded on a file
+    // `AssignmentRegistry::load_inner` refuses to boot on, so the two commands
+    // disagreed about whether one file was loadable — and the one that said
+    // yes wrote those ids into the pool index. The same door, or it is not a
+    // door.
+    let parsed: HashMap<String, ProfileId> = serde_json::from_slice(&bytes)
         .with_context(|| format!("parse {}", registry_path.display()))?;
+    let raw: HashMap<String, String> = parsed
+        .into_iter()
+        .map(|(ih, id)| (ih, id.as_str().to_string()))
+        .collect();
     let n = store.import_legacy_registry(&raw)?;
     if n > 0 {
         println!(
-            "  imported {n} slot assignments from {}",
+            "  imported {n} profile assignments from {}",
             registry_path.display(),
+        );
+    } else {
+        println!(
+            "  {} added no assignments ({} entries, all already in the index)",
+            registry_path.display(),
+            raw.len(),
         );
     }
     Ok(())
@@ -243,6 +292,69 @@ fn human_bytes(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A config whose `state_dir` is `dir`.
+    fn cfg_rooted_at(dir: &Path) -> Config {
+        toml::from_str(&format!(
+            r#"
+default_save_path = "/data/torrents"
+resume_dir = "{d}/resume"
+torrent_dir = "{d}/torrents"
+http_listen = "127.0.0.1:8080"
+
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6881"
+"#,
+            d = dir.display(),
+        ))
+        .expect("test config parses")
+    }
+
+    #[test]
+    fn an_upgrade_scan_reads_the_pre_rename_assignment_file() {
+        // `pool scan` is the documented first migration step and runs before
+        // the daemon's first boot, so `slot_assignments.json` is the only
+        // assignment file on disk. Naming `registry_path()` here read a file
+        // that does not exist, `import_legacy` returned `Ok(())` in silence,
+        // the scan reported success, and every row in `GET /api/pool` came
+        // back with no owning profile.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_rooted_at(dir.path());
+        std::fs::write(dir.path().join("slot_assignments.json"), "{}").unwrap();
+
+        assert_eq!(
+            legacy_import_path(&cfg),
+            dir.path().join("slot_assignments.json"),
+        );
+    }
+
+    #[test]
+    fn a_migrated_deployment_reads_the_current_assignment_file() {
+        // Once the new file exists it is the authority and the old one is
+        // only a rollback copy. `legacy_registry_path`'s own precedence rule
+        // decides this; there is no second copy of that rule here.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_rooted_at(dir.path());
+        std::fs::write(dir.path().join("slot_assignments.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("profile_assignments.json"), "{}").unwrap();
+
+        assert_eq!(
+            legacy_import_path(&cfg),
+            dir.path().join("profile_assignments.json"),
+        );
+    }
+
+    #[test]
+    fn a_deployment_with_no_assignment_file_at_all_names_the_current_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_rooted_at(dir.path());
+        assert_eq!(
+            legacy_import_path(&cfg),
+            dir.path().join("profile_assignments.json"),
+        );
+    }
 
     #[test]
     fn human_bytes_uses_binary_units() {
