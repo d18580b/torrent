@@ -583,18 +583,25 @@ pub async fn remove(
              deleted its resume and .torrent files so the startup scan does not \
              re-assign it",
         );
+        s.unloaded_at_boot.lock().remove(&ih);
         return Ok(StatusCode::NO_CONTENT);
     };
-    // A missing state-map entry is not a missing torrent when the registry
-    // still names one.
+    // A missing state-map entry means one of two things, and only one of them
+    // may be cleared.
     //
-    // `remove_torrent` succeeding emits `TorrentRemoved`, whose handler does
-    // `ctx.state.remove(&ih)`. If the registry persist below then failed, the
-    // 500 told the operator to "retry the delete" — and the retry arrived
-    // here to find the state entry already gone and answered 404
-    // `not_in_state_map`, so the assignment it was sent to clear stayed
-    // exactly where it was. Proceeding to the clear when the registry has the
-    // entry is what makes that retry reach the work.
+    // An entry the startup scans left unloaded — its resume add failed, or a
+    // delete whose registry write failed left it in the file for the next
+    // boot — is held by no session, so the assignment is all there is to
+    // clear. Answering 404 there left it uncleared by any means but
+    // hand-editing `profile_assignments.json`.
+    //
+    // Any other entry was assigned in this process, by the add or adopt
+    // path, and handed to a session whose `AddTorrent` alert has not been
+    // processed yet: the session holds the torrent and the state map does not
+    // know it. Clearing the assignment there answered 204 without removing
+    // anything, and the torrent went on seeding unassigned, free to be added
+    // to a second profile. There is no handle to remove it by until the alert
+    // lands, so the delete is refused as a conflict to retry.
     match s.state.get(&ih) {
         Some(st) => {
             engine
@@ -606,15 +613,23 @@ pub async fn remove(
                     )
                 })?;
         }
-        None => {
+        None if s.unloaded_at_boot.lock().contains(&ih) => {
             tracing::warn!(
                 target: "torrentd::http",
                 infohash = %ih,
                 profile_id = %profile,
-                "no session state for an info-hash the registry still assigns; clearing the \
-                 assignment alone. This is the retry path of a delete whose session removal \
-                 succeeded and whose registry write did not",
+                "no session holds an info-hash the registry still assigns; the startup \
+                 scans did not load it, so clearing the assignment alone",
             );
+        }
+        None => {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "this torrent is still being added to its session; retry the \
+                              delete once its phase is no longer \"unknown\""
+                })),
+            ));
         }
     }
     // Report a persist failure rather than discarding it. On a full or
@@ -636,6 +651,9 @@ pub async fn remove(
             })),
         )
     })?;
+    // Cleared, so a later add of the same info-hash is this process's own
+    // and must not be mistaken for one the boot left unloaded.
+    s.unloaded_at_boot.lock().remove(&ih);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1021,28 +1039,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_registry_persist_that_fails_after_the_session_removal_is_retryable() {
-        // C49, the engine branch. `remove_torrent` succeeding emits
-        // `TorrentRemoved`, whose handler clears the state map. If the
-        // registry write then failed, the 500 said "Retry the delete to clear
-        // the assignment" — and the retry hit `s.state.get(&ih)` on the entry
-        // the alert had already removed and answered 404 `not_in_state_map`,
-        // so the assignment it was sent to clear stayed exactly where it was.
-        //
-        // Simulated at the seam that matters: the state map has no entry and
-        // the registry still does, which is precisely what that retry sees.
+    async fn an_assignment_the_boot_left_unloaded_is_cleared_on_a_live_profile() {
+        // C49, the engine branch. An entry the startup scans did not load —
+        // a resume add that failed, or a delete whose registry write failed
+        // and left the entry in the file for the next boot — is held by no
+        // session, and answering 404 `not_in_state_map` left it clearable by
+        // nothing but hand-editing the registry file.
         let dir = tempfile::tempdir().unwrap();
         let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
         let app = test_state(dir.path());
         // `p` is the live profile `build_test_state` gives a session to.
         app.registry.assign(ih, ProfileId::new("p")).unwrap();
+        app.unloaded_at_boot.lock().insert(ih);
         assert!(
             app.source.engine_for(&ProfileId::new("p")).is_some(),
             "fixture is wrong: this is the engine-backed branch",
         );
         assert!(
             app.state.get(&ih).is_none(),
-            "fixture is wrong: the state entry is what the alert already removed",
+            "fixture is wrong: no session holds it",
         );
 
         let code = remove(
@@ -1053,12 +1068,46 @@ mod tests {
             }),
         )
         .await
-        .expect("a retry whose session removal already happened must clear the assignment");
+        .expect("an entry no session holds must be clearable");
 
         assert_eq!(code, StatusCode::NO_CONTENT);
         assert!(
             app.registry.lookup(&ih).is_none(),
-            "the assignment the retry exists to clear must be gone",
+            "the assignment must be gone",
+        );
+        assert!(
+            !app.unloaded_at_boot.lock().contains(&ih),
+            "a later add of the same info-hash must not be taken for a boot leftover",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_delete_racing_an_add_whose_alert_has_not_landed_is_refused() {
+        // The add path assigns, hands the torrent to the session, and the
+        // state-map entry arrives only with the `AddTorrent` alert. A delete
+        // in that window cleared the assignment and answered 204 without
+        // removing anything, so the torrent seeded unassigned and could be
+        // added to a second profile.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+        let app = test_state(dir.path());
+        app.registry.assign(ih, ProfileId::new("p")).unwrap();
+        assert!(app.state.get(&ih).is_none());
+
+        let err = remove(
+            State(app.clone()),
+            Path(MAGNET_HEX.to_string()),
+            Query(DeleteQuery {
+                delete_files: false,
+            }),
+        )
+        .await
+        .expect_err("a torrent the session may hold must not be reported deleted");
+
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            app.registry.lookup(&ih).is_some(),
+            "the assignment must stay, or a second profile can take the torrent",
         );
     }
 

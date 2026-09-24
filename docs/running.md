@@ -186,6 +186,16 @@ Every profile takes `id` plus `network`, and then:
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
 
+Each `vpn` profile's tunnel must come up with its own address. A session is
+bound to its tunnel by address, so two tunnels sharing one — every Proton
+WireGuard config assigns `10.2.0.2/32` — leave nothing that keeps one account's
+traffic out of the other's tunnel. The address is known only once the tunnel is
+up, so this is checked at startup rather than by `--check-config`: the second
+profile to come up with an address already taken is disabled, with a reason
+naming the other profile, and the rest of the daemon runs. Two accounts behind
+a provider that gives every client the same address cannot share one daemon;
+run the second in a daemon of its own, in its own network namespace.
+
 Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
 `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
 `peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all
@@ -201,7 +211,7 @@ reporting are all read-only without it.
 
 ### Upgrading from a pre-profiles deployment
 
-Four things changed at once, and three of them will stop an upgraded daemon
+Several things changed at once, and most of them will stop an upgraded daemon
 serving your library. Do all of this before you start it.
 
 **1. Remove the two top-level keys that no longer exist.** `session_state_path`
@@ -210,6 +220,27 @@ existing config file is now a fatal startup error naming whichever it reaches
 first. `listen_interfaces` moved onto each `network = "host"` profile; session
 state moved to `session_state-<profile_id>.dat` beside the old file and needs no
 key.
+
+**1a. Rewrite each `[[slot]]` table as a `[[profile]]`.** `[[slot]]` is gone,
+and a file with no `[[profile]]` at all is refused: a single-session deployment
+that had no `[[slot]]` needs one `network = "host"` profile carrying the
+`listen_interfaces` it used to set at the top level. For each old slot:
+
+- Rename the header to `[[profile]]` and add `network = "vpn"`.
+- Rename `vpn_profile` to `vpn_config`. The value is the same file.
+- `resume_dir` and `torrent_dir` were required on a slot and are optional now,
+  defaulting to `<resume_dir>/<id>` and `<torrent_dir>/<id>` under the
+  top-level roots. Keeping the slot's own values is fine, and is how step 3 is
+  done for that profile.
+- **Delete `upload_rate_limit = 0`, do not carry it over.** On a slot, `0`
+  meant "no override — inherit the daemon-wide cap". On a profile it means
+  **unlimited**, the same as the top-level key's `0`, so a slot that wrote `0`
+  to inherit the cap becomes an uncapped profile, and nothing warns: the file
+  is valid either way. Leave the key out to inherit; any other value carries
+  over unchanged.
+- Every other key — `id`, `vpn_type`, `vpn_interface`, `listen_port`,
+  `peer_fingerprint_hex`, `user_agent`, `allowed_tracker_domains`,
+  `port_forward`, `port_forward_gateway` — keeps its name and meaning.
 
 **2. Give a profile the id your registry already uses, or clear the entries.**
 The assignment registry — which torrent belongs to which account — is migrated
@@ -259,10 +290,13 @@ deletes it, nothing ages it out, and no later start reclaims its space: keep it
 until the new index has been in service long enough that you would not go back,
 then delete it yourself. The daemon cannot make that judgement for you, and
 deleting an operator's only rollback on a timer is not a judgement it should
-be making. If a `.pre-v3.bak` is already at that path when a migration starts,
-the daemon keeps it, says so, and takes no new copy: it is from an earlier
-attempt at this same migration, which rolled back, so it describes the same
-state.
+be making. If a `.pre-v3.bak` is already at that path when a migration starts
+— from an earlier attempt, or from an earlier successful migration you rolled
+back by copying it over the index — it need not describe the index as it
+stands now, so the daemon takes a fresh copy beside it as
+`<db_path>.pre-v3.bak.new`. When the migration commits, the fresh copy replaces
+the old one; when it fails, the fresh copy is discarded and the old one stays,
+because it is the copy that predates the run that failed.
 
 That holds for something that is a copy of the index, and the daemon checks
 that it is one. What is at that path has to be a pool index, at a schema
@@ -312,7 +346,11 @@ own statement batch and wrote `user_version` afterwards, so a machine that lost
 power between the last schema statement and that write left a file reporting 0
 or 1 over a schema that is already complete v3. It is recognised on the same
 two checks as the rest — the columns are v3's and `torrent_by_profile` is
-there — and stamped, with the journal kept. Before, such a file could not be
+there — plus a third below version 3, that the `plan` and `plan_step` tables
+exist, and stamped, with the journal kept. A file that lost power before those
+two tables were created is not complete v3 and is not stamped: it fails to
+migrate, and moving it aside for `torrentd pool scan` to rebuild costs nothing,
+because it never had a journal. Before, such a file could not be
 migrated at all: the version-keyed steps tried to create tables that already
 existed, the daemon exited non-zero on every start, and the only remedy the
 message offered that worked was to move the index aside and rescan, which
@@ -631,8 +669,8 @@ curl -sS -X POST localhost:8080/api/reload
 
 | Status | Meaning |
 | --- | --- |
-| `202` | Accepted. The reload runs asynchronously; watch the journal for its result. |
-| `429` | A reload is already in flight. Retry. |
+| `202` | Accepted. The reload runs asynchronously; watch the journal for its result. A request made while another reload is running is queued behind it and also gets `202`. |
+| `429` | The reload queue, which `SIGHUP` shares and which holds eight pending requests, is full. Retry once the queued reloads have run. |
 | `503` | The daemon is shutting down, or was built without the reload channel wired up. |
 
 It needs a token with the `write` scope (or a logged-in session) where `[auth]`
@@ -862,8 +900,11 @@ On a scratch pool, not your real one.
    resumes with 409 until you restart the daemon. It must not restart itself.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
-   interfaces for the daemon's uid. Setting it with no `vpn` profile is a
-   startup error, not a warning.
+   interfaces for the daemon's uid. Setting it with no `vpn` profile, or
+   beside any `host` profile, is a startup error, not a warning: the ruleset
+   matches the daemon's uid and cannot tell a host profile's traffic from a
+   leak, so that profile would send nothing while reporting itself healthy.
+   Run host profiles in a separate daemon without the switch.
 
 ## Troubleshooting
 

@@ -129,7 +129,7 @@ root, where probes and scrapes conventionally look. Default bind
 | `POST /api/torrents/:infohash/upload-limit` | `{"bytes_per_sec":…}`, 0 = unlimited. |
 | `POST /api/torrents/:infohash/file-priority` | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 4 normal, 7 high). |
 | `POST /api/login` \| `/api/logout` | Session cookie in, revocation out. |
-| `POST /api/reload` | Re-read the config file, as SIGHUP does. 202 accepted, 429 if a reload is already running, 503 if the daemon is shutting down or was built without the reload channel. Needs a `write` token. |
+| `POST /api/reload` | Re-read the config file, as SIGHUP does. 202 accepted (queued behind any reload already running), 429 if the eight-deep reload queue is full, 503 if the daemon is shutting down or was built without the reload channel. Needs a `write` token. |
 | `GET /api/events` | SSE change stream. |
 | `GET /metrics` | Prometheus text format. |
 
@@ -210,7 +210,9 @@ the isolation is layered — and honest about its limits.
 - **Network kill switch** (opt-in, `network_kill_switch = true`) — a
   fail-closed nftables table confining the daemon's egress to loopback and the
   tunnel interfaces, so a dropped tunnel fails closed at the kernel regardless
-  of socket binds or poll timing. Needs `CAP_NET_ADMIN` and a dedicated user.
+  of socket binds or poll timing. Needs `CAP_NET_ADMIN` and a dedicated user,
+  and is refused beside a `network = "host"` profile, whose egress it would
+  drop.
 
 **Checking a tunnel without seeding anything** — `vpn check` runs the VPN
 pre-flight the daemon depends on and reports each part separately, with no
