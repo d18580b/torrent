@@ -15,7 +15,7 @@ use std::time::UNIX_EPOCH;
 
 use torrentd_engine::VpnError;
 use torrentd_engine::VpnManager;
-use torrentd_engine::VpnProfile;
+use torrentd_engine::VpnTunnel;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -98,7 +98,7 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
     if latest > now {
         // The handshake is stamped in our future, so one of the two clocks has
         // moved. Treating that as an enormous age is the dangerous reading: it
-        // would fence a healthy slot permanently, and fencing requires an
+        // would fence a healthy profile permanently, and fencing requires an
         // operator to undo. Report it as fresh and say why.
         warn!(
             target: "torrentd::vpn::wireguard",
@@ -149,9 +149,9 @@ fn current_boot_id() -> Option<String> {
 /// wrong one for the daemon's own: after an unclean shutdown the link survives
 /// carrying a key the next boot cannot derive, so the next boot will neither
 /// adopt it — [`Adoption::Adopt`], which the recovery path exists to reach —
-/// nor tear it down, and `SlotRegistry::iter()` excludes the failed slot so
+/// nor tear it down, and `ProfileRegistry::iter()` excludes the failed profile so
 /// nothing else in the process ever sees it either. Every later boot
-/// reproduces that identically: the slot is dark until an operator runs
+/// reproduces that identically: the profile is dark until an operator runs
 /// `ip link delete` by hand.
 ///
 /// A name recorded here is a second way to establish ownership, beside the
@@ -177,9 +177,9 @@ fn current_boot_id() -> Option<String> {
 /// operator removes the link by hand — the one remedy the runbook names for a
 /// stuck tunnel — and something else takes the name before the restart. The
 /// record then still says "this boot raised `wg-a`", and a record that
-/// establishes ownership on that alone has the daemon bind a slot's sockets to
+/// establishes ownership on that alone has the daemon bind a profile's sockets to
 /// a stranger's tunnel, with `vpn_monitor` probing address presence and
-/// handshake age and never a key, so the slot reports healthy indefinitely.
+/// handshake age and never a key, so the profile reports healthy indefinitely.
 /// The boot sweep cannot close it: the sweep drops a record only when the name
 /// is **free**, and here it is occupied.
 ///
@@ -191,8 +191,8 @@ fn current_boot_id() -> Option<String> {
 ///
 /// The cost, stated rather than traded away: a daemon killed **between** a
 /// successful `wg-quick up` and this write leaves an interface with no record,
-/// so a later boot fences the slot instead of adopting it. That window is
-/// narrow, and a fenced slot is the safe side of it.
+/// so a later boot fences the profile instead of adopting it. That window is
+/// narrow, and a fenced profile is the safe side of it.
 #[derive(Debug, Clone)]
 struct RaisedInterfaces {
     dir: std::path::PathBuf,
@@ -471,9 +471,9 @@ impl WireguardManager {
     /// That is deliberate, and it is not a leak. A daemon bound to an address
     /// whose routes are gone cannot fall out over the physical interface: the
     /// source address is not local to it, so the packets are dropped rather
-    /// than misrouted. `vpn_monitor` then fences the slot within one
+    /// than misrouted. `vpn_monitor` then fences the profile within one
     /// `POLL_INTERVAL` on the handshake probe. The failure mode is a fenced
-    /// slot, and the four extra `wg`/`ip` subprocess calls per bring-up that
+    /// profile, and the four extra `wg`/`ip` subprocess calls per bring-up that
     /// checking the rest would cost buy only a faster diagnosis of it.
     ///
     /// Adoption is likewise attempted on **any** non-zero `wg-quick up` exit
@@ -496,7 +496,7 @@ impl WireguardManager {
     /// daemon, **and which still carries the public key that record names**,
     /// is the daemon's when the profile carries no key to compare. It is
     /// consulted *after* the keys and never against them — see [`ownership`].
-    fn adoptable(&self, profile: &VpnProfile) -> Adoption {
+    fn adoptable(&self, profile: &VpnTunnel) -> Adoption {
         let exists = interface_exists(&profile.interface);
         // Both key probes shell out, and neither has anything to adjudicate
         // when there is no link of that name — `wg-quick up` fails for plenty
@@ -612,7 +612,7 @@ impl From<Ownership> for Adoption {
 /// line and returns `None`, a `let ... else` fired before the comparison was
 /// ever reached, and `bring_up_tracked`'s catch-all ran `wg-quick down wg-a`
 /// on a stranger's tunnel — taking its routes and its rules with it, over a
-/// name collision. `SlotConfig::validate_set` checks the profile path's stem
+/// name collision. `ProfileConfig::validate_set` checks the profile path's stem
 /// and its directory and never reads its contents, so that configuration is
 /// accepted and works normally. A link of that name that is not a WireGuard
 /// device at all is the same shape one probe over.
@@ -635,7 +635,7 @@ impl From<Ownership> for Adoption {
 /// an operator runs the runbook's own `ip link delete`, and something else
 /// takes `wg-a` before the restart — and a record believed on the name alone
 /// then answered `Ours` for a stranger's tunnel, which `first_ipv4` turned
-/// into `Adopt(Ground::RaisedThisBoot)` and the daemon bound a slot's sockets
+/// into `Adopt(Ground::RaisedThisBoot)` and the daemon bound a profile's sockets
 /// to. The boot sweep cannot reach that case: it drops a record only when the
 /// name is **free**, and a retaken name is occupied. Comparing the recorded
 /// key against the live one is the only thing that can, because it is the only
@@ -647,7 +647,7 @@ impl From<Ownership> for Adoption {
 /// live link a moment earlier: an operator who rotates the provider
 /// credentials by editing the `.conf` in place — which `validate_set`'s stem
 /// rule forces — restarts into `wg-quick up` refusing the surviving link, the
-/// record calling it ours, and the slot rebuilt on the **previous**
+/// record calling it ours, and the profile rebuilt on the **previous**
 /// credentials and endpoint, reported healthy for as long as the old tunnel
 /// keeps handshaking. Two keys that disagree are direct evidence that the link
 /// is not the one the profile configures, and the record does not outrank
@@ -809,7 +809,7 @@ enum Adoption {
 }
 
 impl VpnManager for WireguardManager {
-    fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, VpnError> {
+    fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError> {
         // Whether a link of this name was already standing when this attempt
         // started. It is what tells a refusal from residue further down, and
         // it is read before anything can create one.
@@ -828,8 +828,8 @@ impl VpnManager for WireguardManager {
         if !status.success() {
             // `wg-quick up` refuses an interface that already exists, which is
             // what a previous process leaves behind when it is killed rather
-            // than shut down: the tunnel outlives it, every slot then fails to
-            // come up, and the daemon exits because no slot came up. Restarting
+            // than shut down: the tunnel outlives it, every profile then fails to
+            // come up, and the daemon exits because no profile came up. Restarting
             // was impossible without an operator tearing the tunnels down by
             // hand — on a host whose whole point is to keep seeding.
             //
@@ -877,7 +877,7 @@ impl VpnManager for WireguardManager {
         // link with the `ip link delete` the runbook sends them to, and
         // something else takes the name before the restart. The record still
         // matched, `ownership` answered `Ours` on it, `first_ipv4` succeeded,
-        // and the daemon adopted and bound a slot's sockets to a stranger's
+        // and the daemon adopted and bound a profile's sockets to a stranger's
         // tunnel — reporting it healthy indefinitely, because `vpn_monitor`
         // probes address presence and handshake age and never a key. The boot
         // sweep cannot reach that: it drops a record only when the name is
@@ -886,7 +886,7 @@ impl VpnManager for WireguardManager {
         // The cost of moving the write down here is a narrower window in the
         // opposite direction: a daemon killed between this `wg-quick up` and
         // this write leaves a link with no record, so a later boot fences the
-        // slot rather than adopting it. A fenced slot is the safe side, and it
+        // profile rather than adopting it. A fenced profile is the safe side, and it
         // is the same direction taken for a link that is ours and carries no
         // address.
         if let Err(e) = self.raised.record(
@@ -899,7 +899,7 @@ impl VpnManager for WireguardManager {
                 path = %self.raised.path(&profile.interface).display(),
                 error.cause = %e,
                 "could not record this interface as raised by this boot; an \
-                 unclean shutdown will leave it unadoptable and the slot dark \
+                 unclean shutdown will leave it unadoptable and the profile dark \
                  until an operator removes the interface by hand",
             );
         }
@@ -966,7 +966,7 @@ impl WireguardManager {
     /// For the keyless `PostUp = wg set %i private-key …` profile the record
     /// was introduced for, discarding the record there means the next start
     /// meets a standing link, no record, and no profile key: `Unestablished`,
-    /// then `ForeignInterface`, and the slot is dark until an operator runs
+    /// then `ForeignInterface`, and the profile is dark until an operator runs
     /// `ip link delete` by hand. `sweep_raised_records` cannot recover it —
     /// the sweep only ever deletes records, never writes one.
     ///
@@ -1120,7 +1120,7 @@ mod tests {
     /// `validate_set` accepts and which works normally — leaves
     /// `profile_public_key` returning `None` forever. Decide ownership on the
     /// keys alone and no boot can *ever* establish that the interface it left
-    /// behind is its own, so it is neither adopted nor torn down and the slot
+    /// behind is its own, so it is neither adopted nor torn down and the profile
     /// is dark for the life of the deployment. A name this boot recorded as
     /// raised answers what the key cannot.
     ///
@@ -1251,7 +1251,7 @@ mod tests {
     /// With the record believed on the boot id and the name alone,
     /// `ownership(exists, raised, Some(stranger), None)` answered `Ours`,
     /// `first_ipv4` succeeded on the stranger's link, and the daemon adopted
-    /// and bound a slot's sockets to it — reporting the slot healthy
+    /// and bound a profile's sockets to it — reporting the profile healthy
     /// indefinitely, because `vpn_monitor` probes address presence and
     /// handshake age and never a key.
     ///
@@ -1291,7 +1291,7 @@ mod tests {
                 None,
             )),
             Adoption::Foreign,
-            "the slot fences and the stranger's tunnel is left exactly as it \
+            "the profile fences and the stranger's tunnel is left exactly as it \
              was found — never adopted, never torn down",
         );
         assert!(
@@ -1388,7 +1388,7 @@ mod tests {
     /// For the keyless profile the record exists for, discarding it there is
     /// the whole of the permanently-dark state: the next start meets a
     /// standing link, no record and no profile key, so `ownership` answers
-    /// `Unestablished`, `bring_up` reports `ForeignInterface`, and the slot is
+    /// `Unestablished`, `bring_up` reports `ForeignInterface`, and the profile is
     /// dark until an operator runs `ip link delete` by hand.
     /// `sweep_raised_records` cannot recover it — the sweep only ever deletes
     /// records, never writes one.
@@ -1434,7 +1434,7 @@ mod tests {
     /// stem rule forces, since the file name must match the interface.
     /// `wg-quick up` refuses the surviving link; with the record consulted
     /// first, `ownership` called it ours, `first_ipv4` returned the **old**
-    /// tunnel's address, and the slot was rebuilt on the previous credentials
+    /// tunnel's address, and the profile was rebuilt on the previous credentials
     /// and endpoint — reported healthy for as long as the stale tunnel kept
     /// handshaking, because `vpn_monitor` probes address presence and
     /// handshake age and never a key.
@@ -1461,7 +1461,7 @@ mod tests {
                 Some("the-rotated-key"),
             )),
             Adoption::Foreign,
-            "so the slot fences honestly rather than adopting the tunnel the \
+            "so the profile fences honestly rather than adopting the tunnel the \
              operator has just replaced",
         );
         assert_eq!(
@@ -1660,7 +1660,7 @@ mod tests {
         );
 
         let mgr = WireguardManager::with_raised(raised.clone());
-        let profile = VpnProfile {
+        let profile = VpnTunnel {
             r#type: torrentd_engine::VpnType::Wireguard,
             interface: "lo".to_string(),
             // No such file, so `profile_public_key` reads `None` — the keyless
@@ -1708,7 +1708,7 @@ mod tests {
                 Err(VpnError::ForeignInterface { .. })
             ),
             "a refusal over a link this attempt did not create fences the \
-             slot; `Spawn` here is what reached the teardown arm",
+             profile; `Spawn` here is what reached the teardown arm",
         );
         assert!(
             matches!(

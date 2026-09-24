@@ -23,7 +23,7 @@ pub enum VpnType {
 }
 
 #[derive(Clone, Debug)]
-pub struct VpnProfile {
+pub struct VpnTunnel {
     pub r#type: VpnType,
     /// e.g. /etc/wireguard/wg-acct-a.conf
     pub config_path: PathBuf,
@@ -40,7 +40,7 @@ pub enum VpnError {
     NoAddress { iface: String },
     #[error("vpn process spawn failed: {0}")]
     Spawn(String),
-    /// An interface of this name already exists and is **not** this slot's.
+    /// An interface of this name already exists and is **not** this profile's.
     ///
     /// Distinct from `Spawn` because it is the one bring-up failure whose
     /// residue the daemon did not create and must not remove: the caller's
@@ -56,7 +56,7 @@ pub trait VpnManager: Send + Sync + std::fmt::Debug {
     /// Bring the tunnel up and return its assigned IP. Blocks (with an
     /// internal timeout — says 30s) until either an IP is
     /// observed or the timeout elapses.
-    fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, VpnError>;
+    fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError>;
 
     /// Read the current IPv4 of `iface`. Used by the 30-second health
     /// poll to detect mid-session IP changes.
@@ -109,7 +109,7 @@ impl MockVpn {
 }
 
 impl VpnManager for MockVpn {
-    fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, VpnError> {
+    fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError> {
         let mut g = self.inner.lock();
         g.bring_up_calls.push(profile.interface.clone());
         if g.foreign.contains(&profile.interface) {
@@ -153,7 +153,7 @@ mod tests {
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
         m.set_ip("wg0", ip);
 
-        let p = VpnProfile {
+        let p = VpnTunnel {
             r#type: VpnType::Wireguard,
             config_path: PathBuf::from("/etc/wireguard/wg0.conf"),
             interface: "wg0".to_string(),

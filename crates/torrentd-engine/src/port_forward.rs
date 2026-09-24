@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::engine::TorrentEngine;
 
-/// How a slot's listening port is determined.
+/// How a profile's listening port is determined.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PortForwardMode {
@@ -105,7 +105,7 @@ pub fn gateway_rebooted(previous_epoch: u32, epoch: u32) -> bool {
 }
 
 /// Outcome of a single renewal attempt. The monitor maps this onto metrics and
-/// slot health; keeping it separate keeps `renew_and_rebind` pure. Successful
+/// profile health; keeping it separate keeps `renew_and_rebind` pure. Successful
 /// variants carry the gateway `epoch` (so the caller can persist it for the
 /// next comparison) and `rebooted` (whether the epoch regressed this cycle —
 /// the mapping was already re-created by the same `map` call).
@@ -131,7 +131,7 @@ pub enum RenewOutcome {
     RenewFailed(PortForwardError),
 }
 
-/// Renew a slot's NAT-PMP mapping and, if the negotiated port changed, rebind
+/// Renew a profile's NAT-PMP mapping and, if the negotiated port changed, rebind
 /// the live libtorrent session by re-applying `listen_interfaces`
 /// (`apply_settings` triggers libtorrent's `reopen_listen_sockets`). Pure with
 /// respect to metrics/health so it is unit-testable with mocks.
@@ -158,7 +158,7 @@ pub fn renew_and_rebind(
                 };
             }
             let settings = Settings {
-                listen_interfaces: Some(crate::slot::bind_endpoint(tunnel_ip, port)),
+                listen_interfaces: Some(crate::profile::bind_endpoint(tunnel_ip, port)),
                 ..Default::default()
             };
             match engine.apply_settings(&settings) {
