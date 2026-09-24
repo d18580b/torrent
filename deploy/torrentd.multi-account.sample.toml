@@ -24,6 +24,13 @@ torrent_dir       = "/var/lib/torrentd/torrents"
 http_listen       = "127.0.0.1:8080"
 log_level         = "info"
 
+# This sample binds loopback, so it states the opt-out rather than configuring
+# [auth]: the daemon refuses to start unless one of the two is stated. Delete
+# this line and configure [auth] — see deploy/torrentd.sample.toml — before
+# exposing the API anywhere. Read once, at startup, like [auth] and
+# http_listen: editing it takes a restart, not a SIGHUP.
+allow_unauthenticated = true
+
 connections_limit             = 10000
 file_pool_size                = 1000
 aio_threads                   = 8

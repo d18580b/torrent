@@ -44,7 +44,59 @@ pub struct Config {
     pub default_save_path: PathBuf,
     pub resume_dir: PathBuf,
     pub torrent_dir: PathBuf,
+    /// Where the control API listens. Defaults to loopback, which is the only
+    /// address it is safe to expose without `[auth]`.
+    ///
+    /// The `serde(default)` removed a refusal as well as making the README's
+    /// claim true: an omitted `http_listen` used to fail to parse with
+    /// `missing field http_listen`, and now binds loopback silently. That is
+    /// the right default everywhere but inside a network namespace, where the
+    /// bind succeeds and the published port reaches nothing. Nothing here
+    /// guards against that: `deploy/compose.yaml` only documents it, telling
+    /// the operator to set `http_listen = "0.0.0.0:8080"` in the mounted
+    /// `torrentd.toml` themselves.
+    #[serde(default = "Config::default_http_listen")]
     pub http_listen: SocketAddr,
+
+    /// Peers whose forwarding headers are believed, as IPs or CIDR blocks.
+    ///
+    /// Empty by default, which means no forwarding header is ever read and
+    /// the socket's peer address is the client.
+    ///
+    /// That is not quite the behaviour that existed before this key. The
+    /// login throttle used to be a single shared bucket; it now keys on the
+    /// address resolved here. Behind a proxy that is the proxy's address for
+    /// every request, so it behaves like the shared bucket it was, but a
+    /// directly exposed daemon — a supported posture, since `[auth]` permits
+    /// any bind — now throttles per source IP. That is the better property:
+    /// one attacker's failures no longer land in the same bucket as the
+    /// operator's, and a client the tracked-client map has no room for falls
+    /// back to the shared bucket rather than to nothing.
+    ///
+    /// It is not a guarantee that nobody can lock the operator out. Every
+    /// verification also spends from one daemon-wide budget, so that the
+    /// Argon2 rate does not scale with the addresses a caller holds, and a
+    /// caller with enough distinct source addresses can keep that budget
+    /// spent — which refuses every login, the old behaviour again. See
+    /// `LoginThrottle`.
+    ///
+    /// Set it to the address the reverse proxy connects from, and only that:
+    /// anything in this list can claim to be any client. The proxy must strip
+    /// or overwrite client-supplied forwarding headers before adding its own.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+
+    /// Permit running with no `[auth]` section.
+    ///
+    /// Without `[auth]` the daemon authenticates nothing: every route,
+    /// including every mutating one, is open to anyone who can reach the
+    /// port. That posture is legitimate — a loopback bind behind a reverse
+    /// proxy that does its own access control — but it is not something an
+    /// operator should arrive at by omission, which is what it used to be.
+    ///
+    /// So the unsafe choice stays available and has to be typed.
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
 
@@ -157,6 +209,10 @@ const REGISTRY_FILE: &str = "profile_assignments.json";
 const LEGACY_REGISTRY_FILE: &str = "slot_assignments.json";
 
 impl Config {
+    fn default_http_listen() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 8080))
+    }
+
     fn default_log_level() -> LogLevel {
         LogLevel::Info
     }
@@ -166,14 +222,129 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let bytes = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: Config =
-            toml::from_str(&bytes).with_context(|| format!("parse {}", path.display()))?;
+        let cfg = Self::parse(path)?;
         cfg.validate()?;
         Ok(cfg)
     }
 
+    /// Load for an operator subcommand — `hash-password`, `new-token`,
+    /// `pool …`, `vpn check` — which validates everything except the
+    /// authentication posture.
+    ///
+    /// Those subcommands construct no session, bind no socket and serve no
+    /// request, so the posture check is judging something they do not do. It
+    /// still has to be judged for them, though, because the only documented
+    /// way onto `[auth]` runs through `hash-password`: a deployment whose
+    /// `http_listen` is not loopback — every container deployment, since the
+    /// published port cannot reach a loopback bind inside the namespace —
+    /// cannot write `allow_unauthenticated = true` to get past the refusal,
+    /// because the opt-out on a routable address is itself refused. With the
+    /// check in front of the subcommand there is no first step: the only way
+    /// out is to flip `http_listen` to loopback, generate, write `[auth]`, and
+    /// flip it back, which is four edits for a bootstrap and is documented
+    /// nowhere.
+    pub fn load_for_operator_tool(path: &Path) -> anyhow::Result<Self> {
+        let cfg = Self::parse(path)?;
+        cfg.validate_without_auth_posture()?;
+        Ok(cfg)
+    }
+
+    fn parse(path: &Path) -> anyhow::Result<Self> {
+        let bytes = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        toml::from_str(&bytes).with_context(|| format!("parse {}", path.display()))
+    }
+
+    /// Refuse a configuration that authenticates nothing without saying so.
+    ///
+    /// Three separate refusals, because they fail for different reasons:
+    ///
+    /// * no `[auth]` and no explicit opt-out — the operator has not chosen,
+    ///   and the default of "no authentication at all" is not one to arrive at
+    ///   by omission;
+    /// * no `[auth]` on a non-loopback bind, even *with* the opt-out — that is
+    ///   an unauthenticated mutating API on a routable address, and
+    ///   `allow_unauthenticated` is for delegating access control to something
+    ///   in front, not for having none;
+    /// * `[auth]` *and* the opt-out together — the flag is inert, and an inert
+    ///   security-relevant flag left in a config file is a standing misreading
+    ///   of the very question this check exists to make explicit.
+    ///
+    /// The whole point is that the posture is stated rather than inferred, so
+    /// a config that states two postures is no better than one that states
+    /// none.
+    fn validate_auth_posture(&self) -> anyhow::Result<()> {
+        if self.auth.is_some() {
+            if self.allow_unauthenticated {
+                anyhow::bail!(
+                    "[auth] is configured and allow_unauthenticated = true is set as well. \
+                     The flag has no effect here — a daemon with [auth] authenticates — but \
+                     it is the one line anyone reads to answer \"does this daemon \
+                     authenticate?\", and left in place it answers no. Delete \
+                     `allow_unauthenticated` from the config."
+                );
+            }
+            return Ok(());
+        }
+        if !self.allow_unauthenticated {
+            anyhow::bail!(
+                "no [auth] section, and allow_unauthenticated is not set. Without [auth] the \
+                 daemon authenticates nothing: every route, including every mutating one, is \
+                 open to anyone who can reach {listen}. Either configure authentication —\n\
+                 \n    torrentd --config <path> hash-password\n\
+                 \n— or, if access control genuinely belongs to something in front of this \
+                 daemon, write `allow_unauthenticated = true` to say so deliberately.",
+                listen = self.http_listen,
+            );
+        }
+        // Unwrap `::ffff:127.0.0.1` before asking. `IpAddr::is_loopback`
+        // delegates to `Ipv6Addr::is_loopback`, which is true only of `::1`,
+        // so an IPv4-mapped loopback bind — reachable from the host and
+        // nowhere else — was refused by a message asserting it is "reachable
+        // from the network". The refusal errs closed either way; a false
+        // statement in a refusal is worth one line to remove rather than one
+        // line to excuse.
+        let listen_ip = match self.http_listen.ip() {
+            std::net::IpAddr::V6(v6) => v6
+                .to_ipv4_mapped()
+                .map_or(std::net::IpAddr::V6(v6), std::net::IpAddr::V4),
+            v4 => v4,
+        };
+        if !listen_ip.is_loopback() {
+            anyhow::bail!(
+                "allow_unauthenticated = true with http_listen = {listen}, which is not a \
+                 loopback address. That is an unauthenticated API that mutates state, \
+                 reachable from the network. Bind to 127.0.0.1 and put a reverse proxy in \
+                 front, or configure [auth].\n\
+                 \nThis judges the address as configured, and nothing else: a bind that is \
+                 routable only inside a network namespace is still refused, because the \
+                 configured address is all `--check-config` has to go on and a namespace is \
+                 not something the daemon can verify it is in. A container that must bind \
+                 0.0.0.0 configures [auth] — `compose run --rm torrentd hash-password` \
+                 generates the values without starting a listener.",
+                listen = self.http_listen,
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> anyhow::Result<()> {
+        self.validate_inner(true)
+    }
+
+    /// Everything [`Config::validate`] checks except the authentication
+    /// posture. See [`Config::load_for_operator_tool`] for who gets this and
+    /// why.
+    ///
+    /// `pub(crate)`, not `pub`. The exemption seam this crate records is
+    /// `load_for_operator_tool`; a second entry point that runs every check
+    /// except the security one is a door nobody recorded opening. There is no
+    /// library target today, so nothing outside the crate can reach it either
+    /// way — which is what makes narrowing it free now and a wager later.
+    pub(crate) fn validate_without_auth_posture(&self) -> anyhow::Result<()> {
+        self.validate_inner(false)
+    }
+
+    fn validate_inner(&self, check_auth_posture: bool) -> anyhow::Result<()> {
         // Unconditional: an empty set is itself a refusal now, because there
         // is no implicit profile to fall back to.
         ProfileConfig::validate_set(&self.profile).context("[[profile]] validation failed")?;
@@ -181,6 +352,58 @@ impl Config {
             .context("[[profile]] validation failed")?;
         self.validate_effective_store_dirs()
             .context("[[profile]] validation failed")?;
+
+        // Parsed at startup so a malformed CIDR is a config error rather than
+        // a proxy that silently stops being trusted. Not gated on
+        // `check_auth_posture`: a malformed CIDR is a syntax error in the file,
+        // not a posture judgement, so an operator tool reports it too.
+        crate::http::forwarded::TrustedProxies::parse(&self.trusted_proxies)
+            .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?;
+        // A `/0` prefix is every address there is. Syntax alone accepts it,
+        // and it is the one value that defeats the whole mechanism: with it
+        // set, every caller on earth is a trusted proxy, so every forwarding
+        // header is believed — the throttle keys on a value the caller
+        // chooses and rotates, `Secure` is set or withheld at the caller's
+        // discretion, and the `client_ip` on the failed-login line is
+        // whatever the caller wrote. That is the "a spoofable header is worse
+        // than none" posture this key exists to make impossible, and both
+        // README.md and docs/running.md §6a promise it "fails safe rather
+        // than open".
+        //
+        // Refused rather than warned, for the same reason
+        // `validate_auth_posture` refuses an unauthenticated routable bind: a
+        // silent footgun in a security posture is the daemon's problem. `/0`
+        // is the bright line — any stricter floor would be a guess about
+        // somebody's network, and refusing a legitimate `/8` would be worse
+        // than the startup log that now records the parsed set.
+        //
+        // Decided on the **parsed** prefix, never on the entry's text. A
+        // guard that reads `entry.split_once('/')` and compares the text to
+        // `"0"` closes one spelling of a value rather than the value:
+        // `Cidr::parse` reads the prefix with `u8::from_str`, which accepts a
+        // leading `+` and any number of leading zeros, so `0.0.0.0/00`,
+        // `0.0.0.0/000`, `0.0.0.0/+0`, `::/00` and `::/+0` all parse to the
+        // same `prefix == 0` and all reach the same `prefix_match`, which
+        // returns `true` before comparing a byte. The number is the value;
+        // the text is one of its spellings.
+        for entry in &self.trusted_proxies {
+            // Re-parsed rather than re-read. `TrustedProxies::parse` above
+            // has already established that every entry parses, so this cannot
+            // fail, and taking the prefix from the parser is the whole point.
+            let prefix = crate::http::forwarded::Cidr::parse(entry)
+                .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?
+                .prefix();
+            if prefix == 0 {
+                anyhow::bail!(
+                    "trusted_proxies: {entry:?} trusts every peer there is. Anything listed \
+                     here can claim to be any client, so a /0 prefix makes every forwarding \
+                     header client-controlled: the login throttle keys on a value the caller \
+                     picks, the session cookie's Secure attribute is the caller's choice, and \
+                     the client_ip on the failed-login line is whatever the caller wrote. \
+                     List the address your reverse proxy connects from, and only that."
+                );
+            }
+        }
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -263,56 +486,250 @@ impl Config {
                 }
             }
         }
+
+        // The boot rule, which is a pure function of the config file and so
+        // belongs above the policy check with every other one. It used to run
+        // in `main::check_config`, after `Config::load` had already returned —
+        // so two configs differing only in whether a posture was stated gave
+        // "no [auth] section…" for one and "Configure a vpn profile, or unset
+        // network_kill_switch" for the other, and the operator saw the thing
+        // they must physically change only once the policy refusal was
+        // cleared. Demonstrated on both. Running it here also gives it to the
+        // operator subcommands, which `load_for_operator_tool` never ran it
+        // for.
+        self.check_boot_rules()?;
+
+        // Shape before policy, last of all: every check above names something
+        // the operator must physically change — a duplicate `listen_port`, a
+        // zero `aio_threads`, a `password_hash` that is not a PHC string, two
+        // `[pool]` roots that nest, a kill switch with no tunnel to confine
+        // egress to — while a config with no stated posture is well-formed and
+        // not permitted. Running the policy check first meant a malformed
+        // value was reported only once the posture was settled, and
+        // `hash-password`, which the posture refusal names as the way out,
+        // then refused for a reason `--check-config` had never shown the
+        // operator: `load_for_operator_tool` skips this check and runs every
+        // one above it. Last is also the position that makes "shape before
+        // policy" describe this function end to end, rather than only the
+        // `[[profile]]` block.
+        //
+        // `--check-config` runs one further refusal after this one, and it is
+        // deliberately not here: whether the `nft` binary exists is a fact
+        // about the host, not about the file. `Config::load` is also what the
+        // SIGHUP pump and every operator subcommand call, so a probe of the
+        // host placed here would refuse a reload, and refuse `hash-password`,
+        // on a machine without nftables — demonstrated, including on
+        // `hash-password`, which is the invocation the posture refusal names
+        // as the way out. See `main::check_config`.
+        if check_auth_posture {
+            self.validate_auth_posture()?;
+        }
         Ok(())
     }
 
     /// Compute a diff against an old config. Used by SIGHUP reload to
     /// apply only the fields that may change without restart.
     pub fn diff(old: &Config, new: &Config) -> ConfigDiff {
+        // `new`, destructured exhaustively and with no `..`, so that adding a
+        // field to `Config` does not compile until this function reaches it.
+        // Naming the field in the pattern is not enough on its own: the field
+        // has to be compared as well.
+        //
+        // The two halves are not enforced by the same thing, and this note
+        // used to run them together:
+        //
+        // * A field **not named** is `error[E0027]: pattern does not mention
+        //   field` — a hard compile error under a bare `cargo build`, with no
+        //   flags and no lint configuration involved.
+        // * A field **named but never compared** is `warning: unused
+        //   variable`, which is a *rustc* lint. `Cargo.toml`'s
+        //   `[workspace.lints.clippy] all = "deny"` does not reach it — that
+        //   denies clippy's lints, not rustc's. It becomes an error under
+        //   `mise run lint` (`cargo clippy … -- -D warnings`) and under any
+        //   build carrying `RUSTFLAGS=-D warnings`, which
+        //   `.github/workflows/ci.yml` sets for the whole workflow. A plain
+        //   local `cargo build` compiles it and prints a warning.
+        //
+        // So the first half is a build error everywhere and the second half
+        // holds wherever warnings are denied, which is the lint task and CI.
+        // Both were demonstrated.
+        //
+        // Neither half sees `field: _`. That binds nothing, so there is no
+        // unused binding to warn about and the field simply leaves the diff —
+        // verified. `diff_profiles` uses `id: _` deliberately, because `id` is
+        // the index key rather than a compared field; it is the one spelling
+        // this invariant cannot detect, and it is not a pattern to copy.
+        //
+        // This replaces a hand-maintained obligation. `reload.rs` states that
+        // no changed key is silently dropped, and the previous note here asked
+        // whoever added a field to remember; a field added and not compared
+        // compiled clean and was absent from the reported set, so the one
+        // compile-time seam this module had protected the test fixture and not
+        // the invariant.
+        let Config {
+            default_save_path: new_default_save_path,
+            resume_dir: new_resume_dir,
+            torrent_dir: new_torrent_dir,
+            http_listen: new_http_listen,
+            allow_unauthenticated: new_allow_unauthenticated,
+            log_level: new_log_level,
+            registry_path: new_registry_path,
+            connections_limit: new_connections_limit,
+            file_pool_size: new_file_pool_size,
+            enable_lsd: new_enable_lsd,
+            aio_threads: new_aio_threads,
+            max_concurrent_http_announces: new_max_concurrent_http_announces,
+            upload_rate_limit: new_upload_rate_limit,
+            peer_fingerprint: new_peer_fingerprint,
+            user_agent: new_user_agent,
+            vpn_handshake_max_age_secs: new_vpn_handshake_max_age_secs,
+            network_kill_switch: new_network_kill_switch,
+            profile: new_profile,
+            auth: new_auth,
+            pool: new_pool,
+            trusted_proxies: new_trusted_proxies,
+        } = new;
+
         let mut d = ConfigDiff::default();
-        if old.connections_limit != new.connections_limit {
-            d.connections_limit = new.connections_limit;
+        // Assigning the new value is not the same as reporting the
+        // difference. Each of the five below is `Option` on both sides, so
+        // deleting the key assigns `None` — indistinguishable from "this key
+        // did not change" to `is_empty`, which is what read the assignment.
+        // `record_reloadable` is what makes the difference itself the record,
+        // and it is called from the same `if` that assigns, so the two cannot
+        // disagree about whether a key changed.
+        if old.connections_limit != *new_connections_limit {
+            d.connections_limit = *new_connections_limit;
+            d.record_reloadable("connections_limit", new_connections_limit.is_some());
         }
-        if old.upload_rate_limit != new.upload_rate_limit {
-            d.upload_rate_limit = new.upload_rate_limit;
+        if old.upload_rate_limit != *new_upload_rate_limit {
+            d.upload_rate_limit = *new_upload_rate_limit;
+            d.record_reloadable("upload_rate_limit", new_upload_rate_limit.is_some());
         }
-        if old.max_concurrent_http_announces != new.max_concurrent_http_announces {
-            d.max_concurrent_http_announces = new.max_concurrent_http_announces;
+        if old.max_concurrent_http_announces != *new_max_concurrent_http_announces {
+            d.max_concurrent_http_announces = *new_max_concurrent_http_announces;
+            d.record_reloadable(
+                "max_concurrent_http_announces",
+                new_max_concurrent_http_announces.is_some(),
+            );
         }
-        if old.aio_threads != new.aio_threads {
-            d.aio_threads = new.aio_threads;
+        if old.aio_threads != *new_aio_threads {
+            d.aio_threads = *new_aio_threads;
+            d.record_reloadable("aio_threads", new_aio_threads.is_some());
         }
-        if old.enable_lsd != new.enable_lsd {
-            d.enable_lsd = new.enable_lsd;
+        if old.enable_lsd != *new_enable_lsd {
+            d.enable_lsd = *new_enable_lsd;
+            d.record_reloadable("enable_lsd", new_enable_lsd.is_some());
         }
-        if old.log_level != new.log_level {
-            d.log_level = Some(new.log_level);
+        // `log_level` is reloadable but is not one of the five: it has a
+        // serde default, so `Config` holds a `LogLevel` rather than an
+        // `Option`, and deleting the key produces the default value rather
+        // than an absence. `Some(..)` here is therefore always a real
+        // difference, which is why `is_empty` can read it directly. See
+        // `ConfigDiff::reloadable_changes`.
+        if old.log_level != *new_log_level {
+            d.log_level = Some(*new_log_level);
         }
 
-        // Identity-critical / non-reloadable fields:
-        // resume_dir, torrent_dir, peer_fingerprint, user_agent. Any change
-        // to these is reported in `non_reloadable_changes` so SIGHUP can
-        // log+ignore.
-        if old.resume_dir != new.resume_dir {
+        // Identity-critical / non-reloadable fields. The rule is that a change
+        // to a key this daemon cannot apply is *reported* rather than
+        // swallowed: a key that is neither applied nor mentioned leaves the
+        // operator believing a reload took.
+        //
+        // The list below is the whole of `Config` except the six reloadable
+        // keys above and `[[profile]]`, which `diff_profiles` reports
+        // separately — so every field of the struct reaches one branch or the
+        // other.
+        //
+        // The destructuring at the top of this function is what keeps that
+        // true. It used to be a manual obligation, which is a different
+        // claim: adding a field and not a branch reopened the gap and
+        // compiled.
+        //
+        // Reaching a branch is not by itself enough to keep a changed file
+        // from answering `SIGHUP: config unchanged`, and this comment used to
+        // say it was. A branch in this list pushes a **name**, which survives
+        // whatever the new value is; the reloadable branches above assign an
+        // `Option`, and an assigned `None` — the operator deleting the key —
+        // is what `is_empty` reads as "did not change". That is why those
+        // branches now record a name too. Neither half is redundant: this one
+        // says the field cannot be applied, that one says the field differed.
+        if old.default_save_path != *new_default_save_path {
+            d.non_reloadable_changes.push("default_save_path");
+        }
+        if old.resume_dir != *new_resume_dir {
             d.non_reloadable_changes.push("resume_dir");
         }
-        if old.torrent_dir != new.torrent_dir {
+        if old.torrent_dir != *new_torrent_dir {
             d.non_reloadable_changes.push("torrent_dir");
         }
-        if old.file_pool_size != new.file_pool_size {
+        if old.file_pool_size != *new_file_pool_size {
             // Not reloadable, and it used to be the one non-reloadable key
             // that was not *reported* either: `diff` skipped it entirely, so a
             // change was neither applied nor mentioned, unlike every other
             // field in this list.
             d.non_reloadable_changes.push("file_pool_size");
         }
-        if old.peer_fingerprint != new.peer_fingerprint {
+        if old.peer_fingerprint != *new_peer_fingerprint {
             d.non_reloadable_changes.push("peer_fingerprint");
         }
-        if old.user_agent != new.user_agent {
+        if old.user_agent != *new_user_agent {
             d.non_reloadable_changes.push("user_agent");
         }
-        d.profile_changes = diff_profiles(&old.profile, &new.profile);
+        // The authentication posture and the bind address are settled at boot:
+        // `AppState.auth` is built once in `startup::boot` and the listener is
+        // bound once, so neither can follow a running daemon's config. They
+        // are reported here for the same reason as everything above, and one
+        // more: an operator who added `[auth]` and reloaded got
+        // `SIGHUP: config unchanged` from the journal and `202 Accepted` from
+        // `POST /api/reload` while the daemon went on authenticating nothing.
+        // Silence there reads as confirmation, which is worse than no signal.
+        if old.auth != *new_auth {
+            d.non_reloadable_changes.push("auth");
+        }
+        if old.allow_unauthenticated != *new_allow_unauthenticated {
+            d.non_reloadable_changes.push("allow_unauthenticated");
+        }
+        if old.http_listen != *new_http_listen {
+            d.non_reloadable_changes.push("http_listen");
+        }
+        // Same again for the trust set: `TrustedProxies` is parsed once into
+        // `AppState` inside `DaemonHandle::boot` and `reload::run` rebuilds no
+        // `AppState`, so a changed value cannot follow a running daemon.
+        // Without this line an operator who decommissions a proxy, deletes its
+        // address and sends SIGHUP is told `config unchanged` while the daemon
+        // goes on believing forwarding headers from the removed address for
+        // the life of the process.
+        if old.trusted_proxies != *new_trusted_proxies {
+            d.non_reloadable_changes.push("trusted_proxies");
+        }
+        // These three arrived with the posture check, and five more came with
+        // it: eight non-reloadable keys `diff` did not look at, not three.
+        // Four of those five are immediately below; the fifth,
+        // `default_save_path`, heads this block.
+        // Each is read exactly once and then never consulted again —
+        // `registry_path` and `pool` when `startup::boot` opens the registry
+        // and the pool, `vpn_handshake_max_age_secs` when the health monitor
+        // is constructed, `network_kill_switch` when `killswitch::enable`
+        // runs at boot — so none of them can follow a running daemon either.
+        //
+        // `network_kill_switch` is the one that matters: an operator who
+        // turns the fail-closed kill switch on and reloads was told the
+        // config was unchanged, and would believe a security control had
+        // taken effect that had not.
+        if old.registry_path != *new_registry_path {
+            d.non_reloadable_changes.push("registry_path");
+        }
+        if old.vpn_handshake_max_age_secs != *new_vpn_handshake_max_age_secs {
+            d.non_reloadable_changes.push("vpn_handshake_max_age_secs");
+        }
+        if old.network_kill_switch != *new_network_kill_switch {
+            d.non_reloadable_changes.push("network_kill_switch");
+        }
+        if old.pool != *new_pool {
+            d.non_reloadable_changes.push("pool");
+        }
+        d.profile_changes = diff_profiles(&old.profile, new_profile);
         d
     }
 
@@ -358,9 +775,22 @@ impl Config {
     /// `Restart=on-failure` — did not. The configuration that reaches it, a
     /// set of profiles with zero tunnels, is new in this change.
     ///
-    /// Kept separate from [`Config::validate`] because it is a boot rule
-    /// rather than a well-formedness rule: `vpn check` and the `pool`
-    /// subcommands load the same file and have no business refusing it.
+    /// Called from [`Config::validate_inner`], above the authentication
+    /// posture, so it reaches everything that loads a config: the daemon,
+    /// `--check-config`, the SIGHUP pump and the operator subcommands alike.
+    ///
+    /// It was kept out of [`Config::validate`] on the ground that a boot rule
+    /// is not a well-formedness rule and that `vpn check` and the `pool`
+    /// subcommands "have no business refusing it". Two things were wrong with
+    /// that. It *is* a pure function of the config file — this function reads
+    /// nothing else — which is the definition "shape before policy" uses; and
+    /// running it after `Config::load` returned put it below the posture
+    /// check, so the operator was told to configure authentication before
+    /// being told the kill switch had no tunnel to confine egress to.
+    ///
+    /// Refusing an operator subcommand here is the intended consequence: a
+    /// configuration the daemon will not boot from is one `pool scan` should
+    /// not be writing an index from either.
     pub fn check_boot_rules(&self) -> anyhow::Result<()> {
         if self.network_kill_switch && !self.profile.iter().any(|p| p.is_vpn()) {
             anyhow::bail!(
@@ -803,6 +1233,12 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
         //
         // `id` is bound and ignored deliberately: it is the map key these two
         // were matched on, so it cannot differ here.
+        //
+        // `id: _` is how that is spelled, and it is also the one spelling this
+        // invariant cannot detect: `_` binds nothing, so there is no unused
+        // binding for the second half of the check to catch, and a field given
+        // it leaves the diff in silence. It is correct here and is not to be
+        // copied to a field that has something to compare.
         let ProfileConfig {
             id: _,
             network,
@@ -884,6 +1320,36 @@ pub struct ConfigDiff {
     pub aio_threads: Option<u32>,
     pub enable_lsd: Option<bool>,
     pub log_level: Option<LogLevel>,
+    /// The reloadable settings keys that **differed**, named independently of
+    /// the value they differ to.
+    ///
+    /// The five `Option` fields above cannot carry that on their own. All five
+    /// are `Option` in `Config` too, so deleting one leaves the comparison
+    /// with nothing to assign but `None` — and `None` is exactly what
+    /// "unchanged" looks like to [`ConfigDiff::is_empty`]. Every one of these
+    /// keys is documented as optional in `deploy/torrentd.sample.toml` ("omit
+    /// any to use the preset's default"), so deleting one is the documented
+    /// way back to the default, and it answered `SIGHUP: config unchanged` on
+    /// all five.
+    ///
+    /// `log_level` is not in this list: it has a serde default, so `Config`
+    /// holds a `LogLevel` rather than an `Option` and deleting the key
+    /// produces the default value rather than an absence. `Some(..)` on the
+    /// field above is therefore always a real difference, which is why
+    /// [`ConfigDiff::is_empty`] can read it directly. It is also not a
+    /// `libtorrent_safe::Settings` key, so `reload::withheld_reloadable_keys`
+    /// — which subtracts a profile's patch field set from this list — must not
+    /// see it.
+    pub reloadable_changes: Vec<&'static str>,
+    /// The subset of `reloadable_changes` the new file gives no value to,
+    /// because the operator deleted the key.
+    ///
+    /// Reported on its own: the preset default such a key falls back to is
+    /// chosen when the session is built, and a `Settings` patch has no way to
+    /// say "unset this", so a deletion cannot be applied to a live session at
+    /// all. That is a different fact from a key withheld from one profile by
+    /// Safety Rule 6, and the journal says so in different words.
+    pub reloadable_deletions: Vec<&'static str>,
     pub non_reloadable_changes: Vec<&'static str>,
     /// Per-profile fields that changed and were ignored, each carrying the
     /// class its warning is owed. Safety Rule 7 requires a warning for the
@@ -913,35 +1379,109 @@ impl ConfigDiff {
     /// patched every session alike and silently discarded the override until
     /// the next restart. A profile that sets nothing still takes the
     /// top-level value, which is what makes it a default.
-    pub fn to_settings_patch_for(&self, profile: &ProfileConfig) -> libtorrent_safe::Settings {
-        libtorrent_safe::Settings {
-            connections_limit: self.connections_limit,
-            upload_rate_limit: if profile.upload_rate_limit.is_some() {
+    pub fn to_settings_patch_for(&self, profile: &ProfileConfig) -> SettingsPatch {
+        // Set one field and name it, in one statement, so the patch and the
+        // record of what it carries cannot be written apart from each other.
+        macro_rules! set {
+            ($patch:expr, $field:ident, $value:expr) => {
+                if let Some(v) = $value {
+                    $patch.settings.$field = Some(v);
+                    $patch.fields.push(stringify!($field));
+                }
+            };
+        }
+
+        let mut patch = SettingsPatch::default();
+        set!(patch, connections_limit, self.connections_limit);
+        set!(
+            patch,
+            upload_rate_limit,
+            if profile.upload_rate_limit.is_some() {
                 None
             } else {
                 self.upload_rate_limit
-            },
-            max_concurrent_http_announces: self.max_concurrent_http_announces,
-            aio_threads: self.aio_threads,
-            enable_lsd: if profile.is_vpn() {
+            }
+        );
+        set!(
+            patch,
+            max_concurrent_http_announces,
+            self.max_concurrent_http_announces
+        );
+        set!(patch, aio_threads, self.aio_threads);
+        set!(
+            patch,
+            enable_lsd,
+            if profile.is_vpn() {
                 None
             } else {
                 self.enable_lsd
-            },
-            ..Default::default()
-        }
+            }
+        );
+        patch
+    }
+
+    /// True when the patch `to_settings_patch_for` built sets nothing, so
+    /// handing it to `apply_settings` would be a no-op.
+    ///
+    /// The reload pump logs `SIGHUP: settings applied` per profile after that
+    /// call, and once the non-reloadable keys are reported the diff for an
+    /// edit that touched *only* them is no longer empty — so the pump fell
+    /// through its warnings into the settings loop and closed the reload with
+    /// a positive confirmation that nothing had been applied. A journal read
+    /// at the default `info` level shows that line last.
+    ///
+    /// This reads [`SettingsPatch::fields`] — the names
+    /// `to_settings_patch_for` recorded as it set them — rather than
+    /// enumerating the fields a patch can carry. An enumeration here was a
+    /// second, hand-maintained copy of the reloadable set: a key added to
+    /// `ConfigDiff`, to `Config::diff` and to `to_settings_patch_for` and not
+    /// to the enumeration made this return `true` over a patch that carried
+    /// it, so the pump skipped `apply_settings` and `withheld_reloadable_keys`
+    /// had nothing to report, and the whole journal for that reload was
+    /// `received SIGHUP`. Nothing about that failed to compile.
+    pub fn settings_patch_is_empty(patch: &SettingsPatch) -> bool {
+        patch.fields.is_empty()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.connections_limit.is_none()
-            && self.upload_rate_limit.is_none()
-            && self.max_concurrent_http_announces.is_none()
-            && self.aio_threads.is_none()
-            && self.enable_lsd.is_none()
+        // `reloadable_changes` covers the five settings keys, including the
+        // ones a deletion leaves as `None`. `log_level` is read directly; see
+        // the field's own documentation for why it is not in the list.
+        self.reloadable_changes.is_empty()
             && self.log_level.is_none()
             && self.non_reloadable_changes.is_empty()
             && self.profile_changes.is_empty()
     }
+
+    /// Record that a reloadable settings key differed, whatever it differs to.
+    ///
+    /// `has_value` is false when the new file deletes the key, which is the
+    /// case the assignment alone could not express.
+    fn record_reloadable(&mut self, key: &'static str, has_value: bool) {
+        self.reloadable_changes.push(key);
+        if !has_value {
+            self.reloadable_deletions.push(key);
+        }
+    }
+}
+
+/// A `libtorrent_safe::Settings` patch together with the names of the fields
+/// it sets.
+///
+/// The names are pushed by the same statement that sets the field, in
+/// [`ConfigDiff::to_settings_patch_for`], so there is one place a reloadable
+/// key is written down and nothing downstream re-enumerates the set.
+/// [`ConfigDiff::settings_patch_is_empty`] and
+/// `reload::withheld_reloadable_keys` both read [`SettingsPatch::fields`]; before
+/// they did, each carried its own five-item list over a struct with roughly
+/// twenty-five fields, and a key added to the reloadable set and to neither
+/// list was neither applied nor reported.
+#[derive(Debug, Default)]
+pub struct SettingsPatch {
+    /// What `apply_settings` is handed.
+    pub settings: libtorrent_safe::Settings,
+    /// The `Settings` field names this patch sets, in the order it set them.
+    pub fields: Vec<&'static str>,
 }
 
 impl Config {
@@ -950,29 +1490,52 @@ impl Config {
     /// Test-only, and deliberately built from the real types rather than from
     /// TOML, so a required field added to `Config` breaks this at compile time
     /// instead of leaving the tests exercising a shape the daemon never sees.
+    ///
+    /// It was `toml::from_str` until the authentication posture became a
+    /// required statement, and the promised compile break did not happen. The
+    /// helper went on building a config with no `[auth]` and no opt-out —
+    /// exactly the shape `Config::validate` now refuses — and its callers
+    /// build `AppState`/`PoolService` from it without ever validating, so the
+    /// seam meant to catch that was the one asserting it already had. Every
+    /// field is listed below with no `..Default::default()`, which is what
+    /// makes the paragraph above true rather than aspirational.
+    ///
+    /// The posture stated is the opt-out on a loopback bind: the shape
+    /// `deploy/torrentd.sample.toml` ships, and the one these tests mean.
     #[cfg(test)]
     pub fn minimal_for_tests(dir: &Path, allow_mutations: bool) -> Self {
-        let mut cfg: Config = toml::from_str(&format!(
-            r#"
-default_save_path = "{d}/data"
-resume_dir = "{d}/resume"
-torrent_dir = "{d}/torrents"
-http_listen = "127.0.0.1:8080"
-"#,
-            d = dir.display(),
-        ))
-        .expect("minimal config parses");
-        cfg.pool = Some(PoolConfig {
-            roots: vec![dir.join("pool")],
-            library_dir: dir.join("library"),
-            db_path: Some(dir.join("pool.db")),
-            max_concurrent_verify: 1,
-            import_legacy_registry: false,
-            allow_mutations,
-        });
         std::fs::create_dir_all(dir.join("pool")).unwrap();
         std::fs::create_dir_all(dir.join("library")).unwrap();
-        cfg
+        Config {
+            default_save_path: dir.join("data"),
+            resume_dir: dir.join("resume"),
+            torrent_dir: dir.join("torrents"),
+            http_listen: Self::default_http_listen(),
+            allow_unauthenticated: true,
+            log_level: Self::default_log_level(),
+            registry_path: None,
+            connections_limit: None,
+            file_pool_size: None,
+            enable_lsd: None,
+            aio_threads: None,
+            max_concurrent_http_announces: None,
+            upload_rate_limit: None,
+            peer_fingerprint: None,
+            user_agent: None,
+            vpn_handshake_max_age_secs: Self::default_handshake_max_age(),
+            network_kill_switch: false,
+            profile: vec![],
+            auth: None,
+            pool: Some(PoolConfig {
+                roots: vec![dir.join("pool")],
+                library_dir: dir.join("library"),
+                db_path: Some(dir.join("pool.db")),
+                max_concurrent_verify: 1,
+                import_legacy_registry: false,
+                allow_mutations,
+            }),
+            trusted_proxies: vec![],
+        }
     }
 }
 
@@ -997,6 +1560,7 @@ torrent_dir = "/var/lib/torrentd/torrents"
 http_listen = "127.0.0.1:8080"
 log_level = "info"
 connections_limit = 10000
+allow_unauthenticated = true
 "#;
 
     const ONE_HOST_PROFILE: &str = r#"
@@ -1017,6 +1581,76 @@ listen_interfaces = "0.0.0.0:6881"
     }
 
     #[test]
+    fn a_trusted_proxies_entry_that_trusts_everyone_is_refused() {
+        // The property: `trusted_proxies` is validated for *posture*, not
+        // only for syntax. A `/0` prefix is every address there is, so it
+        // makes every caller a trusted proxy and every forwarding header
+        // client-controlled — the throttle key, the cookie's `Secure`
+        // attribute and the `client_ip` on the failed-login line all become
+        // the caller's to choose. README.md and docs/running.md §6a both
+        // promise this key "fails safe rather than open"; without this
+        // refusal the one value that defeats it is the one that validates.
+        //
+        // Every spelling of that value, not the two canonical ones. The
+        // prefix is parsed with `u8::from_str`, which takes a leading `+` and
+        // any number of leading zeros, so `/00`, `/000` and `/+0` are the
+        // same prefix reaching the same `prefix_match` — and a refusal
+        // written against the entry's *text* accepts all of them while
+        // refusing `/0`. That is not a hypothetical spelling: a daemon
+        // booted with `["0.0.0.0/00"]` believes a forged `X-Forwarded-For`
+        // from every caller on earth.
+        let dir = tempdir().unwrap();
+
+        for wide in [
+            "0.0.0.0/0",
+            "0.0.0.0/00",
+            "0.0.0.0/000",
+            "0.0.0.0/+0",
+            "::/0",
+            "::/00",
+            "::/000",
+            "::/+0",
+        ] {
+            let body = with_top_level(&format!("trusted_proxies = [\"{wide}\"]"));
+            // `parse` alone, so the refusal is attributed to `validate`
+            // rather than to the file being unreadable.
+            let cfg = Config::parse(&write_cfg(dir.path(), &body)).unwrap();
+            let err = cfg
+                .validate()
+                .expect_err("a /0 prefix trusts every peer and must be refused");
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains(wide),
+                "the refusal must name the offending entry; got {msg}",
+            );
+
+            // And it is not a posture judgement, so the operator subcommands
+            // that skip the posture check — `--check-config` among them — get
+            // it too. That is the command run before a restart.
+            assert!(
+                cfg.validate_without_auth_posture().is_err(),
+                "{wide} must be refused for operator tools as well",
+            );
+
+            // Which means loading the file fails outright.
+            assert!(
+                Config::load(&write_cfg(dir.path(), &body)).is_err(),
+                "{wide} must not produce a daemon that starts",
+            );
+        }
+
+        // The refusal is about breadth, not about prefixes. A real proxy
+        // network still validates, and so does the empty default.
+        for ok in ["\"172.28.0.2\"", "\"10.0.0.0/8\"", "\"2001:db8::/32\""] {
+            let body = with_top_level(&format!("trusted_proxies = [{ok}]"));
+            Config::load(&write_cfg(dir.path(), &body))
+                .unwrap_or_else(|e| panic!("{ok} is a legitimate trust set: {e:#}"));
+        }
+        Config::load(&write_cfg(dir.path(), &single_session()))
+            .expect("the empty default is the safe one and must still load");
+    }
+
+    #[test]
     fn a_file_pool_size_change_is_reported_rather_than_swallowed() {
         let dir = tempdir().unwrap();
         let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
@@ -1025,6 +1659,69 @@ listen_interfaces = "0.0.0.0:6881"
         let d = Config::diff(&a, &b);
         assert!(
             d.non_reloadable_changes.contains(&"file_pool_size"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+    }
+
+    #[test]
+    fn an_auth_only_edit_is_reported_rather_than_called_unchanged() {
+        // The property: a config edit that changes nothing but the
+        // authentication posture is a *change*, and `diff` must say so. If it
+        // does not, `ConfigDiff::is_empty` is true and `reload::run` logs
+        // `SIGHUP: config unchanged` — positive confirmation that a reload
+        // took, to an operator whose daemon is still authenticating nothing.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+
+        let mut with_auth = a.clone();
+        with_auth.auth = Some(crate::auth::AuthConfig {
+            password_hash: crate::auth::hash_password("hunter2").unwrap(),
+            session_ttl_secs: 43_200,
+            token: vec![],
+        });
+        with_auth.allow_unauthenticated = false;
+        let d = Config::diff(&a, &with_auth);
+        assert!(
+            !d.is_empty(),
+            "an auth-only edit must not look like an unchanged config",
+        );
+        assert!(
+            d.non_reloadable_changes.contains(&"auth"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+        assert!(
+            d.non_reloadable_changes.contains(&"allow_unauthenticated"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+
+        // The bind address is settled once, at `TcpListener::bind`, and is
+        // half of the posture the refusal in `validate_auth_posture` judges.
+        let mut moved = a.clone();
+        moved.http_listen = SocketAddr::from(([127, 0, 0, 1], 9090));
+        let d = Config::diff(&a, &moved);
+        assert!(!d.is_empty());
+        assert!(
+            d.non_reloadable_changes.contains(&"http_listen"),
+            "got {:?}",
+            d.non_reloadable_changes,
+        );
+
+        // And the trust set, settled once in `DaemonHandle::boot`. An
+        // operator who decommissions a proxy and deletes its address here is
+        // otherwise told the config did not change, while the daemon keeps
+        // believing that address's forwarding headers until it restarts.
+        let mut proxied = a.clone();
+        proxied.trusted_proxies = vec!["172.28.0.2".to_string()];
+        let d = Config::diff(&a, &proxied);
+        assert!(
+            !d.is_empty(),
+            "a trusted_proxies-only edit must not look like an unchanged config",
+        );
+        assert!(
+            d.non_reloadable_changes.contains(&"trusted_proxies"),
             "got {:?}",
             d.non_reloadable_changes,
         );
@@ -1077,12 +1774,16 @@ listen_interfaces = "0.0.0.0:6881"
             ..Default::default()
         };
         assert_eq!(
-            diff.to_settings_patch_for(&host_profile()).enable_lsd,
+            diff.to_settings_patch_for(&host_profile())
+                .settings
+                .enable_lsd,
             Some(true),
             "a host profile still honours the key",
         );
         assert_eq!(
-            diff.to_settings_patch_for(&vpn_profile()).enable_lsd,
+            diff.to_settings_patch_for(&vpn_profile())
+                .settings
+                .enable_lsd,
             None,
             "a tunnelled profile must not receive it",
         );
@@ -1406,6 +2107,7 @@ default_save_path = "/data/torrents"
 resume_dir = "/var/lib/torrentd/resume"
 torrent_dir = "/var/lib/torrentd/torrents"
 http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
 
 [[profile]]
 id                = "acct_a"
@@ -1680,12 +2382,15 @@ listen_interfaces = "0.0.0.0:6882"
         capped.upload_rate_limit = Some(100_000);
 
         assert_eq!(
-            diff.to_settings_patch_for(&capped).upload_rate_limit,
+            diff.to_settings_patch_for(&capped)
+                .settings
+                .upload_rate_limit,
             None,
             "a profile that set its own must not be patched from the top level",
         );
         assert_eq!(
             diff.to_settings_patch_for(&host_profile())
+                .settings
                 .upload_rate_limit,
             Some(2_000_000),
             "a profile that set nothing still takes the default; that is what makes it one",
@@ -1709,7 +2414,9 @@ listen_interfaces = "0.0.0.0:6882"
         uncapped.upload_rate_limit = Some(0);
 
         assert_eq!(
-            diff.to_settings_patch_for(&uncapped).upload_rate_limit,
+            diff.to_settings_patch_for(&uncapped)
+                .settings
+                .upload_rate_limit,
             None,
             "an explicit 0 is a value the profile set, so the reload must not overwrite it",
         );
@@ -1908,6 +2615,166 @@ listen_interfaces = "0.0.0.0:6882"
         );
     }
 
+    /// The top-level block without the opt-out, for the auth-posture tests.
+    fn top_level_no_opt_out() -> String {
+        TOP_LEVEL.replace("allow_unauthenticated = true\n", "")
+    }
+
+    #[test]
+    fn an_unauthenticated_config_is_refused_unless_it_says_so() {
+        let dir = tempdir().unwrap();
+        let body = format!("{}{ONE_HOST_PROFILE}", top_level_no_opt_out());
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("allow_unauthenticated"), "got: {msg}");
+        assert!(msg.contains("hash-password"), "the error names the way out");
+    }
+
+    #[test]
+    fn a_malformed_value_is_reported_before_the_posture() {
+        // The property: shape before policy, for every shape check and not
+        // only the `[[profile]]` block. A zero `aio_threads`, a
+        // `password_hash` that is not a PHC string, and two `[pool]` roots
+        // that nest each name something the operator must physically change;
+        // a config with no stated posture is well-formed and not permitted.
+        //
+        // The order matters beyond tidiness. `load_for_operator_tool` skips
+        // the posture check and runs every other one, so while the posture
+        // was reported first, the refusal sent the operator to
+        // `hash-password` — the way out it names — and `hash-password` then
+        // refused for a malformed value `--check-config` had never shown
+        // them. Each configuration here is wrong in two ways at once, which
+        // is the only way to observe an ordering.
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+
+        let cases = [
+            (
+                format!(
+                    "{}aio_threads = 0\n{ONE_HOST_PROFILE}",
+                    top_level_no_opt_out(),
+                ),
+                "aio_threads = 0 is out of range",
+            ),
+            (
+                // `[auth]` beside the opt-out is the policy refusal here.
+                format!("{TOP_LEVEL}\n[auth]\npassword_hash = \"not-a-phc-string\"\n{ONE_HOST_PROFILE}"),
+                "password_hash is not a valid PHC string",
+            ),
+            (
+                format!(
+                    "{}\n[pool]\nroots = [\"{}\", \"{}\"]\nlibrary_dir = \"{}\"\n{ONE_HOST_PROFILE}",
+                    top_level_no_opt_out(),
+                    root.display(),
+                    root.join("inner").display(),
+                    dir.path().join("library").display(),
+                ),
+                "[pool] roots must not nest",
+            ),
+        ];
+
+        for (body, expected) in cases {
+            let msg = refusal(&body);
+            assert!(
+                msg.contains(expected),
+                "the malformed value must be reported before the posture; got: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn the_opt_out_is_honoured_on_loopback() {
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &single_session());
+        assert!(Config::load(&p).is_ok());
+    }
+
+    #[test]
+    fn the_opt_out_does_not_extend_to_a_routable_address() {
+        // `allow_unauthenticated` is for delegating access control to
+        // something in front, not for having none.
+        let dir = tempdir().unwrap();
+        let body = single_session().replace("127.0.0.1:8080", "0.0.0.0:8080");
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("loopback"), "got: {msg}");
+    }
+
+    #[test]
+    fn a_loopback_bind_is_loopback_however_it_is_spelled() {
+        // `IpAddr::is_loopback` is false for `::ffff:127.0.0.1`, so the
+        // literal test refused an address reachable only from the host — and
+        // told the operator it was "reachable from the network".
+        let dir = tempdir().unwrap();
+        for form in ["[::1]:8080", "[::ffff:127.0.0.1]:8080"] {
+            let body = single_session().replace("127.0.0.1:8080", form);
+            let p = write_cfg(dir.path(), &body);
+            assert!(
+                Config::load(&p).is_ok(),
+                "{form} is loopback and must be accepted",
+            );
+        }
+        // Unwrapping must not soften the check it is inside: the wildcard
+        // binds stay refused in both families.
+        for form in ["[::]:8080", "0.0.0.0:8080"] {
+            let body = single_session().replace("127.0.0.1:8080", form);
+            let p = write_cfg(dir.path(), &body);
+            let msg = format!("{:#}", Config::load(&p).unwrap_err());
+            assert!(
+                msg.contains("loopback"),
+                "{form} must be refused; got: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_auth_needs_no_opt_out_and_may_bind_anywhere() {
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{}{ONE_HOST_PROFILE}\n[auth]\npassword_hash = \"{}\"\n",
+            top_level_no_opt_out().replace("127.0.0.1:8080", "0.0.0.0:8080"),
+            crate::auth::hash_password("hunter2").unwrap(),
+        );
+        let p = write_cfg(dir.path(), &body);
+        assert!(Config::load(&p).is_ok());
+    }
+
+    #[test]
+    fn the_opt_out_alongside_configured_auth_is_refused() {
+        // The property: a config states one posture. `[auth]` plus the opt-out
+        // states two, and the flag is the one a reader checks — so a daemon
+        // that authenticates ships a config file saying it does not.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{TOP_LEVEL}{ONE_HOST_PROFILE}\n[auth]\npassword_hash = \"{}\"\n",
+            crate::auth::hash_password("hunter2").unwrap(),
+        );
+        assert!(
+            body.contains("allow_unauthenticated = true"),
+            "TOP_LEVEL carries the opt-out; this test is about it being there",
+        );
+        let p = write_cfg(dir.path(), &body);
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(msg.contains("allow_unauthenticated"), "got: {msg}");
+        assert!(
+            msg.contains("Delete"),
+            "the error names the edit that fixes it; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn http_listen_defaults_to_loopback() {
+        // The README claimed this default for a long time while the key was
+        // in fact required; the claim is now true.
+        let dir = tempdir().unwrap();
+        let top = TOP_LEVEL.replace("http_listen = \"127.0.0.1:8080\"\n", "");
+        let p = write_cfg(dir.path(), &format!("{top}{ONE_HOST_PROFILE}"));
+        let cfg = Config::load(&p).unwrap();
+        assert!(cfg.http_listen.ip().is_loopback());
+        assert_eq!(cfg.http_listen.port(), 8080);
+    }
+
     #[test]
     fn a_config_with_no_profiles_is_refused() {
         let dir = tempdir().unwrap();
@@ -2034,10 +2901,65 @@ listen_interfaces = "0.0.0.0:6882"
         // rather than under `Restart=on-failure`. This refusal is a pure
         // function of the file and `boot` makes it anyway, so the pre-flight
         // has no reason not to.
+        //
+        // It is a refusal of `Config::load` itself, not of a second pass over
+        // a config that already loaded: being a pure function of the file is
+        // what puts it with the rest of the shape checks.
         let dir = tempdir().unwrap();
         let p = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
-        let cfg = Config::load(&p).expect("it parses and validates; it does not boot");
-        let msg = format!("{:#}", cfg.check_boot_rules().unwrap_err());
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch") && msg.contains("vpn"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_boot_rule_is_reported_before_the_authentication_posture() {
+        // The property: of two configs differing only in whether a posture is
+        // stated, the one that states none must still be told about the thing
+        // it has to physically change. `check_boot_rules` ran in
+        // `main::check_config`, after `Config::load` had returned, so it sat
+        // below the policy check: `--check-config` on a kill switch with no
+        // vpn profile and no posture answered "no [auth] section…", and the
+        // operator saw "Configure a vpn profile, or unset
+        // network_kill_switch" only on the next run. Demonstrated on both
+        // configs.
+        let dir = tempdir().unwrap();
+
+        let stated = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
+        let msg = format!("{:#}", Config::load(&stated).unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch"),
+            "the posture is stated, so the boot rule is what is left; got: {msg}",
+        );
+
+        // The same file with the opt-out line removed, so no posture is
+        // stated and both refusals apply.
+        let body = with_top_level("network_kill_switch = true")
+            .replace("allow_unauthenticated = true\n", "");
+        assert!(!body.contains("allow_unauthenticated"));
+        let sub = dir.path().join("b");
+        fs::create_dir_all(&sub).unwrap();
+        let unstated = write_cfg(&sub, &body);
+        let msg = format!("{:#}", Config::load(&unstated).unwrap_err());
+        assert!(
+            msg.contains("network_kill_switch"),
+            "shape before policy: the kill switch names something the operator \
+             must physically change, and it is reported first; got: {msg}",
+        );
+    }
+
+    #[test]
+    fn an_operator_subcommand_gets_the_boot_rules_too() {
+        // The property: the exemption `load_for_operator_tool` carries is from
+        // the *posture* check and nothing else. A boot rule that is a pure
+        // function of the file is not about serving, so a subcommand is held
+        // to it — demonstrated before this change by `pool status` running
+        // happily against a config `--check-config` refuses.
+        let dir = tempdir().unwrap();
+        let p = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
+        let msg = format!("{:#}", Config::load_for_operator_tool(&p).unwrap_err());
         assert!(
             msg.contains("network_kill_switch") && msg.contains("vpn"),
             "got: {msg}",
@@ -2063,6 +2985,9 @@ listen_interfaces = "0.0.0.0:6882"
         // The ruleset matches the daemon's uid and admits only the tunnel
         // interfaces, so a host profile under it sends nothing at all while
         // it stays Active and `/healthz` answers 200.
+        //
+        // Boot rules run inside `Config::validate`, so this is a refusal of
+        // `Config::load` itself and reaches `--check-config` with the rest.
         let dir = tempdir().unwrap();
         let body = format!(
             "{TOP_LEVEL}\nnetwork_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
@@ -2074,8 +2999,7 @@ listen_interfaces = "0.0.0.0:6882"
              user_agent = \"ua-a\"\n"
         );
         let p = write_cfg(dir.path(), &body);
-        let cfg = Config::load(&p).expect("it parses and validates; it does not boot");
-        let msg = format!("{:#}", cfg.check_boot_rules().unwrap_err());
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(
             msg.contains("network_kill_switch") && msg.contains("public"),
             "got: {msg}",
@@ -2147,6 +3071,7 @@ default_save_path = "{r}"
 resume_dir = "{r}/resume"
 torrent_dir = "{d}/torrents"
 http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
 
 [[profile]]
 id = "public"
@@ -2179,6 +3104,7 @@ default_save_path = "{d}/data"
 resume_dir = "{d}/resume"
 torrent_dir = "{d}/torrents"
 http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
 
 [[profile]]
 id = "public"
@@ -2219,5 +3145,208 @@ library_dir = "{d}/library"
         let d = Config::diff(&old, &new);
         assert_eq!(d.connections_limit, Some(20000));
         assert_eq!(d.non_reloadable_changes, vec!["torrent_dir"]);
+    }
+
+    #[test]
+    fn the_shared_test_fixture_states_a_posture() {
+        // The property: the config the HTTP and pool test modules build their
+        // `AppState`/`PoolService` from is a shape the daemon would start
+        // from, at least as far as the posture goes. It stated none — no
+        // `[auth]`, no opt-out — which is the one shape `--check-config`
+        // refuses outright, so every handler test using it exercised the
+        // serving path against a configuration the daemon refuses to serve.
+        //
+        // The fixture has no `[[profile]]`, so `validate()` as a whole is not
+        // what it can satisfy; the posture is, and the posture is what this
+        // change made a required statement.
+        let dir = tempdir().unwrap();
+        let cfg = Config::minimal_for_tests(dir.path(), false);
+        cfg.validate_auth_posture()
+            .expect("the shared fixture must state a posture the daemon accepts");
+    }
+
+    #[test]
+    fn an_edit_to_any_non_reloadable_key_is_reported() {
+        // The property: a config that differs in exactly one key the daemon
+        // cannot apply is not an unchanged config, and the warning names the
+        // key that changed. Five keys reached no branch of `diff` at all, so
+        // `is_empty()` stayed true and `reload::run` answered
+        // `SIGHUP: config unchanged` to a file that plainly had. Each is
+        // exercised on its own, because a change that only *happens* to
+        // travel with a reported key is not the failure this is about.
+        //
+        // `network_kill_switch` is the one with a security consequence: an
+        // operator who turns the fail-closed kill switch on and reloads was
+        // told nothing had changed.
+        let dir = tempdir().unwrap();
+        let base = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+
+        let mut save_path = base.clone();
+        save_path.default_save_path = PathBuf::from("/data/elsewhere");
+
+        let mut registry = base.clone();
+        registry.registry_path = Some(PathBuf::from("/var/lib/torrentd/assignments.json"));
+
+        let mut handshake = base.clone();
+        handshake.vpn_handshake_max_age_secs = base.vpn_handshake_max_age_secs + 60;
+
+        let mut kill_switch = base.clone();
+        kill_switch.network_kill_switch = !base.network_kill_switch;
+
+        let mut pool = base.clone();
+        pool.pool = Some(PoolConfig {
+            roots: vec![PathBuf::from("/data/pool")],
+            library_dir: PathBuf::from("/data/library"),
+            db_path: None,
+            max_concurrent_verify: 1,
+            import_legacy_registry: false,
+            allow_mutations: false,
+        });
+
+        for (field, edited) in [
+            ("default_save_path", &save_path),
+            ("registry_path", &registry),
+            ("vpn_handshake_max_age_secs", &handshake),
+            ("network_kill_switch", &kill_switch),
+            ("pool", &pool),
+        ] {
+            let d = Config::diff(&base, edited);
+            assert!(
+                !d.is_empty(),
+                "a config differing only in {field} must not look unchanged",
+            );
+            assert!(
+                d.non_reloadable_changes.contains(&field),
+                "the warning for a changed {field} must name it; got {:?}",
+                d.non_reloadable_changes,
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_reloadable_key_is_a_difference_and_is_named() {
+        // The property: a config that **deletes** one reloadable key is not an
+        // unchanged config, and the diff names the key that went away.
+        //
+        // The five below are `Option` on both sides, so the comparison that
+        // reports them had nothing to assign but `None` — and `None` is what
+        // `is_empty()` reads as "this key did not change". Every one of them
+        // answered `SIGHUP: config unchanged` on a live daemon, one deletion
+        // per reload; worse, that answer `continue`s before `current = next`,
+        // so the deletion stayed invisible to every later reload too. The
+        // sample config documents deleting a key as the way back to the
+        // preset default, so this is the documented edit and not an exotic
+        // one.
+        //
+        // Each is exercised on its own: a deletion that only *happens* to
+        // travel with a key that is reported some other way is not this.
+        let dir = tempdir().unwrap();
+        let base = Config::load(&write_cfg(
+            dir.path(),
+            &with_top_level(
+                "aio_threads = 8\nenable_lsd = true\nupload_rate_limit = 1000000\n\
+                 max_concurrent_http_announces = 30",
+            ),
+        ))
+        .unwrap();
+        // The fixture must actually set all five, or a "deletion" below would
+        // be a no-op and the test would pass on nothing.
+        assert!(
+            base.connections_limit.is_some()
+                && base.aio_threads.is_some()
+                && base.enable_lsd.is_some()
+                && base.upload_rate_limit.is_some()
+                && base.max_concurrent_http_announces.is_some(),
+            "the fixture must set every key this test deletes",
+        );
+
+        let mut connections_limit = base.clone();
+        connections_limit.connections_limit = None;
+
+        let mut aio_threads = base.clone();
+        aio_threads.aio_threads = None;
+
+        let mut enable_lsd = base.clone();
+        enable_lsd.enable_lsd = None;
+
+        let mut upload_rate_limit = base.clone();
+        upload_rate_limit.upload_rate_limit = None;
+
+        let mut announces = base.clone();
+        announces.max_concurrent_http_announces = None;
+
+        for (field, edited) in [
+            ("connections_limit", &connections_limit),
+            ("aio_threads", &aio_threads),
+            ("enable_lsd", &enable_lsd),
+            ("upload_rate_limit", &upload_rate_limit),
+            ("max_concurrent_http_announces", &announces),
+        ] {
+            let d = Config::diff(&base, edited);
+            assert!(
+                !d.is_empty(),
+                "a config that deleted {field} must not look unchanged",
+            );
+            assert!(
+                d.reloadable_changes.contains(&field),
+                "the diff must name {field} as changed; got {:?}",
+                d.reloadable_changes,
+            );
+            assert!(
+                d.reloadable_deletions.contains(&field),
+                "the diff must name {field} as deleted, so the pump can say the \
+                 preset default needs a restart; got {:?}",
+                d.reloadable_deletions,
+            );
+        }
+    }
+
+    #[test]
+    fn an_edit_to_only_non_reloadable_keys_applies_no_settings() {
+        // The property: the reload pump's per-profile settings loop is
+        // skipped for an edit it cannot apply anything from, so such a reload
+        // does not close with `INFO SIGHUP: settings applied`.
+        //
+        // Once the non-reloadable keys are reported, `is_empty()` is false for
+        // an edit that touched only them, so the pump falls through its
+        // warnings into that loop and calls `apply_settings` with a patch that
+        // sets nothing. It succeeds, and the journal's last word on a reload
+        // that was ignored is a success line. `reload::run` guards on this
+        // predicate; nothing in the workspace drives the pump itself, so the
+        // guard is pinned here rather than through `run`.
+        let dir = tempdir().unwrap();
+        let base = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+
+        // The documented operator edit: add `[auth]`, delete the opt-out.
+        let mut with_auth = base.clone();
+        with_auth.auth = Some(crate::auth::AuthConfig {
+            password_hash: crate::auth::hash_password("hunter2").unwrap(),
+            session_ttl_secs: 43_200,
+            token: vec![],
+        });
+        with_auth.allow_unauthenticated = false;
+
+        let d = Config::diff(&base, &with_auth);
+        assert!(
+            !d.is_empty(),
+            "the edit is reported, so the diff is not empty"
+        );
+        for profile in [host_profile(), vpn_profile()] {
+            assert!(
+                ConfigDiff::settings_patch_is_empty(&d.to_settings_patch_for(&profile)),
+                "an auth-only edit has nothing to apply to profile {}",
+                profile.id,
+            );
+        }
+
+        // A reloadable key in the same edit still reaches the loop: the guard
+        // withholds a no-op call, not every call.
+        let mut also_reloadable = with_auth.clone();
+        also_reloadable.connections_limit = Some(20_000);
+        let d = Config::diff(&base, &also_reloadable);
+        assert!(
+            !ConfigDiff::settings_patch_is_empty(&d.to_settings_patch_for(&host_profile())),
+            "a changed connections_limit must still be applied",
+        );
     }
 }

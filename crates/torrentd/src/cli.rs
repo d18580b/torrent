@@ -106,7 +106,15 @@ pub enum VpnCmd {
         /// prompts for a password it cannot read and the bring-up fails. Run
         /// it under `sudo`, or from something already running as root. Every
         /// other flag here works unprivileged.
-        #[arg(long)]
+        ///
+        /// Because it modifies the host, this is also the one `vpn check`
+        /// invocation that is NOT exempt from the authentication-posture
+        /// check: it takes the daemon's full validation, so a configuration
+        /// the daemon refuses to start from cannot be used to bring a tunnel
+        /// up either. Observe-only `vpn check` keeps the exemption and still
+        /// runs against a config the daemon refuses, which is the pre-flight
+        /// it exists for.
+        #[arg(long, verbatim_doc_comment)]
         bring_up: bool,
         /// Prove the tunnel carries traffic: send a DNS query from a socket
         /// bound to the tunnel address and require a reply, e.g. `1.1.1.1:53`.

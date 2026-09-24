@@ -11,8 +11,54 @@
 default_save_path = "/data/torrents"
 resume_dir        = "/var/lib/torrentd/resume"
 torrent_dir       = "/var/lib/torrentd/torrents"
-http_listen       = "127.0.0.1:8080"
+http_listen       = "127.0.0.1:8080"   # loopback by default
 log_level         = "info"   # error | warn | info | debug (reloadable)
+
+# The daemon refuses to start unless you either configure [auth] (see the
+# bottom of this file) or say here that you do not want authentication. This
+# sample takes the second option because it binds loopback, where access
+# control is the reverse proxy's job. Delete this line and configure [auth]
+# before exposing the API anywhere — a non-loopback bind without [auth] is
+# refused outright.
+#
+# Read once, at startup, like [auth], http_listen and trusted_proxies: editing
+# any of the four takes effect on restart, not on SIGHUP. A reload after such an
+# edit warns "requires daemon restart; ignored" and changes nothing.
+allow_unauthenticated = true
+
+# Peers whose forwarding headers are believed, as IPs or CIDR blocks. There
+# are three such headers and all three are read: X-Forwarded-For,
+# X-Forwarded-Proto and RFC 7239 Forwarded. Empty by default, which means no
+# forwarding header is ever read and the socket's peer address is the client.
+#
+# The proxy must strip or overwrite all three before adding its own. That is
+# the only requirement torrentd places on it, and it covers Forwarded too, not
+# just the two X- names: where an X- name is absent, the client's Forwarded is
+# what the daemon reads. `deploy/Caddyfile` is the worked example.
+#
+# A /0 prefix is refused at startup. It would make every caller a trusted
+# proxy, which makes every forwarding header client-controlled.
+#
+# Set this to the address your reverse proxy connects from, and only that:
+# anything listed here can claim to be any client. Three things use it — the
+# login throttle, which becomes per-client instead of one shared bucket; the
+# `Secure` attribute on the session cookie, which is set when the original
+# request was over TLS; and the `client_ip` field on the login log lines,
+# including the one that records a failed attempt.
+#
+# One address, not a range. `deploy/compose.yaml` pins its `proxy` service to
+# 172.28.0.2 on an explicit subnet precisely so a single /32 can be named here;
+# a range such as 172.16.0.0/12 would trust every container on every Docker
+# network on the host.
+#
+# Read once, at startup, like [auth], http_listen and allow_unauthenticated:
+# the trust set is parsed before anything is served and does not follow a
+# running daemon. Editing this key and sending SIGHUP warns "requires daemon
+# restart; ignored" and changes nothing — decommission a proxy here and the
+# daemon keeps believing its headers until you restart.
+#
+# torrentd never terminates TLS itself. See deploy/Caddyfile.
+# trusted_proxies = ["172.28.0.2"]
 
 # `resume_dir` and `torrent_dir` are roots: each profile gets its own
 # subdirectory under them, named after the profile id. A profile may override
@@ -248,15 +294,38 @@ dht               = true
 # allow_mutations = false
 
 # ---------------------------------------------------------------------------
-# Authentication
+# Authentication — required, one way or the other
 # ---------------------------------------------------------------------------
+# The daemon refuses to start unless you have either configured `[auth]` or
+# written `allow_unauthenticated = true`. Without `[auth]` it authenticates
+# nothing: every route, including every mutating one, is open to anyone who can
+# reach the port. That is a legitimate posture behind a reverse proxy that does
+# its own access control — but not one to arrive at by omission, which is what
+# it used to be.
+#
+# The opt-out does not extend to a routable address: `allow_unauthenticated`
+# with a non-loopback `http_listen` is refused, because that is an
+# unauthenticated mutating API on the network. So the two safe shapes are:
+#
+#   loopback + allow_unauthenticated   access control is the proxy's job
+#   any bind + [auth]                  the daemon authenticates itself
+#
+# This sample ships the first, because it binds loopback: see
+# `allow_unauthenticated` in the daemon-wide block at the top. Configure [auth]
+# below and delete that line before exposing the API anywhere.
 # Generate the values — never write a password or token here by hand:
 #   torrentd --config /etc/torrentd/torrentd.toml hash-password
 #   torrentd --config /etc/torrentd/torrentd.toml new-token --name ci --scopes read
 #
-# Bootstrapping order: `--config` is validated before any subcommand runs, so
-# write this file *without* `[auth]` first, generate the values, then add the
-# section.
+# Bootstrapping order: `--config` is read before any subcommand runs, so this
+# file has to exist and parse first — but `hash-password`, `new-token`, the
+# `pool` subcommands and observe-only `vpn check` are exempt from the
+# authentication posture check, because they construct no session and bind
+# nothing. `vpn check --bring-up` is not: it raises a real tunnel on this host,
+# so it takes the daemon's full check. So write this file without `[auth]` and
+# with whatever `http_listen` the deployment needs, generate the values, then
+# add the section. In a container: `compose run --rm torrentd hash-password`.
+# See docs/running.md §6.
 #
 # The token is printed once and is not stored; only its SHA-256 goes below, so
 # a leaked config file cannot be replayed as a credential. The password gets
