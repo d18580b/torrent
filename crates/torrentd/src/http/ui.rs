@@ -225,19 +225,21 @@ fn with_encoding(tag: &str, encoding: Option<&str>) -> String {
 /// `*` matches anything present, per RFC 9110; otherwise any member of the
 /// comma-separated list matching the tag is a hit. Weak prefixes are stripped
 /// because a weak comparison is the right one for a conditional GET.
+///
+/// The list is read across **every** field line, as [`accepts`] reads
+/// `Accept-Encoding`: RFC 9110 §5.3 makes a list-valued header split over
+/// several lines equivalent to one line joined with commas, so a member on
+/// the second line is as much a member as one on the first. A `*` member is
+/// read as `*` wherever it appears; a line that is not visible ASCII is
+/// skipped rather than voiding the others.
 fn matches_etag(headers: &HeaderMap, tag: &str) -> bool {
-    let Some(inm) = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|v| v.to_str().ok())
-    else {
-        return false;
-    };
-    if inm.trim() == "*" {
-        return true;
-    }
-    inm.split(',')
+    headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
         .map(|c| c.trim().trim_start_matches("W/"))
-        .any(|c| c == tag)
+        .any(|c| c == "*" || c == tag)
 }
 
 /// `Cache-Control` for a path.
@@ -430,6 +432,28 @@ mod tests {
             &headers(&[(header::IF_NONE_MATCH, "\"x\", \"y\"")]),
             "\"abc\""
         ));
+    }
+
+    #[test]
+    fn a_member_on_a_later_field_line_matches() {
+        let mut h = HeaderMap::new();
+        h.append(header::IF_NONE_MATCH, HeaderValue::from_static("\"x\""));
+        h.append(header::IF_NONE_MATCH, HeaderValue::from_static("\"abc\""));
+        assert!(matches_etag(&h, "\"abc\""));
+
+        let mut h = HeaderMap::new();
+        h.append(header::IF_NONE_MATCH, HeaderValue::from_static("\"x\""));
+        h.append(header::IF_NONE_MATCH, HeaderValue::from_static("\"y\""));
+        assert!(!matches_etag(&h, "\"abc\""));
+
+        // A non-UTF-8 line is skipped, not fatal to the lines around it.
+        let mut h = HeaderMap::new();
+        h.append(
+            header::IF_NONE_MATCH,
+            HeaderValue::from_bytes(b"\"\xff\"").unwrap(),
+        );
+        h.append(header::IF_NONE_MATCH, HeaderValue::from_static("\"abc\""));
+        assert!(matches_etag(&h, "\"abc\""));
     }
 
     #[test]
