@@ -68,8 +68,9 @@ Everyday tasks:
 | `mise run fmt-fix` | Apply formatting                                         |
 | `mise run lint`    | Clippy across the workspace, warnings denied             |
 | `mise run lint-fix`| Clippy autofix                                           |
-| `mise run test`    | `cargo test --workspace`                                 |
+| `mise run test`    | Workspace unit tests (see Test, below)                   |
 | `mise run check`   | fmt + lint                                               |
+| `mise run test-all`| every test layer, including the ignored ones             |
 | `mise run native`  | Provision the shared libtorrent prefix (see Build)       |
 | `mise run native-clean` | Delete every cached native prefix                   |
 | `mise run vpn-check <config> [-- <flags>]` | Verify a real VPN configuration (see below) |
@@ -132,6 +133,11 @@ cargo build --workspace          # debug
 cargo build --workspace --release
 ```
 
+Node is a build dependency of the default feature set and the build panics
+without it. Building headless — the `--no-default-features` flag and what it
+costs you — is documented in one place,
+[`docs/running.md` §3](docs/running.md#3-build).
+
 ### The shared native prefix
 
 `libtorrent-sys` builds Boost and libtorrent into a content-addressed directory outside
@@ -173,13 +179,25 @@ reason to re-run and rebuild rather than linking against paths that no longer ex
 
 ## Test
 
-```bash
-cargo test --workspace                              # all unit + integration tests
-cargo test -p libtorrent-sys --features shim-tests  # Layer 2 shim FFI tests (Linux only)
-```
+Every test command is a mise task, and CI runs the same tasks:
 
-Integration tests that spin up real libtorrent sessions are gated behind `--ignored`
-and run as a separate CI job Strategy.
+| Task | Layer |
+| --- | --- |
+| `mise run test` | unit + in-memory; no libtorrent, no network |
+| `mise run test-shim` | Layer 2, the C ABI boundary. Needs the `vendor/libtorrent` submodule for its `.torrent` fixtures. |
+| `mise run test-lifecycle` | Layer 3, real libtorrent against real disk. No network. |
+| `mise run test-daemon` | Layer 3, spawns the built binary and drives it over HTTP |
+| `mise run test-all` | all of the above |
+| `mise run bench -- <subcommand>` | Layer 4, manual: minutes and GBs of RAM |
+
+Layers 2 and 3 are `#[ignore]`d or feature-gated so `mise run test` stays fast,
+and each runs as its own CI job.
+
+`mise run vpn-check <config>` verifies a real VPN configuration against the
+real host. It inspects `vpn` profiles, so the config it is given needs one,
+and needs `--profile <id>` naming it if that config also carries `host`
+profiles. It is deliberately not part of any `test` task: it needs real
+tunnels and is meaningless in CI.
 
 Deploying it for real — packages, submodules, the service user, directories,
 config, auth bootstrap, ulimits, and the drills worth running once before you
@@ -201,12 +219,12 @@ fields have **one** spelling each, because log queries depend on it:
 
 | Field | Notes |
 | --- | --- |
-| `profile_id` | The `id` of a configured `[[profile]]`. Always present — every torrent belongs to exactly one profile, and there is no implicit one. |
-| `infohash` | Lowercase hex, 40 chars. **Never** `info_hash` — CI fails on that spelling anywhere in `crates/`. |
+| `profile_id` | The `id` of a configured `[[profile]]`. Always present — every torrent belongs to exactly one profile, and there is no implicit one. **Never** `slot_id`, its name before profiles; CI fails on that spelling in any `.rs` file under `crates/`. |
+| `infohash` | Lowercase hex, 40 chars. **Never** `info_hash` — CI fails on that spelling in any `.rs` file under `crates/`. |
 | `op` | The engine operation: `add_torrent`, `remove_torrent`, `pause_torrent`, `resume_torrent`, `save_resume_data`, `set_upload_limit`, `set_file_priority`, `force_recheck`, `move_storage`, `apply_settings`. |
 | `alert_type` | Lowercase `AlertKind`, e.g. `add_torrent`. |
 | `error.kind` / `error.code` / `error.cause` | Short identifier, OS or libtorrent code, human-readable cause. |
-| `vpn_iface`, `tunnel_ip` | Profile networking. |
+| `vpn_iface`, `tunnel_ip` | Tunnel networking, on `vpn` profiles. |
 | `pending_resume_count` | Outstanding `save_resume_data` calls. |
 
 `error.kind` cannot be the first field in an `error!` macro — the macro name and
