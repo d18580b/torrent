@@ -1,22 +1,22 @@
-//! `torrentd vpn check` — verify a slot's VPN configuration against the real
+//! `torrentd vpn check` — verify a profile's VPN configuration against the real
 //! host, with no libtorrent session, no torrents and no tracker contact.
 //!
 //! Every other way of exercising this code needs a fully configured daemon: a
-//! pool, a torrent library, real payload, and an operator watching `/slots` for
+//! pool, a torrent library, real payload, and an operator watching `/profiles` for
 //! thirty seconds to see whether the health monitor fences anything. That
 //! conflates two independent things — "does my VPN configuration work" and
 //! "does my seeding setup work" — and it is the first of those that has to be
 //! true before the second is worth testing.
 //!
-//! Host prerequisites run first, then each slot's checks in the order `boot`
+//! Host prerequisites run first, then each profile's checks in the order `boot`
 //! performs them. The host block is deliberately *not* in boot's order: boot
-//! installs the kill switch last, after every slot is up, and burying a
+//! installs the kill switch last, after every profile is up, and burying a
 //! missing `iproute2` or `nft` behind a thirty-second tunnel bring-up would
 //! cost an operator the thing this command is for.
 //!
 //! Observe-only by default, stated precisely: the default path makes **no
 //! host change** and **deletes nothing**. It reads interfaces, reads `wg`
-//! output, reads sysctls, and — for a NAT-PMP slot — asks the gateway for a
+//! output, reads sysctls, and — for a NAT-PMP profile — asks the gateway for a
 //! mapping with the daemon's own short lease and lets that lease lapse. Its
 //! one interaction with a running daemon is that NAT-PMP request, sent from
 //! the same client identity the daemon uses; whether a gateway coalesces it
@@ -52,7 +52,7 @@ use serde::Serialize;
 use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
-use torrentd_engine::SlotConfig;
+use torrentd_engine::ProfileConfig;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
 
@@ -67,7 +67,7 @@ const EGRESS_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Verdict {
     Pass,
     Fail,
-    /// Correctly configured to not apply — a NAT-PMP check on a static slot,
+    /// Correctly configured to not apply — a NAT-PMP check on a static profile,
     /// a handshake check on OpenVPN. Distinct from `Pass` so a summary cannot
     /// read as "everything was verified" when most of it was skipped.
     Skip,
@@ -167,13 +167,13 @@ impl Check {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SlotReport {
-    pub slot_id: String,
+pub struct ProfileReport {
+    pub profile_id: String,
     pub vpn_type: &'static str,
     pub checks: Vec<Check>,
 }
 
-impl SlotReport {
+impl ProfileReport {
     pub fn failed(&self) -> bool {
         self.checks.iter().any(|c| c.verdict == Verdict::Fail)
     }
@@ -182,7 +182,7 @@ impl SlotReport {
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub host: Vec<Check>,
-    pub slots: Vec<SlotReport>,
+    pub profiles: Vec<ProfileReport>,
 }
 
 /// Everything established was good — excluding a check nothing this
@@ -197,13 +197,13 @@ pub const EXIT_UNKNOWN: i32 = 2;
 impl Report {
     pub fn failed(&self) -> bool {
         self.host.iter().any(|c| c.verdict == Verdict::Fail)
-            || self.slots.iter().any(SlotReport::failed)
+            || self.profiles.iter().any(ProfileReport::failed)
     }
 
     fn checks(&self) -> impl Iterator<Item = &Check> {
         self.host
             .iter()
-            .chain(self.slots.iter().flat_map(|s| &s.checks))
+            .chain(self.profiles.iter().flat_map(|s| &s.checks))
     }
 
     /// Whether any check could not be performed at all.
@@ -233,7 +233,7 @@ impl Report {
     /// for want of permission established nothing about the handshake half and
     /// exited 0.
     ///
-    /// `Skip` is not `Unknown`: a NAT-PMP check on a static slot did not fail
+    /// `Skip` is not `Unknown`: a NAT-PMP check on a static profile did not fail
     /// to happen, it correctly did not apply, and it does not colour the
     /// status.
     pub fn exit_code(&self) -> i32 {
@@ -299,7 +299,7 @@ fn tool_available(bin: &str, probe_arg: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// The host-touching operations a slot's checks perform, behind a trait so the
+/// The host-touching operations a profile's checks perform, behind a trait so the
 /// branch structure around them is testable without a tunnel or a gateway.
 ///
 /// Two of those branches are the reason this exists rather than being inlined:
@@ -315,10 +315,10 @@ pub trait CheckHost {
     /// is still somebody else's outage.
     fn interface_exists(&self, iface: &str) -> bool;
 
-    /// The address the daemon would bind every socket in this slot to.
+    /// The address the daemon would bind every socket in this profile to.
     fn first_ipv4(&self, iface: &str) -> std::io::Result<Ipv4Addr>;
 
-    /// The tunnel manager for a slot's VPN type.
+    /// The tunnel manager for a profile's VPN type.
     fn manager(&self, t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager>;
 
     /// A NAT-PMP client with startup's retransmit budget that deletes nothing.
@@ -343,14 +343,14 @@ pub trait CheckHost {
     /// Whether an executable answers `probe_arg` with a zero status.
     fn tool_available(&self, bin: &str, probe_arg: &str) -> bool;
 
-    /// Stat the slot's VPN profile, or say why it could not be.
+    /// Stat the profile's tunnel config, or say why it could not be.
     fn profile_metadata(&self, path: &Path) -> std::io::Result<()>;
 
     /// [`vpn::wireguard_handshake_age`], with its reason reduced to the string
     /// that type already publishes.
     ///
     /// Behind the trait so [`judge_handshake`]'s fresh and stale arms are
-    /// reachable through [`slot_checks`] without a live tunnel, and so a slot's
+    /// reachable through [`profile_checks`] without a live tunnel, and so a profile's
     /// checks reach the host through this seam and nothing else.
     fn handshake_age(&self, iface: &str) -> Result<Option<Duration>, &'static str>;
 
@@ -692,11 +692,11 @@ fn judge_nft_check(
     uid: u32,
     ruleset: &str,
 ) -> Check {
-    // Boot builds this interface list from the slots whose tunnel actually
-    // came up, not from every configured slot. Without a live registry this
+    // Boot builds this interface list from the profiles whose tunnel actually
+    // came up, not from every configured profile. Without a live registry this
     // check cannot know that set; naming the discrepancy is honest, and
     // guessing at it would not be.
-    let caveat = "interfaces listed are the configured slots; boot lists only the slots \
+    let caveat = "interfaces listed are the configured profiles; boot lists only the profiles \
                   whose tunnel came up";
     match outcome {
         Err(e) => Check::unknown(
@@ -749,10 +749,10 @@ fn judge_nft_check(
 /// is documented at `vpn/wireguard.rs` as meaning *either* "not a WireGuard
 /// interface" *or* "no permission", and privilege is the one axis that cannot
 /// separate them: `wg show lo` and `wg show <nonexistent>` return the same
-/// refusal. Resolving it by privilege alone gave a wireguard slot pointed at a
-/// non-WireGuard interface — a configuration `SlotConfig::validate_set`
-/// accepts, since it constrains only that the interface equals the profile's
-/// file stem — an all-clear `0` and a message asserting the daemon would be
+/// refusal. Resolving it by privilege alone gave a wireguard profile pointed at
+/// a non-WireGuard interface — a configuration `ProfileConfig::validate_set`
+/// accepts, since it constrains only that the interface equals the tunnel
+/// config's file stem — an all-clear `0` and a message asserting the daemon would be
 /// fine. A capability-free read of the link type says otherwise, and that is a
 /// `fail` about the configuration rather than an `unknown` about this shell.
 ///
@@ -776,7 +776,7 @@ fn judge_handshake(
                 "{iface} is not a WireGuard device: the kernel reports no wireguard link \
                  type for it, so `wg show {iface} latest-handshakes` can never answer and \
                  the daemon's health monitor would fall back to IP presence alone for this \
-                 slot. Point vpn_interface at the slot's own tunnel"
+                 profile. Point vpn_interface at the profile's own tunnel"
             ),
         );
     }
@@ -793,7 +793,7 @@ fn judge_handshake(
             "handshake",
             format!(
                 "last handshake {}s ago, over the {}s threshold: the daemon would fence this \
-                 slot",
+                 profile",
                 age.as_secs(),
                 max.as_secs()
             ),
@@ -852,24 +852,24 @@ fn nft_check(ruleset: &str) -> std::io::Result<std::process::Output> {
     child.wait_with_output()
 }
 
-/// Checks that are about the host, not any one slot.
+/// Checks that are about the host, not any one profile.
 ///
 /// `iproute2` and `nftables` are here because they genuinely are host-wide: a
-/// missing binary is missing for every slot, and neither answer changes with
-/// `--slot`. `rp_filter` is **not** here, even though it reads a sysctl:
-/// `conf/<iface>/rp_filter` is per slot by construction, so judging it here
+/// missing binary is missing for every profile, and neither answer changes with
+/// `--profile`. `rp_filter` is **not** here, even though it reads a sysctl:
+/// `conf/<iface>/rp_filter` is per profile by construction, so judging it here
 /// scoped a check to interfaces the operator had excluded — a run narrowed to
-/// one healthy slot exited 2 because of another slot's interface — and ran it
+/// one healthy profile exited 2 because of another profile's interface — and ran it
 /// before `--bring-up` had raised anything, so the sysctl for the interface
 /// the command was about to create did not exist yet. It also put two checks
 /// named `rp_filter` in the same `host` array, which the `--json` contract
 /// cannot express to a consumer keying by name. It lives in
-/// [`slot_checks`] instead.
+/// [`profile_checks`] instead.
 ///
-/// Every host touch goes through `host` for the same reason [`slot_checks`]'s
+/// Every host touch goes through `host` for the same reason [`profile_checks`]'s
 /// do: the classification this function performs — which `nft --check` failure
-/// is a rejection of the ruleset, and whether an excluded slot's interface may
-/// decide a scoped run — is branch logic, and a test that shells out to the
+/// is a rejection of the ruleset, and whether an excluded profile's interface
+/// may decide a scoped run — is branch logic, and a test that shells out to the
 /// real `ip` and `nft` asserts whatever the machine it runs on happens to
 /// answer.
 fn host_checks(
@@ -919,8 +919,11 @@ fn host_checks(
                  nothing to render a ruleset for; see kill_switch_uid",
             ),
             Some(uid) => {
-                let tunnels: Vec<String> =
-                    cfg.slot.iter().map(|s| s.vpn_interface.clone()).collect();
+                let tunnels: Vec<String> = cfg
+                    .profile
+                    .iter()
+                    .filter_map(|p| p.vpn_interface().map(str::to_string))
+                    .collect();
                 let ruleset = vpn::killswitch::render_ruleset(uid, &tunnels);
                 let verdict = judge_nft_check(
                     host.nft_check(&ruleset),
@@ -938,22 +941,23 @@ fn host_checks(
     out
 }
 
-/// Keep an excluded slot's interface out of a scoped run's exit status.
+/// Keep an excluded profile's interface out of a scoped run's exit status.
 ///
 /// The kill-switch table is host-wide — boot installs it whole — so the
-/// rendered ruleset lists every configured slot, and the caveat in the detail
-/// already says so. That justifies *listing* them. It does not justify letting
-/// one decide the verdict of a run the operator narrowed with `--slot`:
-/// `cli.rs` says "Check only this slot." and `docs/running.md` "Check one slot
-/// instead of every configured slot", and a rejection caused by an interface
-/// belonging to a slot that was excluded is a `fail` and an exit `1` for a
-/// slot nobody asked about.
+/// rendered ruleset lists every configured vpn profile's interface, and the
+/// caveat in the detail already says so. That justifies *listing* them. It
+/// does not justify letting one decide the verdict of a run the operator
+/// narrowed with `--profile`: `cli.rs` says "Check only this profile." and
+/// `docs/running.md` "Check one profile instead of every configured profile",
+/// and a rejection caused by an interface belonging to a profile that was
+/// excluded is a `fail` and an exit `1` for a profile nobody asked about.
 ///
-/// Attribution is by re-rendering: the same ruleset for the selected slot's
+/// Attribution is by re-rendering: the same ruleset for the selected profile's
 /// interfaces alone, dry-run the same way. If that parses while the full one
-/// did not, the rejection is the excluded slots' and this run reports it
-/// without colouring the status. If it fails too, the selected slot owns it
-/// and the verdict stands. Nothing here reads nft's message for interface
+/// did not, the rejection is the excluded profiles' and this run reports it
+/// without colouring the status. If it fails too, the selected profile owns it
+/// and the verdict stands. A host profile has no interface in the table, so an
+/// excluded host profile can own no part of a rejection. Nothing here reads nft's message for interface
 /// names — every name is in it, including the ones that are fine.
 fn attribute_ruleset_rejection(
     verdict: Check,
@@ -970,12 +974,18 @@ fn attribute_ruleset_rejection(
     let Some(id) = only else {
         return verdict;
     };
-    let (kept, excluded): (Vec<&SlotConfig>, Vec<&SlotConfig>) =
-        cfg.slot.iter().partition(|s| s.id.as_str() == id);
+    let (kept, excluded): (Vec<&ProfileConfig>, Vec<&ProfileConfig>) = cfg
+        .profile
+        .iter()
+        .filter(|p| p.vpn_interface().is_some())
+        .partition(|p| p.id.as_str() == id);
     if excluded.is_empty() {
         return verdict;
     }
-    let scoped: Vec<String> = kept.iter().map(|s| s.vpn_interface.clone()).collect();
+    let scoped: Vec<String> = kept
+        .iter()
+        .filter_map(|p| p.vpn_interface().map(str::to_string))
+        .collect();
     let scoped_ruleset = vpn::killswitch::render_ruleset(uid, &scoped);
     let scoped_parses = match host.nft_check(&scoped_ruleset) {
         Ok(o) => {
@@ -990,14 +1000,17 @@ fn attribute_ruleset_rejection(
     }
     let names: Vec<String> = excluded
         .iter()
-        .map(|s| format!("{} (slot {})", s.vpn_interface, s.id.as_str()))
+        .filter_map(|p| {
+            p.vpn_interface()
+                .map(|iface| format!("{iface} (profile {})", p.id.as_str()))
+        })
         .collect();
     Check::skip(
         "kill_switch_ruleset",
         format!(
-            "{} — but the ruleset for slot {id}'s interfaces alone is accepted, so the \
-             rejection belongs to {}, which --slot {id} excluded. It is reported and it does \
-             not decide this run's status; re-run without --slot to have it do so",
+            "{} — but the ruleset for profile {id}'s interfaces alone is accepted, so the \
+             rejection belongs to {}, which --profile {id} excluded. It is reported and it \
+             does not decide this run's status; re-run without --profile to have it do so",
             verdict.detail,
             names.join(", "),
         ),
@@ -1008,8 +1021,8 @@ fn attribute_ruleset_rejection(
 ///
 /// This is the check that distinguishes a tunnel which exists from a tunnel
 /// which works, and it is the same question the daemon asks implicitly of
-/// every slot: `outgoing_interfaces` is pinned to the tunnel IP, so if traffic
-/// cannot leave from that source address the slot connects to no peers and
+/// every profile: `outgoing_interfaces` is pinned to the tunnel IP, so if traffic
+/// cannot leave from that source address the profile connects to no peers and
 /// announces to no tracker, while looking perfectly healthy to the IP-presence
 /// check.
 ///
@@ -1031,7 +1044,7 @@ fn egress_probe(src: IpAddr, dest: SocketAddr) -> Check {
                 "egress",
                 format!(
                     "cannot bind a UDP socket to the tunnel address {src}: {e}. Every socket \
-                     in this slot would fail the same way."
+                     in this profile would fail the same way."
                 ),
             )
         }
@@ -1093,27 +1106,44 @@ fn egress_probe(src: IpAddr, dest: SocketAddr) -> Check {
     }
 }
 
-fn slot_checks(
+/// Check one **vpn** profile.
+///
+/// The three assertions below hold because [`profile_reports`] filters the
+/// selection on [`ProfileConfig::is_vpn`] and routes a host profile to
+/// [`no_tunnel_report`] instead. They were reachable before that filter
+/// existed.
+fn profile_checks(
     cfg: &Config,
-    slot: &SlotConfig,
+    profile: &ProfileConfig,
     bring_up: bool,
     egress: Option<SocketAddr>,
     host: &dyn CheckHost,
-) -> SlotReport {
+) -> ProfileReport {
     let mut checks = Vec::new();
-    let iface = slot.vpn_interface.as_str();
+    let iface = profile
+        .vpn_interface()
+        .expect("only vpn profiles reach profile_checks");
+    let vpn_config = match &profile.network {
+        torrentd_engine::ProfileNetwork::Vpn { vpn_config, .. } => vpn_config.clone(),
+        torrentd_engine::ProfileNetwork::Host { .. } => {
+            unreachable!("filtered by profile_reports")
+        }
+    };
+    let vpn_type = profile
+        .vpn_type()
+        .expect("only vpn profiles reach profile_checks");
 
-    // 1. The profile the daemon would hand to wg-quick / openvpn.
-    checks.push(match host.profile_metadata(&slot.vpn_profile) {
+    // 1. The tunnel config the daemon would hand to wg-quick / openvpn.
+    checks.push(match host.profile_metadata(&vpn_config) {
         Ok(_) => Check::pass(
-            "profile",
-            format!("{} is readable", slot.vpn_profile.display()),
+            "vpn_config",
+            format!("{} is readable", vpn_config.display()),
         ),
-        Err(e) => Check::fail("profile", format!("{}: {e}", slot.vpn_profile.display())),
+        Err(e) => Check::fail("vpn_config", format!("{}: {e}", vpn_config.display())),
     });
 
-    // 2. The tools that slot's type needs.
-    match slot.vpn_type {
+    // 2. The tools that profile's type needs.
+    match vpn_type {
         VpnType::Wireguard => {
             checks.push(if host.tool_available("wg", "--version") {
                 Check::pass("wireguard_tools", "`wg` is available")
@@ -1143,13 +1173,13 @@ fn slot_checks(
     //    is not already there.
     //
     //    `wg-quick up` refuses an interface that already exists, and the
-    //    adoption path in `vpn::wireguard` then matches the profile's public
+    //    adoption path in `vpn::wireguard` then matches the tunnel config's public
     //    key and returns the address anyway. So a running daemon's tunnel used
     //    to be reported as "came up" having been created by nothing, and the
     //    unconditional teardown below then ran the same `wg-quick down` the
-    //    daemon's own shutdown uses. The slot went down, `vpn_monitor` fenced
+    //    daemon's own shutdown uses. The profile went down, `vpn_monitor` fenced
     //    it within 30s, and nothing re-raised it: a diagnostic command took a
-    //    live seeding slot out until someone restarted the daemon.
+    //    live seeding profile out until someone restarted the daemon.
     //
     //    An interface that was already there is adopted for every remaining
     //    check and never lowered. That also leaves the flag useful for the
@@ -1167,7 +1197,7 @@ fn slot_checks(
     //    permanent — a re-run then sees the interface and reports `skip`. And
     //    `Ok` is not evidence of a raise, because the adoption path returns
     //    `Ok` for an interface `wg-quick up` refused.
-    let manager = host.manager(slot.vpn_type, &cfg.state_dir());
+    let manager = host.manager(vpn_type, &cfg.state_dir());
     let existed_before = bring_up && host.interface_exists(iface);
     let mut raised_here = false;
     if bring_up {
@@ -1180,7 +1210,7 @@ fn slot_checks(
                 ),
             ));
         } else {
-            let outcome = manager.bring_up(&slot.vpn_profile());
+            let outcome = manager.bring_up(&profile.vpn_tunnel().expect("vpn profile"));
             raised_here = host.interface_exists(iface);
             match outcome {
                 Ok(ip) => {
@@ -1192,7 +1222,7 @@ fn slot_checks(
                     // address poll, so a failure there can leave a process
                     // standing that this command cannot see to stop;
                     // `wg-quick up` leaves no surviving process, and printing
-                    // openvpn's mechanism for a WireGuard slot sent the
+                    // openvpn's mechanism for a WireGuard profile sent the
                     // operator looking for an orphan that cannot exist — on
                     // the one failure path where the report's precision is
                     // the point.
@@ -1202,7 +1232,7 @@ fn slot_checks(
                              lowering it again"
                         )
                     } else {
-                        match slot.vpn_type {
+                        match vpn_type {
                             VpnType::Openvpn => format!(
                                 "; no {iface} appeared, but openvpn daemonises (it forks and \
                                  exits 0 before its own address poll) so it may have left a \
@@ -1219,9 +1249,9 @@ fn slot_checks(
                     if raised_here {
                         checks.push(teardown(host, manager.as_ref(), iface));
                     }
-                    return SlotReport {
-                        slot_id: slot.id.as_str().to_string(),
-                        vpn_type: vpn_type_str(slot.vpn_type),
+                    return ProfileReport {
+                        profile_id: profile.id.as_str().to_string(),
+                        vpn_type: vpn_type_str(vpn_type),
                         checks,
                     };
                 }
@@ -1229,14 +1259,14 @@ fn slot_checks(
         }
     }
 
-    // 3b. rp_filter, for this slot's interface, after the bring-up step.
+    // 3b. rp_filter, for this profile's interface, after the bring-up step.
     //
     //     Strict reverse-path filtering drops the replies to a source-bound
-    //     socket, so a multi-slot daemon looks like a tunnel that connects and
+    //     socket, so a multi-profile daemon looks like a tunnel that connects and
     //     carries no traffic. docs/running.md calls for 2 (loose). Judged per
     //     interface, because that is how the kernel judges it — and therefore
-    //     judged *here* rather than in `host_checks`, because a per-slot
-    //     property in the unscoped host block ignores `--slot`, and because
+    //     judged *here* rather than in `host_checks`, because a per-profile
+    //     property in the unscoped host block ignores `--profile`, and because
     //     `/proc/sys/net/ipv4/conf/<iface>/rp_filter` does not exist until the
     //     interface does. Reading it before `--bring-up` raised the tunnel
     //     reported `unknown` for the one interface the run was about.
@@ -1244,7 +1274,7 @@ fn slot_checks(
     let per = host.read_sysctl(&format!("/proc/sys/net/ipv4/conf/{iface}/rp_filter"));
     checks.push(judge_rp_filter(iface, all.as_deref(), per.as_deref()));
 
-    // 4. The address the daemon would bind every socket in this slot to.
+    // 4. The address the daemon would bind every socket in this profile to.
     let tunnel_ip = match host.first_ipv4(iface) {
         Ok(v4) => {
             checks.push(Check::pass("tunnel_ip", format!("{iface} has {v4}")));
@@ -1268,7 +1298,7 @@ fn slot_checks(
 
     // 5. Handshake liveness — the same probe and the same threshold the health
     //    monitor applies every 30 seconds.
-    match slot.vpn_type {
+    match vpn_type {
         VpnType::Wireguard => {
             let max = Duration::from_secs(cfg.vpn_handshake_max_age_secs);
             let probe = host.handshake_age(iface);
@@ -1313,16 +1343,16 @@ fn slot_checks(
     //    with the mapping the daemon already holds, or it may hand out a
     //    second one. Which of those happens is gateway behaviour that nothing
     //    in this repository tests.
-    match slot.port_forward {
+    match profile.port_forward() {
         PortForwardMode::Static => {
             checks.push(Check::skip(
                 "port_forward",
-                format!("static listen_port {:?}", slot.listen_port),
+                format!("static listen_port {:?}", profile.listen_port()),
             ));
         }
         PortForwardMode::Natpmp => match (
             tunnel_ip,
-            slot.port_forward_gateway_or_default().parse::<IpAddr>(),
+            profile.port_forward_gateway_or_default().parse::<IpAddr>(),
         ) {
             (Some(bind_ip), Ok(gateway)) => {
                 let lease = crate::port_forward_monitor::LEASE_SECS;
@@ -1385,9 +1415,9 @@ fn slot_checks(
         checks.push(teardown(host, manager.as_ref(), iface));
     }
 
-    SlotReport {
-        slot_id: slot.id.as_str().to_string(),
-        vpn_type: vpn_type_str(slot.vpn_type),
+    ProfileReport {
+        profile_id: profile.id.as_str().to_string(),
+        vpn_type: vpn_type_str(vpn_type),
         checks,
     }
 }
@@ -1397,7 +1427,7 @@ fn slot_checks(
 /// `VpnManager::bring_down` returns `()` and, per its own contract, swallows
 /// its errors to the log — so reporting a pass straight after calling it
 /// reported the one host mutation this command advertises without ever looking
-/// at it. `wg-quick down` can fail: the interface is busy, the profile moved,
+/// at it. `wg-quick down` can fail: the interface is busy, the tunnel config moved,
 /// `wg-quick` is not on this uid's PATH. Look at the address instead, and say
 /// plainly when the host has been left changed.
 ///
@@ -1432,6 +1462,73 @@ fn vpn_type_str(t: VpnType) -> &'static str {
     }
 }
 
+/// Select the profiles `only` names and report on each.
+///
+/// A profile with no tunnel gets a `skip` line rather than being dropped or
+/// being handed to [`profile_checks`]. Dropping it would make a bare
+/// `vpn check` on a host-only deployment print nothing and exit 0, which reads
+/// as "checked, all clear" on a machine that has no tunnel at all —
+/// `README.md` and `cli.rs` both document the bare invocation as every
+/// configured profile. Handing it over is what the command did before: the
+/// selection filtered on id alone, so `profile_checks`'s
+/// `expect("only vpn profiles reach profile_checks")` was reachable from the
+/// shipped sample config, and a documented pre-flight exited 101 — outside the
+/// 0/1/2 contract `cli.rs` publishes. The `skip` follows the precedent the
+/// `--egress` check already sets: report that it did not apply, and do not
+/// colour the exit status.
+///
+/// Split out of [`check`] so the selection is reachable without a real host.
+fn profile_reports(
+    cfg: &Config,
+    only: Option<&str>,
+    bring_up: bool,
+    egress: Option<SocketAddr>,
+    host: &dyn CheckHost,
+) -> anyhow::Result<Vec<ProfileReport>> {
+    if cfg.profile.is_empty() {
+        anyhow::bail!(
+            "no [[profile]] entries are configured, so there is no VPN to check. \
+             A daemon with no [[profile]] table cannot start either; see \
+             deploy/torrentd.sample.toml."
+        );
+    }
+    let selected: Vec<&ProfileConfig> = cfg
+        .profile
+        .iter()
+        .filter(|s| only.is_none_or(|id| s.id.as_str() == id))
+        .collect();
+    if selected.is_empty() {
+        anyhow::bail!("no profile matches {:?}", only.unwrap_or_default());
+    }
+
+    Ok(selected
+        .into_iter()
+        .map(|s| {
+            if s.is_vpn() {
+                profile_checks(cfg, s, bring_up, egress, host)
+            } else {
+                no_tunnel_report(s)
+            }
+        })
+        .collect())
+}
+
+/// The report for a profile that has no tunnel to check.
+fn no_tunnel_report(profile: &ProfileConfig) -> ProfileReport {
+    ProfileReport {
+        profile_id: profile.id.as_str().to_string(),
+        vpn_type: "none",
+        checks: vec![Check::skip(
+            "tunnel",
+            format!(
+                "profile {:?} is network = \"host\" and reaches the network over the \
+                 machine's own interfaces, so it has no tunnel to check",
+                profile.id.as_str(),
+            ),
+        )],
+    }
+}
+
 /// Run the checks, print them, and return the exit status they imply — `0`
 /// clean, `1` for any failure, `2` for "nothing failed, but something could not
 /// be checked". Usable as a pre-flight step in a unit or a CI job, which is why
@@ -1444,28 +1541,10 @@ pub fn check(
     egress: Option<SocketAddr>,
     as_uid: Option<u32>,
 ) -> anyhow::Result<i32> {
-    if cfg.slot.is_empty() {
-        anyhow::bail!(
-            "no [[slot]] entries are configured, so there is no VPN to check. \
-             Single-session mode does not use a tunnel."
-        );
-    }
-    let selected: Vec<&SlotConfig> = cfg
-        .slot
-        .iter()
-        .filter(|s| only.is_none_or(|id| s.id.as_str() == id))
-        .collect();
-    if selected.is_empty() {
-        anyhow::bail!("no slot matches {:?}", only.unwrap_or_default());
-    }
-
     let host = RealHost;
     let report = Report {
         host: host_checks(cfg, as_uid, only, &host),
-        slots: selected
-            .into_iter()
-            .map(|s| slot_checks(cfg, s, bring_up, egress, &host))
-            .collect(),
+        profiles: profile_reports(cfg, only, bring_up, egress, &host)?,
     };
 
     if json {
@@ -1509,8 +1588,8 @@ fn print_human(report: &Report) {
     for c in &report.host {
         println!("  [{}] {:<20} {}", symbol(c), c.name, c.detail);
     }
-    for s in &report.slots {
-        println!("\nslot {} ({})", s.slot_id, s.vpn_type);
+    for s in &report.profiles {
+        println!("\nprofile {} ({})", s.profile_id, s.vpn_type);
         for c in &s.checks {
             println!("  [{}] {:<20} {}", symbol(c), c.name, c.detail);
         }
@@ -1779,13 +1858,13 @@ mod tests {
     impl VpnManager for RecordingVpn {
         fn bring_up(
             &self,
-            profile: &torrentd_engine::VpnProfile,
+            tunnel: &torrentd_engine::VpnTunnel,
         ) -> Result<IpAddr, torrentd_engine::VpnError> {
             self.events
                 .lock()
                 .unwrap()
-                .push(format!("bring_up {}", profile.interface));
-            self.inner.bring_up(profile)
+                .push(format!("bring_up {}", tunnel.interface));
+            self.inner.bring_up(tunnel)
         }
 
         fn current_ip(&self, iface: &str) -> Result<IpAddr, torrentd_engine::VpnError> {
@@ -1801,22 +1880,22 @@ mod tests {
         }
     }
 
-    /// A multi-slot config with one WireGuard slot, built from TOML so a
-    /// required field added to `SlotConfig` breaks this rather than letting it
-    /// exercise a shape the daemon never parses.
-    fn cfg_with_slot(extra: &str) -> Config {
+    /// A config with one WireGuard `vpn` profile, built from TOML so a
+    /// required field added to `ProfileConfig` breaks this rather than letting
+    /// it exercise a shape the daemon never parses.
+    fn cfg_with_profile(extra: &str) -> Config {
         toml::from_str(&format!(
             r#"
-listen_interfaces = "0.0.0.0:6881"
 default_save_path = "/tmp/torrentd-test/data"
 resume_dir = "/tmp/torrentd-test/state/resume"
 torrent_dir = "/tmp/torrentd-test/torrents"
 http_listen = "127.0.0.1:8080"
 
-[[slot]]
+[[profile]]
 id                   = "acct_a"
-vpn_profile          = "/etc/wireguard/wg-acct-a.conf"
+network              = "vpn"
 vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 listen_port          = 6881
 peer_fingerprint_hex = "a1b2c3d4e5f60718"
@@ -1829,23 +1908,84 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
         .expect("test config parses")
     }
 
-    /// `cfg_with_slot`'s config with a second slot, so `--slot` has something
-    /// to exclude and the kill-switch table has more than one interface in it.
-    fn cfg_with_two_slots() -> Config {
-        let mut cfg = cfg_with_slot("");
-        cfg.network_kill_switch = true;
-        let mut b = toml::from_str::<Config>(
+    /// A config holding whatever `tables` spells out.
+    ///
+    /// [`cfg_with_profile`] interpolates its argument *inside* the one
+    /// `[[profile]]` table it builds, so it can express neither a second
+    /// profile nor a host profile — which is why a 41-test suite was green
+    /// while the binary panicked on the shipped sample, and the sample ships
+    /// exactly one profile, `network = "host"`.
+    fn cfg_with_tables(tables: &str) -> Config {
+        toml::from_str(&format!(
             r#"
-listen_interfaces = "0.0.0.0:6881"
 default_save_path = "/tmp/torrentd-test/data"
 resume_dir = "/tmp/torrentd-test/state/resume"
 torrent_dir = "/tmp/torrentd-test/torrents"
 http_listen = "127.0.0.1:8080"
+{tables}
+"#
+        ))
+        .expect("test config parses")
+    }
 
-[[slot]]
-id                   = "acct_b"
-vpn_profile          = "/etc/wireguard/wg-acct-b.conf"
+    /// The shipped sample's shape: one profile, `network = "host"`.
+    const HOST_TABLE: &str = r#"
+[[profile]]
+id                = "public"
+network           = "host"
+listen_interfaces = "0.0.0.0:6882,[::]:6882"
+"#;
+
+    const VPN_TABLE: &str = r#"
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
 vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg-acct-a.conf"
+vpn_interface        = "wg-acct-a"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+"#;
+
+    /// The same profile with a gateway-assigned port.
+    ///
+    /// Written out rather than appended to [`cfg_with_profile`], which sets a
+    /// static `listen_port`: a `listen_port` under `port_forward = "natpmp"`
+    /// is refused now, because the gateway assigns the port at runtime and
+    /// nothing binds the configured one.
+    fn cfg_with_natpmp_profile(extra: &str) -> Config {
+        cfg_with_tables(&format!(
+            r#"
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg-acct-a.conf"
+vpn_interface        = "wg-acct-a"
+port_forward         = "natpmp"
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+resume_dir           = "/tmp/torrentd-test/state/resume/acct_a"
+torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
+{extra}
+"#
+        ))
+    }
+
+    /// `cfg_with_profile`'s config with a second vpn profile, so `--profile`
+    /// has something to exclude and the kill-switch table has more than one
+    /// interface in it.
+    fn cfg_with_two_profiles() -> Config {
+        let mut cfg = cfg_with_profile("");
+        cfg.network_kill_switch = true;
+        let mut b = cfg_with_tables(
+            r#"
+[[profile]]
+id                   = "acct_b"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg-acct-b.conf"
 vpn_interface        = "wg-acct-b"
 listen_port          = 6882
 peer_fingerprint_hex = "b1b2c3d4e5f60718"
@@ -1853,9 +1993,8 @@ user_agent           = "Transmission/4.0.5"
 resume_dir           = "/tmp/torrentd-test/state/resume/acct_b"
 torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
 "#,
-        )
-        .expect("test config parses");
-        cfg.slot.push(b.slot.remove(0));
+        );
+        cfg.profile.push(b.profile.remove(0));
         cfg
     }
 
@@ -1864,18 +2003,96 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
     }
 
     #[test]
-    fn bring_up_never_lowers_an_interface_it_did_not_raise() {
-        // F1. The daemon is up and seeding on wg-acct-a. `--bring-up` finds
-        // the interface already there, so it must adopt it: report the
-        // bring-up as `skip`, run the remaining checks, and issue no teardown
-        // at all. A `bring_down` recorded here is a live slot fenced until
-        // someone restarts the daemon.
-        let cfg = cfg_with_slot("");
+    fn a_host_profile_is_skipped_rather_than_handed_to_profile_checks() {
+        // F14. `check()` filtered the selection by id alone and mapped
+        // `profile_checks` over every survivor, and `profile_checks` opens
+        // with `.expect("only vpn profiles reach profile_checks")`. On the
+        // shipped sample — one `network = "host"` profile — the documented
+        // bare invocation panicked and exited 101, outside the 0/1/2 contract
+        // `cli.rs` publishes.
+        let cfg = cfg_with_tables(HOST_TABLE);
+        let host = FakeHost::new();
+
+        let reports = profile_reports(&cfg, None, false, None, &host)
+            .expect("a host-only config is a legal config to check");
+
+        assert_eq!(reports.len(), 1, "the profile is reported, not dropped");
+        assert_eq!(reports[0].profile_id, "public");
+        assert_eq!(reports[0].vpn_type, "none");
+        let tunnel = find(&reports[0].checks, "tunnel")
+            .expect("a host profile still gets a line, or the run reads as `checked, all clear`");
+        assert_eq!(tunnel.verdict, Verdict::Skip, "detail: {}", tunnel.detail);
+        assert!(
+            tunnel.detail.contains("public") && tunnel.detail.contains("no tunnel"),
+            "the operator has to be told why it was skipped: {}",
+            tunnel.detail,
+        );
+
+        // A `skip` does not colour the status: the command exits 0 rather
+        // than 101.
+        let report = Report {
+            host: Vec::new(),
+            profiles: reports,
+        };
+        assert_eq!(report.exit_code(), EXIT_OK);
+        assert!(!report.incomplete(), "a skip is not an unknown");
+    }
+
+    #[test]
+    fn scoping_to_a_host_profile_by_id_is_skipped_too() {
+        // `--profile public` on a mixed config. The id filter is what used to
+        // select the panicking profile on its own.
+        let cfg = cfg_with_tables(&format!("{VPN_TABLE}{HOST_TABLE}"));
+        let host = FakeHost::new();
+
+        let reports = profile_reports(&cfg, Some("public"), false, None, &host)
+            .expect("naming a host profile is not a usage error");
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].profile_id, "public");
+        assert_eq!(
+            find(&reports[0].checks, "tunnel").unwrap().verdict,
+            Verdict::Skip
+        );
+    }
+
+    #[test]
+    fn a_mixed_config_checks_the_tunnel_and_skips_the_host() {
+        // The bare invocation on a config that has both. Every profile is
+        // reported, in configured order, and only the tunnelled one is
+        // actually probed.
+        let cfg = cfg_with_tables(&format!("{VPN_TABLE}{HOST_TABLE}"));
         let host = FakeHost::new()
             .with_existing("wg-acct-a")
             .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
 
-        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+        let reports = profile_reports(&cfg, None, false, None, &host)
+            .expect("a mixed config is legal and --check-config calls it OK");
+
+        assert_eq!(reports.len(), 2);
+        assert_eq!(reports[0].profile_id, "acct_a");
+        assert!(
+            find(&reports[0].checks, "tunnel_ip").is_some(),
+            "the vpn profile is still fully checked",
+        );
+        assert_eq!(reports[1].profile_id, "public");
+        assert_eq!(reports[1].checks.len(), 1, "a host profile gets one line");
+        assert_eq!(reports[1].checks[0].verdict, Verdict::Skip);
+    }
+
+    #[test]
+    fn bring_up_never_lowers_an_interface_it_did_not_raise() {
+        // F1. The daemon is up and seeding on wg-acct-a. `--bring-up` finds
+        // the interface already there, so it must adopt it: report the
+        // bring-up as `skip`, run the remaining checks, and issue no teardown
+        // at all. A `bring_down` recorded here is a live profile fenced until
+        // someone restarts the daemon.
+        let cfg = cfg_with_profile("");
+        let host = FakeHost::new()
+            .with_existing("wg-acct-a")
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
 
         assert!(
             host.vpn.bring_down_calls().is_empty(),
@@ -1897,7 +2114,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
             "the operator has to be told why it was skipped: {}",
             bu.detail,
         );
-        // Adoption is not an early return: the rest of the slot is still
+        // Adoption is not an early return: the rest of the profile is still
         // checked against the interface as it stands.
         assert!(find(&r.checks, "tunnel_ip").is_some());
     }
@@ -1911,7 +2128,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         // Absent on the probe before the call, present on the re-probe after
         // it: that pair, and not the arm `bring_up` returned on, is what makes
         // it this command's to lower.
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new().with_exists_seq([false, true]).with_addrs([
             ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
             ("wg-acct-a", None),
@@ -1919,7 +2136,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         host.vpn
             .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
 
-        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
 
         assert_eq!(host.vpn.bring_up_calls(), vec!["wg-acct-a"]);
         assert_eq!(host.vpn.bring_down_calls(), vec!["wg-acct-a"]);
@@ -1931,12 +2148,12 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
 
     #[test]
     fn without_bring_up_no_tunnel_is_touched_either_way() {
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new()
             .with_existing("wg-acct-a")
             .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
 
-        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
 
         assert!(host.vpn.bring_up_calls().is_empty());
         assert!(host.vpn.bring_down_calls().is_empty());
@@ -1951,7 +2168,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         // Here the address is still there on the second lookup — `wg-quick
         // down` failed — and the operator has to be told the host was left
         // changed, on the one mutation this command advertises.
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new().with_exists_seq([false, true]).with_addrs([
             ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
             ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
@@ -1959,7 +2176,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         host.vpn
             .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
 
-        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
 
         assert_eq!(host.vpn.bring_down_calls(), vec!["wg-acct-a"]);
         let bd = find(&r.checks, "bring_down").expect("a bring_down line");
@@ -1974,7 +2191,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
 
     #[test]
     fn a_bring_down_that_worked_is_reported_only_once_the_address_is_gone() {
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new().with_exists_seq([false, true]).with_addrs([
             ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
             ("wg-acct-a", None),
@@ -1982,7 +2199,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         host.vpn
             .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
 
-        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
 
         assert_eq!(
             find(&r.checks, "bring_down").map(|c| c.verdict),
@@ -2003,11 +2220,11 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         // contract, asserted below, is that the lease is left to lapse: the
         // previous wording said the mapping had been "released again", so this
         // assertion fails against the behaviour it replaced.
-        let cfg = cfg_with_slot("port_forward = \"natpmp\"\nport_forward_gateway = \"10.2.0.1\"");
+        let cfg = cfg_with_natpmp_profile("port_forward_gateway = \"10.2.0.1\"");
         let host = FakeHost::new().with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
         host.fwd.push_ok(51413);
 
-        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
 
         assert_eq!(
             host.fwd.call_count(),
@@ -2037,15 +2254,15 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
     }
 
     #[test]
-    fn a_natpmp_slot_with_no_tunnel_address_negotiates_nothing() {
+    fn a_natpmp_profile_with_no_tunnel_address_negotiates_nothing() {
         // The gateway is only reachable through the tunnel, so with no tunnel
         // address there is nothing to negotiate from and nothing to report but
         // a skip. Checked here because it is the arm that keeps the mapping
         // call off a host that has no tunnel at all.
-        let cfg = cfg_with_slot("port_forward = \"natpmp\"");
+        let cfg = cfg_with_natpmp_profile("");
         let host = FakeHost::new();
 
-        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
 
         assert_eq!(host.fwd.call_count(), 0);
         assert_eq!(
@@ -2058,8 +2275,8 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
     fn a_report_fails_when_any_check_fails() {
         let r = Report {
             host: vec![Check::pass("a", "")],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "wireguard",
                 checks: vec![Check::pass("b", ""), Check::fail("c", "")],
             }],
@@ -2100,8 +2317,8 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
 
     #[test]
     fn an_egress_probe_that_cannot_bind_the_source_fails_with_the_address() {
-        // Every socket in the slot is source-bound to the tunnel address, so
-        // an address that cannot be bound is the whole slot failing, not just
+        // Every socket in the profile is source-bound to the tunnel address, so
+        // an address that cannot be bound is the whole profile failing, not just
         // this probe.
         let unbindable = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
         let c = egress_probe(unbindable, "127.0.0.1:53".parse().unwrap());
@@ -2150,14 +2367,14 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
     #[test]
     fn an_egress_check_that_was_asked_for_and_could_not_run_says_so() {
         // D7. `--egress` used to produce no line in the human report and no
-        // key in the JSON when the slot had no tunnel address — a check the
+        // key in the JSON when the profile had no tunnel address — a check the
         // operator explicitly asked for, silently absent.
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new();
 
-        let r = slot_checks(
+        let r = profile_checks(
             &cfg,
-            &cfg.slot[0],
+            &cfg.profile[0],
             false,
             Some("1.1.1.1:53".parse().unwrap()),
             &host,
@@ -2174,9 +2391,9 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
 
     #[test]
     fn no_egress_flag_means_no_egress_line() {
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new();
-        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
         assert!(find(&r.checks, "egress").is_none());
     }
 
@@ -2256,20 +2473,20 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
     }
 
     #[test]
-    fn an_excluded_slot_s_interface_does_not_decide_a_scoped_run() {
-        // C52 / F4, reopened. `rp_filter` moved into the slot when the same
-        // finding was first repaired, and `kill_switch_ruleset` kept building
-        // its interface list from `cfg.slot.iter()` — every configured slot,
-        // ignoring `--slot`. A rejection caused by an interface belonging to a
-        // slot the operator excluded was a `fail` and an exit 1 for a slot
-        // that was not being checked, against a flag whose help says "Check
-        // only this slot."
+    fn an_excluded_profile_s_interface_does_not_decide_a_scoped_run() {
+        // C52 / F4, reopened. `rp_filter` moved into the profile when the
+        // same finding was first repaired, and `kill_switch_ruleset` kept
+        // building its interface list from every configured profile, ignoring
+        // `--profile`. A rejection caused by an interface belonging to a
+        // profile the operator excluded was a `fail` and an exit 1 for a
+        // profile that was not being checked, against a flag whose help says
+        // "Check only this profile."
         //
         // The table is still rendered whole, because boot installs it whole
         // and the caveat says so. What changes is the verdict.
-        let cfg = cfg_with_two_slots();
+        let cfg = cfg_with_two_profiles();
         let host = FakeHost::new()
-            // The full table is rejected; the selected slot's alone is not.
+            // The full table is rejected; the selected profile's alone is not.
             .with_nft([
                 (
                     1,
@@ -2284,12 +2501,12 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         assert_ne!(
             c.verdict,
             Verdict::Fail,
-            "an excluded slot's interface does not colour a scoped run: {}",
+            "an excluded profile's interface does not colour a scoped run: {}",
             c.detail,
         );
         assert!(
             c.detail.contains("wg-acct-b") && c.detail.contains("acct_b"),
-            "the offending interface and the slot it belongs to are both named: {}",
+            "the offending interface and the profile it belongs to are both named: {}",
             c.detail,
         );
         assert!(
@@ -2299,16 +2516,16 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         );
         let report = Report {
             host: checks,
-            slots: Vec::new(),
+            profiles: Vec::new(),
         };
         assert_eq!(
             report.exit_code(),
             EXIT_OK,
-            "a run scoped to a healthy slot is clean",
+            "a run scoped to a healthy profile is clean",
         );
 
         // The complement: when the rejection survives scoping, it is the
-        // selected slot's and it still decides the run.
+        // selected profile's and it still decides the run.
         let host = FakeHost::new().with_nft([
             (
                 1,
@@ -2324,7 +2541,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         assert_eq!(
             c.verdict,
             Verdict::Fail,
-            "a rejection the selected slot owns still fails: {}",
+            "a rejection the selected profile owns still fails: {}",
             c.detail,
         );
 
@@ -2376,7 +2593,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
                 Check::pass("nftables", "`nft` is available"),
                 judge_kill_switch_uid(Some(998), Ok(2000)),
             ],
-            slots: Vec::new(),
+            profiles: Vec::new(),
         };
         assert_eq!(
             report.exit_code(),
@@ -2417,7 +2634,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         // It has to reach the exit status, not just the report.
         let r = Report {
             host: vec![c],
-            slots: vec![],
+            profiles: vec![],
         };
         assert_eq!(r.exit_code(), EXIT_FAILED);
 
@@ -2493,8 +2710,8 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         // established nothing about the handshake half used to exit 0.
         let r = Report {
             host: vec![Check::pass("iproute2", ""), Check::unknown("rp_filter", "")],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "wireguard",
                 checks: vec![
                     Check::pass("tunnel_ip", ""),
@@ -2508,14 +2725,14 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
     }
 
     #[test]
-    fn an_unknown_inside_a_slot_alone_is_enough_to_colour_the_status() {
-        // The host half can be entirely clean and the slot half entirely
+    fn an_unknown_inside_a_profile_alone_is_enough_to_colour_the_status() {
+        // The host half can be entirely clean and the profile half entirely
         // unestablished; `Report::failed` only ever looked at `Fail`, so the
-        // slot half has to be reached explicitly.
+        // profile half has to be reached explicitly.
         let r = Report {
             host: vec![Check::pass("iproute2", "")],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "wireguard",
                 checks: vec![Check::unknown("handshake", "")],
             }],
@@ -2527,8 +2744,8 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
     fn a_failure_outranks_an_unknown_in_the_exit_status() {
         let r = Report {
             host: vec![Check::unknown("rp_filter", "")],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "wireguard",
                 checks: vec![Check::fail("tunnel_ip", "")],
             }],
@@ -2538,13 +2755,13 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
 
     #[test]
     fn a_skip_is_not_an_unknown_and_exits_clean() {
-        // A NAT-PMP check on a static slot did not fail to happen; it
+        // A NAT-PMP check on a static profile did not fail to happen; it
         // correctly did not apply. Colouring the status for it would make
         // every static deployment exit 2 forever.
         let r = Report {
             host: vec![Check::pass("iproute2", ""), Check::skip("kill_switch", "")],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "wireguard",
                 checks: vec![
                     Check::pass("tunnel_ip", ""),
@@ -2561,7 +2778,7 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         // The left side of `Report::failed`'s `||`, which nothing reached.
         let r = Report {
             host: vec![Check::fail("iproute2", "")],
-            slots: vec![],
+            profiles: vec![],
         };
         assert!(r.failed());
         assert_eq!(r.exit_code(), EXIT_FAILED);
@@ -2573,8 +2790,8 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         // reporting it as a failure would train an operator to ignore them.
         let r = Report {
             host: vec![Check::unknown("a", "")],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "openvpn",
                 checks: vec![Check::skip("b", ""), Check::unknown("c", "")],
             }],
@@ -2585,14 +2802,14 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
     #[test]
     fn the_json_report_keeps_the_shape_its_consumers_parse() {
         // C7/C8. `--json` is a contract: the four verdicts are lowercase
-        // strings, and the report is `host` plus `slots`, each slot carrying
-        // `slot_id`, `vpn_type` and `checks` of `name`/`verdict`/`detail`.
+        // strings, and the report is `host` plus `profiles`, each profile carrying
+        // `profile_id`, `vpn_type` and `checks` of `name`/`verdict`/`detail`.
         // Nothing here is enforced by the type system — `#[serde(rename_all)]`
         // is one attribute away from renaming every verdict at once.
         let r = Report {
             host: vec![Check::pass("iproute2", "`ip` is available")],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "wireguard",
                 checks: vec![
                     Check::fail("tunnel_ip", "no address"),
@@ -2606,11 +2823,11 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         assert_eq!(v["host"][0]["name"], "iproute2");
         assert_eq!(v["host"][0]["verdict"], "pass");
         assert_eq!(v["host"][0]["detail"], "`ip` is available");
-        assert_eq!(v["slots"][0]["slot_id"], "acct_a");
-        assert_eq!(v["slots"][0]["vpn_type"], "wireguard");
-        assert_eq!(v["slots"][0]["checks"][0]["verdict"], "fail");
-        assert_eq!(v["slots"][0]["checks"][1]["verdict"], "skip");
-        assert_eq!(v["slots"][0]["checks"][2]["verdict"], "unknown");
+        assert_eq!(v["profiles"][0]["profile_id"], "acct_a");
+        assert_eq!(v["profiles"][0]["vpn_type"], "wireguard");
+        assert_eq!(v["profiles"][0]["checks"][0]["verdict"], "fail");
+        assert_eq!(v["profiles"][0]["checks"][1]["verdict"], "skip");
+        assert_eq!(v["profiles"][0]["checks"][2]["verdict"], "unknown");
     }
 
     #[test]
@@ -2626,12 +2843,12 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
     }
 
     #[test]
-    fn a_single_session_config_is_refused_with_an_explanation() {
-        // C38. Single-session mode uses no tunnel, so there is nothing to
-        // check and an empty report would read as a clean bill of health.
+    fn a_config_with_no_profiles_is_refused_with_an_explanation() {
+        // C38. A config with no `[[profile]]` table has no tunnel to check, so
+        // an empty report would read as a clean bill of health. Such a config
+        // cannot start a daemon either, and the refusal says so.
         let cfg: Config = toml::from_str(
             r#"
-listen_interfaces = "0.0.0.0:6881"
 default_save_path = "/tmp/torrentd-test/data"
 resume_dir = "/tmp/torrentd-test/state/resume"
 torrent_dir = "/tmp/torrentd-test/torrents"
@@ -2642,15 +2859,15 @@ http_listen = "127.0.0.1:8080"
 
         let e = check(&cfg, None, false, false, None, None).unwrap_err();
         let msg = format!("{e:#}");
-        assert!(msg.contains("[[slot]]"), "got {msg}");
-        assert!(msg.contains("Single-session"), "got {msg}");
+        assert!(msg.contains("[[profile]]"), "got {msg}");
+        assert!(msg.contains("cannot start"), "got {msg}");
     }
 
     #[test]
-    fn a_slot_filter_that_matches_nothing_is_refused_rather_than_reported_clean() {
-        // C39. `--slot typo` used to be indistinguishable from "every slot
-        // passed": no slots selected, no failures, exit 0.
-        let cfg = cfg_with_slot("");
+    fn a_profile_filter_that_matches_nothing_is_refused_rather_than_reported_clean() {
+        // C39. `--profile typo` used to be indistinguishable from "every profile
+        // passed": no profiles selected, no failures, exit 0.
+        let cfg = cfg_with_profile("");
         let e = check(&cfg, Some("acct_b"), false, false, None, None).unwrap_err();
         assert!(format!("{e:#}").contains("acct_b"), "got {e:#}");
     }
@@ -2691,10 +2908,10 @@ http_listen = "127.0.0.1:8080"
     }
 
     #[test]
-    fn rp_filter_is_judged_for_the_slot_and_only_after_it_has_been_raised() {
-        // F4, reopened. `conf/<iface>/rp_filter` is per slot by construction,
-        // so judging it in the unscoped host block ignored `--slot` — a run
-        // narrowed to one healthy slot exited 2 because of an interface the
+    fn rp_filter_is_judged_for_the_profile_and_only_after_it_has_been_raised() {
+        // F4, reopened. `conf/<iface>/rp_filter` is per profile by construction,
+        // so judging it in the unscoped host block ignored `--profile` — a run
+        // narrowed to one healthy profile exited 2 because of an interface the
         // operator had excluded — and ran it before `--bring-up` had raised
         // anything, so the sysctl for the interface the command was about to
         // create did not exist and the check reported `unknown` about the one
@@ -2704,7 +2921,7 @@ http_listen = "127.0.0.1:8080"
         // scripted, and the assertion is on the *order* of the read against
         // the raise, so moving the read back into `host_checks` fails this
         // rather than merely relocating a passing test.
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new()
             .with_exists_seq([false, true])
             .with_sysctl("/proc/sys/net/ipv4/conf/all/rp_filter", "0")
@@ -2716,9 +2933,9 @@ http_listen = "127.0.0.1:8080"
         host.vpn
             .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
 
-        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
 
-        let rp = find(&r.checks, "rp_filter").expect("the slot carries its own rp_filter line");
+        let rp = find(&r.checks, "rp_filter").expect("the profile carries its own rp_filter line");
         assert_eq!(rp.verdict, Verdict::Pass, "detail: {}", rp.detail);
         assert!(
             rp.detail.contains("wg-acct-a") && rp.detail.contains("effective 2"),
@@ -2743,8 +2960,8 @@ http_listen = "127.0.0.1:8080"
     }
 
     #[test]
-    fn the_host_block_carries_no_per_slot_check_and_no_duplicate_name() {
-        // The other half of the same finding: a per-slot sysctl in the
+    fn the_host_block_carries_no_per_profile_check_and_no_duplicate_name() {
+        // The other half of the same finding: a per-profile sysctl in the
         // unscoped host block emitted one `Check` per configured interface,
         // all named `rp_filter`, so `host[]` in the `--json` contract carried
         // duplicate `name` values and a consumer keying by name silently kept
@@ -2753,11 +2970,11 @@ http_listen = "127.0.0.1:8080"
         // Run against a `CheckHost` double rather than the real `ip` and
         // `nft`: what this asserts is the shape of the block, which must not
         // depend on what happens to be installed on the machine running it.
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = host_checks(&cfg, None, None, &FakeHost::new());
         assert!(
             find(&host, "rp_filter").is_none(),
-            "rp_filter is per slot and belongs to the slot: {:?}",
+            "rp_filter is per profile and belongs to the profile: {:?}",
             host.iter().map(|c| c.name).collect::<Vec<_>>(),
         );
         let mut names: Vec<&str> = host.iter().map(|c| c.name).collect();
@@ -2780,7 +2997,7 @@ http_listen = "127.0.0.1:8080"
         //
         // Every host touch is scripted here, and the block's names and
         // verdicts follow the script rather than the host.
-        let mut cfg = cfg_with_slot("");
+        let mut cfg = cfg_with_profile("");
         cfg.network_kill_switch = true;
         let host = FakeHost::new().with_uid(998).with_nft([(
             1,
@@ -2802,7 +3019,7 @@ http_listen = "127.0.0.1:8080"
         );
         assert!(
             !names.contains(&"rp_filter"),
-            "no per-slot check belongs in the unscoped host block: {names:?}",
+            "no per-profile check belongs in the unscoped host block: {names:?}",
         );
 
         // The scripted uid is the one judged, and the scripted `nft` outcome
@@ -2842,7 +3059,7 @@ http_listen = "127.0.0.1:8080"
         //
         // Absent before, present after, so it is this command's to lower,
         // whatever arm `bring_up` came back on.
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new()
             .with_exists_seq([false, true])
             .with_addrs([("wg-acct-a", None)]);
@@ -2850,7 +3067,7 @@ http_listen = "127.0.0.1:8080"
         // error both real managers produce after they have already started
         // something.
 
-        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
 
         let bu = find(&r.checks, "bring_up").expect("a bring_up line");
         assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
@@ -2876,15 +3093,15 @@ http_listen = "127.0.0.1:8080"
         // no teardown is issued. What the report says it cannot see depends on
         // the manager that was asked.
         //
-        // F17. The caveat was unconditional, so a WireGuard slot's failure was
-        // explained with openvpn's daemonising and the operator was sent
+        // F17. The caveat was unconditional, so a WireGuard profile's failure
+        // was explained with openvpn's daemonising and the operator was sent
         // looking for an orphaned process that cannot exist. `openvpn
         // --daemon` forks and exits 0 before its own address poll and can
         // leave one; `wg-quick up` cannot.
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new().with_exists_seq([false, false]);
 
-        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
 
         assert!(host.vpn.bring_down_calls().is_empty());
         assert!(find(&r.checks, "bring_down").is_none());
@@ -2901,12 +3118,17 @@ http_listen = "127.0.0.1:8080"
             bu.detail,
         );
 
-        // The openvpn slot, where the caveat is true and belongs.
-        let mut cfg = cfg_with_slot("");
-        cfg.slot[0].vpn_type = VpnType::Openvpn;
+        // The openvpn profile, where the caveat is true and belongs.
+        let mut cfg = cfg_with_profile("");
+        match &mut cfg.profile[0].network {
+            torrentd_engine::ProfileNetwork::Vpn { vpn_type, .. } => {
+                *vpn_type = VpnType::Openvpn;
+            }
+            torrentd_engine::ProfileNetwork::Host { .. } => unreachable!("a vpn profile"),
+        }
         let host = FakeHost::new().with_exists_seq([false, false]);
 
-        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
 
         let bu = find(&r.checks, "bring_up").expect("a bring_up line");
         assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
@@ -2925,14 +3147,14 @@ http_listen = "127.0.0.1:8080"
         // the adoption path returns `Ok(ip)` for it. The re-probe is what
         // decides, so an interface that is *not* there after the call is not
         // lowered on the strength of an `Ok`.
-        let cfg = cfg_with_slot("");
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new()
             .with_exists_seq([false, false])
             .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
         host.vpn
             .set_ip("wg-acct-a", IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
 
-        let r = slot_checks(&cfg, &cfg.slot[0], true, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
 
         assert_eq!(
             find(&r.checks, "bring_up").map(|c| c.verdict),
@@ -2960,8 +3182,8 @@ http_listen = "127.0.0.1:8080"
                 Check::pass("iproute2", ""),
                 Check::unknown_without_capability("kill_switch_ruleset", ""),
             ],
-            slots: vec![SlotReport {
-                slot_id: "acct_a".into(),
+            profiles: vec![ProfileReport {
+                profile_id: "acct_a".into(),
                 vpn_type: "wireguard",
                 checks: vec![
                     Check::pass("tunnel_ip", ""),
@@ -2984,7 +3206,7 @@ http_listen = "127.0.0.1:8080"
                 Check::unknown_without_capability("kill_switch_ruleset", ""),
                 Check::unknown("rp_filter", ""),
             ],
-            slots: vec![],
+            profiles: vec![],
         };
         assert_eq!(r.exit_code(), EXIT_UNKNOWN);
 
@@ -2994,7 +3216,7 @@ http_listen = "127.0.0.1:8080"
                 Check::unknown_without_capability("handshake", ""),
                 Check::fail("iproute2", ""),
             ],
-            slots: vec![],
+            profiles: vec![],
         };
         assert_eq!(r.exit_code(), EXIT_FAILED);
     }
@@ -3241,18 +3463,18 @@ http_listen = "127.0.0.1:8080"
     }
 
     #[test]
-    fn a_wireguard_slot_pointed_at_a_device_that_is_not_wireguard_fails() {
+    fn a_wireguard_profile_pointed_at_a_device_that_is_not_wireguard_fails() {
         // F14. `ProbeUnavailable::Refused` means *either* "not a WireGuard
         // interface" *or* "no permission", and privilege is the one axis that
         // cannot separate them — `wg show lo` and `wg show <nonexistent>`
         // return the same refusal on this host. Resolving it by privilege gave
-        // a wireguard slot pointed at `lo` — a config `validate_set` accepts,
-        // because it constrains only that the interface equals the profile's
-        // file stem — an all-clear `0` and a line asserting the daemon would
-        // be fine.
+        // a wireguard profile pointed at `lo` — a config `validate_set`
+        // accepts, because it constrains only that the interface equals the
+        // tunnel config's file stem — an all-clear `0` and a line asserting
+        // the daemon would be fine.
         //
         // A capability-free read of the link type settles it, and a
-        // misconfigured slot is a `fail` about the configuration.
+        // misconfigured profile is a `fail` about the configuration.
         let c = judge_handshake(
             "lo",
             Err("refused"),
@@ -3268,24 +3490,24 @@ http_listen = "127.0.0.1:8080"
             c.detail,
         );
 
-        // And through the whole slot: the verdict has to reach the report and
-        // the exit status, not just the judge.
-        let cfg = cfg_with_slot("");
+        // And through the whole profile: the verdict has to reach the report
+        // and the exit status, not just the judge.
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new()
             .with_existing("wg-acct-a")
             .with_wireguard_device("wg-acct-a", false)
             .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(127, 0, 0, 1)))]);
-        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
         let hs = find(&r.checks, "handshake").expect("the handshake line is still reported");
         assert_eq!(hs.verdict, Verdict::Fail, "detail: {}", hs.detail);
         let report = Report {
             host: Vec::new(),
-            slots: vec![r],
+            profiles: vec![r],
         };
         assert_eq!(
             report.exit_code(),
             EXIT_FAILED,
-            "a slot whose handshake can never answer is not a clean run",
+            "a profile whose handshake can never answer is not a clean run",
         );
     }
 
@@ -3325,14 +3547,14 @@ http_listen = "127.0.0.1:8080"
             pending.detail
         );
 
-        // And through the whole slot, to the exit status.
-        let cfg = cfg_with_slot("");
+        // And through the whole profile, to the exit status.
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new()
             .with_existing("wg-acct-a")
             .with_wireguard_device("wg-acct-a", false)
             .with_handshake(Ok(Some(Duration::from_secs(30))))
             .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(127, 0, 0, 1)))]);
-        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
         let hs = find(&r.checks, "handshake").expect("the handshake line is reported");
         assert_eq!(hs.verdict, Verdict::Pass, "detail: {}", hs.detail);
     }
@@ -3360,20 +3582,20 @@ http_listen = "127.0.0.1:8080"
     }
 
     #[test]
-    fn a_slot_s_checks_reach_the_host_only_through_the_check_host() {
-        // C1. Decision 32 put `host_checks` behind `CheckHost`; `slot_checks`
-        // still stat'ed the profile, ran the tool probes and the handshake
-        // probe against this machine directly. Every one is scripted here,
-        // and the verdicts follow the script.
-        let cfg = cfg_with_slot("");
+    fn a_profile_s_checks_reach_the_host_only_through_the_check_host() {
+        // C1. Decision 32 put `host_checks` behind `CheckHost`; the per-tunnel
+        // checks still stat'ed the tunnel config, ran the tool probes and the
+        // handshake probe against this machine directly. Every one is scripted
+        // here, and the verdicts follow the script.
+        let cfg = cfg_with_profile("");
         let host = FakeHost::new()
             .with_missing_tool("wg")
             .with_handshake(Ok(Some(Duration::from_secs(10_000))))
             .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(127, 0, 0, 1)))]);
-        let r = slot_checks(&cfg, &cfg.slot[0], false, None, &host);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
 
-        let profile = find(&r.checks, "profile").expect("the profile line is reported");
-        assert_eq!(profile.verdict, Verdict::Pass, "detail: {}", profile.detail);
+        let config = find(&r.checks, "vpn_config").expect("the vpn_config line is reported");
+        assert_eq!(config.verdict, Verdict::Pass, "detail: {}", config.detail);
         let wg = find(&r.checks, "wireguard_tools").expect("the wg line is reported");
         assert_eq!(wg.verdict, Verdict::Fail, "detail: {}", wg.detail);
         let quick = find(&r.checks, "wg_quick").expect("the wg-quick line is reported");

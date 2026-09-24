@@ -1,7 +1,7 @@
 //! Engine-side state map.
 //!
-//! One entry per torrent — keyed by infohash for the cross-slot uniqueness
-//! invariant. Each entry tracks the slot the torrent
+//! One entry per torrent — keyed by infohash for the cross-profile uniqueness
+//! invariant. Each entry tracks the profile the torrent
 //! belongs to, its libtorrent state, and timer / counter state used by
 //! the alert handlers and the shutdown coordinator.
 
@@ -13,7 +13,7 @@ use libtorrent_safe::InfoHash;
 use libtorrent_safe::TorrentHandle;
 use parking_lot::Mutex;
 
-use crate::slot::SlotId;
+use crate::profile::ProfileId;
 
 /// Lifecycle phases the daemon tracks for a torrent. Mostly mirrors
 /// libtorrent's `torrent_status::state_t` but adds an explicit
@@ -99,7 +99,7 @@ pub enum StorageMove {
 #[derive(Clone, Debug)]
 pub struct TorrentState {
     pub handle: TorrentHandle,
-    pub slot_id: SlotId,
+    pub profile_id: ProfileId,
     pub phase: TorrentPhase,
     pub last_alert: Instant,
     pub retry: Option<RetryState>,
@@ -138,10 +138,10 @@ pub struct TorrentState {
 }
 
 impl TorrentState {
-    pub fn newly_added(handle: TorrentHandle, slot: SlotId, now: Instant) -> Self {
+    pub fn newly_added(handle: TorrentHandle, profile: ProfileId, now: Instant) -> Self {
         Self {
             handle,
-            slot_id: slot,
+            profile_id: profile,
             phase: TorrentPhase::Idle,
             last_alert: now,
             retry: None,
@@ -224,12 +224,12 @@ impl StateMap {
         self.inner.iter().map(|e| e.value().handle).collect()
     }
 
-    /// All torrent handles currently assigned to `slot` — for slot-wide
+    /// All torrent handles currently assigned to `profile` — for profile-wide
     /// pause/resume and VPN-down handling.
-    pub fn handles_for_slot(&self, slot: &SlotId) -> Vec<TorrentHandle> {
+    pub fn handles_for_profile(&self, profile: &ProfileId) -> Vec<TorrentHandle> {
         self.inner
             .iter()
-            .filter(|e| &e.value().slot_id == slot)
+            .filter(|e| &e.value().profile_id == profile)
             .map(|e| e.value().handle)
             .collect()
     }
@@ -304,12 +304,12 @@ mod tests {
         let now = Instant::now();
         let h1 = handle(1, 1);
         let h2 = handle(2, 2);
-        let mut s1 = TorrentState::newly_added(h1, SlotId::default_single(), now);
+        let mut s1 = TorrentState::newly_added(h1, ProfileId::new("p"), now);
         s1.retry = Some(RetryState {
             next_attempt: now - Duration::from_secs(1),
             attempts: 1,
         });
-        let mut s2 = TorrentState::newly_added(h2, SlotId::default_single(), now);
+        let mut s2 = TorrentState::newly_added(h2, ProfileId::new("p"), now);
         s2.retry = Some(RetryState {
             next_attempt: now + Duration::from_secs(60),
             attempts: 1,

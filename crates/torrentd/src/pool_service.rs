@@ -15,8 +15,9 @@ use anyhow::Context;
 use parking_lot::Mutex;
 use torrentd_engine::AddParams;
 use torrentd_engine::AlertSource;
-use torrentd_engine::SlotId;
-use torrentd_engine::SlotStatus;
+use torrentd_engine::AssignmentRegistry;
+use torrentd_engine::ProfileId;
+use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentPhase;
@@ -197,7 +198,7 @@ pub struct PendingVerify {
     pub infohash: String,
     pub torrent_path: PathBuf,
     pub save_path: PathBuf,
-    pub slot: SlotId,
+    pub profile: ProfileId,
 }
 
 impl VerifyQueue {
@@ -249,7 +250,8 @@ pub async fn run_verify_queue(
     source: Arc<dyn AlertSource>,
     state: Arc<StateMap>,
     metrics: Arc<crate::metrics_sink::PromSink>,
-    slots: Option<Arc<crate::slot_registry::SlotRegistry>>,
+    profiles: Arc<crate::profile_registry::ProfileRegistry>,
+    registry: Arc<AssignmentRegistry>,
     mut shutdown: tokio::sync::broadcast::Receiver<torrentd_engine::ShutdownReason>,
 ) {
     use torrentd_engine::MetricsSink;
@@ -319,27 +321,28 @@ pub async fn run_verify_queue(
             let Some(item) = q.pending.lock().pop_front() else {
                 break;
             };
-            // `POST /api/pool/adopt` checks the slot's tunnel before queueing,
+            // `POST /api/pool/adopt` checks the profile's tunnel before queueing,
             // but the queue drains over minutes or hours and the tunnel can
             // drop in between. Admitting then would add torrents to a fenced
-            // slot — the one thing fencing exists to prevent. Put it back and
+            // profile — the one thing fencing exists to prevent. Put it back and
             // wait for the operator.
-            if slots
-                .as_ref()
-                .and_then(|sr| sr.get(&item.slot))
-                .is_some_and(|e| e.health().status == SlotStatus::VpnDown)
+            if profiles
+                .resolve(&item.profile)
+                .active()
+                .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
             {
                 warn!(
                     target: "torrentd::pool",
-                    slot_id = %item.slot,
+                    profile_id = %item.profile,
                     infohash = %item.infohash,
-                    "verify held: slot is fenced (vpn_down)",
+                    "verify held: profile is fenced (vpn_down)",
                 );
                 q.pending.lock().push_back(item);
                 break;
             }
-            let Some(engine) = source.engine_for(&item.slot) else {
-                warn!(target: "torrentd::pool", slot_id = %item.slot, "no engine for slot; dropping verify");
+            let Some(engine) = source.engine_for(&item.profile) else {
+                warn!(target: "torrentd::pool", profile_id = %item.profile, "no engine for profile; dropping verify");
+                release_dropped_claim(&registry, &item);
                 continue;
             };
             let bytes = match std::fs::read(&item.torrent_path) {
@@ -352,13 +355,24 @@ pub async fn run_verify_queue(
                         "cannot read .torrent; dropping verify",
                     );
                     q.failed.fetch_add(1, Ordering::Relaxed);
+                    release_dropped_claim(&registry, &item);
                     continue;
                 }
             };
             // No SEED_MODE: that is what makes libtorrent hash the payload
             // against the piece hashes before it will seed. The no-download
             // invariant rides along regardless — see `torrentd_engine::policy`.
-            let flags = torrentd_engine::verify_flags(&item.slot);
+            let Some(profile_cfg) = profiles.config(&item.profile) else {
+                warn!(
+                    target: "torrentd::pool",
+                    profile_id = %item.profile,
+                    "verify queue holds an item for a profile that is not live; dropping",
+                );
+                q.failed.fetch_add(1, Ordering::Relaxed);
+                release_dropped_claim(&registry, &item);
+                continue;
+            };
+            let flags = torrentd_engine::verify_flags(profile_cfg);
             match engine.add_torrent(AddParams::File {
                 bytes,
                 save_path: item.save_path.to_string_lossy().into_owned(),
@@ -376,6 +390,7 @@ pub async fn run_verify_queue(
                 Err(e) => {
                     q.failed.fetch_add(1, Ordering::Relaxed);
                     warn!(target: "torrentd::pool", infohash = %item.infohash, error.cause = %e, "verify add failed");
+                    release_dropped_claim(&registry, &item);
                 }
             }
         }
@@ -391,6 +406,34 @@ pub async fn run_verify_queue(
         if failed > 0 {
             metrics.add_counter("pool_verify_failed_total", failed, &[]);
         }
+    }
+}
+
+/// Release the registry claim of a verify item the worker is dropping.
+///
+/// `POST /api/pool/adopt` claims the info-hash before it queues the item, and
+/// releases the claim itself only when `execute_adopt` fails synchronously. An
+/// item dropped here never reaches a session, so no `AddTorrent` alert will
+/// ever give it a state-map entry, and it is not in `unloaded_at_boot` either:
+/// a claim left behind made `DELETE` answer 409 "still being added" and refused
+/// every re-add or re-adopt until a restart. The claim is released only while
+/// it still names the item's profile, so a claim someone else has since taken
+/// is left alone.
+fn release_dropped_claim(registry: &AssignmentRegistry, item: &PendingVerify) {
+    let Some(ih) = libtorrent_safe::InfoHash::from_hex(&item.infohash) else {
+        return;
+    };
+    if registry.lookup(&ih).as_ref() != Some(&item.profile) {
+        return;
+    }
+    if let Err(e) = registry.remove(&ih) {
+        warn!(
+            target: "torrentd::pool",
+            infohash = %item.infohash,
+            profile_id = %item.profile,
+            error.cause = %e,
+            "could not release the registry claim of a dropped verify",
+        );
     }
 }
 
@@ -436,6 +479,25 @@ fn verify_outcome(
     }
 }
 
+/// Why a `profile_id` resolved to no engine.
+///
+/// A configured profile that failed to come up carries no engine by
+/// construction, so "unknown profile_id" was this path's answer for it too —
+/// which reads as a typo in the id rather than as a tunnel that did not rise.
+fn unresolved_profile(
+    profiles: &crate::profile_registry::ProfileRegistry,
+    profile: &ProfileId,
+) -> String {
+    match profiles.resolve(profile) {
+        crate::profile_registry::Resolution::Failed(f) => {
+            format!("profile failed to start: {}", f.reason)
+        }
+        // `Active` cannot reach here — the caller got no engine for it — and
+        // `Unknown` is the id nothing declares.
+        _ => "unknown profile_id".to_string(),
+    }
+}
+
 /// Adopt one torrent: execute whatever `torrentd_pool::adopt::plan` decided.
 ///
 /// The fast path adds immediately in seed mode. The verify path only enqueues —
@@ -444,8 +506,9 @@ fn verify_outcome(
 pub fn execute_adopt(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
+    profiles: &crate::profile_registry::ProfileRegistry,
     infohash: &str,
-    slot: SlotId,
+    profile: ProfileId,
 ) -> Result<&'static str, String> {
     let plan = pool
         .with_store(|s| torrentd_pool::adopt::plan(s, infohash, |id| pool.root_path_of(id)))
@@ -459,8 +522,8 @@ pub fn execute_adopt(
             save_path,
         } => {
             let engine = source
-                .engine_for(&slot)
-                .ok_or_else(|| "unknown slot_id".to_string())?;
+                .engine_for(&profile)
+                .ok_or_else(|| unresolved_profile(profiles, &profile))?;
             let resume = match std::fs::read(&resume_path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -474,14 +537,17 @@ pub fn execute_adopt(
                         error.cause = %e,
                         "resume data unreadable; falling back to verification",
                     );
-                    return enqueue_verify(pool, infohash, torrent_path, save_path, slot);
+                    return enqueue_verify(pool, infohash, torrent_path, save_path, profile);
                 }
             };
             // The .torrent rides along because resume data written without
             // SAVE_INFO_DICT carries no metadata; libtorrent ignores it when
             // the resume data already has an info dict.
             let torrent = std::fs::read(&torrent_path).ok();
-            let flags = torrentd_engine::seed_flags(&slot);
+            let Some(profile_cfg) = profiles.config(&profile) else {
+                return Err(format!("profile {profile} is not live"));
+            };
+            let flags = torrentd_engine::seed_flags(profile_cfg);
             if let Err(e) = engine.add_torrent(AddParams::Resume {
                 bytes: resume,
                 torrent: torrent.clone(),
@@ -500,7 +566,7 @@ pub fn execute_adopt(
                     error.cause = %e,
                     "resume add rejected; falling back to verification",
                 );
-                return enqueue_verify(pool, infohash, torrent_path, save_path, slot);
+                return enqueue_verify(pool, infohash, torrent_path, save_path, profile);
             }
 
             pool.with_store(|s| {
@@ -514,14 +580,14 @@ pub fn execute_adopt(
                     None,
                     None,
                 );
-                let _ = s.set_slot(infohash, Some(slot.as_str()));
+                let _ = s.set_profile(infohash, Some(profile.as_str()));
             });
             Ok("fast_path")
         }
         AdoptPlan::Verify {
             torrent_path,
             save_path,
-        } => enqueue_verify(pool, infohash, torrent_path, save_path, slot),
+        } => enqueue_verify(pool, infohash, torrent_path, save_path, profile),
     }
 }
 
@@ -531,16 +597,16 @@ fn enqueue_verify(
     infohash: &str,
     torrent_path: PathBuf,
     save_path: PathBuf,
-    slot: SlotId,
+    profile: ProfileId,
 ) -> Result<&'static str, String> {
     pool.with_store(|s| {
-        let _ = s.set_slot(infohash, Some(slot.as_str()));
+        let _ = s.set_profile(infohash, Some(profile.as_str()));
     });
     pool.verify_queue().enqueue(PendingVerify {
         infohash: infohash.to_string(),
         torrent_path,
         save_path,
-        slot,
+        profile,
     });
     Ok("queued_for_verification")
 }
@@ -558,7 +624,7 @@ mod tests {
     use std::time::Instant;
 
     use torrentd_engine::InfoHash;
-    use torrentd_engine::SlotId;
+    use torrentd_engine::ProfileId;
     use torrentd_engine::TorrentHandle;
     use torrentd_engine::TorrentPhase;
     use torrentd_engine::TorrentState;
@@ -575,7 +641,7 @@ mod tests {
                 id: 1,
                 infohash: InfoHash([0x11; 20]),
             },
-            SlotId::default_single(),
+            ProfileId::new("p"),
             now,
         );
         s.phase = phase;
@@ -584,13 +650,13 @@ mod tests {
     }
 
     #[test]
-    fn a_torrent_still_hashing_keeps_its_slot() {
+    fn a_torrent_still_hashing_keeps_its_profile() {
         let s = st(TorrentPhase::Checking, None);
         assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Waiting);
     }
 
     #[test]
-    fn a_torrent_absent_from_the_state_map_keeps_its_slot() {
+    fn a_torrent_absent_from_the_state_map_keeps_its_profile() {
         assert_eq!(verify_outcome(None, SETTLE), VerifyOutcome::Waiting);
     }
 
@@ -606,7 +672,7 @@ mod tests {
     /// `checked_at` arm it held a verify slot forever. Four of these were
     /// enough to stop the whole pool adopting.
     #[test]
-    fn a_torrent_that_failed_hashing_does_not_hold_its_slot_forever() {
+    fn a_torrent_that_failed_hashing_does_not_hold_its_verify_slot_forever() {
         let s = st(TorrentPhase::Checking, Some(Duration::from_secs(60)));
         assert_eq!(
             verify_outcome(Some(&s), SETTLE),
@@ -621,6 +687,40 @@ mod tests {
     fn a_just_checked_torrent_is_given_time_to_report_seeding() {
         let s = st(TorrentPhase::Checking, Some(Duration::from_millis(10)));
         assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Waiting);
+    }
+
+    fn pending(ih: InfoHash, profile: &str) -> super::PendingVerify {
+        super::PendingVerify {
+            infohash: ih.to_hex(),
+            torrent_path: "/nonexistent.torrent".into(),
+            save_path: "/nonexistent".into(),
+            profile: ProfileId::new(profile),
+        }
+    }
+
+    /// A verify item the worker drops never reaches a session, so its claim
+    /// must go with it: left behind, `DELETE` answered 409 and every re-adopt
+    /// was refused until a restart.
+    #[test]
+    fn a_dropped_verify_releases_its_registry_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let ih = InfoHash([0x22; 20]);
+        reg.assign(ih, ProfileId::new("p")).unwrap();
+        super::release_dropped_claim(&reg, &pending(ih, "p"));
+        assert_eq!(reg.lookup(&ih), None);
+    }
+
+    /// A claim that no longer names the item's profile is not the item's to
+    /// release.
+    #[test]
+    fn a_dropped_verify_leaves_another_profiles_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let ih = InfoHash([0x33; 20]);
+        reg.assign(ih, ProfileId::new("other")).unwrap();
+        super::release_dropped_claim(&reg, &pending(ih, "p"));
+        assert_eq!(reg.lookup(&ih), Some(ProfileId::new("other")));
     }
 
     #[test]

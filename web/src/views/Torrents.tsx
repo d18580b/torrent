@@ -14,7 +14,7 @@ interface Row {
   up: number
   uploaded: number
   peers: number
-  slot: string | null
+  profile: string | null
 }
 
 /// The torrent list, virtualised.
@@ -56,7 +56,7 @@ export function Torrents() {
         up: t.upload_rate,
         uploaded: t.total_uploaded,
         peers: t.num_peers,
-        slot: t.slot_id,
+        profile: t.profile_id,
       })
     }
     // Torrents the pool knows about but that are not loaded: the ones that need
@@ -72,7 +72,7 @@ export function Torrents() {
         up: 0,
         uploaded: 0,
         peers: 0,
-        slot: m.slot,
+        profile: m.profile,
       })
     }
     return out
@@ -133,7 +133,7 @@ export function Torrents() {
               <th className="num">Up</th>
               <th className="num">Uploaded</th>
               <th className="num">Peers</th>
-              <th>Slot</th>
+              <th>Profile</th>
             </tr>
           </thead>
         </table>
@@ -158,7 +158,7 @@ export function Torrents() {
                       <td className="num">{rate(r.up)}</td>
                       <td className="num">{r.uploaded ? bytes(r.uploaded) : '—'}</td>
                       <td className="num">{r.peers || '—'}</td>
-                      <td className="small muted">{r.slot ?? '—'}</td>
+                      <td className="small muted">{r.profile ?? '—'}</td>
                     </tr>
                   )
                 })}

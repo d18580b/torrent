@@ -8,7 +8,7 @@
 //! Two things make that possible, and both are passed on the command line
 //! rather than left to the profile:
 //!
-//! * `--dev <iface>` pins the interface to the one the slot config declares,
+//! * `--dev <iface>` pins the interface to the one the profile config declares,
 //!   instead of trusting the profile's own `dev` line to agree with it;
 //! * `--writepid <file>` records the daemonised pid where `bring_down` can
 //!   read it.
@@ -45,7 +45,7 @@ use std::time::Instant;
 
 use torrentd_engine::VpnError;
 use torrentd_engine::VpnManager;
-use torrentd_engine::VpnProfile;
+use torrentd_engine::VpnTunnel;
 use tracing::info;
 use tracing::warn;
 
@@ -147,7 +147,7 @@ impl OpenvpnManager {
 }
 
 impl VpnManager for OpenvpnManager {
-    fn bring_up(&self, profile: &VpnProfile) -> Result<IpAddr, VpnError> {
+    fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError> {
         let pid_file = self.pid_file(&profile.interface);
         if let Some(parent) = pid_file.parent() {
             // A missing state dir would otherwise surface as openvpn exiting
@@ -165,7 +165,8 @@ impl VpnManager for OpenvpnManager {
             .arg("--daemon")
             .arg("--config")
             .arg(&profile.config_path)
-            // Authoritative, so the profile cannot disagree with the slot.
+            // Authoritative, so the OpenVPN profile file cannot disagree with
+            // the profile config.
             .arg("--dev")
             .arg(&profile.interface)
             .arg("--writepid")
@@ -419,7 +420,7 @@ mod tests {
     /// deletes the link it has just created — so a full-tunnel
     /// `AllowedIPs = 0.0.0.0/0` profile, the shape every commercial provider
     /// uses, cannot come up in the image at all and the daemon exits because
-    /// no slot came up.
+    /// no profile came up.
     ///
     /// **What this does and does not establish.** It pins the install list and
     /// the recorded reason, which is what a `grep` of this repository's own

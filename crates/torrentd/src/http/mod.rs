@@ -2,10 +2,12 @@
 
 mod auth_routes;
 mod events;
+pub mod forwarded;
 mod healthz;
 mod metrics;
 mod pool;
-mod slots;
+mod profiles;
+mod reload;
 mod status;
 pub(crate) mod torrents;
 #[cfg(feature = "web-ui")]
@@ -19,15 +21,23 @@ use crate::app_state::AppState;
 
 /// Build the full router.
 ///
-/// Everything is served under `/api`, with the historical bare paths kept as
-/// aliases so deployed scripts and scrapes keep working. Slot and pool routes
-/// are mounted only when those features are configured, so an unconfigured
-/// daemon returns 404 for them rather than a confusing empty success.
+/// Everything is served under `/api`, and only under `/api`.
+///
+/// The bare paths used to be mounted a second time as "back-compat aliases".
+/// There was nothing to be compatible with — the daemon has never been
+/// released — so every route existed twice, under two gates, and any spec
+/// describing this surface would have had to describe both. Probes and scrapes
+/// keep their root paths (`/healthz`, `/metrics`) because those genuinely are
+/// conventional locations.
+///
+/// Pool routes are mounted only when `[pool]` is configured, so an
+/// unconfigured daemon returns 404 rather than a confusing empty success.
 pub fn router(state: AppState) -> Router {
     let mut api = Router::new()
         .route("/status", get(status::status))
         // Live change notifications for the web client.
         .route("/events", get(events::events))
+        .route("/reload", post(reload::trigger))
         .route("/torrents", get(torrents::list).post(torrents::add))
         .route(
             "/torrents/:infohash",
@@ -44,13 +54,17 @@ pub fn router(state: AppState) -> Router {
             post(torrents::set_file_priority),
         );
 
-    if state.slots.is_some() {
+    // Always mounted: a daemon always has at least one profile.
+    {
         api = api
-            .route("/slots", get(slots::list))
-            .route("/slots/:slot_id", get(slots::get))
-            .route("/slots/:slot_id/torrents", get(slots::torrents))
-            .route("/slots/:slot_id/pause-all", post(slots::pause_all))
-            .route("/slots/:slot_id/resume-all", post(slots::resume_all));
+            .route("/profiles", get(profiles::list))
+            .route("/profiles/:profile_id", get(profiles::get))
+            .route("/profiles/:profile_id/torrents", get(profiles::torrents))
+            .route("/profiles/:profile_id/pause-all", post(profiles::pause_all))
+            .route(
+                "/profiles/:profile_id/resume-all",
+                post(profiles::resume_all),
+            );
     }
 
     if state.pool.is_some() {
@@ -96,9 +110,7 @@ pub fn router(state: AppState) -> Router {
         // Login must sit outside the gate, or nobody can ever get in.
         .route("/api/login", post(auth_routes::login))
         .route("/api/logout", post(auth_routes::logout))
-        .nest("/api", api.clone())
-        // Back-compat: the pre-/api paths, same handlers and same gate.
-        .merge(api)
+        .nest("/api", api)
         .layer(axum::extract::DefaultBodyLimit::max(
             torrents::MAX_BODY_BYTES,
         ));
