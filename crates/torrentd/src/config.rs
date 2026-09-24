@@ -2807,6 +2807,9 @@ listen_interfaces = "0.0.0.0:6882"
         // The ruleset matches the daemon's uid and admits only the tunnel
         // interfaces, so a host profile under it sends nothing at all while
         // it stays Active and `/healthz` answers 200.
+        //
+        // Boot rules run inside `Config::validate`, so this is a refusal of
+        // `Config::load` itself and reaches `--check-config` with the rest.
         let dir = tempdir().unwrap();
         let body = format!(
             "{TOP_LEVEL}\nnetwork_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
@@ -2818,8 +2821,7 @@ listen_interfaces = "0.0.0.0:6882"
              user_agent = \"ua-a\"\n"
         );
         let p = write_cfg(dir.path(), &body);
-        let cfg = Config::load(&p).expect("it parses and validates; it does not boot");
-        let msg = format!("{:#}", cfg.check_boot_rules().unwrap_err());
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(
             msg.contains("network_kill_switch") && msg.contains("public"),
             "got: {msg}",
