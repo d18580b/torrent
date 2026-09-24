@@ -1400,6 +1400,14 @@ fn slot_checks(
 /// at it. `wg-quick down` can fail: the interface is busy, the profile moved,
 /// `wg-quick` is not on this uid's PATH. Look at the address instead, and say
 /// plainly when the host has been left changed.
+///
+/// This is a direct `bring_down` rather than `startup`'s
+/// `take_down_off_worker`, and `boot_has_exactly_one_teardown_shape` counts it
+/// as a documented site for that reason: `vpn check` is dispatched from `main`
+/// before the tokio runtime is built, so there is no worker to keep free and
+/// nothing to `spawn_blocking` onto, and the interface was raised by this
+/// command, not recorded by a `boot`'s `BootCleanup`. Blocking here is the
+/// command doing its job.
 fn teardown(host: &dyn CheckHost, manager: &dyn VpnManager, iface: &str) -> Check {
     manager.bring_down(iface);
     match host.first_ipv4(iface) {

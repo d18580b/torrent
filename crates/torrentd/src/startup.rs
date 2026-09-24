@@ -1603,10 +1603,12 @@ mod tests {
     /// `boot`: a fourth teardown written with any other context string, or in
     /// any other module of this crate, passed it in silence. Both halves are
     /// now checked across the crate's sources: the helper is defined and
-    /// wrapped once, and `bring_down` is called at exactly the two sites that
+    /// wrapped once, and `bring_down` is called at exactly the three sites that
     /// document why they are not the helper — `Drop for BootCleanup`, which
-    /// cannot await, and the shutdown job builder in `run_until_signal`, which
-    /// is outside `boot` entirely.
+    /// cannot await, the shutdown job builder in `run_until_signal`, which
+    /// is outside `boot` entirely, and `vpn_cmd::teardown`, which lowers what
+    /// `torrentd vpn check --bring-up` raised and runs before `main` has built
+    /// a runtime or `boot` has a `BootCleanup` to track anything with.
     ///
     /// What is excluded is **`#[cfg(test)]` regions**, not a directory. The
     /// filter used to drop every path under `vpn/`, on the accurate reasoning
@@ -1637,7 +1639,7 @@ mod tests {
         );
 
         // And the helper is what every teardown in `boot` reaches for, so a
-        // direct `bring_down` outside the two documented sites is the same
+        // direct `bring_down` outside the three documented sites is the same
         // hazard arriving without the context string.
         //
         // Counted rather than located: a line number would have to be moved
@@ -1654,14 +1656,16 @@ mod tests {
         assert_eq!(
             direct,
             // One inside `take_down_off_worker`, which is the helper, plus the
-            // two sites that document why they are not it: `Drop for
-            // BootCleanup`, where `drop` cannot await, and the shutdown job
-            // builder in `run_until_signal`, which is outside `boot` entirely.
-            vec!["startup.rs: 3".to_string()],
+            // three sites that document why they are not it: `Drop for
+            // BootCleanup`, where `drop` cannot await, the shutdown job
+            // builder in `run_until_signal`, which is outside `boot` entirely,
+            // and `vpn_cmd::teardown`, the synchronous `vpn check --bring-up`
+            // path that runs before any runtime exists and never enters `boot`.
+            vec!["startup.rs: 3".to_string(), "vpn_cmd.rs: 1".to_string()],
             "every teardown in `boot` goes through `take_down_off_worker`; the \
-             only other `bring_down` calls are the two that say why they are \
+             only other `bring_down` calls are the three that say why they are \
              not it. Found {direct:?} — a new one wants the helper, and a \
-             fourth documented site wants this count and its comment moved \
+             fifth documented site wants this count and its comment moved \
              together",
         );
     }
