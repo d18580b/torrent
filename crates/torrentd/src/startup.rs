@@ -416,7 +416,10 @@ pub async fn boot(
                         )
                     );
                 }
-                tunnel_owner.insert(ip, p.id.clone());
+                // Recorded only once this profile's session is built (below):
+                // a profile that fails a later step has its tunnel taken
+                // down, and still owning the address then disabled a later
+                // profile over a tunnel that no longer exists.
 
                 // The listening port. A static profile binds the operator's
                 // `listen_port`; a natpmp profile negotiates an ephemeral one
@@ -494,6 +497,9 @@ pub async fn boot(
                     dht = p.dht_enabled(),
                     "profile engine up",
                 );
+                if let Some(ip) = tunnel_ip {
+                    tunnel_owner.insert(ip, p.id.clone());
+                }
                 profile_entries.push(ProfileEntry::new(
                     p.clone(),
                     Arc::new(engine),
