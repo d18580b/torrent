@@ -114,7 +114,7 @@ const NON_RELOADABLE_WARNING: &str =
 /// Safety Rule 7: identity-critical profile fields cannot change under a live
 /// session, and the operator has to be told rather than left believing a
 /// reload took. This is also the line an alert rule watches for — an edited
-/// `peer_fingerprint_hex` or `user_agent` under a live session is the privacy
+/// `peer_fingerprint` or `user_agent` under a live session is the privacy
 /// event this warning exists for — so nothing that is not identity may emit
 /// it.
 const IDENTITY_WARNING: &str = "SIGHUP: profile identity change requires daemon restart; ignored";
@@ -254,7 +254,7 @@ mod tests {
                 listen_interfaces: "127.0.0.1:6881".into(),
                 dht: false,
             },
-            peer_fingerprint_hex: None,
+            peer_fingerprint: None,
             user_agent: None,
             resume_dir: None,
             torrent_dir: None,
@@ -290,7 +290,7 @@ mod tests {
                 port_forward: Default::default(),
                 port_forward_gateway: None,
             },
-            peer_fingerprint_hex: Some("a1b2c3d4e5f60718".into()),
+            peer_fingerprint: Some("-AA1000-".into()),
             user_agent: Some("qB/5.0".into()),
             resume_dir: None,
             torrent_dir: None,
@@ -433,7 +433,7 @@ mod tests {
         // rule watches: it must keep its own text. Which fields are in this
         // class is `diff_profiles`' statement, pinned in `config.rs`; what
         // that class is told is this one.
-        let c = change("acct_a.peer_fingerprint_hex", ProfileChangeKind::Identity);
+        let c = change("acct_a.peer_fingerprint", ProfileChangeKind::Identity);
         assert_eq!(warning_for(&c), IDENTITY_WARNING);
     }
 
