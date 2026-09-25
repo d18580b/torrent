@@ -24,6 +24,7 @@ use torrentd_engine::MetricsSink;
 use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
+use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileNetwork;
 use torrentd_engine::ProfileSource;
@@ -44,6 +45,7 @@ use crate::app_state::AppState;
 use crate::config::Config;
 use crate::http;
 use crate::metrics_sink::PromSink;
+use crate::profile_registry::FailedProfile;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
 use crate::reload;
@@ -563,275 +565,16 @@ pub async fn boot(
 
     // One libtorrent session per configured profile. There is no other shape:
     // a deployment with one profile is this with n = 1, not a mode of its own.
-    let mut profile_entries: Vec<ProfileEntry> = Vec::new();
-    // Safety Rule 1: a profile whose tunnel does not come up never gets a
-    // session, and the others carry on. It still has to be *reported* as
-    // failed — skipping it outright made it vanish from `/profiles`, so an
-    // operator wondering why an account was quiet found no trace of it
-    // anywhere but the startup log.
-    let mut failed_profiles: Vec<crate::profile_registry::FailedProfile> = Vec::new();
-    macro_rules! fail_profile {
-        ($cfg:expr, $reason:expr) => {{
-            failed_profiles.push(crate::profile_registry::FailedProfile {
-                config: $cfg.clone(),
-                reason: $reason,
-            });
-            continue;
-        }};
-    }
-
-    // Which profile holds each tunnel address. A vpn session is bound by
-    // address, listening and outgoing alike, so two tunnels that come up with
-    // one address (every Proton WireGuard config assigns 10.2.0.2/32) leave
-    // nothing — neither the bind nor a source-address routing rule — that can
-    // keep one account's traffic out of the other's tunnel. Only known after
-    // bring-up, since OpenVPN's address is pushed by the server.
-    let mut tunnel_owner: std::collections::HashMap<IpAddr, ProfileId> =
-        std::collections::HashMap::new();
-
-    // A bring-up or teardown task that does not join — a panic inside
-    // `spawn_blocking`, or the runtime shutting down under it — fails **that
-    // profile**, and the boot carries on with the rest. Every one of these
-    // sites was a `?`, which aborted the whole boot: one profile's panicking
-    // `wg-quick` wrapper took every other profile's tunnel down with it, on a
-    // daemon whose entire purpose is to keep the remaining profiles seeding.
-    // Failing the profile is what the surrounding code does with every other
-    // per-profile failure, and a failed profile is still visible:
-    // `ProfileRegistry::with_failed` keeps it in `/profiles` and `vpn_monitor`
-    // emits its tunnel-down series.
-    //
-    // `boot` as a whole still fails when *no* profile comes up, which is the
-    // check below the loop.
-    macro_rules! profile_task_failed {
-        ($cfg:expr, $what:literal, $err:expr) => {{
-            let e = $err;
-            error!(
-                profile_id = %$cfg.id,
-                error.cause = %e,
-                concat!($what, " task did not join; profile disabled"),
-            );
-            fail_profile!($cfg, format!(concat!($what, " task failed: {}"), e));
-        }};
-    }
-    // The teardowns below all run on a profile that is failing anyway, so a
-    // task that does not join is reported against the profile and does not
-    // replace the reason it is failing for. It does not abort the boot either:
-    // the tunnel that may still be standing belongs to this profile, and
-    // taking the other profiles down does not remove it.
-    macro_rules! tear_down_or_warn {
-        ($cfg:expr, $iface:expr) => {
-            if let Err(e) = cleanup.take_down_off_worker($iface).await {
-                warn!(
-                    profile_id = %$cfg.id,
-                    vpn_iface = %$iface,
-                    error.cause = %e,
-                    "VPN teardown task did not join; the profile is disabled \
-                     either way and its tunnel may still be standing",
-                );
-            }
-        };
-    }
-
-    for p in &cfg.profile {
-        // A shutdown asked for during a previous profile's bring-up is
-        // honoured here rather than after every remaining tunnel is raised.
-        if boot_shutdown.try_recv().is_ok() {
-            anyhow::bail!("shutdown requested during profile bring-up");
-        }
-
-        let mut settings = cfg.libtorrent_settings();
-        if let Some(ua) = &p.user_agent {
-            settings.user_agent = Some(ua.clone());
-            settings.handshake_client_version = Some(ua.clone());
-        }
-        if let Some(fp) = &p.peer_fingerprint_hex {
-            settings.peer_fingerprint = Some(fp.clone());
-        }
-        // `is_some()`, not `> 0`. `0` is a legal per-profile value meaning
-        // *unlimited* — the top-level key's own comment says so — and testing
-        // `> 0` read it as "unset" and pushed the daemon-wide cap onto a
-        // session the operator had explicitly uncapped.
-        if let Some(limit) = p.upload_rate_limit {
-            settings.upload_rate_limit = Some(limit);
-        }
-
-        // What differs between the two postures, and nothing else: where the
-        // sockets bind, and whether discovery may run.
-        let mut tunnel_ip: Option<IpAddr> = None;
-        let mut forwarded_port: Option<u16> = None;
-        let mut forwarded_epoch: u32 = 0;
-        let mut session_state: Option<Vec<u8>> = None;
-
-        match &p.network {
-            ProfileNetwork::Host {
-                listen_interfaces,
-                dht,
-            } => {
-                settings.listen_interfaces = Some(listen_interfaces.clone());
-                settings.enable_dht = Some(*dht);
-                // DHT keeps a routing table worth restoring; without DHT there
-                // is nothing in session state worth the file.
-                if *dht {
-                    session_state = load_session_state(&cfg.session_state_path(&p.id));
-                    if let Some(bytes) = &session_state {
-                        info!(profile_id = %p.id, bytes = bytes.len(), "restoring session state");
-                    }
-                }
-            }
-            ProfileNetwork::Vpn { .. } => {
-                let iface = p.vpn_interface().expect("vpn profile has an interface");
-                let vpn_type = p.vpn_type().expect("vpn profile has a type");
-                let tunnel = p.vpn_tunnel().expect("vpn profile has a tunnel");
-
-                // Bring the tunnel up first. Safety Rule 1: if it fails, this
-                // profile's session is never constructed — no bare-IP
-                // fallback. Recorded before the attempt and torn down on
-                // failure — a half-up tunnel is the one failure path nothing
-                // else can reach. See `BootCleanup::bring_up_tracked`.
-                let brought_up = match cleanup.bring_up_tracked(vpn_type, tunnel).await {
-                    Ok(r) => r,
-                    Err(e) => profile_task_failed!(p, "VPN bring-up", e),
-                };
-                let ip = match brought_up {
-                    Ok(ip) => ip,
-                    Err(e) => {
-                        error!(
-                            profile_id = %p.id,
-                            error.cause = %e,
-                            "VPN bring-up failed; profile disabled (no bare-IP fallback)",
-                        );
-                        fail_profile!(p, format!("VPN bring-up failed: {e}"));
-                    }
-                };
-                if let Some(owner) = tunnel_owner.get(&ip) {
-                    error!(
-                        profile_id = %p.id,
-                        tunnel_ip = %ip,
-                        other_profile_id = %owner,
-                        "tunnel came up with an address another profile's tunnel already has; \
-                         profile disabled, since a session bound by address cannot be kept \
-                         out of the other account's tunnel",
-                    );
-                    let reason = format!(
-                        "tunnel address {ip} is also profile {owner}'s, so neither session can \
-                         be kept out of the other's tunnel"
-                    );
-                    tear_down_or_warn!(p, iface);
-                    fail_profile!(p, reason);
-                }
-                // Recorded only once this profile's session is built (below):
-                // a profile that fails a later step has its tunnel taken
-                // down, and still owning the address then disabled a later
-                // profile over a tunnel that no longer exists.
-
-                // The listening port. A static profile binds the operator's
-                // `listen_port`; a natpmp profile negotiates an ephemeral one
-                // from the tunnel gateway. A startup negotiation failure
-                // disables the profile — loud, like a bring-up failure —
-                // rather than silently seeding on an unforwarded port.
-                // Mid-session renewal failures are the soft keep-seeding path
-                // (see port_forward_monitor).
-                let effective_port = match p.port_forward() {
-                    PortForwardMode::Static => match p.listen_port() {
-                        Some(port) => port,
-                        None => {
-                            // validate_set should have caught this.
-                            error!(profile_id = %p.id, "static profile missing listen_port; profile disabled");
-                            tear_down_or_warn!(p, iface);
-                            fail_profile!(p, "static profile has no listen_port".to_string());
-                        }
-                    },
-                    PortForwardMode::Natpmp => {
-                        let gw_str = p.port_forward_gateway_or_default();
-                        let gateway: IpAddr = match gw_str.parse() {
-                            Ok(ip) => ip,
-                            Err(e) => {
-                                error!(profile_id = %p.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; profile disabled");
-                                tear_down_or_warn!(p, iface);
-                                fail_profile!(p, format!("invalid port_forward_gateway: {e}"));
-                            }
-                        };
-                        let req = PortMapRequest {
-                            gateway,
-                            bind_ip: ip,
-                            internal_port: 0,
-                            lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
-                        };
-                        match vpn::NatpmpForwarder::for_startup().map(&req) {
-                            Ok(m) => {
-                                info!(profile_id = %p.id, tunnel_ip = %ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
-                                forwarded_port = Some(m.port);
-                                forwarded_epoch = m.epoch;
-                                m.port
-                            }
-                            Err(e) => {
-                                error!(profile_id = %p.id, tunnel_ip = %ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; profile disabled (no bare-IP fallback)");
-                                tear_down_or_warn!(p, iface);
-                                fail_profile!(p, format!("NAT-PMP negotiation failed: {e}"));
-                            }
-                        }
-                    }
-                };
-
-                settings.listen_interfaces =
-                    Some(torrentd_engine::bind_endpoint(ip, effective_port));
-                settings.outgoing_interfaces = Some(ip.to_string());
-                // Not configurable, by construction: there is no key on a vpn
-                // profile that reaches these.
-                settings.enable_dht = Some(false);
-                settings.enable_lsd = Some(false);
-                settings.enable_upnp = Some(false);
-                settings.enable_natpmp = Some(false);
-                tunnel_ip = Some(ip);
-            }
-        }
-
-        let built = match session_state {
-            Some(state) => libtorrent_safe::Session::with_state(&settings, &state)
-                .map(RealEngine::from_session),
-            None => libtorrent_safe::Session::new(&settings).map(RealEngine::from_session),
-        };
-        match built {
-            Ok(engine) => {
-                info!(
-                    profile_id = %p.id,
-                    network = if p.is_vpn() { "vpn" } else { "host" },
-                    tunnel_ip = tunnel_ip.map(|i| i.to_string()).unwrap_or_default(),
-                    dht = p.dht_enabled(),
-                    "profile engine up",
-                );
-                if let Some(ip) = tunnel_ip {
-                    tunnel_owner.insert(ip, p.id.clone());
-                }
-                profile_entries.push(ProfileEntry::new(
-                    p.clone(),
-                    Arc::new(engine),
-                    tunnel_ip,
-                    forwarded_port,
-                    forwarded_epoch,
-                ));
-            }
-            Err(e) => {
-                error!(
-                    profile_id = %p.id,
-                    error.cause = %e,
-                    "profile engine construction failed",
-                );
-                // Through the helper, like every other teardown in `boot`:
-                // the same bounded exit wait, reached by one more path.
-                // Hand-inlining it here meant a change to the teardown
-                // contract — a timeout on the join, a retry, a metric —
-                // applied through the helper missed this arm silently.
-                if let Some(iface) = p.vpn_interface() {
-                    tear_down_or_warn!(p, iface);
-                }
-                failed_profiles.push(crate::profile_registry::FailedProfile {
-                    config: p.clone(),
-                    reason: format!("session construction failed: {e}"),
-                });
-            }
-        }
-    }
+    // The NAT-PMP client is stateless — each `map` opens a fresh socket — so
+    // one serves every profile's startup negotiation.
+    let (profile_entries, failed_profiles) = build_profiles(
+        &cfg,
+        &mut cleanup,
+        &vpn::NatpmpForwarder::for_startup(),
+        &mut boot_shutdown,
+        real_engine,
+    )
+    .await?;
     // The profile loop's own check is only re-evaluated at the top of the
     // *next* iteration, so the last profile's 30-second bring-up had no check
     // against it at all — and a one-profile deployment had none anywhere. Ask
@@ -1279,6 +1022,341 @@ pub async fn boot(
         alert_loop,
         unloaded_at_boot,
     })
+}
+
+/// The production engine factory for [`build_profiles`]: a real libtorrent
+/// session, restored from `state` where a host profile with DHT kept one.
+fn real_engine(
+    settings: &torrentd_engine::Settings,
+    state: Option<Vec<u8>>,
+) -> Result<Arc<dyn TorrentEngine>, libtorrent_safe::Error> {
+    let session = match state {
+        Some(state) => libtorrent_safe::Session::with_state(settings, &state),
+        None => libtorrent_safe::Session::new(settings),
+    }?;
+    Ok(Arc::new(RealEngine::from_session(session)))
+}
+
+/// Build every configured profile's session, in configuration order.
+///
+/// Safety Rule 1: a profile whose tunnel does not come up never gets a
+/// session, and the others carry on. It still has to be *reported* as failed
+/// — skipping it outright made it vanish from `/profiles`, so an operator
+/// wondering why an account was quiet found no trace of it anywhere but the
+/// startup log. Returned as `(up, failed)`; an empty `up` is the caller's to
+/// refuse, since a daemon with no session has nothing to run.
+///
+/// Every piece of the outside world arrives as a parameter — the tunnel
+/// managers through `cleanup`'s factory, NAT-PMP through `forwarder`, the
+/// session through `make_engine` — so a test drives this whole loop with
+/// `MockVpn`, `MockForwarder` and `MockEngine`. `boot` constructed each of
+/// them inline, and the safety rules below were guaranteed only by reading.
+///
+/// `Err` only for a shutdown asked for between two profiles' bring-ups.
+async fn build_profiles<F, E>(
+    cfg: &Config,
+    cleanup: &mut BootCleanup,
+    forwarder: &dyn PortForwarder,
+    boot_shutdown: &mut broadcast::Receiver<ShutdownReason>,
+    mut make_engine: F,
+) -> anyhow::Result<(Vec<ProfileEntry>, Vec<FailedProfile>)>
+where
+    F: FnMut(&torrentd_engine::Settings, Option<Vec<u8>>) -> Result<Arc<dyn TorrentEngine>, E>,
+    E: std::fmt::Display,
+{
+    let mut profile_entries: Vec<ProfileEntry> = Vec::new();
+    let mut failed_profiles: Vec<FailedProfile> = Vec::new();
+
+    // Which profile holds each tunnel address. A vpn session is bound by
+    // address, listening and outgoing alike, so two tunnels that come up with
+    // one address (every Proton WireGuard config assigns 10.2.0.2/32) leave
+    // nothing — neither the bind nor a source-address routing rule — that can
+    // keep one account's traffic out of the other's tunnel. Only known after
+    // bring-up, since OpenVPN's address is pushed by the server.
+    let mut tunnel_owner: std::collections::HashMap<IpAddr, ProfileId> =
+        std::collections::HashMap::new();
+
+    for p in &cfg.profile {
+        // A shutdown asked for during a previous profile's bring-up is
+        // honoured here rather than after every remaining tunnel is raised.
+        if boot_shutdown.try_recv().is_ok() {
+            anyhow::bail!("shutdown requested during profile bring-up");
+        }
+
+        match build_profile(
+            p,
+            cfg.libtorrent_settings(),
+            &cfg.session_state_path(&p.id),
+            cleanup,
+            forwarder,
+            &tunnel_owner,
+            &mut make_engine,
+        )
+        .await
+        {
+            Ok(entry) => {
+                // Recorded only once this profile's session is built: a
+                // profile that fails a later step has its tunnel taken down,
+                // and still owning the address then disabled a later profile
+                // over a tunnel that no longer exists.
+                if let Some(ip) = entry.health().tunnel_ip {
+                    tunnel_owner.insert(ip, p.id.clone());
+                }
+                profile_entries.push(entry);
+            }
+            Err(failed) => failed_profiles.push(failed),
+        }
+    }
+    Ok((profile_entries, failed_profiles))
+}
+
+/// Build one profile's session, or say why it has none.
+///
+/// Any tunnel this raised and then failed after is taken down before the
+/// `Err` returns, so a failed profile leaves nothing standing whether or not
+/// the boot around it goes on to succeed. A tunnel that came up for a profile
+/// that succeeded stays tracked by `cleanup`, whose drop guard owns it until
+/// `boot` disarms it.
+async fn build_profile<F, E>(
+    p: &ProfileConfig,
+    mut settings: torrentd_engine::Settings,
+    session_state_path: &std::path::Path,
+    cleanup: &mut BootCleanup,
+    forwarder: &dyn PortForwarder,
+    tunnel_owner: &std::collections::HashMap<IpAddr, ProfileId>,
+    make_engine: &mut F,
+) -> Result<ProfileEntry, FailedProfile>
+where
+    F: FnMut(&torrentd_engine::Settings, Option<Vec<u8>>) -> Result<Arc<dyn TorrentEngine>, E>,
+    E: std::fmt::Display,
+{
+    macro_rules! fail_profile {
+        ($reason:expr) => {
+            return Err(FailedProfile {
+                config: p.clone(),
+                reason: $reason,
+            })
+        };
+    }
+
+    // A bring-up or teardown task that does not join — a panic inside
+    // `spawn_blocking`, or the runtime shutting down under it — fails **that
+    // profile**, and the boot carries on with the rest. Every one of these
+    // sites was a `?`, which aborted the whole boot: one profile's panicking
+    // `wg-quick` wrapper took every other profile's tunnel down with it, on a
+    // daemon whose entire purpose is to keep the remaining profiles seeding.
+    // Failing the profile is what the surrounding code does with every other
+    // per-profile failure, and a failed profile is still visible:
+    // `ProfileRegistry::with_failed` keeps it in `/profiles` and `vpn_monitor`
+    // emits its tunnel-down series.
+    //
+    // `boot` as a whole still fails when *no* profile comes up, which is the
+    // check below its call to `build_profiles`.
+    macro_rules! profile_task_failed {
+        ($what:literal, $err:expr) => {{
+            let e = $err;
+            error!(
+                profile_id = %p.id,
+                error.cause = %e,
+                concat!($what, " task did not join; profile disabled"),
+            );
+            fail_profile!(format!(concat!($what, " task failed: {}"), e));
+        }};
+    }
+    // The teardowns below all run on a profile that is failing anyway, so a
+    // task that does not join is reported against the profile and does not
+    // replace the reason it is failing for. It does not abort the boot either:
+    // the tunnel that may still be standing belongs to this profile, and
+    // taking the other profiles down does not remove it.
+    macro_rules! tear_down_or_warn {
+        ($iface:expr) => {
+            if let Err(e) = cleanup.take_down_off_worker($iface).await {
+                warn!(
+                    profile_id = %p.id,
+                    vpn_iface = %$iface,
+                    error.cause = %e,
+                    "VPN teardown task did not join; the profile is disabled \
+                     either way and its tunnel may still be standing",
+                );
+            }
+        };
+    }
+
+    if let Some(ua) = &p.user_agent {
+        settings.user_agent = Some(ua.clone());
+        settings.handshake_client_version = Some(ua.clone());
+    }
+    if let Some(fp) = &p.peer_fingerprint_hex {
+        settings.peer_fingerprint = Some(fp.clone());
+    }
+    // `is_some()`, not `> 0`. `0` is a legal per-profile value meaning
+    // *unlimited* — the top-level key's own comment says so — and testing
+    // `> 0` read it as "unset" and pushed the daemon-wide cap onto a
+    // session the operator had explicitly uncapped.
+    if let Some(limit) = p.upload_rate_limit {
+        settings.upload_rate_limit = Some(limit);
+    }
+
+    // What differs between the two postures, and nothing else: where the
+    // sockets bind, and whether discovery may run.
+    let mut tunnel_ip: Option<IpAddr> = None;
+    let mut forwarded_port: Option<u16> = None;
+    let mut forwarded_epoch: u32 = 0;
+    let mut session_state: Option<Vec<u8>> = None;
+
+    match &p.network {
+        ProfileNetwork::Host {
+            listen_interfaces,
+            dht,
+        } => {
+            settings.listen_interfaces = Some(listen_interfaces.clone());
+            settings.enable_dht = Some(*dht);
+            // DHT keeps a routing table worth restoring; without DHT there
+            // is nothing in session state worth the file.
+            if *dht {
+                session_state = load_session_state(session_state_path);
+                if let Some(bytes) = &session_state {
+                    info!(profile_id = %p.id, bytes = bytes.len(), "restoring session state");
+                }
+            }
+        }
+        ProfileNetwork::Vpn { .. } => {
+            let iface = p.vpn_interface().expect("vpn profile has an interface");
+            let vpn_type = p.vpn_type().expect("vpn profile has a type");
+            let tunnel = p.vpn_tunnel().expect("vpn profile has a tunnel");
+
+            // Bring the tunnel up first. Safety Rule 1: if it fails, this
+            // profile's session is never constructed — no bare-IP
+            // fallback. Recorded before the attempt and torn down on
+            // failure — a half-up tunnel is the one failure path nothing
+            // else can reach. See `BootCleanup::bring_up_tracked`.
+            let brought_up = match cleanup.bring_up_tracked(vpn_type, tunnel).await {
+                Ok(r) => r,
+                Err(e) => profile_task_failed!("VPN bring-up", e),
+            };
+            let ip = match brought_up {
+                Ok(ip) => ip,
+                Err(e) => {
+                    error!(
+                        profile_id = %p.id,
+                        error.cause = %e,
+                        "VPN bring-up failed; profile disabled (no bare-IP fallback)",
+                    );
+                    fail_profile!(format!("VPN bring-up failed: {e}"));
+                }
+            };
+            if let Some(owner) = tunnel_owner.get(&ip) {
+                error!(
+                    profile_id = %p.id,
+                    tunnel_ip = %ip,
+                    other_profile_id = %owner,
+                    "tunnel came up with an address another profile's tunnel already has; \
+                     profile disabled, since a session bound by address cannot be kept \
+                     out of the other account's tunnel",
+                );
+                let reason = format!(
+                    "tunnel address {ip} is also profile {owner}'s, so neither session can \
+                     be kept out of the other's tunnel"
+                );
+                tear_down_or_warn!(iface);
+                fail_profile!(reason);
+            }
+
+            // The listening port. A static profile binds the operator's
+            // `listen_port`; a natpmp profile negotiates an ephemeral one
+            // from the tunnel gateway. A startup negotiation failure
+            // disables the profile — loud, like a bring-up failure —
+            // rather than silently seeding on an unforwarded port.
+            // Mid-session renewal failures are the soft keep-seeding path
+            // (see port_forward_monitor).
+            let effective_port = match p.port_forward() {
+                PortForwardMode::Static => match p.listen_port() {
+                    Some(port) => port,
+                    None => {
+                        // validate_set should have caught this.
+                        error!(profile_id = %p.id, "static profile missing listen_port; profile disabled");
+                        tear_down_or_warn!(iface);
+                        fail_profile!("static profile has no listen_port".to_string());
+                    }
+                },
+                PortForwardMode::Natpmp => {
+                    let gw_str = p.port_forward_gateway_or_default();
+                    let gateway: IpAddr = match gw_str.parse() {
+                        Ok(ip) => ip,
+                        Err(e) => {
+                            error!(profile_id = %p.id, gateway = %gw_str, error.cause = %e, "invalid port_forward_gateway; profile disabled");
+                            tear_down_or_warn!(iface);
+                            fail_profile!(format!("invalid port_forward_gateway: {e}"));
+                        }
+                    };
+                    let req = PortMapRequest {
+                        gateway,
+                        bind_ip: ip,
+                        internal_port: 0,
+                        lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
+                    };
+                    match forwarder.map(&req) {
+                        Ok(m) => {
+                            info!(profile_id = %p.id, tunnel_ip = %ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
+                            forwarded_port = Some(m.port);
+                            forwarded_epoch = m.epoch;
+                            m.port
+                        }
+                        Err(e) => {
+                            error!(profile_id = %p.id, tunnel_ip = %ip, gateway = %gateway, error.cause = %e, "NAT-PMP negotiation failed at startup; profile disabled (no bare-IP fallback)");
+                            tear_down_or_warn!(iface);
+                            fail_profile!(format!("NAT-PMP negotiation failed: {e}"));
+                        }
+                    }
+                }
+            };
+
+            settings.listen_interfaces = Some(torrentd_engine::bind_endpoint(ip, effective_port));
+            settings.outgoing_interfaces = Some(ip.to_string());
+            // Not configurable, by construction: there is no key on a vpn
+            // profile that reaches these.
+            settings.enable_dht = Some(false);
+            settings.enable_lsd = Some(false);
+            settings.enable_upnp = Some(false);
+            settings.enable_natpmp = Some(false);
+            tunnel_ip = Some(ip);
+        }
+    }
+
+    match make_engine(&settings, session_state) {
+        Ok(engine) => {
+            info!(
+                profile_id = %p.id,
+                network = if p.is_vpn() { "vpn" } else { "host" },
+                tunnel_ip = tunnel_ip.map(|i| i.to_string()).unwrap_or_default(),
+                dht = p.dht_enabled(),
+                "profile engine up",
+            );
+            Ok(ProfileEntry::new(
+                p.clone(),
+                engine,
+                tunnel_ip,
+                forwarded_port,
+                forwarded_epoch,
+            ))
+        }
+        Err(e) => {
+            error!(
+                profile_id = %p.id,
+                error.cause = %e,
+                "profile engine construction failed",
+            );
+            // Through the helper, like every other teardown in `boot`:
+            // the same bounded exit wait, reached by one more path.
+            // Hand-inlining it here meant a change to the teardown
+            // contract — a timeout on the join, a retry, a metric —
+            // applied through the helper missed this arm silently.
+            if let Some(iface) = p.vpn_interface() {
+                tear_down_or_warn!(iface);
+            }
+            fail_profile!(format!("session construction failed: {e}"));
+        }
+    }
 }
 
 impl DaemonHandle {
