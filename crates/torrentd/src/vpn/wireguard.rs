@@ -1,8 +1,14 @@
-//! WireGuard tunnel control via `wg-quick`.
+//! WireGuard tunnel control.
 //!
-//! Bring-up: `wg-quick up <profile>` then poll the interface IP via
-//! `ip addr` every 250ms until either an address appears or the 30-second
-//! timeout fires.
+//! Bring-up: raise the link, then poll the interface IP via `ip addr` every
+//! 250ms until either an address appears or the 30-second timeout fires.
+//!
+//! How the link is raised depends on the daemon's uid ([`Raiser`]). As root it
+//! is `wg-quick up <profile>`. As any other uid `wg-quick` cannot run — it
+//! re-execs itself through `sudo` — so the daemon raises the link with `ip`
+//! and `wg`, which need only `CAP_NET_ADMIN` ([`native`]). That is the shape
+//! the network kill switch runs in: a dedicated uid whose links' sockets it
+//! owns, with their transport exempted by the ruleset.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -432,17 +438,51 @@ fn profile_public_key(config_path: &Path) -> Option<String> {
     (!key.is_empty()).then_some(key)
 }
 
+/// How this process raises and lowers a WireGuard link.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum Raiser {
+    /// `wg-quick up` / `wg-quick down`: routing, DNS and hooks exactly as
+    /// the config says. Only as uid 0, because `wg-quick` re-execs itself
+    /// through `sudo` otherwise, and under the packaged unit's
+    /// `NoNewPrivileges=yes` that `sudo` cannot elevate.
+    WgQuick,
+    /// `ip` and `wg` directly, which need `CAP_NET_ADMIN` and not uid 0 —
+    /// see [`native`] for what that does and does not carry over.
+    Native,
+}
+
+impl Raiser {
+    /// `wg-quick` for root, and wherever the uid could not be read (the
+    /// behaviour before the native path existed); `ip`/`wg` for every other
+    /// uid, where `wg-quick` could only fail.
+    fn for_uid(uid: Option<u32>) -> Self {
+        match uid {
+            Some(0) | None => Raiser::WgQuick,
+            Some(_) => Raiser::Native,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Raiser::WgQuick => "wg_quick",
+            Raiser::Native => "ip_wg",
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct WireguardManager {
     /// Where this boot's raised-interface records live — `Config::state_dir()`,
     /// beside the OpenVPN pid file. See [`RaisedInterfaces`].
     raised: RaisedInterfaces,
+    raiser: Raiser,
 }
 
 impl WireguardManager {
     pub fn new(run_dir: std::path::PathBuf) -> Self {
         Self {
             raised: RaisedInterfaces::new(run_dir),
+            raiser: Raiser::for_uid(super::killswitch::current_uid().ok()),
         }
     }
 
@@ -452,7 +492,30 @@ impl WireguardManager {
     /// that is real.
     #[cfg(test)]
     fn with_raised(raised: RaisedInterfaces) -> Self {
-        Self { raised }
+        Self {
+            raised,
+            raiser: Raiser::WgQuick,
+        }
+    }
+
+    /// Raise `profile`'s link. `Ok(Err(text))` is a refusal — the link could
+    /// not be raised, which the caller answers by asking whether one it may
+    /// adopt is already standing; `Err` is a tool that could not be run.
+    fn raise(&self, profile: &VpnTunnel) -> Result<Result<(), String>, std::io::Error> {
+        match self.raiser {
+            Raiser::WgQuick => {
+                let status = Command::new("wg-quick")
+                    .arg("up")
+                    .arg(&profile.config_path)
+                    .status()?;
+                Ok(if status.success() {
+                    Ok(())
+                } else {
+                    Err(format!("wg-quick up exited with {status}"))
+                })
+            }
+            Raiser::Native => Ok(native::up(&profile.interface, &profile.config_path)),
+        }
     }
 
     /// The IP of an existing interface that is safe to adopt as `profile`'s
@@ -818,14 +881,10 @@ impl VpnManager for WireguardManager {
             target: "torrentd::vpn::wireguard",
             vpn_iface = %profile.interface,
             config = %profile.config_path.display(),
-            "wg-quick up",
+            raiser = self.raiser.as_str(),
+            "raising wireguard link",
         );
-        let status = Command::new("wg-quick")
-            .arg("up")
-            .arg(&profile.config_path)
-            .status()
-            .map_err(VpnError::Io)?;
-        if !status.success() {
+        if let Err(refused) = self.raise(profile).map_err(VpnError::Io)? {
             // `wg-quick up` refuses an interface that already exists, which is
             // what a previous process leaves behind when it is killed rather
             // than shut down: the tunnel outlives it, every profile then fails to
@@ -862,7 +921,7 @@ impl VpnManager for WireguardManager {
                 &profile.interface,
                 standing_before,
                 self.adoptable(profile),
-                &format!("wg-quick up exited with {status}"),
+                &refused,
             );
         }
 
@@ -943,7 +1002,12 @@ impl VpnManager for WireguardManager {
     }
 
     fn bring_down(&self, iface: &str) {
-        let _ = Command::new("wg-quick").arg("down").arg(iface).status();
+        match self.raiser {
+            Raiser::WgQuick => {
+                let _ = Command::new("wg-quick").arg("down").arg(iface).status();
+            }
+            Raiser::Native => native::down(iface),
+        }
         self.drop_record_if_gone(iface, interface_exists);
     }
 }
@@ -987,6 +1051,321 @@ impl WireguardManager {
             return;
         }
         self.raised.forget(iface);
+    }
+}
+
+/// Raising and lowering a WireGuard link with `ip` and `wg`, for a daemon that
+/// is not uid 0.
+///
+/// This is `wg-quick up`'s sequence, reduced to what `CAP_NET_ADMIN` can do
+/// and what the daemon needs:
+///
+/// 1. `ip link add <iface> type wireguard`. A name that is already taken fails
+///    here, before anything is created, and the caller's adoption logic then
+///    decides about the standing link exactly as it does for `wg-quick up`.
+/// 2. `wg setconf` with the config minus the `wg-quick`-only keys.
+/// 3. `ip address add` for each `Address`, then `ip link set mtu … up`.
+/// 4. **Source-address routing instead of `wg-quick`'s host-wide default.**
+///    Each peer's `AllowedIPs`, for the address families the link has an
+///    `Address` in, is routed via the link in a table of its own, and a rule
+///    sends traffic *from* each of the link's addresses to that table. Every
+///    profile's sockets are bound to its tunnel address, so that is all the
+///    daemon's own traffic needs, and nothing else on the host is rerouted.
+///    `Table = off` skips this step, as it does for `wg-quick`.
+///
+/// Any failure after step 1 removes what this call made — the rules and the
+/// link — the same way `wg-quick`'s own exit trap does.
+///
+/// **What does not carry over.** `DNS` needs `resolvconf` and root, and
+/// `SaveConfig` writes the config back as root; both are ignored with a
+/// warning. `PreUp`/`PostUp`/`PreDown`/`PostDown` hooks are refused rather
+/// than run: they are shell the operator wrote for a root `wg-quick`, and
+/// running them under the daemon's uid would either fail part-way or do
+/// something different from what they were written for. A named or numeric
+/// `Table` is refused too, because the teardown finds its rules by the table
+/// this module derives.
+///
+/// A refused config still reaches adoption: a link root raised from it before
+/// the daemon started is adopted when its key matches, as before.
+mod native {
+    use std::io::Write;
+    use std::path::Path;
+    use std::process::Command;
+    use std::process::Stdio;
+
+    use tracing::warn;
+
+    /// `wg-quick`'s MTU for a 1500-byte path, used when the config sets none.
+    const DEFAULT_MTU: u32 = 1420;
+
+    /// The routing tables this module uses are `TABLE_BASE + ifindex`: unique
+    /// per live link, derivable again at teardown from the link alone, and
+    /// clear of `wg-quick`'s 51820 and the kernel's reserved 253-255.
+    const TABLE_BASE: u32 = 0x7464_0000;
+
+    /// Upper bound on `ip rule del` per family at teardown. One rule is added
+    /// per `Address`, so this is far above any real config; it only stops a
+    /// loop on an `ip` that reports success without deleting.
+    const MAX_RULES: usize = 64;
+
+    /// A WireGuard config split into what `wg` takes and what `wg-quick`
+    /// would have done around it.
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(super) struct Parsed {
+        pub(super) addresses: Vec<String>,
+        pub(super) allowed_ips: Vec<String>,
+        pub(super) mtu: Option<u32>,
+        /// `false` for `Table = off`.
+        pub(super) route: bool,
+        /// `wg-quick`-only keys this path cannot honour and ignores.
+        pub(super) ignored: Vec<String>,
+        /// The config with every `wg-quick`-only line removed, for `wg setconf`.
+        pub(super) wg_conf: String,
+    }
+
+    fn list(value: &str) -> impl Iterator<Item = String> + '_ {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// Split a config the way `wg-quick`'s `parse_options` does: `#` starts a
+    /// comment, keys match case-insensitively, and the `wg-quick` keys are
+    /// taken only inside `[Interface]`.
+    pub(super) fn parse(text: &str) -> Result<Parsed, String> {
+        let mut p = Parsed {
+            route: true,
+            ..Parsed::default()
+        };
+        let mut in_interface = false;
+        for line in text.lines() {
+            let stripped = line.split('#').next().unwrap_or_default();
+            let (key, value) = match stripped.split_once('=') {
+                Some((k, v)) => (k.trim(), v.trim()),
+                None => (stripped.trim(), ""),
+            };
+            if key.starts_with('[') {
+                in_interface = key.eq_ignore_ascii_case("[Interface]");
+            } else if key.eq_ignore_ascii_case("AllowedIPs") {
+                p.allowed_ips.extend(list(value));
+            } else if in_interface {
+                match key.to_ascii_lowercase().as_str() {
+                    "address" => {
+                        p.addresses.extend(list(value));
+                        continue;
+                    }
+                    "mtu" => {
+                        p.mtu = Some(
+                            value
+                                .parse()
+                                .map_err(|_| format!("MTU = {value:?} is not a number"))?,
+                        );
+                        continue;
+                    }
+                    "table" => {
+                        match value.to_ascii_lowercase().as_str() {
+                            "off" => p.route = false,
+                            "auto" => p.route = true,
+                            _ => {
+                                return Err(format!(
+                                    "Table = {value:?} is not supported when the daemon raises \
+                                     the link itself (not uid 0); use auto or off"
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    "dns" | "saveconfig" => {
+                        p.ignored.push(key.to_string());
+                        continue;
+                    }
+                    "preup" | "postup" | "predown" | "postdown" => {
+                        return Err(format!(
+                            "{key} hooks are not run when the daemon raises the link itself \
+                             (not uid 0); remove them, or raise the link as root before \
+                             the daemon starts"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            p.wg_conf.push_str(line);
+            p.wg_conf.push('\n');
+        }
+        if p.addresses.is_empty() {
+            return Err("the config names no Address for the link".to_string());
+        }
+        Ok(p)
+    }
+
+    fn family(addr: &str) -> &'static str {
+        if addr.contains(':') {
+            "-6"
+        } else {
+            "-4"
+        }
+    }
+
+    /// Run `args`, feeding `stdin` if given. The error names the command and
+    /// what it printed; `stdin` — which carries the private key — never
+    /// appears in it.
+    fn run(args: &[&str], stdin: Option<&str>) -> Result<(), String> {
+        let shown = args.join(" ");
+        let mut child = Command::new(args[0])
+            .args(&args[1..])
+            .stdin(if stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("`{shown}` could not run: {e}"))?;
+        if let Some(input) = stdin {
+            let mut pipe = child
+                .stdin
+                .take()
+                .ok_or_else(|| format!("`{shown}`: stdin unavailable"))?;
+            pipe.write_all(input.as_bytes())
+                .map_err(|e| format!("`{shown}`: {e}"))?;
+        }
+        let out = child
+            .wait_with_output()
+            .map_err(|e| format!("`{shown}`: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "`{shown}` exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            ))
+        }
+    }
+
+    /// The routing table this module uses for the live link `iface`.
+    ///
+    /// The ifindex is asked of `ip` rather than read from `/sys/class/net`,
+    /// which shows the network namespace sysfs was mounted in and not
+    /// necessarily this process's.
+    pub(super) fn table_for(iface: &str) -> Result<u32, String> {
+        let out = Command::new("ip")
+            .args(["-o", "link", "show", "dev", iface])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("`ip -o link show dev {iface}` could not run: {e}"))?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let index = out
+            .status
+            .success()
+            .then(|| text.split(':').next())
+            .flatten()
+            .and_then(|i| i.trim().parse::<u32>().ok())
+            .ok_or_else(|| format!("no ifindex for {iface}"))?;
+        Ok(TABLE_BASE.wrapping_add(index))
+    }
+
+    pub(super) fn up(iface: &str, config: &Path) -> Result<(), String> {
+        let text = std::fs::read_to_string(config)
+            .map_err(|e| format!("read {}: {e}", config.display()))?;
+        let parsed = parse(&text)?;
+        for key in &parsed.ignored {
+            warn!(
+                target: "torrentd::vpn::wireguard",
+                vpn_iface = %iface,
+                key = %key,
+                "ignoring a wg-quick-only key the daemon cannot apply without root",
+            );
+        }
+        run(
+            &["ip", "link", "add", "dev", iface, "type", "wireguard"],
+            None,
+        )?;
+        // The link is this call's from here on, so a failure removes it.
+        let configured = configure(iface, &parsed);
+        if configured.is_err() {
+            down(iface);
+        }
+        configured
+    }
+
+    fn configure(iface: &str, p: &Parsed) -> Result<(), String> {
+        run(&["wg", "setconf", iface, "/dev/stdin"], Some(&p.wg_conf))?;
+        for addr in &p.addresses {
+            run(
+                &["ip", family(addr), "address", "add", addr, "dev", iface],
+                None,
+            )?;
+        }
+        let mtu = p.mtu.unwrap_or(DEFAULT_MTU).to_string();
+        run(
+            &["ip", "link", "set", "mtu", &mtu, "up", "dev", iface],
+            None,
+        )?;
+        if !p.route {
+            return Ok(());
+        }
+        let table = table_for(iface)?.to_string();
+        for prefix in &p.allowed_ips {
+            // A route in a family the link has no address in could never be
+            // chosen — the rules below are keyed on those addresses — and on
+            // a host with IPv6 disabled it fails the whole bring-up.
+            if !p.addresses.iter().any(|a| family(a) == family(prefix)) {
+                continue;
+            }
+            run(
+                &[
+                    "ip",
+                    family(prefix),
+                    "route",
+                    "replace",
+                    prefix,
+                    "dev",
+                    iface,
+                    "table",
+                    &table,
+                ],
+                None,
+            )?;
+        }
+        for addr in &p.addresses {
+            let host = addr.split('/').next().unwrap_or(addr);
+            run(
+                &[
+                    "ip",
+                    family(addr),
+                    "rule",
+                    "add",
+                    "from",
+                    host,
+                    "table",
+                    &table,
+                ],
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Remove the rules this module added for `iface`, then the link. Routes
+    /// in its table go with the link. Best effort, like `wg-quick down`: the
+    /// caller decides what a link still standing afterwards means.
+    pub(super) fn down(iface: &str) {
+        if let Ok(table) = table_for(iface) {
+            let table = table.to_string();
+            for fam in ["-4", "-6"] {
+                for _ in 0..MAX_RULES {
+                    if run(&["ip", fam, "rule", "del", "table", &table], None).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = run(&["ip", "link", "delete", "dev", iface], None);
     }
 }
 
@@ -1804,5 +2183,270 @@ mod tests {
             dir.path().join("wireguard-wg-a.raised"),
             "openvpn-<iface>.pid is the neighbour this must not collide with",
         );
+    }
+
+    /// `wg-quick` for root, `ip`/`wg` for everyone else. A non-root daemon
+    /// handed to `wg-quick` re-execs through `sudo`, which the packaged
+    /// unit's `NoNewPrivileges=yes` stops from elevating, so every WireGuard
+    /// profile failed there.
+    #[test]
+    fn a_non_root_daemon_raises_its_links_with_ip_and_wg() {
+        assert_eq!(Raiser::for_uid(Some(0)), Raiser::WgQuick);
+        assert_eq!(Raiser::for_uid(Some(998)), Raiser::Native);
+        assert_eq!(
+            Raiser::for_uid(None),
+            Raiser::WgQuick,
+            "an unreadable uid keeps the behaviour from before the native path",
+        );
+    }
+
+    const PROVIDER_CONF: &str = "\
+# a provider's config
+[Interface]
+PrivateKey = SQpwDMoEnJn6CQNH0LX0dCMvuwLQFYpIXNBs1rD3BEQ=
+Address = 10.2.0.2/32, fd00::2/128
+DNS = 10.2.0.1
+mtu = 1380
+
+[Peer]
+PublicKey = 9i3m82SNQxVlVX9kdCS0bDhGkWJQMi1YxDvNPuUFVXQ=
+AllowedIPs = 0.0.0.0/0,::/0
+Endpoint = 203.0.113.7:51820 # the exit
+";
+
+    /// The `wg-quick` keys come out, everything `wg setconf` reads stays in,
+    /// and `DNS` is reported as ignored rather than dropped silently.
+    #[test]
+    fn a_provider_config_is_split_into_what_wg_takes_and_what_ip_does() {
+        let p = native::parse(PROVIDER_CONF).expect("a plain provider config parses");
+        assert_eq!(p.addresses, ["10.2.0.2/32", "fd00::2/128"]);
+        assert_eq!(p.allowed_ips, ["0.0.0.0/0", "::/0"]);
+        assert_eq!(p.mtu, Some(1380), "keys match case-insensitively");
+        assert!(p.route);
+        assert_eq!(p.ignored, ["DNS"]);
+        for gone in ["Address", "DNS", "mtu"] {
+            assert!(
+                !p.wg_conf.contains(gone),
+                "{gone} is a wg-quick key and `wg setconf` rejects it:\n{}",
+                p.wg_conf,
+            );
+        }
+        for kept in [
+            "[Interface]",
+            "PrivateKey = ",
+            "[Peer]",
+            "PublicKey = ",
+            "AllowedIPs = ",
+            "Endpoint = ",
+        ] {
+            assert!(p.wg_conf.contains(kept), "{kept} is for wg:\n{}", p.wg_conf);
+        }
+    }
+
+    /// Hooks are refused by name rather than skipped: the documented
+    /// `PostUp = wg set %i private-key …` would otherwise leave a link with
+    /// no key, which comes up and never handshakes.
+    #[test]
+    fn hooks_and_a_named_table_are_refused_and_table_off_is_honoured() {
+        let with = |line: &str| PROVIDER_CONF.replace("DNS = 10.2.0.1", line);
+        let e = native::parse(&with("PostUp = wg set %i private-key /etc/wireguard/k"))
+            .expect_err("a hook is not run under the daemon's uid");
+        assert!(e.contains("PostUp"), "got {e}");
+        let e = native::parse(&with("Table = 1234")).expect_err("a numeric table");
+        assert!(e.contains("Table"), "got {e}");
+        let p = native::parse(&with("Table = off")).unwrap();
+        assert!(!p.route, "Table = off adds no routes and no rules");
+        let e = native::parse(&PROVIDER_CONF.replace("Address = 10.2.0.2/32, fd00::2/128", ""))
+            .expect_err("no Address, nothing to bind a profile to");
+        assert!(e.contains("Address"), "got {e}");
+    }
+
+    /// The kill switch against a live WireGuard link the daemon raised itself,
+    /// as a non-root uid: the shape #42 was about. Asserts, in order, that
+    ///
+    /// 1. the link comes up through `WireguardManager::bring_up` on the
+    ///    `ip`/`wg` path, because the uid is not 0;
+    /// 2. under the ruleset **without** the transport exemption, traffic sent
+    ///    into the tunnel never completes a handshake (the negative control);
+    /// 3. under the ruleset `killswitch::enable` installs, it does;
+    /// 4. the same uid's traffic on the bare interface is still dropped;
+    /// 5. `bring_down` removes the link and every rule it added.
+    ///
+    /// It needs a non-root uid holding `CAP_NET_ADMIN` and `CAP_SYS_ADMIN` in
+    /// a private network namespace, `ip`, `wg`, `nft`, `unshare` and
+    /// `nsenter`, so it is ignored by default. Unprivileged:
+    ///
+    /// ```text
+    /// cargo test -p torrentd --bin torrentd --no-run
+    /// unshare --user --map-user=998 --map-group=998 --net --keep-caps \
+    ///     target/debug/deps/torrentd-<hash> live_link -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs a non-root uid with CAP_NET_ADMIN in a private network namespace"]
+    fn live_link_the_kill_switch_carries_a_link_the_daemon_raised_and_drops_the_bare_interface() {
+        use std::net::UdpSocket;
+
+        use super::super::killswitch;
+
+        let uid = killswitch::current_uid().expect("uid");
+        assert_ne!(uid, 0, "run as a non-root uid; uid 0 is refused outright");
+        let sh = |cmd: &str| {
+            let out = Command::new("sh").arg("-c").arg(cmd).output().unwrap();
+            assert!(
+                out.status.success(),
+                "`{cmd}`: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = |name: &str| dir.path().join(name).display().to_string();
+        let ours_key = sh("wg genkey");
+        let peer_key = sh("wg genkey");
+        std::fs::write(path("peer.key"), &peer_key).unwrap();
+        let ours_pub = sh(&format!("echo {ours_key} | wg pubkey"));
+        let peer_pub = sh(&format!("echo {peer_key} | wg pubkey"));
+
+        // The peer lives in a network namespace of its own, one veth away, so
+        // the tunnel's transport has to leave by a non-loopback interface.
+        let mut peer = Command::new("unshare")
+            .args(["-n", "sleep", "60"])
+            .spawn()
+            .unwrap();
+        let pid = peer.id();
+        let ours_ns = std::fs::read_link("/proc/self/ns/net").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::fs::read_link(format!("/proc/{pid}/ns/net"))
+            .ok()
+            .as_ref()
+            == Some(&ours_ns)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the peer namespace never appeared"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        sh("ip link set lo up");
+        sh(&format!(
+            "ip link add veth-ks type veth peer name veth-peer netns {pid}"
+        ));
+        sh("ip addr add 10.9.0.1/24 dev veth-ks && ip link set veth-ks up");
+        sh(&format!(
+            "nsenter -t {pid} -n sh -ec 'ip link set lo up; \
+             ip addr add 10.9.0.2/24 dev veth-peer; ip link set veth-peer up; \
+             ip link add wg-peer type wireguard; \
+             wg set wg-peer private-key {} listen-port 51820 \
+                 peer {ours_pub} allowed-ips 10.200.0.1/32; \
+             ip addr add 10.200.0.2/24 dev wg-peer; ip link set wg-peer up'",
+            path("peer.key"),
+        ));
+
+        // A provider-shaped config: full-tunnel AllowedIPs and a DNS line.
+        let iface = "wg-ks";
+        std::fs::write(
+            path("wg-ks.conf"),
+            format!(
+                "[Interface]\nPrivateKey = {ours_key}\nAddress = 10.200.0.1/32\n\
+                 DNS = 10.200.0.2\n\n[Peer]\nPublicKey = {peer_pub}\n\
+                 Endpoint = 10.9.0.2:51820\nAllowedIPs = 0.0.0.0/0, ::/0\n"
+            ),
+        )
+        .unwrap();
+        let manager = WireguardManager::new(dir.path().join("state"));
+        assert_eq!(manager.raiser, Raiser::Native);
+        let ip = manager
+            .bring_up(&VpnTunnel {
+                r#type: torrentd_engine::VpnType::Wireguard,
+                config_path: dir.path().join("wg-ks.conf"),
+                interface: iface.to_string(),
+            })
+            .expect("the daemon raises its own link without wg-quick");
+        assert_eq!(ip.to_string(), "10.200.0.1");
+        let table = native::table_for(iface).unwrap();
+
+        // What arrives is counted on the peer's side of the tunnel: packets
+        // the peer's link decrypted and delivered. Handshakes are not among
+        // them, and they have to be excluded: they are built by the kernel
+        // with no socket attached, so no `meta skuid` rule ever matches them
+        // and they complete with or without the exemption. It is the
+        // encrypted *data* that carries the sending socket — the daemon's —
+        // out of the physical interface, and that the drop takes.
+        let delivered = || -> u64 {
+            let json = sh(&format!(
+                "nsenter -t {pid} -n ip -j -s link show dev wg-peer"
+            ));
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            v[0]["stats64"]["rx"]["packets"].as_u64().unwrap()
+        };
+        let delivered_within = |before: u64, bound: Duration| {
+            let deadline = Instant::now() + bound;
+            loop {
+                if delivered() > before {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        };
+        // Kept open for the whole test: a packet whose socket has closed no
+        // longer has a uid to match.
+        let tunnel = UdpSocket::bind("10.200.0.1:0").unwrap();
+        let send_into_tunnel = || {
+            tunnel
+                .send_to(b"x", "10.200.0.2:9")
+                .expect("the tunnel interface is accepted");
+        };
+
+        // A session first, with no ruleset at all. A packet sent while the
+        // handshake is still pending is queued and leaves once it completes,
+        // and that one was observed to pass even an unexempted ruleset; a
+        // packet sent over an established session is the steady state, and
+        // the one the drop takes.
+        send_into_tunnel();
+        assert!(
+            delivered_within(0, Duration::from_secs(10)),
+            "the tunnel carries before any ruleset",
+        );
+
+        // Negative control: the ruleset as it was before the exemption.
+        killswitch::apply(&killswitch::render_ruleset(uid, &[iface.to_string()]).unwrap())
+            .expect("install the unexempted ruleset");
+        let before = delivered();
+        send_into_tunnel();
+        assert!(
+            !delivered_within(before, Duration::from_secs(2)),
+            "without the exemption the tunnel's encrypted traffic is dropped",
+        );
+
+        let installed = killswitch::enable(&[iface.to_string()]).expect("enable");
+        assert_eq!(installed, uid);
+        let before = delivered();
+        send_into_tunnel();
+        assert!(
+            delivered_within(before, Duration::from_secs(10)),
+            "with the listen port exempted the tunnel carries",
+        );
+
+        let bare = UdpSocket::bind("10.9.0.1:0").unwrap();
+        let e = bare
+            .send_to(b"x", "10.9.0.2:9")
+            .expect_err("the daemon's own traffic on the bare interface is dropped");
+        assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "got {e}");
+
+        manager.bring_down(iface);
+        assert!(
+            native::table_for(iface).is_err(),
+            "the link is gone (asked of `ip`: /sys/class/net is the host's here)",
+        );
+        assert!(
+            !sh("ip -4 rule show; ip -6 rule show").contains(&format!("lookup {table}")),
+            "and so is every rule it added",
+        );
+        killswitch::disable().expect("disable");
+        let _ = peer.kill();
+        let _ = peer.wait();
     }
 }

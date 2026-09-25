@@ -18,16 +18,20 @@
 //! `User=torrentd`).
 //!
 //! **What that leaves runnable.** Matching by uid confines every socket that
-//! uid owns, and a tunnel's own connection to its provider leaves by the
-//! physical interface. The kernel's WireGuard socket belongs to the uid that
-//! raised the link, so the ruleset carries one exemption for it: each
-//! tunnel's UDP **listen port**, read off the live link with
+//! uid owns, and a WireGuard tunnel's encrypted traffic to its provider
+//! leaves by the physical interface. WireGuard encrypts a packet in place, so
+//! the encrypted UDP datagram still carries the socket that sent the
+//! plaintext — the daemon's — and `meta skuid` matches it, whichever uid
+//! raised the link. (Handshakes are built by the kernel with no socket
+//! attached and match no uid rule, which is why a tunnel under the bare drop
+//! handshakes and then carries nothing.) So the ruleset carries one
+//! exemption per tunnel: its UDP **listen port**, read off the live link with
 //! `wg show <iface> listen-port` when the ruleset is installed, is accepted
 //! as a source port for the daemon's uid on any interface
-//! ([`render_ruleset_with_transport`]). Nothing else the daemon owns can
+//! ([`render_ruleset_with_transport`]). Nothing the daemon opens itself can
 //! hold that port: the WireGuard socket binds it on the wildcard address
-//! without address reuse, so a libtorrent bind to it fails with
-//! `EADDRINUSE` rather than sharing it.
+//! without address reuse, so a libtorrent bind to it fails with `EADDRINUSE`
+//! rather than sharing it.
 //!
 //! - **OpenVPN: never.** The daemon spawns `openvpn` under its own uid, so the
 //!   ruleset drops the client's connection to the provider. `Config::validate`
@@ -37,10 +41,9 @@
 //! - **WireGuard as a dedicated uid with `CAP_NET_ADMIN`: yes.** `wg-quick`
 //!   re-execs itself through `sudo` unless its uid is 0, so a non-root daemon
 //!   raises its links with `ip` and `wg` directly (see `vpn::wireguard`),
-//!   which need only the capability. Those links' sockets are the daemon's,
-//!   and the listen-port exemption is what lets them carry traffic. A link
-//!   root raised before the daemon started, and which the daemon adopted, has
-//!   a root-owned socket the ruleset never matches; its exemption is inert.
+//!   which need only the capability. A link root raised before the daemon
+//!   started, and which the daemon adopted, needs the same exemption and gets
+//!   it: the packets are the daemon's either way.
 
 use std::io;
 use std::io::Write;
@@ -76,10 +79,10 @@ pub fn render_ruleset(uid: u32, tunnels: &[String]) -> io::Result<String> {
 /// `transport_ports` is accepted as a UDP source port for `uid` on any
 /// interface, ahead of the drop.
 ///
-/// This is the ruleset `enable` installs. Without it a WireGuard link the
-/// daemon raised itself cannot carry anything: its encrypted UDP to the
-/// provider leaves by the physical interface from a socket `uid` owns, and
-/// the final `drop` takes it. Ports are de-duplicated and sorted, like the
+/// This is the ruleset `enable` installs. Without it no WireGuard link
+/// carries the daemon's traffic: the encrypted UDP to the provider leaves by
+/// the physical interface still attached to the daemon's sending socket, so
+/// it matches `meta skuid <uid>` and the final `drop` takes it. Ports are de-duplicated and sorted, like the
 /// interface names, so the output is deterministic.
 pub fn render_ruleset_with_transport(
     uid: u32,
