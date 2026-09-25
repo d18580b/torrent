@@ -16,8 +16,14 @@ use parking_lot::Mutex;
 use crate::profile::ProfileId;
 
 /// Lifecycle phases the daemon tracks for a torrent. Mostly mirrors
-/// libtorrent's `torrent_status::state_t` but adds an explicit
-/// `UploadMode` bit because torrentd's the spec distinguishes that case.
+/// libtorrent's `torrent_status::state_t`, plus [`TorrentPhase::UploadMode`]
+/// for a torrent that hit a disk error.
+///
+/// None of these phases reads libtorrent's `upload_mode` flag. Every torrent
+/// carries that flag from the moment it is added (`policy::no_download`), so
+/// it says nothing about a torrent's health; the phase is derived from
+/// `state` and the `PAUSED` bit (`handlers::state_update`) and from the error
+/// handlers.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TorrentPhase {
     /// libtorrent is hashing pieces; the torrent isn't seeding yet.
@@ -28,8 +34,14 @@ pub enum TorrentPhase {
     Seeding,
     /// Paused via the API or by the alert loop after a disk error.
     Paused,
-    /// Disk error pushed libtorrent into upload-mode. The retry timer
-    /// fires `resume_torrent` to attempt recovery.
+    /// A disk error happened: set by `handlers::error` on a file error and
+    /// cleared by the next healthy `seeding` update. The name and its
+    /// `"upload_mode"` string predate the add-time `upload_mode` flag and
+    /// mean only "disk error", not "libtorrent's `upload_mode` flag is set",
+    /// which is true of every torrent. The name is kept because the HTTP API
+    /// publishes it: `/status` counts this phase as `upload_mode`, and the
+    /// torrent list reports it as `"upload_mode"`. The retry timer fires `resume_torrent`; what that does
+    /// for a torrent in this phase is issue #46.
     UploadMode,
     /// Terminal: a non-recoverable libtorrent error.
     Errored,

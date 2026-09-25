@@ -1,9 +1,23 @@
 //! IPv4 lookup for a network interface.
 //!
-//! Shells out to `/usr/sbin/ip` (iproute2). We deliberately don't depend
-//! on the netlink crate stack — it's another ~30 transitive deps for one
-//! small piece of functionality, and the `ip` tool is universally
-//! present on every Linux distro that runs WireGuard.
+//! Shells out to `ip` (iproute2), found on the daemon's `PATH`. We
+//! deliberately don't depend on the netlink crate stack — it's another ~30
+//! transitive deps for one small piece of functionality, and the `ip` tool is
+//! universally present on every Linux distro that runs WireGuard.
+//!
+//! **Every VPN tool is run by bare name, on purpose.** `ip` here, `wg` and
+//! `wg-quick` (`vpn::wireguard`), `openvpn` and `kill` (`vpn::openvpn`), and
+//! `nft` (`vpn::killswitch`) are all resolved through the daemon's inherited
+//! `PATH`, and the daemon treats its own environment as trusted. Whoever can
+//! set that `PATH` — the unit file, the container image, the invoking shell —
+//! can equally replace `ExecStart=` or the binary itself, so an absolute path
+//! would not narrow who can run code with the daemon's `CAP_NET_ADMIN`; it
+//! would only break every host whose iproute2 or nftables lives somewhere
+//! other than the one path chosen (`/sbin` versus `/usr/sbin`, NixOS's store).
+//! The packaged unit sets no `PATH` and so gets systemd's fixed default for
+//! system services, and the container image's is its own. A deployment that
+//! puts an operator-writable directory on the daemon's `PATH` has made those
+//! tools operator-controlled.
 //!
 //! Output format we parse (`-o` makes it one address per line):
 //!
