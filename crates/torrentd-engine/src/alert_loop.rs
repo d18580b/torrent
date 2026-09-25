@@ -1090,6 +1090,83 @@ mod tests {
     }
 
     #[test]
+    fn a_due_timer_between_a_failed_check_and_its_status_update_resumes() {
+        // The re-check fails: `file_error_alert` arrives and sets `DiskError`,
+        // but the status that reports libtorrent's error has not come yet. A
+        // timer due in that window must still resume the torrent. If the
+        // file-error handler left `has_error` false, the timer would see no
+        // error and a phase other than `Checking`, retire, and leave the
+        // torrent error-paused with no retry.
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let state = Arc::new(StateMap::new());
+        let ih = InfoHash([9u8; 20]);
+        let h = TorrentHandle {
+            id: 9,
+            infohash: ih,
+        };
+        let now = std::time::Instant::now();
+        let mut st = crate::state::TorrentState::newly_added(h, ProfileId::new("p"), now);
+        st.has_error = false;
+        st.phase = TorrentPhase::Checking;
+        st.retry = Some(crate::state::RetryState {
+            next_attempt: now - Duration::from_secs(1),
+            attempts: 5,
+        });
+        state.insert(ih, st);
+
+        let recording = Arc::new(RecordingSink::new());
+        {
+            let resume = MemoryResumeStore::new();
+            let torrents = crate::torrent_store::MemoryTorrentStore::new();
+            let mock_clock = MockClock::new();
+            let ctx_engine: Arc<dyn TorrentEngine> = Arc::clone(&engine) as Arc<dyn TorrentEngine>;
+            let mut ctx = crate::handlers::HandlerCtx {
+                state: &state,
+                resume: &resume,
+                torrents: &torrents,
+                metrics: recording.as_ref(),
+                clock: &mock_clock,
+                engine: &ctx_engine,
+                profile_id: ProfileId::new("p"),
+                span: tracing::info_span!("test"),
+            };
+            crate::handlers::error::handle(
+                &Alert::FileError {
+                    hdr: AlertHeader {
+                        kind: AlertKind::FileError,
+                        infohash: Some(ih),
+                        handle: None,
+                        timestamp_us: 0,
+                    },
+                    error_code: 13,
+                    filename: "data.bin".into(),
+                    operation: "read".into(),
+                    message: "permission denied".into(),
+                },
+                &mut ctx,
+            );
+        }
+
+        let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::SystemClock);
+        execute_due_retries(&source, &state, &metrics, &clock, None, now);
+
+        assert!(resumed(&engine), "the error-paused torrent was not resumed");
+        let retry = state
+            .get(&ih)
+            .unwrap()
+            .retry
+            .expect("the timer must stay armed while the error is held");
+        assert_eq!(
+            retry.attempts, 6,
+            "the backoff advances from the kept count"
+        );
+    }
+
+    #[test]
     fn a_panicking_handler_takes_the_process_down() {
         // The loop is the only consumer of the alert queue and the only writer
         // to the state map. A panic that unwinds just this thread leaves the
