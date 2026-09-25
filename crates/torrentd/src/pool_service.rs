@@ -741,6 +741,26 @@ mod tests {
         assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Waiting);
     }
 
+    #[test]
+    fn a_scan_counts_its_errors_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let metrics = std::sync::Arc::new(crate::metrics_sink::PromSink::new());
+        pool.set_metrics(metrics.clone());
+        std::fs::create_dir_all(dir.path().join("library")).unwrap();
+        std::fs::write(dir.path().join("library/broken.torrent"), b"not bencode").unwrap();
+
+        let summary = pool.scan().unwrap();
+
+        assert_eq!(summary.errors, 1);
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(
+            text.contains("torrentd_pool_scan_errors_total{kind=\"parse\"} 1"),
+            "{text}"
+        );
+    }
+
     fn pending(ih: InfoHash, profile: &str) -> super::PendingVerify {
         super::PendingVerify {
             infohash: ih.to_hex(),
