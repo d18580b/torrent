@@ -260,6 +260,20 @@ jobs:
       - name: Build the image
         run: podman build -f deploy/Containerfile -t torrentd:ci .
 
+  alert-rules:
+    name: alert rules (promtool)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      # mise provides the task, which runs promtool from the pinned Prometheus
+      # image on the runner's docker.
+      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+      - run: mise run test-alerts
+
   web:
     name: web client
     runs-on: ubuntu-24.04

@@ -170,6 +170,7 @@ impl AlertLoopBuilder {
         // means the thread returns normally, so `join()` reports success and
         // the panic would otherwise be invisible to the exit path.
         let panicked = Arc::new(AtomicBool::new(false));
+        let unsaved_at_shutdown = Arc::new(AtomicU64::new(0));
 
         let join = thread::Builder::new()
             .name("torrentd-alert-loop".into())
@@ -183,6 +184,7 @@ impl AlertLoopBuilder {
                 let heartbeat = Arc::clone(&heartbeat);
                 let listen_failed = Arc::clone(&listen_failed);
                 let panicked = Arc::clone(&panicked);
+                let unsaved_at_shutdown = Arc::clone(&unsaved_at_shutdown);
                 let fatal_listen_failure = self.fatal_listen_failure;
                 let on_fatal = self.on_fatal.clone();
                 let profile_fenced = self.profile_fenced.clone();
@@ -211,6 +213,7 @@ impl AlertLoopBuilder {
                                 fatal_listen_failure,
                                 on_fatal,
                                 profile_fenced,
+                                unsaved_at_shutdown,
                             },
                         );
                     }));
@@ -240,6 +243,7 @@ impl AlertLoopBuilder {
             heartbeat,
             listen_failed,
             panicked,
+            unsaved_at_shutdown,
         }
     }
 }
@@ -252,6 +256,7 @@ pub struct AlertLoopHandle {
     heartbeat: Arc<AtomicU64>,
     listen_failed: Arc<AtomicBool>,
     panicked: Arc<AtomicBool>,
+    unsaved_at_shutdown: Arc<AtomicU64>,
 }
 
 impl AlertLoopHandle {
@@ -282,6 +287,18 @@ impl AlertLoopHandle {
     /// the opposite of what catching the panic was for.
     pub fn panicked(&self) -> bool {
         self.panicked.load(Ordering::Relaxed)
+    }
+
+    /// Shared cell holding how many torrents' resume data was still unsaved
+    /// when the shutdown drain's deadline elapsed; 0 until the loop has shut
+    /// down, and 0 after a clean one.
+    ///
+    /// A metric emitted at that moment is never scraped — the process exits
+    /// straight after — so the daemon takes the number from here once
+    /// [`AlertLoopHandle::join`] returns, persists it, and re-exports it on
+    /// the next boot. Taken as a clone before `join` consumes the handle.
+    pub fn unsaved_at_shutdown(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.unsaved_at_shutdown)
     }
 
     /// Send a shutdown signal. Idempotent; returns true on the first
@@ -332,6 +349,7 @@ struct LoopHooks {
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
+    unsaved_at_shutdown: Arc<AtomicU64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -357,7 +375,7 @@ fn run(
         // 1) Shutdown probe.
         if let Ok(reason) = shutdown_rx.try_recv() {
             info!(target: "torrentd_engine::alert_loop", reason = ?reason, "shutdown signaled");
-            run_shutdown(
+            let unsaved = run_shutdown(
                 reason,
                 SHUTDOWN_DEFAULT_DEADLINE,
                 &source,
@@ -367,6 +385,7 @@ fn run(
                 &metrics,
                 &clock,
             );
+            hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
         }
 
@@ -408,7 +427,7 @@ fn run(
             if let Some(cb) = &hooks.on_fatal {
                 cb(ShutdownReason::ListenFailed);
             }
-            run_shutdown(
+            let unsaved = run_shutdown(
                 ShutdownReason::ListenFailed,
                 SHUTDOWN_DEFAULT_DEADLINE,
                 &source,
@@ -418,6 +437,7 @@ fn run(
                 &metrics,
                 &clock,
             );
+            hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
         }
 
@@ -511,10 +531,12 @@ fn dispatch_alert(
         Alert::TorrentChecked { .. }
         | Alert::StorageMoved { .. }
         | Alert::StorageMovedFailed { .. } => handlers::storage::handle(&alert, &mut ctx),
+        Alert::TrackerError { .. } | Alert::Warning { .. } | Alert::TrackerReply { .. } => {
+            handlers::warning::handle(&alert, &mut ctx)
+        }
 
-        // Other alerts (tracker_error, peer_disconnected) are interesting for
-        // ops/metrics but not yet wired up; emit a debug log so we can spot
-        // them in field traces without losing the loop's progress.
+        // Peer disconnects are per-peer churn, not an operational condition;
+        // a debug line keeps them visible in field traces.
         other => tracing::debug!(
             target: "torrentd_engine::alert_loop",
             alert_type = other.kind().as_str(),
@@ -654,7 +676,7 @@ fn run_shutdown(
     torrents: &Arc<dyn TorrentStore>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
-) {
+) -> u64 {
     let started = clock.now();
     let started_count = state.len();
 
@@ -696,7 +718,6 @@ fn run_shutdown(
             elapsed_ms = clock.now().saturating_duration_since(started).as_millis() as u64,
             "shutdown deadline elapsed with unsaved resume data",
         );
-        metrics.add_counter("shutdown_unsaved_resumes_total", outstanding, &[]);
     } else {
         info!(
             target: "torrentd_engine::alert_loop",
@@ -705,6 +726,10 @@ fn run_shutdown(
             "shutdown clean: all resume data persisted",
         );
     }
+    // Returned rather than counted: a `shutdown_unsaved_resumes_total` bumped
+    // here was emitted as the process exited, so no scrape ever saw it. The
+    // daemon persists this through `AlertLoopHandle::unsaved_at_shutdown`.
+    outstanding
 }
 
 fn drain_once(
@@ -1188,7 +1213,7 @@ mod tests {
 
         // No alerts queued; the engine accepts save_resume_data but the
         // settling alert never arrives. The deadline must drop us out.
-        run_shutdown(
+        let unsaved = run_shutdown(
             ShutdownReason::Test,
             Duration::from_millis(500),
             &source,
@@ -1200,5 +1225,35 @@ mod tests {
         );
 
         assert_eq!(state.pending_resume_count(), 1);
+        assert_eq!(unsaved, 1, "the unsaved count is what the daemon persists");
+    }
+
+    #[test]
+    fn the_handle_reports_what_the_shutdown_drain_left_unsaved() {
+        // Saves are accepted and never settle, so the whole 30 s default
+        // deadline runs — on the mock clock, which advances on every sleep
+        // instead of waiting. The torrent is in the state map before the loop
+        // starts, so the signal cannot race it.
+        let engine = Arc::new(MockEngine::new());
+        let h = engine.register_handle(InfoHash([0xC1; 20]));
+        let state = Arc::new(StateMap::new());
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        state.insert(
+            h.infohash,
+            crate::state::TorrentState::newly_added(h, ProfileId::new("p"), clock.now()),
+        );
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine)),
+            state,
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            Arc::new(NoopSink),
+            clock,
+        )
+        .spawn();
+        let unsaved = handle.unsaved_at_shutdown();
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread");
+        assert_eq!(unsaved.load(Ordering::Relaxed), 1);
     }
 }

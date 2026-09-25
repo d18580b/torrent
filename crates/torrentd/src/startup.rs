@@ -369,10 +369,7 @@ impl Drop for BootCleanup {
             return;
         }
         if self.kill_switch {
-            match crate::vpn::killswitch::disable() {
-                Ok(()) => info!("boot failed: network kill switch removed"),
-                Err(e) => warn!(error.cause = %e, "boot failed: could not remove kill switch"),
-            }
+            finish_boot_kill_switch_removal(&self.run_dir, crate::vpn::killswitch::disable());
         }
         for (t, iface) in std::mem::take(&mut self.tunnels) {
             warn!(vpn_iface = %iface, "boot failed: bringing tunnel down");
@@ -683,6 +680,22 @@ pub async fn boot(
         real_engine,
     )
     .await?;
+    // Every alert-referenced series exists from here, before the alert loop
+    // or any request can move one. A profile that failed is seeded too: its
+    // engine counters stay at zero, and `profile_boot_failed` says why.
+    {
+        let configured: Vec<&str> = cfg.profile.iter().map(|p| p.id.as_str()).collect();
+        metrics.seed(&configured);
+        for p in &cfg.profile {
+            let failed = failed_profiles.iter().any(|f| f.config.id == p.id);
+            metrics.set_gauge(
+                "profile_boot_failed",
+                if failed { 1.0 } else { 0.0 },
+                &[("profile_id", p.id.as_str())],
+            );
+        }
+        export_shutdown_report(&metrics, &take_shutdown_report(&run_dir));
+    }
     // The profile loop's own check is only re-evaluated at the top of the
     // *next* iteration, so the last profile's 30-second bring-up had no check
     // against it at all — and a one-profile deployment had none anywhere. Ask
@@ -713,12 +726,22 @@ pub async fn boot(
     // resume and `.torrent` scans, opening the pool — is time a 60-second
     // lease negotiated during bring-up spent unrenewed. It renews at once.
     // If boot fails below, the process exits and the task with it.
-    tokio::spawn(crate::port_forward_monitor::run(
+    // It returns at once when no live profile negotiates a port, which is
+    // not a death, so it is supervised only where it has work.
+    let pf = crate::port_forward_monitor::run(
         profile_registry.clone(),
         state.clone(),
         metrics.clone(),
         shutdown_tx.subscribe(),
-    ));
+    );
+    if profile_registry
+        .iter()
+        .any(|e| e.config.port_forward() == PortForwardMode::Natpmp)
+    {
+        spawn_supervised("port_forward_monitor", metrics.clone(), pf);
+    } else {
+        tokio::spawn(pf);
+    }
 
     // Network-layer kill switch (defence-in-depth; multi-profile + opt-in).
     // Installed once, after every profile's tunnel is up, so the ruleset covers all
@@ -782,6 +805,12 @@ pub async fn boot(
     // of entry `DELETE` may clear without a state-map entry to remove.
     let mut loaded: std::collections::HashSet<libtorrent_safe::InfoHash> =
         std::collections::HashSet::new();
+    // What the scans could not load, per profile, as
+    // `(resume_add, torrent_read, torrent_dir_add)`. Exported as gauges once
+    // both have run: these happen before any scrape can, so a counter would
+    // appear already incremented and `increase()` would never see it move.
+    let mut load_failures: std::collections::HashMap<ProfileId, (u64, u64, u64)> =
+        std::collections::HashMap::new();
 
     // Resume scan: load every saved resume file per profile. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
@@ -846,6 +875,7 @@ pub async fn boot(
                 Err(e) => {
                     warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
                           "could not read .torrent for resume add; continuing without metadata");
+                    load_failures.entry(profile.clone()).or_default().1 += 1;
                     None
                 }
             };
@@ -879,7 +909,8 @@ pub async fn boot(
                     loaded.insert(ih);
                 }
                 Err(e) => {
-                    warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed")
+                    warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed");
+                    load_failures.entry(profile.clone()).or_default().0 += 1;
                 }
             }
         }
@@ -946,14 +977,25 @@ pub async fn boot(
                     loaded.insert(ih);
                 }
                 Err(e) => {
-                    // Release the claim so a later run can retry the add.
-                    let _ = registry.remove(&ih);
                     warn!(
                         profile_id = %profile,
                         infohash = %ih,
                         error.cause = %e,
                         "torrent-dir add failed",
                     );
+                    load_failures.entry(profile.clone()).or_default().2 += 1;
+                    // Release the claim so a later run can retry the add. A
+                    // release that fails to persist leaves the claim on disk,
+                    // and the next boot skips this torrent as already loaded.
+                    if let Err(e) = registry.remove(&ih) {
+                        warn!(
+                            profile_id = %profile,
+                            infohash = %ih,
+                            error.cause = %e,
+                            "could not release the claim of a torrent that failed to load",
+                        );
+                        metrics.inc_counter("store_write_errors_total", &[("store", "registry")]);
+                    }
                 }
             }
         }
@@ -964,6 +1006,23 @@ pub async fn boot(
             .entry(profile.clone())
             .and_modify(|n| *n += added)
             .or_insert(added);
+    }
+
+    // Every configured profile, so a failed one reads zero rather than absent.
+    for profile in cfg.profile.iter().map(|p| &p.id) {
+        let (resume_add, torrent_read, torrent_dir_add) =
+            load_failures.get(profile).copied().unwrap_or_default();
+        for (what, n) in [
+            ("resume_add", resume_add),
+            ("torrent_read", torrent_read),
+            ("torrent_dir_add", torrent_dir_add),
+        ] {
+            metrics.set_gauge(
+                "boot_torrent_load_failures",
+                n as f64,
+                &[("profile_id", profile.as_str()), ("source", what)],
+            );
+        }
     }
 
     // Reconcile what the registry claims against what the scans actually
@@ -1034,6 +1093,9 @@ pub async fn boot(
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call.
     let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
+    if let Some(pool) = pool.as_ref() {
+        pool.set_metrics(metrics.clone());
+    }
 
     // Two artefacts persist a torrent→profile mapping, and nothing reconciled
     // them: `profile_assignments.json`, which the resume scan above writes and
@@ -1533,13 +1595,29 @@ impl DaemonHandle {
         // VPN health monitor (multi-profile only). Spawned before AppState
         // consumes the registry/state/metrics. The port-forward monitor is
         // not here: `boot` starts it as soon as the profiles are built.
-        tokio::spawn(crate::vpn_monitor::run(
-            profile_registry.clone(),
-            state.clone(),
+        spawn_supervised(
+            "vpn_monitor",
             metrics.clone(),
-            std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
-            shutdown_tx.subscribe(),
-        ));
+            crate::vpn_monitor::run(
+                profile_registry.clone(),
+                state.clone(),
+                metrics.clone(),
+                std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
+                shutdown_tx.subscribe(),
+            ),
+        );
+
+        // The kill switch was checked once, at install. Anything that flushes
+        // the ruleset afterwards — an `nft flush ruleset` from a firewall
+        // reload, another service replacing the tables — removed the backstop
+        // with nothing noticing.
+        if kill_switch_active {
+            spawn_supervised(
+                "kill_switch_watch",
+                metrics.clone(),
+                crate::vpn::killswitch::watch(metrics.clone(), shutdown_tx.subscribe()),
+            );
+        }
 
         // Re-drive any plan a crash or a kill left mid-apply, before the API
         // can accept new ones. A half-applied reorganisation is exactly the
@@ -1555,15 +1633,19 @@ impl DaemonHandle {
         // Verify queue: admits a bounded number of adopt-time re-hashes so a
         // bulk adopt cannot starve whatever is already seeding.
         if let Some(pool) = pool.clone() {
-            tokio::spawn(crate::pool_service::run_verify_queue(
-                pool,
-                source.clone(),
-                state.clone(),
+            spawn_supervised(
+                "verify_queue",
                 metrics.clone(),
-                profile_registry.clone(),
-                registry.clone(),
-                shutdown_tx.subscribe(),
-            ));
+                crate::pool_service::run_verify_queue(
+                    pool,
+                    source.clone(),
+                    state.clone(),
+                    metrics.clone(),
+                    profile_registry.clone(),
+                    registry.clone(),
+                    shutdown_tx.subscribe(),
+                ),
+            );
         }
 
         let trusted_proxies = crate::http::forwarded::TrustedProxies::parse(&cfg.trusted_proxies)
@@ -1617,14 +1699,19 @@ impl DaemonHandle {
         // SIGHUP pump.
         let reload_source = source.clone();
         let cfg_clone = cfg.clone();
-        tokio::spawn(reload::run(
-            config_path,
-            cfg_clone,
-            reload_source,
-            profile_registry.clone(),
-            reload_rx,
-            log_handle,
-        ));
+        spawn_supervised(
+            "reload",
+            metrics.clone(),
+            reload::run(
+                config_path,
+                cfg_clone,
+                reload_source,
+                profile_registry.clone(),
+                reload_rx,
+                log_handle,
+                metrics.clone(),
+            ),
+        );
 
         // A bind failure does not return from here: `boot` has already
         // disarmed its cleanup guard, so this function is the only thing left
@@ -1673,9 +1760,14 @@ impl DaemonHandle {
             error!("exiting non-zero: the alert loop panicked");
             exit_code = 70;
         }
+        let unsaved_at_shutdown = alert_loop.unsaved_at_shutdown();
         if let Err(e) = alert_loop.join() {
             warn!(error.cause = ?e, "alert loop join panicked");
         }
+        let mut shutdown_report = ShutdownReport {
+            unsaved_resumes: unsaved_at_shutdown.load(std::sync::atomic::Ordering::Relaxed),
+            kill_switch_removal_failed: false,
+        };
 
         // Persist DHT routing tables for the next start. Only a host profile
         // with DHT enabled has one; a tunnelled profile runs with DHT off by
@@ -1705,12 +1797,13 @@ impl DaemonHandle {
         // tunnel is still up during a graceful shutdown, so the profiles' sockets
         // (still source-bound to the tunnel IP) can't leak in this window.
         if kill_switch_active {
-            match crate::vpn::killswitch::disable() {
-                Ok(()) => info!("network kill switch removed"),
-                Err(e) => warn!(error.cause = %e, "failed to remove network kill switch"),
-            }
-            metrics.set_gauge("kill_switch_active", 0.0, &[]);
+            finish_kill_switch_removal(
+                crate::vpn::killswitch::disable(),
+                &metrics,
+                &mut shutdown_report,
+            );
         }
+        write_shutdown_report(&run_dir, &shutdown_report);
 
         // Then bring the tunnels down, after the sessions are gone. The daemon
         // brought them up, so it owns tearing them down; leaving them up meant
@@ -1896,6 +1989,168 @@ fn save_session_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
     Ok(())
 }
 
+/// What a run's exit left behind that no scrape of that run could see.
+///
+/// Both halves happen as the process is leaving: a metric set there is gone
+/// before anything scrapes it, so an alert on it could never fire. The exiting
+/// run writes this file and the next boot re-exports it as the
+/// `last_shutdown_*` gauges, then deletes it — a run that dies without
+/// writing one leaves the next boot reporting zero rather than a stale value
+/// from an older exit.
+#[derive(Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct ShutdownReport {
+    /// Resume saves the shutdown drain's deadline left unsaved.
+    unsaved_resumes: u64,
+    /// The kill switch could not be removed on the way out.
+    kill_switch_removal_failed: bool,
+}
+
+/// `<state_dir>/last_shutdown.json`.
+fn shutdown_report_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+    state_dir.join("last_shutdown.json")
+}
+
+/// Persist `report` for the next boot. A failure is logged and otherwise
+/// ignored: the process is exiting, and the journal line is all that is left.
+fn write_shutdown_report(state_dir: &std::path::Path, report: &ShutdownReport) {
+    let bytes = serde_json::to_vec(report).expect("a plain struct serializes");
+    if let Err(e) = save_session_state(&shutdown_report_path(state_dir), &bytes) {
+        warn!(
+            path = %shutdown_report_path(state_dir).display(),
+            error.cause = %e,
+            "could not persist the shutdown report; the next boot will report zero",
+        );
+    }
+}
+
+/// Read and delete the previous run's report. Absent, unreadable or
+/// malformed all read as the default, the last two with a warning.
+fn take_shutdown_report(state_dir: &std::path::Path) -> ShutdownReport {
+    let path = shutdown_report_path(state_dir);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ShutdownReport::default(),
+        Err(e) => {
+            warn!(path = %path.display(), error.cause = %e, "could not read the shutdown report");
+            return ShutdownReport::default();
+        }
+    };
+    let report = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        warn!(path = %path.display(), error.cause = %e, "malformed shutdown report; ignoring it");
+        ShutdownReport::default()
+    });
+    if let Err(e) = std::fs::remove_file(&path) {
+        warn!(path = %path.display(), error.cause = %e, "could not remove the shutdown report");
+    }
+    report
+}
+
+/// Record the outcome of removing the kill switch on a clean shutdown.
+///
+/// On success `kill_switch_active` drops to 0. On failure it stays 1, because
+/// the table is still installed and still confines the uid, and the report
+/// carries the failure to the next boot.
+fn finish_kill_switch_removal(
+    outcome: std::io::Result<()>,
+    metrics: &PromSink,
+    report: &mut ShutdownReport,
+) {
+    match outcome {
+        Ok(()) => {
+            info!("network kill switch removed");
+            metrics.set_gauge("kill_switch_active", 0.0, &[]);
+        }
+        Err(e) => {
+            error!(
+                error.cause = %e,
+                "failed to remove network kill switch; the daemon's uid stays \
+                 confined to the tunnels until the table is removed \
+                 (nft delete table inet torrentd_ks) or a kill-switch boot replaces it",
+            );
+            report.kill_switch_removal_failed = true;
+        }
+    }
+}
+
+/// Record the outcome of removing the kill switch after a failed boot. The
+/// process is on its way out, so a failure goes to the report the next boot
+/// reads.
+fn finish_boot_kill_switch_removal(run_dir: &std::path::Path, outcome: std::io::Result<()>) {
+    match outcome {
+        Ok(()) => info!("boot failed: network kill switch removed"),
+        Err(e) => {
+            warn!(error.cause = %e, "boot failed: could not remove kill switch");
+            write_shutdown_report(
+                run_dir,
+                &ShutdownReport {
+                    unsaved_resumes: 0,
+                    kill_switch_removal_failed: true,
+                },
+            );
+        }
+    }
+}
+
+/// Export the previous run's [`ShutdownReport`] and warn about what it holds.
+fn export_shutdown_report(metrics: &PromSink, report: &ShutdownReport) {
+    if report.unsaved_resumes > 0 {
+        warn!(
+            pending_resume_count = report.unsaved_resumes,
+            "the previous run's shutdown left resume data unsaved; those torrents resumed from \
+             older state",
+        );
+    }
+    if report.kill_switch_removal_failed {
+        warn!(
+            "the previous run could not remove the network kill switch on its way out; a boot \
+             with network_kill_switch replaces it, otherwise remove it with \
+             `nft delete table inet torrentd_ks`",
+        );
+    }
+    metrics.set_gauge(
+        "last_shutdown_unsaved_resumes",
+        report.unsaved_resumes as f64,
+        &[],
+    );
+    metrics.set_gauge(
+        "last_shutdown_kill_switch_removal_failed",
+        if report.kill_switch_removal_failed {
+            1.0
+        } else {
+            0.0
+        },
+        &[],
+    );
+}
+
+/// Spawn a long-running task under `task_up{task}`: 1 from now, 0 once the
+/// task returns or panics.
+///
+/// Every background task was spawned with its handle discarded, so a monitor
+/// that panicked left the daemon healthy by every signal it has — `/healthz`
+/// reads the alert loop only — with its tunnels unwatched. A task that returns
+/// is also logged: each of these returns only on shutdown, and at shutdown
+/// the gauge going to 0 is harmless.
+fn spawn_supervised<F>(task: &'static str, metrics: Arc<PromSink>, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let labels = [("task", task)];
+    metrics.set_gauge("task_up", 1.0, &labels);
+    let handle = tokio::spawn(fut);
+    tokio::spawn(async move {
+        match handle.await {
+            Ok(()) => info!(task, "background task exited"),
+            Err(e) => error!(
+                task,
+                error.cause = %e,
+                "background task panicked; what it watched is no longer watched",
+            ),
+        }
+        metrics.set_gauge("task_up", 0.0, &[("task", task)]);
+    });
+}
+
 /// What a daemon running without `[auth]` says about itself at boot.
 ///
 /// `None` when `[auth]` is configured. Otherwise the operator opted into
@@ -1914,6 +2169,106 @@ fn unauthenticated_posture(cfg: &Config) -> Option<String> {
          reach it. Access control belongs to whatever sits in front of this daemon.",
         cfg.http_listen,
     ))
+}
+
+#[cfg(test)]
+mod shutdown_report_tests {
+    use super::*;
+
+    fn rendered(metrics: &PromSink) -> String {
+        String::from_utf8(metrics.render()).unwrap()
+    }
+
+    fn failed() -> std::io::Result<()> {
+        Err(std::io::Error::other("nft: permission denied"))
+    }
+
+    #[test]
+    fn a_written_report_is_read_back_once_and_then_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = ShutdownReport {
+            unsaved_resumes: 3,
+            kill_switch_removal_failed: true,
+        };
+        write_shutdown_report(dir.path(), &report);
+        assert_eq!(take_shutdown_report(dir.path()), report);
+        assert!(
+            !shutdown_report_path(dir.path()).exists(),
+            "the report is deleted once read"
+        );
+        // A second boot, with no exit in between that wrote one, reports zero.
+        assert_eq!(take_shutdown_report(dir.path()), ShutdownReport::default());
+    }
+
+    #[test]
+    fn a_malformed_report_reads_as_zero_and_is_still_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(shutdown_report_path(dir.path()), b"{not json").unwrap();
+        assert_eq!(take_shutdown_report(dir.path()), ShutdownReport::default());
+        assert!(!shutdown_report_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_non_zero_report_is_exported_as_non_zero_gauges() {
+        let metrics = PromSink::new();
+        export_shutdown_report(
+            &metrics,
+            &ShutdownReport {
+                unsaved_resumes: 7,
+                kill_switch_removal_failed: true,
+            },
+        );
+        let text = rendered(&metrics);
+        assert!(
+            text.contains("torrentd_last_shutdown_unsaved_resumes 7"),
+            "{text}"
+        );
+        assert!(
+            text.contains("torrentd_last_shutdown_kill_switch_removal_failed 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_kill_switch_removal_leaves_it_active_and_reports_it() {
+        let metrics = PromSink::new();
+        metrics.set_gauge("kill_switch_active", 1.0, &[]);
+        let mut report = ShutdownReport::default();
+        finish_kill_switch_removal(failed(), &metrics, &mut report);
+        assert!(report.kill_switch_removal_failed);
+        let text = rendered(&metrics);
+        assert!(text.contains("torrentd_kill_switch_active 1"), "{text}");
+    }
+
+    #[test]
+    fn a_removed_kill_switch_reads_inactive_and_reports_nothing() {
+        let metrics = PromSink::new();
+        metrics.set_gauge("kill_switch_active", 1.0, &[]);
+        let mut report = ShutdownReport::default();
+        finish_kill_switch_removal(Ok(()), &metrics, &mut report);
+        assert!(!report.kill_switch_removal_failed);
+        let text = rendered(&metrics);
+        assert!(text.contains("torrentd_kill_switch_active 0"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_boot_that_cannot_remove_the_kill_switch_leaves_a_report() {
+        let dir = tempfile::tempdir().unwrap();
+        finish_boot_kill_switch_removal(dir.path(), failed());
+        assert_eq!(
+            take_shutdown_report(dir.path()),
+            ShutdownReport {
+                unsaved_resumes: 0,
+                kill_switch_removal_failed: true,
+            }
+        );
+
+        finish_boot_kill_switch_removal(dir.path(), Ok(()));
+        assert!(
+            !shutdown_report_path(dir.path()).exists(),
+            "a removal that worked writes no report"
+        );
+    }
 }
 
 #[cfg(test)]
