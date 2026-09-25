@@ -9,11 +9,21 @@
 //!     EngineError::...)` makes the next call to that op fail.
 //!   - Synthetic handle issuance: `register_handle(infohash)` returns a
 //!     `TorrentHandle` the test can hold and pass back through the trait.
+//!   - Fault injection beyond errors: `inject_panic(op)` makes the next call
+//!     to that op panic, and `stall_next_pop(d)` makes the next `pop_alerts`
+//!     block for `d`, which wedges whatever loop is draining it.
+//!
+//! The daemon's `fault-injection` build layers one of these over each real
+//! session so an alert drill can queue libtorrent alerts, stall the alert
+//! loop, or panic a task. A long-running process calls `pop_alerts` many
+//! times a second, so that build turns the call recorder off with
+//! `without_recording`.
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use dashmap::DashMap;
 use libtorrent_safe::alert::AlertHeader;
@@ -132,6 +142,12 @@ pub struct MockEngine {
     next_handle_id: AtomicU64,
     /// `op_name` → fixed error to return on the next call to that op.
     error_inject: DashMap<&'static str, EngineError>,
+    /// Ops whose next call panics.
+    panic_inject: DashMap<&'static str, ()>,
+    /// How long the next `pop_alerts` blocks before draining.
+    stall: Mutex<Option<Duration>>,
+    /// When clear, `calls()` stays empty. On by default.
+    recording: AtomicBool,
     /// infohash → handle, so add/remove are consistent across calls.
     handles: DashMap<InfoHash, TorrentHandle>,
     /// When set, every successful `save_resume_data(h, _)` immediately
@@ -158,10 +174,20 @@ impl MockEngine {
             calls: Mutex::new(Vec::new()),
             next_handle_id: AtomicU64::new(1),
             error_inject: DashMap::new(),
+            panic_inject: DashMap::new(),
+            stall: Mutex::new(None),
+            recording: AtomicBool::new(true),
             handles: DashMap::new(),
             auto_save_resume: AtomicBool::new(false),
             auto_check: AtomicBool::new(false),
         }
+    }
+
+    /// Record no calls. For a mock that lives as long as a process, where the
+    /// recorder would otherwise grow with every `pop_alerts`.
+    pub fn without_recording(self) -> Self {
+        self.recording.store(false, Ordering::SeqCst);
+        self
     }
 
     /// Make every successful save_resume_data call enqueue a synthetic
@@ -205,6 +231,18 @@ impl MockEngine {
         self.error_inject.insert(op, err);
     }
 
+    /// Make the next call to `op` panic, with a message naming it. Takes the
+    /// same op names as `inject_error`, and is checked before them.
+    pub fn inject_panic(&self, op: &'static str) {
+        self.panic_inject.insert(op, ());
+    }
+
+    /// Make the next `pop_alerts` block for `d` before it drains the queue.
+    /// A later call replaces an armed stall that has not been taken yet.
+    pub fn stall_next_pop(&self, d: Duration) {
+        *self.stall.lock() = Some(d);
+    }
+
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.calls.lock().clone()
     }
@@ -227,10 +265,15 @@ impl MockEngine {
     // --- internal -----------------------------------------------------------
 
     fn record(&self, c: RecordedCall) {
-        self.calls.lock().push(c);
+        if self.recording.load(Ordering::SeqCst) {
+            self.calls.lock().push(c);
+        }
     }
 
     fn check_error(&self, op: &'static str) -> Result<(), EngineError> {
+        if self.panic_inject.remove(op).is_some() {
+            panic!("mock injected panic on `{op}`");
+        }
         if let Some((_, err)) = self.error_inject.remove(op) {
             return Err(err);
         }
@@ -372,6 +415,12 @@ impl TorrentEngine for MockEngine {
 
     fn pop_alerts(&self) -> Vec<Alert> {
         self.record(RecordedCall::PopAlerts);
+        // Taken out of the lock before sleeping, so arming another stall or
+        // queueing an alert does not wait out this one.
+        let stall = self.stall.lock().take();
+        if let Some(d) = stall {
+            std::thread::sleep(d);
+        }
         self.alerts.lock().drain(..).collect()
     }
 
@@ -437,5 +486,46 @@ mod tests {
         assert!(matches!(calls[0], RecordedCall::PauseTorrent(_)));
         assert!(matches!(calls[1], RecordedCall::ResumeTorrent(_)));
         assert!(matches!(calls[2], RecordedCall::PostUpdates));
+    }
+
+    #[test]
+    fn inject_panic_panics_once_naming_the_op() {
+        let m = MockEngine::new();
+        m.inject_panic("apply_settings");
+        let err = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            m.apply_settings(&Settings::default())
+        }))
+        .expect_err("the armed call panics");
+        let msg = err.downcast_ref::<String>().cloned().unwrap_or_default();
+        assert!(msg.contains("apply_settings"), "{msg}");
+        assert!(m.apply_settings(&Settings::default()).is_ok());
+    }
+
+    #[test]
+    fn a_stall_blocks_one_pop_then_drains_what_was_queued() {
+        let m = MockEngine::new();
+        m.push_alert(Alert::TorrentFinished {
+            hdr: AlertHeader {
+                kind: AlertKind::TorrentFinished,
+                infohash: Some(InfoHash([3u8; 20])),
+                handle: None,
+                timestamp_us: 0,
+            },
+        });
+        m.stall_next_pop(Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        assert_eq!(m.pop_alerts().len(), 1);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        assert!(m.pop_alerts().is_empty());
+        assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn without_recording_keeps_no_calls() {
+        let m = MockEngine::new().without_recording();
+        m.pop_alerts();
+        m.post_updates();
+        assert!(m.calls().is_empty());
     }
 }

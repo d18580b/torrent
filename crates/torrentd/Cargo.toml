@@ -61,6 +61,10 @@ sha1 = { workspace = true }
 # who only wants the daemon.
 default = ["web-ui"]
 web-ui = ["dep:rust-embed", "dep:mime_guess"]
+# The alert drill's build (deploy/drill): layers a MockEngine over every
+# session and mounts `POST /api/fault` to queue alerts, stall the alert loop,
+# or panic a task. Never enable it for a deployment; no release image does.
+fault-injection = []
 
 [dev-dependencies]
 tempfile = { workspace = true }

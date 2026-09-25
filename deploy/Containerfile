@@ -37,11 +37,18 @@ COPY . /src
 # VM, where a build cache mount starts empty.
 ENV LIBTORRENT_SYS_CACHE_DIR=/root/.cache/torrentd/native
 
+# Extra cargo features, empty for every image but the alert drill's, which
+# passes `torrentd/fault-injection` (deploy/drill/compose.yaml). That feature
+# mounts an endpoint that injects faults into the daemon, so an image built
+# with it is a test fixture and never a deployment.
+ARG CARGO_FEATURES=""
+
 # `cargo build --release` will re-read rust-toolchain.toml and download
 # the matching channel automatically.
 RUN --mount=type=cache,target=/root/.cache/torrentd,sharing=locked \
     --mount=type=cache,target=/root/.cargo/registry,sharing=locked \
-    cargo build --release --workspace --bin torrentd
+    cargo build --release --workspace --bin torrentd \
+        ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # ---- runtime --------------------------------------------------------------
 

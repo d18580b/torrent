@@ -677,7 +677,7 @@ pub async fn boot(
         &vpn::NatpmpForwarder::for_startup(),
         &*metrics,
         &mut boot_shutdown,
-        real_engine,
+        boot_engine,
     )
     .await?;
     // Every alert-referenced series exists from here, before the alert loop
@@ -1223,6 +1223,25 @@ fn real_engine(
         None => libtorrent_safe::Session::new(settings),
     }?;
     Ok(Arc::new(RealEngine::from_session(session)))
+}
+
+/// The engine factory `boot` hands [`build_profiles`]: [`real_engine`], and in
+/// a `fault-injection` build that session with the drill's fault layer over
+/// it (`http::fault_injection::FaultEngine`).
+fn boot_engine(
+    settings: &torrentd_engine::Settings,
+    state: Option<Vec<u8>>,
+) -> Result<Arc<dyn TorrentEngine>, libtorrent_safe::Error> {
+    let engine = real_engine(settings, state)?;
+    #[cfg(feature = "fault-injection")]
+    let engine = {
+        warn!(
+            "fault-injection build: this session accepts injected faults over POST /api/fault; \
+             it exists for deploy/drill and must never seed for real",
+        );
+        crate::http::fault_injection::FaultEngine::wrap(engine)
+    };
+    Ok(engine)
 }
 
 /// Build every configured profile's session, in configuration order.
