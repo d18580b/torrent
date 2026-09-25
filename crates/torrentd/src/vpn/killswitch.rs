@@ -42,6 +42,7 @@ use std::io::Write;
 use std::process::Command;
 use std::process::Stdio;
 
+use torrentd_engine::profile::ProfileConfig;
 use tracing::info;
 
 /// nftables table this module owns. Torn down on graceful shutdown.
@@ -54,7 +55,27 @@ pub const TABLE: &str = "torrentd_ks";
 ///
 /// The chain policy stays `accept` (we must not touch other uids' traffic); we
 /// only `drop` packets owned by `uid` that don't egress loopback or a tunnel.
-pub fn render_ruleset(uid: u32, tunnels: &[String]) -> String {
+///
+/// Refuses, with `InvalidInput` naming it, any interface name
+/// [`ProfileConfig::is_valid_interface_name`] rejects. Each name is written
+/// between literal quotes, and nftables has no escape for a `"` inside one, so
+/// a name carrying a quote, brace or newline would produce a ruleset `nft`
+/// rejects with a syntax error in a file the operator never wrote. Config
+/// validation refuses such a name first; this keeps the renderer from emitting
+/// an unparseable ruleset for any caller that did not.
+pub fn render_ruleset(uid: u32, tunnels: &[String]) -> io::Result<String> {
+    if let Some(bad) = tunnels
+        .iter()
+        .find(|i| !ProfileConfig::is_valid_interface_name(i))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "vpn_interface {bad:?} cannot be written into the kill-switch ruleset: an \
+                 interface name must be 1-15 characters of [A-Za-z0-9_=+.-]",
+            ),
+        ));
+    }
     let mut ifaces: Vec<&str> = tunnels.iter().map(String::as_str).collect();
     ifaces.sort_unstable();
     ifaces.dedup();
@@ -74,7 +95,9 @@ pub fn render_ruleset(uid: u32, tunnels: &[String]) -> String {
     }
     chain.push_str(&format!("\t\tmeta skuid {uid} counter drop\n"));
 
-    format!("table inet {TABLE} {{\n\tchain output {{\n{chain}\t}}\n}}\n")
+    Ok(format!(
+        "table inet {TABLE} {{\n\tchain output {{\n{chain}\t}}\n}}\n"
+    ))
 }
 
 /// Effective uid of this process, read from `/proc/self/status` (Linux-only,
@@ -184,7 +207,9 @@ pub(crate) fn enable_for_uid(
     if let Some(refusal) = refusal_for_uid(uid) {
         return Err(refusal);
     }
-    let ruleset = render_ruleset(uid, tunnels);
+    // Rendered before the clear, so a name the ruleset cannot carry leaves a
+    // previous run's kill switch armed rather than disarming it and failing.
+    let ruleset = render_ruleset(uid, tunnels)?;
     // Clear a stale table before reloading. `nft -f -` merges into an existing
     // table rather than replacing it, so a delete that silently failed would
     // leave a previous run's rules in force alongside the new ones — with the
@@ -391,7 +416,7 @@ mod tests {
             calls[1],
             format!(
                 "apply:{}",
-                render_ruleset(998, &["wg-a".to_string(), "wg-b".to_string()])
+                render_ruleset(998, &["wg-a".to_string(), "wg-b".to_string()]).unwrap()
             ),
             "and the ruleset handed to nft is this uid's, over these tunnels",
         );
@@ -497,7 +522,7 @@ mod tests {
     #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
     fn disable_against_real_nft() {
         disable().expect("no table yet: success, in any locale");
-        apply(&render_ruleset(998, &["wg0".to_string()])).expect("install");
+        apply(&render_ruleset(998, &["wg0".to_string()]).unwrap()).expect("install");
         assert!(table_listed(&list_tables().expect("list")));
         disable().expect("an installed table is deleted");
         assert!(!table_listed(&list_tables().expect("list")));
@@ -519,7 +544,7 @@ mod tests {
         // ruleset that drops every root-owned socket on the host. This pins
         // the shape `refusal_for_uid` exists to keep out of `nft`; on its own
         // it establishes nothing about whether anything checks.
-        let rs = render_ruleset(0, &["wg0".to_string()]);
+        let rs = render_ruleset(0, &["wg0".to_string()]).unwrap();
         assert!(
             rs.contains("meta skuid 0 counter drop"),
             "if this ever stops being catastrophic, revisit refusal_for_uid",
@@ -528,7 +553,7 @@ mod tests {
 
     #[test]
     fn ruleset_confines_uid_to_lo_and_tunnels() {
-        let rs = render_ruleset(998, &["wg-b".to_string(), "wg-a".to_string()]);
+        let rs = render_ruleset(998, &["wg-b".to_string(), "wg-a".to_string()]).unwrap();
         let expected = "\
 table inet torrentd_ks {
 \tchain output {
@@ -544,7 +569,7 @@ table inet torrentd_ks {
 
     #[test]
     fn ruleset_dedups_shared_interface() {
-        let rs = render_ruleset(1000, &["wg0".to_string(), "wg0".to_string()]);
+        let rs = render_ruleset(1000, &["wg0".to_string(), "wg0".to_string()]).unwrap();
         assert_eq!(rs.matches("wg0").count(), 1);
         // Still fails closed: lo accept, one tunnel accept, then drop.
         assert!(rs.contains("meta skuid 1000 counter drop"));
@@ -552,9 +577,45 @@ table inet torrentd_ks {
 
     #[test]
     fn ruleset_with_no_tunnels_allows_only_loopback() {
-        let rs = render_ruleset(1000, &[]);
+        let rs = render_ruleset(1000, &[]).unwrap();
         assert!(!rs.contains("oifname {"));
         assert!(rs.contains("oifname \"lo\" accept"));
         assert!(rs.contains("counter drop"));
+    }
+
+    /// The shape from #33: a quote closes the set's quoted token early and
+    /// `nft` rejects the whole table. The renderer refuses it by name instead
+    /// of emitting a ruleset it knows will not parse.
+    #[test]
+    fn ruleset_refuses_a_name_it_cannot_quote() {
+        for bad in ["wg\"x", "wg}x", "wg\nx", ""] {
+            let e = render_ruleset(2000, &["lo".to_string(), bad.to_string()])
+                .expect_err("an unquotable name is refused, not rendered");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            assert!(e.to_string().contains(&format!("{bad:?}")), "got {e}");
+        }
+    }
+
+    /// And `enable` refuses it before the pre-clear, so a previous run's kill
+    /// switch stays armed rather than being deleted and never replaced.
+    #[test]
+    fn enable_refuses_an_unquotable_name_before_clearing() {
+        let cleared = std::cell::Cell::new(false);
+        let applied = std::cell::Cell::new(false);
+        enable_for_uid(
+            998,
+            &["wg\"x".to_string()],
+            || {
+                cleared.set(true);
+                Ok(())
+            },
+            |_| {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("an unquotable name stops the install");
+        assert!(!cleared.get(), "the existing table is left in force");
+        assert!(!applied.get(), "nothing is handed to nft");
     }
 }
