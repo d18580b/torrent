@@ -1,6 +1,13 @@
 //! Forward libtorrent's `Log` and `TorrentLog` alerts at debug level.
 //! Higher levels are too noisy for production but invaluable when
 //! reproducing a peer-protocol or DHT issue.
+//!
+//! libtorrent's messages carry tracker announce URLs verbatim, passkeys
+//! included. They are forwarded unmodified on purpose: the daemon's
+//! subscriber (`torrentd::tracing_init`) redacts credential-carrying URLs
+//! from every formatted line, so redacting here as well would be a second
+//! copy of the rule to keep in step. A subscriber installed without that
+//! redactor (a test harness, another binary) sees the raw URLs.
 
 use libtorrent_safe::Alert;
 use tracing::debug;
