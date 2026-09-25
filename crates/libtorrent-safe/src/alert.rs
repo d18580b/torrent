@@ -44,6 +44,7 @@ pub enum AlertKind {
     UdpError,
     FastresumeRejected,
     Performance,
+    TrackerReply,
 }
 
 impl AlertKind {
@@ -76,6 +77,7 @@ impl AlertKind {
             AlertKind::UdpError => "udp_error",
             AlertKind::FastresumeRejected => "fastresume_rejected",
             AlertKind::Performance => "performance",
+            AlertKind::TrackerReply => "tracker_reply",
         }
     }
 }
@@ -228,6 +230,11 @@ pub enum Alert {
         /// libtorrent's rendering of the alert.
         message: String,
     },
+    /// A successful tracker announce. Counted only, as the denominator the
+    /// tracker failure fraction is taken against.
+    TrackerReply {
+        hdr: AlertHeader,
+    },
 }
 
 impl Alert {
@@ -254,7 +261,8 @@ impl Alert {
             | Alert::PeerDisconnected { hdr, .. }
             | Alert::TorrentLog { hdr, .. }
             | Alert::Log { hdr, .. }
-            | Alert::Warning { hdr, .. } => hdr,
+            | Alert::Warning { hdr, .. }
+            | Alert::TrackerReply { hdr } => hdr,
         }
     }
 
@@ -306,6 +314,7 @@ impl Alert {
             ffi::lt_alert_kind_LT_ALERT_UDP_ERROR => AlertKind::UdpError,
             ffi::lt_alert_kind_LT_ALERT_FASTRESUME_REJECTED => AlertKind::FastresumeRejected,
             ffi::lt_alert_kind_LT_ALERT_PERFORMANCE => AlertKind::Performance,
+            ffi::lt_alert_kind_LT_ALERT_TRACKER_REPLY => AlertKind::TrackerReply,
             _ => {
                 // Unknown — still free any payload to avoid leaks.
                 unsafe { ffi::lt_alert_payload_free(raw as *mut _) };
@@ -513,6 +522,7 @@ impl Alert {
                     message: c_str_to_owned(&p.message),
                 }
             }
+            AlertKind::TrackerReply => Alert::TrackerReply { hdr },
             AlertKind::TorrentLog | AlertKind::Log => {
                 let p = unsafe { &raw.payload.log_msg };
                 let msg = c_str_to_owned(&p.message);

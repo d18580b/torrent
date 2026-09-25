@@ -531,7 +531,7 @@ fn dispatch_alert(
         Alert::TorrentChecked { .. }
         | Alert::StorageMoved { .. }
         | Alert::StorageMovedFailed { .. } => handlers::storage::handle(&alert, &mut ctx),
-        Alert::TrackerError { .. } | Alert::Warning { .. } => {
+        Alert::TrackerError { .. } | Alert::Warning { .. } | Alert::TrackerReply { .. } => {
             handlers::warning::handle(&alert, &mut ctx)
         }
 

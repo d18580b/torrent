@@ -150,12 +150,20 @@ groups:
           summary: "libtorrent dropped alerts for profile {{ $labels.profile_id }}; the alert loop is falling behind"
 
       - alert: TorrentdTrackerErrors
-        expr: increase(torrentd_tracker_alerts_total{kind="error"}[15m]) > 0
+        # A fraction of announces, not any error: one dead tracker among many
+        # torrents fails on every retry forever, while the rest keep replying.
+        # This fires only when most announces fail, as in a tracker outage or
+        # a tunnel that blocks them. No announces at all divides 0 by 0 and
+        # stays silent.
+        expr: |
+          sum by (profile_id) (increase(torrentd_tracker_alerts_total{kind="error"}[30m]))
+            / sum by (profile_id) (increase(torrentd_tracker_alerts_total{kind=~"error|reply"}[30m]))
+            > 0.5
         for: 30m
         labels:
           severity: warning
         annotations:
-          summary: "Tracker announces for profile {{ $labels.profile_id }} have been failing for 30 minutes"
+          summary: "Most tracker announces for profile {{ $labels.profile_id }} have been failing for 30 minutes"
 
       - alert: TorrentdTrackerWarnings
         expr: increase(torrentd_tracker_alerts_total{kind=~"warning|scrape_failed"}[1h]) > 0

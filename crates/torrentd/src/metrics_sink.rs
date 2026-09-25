@@ -270,7 +270,7 @@ pub const CATALOGUE: &[Series] = &[
         Profile,
         ("kind", torrentd_engine::handlers::warning::TRACKER_KINDS),
         Seed::Zero,
-        "Tracker announce errors, tracker warnings, and scrape failures.",
+        "Tracker announce errors, successful announces (reply), tracker warnings, and scrape failures.",
     ),
     labelled(
         "session_alerts_total",

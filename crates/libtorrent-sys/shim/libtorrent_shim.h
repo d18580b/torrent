@@ -132,7 +132,10 @@ typedef enum {
     LT_ALERT_PORTMAP_ERROR,
     LT_ALERT_UDP_ERROR,
     LT_ALERT_FASTRESUME_REJECTED,
-    LT_ALERT_PERFORMANCE
+    LT_ALERT_PERFORMANCE,
+    /* A successful announce. No payload: the daemon only counts it, as the
+     * denominator of the tracker failure fraction. */
+    LT_ALERT_TRACKER_REPLY
 } lt_alert_kind;
 
 /* ------------------------------------------------------------------ */

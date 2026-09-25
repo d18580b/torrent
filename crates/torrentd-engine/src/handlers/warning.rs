@@ -6,6 +6,9 @@
 //! the tracker error reached only a `debug!` line and the rest were never
 //! translated at all.
 //!
+//! Successful announces are counted too (`kind="reply"`), not logged: they are
+//! the denominator an alert divides tracker errors by.
+//!
 //! Two counters, both with a bounded label set: `profile_id` and a `kind` drawn
 //! from the fixed lists below. No per-torrent and no per-tracker-URL label:
 //! either would give every torrent a series of its own, and the URL carries
@@ -19,7 +22,7 @@ use tracing::warn;
 use crate::handlers::HandlerCtx;
 
 /// `tracker_alerts_total{kind}`: every value this handler can emit.
-pub const TRACKER_KINDS: &[&str] = &["error", "warning", "scrape_failed"];
+pub const TRACKER_KINDS: &[&str] = &["error", "reply", "warning", "scrape_failed"];
 
 /// `session_alerts_total{kind}`: every value this handler can emit.
 pub const SESSION_KINDS: &[&str] = &[
@@ -67,6 +70,15 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             ctx.metrics.inc_counter(
                 "tracker_alerts_total",
                 &[("profile_id", profile), ("kind", "error")],
+            );
+        }
+        // Not logged: every torrent announces every few minutes. Counted so the
+        // failure alert can divide errors by all announces, which tells one
+        // dead tracker among many working ones from trackers that are down.
+        Alert::TrackerReply { .. } => {
+            ctx.metrics.inc_counter(
+                "tracker_alerts_total",
+                &[("profile_id", profile), ("kind", "reply")],
             );
         }
         Alert::Warning {
@@ -192,6 +204,21 @@ mod tests {
                 vec![pair("profile_id", "p"), pair("kind", "error")]
             )]
         );
+    }
+
+    #[test]
+    fn a_tracker_reply_counts_as_kind_reply_for_its_profile() {
+        let calls = run(Alert::TrackerReply {
+            hdr: hdr(AlertKind::TrackerReply),
+        });
+        assert_eq!(
+            labels_of(&calls),
+            vec![(
+                "tracker_alerts_total".to_string(),
+                vec![pair("profile_id", "p"), pair("kind", "reply")]
+            )]
+        );
+        assert!(TRACKER_KINDS.contains(&"reply"));
     }
 
     #[test]

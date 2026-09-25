@@ -282,14 +282,25 @@ tests:
             exp_annotations:
               summary: "libtorrent dropped alerts for profile acct_a; the alert loop is falling behind"
 
-  # One failed announce is not an outage: the alert waits for 30 minutes of
-  # them.
+  # The alert is a fraction of announces held for 30 minutes.
+  #   acct_a: three of every four announces fail (a tracker outage). Fires.
+  #   acct_b: one dead tracker failing every minute, forever, among torrents
+  #           whose trackers reply four times as often. Never fires.
+  #   acct_c: one failed announce among steady replies. Never fires.
   - interval: 1m
     input_series:
       - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="error"}'
-        values: '0+1x60'
+        values: '0+3x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="reply"}'
+        values: '0+1x90'
       - series: 'torrentd_tracker_alerts_total{profile_id="acct_b", kind="error"}'
-        values: '0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1'
+        values: '0+1x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_b", kind="reply"}'
+        values: '0+4x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_c", kind="error"}'
+        values: '0 1x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_c", kind="reply"}'
+        values: '0+2x90'
     alert_rule_test:
       - eval_time: 10m
         alertname: TorrentdTrackerErrors
@@ -300,9 +311,16 @@ tests:
           - exp_labels:
               severity: warning
               profile_id: acct_a
-              kind: error
             exp_annotations:
-              summary: "Tracker announces for profile acct_a have been failing for 30 minutes"
+              summary: "Most tracker announces for profile acct_a have been failing for 30 minutes"
+      - eval_time: 90m
+        alertname: TorrentdTrackerErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Most tracker announces for profile acct_a have been failing for 30 minutes"
 
   - interval: 1m
     input_series:

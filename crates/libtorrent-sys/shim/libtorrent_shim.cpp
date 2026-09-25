@@ -670,6 +670,11 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
+    if (auto* x = lt::alert_cast<lt::tracker_reply_alert>(a)) {
+        out.kind = LT_ALERT_TRACKER_REPLY;
+        fill_torrent_scope(out, s, x->handle);
+        return true;
+    }
     return false;
 }
 
