@@ -94,6 +94,10 @@ pub struct TorrentStatusView {
     pub needs_save_resume: bool,
     pub is_finished: bool,
     pub is_seeding: bool,
+    /// libtorrent holds an error on this torrent (`torrent_status::errc`).
+    /// A disk error that is not routed to upload mode sets one and pauses
+    /// the torrent; `resume()` clears it.
+    pub has_error: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -329,6 +333,7 @@ impl Alert {
                                 needs_save_resume: s.needs_save_resume != 0,
                                 is_finished: s.is_finished != 0,
                                 is_seeding: s.is_seeding != 0,
+                                has_error: s.has_error != 0,
                             });
                         }
                     }

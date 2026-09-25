@@ -23,6 +23,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     st.is_finished = s.is_finished;
                     st.is_seeding = s.is_seeding;
                     st.needs_save_resume = s.needs_save_resume;
+                    st.has_error = s.has_error;
                     // Map libtorrent's state enum onto our TorrentPhase.
                     // libtorrent state_t values:
                     //   0=queued_for_checking (deprecated), 1=checking_files,
@@ -170,6 +171,7 @@ mod tests {
             needs_save_resume: true,
             is_finished: true,
             is_seeding: true,
+            has_error: false,
         };
         dispatch(
             &Alert::StateUpdate {
@@ -191,6 +193,61 @@ mod tests {
         assert_eq!(st.total_payload_uploaded, 90);
         assert_eq!(st.num_peers, 3);
         assert!(st.is_seeding && st.needs_save_resume);
+    }
+
+    #[test]
+    fn state_update_tracks_libtorrent_error_both_ways() {
+        // A read-class disk error leaves the torrent paused with an error set;
+        // `resume()` clears both. The retry timer keys on `has_error`, so it
+        // must follow libtorrent in each direction, not latch.
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        let h = TorrentHandle {
+            id: 3,
+            infohash: ih(0x66),
+        };
+        seed_state(&state, h);
+        let view = |paused: bool, has_error: bool| TorrentStatusView {
+            handle: h,
+            state: 5,
+            flags: if paused {
+                TorrentFlags::PAUSED.bits()
+            } else {
+                0
+            },
+            total_uploaded: 0,
+            total_payload_uploaded: 0,
+            upload_rate: 0,
+            download_rate: 0,
+            num_peers: 0,
+            num_seeds: 0,
+            num_connections: 0,
+            progress: 1.0,
+            has_metadata: true,
+            needs_save_resume: false,
+            is_finished: true,
+            is_seeding: !paused,
+            has_error,
+        };
+        let update = |v: TorrentStatusView| Alert::StateUpdate {
+            hdr: AlertHeader {
+                kind: AlertKind::StateUpdate,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            statuses: vec![v],
+        };
+
+        dispatch(&update(view(true, true)), &state, &metrics);
+        let st = state.get(&ih(0x66)).unwrap();
+        assert!(st.has_error);
+        assert_eq!(st.phase, TorrentPhase::Paused);
+
+        dispatch(&update(view(false, false)), &state, &metrics);
+        let st = state.get(&ih(0x66)).unwrap();
+        assert!(!st.has_error);
+        assert_eq!(st.phase, TorrentPhase::Seeding);
     }
 
     #[test]
