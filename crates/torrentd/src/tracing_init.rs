@@ -1,7 +1,12 @@
 //! Structured-logging bring-up.
 //!
-//! Per JSON lines on stdout, RFC3339 timestamps,
-//! `level`/`msg` always present, plus span fields flat at the top.
+//! JSON lines on stdout, one object per event, keys in this order:
+//! `timestamp` (RFC3339), `level`, the event's own fields (including
+//! `message`) flat at the top (`flatten_event`), `target`, then `span`.
+//! `span` is an object holding the current span's `name` and fields, e.g. the
+//! `op`/`infohash` an `#[instrument]` attaches; those are nested there, not
+//! flat at the top (`with_current_span`). `with_span_list(false)` suppresses
+//! the separate `spans` array. Events outside any span have no `span` key.
 //! Filter level seeded from config + overridden by RUST_LOG if set.
 //!
 //! The global filter is wrapped in a `reload::Layer` so SIGHUP can swap the
