@@ -1997,6 +1997,60 @@ mod tests {
         );
     }
 
+    /// A state directory that cannot be created refuses the start, naming
+    /// the directory. A regular file standing where the directory belongs
+    /// fails `create_dir_all` whoever runs the test, root included.
+    #[test]
+    fn a_state_directory_that_cannot_be_created_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("state");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let path = blocker.join("torrentd.lock");
+
+        let err = InstanceLock::acquire(&path).expect_err("a file as the state dir");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("create the state directory {}", blocker.display())),
+            "names the directory: {msg}"
+        );
+    }
+
+    /// A lock file that cannot be opened refuses the start, naming the lock.
+    /// A directory at the lock path cannot be opened for writing, whoever
+    /// runs the test.
+    #[test]
+    fn a_lock_file_that_cannot_be_opened_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torrentd.lock");
+        std::fs::create_dir(&path).unwrap();
+
+        let err = InstanceLock::acquire(&path).expect_err("a directory as the lock file");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains(&format!("open the single-instance lock {}", path.display())),
+            "names the lock: {msg}"
+        );
+    }
+
+    /// A pid that cannot be recorded costs only the pid: the start goes on
+    /// and the lock is held. `/dev/full` opens, locks and refuses
+    /// `ftruncate`, so the record fails after the lock is taken.
+    #[test]
+    fn a_pid_that_cannot_be_recorded_still_holds_the_lock() {
+        let path = std::path::Path::new("/dev/full");
+        let lock = InstanceLock::acquire(path).expect("an unrecordable pid is not fatal");
+
+        // Probe with a bare `try_lock` rather than a second `acquire`: its
+        // refusal reads the file, and `/dev/full` never reaches end of file.
+        let probe = std::fs::File::open(path).unwrap();
+        assert!(
+            matches!(probe.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "the lock is held although the pid was not recorded",
+        );
+        drop(lock);
+        probe.try_lock().expect("released on drop");
+    }
+
     fn profile(iface: &str) -> VpnTunnel {
         VpnTunnel {
             r#type: VpnType::Wireguard,
