@@ -2,6 +2,8 @@
 
 mod auth_routes;
 mod events;
+#[cfg(feature = "fault-injection")]
+pub(crate) mod fault_injection;
 pub mod forwarded;
 mod healthz;
 mod metrics;
@@ -88,6 +90,13 @@ pub fn router(state: AppState) -> Router {
                 get(pool::get_plan).delete(pool::delete_plan),
             )
             .route("/pool/plans/:id/apply", post(pool::apply_plan));
+    }
+
+    // The alert drill's fault injection. Only a `fault-injection` build has
+    // it, and it sits behind the same write credential as everything below.
+    #[cfg(feature = "fault-injection")]
+    {
+        api = api.route("/fault", post(fault_injection::inject));
     }
 
     // Everything in `api` requires a credential; read for safe methods, write
