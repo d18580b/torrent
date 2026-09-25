@@ -1022,6 +1022,69 @@ On a scratch pool, not your real one.
      container image runs the daemon as uid 1000 and raises no links, so it
      cannot run the kill switch with a working tunnel either.
 
+## 12. Capturing a log
+
+What a bug report needs ([`CONTRIBUTING.md`](../CONTRIBUTING.md#reporting-bugs)
+asks for it) is the JSON log of the daemon that misbehaved, taken while it is
+still running. Everything below keeps that daemon running.
+
+**Where it is.** The daemon writes one JSON object per line to stdout, and the
+unit of §8 sends stdout to the journal. Reading a system unit's journal needs
+root or a journal-reader group (`systemd-journal` on most distributions), hence
+the `sudo`.
+
+```bash
+# Follow it live.
+sudo journalctl -u torrentd -f
+
+# Capture a window for a report. `-o cat` drops journald's own prefix and
+# leaves the raw JSON lines.
+sudo journalctl -u torrentd -o cat --since '10 min ago' > torrentd.log
+```
+
+Take out tracker announce URLs (their passkeys identify your account) and any
+API token before you paste the result anywhere.
+
+**Raising the level without a restart.** `log_level` is reloadable, and the
+unit's `ExecReload=` sends `SIGHUP`, which swaps the filter on the live daemon.
+A restart would throw away the state you are trying to capture.
+
+1. Set `log_level = "debug"` in `/etc/torrentd/torrentd.toml`.
+2. `sudo systemctl reload torrentd`. The journal shows
+   `SIGHUP: log level applied` with `new_log_level` set to `debug`.
+3. Reproduce, and capture as above.
+4. Set `log_level` back to what it was and reload again. The file is what the
+   daemon reads at every start, so a level left at `debug` there survives the
+   next restart too.
+
+The reload applies `log_level` only when it differs from the value the daemon
+last loaded, and the level it applies replaces any `RUST_LOG` the process was
+started with. Where there is no `systemctl` — the container in `deploy/` has no
+unit, and its log is `docker compose logs torrentd` (or `podman logs`) rather
+than the journal — edit the mounted `torrentd.toml` and call `POST /api/reload`
+(§8) instead: it does what `SIGHUP` does. Edit that file in place: `compose.yaml`
+mounts it as a single file, which keeps the inode it was started with, so an
+editor that saves by writing a new file leaves the container reading the old
+one.
+
+`debug` is per-alert detail, and on a large pool it can exceed journald's
+per-service rate limit. A `Suppressed N messages` line in the journal means
+lines were dropped; say so in the report, and keep `debug` on only for the
+reproduction itself.
+
+**Do not start a second copy by hand to watch its output.** Nothing stops one:
+the daemon takes no single-instance lock. A second `torrentd --config …` reads
+the same config and state directory, and binds the HTTP port last: before it,
+wherever it has the privileges to get that far, it has replaced the
+kill-switch table (§11, drill 6), brought up tunnels, and opened the resume
+directory and pool index. When the bind then fails against the running
+daemon's port, it shuts down the way a signalled daemon does: it writes resume
+data, deletes the `inet torrentd_ks` table — the running daemon's kill switch,
+since there is only one — and brings down every `vpn` profile's interface by
+name, the running daemon's tunnels included. If you stop the service to run
+it by hand instead, start the service again afterwards: `Restart=on-failure`
+does not bring back a unit that was stopped.
+
 ## Troubleshooting
 
 | Symptom | Cause |
