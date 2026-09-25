@@ -1023,7 +1023,10 @@ On a scratch pool, not your real one.
      `NoNewPrivileges=yes` stops that `sudo` from elevating, so a daemon that
      is not root raises its links itself with `ip` and `wg`, which need only
      `CAP_NET_ADMIN`. A link root raised before the daemon started is still
-     adopted when its key matches, and is exempted the same way.
+     adopted when its key matches, and is exempted the same way. The daemon
+     does not remove such a link at shutdown: it removes only links its
+     `wireguard-<iface>.raised` record (§4) names, so a root-raised link — and
+     its hooks' work — outlives the daemon, as it did before.
 
    **The deployment**, with the packaged unit (§4, §8):
 
@@ -1046,13 +1049,14 @@ On a scratch pool, not your real one.
    4. Set `network_kill_switch = true` and start the unit.
 
    How the daemon raises a link: `ip link add <iface> type wireguard`,
-   `wg setconf`, each `Address`, `MTU` (default 1420), and then — instead of
+   `wg setconf`, each `Address`, `MTU` (default 1420, where `wg-quick` would
+   derive it from the route; set `MTU` on a smaller path), and then — instead of
    `wg-quick`'s host-wide default route — **source-address routing**: each
    peer's `AllowedIPs` go into a routing table of the link's own, and an
    `ip rule` sends traffic *from* the link's address to it. Every profile's
    sockets are bound to its tunnel address, so that is all the daemon needs,
    and nothing else on the host is rerouted. Shutdown removes the rules and
-   the link. `ip rule show` lists them as `from <address> lookup <table>`.
+   the link it raised. `ip rule show` lists them as `from <address> lookup <table>`.
 
    **Name resolution does not go through the tunnel on this path.** The
    daemon's lookups use the host's resolver, and under the kill switch only a

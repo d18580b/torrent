@@ -1006,13 +1006,42 @@ impl VpnManager for WireguardManager {
             Raiser::WgQuick => {
                 let _ = Command::new("wg-quick").arg("down").arg(iface).status();
             }
-            Raiser::Native => native::down(iface),
+            Raiser::Native => {
+                let live = interface_public_key(iface);
+                if !self.native_teardown_permitted(iface, live.as_deref()) {
+                    warn!(
+                        target: "torrentd::vpn::wireguard",
+                        vpn_iface = %iface,
+                        "not removing a link no daemon on this boot recorded raising \
+                         (raised by root, or adopted); leaving it standing",
+                    );
+                    return;
+                }
+                native::down(iface);
+            }
         }
         self.drop_record_if_gone(iface, interface_exists);
     }
 }
 
 impl WireguardManager {
+    /// Whether the native path may remove the link standing as `iface`, which
+    /// carries `live_key`: only when this host boot's raised-interface record
+    /// names it by that key.
+    ///
+    /// `wg-quick down` as a non-root uid fails through `sudo`, so before the
+    /// native path a link root raised and the daemon adopted survived the
+    /// daemon's shutdown. `ip link delete` does not fail, and removing that
+    /// link leaves a config with hooks — which the native path refuses to
+    /// raise — with nothing to adopt at the next start. A link the daemon
+    /// raised itself carries a record written right after it came up, so it
+    /// is still removed. The cost: where the record could not be written (no
+    /// boot id, an unwritable state directory, a key that would not read) the
+    /// daemon's own link is left standing too, and the next start adopts it by
+    /// its key.
+    fn native_teardown_permitted(&self, iface: &str, live_key: Option<&str>) -> bool {
+        self.raised.recorded(iface, live_key)
+    }
     /// Drop the raised-interface record, but only once the link is actually
     /// gone.
     ///
@@ -1096,6 +1125,8 @@ mod native {
     use tracing::warn;
 
     /// `wg-quick`'s MTU for a 1500-byte path, used when the config sets none.
+    /// `wg-quick` derives it from the route MTU instead (minus 80); this path
+    /// fixes it, so a config on a smaller path should set `MTU`.
     const DEFAULT_MTU: u32 = 1420;
 
     /// The routing tables this module uses are `TABLE_BASE + ifindex`: unique
@@ -2261,6 +2292,94 @@ Endpoint = 203.0.113.7:51820 # the exit
         assert!(e.contains("Address"), "got {e}");
     }
 
+    fn native_manager(raised: RaisedInterfaces) -> WireguardManager {
+        WireguardManager {
+            raised,
+            raiser: Raiser::Native,
+        }
+    }
+
+    /// A native bring-up that is refused — a config it will not apply, or
+    /// `ip link add` on a name that is taken — is a refusal and not an I/O
+    /// error, so it reaches `adoptable` and `refusal` exactly as a failed
+    /// `wg-quick up` does. Return the refusal as `Err` from `raise` and the
+    /// first assertion fails; the link is then never considered for adoption.
+    #[test]
+    fn a_refused_native_bring_up_goes_through_adoption_like_wg_quick() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = native_manager(raised_in(dir.path(), "one-boot"));
+        let hooked = dir.path().join("tdnx-absent.conf");
+        std::fs::write(
+            &hooked,
+            PROVIDER_CONF.replace("DNS = 10.2.0.1", "PostUp = wg set %i private-key /k"),
+        )
+        .unwrap();
+
+        // A parse refusal, over a name that is free: nothing was created, so
+        // this is the ordinary bring-up failure.
+        let profile = VpnTunnel {
+            r#type: torrentd_engine::VpnType::Wireguard,
+            interface: "tdnx-absent".to_string(),
+            config_path: hooked.clone(),
+        };
+        let refused = mgr
+            .raise(&profile)
+            .expect("a refusal is not an I/O error")
+            .expect_err("a hook is refused before anything is run");
+        assert!(refused.contains("PostUp"), "got {refused}");
+        assert_eq!(mgr.adoptable(&profile), Adoption::No);
+        assert!(matches!(
+            refusal(&profile.interface, false, mgr.adoptable(&profile), &refused),
+            Err(VpnError::Spawn(_))
+        ));
+
+        // `ip link add` on a taken name (`lo`, which is no WireGuard link):
+        // refused, then declined by `adoptable` and fenced, never torn down.
+        let plain = dir.path().join("lo.conf");
+        std::fs::write(&plain, PROVIDER_CONF).unwrap();
+        let profile = VpnTunnel {
+            r#type: torrentd_engine::VpnType::Wireguard,
+            interface: "lo".to_string(),
+            config_path: plain,
+        };
+        let refused = mgr
+            .raise(&profile)
+            .expect("a refusal is not an I/O error")
+            .expect_err("`lo` exists, so `ip link add` fails");
+        assert!(matches!(
+            refusal(&profile.interface, true, mgr.adoptable(&profile), &refused),
+            Err(VpnError::ForeignInterface { .. })
+        ));
+    }
+
+    /// The native teardown removes only a link this boot's record names by
+    /// the key it carries. A link root raised and the daemon adopted has no
+    /// record, and `ip link delete` on it would leave a hooked config with
+    /// nothing to raise or adopt at the next start. Make the check always
+    /// true and the first assertion fails.
+    #[test]
+    fn the_native_teardown_spares_a_link_this_boot_did_not_raise() {
+        let dir = tempfile::tempdir().unwrap();
+        let raised = raised_in(dir.path(), "one-boot");
+        let mgr = native_manager(raised.clone());
+        assert!(
+            !mgr.native_teardown_permitted("wg-a", Some(LIVE_KEY)),
+            "no record: root raised it, or it was adopted",
+        );
+        raised
+            .record("wg-a", Some(LIVE_KEY))
+            .expect("a temporary directory accepts a write");
+        assert!(
+            mgr.native_teardown_permitted("wg-a", Some(LIVE_KEY)),
+            "the daemon's own link",
+        );
+        assert!(
+            !mgr.native_teardown_permitted("wg-a", Some(STRANGER_KEY)),
+            "a name retaken by another link",
+        );
+        assert!(!mgr.native_teardown_permitted("wg-a", None));
+    }
+
     /// The kill switch against a live WireGuard link the daemon raised itself,
     /// as a non-root uid: the shape #42 was about. Asserts, in order, that
     ///
@@ -2448,5 +2567,61 @@ Endpoint = 203.0.113.7:51820 # the exit
         killswitch::disable().expect("disable");
         let _ = peer.kill();
         let _ = peer.wait();
+    }
+
+    /// Against live links, in a private network namespace:
+    ///
+    /// 1. `native::up` whose configuration fails after `ip link add` created
+    ///    the link (an `Address` `ip` rejects) removes the link again;
+    /// 2. the native `bring_down` leaves standing a link no record names — one
+    ///    raised by hand, as root would before the daemon starts;
+    /// 3. and removes it once this boot's record names it by its key.
+    ///
+    /// Needs `CAP_NET_ADMIN` in a private network namespace, `ip` and `wg`;
+    /// ignored by default. `unshare -rn target/debug/deps/torrentd-<hash>
+    /// live_link --ignored`, or the uid-998 command above.
+    #[test]
+    #[ignore = "needs CAP_NET_ADMIN in a private network namespace"]
+    fn live_link_a_native_failure_rolls_back_and_teardown_spares_links_it_did_not_raise() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = |iface: &str| native::table_for(iface).is_err();
+
+        // 1. `ip address add` fails after the link exists.
+        let conf = dir.path().join("wg-rb.conf");
+        std::fs::write(
+            &conf,
+            PROVIDER_CONF.replace(
+                "Address = 10.2.0.2/32, fd00::2/128",
+                "Address = 300.1.1.1/32",
+            ),
+        )
+        .unwrap();
+        let e = native::up("wg-rb", &conf).expect_err("ip rejects the address");
+        assert!(e.contains("address add"), "failed at configure: {e}");
+        assert!(gone("wg-rb"), "the half-configured link is removed");
+
+        // 2. A link raised outside the daemon, carrying a key.
+        let key = dir.path().join("k");
+        std::fs::write(&key, LIVE_KEY).unwrap();
+        let out = Command::new("sh")
+            .arg("-c")
+            .arg(format!(
+                "ip link add wg-root type wireguard && wg set wg-root private-key {}",
+                key.display()
+            ))
+            .status()
+            .unwrap();
+        assert!(out.success());
+        let raised = raised_in(dir.path(), "one-boot");
+        let mgr = native_manager(raised.clone());
+        mgr.bring_down("wg-root");
+        assert!(!gone("wg-root"), "no record names it, so it stays");
+
+        // 3. Once recorded, it is the daemon's to remove.
+        raised
+            .record("wg-root", interface_public_key("wg-root").as_deref())
+            .unwrap();
+        mgr.bring_down("wg-root");
+        assert!(gone("wg-root"), "a recorded link is removed");
     }
 }
