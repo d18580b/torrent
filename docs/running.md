@@ -900,6 +900,37 @@ torrentd_libtorrent_`.)
 
 Then add one torrent and watch it reach `seeding` in `/api/status`.
 
+### Monitoring: Prometheus alerts and a Grafana dashboard
+
+`deploy/` ships what a Prometheus and a Grafana you already run need; neither
+is part of the compose stack.
+
+- [`deploy/metrics.md`](../deploy/metrics.md) names every series `/metrics`
+  can hold, with its labels, its type, and when it first exists. Start there
+  when writing a query of your own.
+- [`deploy/prometheus/torrentd.rules.yml`](../deploy/prometheus/torrentd.rules.yml)
+  is the alert rules. Add it to `rule_files` in `prometheus.yml`, and scrape
+  the daemon under `job_name: torrentd`, which `TorrentdDown` matches on. The
+  scrape authenticates with a `metrics`-scoped token (§6).
+- [`deploy/dashboard.json`](../deploy/dashboard.json) is the dashboard: in
+  Grafana, **Dashboards → New → Import** and upload it, or drop it into a
+  provisioned dashboards directory. It asks for no datasource at import; pick
+  the Prometheus one from its `Prometheus` selector. Four rows — Fleet, Disk,
+  Durability, VPN — each filtered by the `Instance` and `Profile` selectors.
+  The VPN row is empty for a `host` profile, and its port-forward panels are
+  empty for any profile without NAT-PMP.
+
+Two alerts stand in for probes you would otherwise have to run yourself.
+`TorrentdUnready` fires when every configured profile either got no session
+at boot or is fenced, which is when `/healthz` answers 503 `no_sessions` or
+`all_profiles_fenced`; its third 503, `alert_loop_stalled`, is
+`TorrentdAlertLoopStalled`. `TorrentdKillSwitchOff` is `info`: it notes that
+every profile is vpn-backed and `network_kill_switch` is still off. Silence it
+where that is intended, as it must be for an OpenVPN profile (§11, drill 6).
+
+`mise run test-alerts` checks the rules with `promtool` and runs a fixture per
+alert; it needs podman or docker.
+
 ### Checking the VPN on its own
 
 `vpn check` runs the VPN pre-flight without constructing a session, so "does

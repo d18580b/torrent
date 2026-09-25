@@ -1055,6 +1055,19 @@ mod tests {
     }
 
     #[test]
+    fn every_series_the_dashboard_reads_is_catalogued() {
+        let dashboard = deploy("dashboard.json");
+        let names = referenced(&dashboard);
+        assert!(!names.is_empty());
+        for name in names {
+            assert!(
+                catalogued(&name).is_some(),
+                "deploy/dashboard.json reads torrentd_{name}, which the daemon does not export",
+            );
+        }
+    }
+
+    #[test]
     fn a_rule_reading_a_first_event_series_also_matches_its_appearance() {
         // `increase()` needs a sample before the event; a series that only
         // appears with its first event has none. Any rule reading one must
