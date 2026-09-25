@@ -11,12 +11,14 @@
 #
 # Environment:
 #   TORRENTD_IMAGE  image to run (default localhost/torrentd:drill, built from
-#                   deploy/Containerfile when absent)
+#                   deploy/Containerfile with the fault-injection feature when
+#                   absent). It must be a fault-injection build: the drill
+#                   checks, and says how to rebuild one that is not.
 #   DRILL_DIR       where the config and faults are written (default: mktemp)
-#   DEADLINE_SECS   how long to wait for the alerts (default 180)
+#   DEADLINE_SECS   how long to wait for the alerts (default 240)
 #   KEEP=1          leave the stack running
 #
-# Faults injected, and the alert each must produce:
+# Faults injected from outside the process, and the alert each must produce:
 #   a .torrent in the torrent dir that is not one   TorrentdBootLoadFailures
 #   a vpn profile whose tunnel cannot come up        TorrentdProfileBootFailed,
 #                                                    TorrentdVpnTunnelDown
@@ -28,9 +30,29 @@
 # torrentd_tracker_alerts_total{kind="error"}: its alert waits 30 minutes by
 # design, so the drill checks the series through Prometheus instead.
 #
-# Faults only reachable inside the engine — a stalled alert loop, an overflowing
-# alert queue, a vanished kill-switch table — are covered by the promtool
-# fixtures in deploy/prometheus, not here.
+# Faults with no trigger outside the engine go through the image's
+# fault-injection endpoint, POST /api/fault (crates/torrentd/src/http/
+# fault_injection.rs):
+#   libtorrent alerts, queued on the drill profile's session:
+#     alerts_dropped                                 TorrentdAlertQueueOverflow
+#     portmap_error                                  TorrentdSessionErrors
+#     performance_warning                            TorrentdPerformanceWarning
+#     torrent_error                                  TorrentdTorrentErrors
+#     file_error                                     TorrentdDiskErrors
+#     save_resume_data_failed                        TorrentdResumeSaveFailures
+#     save_resume_data, whose write the drill has
+#       blocked with a directory in the file's way   TorrentdResumeWriteErrors
+#   the alert loop's drain blocked for 150 s         TorrentdAlertLoopStalled
+#   apply_settings made to panic, then a reload
+#     that changes a setting                         TorrentdTaskDown (reload)
+#   a sample emitted with the wrong label set        TorrentdMetricsDropped
+#   and, through the daemon's own sink, the series of faults that need a host
+#   the drill does not have — an nftables table, a tunnel to fence, a store or
+#   a pool plan that fails to write:
+#     kill_switch_active 1, table_present 0          TorrentdKillSwitchGone
+#     profile_fence_pause_errors_total +1            TorrentdFencePauseFailed
+#     store_write_errors_total{store="registry"} +1  TorrentdStoreWriteFailed
+#     pool_plan_failures_total{kind="step_failed"}+1 TorrentdPoolPlanFailed
 
 set -euo pipefail
 
@@ -43,7 +65,9 @@ compose=("$engine" compose)
 
 export TORRENTD_IMAGE=${TORRENTD_IMAGE:-localhost/torrentd:drill}
 export DRILL_DIR=${DRILL_DIR:-$(mktemp -d)}
-deadline_secs=${DEADLINE_SECS:-180}
+# The stall and task alerts each hold for a minute before firing, after
+# Prometheus has seen the condition, so the default leaves room for both.
+deadline_secs=${DEADLINE_SECS:-240}
 api=http://127.0.0.1:18180
 prom=http://127.0.0.1:19090
 sink=http://127.0.0.1:19095
@@ -96,7 +120,7 @@ printf '%s' "$metrics_token_out" >"$DRILL_DIR/metrics.token"
 # ---- the daemon's config, faults included --------------------------------
 cat >"$DRILL_DIR/torrentd.toml" <<EOF
 default_save_path = "/data/torrents"
-resume_dir = "/var/lib/torrentd/resume"
+resume_dir = "/drill/resume"
 torrent_dir = "/drill/torrents"
 http_listen = "0.0.0.0:8080"
 log_level = "info"
@@ -141,7 +165,16 @@ tool_check() {
 }
 # Named for an info-hash, so the boot scan tries to add it, and not a torrent.
 printf 'not bencode' >"$DRILL_DIR/torrents/drill/$(printf 'd%.0s' {1..40}).torrent"
+# The resume store writes <hash>.resume.tmp and renames it into place; a
+# directory by that name makes the write fail. The boot scan reads only
+# *.resume, so it passes over it.
+blocked_ih=$(printf 'e%.0s' {1..40})
+mkdir -p "$DRILL_DIR/resume/drill/$blocked_ih.resume.tmp"
+# The good config, kept for the reload that panics the reload task: that one
+# has to parse, and change a setting, to reach apply_settings.
+cp "$DRILL_DIR/torrentd.toml" "$DRILL_DIR/torrentd.good.toml"
 chmod -R a+rX "$DRILL_DIR"
+chmod -R a+rwX "$DRILL_DIR/resume"
 chmod a+rw "$DRILL_DIR/torrentd.toml"
 tool_check || { echo "drill: the generated config does not load" >&2; exit 2; }
 
@@ -179,6 +212,69 @@ curl -s -o /dev/null -H "Authorization: Bearer $write_token" -H 'Content-Type: a
 printf 'this is = = not toml\n' >"$DRILL_DIR/torrentd.toml"
 curl -s -o /dev/null -X POST -H "Authorization: Bearer $write_token" "$api/api/reload"
 
+# ---- engine faults, through the fault-injection endpoint -----------------
+# An unknown fault is refused as unparseable (422) by a fault-injection build;
+# any other build has no such route.
+probe=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $write_token" \
+  -H 'Content-Type: application/json' -d '{"fault":"none"}' "$api/api/fault")
+if [ "$probe" != 422 ]; then
+  echo "drill: $TORRENTD_IMAGE is not a fault-injection build (POST /api/fault answered $probe);" \
+    "remove it and rerun to rebuild: $engine rmi $TORRENTD_IMAGE" >&2
+  exit 2
+fi
+fault() {
+  curl -fsS -o /dev/null -H "Authorization: Bearer $write_token" \
+    -H 'Content-Type: application/json' -d "$1" "$api/api/fault" \
+    || { echo "drill: the daemon refused the fault $1" >&2; exit 1; }
+}
+fault '{"fault":"alert_queue_overflow","profile_id":"drill"}'
+fault '{"fault":"portmap_error","profile_id":"drill"}'
+fault '{"fault":"performance_warning","profile_id":"drill"}'
+fault '{"fault":"torrent_error","profile_id":"drill"}'
+fault '{"fault":"file_error","profile_id":"drill"}'
+fault '{"fault":"save_resume_failed","profile_id":"drill"}'
+# Queued last: once its write has failed, every alert queued before it has
+# been dispatched too.
+fault "{\"fault\":\"save_resume\",\"profile_id\":\"drill\",\"infohash\":\"$blocked_ih\"}"
+fault '{"fault":"metrics_label_mismatch"}'
+fault '{"fault":"kill_switch_gone"}'
+fault '{"fault":"fence_pause_failed","profile_id":"drill"}'
+fault '{"fault":"store_write_failed","store":"registry"}'
+fault '{"fault":"pool_plan_failed","kind":"step_failed"}'
+
+# The stall holds the alert loop, and nothing it would count moves while it
+# does: wait for the queued alerts and the tracker error to be counted first,
+# and for the unparseable config's reload to have failed before the file is
+# rewritten for the next one.
+counted() {
+  local text
+  text=$(curl -fsS -H "Authorization: Bearer $metrics_token_out" "$api/metrics" 2>/dev/null || true)
+  grep -Eq "^torrentd_$1\{[^}]*$2[^}]*\} [1-9]" <<<"$text"
+}
+before_stall() {
+  counted resume_write_errors_total 'profile_id="drill"' \
+    && counted tracker_alerts_total 'kind="error",profile_id="drill"' \
+    && counted config_reload_failures_total 'stage="load"'
+}
+for _ in $(seq 1 60); do
+  before_stall && break
+  sleep 1
+done
+before_stall || {
+  echo "drill: the queued alerts, the tracker error or the failed reload were never counted" >&2
+  exit 1
+}
+
+# Longer than the alert's 15 s threshold held for a minute, plus a scrape
+# and an evaluation either side.
+fault '{"fault":"stall_alert_loop","profile_id":"drill","secs":150}'
+# The reload task's next apply_settings panics; a reload of a config that
+# parses and changes a reloadable setting is what makes that call.
+fault '{"fault":"panic_apply_settings","profile_id":"drill"}'
+{ echo 'connections_limit = 321'; cat "$DRILL_DIR/torrentd.good.toml"; } >"$DRILL_DIR/torrentd.toml"
+curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $write_token" "$api/api/reload" \
+  || { echo "drill: the reload that panics the reload task was refused" >&2; exit 1; }
+
 # ---- wait for delivery ---------------------------------------------------
 expected=(
   TorrentdBootLoadFailures
@@ -188,6 +284,20 @@ expected=(
   TorrentdLoginThrottled
   TorrentdTokenScopeDenied
   TorrentdReloadFailed
+  TorrentdAlertQueueOverflow
+  TorrentdSessionErrors
+  TorrentdPerformanceWarning
+  TorrentdTorrentErrors
+  TorrentdDiskErrors
+  TorrentdResumeSaveFailures
+  TorrentdResumeWriteErrors
+  TorrentdAlertLoopStalled
+  TorrentdTaskDown
+  TorrentdMetricsDropped
+  TorrentdKillSwitchGone
+  TorrentdFencePauseFailed
+  TorrentdStoreWriteFailed
+  TorrentdPoolPlanFailed
 )
 tracker_query='torrentd_tracker_alerts_total{kind="error",profile_id="drill"} > 0'
 end=$((SECONDS + deadline_secs))

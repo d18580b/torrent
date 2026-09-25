@@ -1,9 +1,11 @@
 # Alert-delivery drill: torrentd, Prometheus with deploy/prometheus's rules,
 # Alertmanager, and a webhook sink that records what it is sent.
 #
-# Not a deployment. run.sh writes the daemon's config and faults into
-# $DRILL_DIR, brings this up, injects faults through the daemon's own API, and
-# asserts each matching alert arrives at the sink:
+# Not a deployment, and the daemon here is not a release build: it is built
+# with the fault-injection feature, which adds POST /api/fault. run.sh writes
+# the daemon's config and faults into $DRILL_DIR, brings this up, injects
+# faults through the daemon's own API, and asserts each matching alert arrives
+# at the sink:
 #
 #   deploy/drill/run.sh
 #
@@ -16,12 +18,19 @@ services:
     build:
       context: ../..
       dockerfile: deploy/Containerfile
+      # The fault-injection build: real sessions, plus POST /api/fault for
+      # the faults nothing outside the process can cause. Never a release.
+      args:
+        CARGO_FEATURES: torrentd/fault-injection
     volumes:
       # Rewritten in place by run.sh to make a reload fail, so a file mount
       # rather than :ro.
       - ${DRILL_DIR:?run through run.sh}/torrentd.toml:/etc/torrentd/torrentd.toml:z
       # Holds a .torrent that is not one, which the boot scan fails to load.
       - ${DRILL_DIR:?run through run.sh}/torrents:/drill/torrents:ro,z
+      # The resume store, on the host so run.sh can put a directory where
+      # one resume file's temporary file goes, and that write fails.
+      - ${DRILL_DIR:?run through run.sh}/resume:/drill/resume:z
       - state:/var/lib/torrentd
     ports:
       - "127.0.0.1:18180:8080"
