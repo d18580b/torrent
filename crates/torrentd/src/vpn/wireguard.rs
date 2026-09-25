@@ -7,8 +7,8 @@
 //! is `wg-quick up <profile>`. As any other uid `wg-quick` cannot run — it
 //! re-execs itself through `sudo` — so the daemon raises the link with `ip`
 //! and `wg`, which need only `CAP_NET_ADMIN` ([`native`]). That is the shape
-//! the network kill switch runs in: a dedicated uid whose links' sockets it
-//! owns, with their transport exempted by the ruleset.
+//! the network kill switch runs in: a dedicated uid, with each tunnel's
+//! encrypted transport exempted by the ruleset (`vpn::killswitch`).
 
 use std::net::IpAddr;
 use std::path::Path;
