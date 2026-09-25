@@ -257,6 +257,70 @@ naming the other profile, and the rest of the daemon runs. Two accounts behind
 a provider that gives every client the same address cannot share one daemon;
 run the second in a daemon of its own, in its own network namespace.
 
+### ProtonVPN: a forwarded port over NAT-PMP
+
+Proton hands out no fixed forwarded port. The port is asked for over NAT-PMP
+through the tunnel, carries a 60-second lease, and can change whenever the
+tunnel reconnects. `port_forward = "natpmp"` does that for a profile.
+
+1. **Generate the WireGuard config with NAT-PMP on.** In Proton's WireGuard
+   configuration page, pick a P2P server and enable *NAT-PMP (Port
+   Forwarding)* before downloading. A config generated without it connects
+   normally and then answers every port request with an error, which fails
+   the profile at startup: `NAT-PMP negotiation failed`.
+2. **Configure the profile** with `port_forward = "natpmp"` and no
+   `listen_port`. `port_forward_gateway` defaults to `10.2.0.1`, the gateway
+   of Proton's WireGuard configs. The daemon does not derive it; **an OpenVPN
+   profile must set it** to its own tunnel's gateway, which `ip route show
+   dev <vpn_interface>` names once the tunnel is up.
+3. **Check it before seeding:** `torrentd vpn check --profile <id>` (§9)
+   asks the gateway for a port from the tunnel address, the same exchange
+   the daemon makes.
+
+What the daemon does with the port:
+
+- It negotiates it during that profile's bring-up and binds the session to
+  it. Failing to get a port disables the profile rather than seed on an
+  unforwarded one.
+- While later profiles are being brought up, it renews the ports already
+  negotiated before each bring-up, and the renewal monitor starts as soon
+  as every profile is built. No lease waits on the resume and `.torrent`
+  scans.
+- Each profile renews on its own schedule, 30 seconds after a success and
+  5 seconds after a failure, so one slow gateway cannot delay another
+  profile, and only two failures in a row let a lease lapse. A renewal asks
+  to keep the port the session is listening on. A failed renewal never
+  pauses anything: an expired mapping blocks new inbound peers and nothing
+  else.
+- When the gateway answers with a different port, the session is rebound to
+  it and **every torrent in the profile reannounces at once**, so trackers
+  learn the new port within seconds rather than at their next scheduled
+  announce, which may be up to an hour away.
+
+The requests name internal port `1`, the value Proton documents (`natpmpc -a
+1 0 tcp 60 -g 10.2.0.1`); RFC 6886 gives internal port `0` to its
+delete-all request. TCP is mapped first and UDP (uTP) is asked for on the
+same port.
+
+Metrics, each labelled `profile_id`:
+
+| Series | Meaning |
+| --- | --- |
+| `torrentd_profile_forwarded_port` | the port the session listens on |
+| `torrentd_profile_port_forward_up` | `1` while the last renewal succeeded and the session is bound to its result |
+| `torrentd_profile_port_forward_udp_mapped` | `0` while the gateway mapped TCP only; uTP peers cannot reach the session then |
+| `torrentd_profile_port_forward_renewals_total` | successful renewals |
+| `torrentd_profile_port_forward_failures_total` | every failed attempt: the gateway did not answer, or it answered with a port the session could not be rebound to |
+| `torrentd_profile_port_forward_rebind_failures_total` | the second kind alone |
+| `torrentd_profile_forwarded_port_changes_total` | port changes the session followed |
+| `torrentd_profile_port_change_reannounce_seconds` | histogram: from the gateway naming a new port to the last reannounce being handed to the session |
+| `torrentd_profile_vpn_gateway_reboots_total` | gateway epoch went backwards; the mapping was re-created on the spot |
+
+Several Proton accounts cannot share one daemon: every Proton WireGuard
+config gives the tunnel `10.2.0.2/32`, and the paragraph above says what
+happens to the second profile. Run each extra account in its own daemon and
+network namespace.
+
 Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
 `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
 `peer_fingerprint`, `user_agent`, `resume_dir` and `torrent_dir` must all
@@ -1044,6 +1108,27 @@ On a scratch pool, not your real one.
      up and is not this profile's" row below for the refusals). The shipped
      container image runs the daemon as uid 1000 and raises no links, so it
      cannot run the kill switch with a working tunnel either.
+7. **A Proton port change reaches the tracker.** With a `natpmp` profile
+   seeding a torrent on a private tracker (§5, "ProtonVPN"):
+   1. Note `torrentd_profile_forwarded_port` and the port the tracker's peer
+      list or client page shows for this client.
+   2. Force a new port by reconnecting the tunnel as root, quickly
+      (`wg-quick down <iface> && wg-quick up <iface>`), so the gateway
+      forgets the mapping. If the VPN monitor saw the tunnel down in
+      between, the profile is paused and fenced as in drill 5 and stays so
+      until a restart; that is the tunnel-loss path, not this one. Repeat
+      until the log shows `NAT-PMP port changed; rebound live session and
+      reannounced its torrents` with the profile still `active`.
+   3. Within 60 seconds of that line the tracker should show the new port.
+      `torrentd_profile_port_change_reannounce_seconds` shows how long the
+      reannounce took to go out.
+   4. Across a slow boot — several profiles, a large resume directory —
+      `torrentd_profile_port_forward_up` should never drop to `0` and
+      `torrentd_profile_port_forward_failures_total` should stay at `0`.
+
+   This drill has not yet been run against a live Proton gateway from this
+   repository: the renewal, rebind and reannounce are tested against a fake
+   NAT-PMP gateway and a mock session. Record the result here when it has.
 
    The ruleset also confines the daemon's **replies**: a request to
    `http_listen` that arrives on a physical interface — the web client, the
