@@ -16,8 +16,14 @@ use parking_lot::Mutex;
 use crate::profile::ProfileId;
 
 /// Lifecycle phases the daemon tracks for a torrent. Mostly mirrors
-/// libtorrent's `torrent_status::state_t` but adds an explicit
-/// `DiskError` phase for the window after a `file_error_alert`.
+/// libtorrent's `torrent_status::state_t`, plus [`TorrentPhase::DiskError`]
+/// for the window after a `file_error_alert`.
+///
+/// None of these phases reads libtorrent's `upload_mode` flag. Every torrent
+/// carries that flag from the moment it is added (`policy::no_download`), so
+/// it says nothing about a torrent's health; the phase is derived from
+/// `state` and the `PAUSED` bit (`handlers::state_update`) and from the error
+/// handlers.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TorrentPhase {
     /// libtorrent is hashing pieces; the torrent isn't seeding yet.

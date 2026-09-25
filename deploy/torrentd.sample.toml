@@ -89,6 +89,11 @@ enable_lsd = false
 # with the same effective `peer_fingerprint` / `user_agent` — one inheriting
 # these, one spelling them out — are refused, because that is one peer-id
 # prefix on the wire from two postures.
+#
+# `peer_fingerprint` is the peer-id prefix itself: exactly 8 printable ASCII
+# characters, handed to libtorrent as written. A profile's own
+# `peer_fingerprint` below is the same field in the same form and overrides
+# this one. libtorrent's own default, "-LT20C0-", is refused.
 # peer_fingerprint = "-XX1234-"
 # user_agent       = "libtorrent/2.0"
 
@@ -113,9 +118,10 @@ enable_lsd = false
 #
 # WireGuard profiles only: `openvpn` runs under the daemon's uid, so the
 # ruleset would drop its own connection to the provider, and the daemon
-# refuses the kill switch beside an OpenVPN profile. And a non-root daemon
-# cannot run `wg-quick` itself, so each profile's link must be raised by root
-# before the daemon starts — docs/running.md §11.6.
+# refuses the kill switch beside an OpenVPN profile. A non-root daemon cannot
+# run `wg-quick`, so it raises each profile's link itself with `ip` and `wg`
+# under CAP_NET_ADMIN; that path runs no PostUp/PreDown hooks and applies no
+# DNS line — docs/running.md §11.6.
 #
 # Verify the whole tunnel setup before trusting it, without seeding anything:
 #   torrentd --config /etc/torrentd/torrentd.toml vpn check
@@ -157,7 +163,7 @@ dht               = true
 # Optional per-profile overrides. Every value below is distinct from every
 # other profile's in this file, and has to stay that way. `listen_port` shares
 # one namespace with the ports in a host profile's `listen_interfaces`, and two
-# profiles that end up on one port are refused. `peer_fingerprint_hex` and
+# profiles that end up on one port are refused. `peer_fingerprint` and
 # `user_agent` are refused the same way whenever either of the two profiles
 # wrote the value down; two that both omit the key and inherit the default
 # above are accepted, which is what makes it a default. `resume_dir` and
@@ -165,7 +171,7 @@ dht               = true
 # is fine, since neither store descends into a subdirectory.
 # resume_dir           = "/var/lib/torrentd/resume/public"
 # torrent_dir          = "/var/lib/torrentd/torrents/public"
-# peer_fingerprint_hex = "b7c6d5e4f3a29180"
+# peer_fingerprint     = "-XX0001-"
 # user_agent           = "libtorrent/2.0"
 # Per-profile upload cap in bytes/sec, overriding the daemon-wide key above.
 # `0` here means *unlimited* for this profile, not "unset": writing it is how
@@ -178,8 +184,12 @@ dht               = true
 # ---------------------------------------------------------------------------
 # Private trackers ban permanently for cross-contamination between accounts, so
 # each account gets its own profile, its own tunnel, and its own identity.
-# `peer_fingerprint_hex` and `user_agent` are required here and must be unique
+# `peer_fingerprint` and `user_agent` are required here and must be unique
 # across profiles: they are what a tracker sees as the account's client.
+# `peer_fingerprint` takes the same 8-character raw form as the top-level key.
+# The older `peer_fingerprint_hex` key is no longer read, and a profile that
+# still sets it is refused at load: its sixteen hex characters were never
+# decoded, so they did not reach the wire as the prefix they spelled.
 #
 # A wireguard profile's `vpn_config` must be
 # /etc/wireguard/<vpn_interface>.conf — wg-quick derives the interface from the
@@ -206,7 +216,7 @@ dht               = true
 # vpn_config               = "/etc/wireguard/wg-acct-a.conf"
 # vpn_interface            = "wg-acct-a"
 # listen_port              = 6891
-# peer_fingerprint_hex     = "a1b2c3d4e5f60718"
+# peer_fingerprint         = "-XX0002-"
 # user_agent               = "qBittorrent/5.0.3"
 # resume_dir               = "/var/lib/torrentd/resume/account_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/account_a"
@@ -231,7 +241,7 @@ dht               = true
 # vpn_interface            = "proton-a"
 # port_forward             = "natpmp"
 # port_forward_gateway     = "10.2.0.1"   # ProtonVPN WireGuard gateway (default)
-# peer_fingerprint_hex     = "3c2d1e0f4a5b6c7d"
+# peer_fingerprint         = "-XX0003-"
 # user_agent               = "Transmission/4.0.6"
 # resume_dir               = "/var/lib/torrentd/resume/proton_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/proton_a"

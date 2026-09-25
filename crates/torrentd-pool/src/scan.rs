@@ -28,6 +28,23 @@ pub struct ScanStats {
     /// parse. Surfaced rather than swallowed: a permissions problem on a root
     /// otherwise looks exactly like an empty directory.
     pub errors: u64,
+    /// `errors`, by kind: `walk` (the walk could not read an entry), `stat`,
+    /// `path` (not UTF-8), `read` (a `.torrent` that could not be read) and
+    /// `parse` (one that is not a torrent, or names no info-hash). A kind that
+    /// never happened is absent. The daemon exports each as its own series, so
+    /// an unreadable root and a library of corrupt files alert differently.
+    pub errors_by_kind: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl ScanStats {
+    /// Every value `errors_by_kind` can hold as a key.
+    pub const ERROR_KINDS: &'static [&'static str] = &["walk", "stat", "path", "read", "parse"];
+
+    fn note_error(&mut self, kind: &'static str) {
+        debug_assert!(Self::ERROR_KINDS.contains(&kind), "{kind}");
+        self.errors += 1;
+        *self.errors_by_kind.entry(kind).or_default() += 1;
+    }
 }
 
 /// Walk one managed root and replace its file index.
@@ -48,7 +65,7 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             Ok(e) => e,
             Err(e) => {
                 warn!(target: "torrentd_pool::scan", root = %root_path.display(), error.cause = %e, "walk error");
-                stats.errors += 1;
+                stats.note_error("walk");
                 continue;
             }
         };
@@ -60,7 +77,7 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             Ok(m) => m,
             Err(e) => {
                 warn!(target: "torrentd_pool::scan", path = %path.display(), error.cause = %e, "stat failed");
-                stats.errors += 1;
+                stats.note_error("stat");
                 continue;
             }
         };
@@ -71,7 +88,7 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
         // Skipping loudly beats indexing a lossy name that would never match.
         let Some(rel_str) = rel.to_str() else {
             warn!(target: "torrentd_pool::scan", path = %path.display(), "skipping non-UTF-8 path");
-            stats.errors += 1;
+            stats.note_error("path");
             continue;
         };
 
@@ -121,9 +138,15 @@ pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanSta
         .follow_links(false)
         .sort(false)
     {
-        let Ok(entry) = entry else {
-            stats.errors += 1;
-            continue;
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                // Counted and previously not logged at all, so the count had
+                // nothing in the journal to explain it.
+                warn!(target: "torrentd_pool::scan", path = %library_dir.display(), error.cause = %e, "walk error");
+                stats.note_error("walk");
+                continue;
+            }
         };
         let path = entry.path();
         if !entry.file_type().is_file()
@@ -136,7 +159,7 @@ pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanSta
             Ok(b) => b,
             Err(e) => {
                 warn!(target: "torrentd_pool::scan", path = %path.display(), error.cause = %e, "read failed");
-                stats.errors += 1;
+                stats.note_error("read");
                 continue;
             }
         };
@@ -146,13 +169,13 @@ pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanSta
                 // One unparseable torrent must not abort indexing a library of
                 // tens of thousands.
                 warn!(target: "torrentd_pool::scan", path = %path.display(), error.cause = %e, "unparseable .torrent");
-                stats.errors += 1;
+                stats.note_error("parse");
                 continue;
             }
         };
         let Some(best) = meta.best_infohash() else {
             warn!(target: "torrentd_pool::scan", path = %path.display(), "torrent has no info-hash");
-            stats.errors += 1;
+            stats.note_error("parse");
             continue;
         };
 
@@ -241,4 +264,35 @@ fn inode(m: &std::fs::Metadata) -> u64 {
 fn device(m: &std::fs::Metadata) -> u64 {
     use std::os::unix::fs::MetadataExt;
     m.dev()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unparseable_torrent_is_a_parse_error_by_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broken.torrent"), b"not bencode").unwrap();
+        let mut store = PoolStore::open_in_memory().unwrap();
+
+        let stats = scan_library(&mut store, dir.path()).unwrap();
+
+        assert_eq!(stats.errors, 1);
+        assert_eq!(
+            stats.errors_by_kind,
+            std::collections::BTreeMap::from([("parse", 1)])
+        );
+    }
+
+    #[test]
+    fn the_kinds_sum_to_the_total() {
+        let mut stats = ScanStats::default();
+        for kind in ScanStats::ERROR_KINDS {
+            stats.note_error(kind);
+        }
+        stats.note_error("parse");
+        assert_eq!(stats.errors, stats.errors_by_kind.values().sum::<u64>());
+        assert_eq!(stats.errors_by_kind["parse"], 2);
+    }
 }

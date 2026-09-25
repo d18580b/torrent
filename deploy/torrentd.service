@@ -38,7 +38,11 @@ StateDirectoryMode=0750
 
 # WireGuard / tunnel control. A `network = "vpn"` profile brings up its own
 # tunnel (and, with `network_kill_switch = true`, installs an nftables table),
-# and needs NET_ADMIN.
+# and needs NET_ADMIN. Running as User=torrentd, the daemon cannot use
+# `wg-quick` (it re-execs through sudo, which NoNewPrivileges=yes stops), so
+# it raises WireGuard links with `ip` and `wg`, which need only this
+# capability. The WireGuard configs must be readable by the torrentd group
+# and carry no PostUp/PreDown hooks — docs/running.md §11.6.
 #
 # The two directives pull in opposite directions and are treated differently
 # here. `AmbientCapabilities=` is a grant, so it is commented out by default: a
@@ -46,7 +50,7 @@ StateDirectoryMode=0750
 # granted for nothing. `CapabilityBoundingSet=` is a ceiling, so commenting it
 # out grants rather than withholds — it replaces a bounding set of exactly
 # CAP_NET_ADMIN with systemd's full default set, and every binary the daemon
-# execs (`nft`, `wg`, `wg-quick`, `pkill`) can then acquire whatever file
+# execs (`nft`, `ip`, `wg`, `pkill`) can then acquire whatever file
 # capabilities it carries. It is therefore active and empty below: nothing this
 # unit runs can hold any capability at all.
 #

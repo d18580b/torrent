@@ -81,8 +81,9 @@ network_kill_switch = false
 #   * `listen_port` and the ports inside a host profile's `listen_interfaces`
 #     share one namespace. An announced port two profiles share correlates them
 #     to a tracker operator whichever address each announced from.
-#   * `peer_fingerprint_hex` and `user_agent` are what a tracker reads as the
-#     account's client. Two profiles that end up announcing one of them are
+#   * `peer_fingerprint` and `user_agent` are what a tracker reads as the
+#     account's client. `peer_fingerprint` is the 8-character peer-id prefix
+#     itself, the same form the top-level key of that name takes. Two profiles that end up announcing one of them are
 #     refused where either of them wrote it down — one profile declaring the
 #     value another takes from a top-level default is the cross-account
 #     correlation whose stated consequence is a permanent ban. A pair that both
@@ -118,7 +119,7 @@ vpn_type                = "wireguard"
 vpn_config              = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface           = "wg-acct-a"
 listen_port             = 6891
-peer_fingerprint_hex    = "a1b2c3d4e5f60718"
+peer_fingerprint        = "-XX0002-"
 user_agent              = "qBittorrent/5.0.3"
 allowed_tracker_domains = ["tracker-a.example.com"]
 
@@ -135,6 +136,6 @@ vpn_config              = "/etc/wireguard/proton-b.conf"
 vpn_interface           = "proton-b"
 port_forward            = "natpmp"
 port_forward_gateway    = "10.2.0.1"
-peer_fingerprint_hex    = "3c2d1e0f4a5b6c7d"
+peer_fingerprint        = "-XX0003-"
 user_agent              = "Transmission/4.0.6"
 allowed_tracker_domains = ["tracker-b.example.com"]

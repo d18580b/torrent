@@ -7,7 +7,7 @@
 #   mise install         # provision the tools below
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|lint|test|check
-#   mise run test-shim|test-lifecycle|test-daemon|test-all
+#   mise run test-shim|test-lifecycle|test-daemon|test-all|test-alerts
 #   mise run web|daemon-only
 #   mise run bench -- <subcommand>
 
@@ -62,6 +62,24 @@ run = "cargo test -p torrentd-engine --test lifecycle -- --ignored"
 description = "Layer 3: spawns the built binary and drives it over HTTP"
 run = "cargo test -p torrentd --test daemon -- --ignored"
 
+[tasks.test-alerts]
+description = "promtool: check deploy/prometheus's alert rules and run their fixtures (needs podman or docker)"
+# In a container rather than as a [tools] entry: promtool ships only inside the
+# Prometheus release, which no registry mise resolves packages as a tool, and
+# the pinned image is the exact binary a deployment's Prometheus evaluates the
+# rules with. `:Z` relabels the mount for SELinux hosts; docker ignores it
+# elsewhere.
+run = '''
+set -eu
+engine=$(command -v podman || command -v docker)
+promtool() {
+  "$engine" run --rm -v "$PWD/deploy/prometheus:/w:ro,Z" -w /w \
+    --entrypoint promtool docker.io/prom/prometheus:v3.5.0 "$@"
+}
+promtool check rules torrentd.rules.yml
+promtool test rules torrentd.rules.test.yml
+'''
+
 [tasks.test-all]
 description = "Every automated test, including the ignored integration layers"
 # Sequential `run`, not `depends`: mise schedules dependencies in parallel
@@ -77,6 +95,7 @@ run = [
   "mise run test-shim",
   "mise run test-lifecycle",
   "mise run test-daemon",
+  "mise run test-alerts",
 ]
 
 [tasks.bench]
