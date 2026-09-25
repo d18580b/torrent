@@ -208,6 +208,8 @@ const REGISTRY_FILE: &str = "profile_assignments.json";
 /// Its name before profiles replaced slots. Read once, then written under the
 /// current name.
 const LEGACY_REGISTRY_FILE: &str = "slot_assignments.json";
+/// The single-instance lock `boot` holds for the life of the process.
+const INSTANCE_LOCK_FILE: &str = "torrentd.lock";
 
 impl Config {
     fn default_http_listen() -> SocketAddr {
@@ -1112,11 +1114,26 @@ impl Config {
     }
 
     /// Directory the daemon keeps its own state in, derived from `resume_dir`.
+    ///
+    /// One daemon per state directory: `boot` locks
+    /// [`Config::instance_lock_path`] here before it does anything else.
     pub fn state_dir(&self) -> PathBuf {
         self.resume_dir
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from("/var/lib/torrentd"))
+    }
+
+    /// The file `boot` holds an exclusive lock on for the life of the
+    /// process, so a second daemon against the same state directory refuses
+    /// before it touches the kill-switch table, a tunnel, or a state file.
+    ///
+    /// Always in [`Config::state_dir`], even where `registry_path` puts the
+    /// registry elsewhere: the state directory is what every other file the
+    /// daemon owns is derived from, and the one thing two daemons sharing a
+    /// config necessarily share.
+    pub fn instance_lock_path(&self) -> PathBuf {
+        self.state_dir().join(INSTANCE_LOCK_FILE)
     }
 
     /// Where a profile's DHT/session state is persisted.
