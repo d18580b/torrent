@@ -1095,6 +1095,17 @@ extern "C" int lt_torrent_force_recheck(lt_session* s, lt_handle h) {
     LT_SHIM_CATCH(nullptr, 0, LT_ERR)
 }
 
+extern "C" int lt_torrent_force_reannounce(lt_session* s, lt_handle h) {
+    if (!s) return LT_ERR;
+    LT_SHIM_TRY
+    auto th = s->lookup(h);
+    if (!th.is_valid()) return LT_ERR;
+    // Every tracker, now: the defaults are seconds = 0, tracker_index = -1.
+    th.force_reannounce();
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
 extern "C" int lt_torrent_move_storage(lt_session* s, lt_handle h,
                                        const char* new_path, uint32_t flags)
 {

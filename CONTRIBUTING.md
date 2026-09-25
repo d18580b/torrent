@@ -226,6 +226,7 @@ fields have **one** spelling each, because log queries depend on it:
 | `error.kind` / `error.code` / `error.cause` | Short identifier, OS or libtorrent code, human-readable cause. |
 | `vpn_iface`, `tunnel_ip` | Tunnel networking, on `vpn` profiles. |
 | `pending_resume_count` | Outstanding `save_resume_data` calls. |
+| `span` | Object holding the current span's `name` and fields. Fields recorded on a span (e.g. `op`, `infohash` from `#[instrument]`) appear here, **not** at the top level; only the event's own fields are flat. Absent when the event is outside any span. |
 
 `error.kind` cannot be the first field in an `error!` macro — the macro name and
 the field path are ambiguous to the parser. Put another field first.
@@ -237,4 +238,9 @@ crate, e.g. `RUST_LOG=info,torrentd_engine::handler::resume=debug`.
 ## Reporting bugs
 
 Open a GitHub issue with: kernel version, libtorrent submodule SHA, `cargo --version`,
-and the JSON log output (with `RUST_LOG=debug` if reproducible).
+and the JSON log output, at `debug` if it reproduces.
+[`docs/running.md` §12](docs/running.md#12-capturing-a-log) says how to take it
+from the running service and raise the level with `log_level` and a reload
+rather than a restart. `RUST_LOG` is read only at startup, so it applies to a
+daemon you are starting anyway, such as one under `cargo run`; do not start a
+second copy beside a running service to get a log.

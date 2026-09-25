@@ -56,6 +56,7 @@ use std::io::Write;
 use std::process::Command;
 use std::process::Stdio;
 
+use torrentd_engine::profile::ProfileConfig;
 use tracing::info;
 
 /// nftables table this module owns. Torn down on graceful shutdown.
@@ -68,7 +69,27 @@ pub const TABLE: &str = "torrentd_ks";
 ///
 /// The chain policy stays `accept` (we must not touch other uids' traffic); we
 /// only `drop` packets owned by `uid` that don't egress loopback or a tunnel.
-pub fn render_ruleset(uid: u32, tunnels: &[String]) -> String {
+///
+/// Refuses, with `InvalidInput` naming it, any interface name
+/// [`ProfileConfig::is_valid_interface_name`] rejects. Each name is written
+/// between literal quotes, and nftables has no escape for a `"` inside one, so
+/// a name carrying a quote, brace or newline would produce a ruleset `nft`
+/// rejects with a syntax error in a file the operator never wrote. Config
+/// validation refuses such a name first; this keeps the renderer from emitting
+/// an unparseable ruleset for any caller that did not.
+pub fn render_ruleset(uid: u32, tunnels: &[String]) -> io::Result<String> {
+    if let Some(bad) = tunnels
+        .iter()
+        .find(|i| !ProfileConfig::is_valid_interface_name(i))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "vpn_interface {bad:?} cannot be written into the kill-switch ruleset: an \
+                 interface name must be 1-15 characters of [A-Za-z0-9_=+.-]",
+            ),
+        ));
+    }
     let mut ifaces: Vec<&str> = tunnels.iter().map(String::as_str).collect();
     ifaces.sort_unstable();
     ifaces.dedup();
@@ -88,7 +109,9 @@ pub fn render_ruleset(uid: u32, tunnels: &[String]) -> String {
     }
     chain.push_str(&format!("\t\tmeta skuid {uid} counter drop\n"));
 
-    format!("table inet {TABLE} {{\n\tchain output {{\n{chain}\t}}\n}}\n")
+    Ok(format!(
+        "table inet {TABLE} {{\n\tchain output {{\n{chain}\t}}\n}}\n"
+    ))
 }
 
 /// Effective uid of this process, read from `/proc/self/status` (Linux-only,
@@ -198,7 +221,9 @@ pub(crate) fn enable_for_uid(
     if let Some(refusal) = refusal_for_uid(uid) {
         return Err(refusal);
     }
-    let ruleset = render_ruleset(uid, tunnels);
+    // Rendered before the clear, so a name the ruleset cannot carry leaves a
+    // previous run's kill switch armed rather than disarming it and failing.
+    let ruleset = render_ruleset(uid, tunnels)?;
     // Clear a stale table before reloading. `nft -f -` merges into an existing
     // table rather than replacing it, so a delete that silently failed would
     // leave a previous run's rules in force alongside the new ones — with the
@@ -218,28 +243,78 @@ pub(crate) fn enable_for_uid(
 ///
 /// A missing table is success — shutdown must never fail on it, and the
 /// startup pre-clear runs against a table that usually is not there. Any other
-/// non-zero exit is reported: `nft` merges into an existing table rather than
+/// failure is reported: `nft` merges into an existing table rather than
 /// replacing it, so a stale table that failed to delete would silently survive
-/// alongside the new rules. Previously only a failure to *spawn* `nft` was
-/// noticed, and a non-zero exit looked identical to success.
+/// alongside the new rules.
+///
+/// Whether the table exists is asked directly, with `nft list tables`, rather
+/// than inferred from the text of a failed delete. That text is `strerror`
+/// output, which is localised: matching "No such file or directory" failed on
+/// any host whose `LC_MESSAGES` is not C or English, so the first boot with the
+/// kill switch on aborted on a delete of a table that was never there. The
+/// listing is ruleset syntax, which no locale translates, and it still fails —
+/// and so still reports — on the errors that matter, such as a missing
+/// `CAP_NET_ADMIN`.
 pub fn disable() -> io::Result<()> {
+    disable_with(list_tables, delete_table)
+}
+
+/// `disable`, with both `nft` calls handed in so the decision between them is
+/// reachable by a test on a host without `nft` or `CAP_NET_ADMIN`.
+pub(crate) fn disable_with(
+    list: impl Fn() -> io::Result<String>,
+    delete: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    if !table_listed(&list()?) {
+        return Ok(());
+    }
+    delete()
+}
+
+/// Whether `nft list tables` output names this module's table. Each line is
+/// `table <family> <name>`; the table is matched on family and name exactly,
+/// so a same-named table in another family, or one whose name merely starts
+/// with [`TABLE`], is not taken for it.
+fn table_listed(listing: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.split_whitespace().eq(["table", "inet", TABLE]))
+}
+
+/// `nft list tables`, returning its stdout.
+fn list_tables() -> io::Result<String> {
+    let out = Command::new("nft")
+        .args(["list", "tables"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "nft list tables exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `nft delete table inet TABLE`. Any non-zero exit is an error: it is only
+/// called once the table has been listed, so there is no absent case to
+/// excuse.
+fn delete_table() -> io::Result<()> {
     let out = Command::new("nft")
         .args(["delete", "table", "inet", TABLE])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()?;
-    if out.status.success() {
-        return Ok(());
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "nft delete table exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        )));
     }
-    let err = String::from_utf8_lossy(&out.stderr);
-    if err.contains("No such file or directory") || err.contains("does not exist") {
-        return Ok(());
-    }
-    Err(io::Error::other(format!(
-        "nft delete table exited {}: {}",
-        out.status,
-        err.trim(),
-    )))
+    Ok(())
 }
 
 /// Feed a ruleset to `nft -f -`.
@@ -355,7 +430,7 @@ mod tests {
             calls[1],
             format!(
                 "apply:{}",
-                render_ruleset(998, &["wg-a".to_string(), "wg-b".to_string()])
+                render_ruleset(998, &["wg-a".to_string(), "wg-b".to_string()]).unwrap()
             ),
             "and the ruleset handed to nft is this uid's, over these tunnels",
         );
@@ -387,13 +462,103 @@ mod tests {
         );
     }
 
+    /// The first boot with the kill switch on: no table yet. `disable` must
+    /// succeed without attempting the delete, whatever language `nft` would
+    /// have failed it in — the absence is read from the listing, not from a
+    /// localised error message.
+    #[test]
+    fn disable_succeeds_without_deleting_when_the_table_is_absent() {
+        let deleted = std::cell::Cell::new(false);
+        disable_with(
+            || Ok("table ip filter\ntable inet other\n".to_string()),
+            || {
+                deleted.set(true);
+                Err(io::Error::other(
+                    "nft delete table exited 1: Fehler: Datei oder Verzeichnis nicht gefunden",
+                ))
+            },
+        )
+        .expect("an absent table is success");
+        assert!(!deleted.get(), "nothing to delete, so no delete is run");
+
+        disable_with(|| Ok(String::new()), || panic!("no tables at all"))
+            .expect("an empty listing is an absent table");
+    }
+
+    #[test]
+    fn disable_deletes_a_listed_table_and_reports_its_failure() {
+        let deleted = std::cell::Cell::new(false);
+        disable_with(
+            || Ok(format!("table ip filter\ntable inet {TABLE}\n")),
+            || {
+                deleted.set(true);
+                Ok(())
+            },
+        )
+        .expect("a delete that succeeded");
+        assert!(deleted.get(), "a listed table is deleted");
+
+        let e = disable_with(
+            || Ok(format!("table inet {TABLE}\n")),
+            || Err(io::Error::other("nft delete table exited 1: busy")),
+        )
+        .expect_err("a table that exists and would not delete is not swallowed");
+        assert!(e.to_string().contains("nft delete table"), "got {e}");
+    }
+
+    /// A listing that fails — no `CAP_NET_ADMIN`, say — is an error, not an
+    /// absent table: otherwise a stale table this run cannot see would be
+    /// left in force beneath the new rules.
+    #[test]
+    fn disable_reports_a_failed_listing_without_deleting() {
+        let e = disable_with(
+            || {
+                Err(io::Error::other(
+                    "nft list tables exited 1: Operation not permitted",
+                ))
+            },
+            || panic!("nothing is deleted on a listing nobody could read"),
+        )
+        .expect_err("a failed listing is not an absent table");
+        assert!(e.to_string().contains("nft list tables"), "got {e}");
+    }
+
+    /// `disable` against a real `nft`: absent, then present, then absent
+    /// again. Needs `CAP_NET_ADMIN` in a network namespace of its own, so it
+    /// is ignored by default; run it unprivileged, under a non-English locale,
+    /// with
+    ///
+    /// ```text
+    /// LC_ALL=de_DE.UTF-8 unshare -rn cargo test -p torrentd --bin torrentd \
+    ///     disable_against_real_nft -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
+    fn disable_against_real_nft() {
+        disable().expect("no table yet: success, in any locale");
+        apply(&render_ruleset(998, &["wg0".to_string()]).unwrap()).expect("install");
+        assert!(table_listed(&list_tables().expect("list")));
+        disable().expect("an installed table is deleted");
+        assert!(!table_listed(&list_tables().expect("list")));
+        disable().expect("and deleting it again is still success");
+    }
+
+    #[test]
+    fn only_this_family_and_name_count_as_the_table() {
+        assert!(table_listed(&format!("table inet {TABLE}\n")));
+        assert!(table_listed(&format!("table ip nat\ntable inet {TABLE}")));
+        assert!(!table_listed(&format!("table ip {TABLE}\n")));
+        assert!(!table_listed(&format!("table inet {TABLE}_old\n")));
+        assert!(!table_listed(""));
+    }
+
     #[test]
     fn render_ruleset_would_happily_confine_uid_0() {
         // `render_ruleset` is pure and has no guard of its own: it renders a
         // ruleset that drops every root-owned socket on the host. This pins
         // the shape `refusal_for_uid` exists to keep out of `nft`; on its own
         // it establishes nothing about whether anything checks.
-        let rs = render_ruleset(0, &["wg0".to_string()]);
+        let rs = render_ruleset(0, &["wg0".to_string()]).unwrap();
         assert!(
             rs.contains("meta skuid 0 counter drop"),
             "if this ever stops being catastrophic, revisit refusal_for_uid",
@@ -402,7 +567,7 @@ mod tests {
 
     #[test]
     fn ruleset_confines_uid_to_lo_and_tunnels() {
-        let rs = render_ruleset(998, &["wg-b".to_string(), "wg-a".to_string()]);
+        let rs = render_ruleset(998, &["wg-b".to_string(), "wg-a".to_string()]).unwrap();
         let expected = "\
 table inet torrentd_ks {
 \tchain output {
@@ -418,7 +583,7 @@ table inet torrentd_ks {
 
     #[test]
     fn ruleset_dedups_shared_interface() {
-        let rs = render_ruleset(1000, &["wg0".to_string(), "wg0".to_string()]);
+        let rs = render_ruleset(1000, &["wg0".to_string(), "wg0".to_string()]).unwrap();
         assert_eq!(rs.matches("wg0").count(), 1);
         // Still fails closed: lo accept, one tunnel accept, then drop.
         assert!(rs.contains("meta skuid 1000 counter drop"));
@@ -426,9 +591,45 @@ table inet torrentd_ks {
 
     #[test]
     fn ruleset_with_no_tunnels_allows_only_loopback() {
-        let rs = render_ruleset(1000, &[]);
+        let rs = render_ruleset(1000, &[]).unwrap();
         assert!(!rs.contains("oifname {"));
         assert!(rs.contains("oifname \"lo\" accept"));
         assert!(rs.contains("counter drop"));
+    }
+
+    /// The shape from #33: a quote closes the set's quoted token early and
+    /// `nft` rejects the whole table. The renderer refuses it by name instead
+    /// of emitting a ruleset it knows will not parse.
+    #[test]
+    fn ruleset_refuses_a_name_it_cannot_quote() {
+        for bad in ["wg\"x", "wg}x", "wg\nx", ""] {
+            let e = render_ruleset(2000, &["lo".to_string(), bad.to_string()])
+                .expect_err("an unquotable name is refused, not rendered");
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+            assert!(e.to_string().contains(&format!("{bad:?}")), "got {e}");
+        }
+    }
+
+    /// And `enable` refuses it before the pre-clear, so a previous run's kill
+    /// switch stays armed rather than being deleted and never replaced.
+    #[test]
+    fn enable_refuses_an_unquotable_name_before_clearing() {
+        let cleared = std::cell::Cell::new(false);
+        let applied = std::cell::Cell::new(false);
+        enable_for_uid(
+            998,
+            &["wg\"x".to_string()],
+            || {
+                cleared.set(true);
+                Ok(())
+            },
+            |_| {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("an unquotable name stops the install");
+        assert!(!cleared.get(), "the existing table is left in force");
+        assert!(!applied.get(), "nothing is handed to nft");
     }
 }

@@ -45,6 +45,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/torrents/:infohash/pause", post(torrents::pause))
         .route("/torrents/:infohash/resume", post(torrents::resume))
+        .route("/torrents/:infohash/recheck", post(torrents::recheck))
+        .route("/torrents/:infohash/reannounce", post(torrents::reannounce))
         .route(
             "/torrents/:infohash/upload-limit",
             post(torrents::set_upload_limit),
@@ -57,6 +59,9 @@ pub fn router(state: AppState) -> Router {
     // Always mounted: a daemon always has at least one profile.
     {
         api = api
+            // Daemon-wide: every live profile at once, for an incident.
+            .route("/pause-all", post(profiles::pause_everything))
+            .route("/resume-all", post(profiles::resume_everything))
             .route("/profiles", get(profiles::list))
             .route("/profiles/:profile_id", get(profiles::get))
             .route("/profiles/:profile_id/torrents", get(profiles::torrents))
