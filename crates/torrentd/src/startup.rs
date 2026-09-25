@@ -3094,7 +3094,7 @@ mod profile_construction_tests {
         let dir = tempfile::tempdir().unwrap();
         let second = "[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
              vpn_config = \"/etc/wireguard/wg-b.conf\"\nvpn_interface = \"wg-b\"\n\
-             port_forward = \"natpmp\"\npeer_fingerprint_hex = \"b1b2c3d4e5f60719\"\n\
+             port_forward = \"natpmp\"\npeer_fingerprint = \"-BB1001-\"\n\
              user_agent = \"ua-acct_b\"\n"
             .to_string();
         let cfg = cfg_with(dir.path(), &[natpmp("acct_a", "wg-a"), second]);
