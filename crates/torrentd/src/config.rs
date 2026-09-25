@@ -2629,6 +2629,10 @@ listen_interfaces = "0.0.0.0:6882"
         assert_eq!(d.profile_changes[0].kind, ProfileChangeKind::Identity);
     }
 
+    /// A profile key, the class its change is owed, and the profile with only
+    /// that key changed.
+    type FieldEdit = (&'static str, ProfileChangeKind, ProfileConfig);
+
     /// Every `[[profile]]` field of `base` changed alone, each paired with the
     /// key and class `diff_profiles` owes it.
     ///
@@ -2637,9 +2641,7 @@ listen_interfaces = "0.0.0.0:6882"
     /// the test-side twin of the pattern in `diff_profiles`. Each binding is
     /// then read by an `assert_ne!` proving its row is a real change, so a
     /// row cannot pass by setting a field to the value it already had.
-    fn each_profile_field_changed_alone(
-        base: &ProfileConfig,
-    ) -> Vec<(&'static str, ProfileChangeKind, ProfileConfig)> {
+    fn each_profile_field_changed_alone(base: &ProfileConfig) -> Vec<FieldEdit> {
         let ProfileConfig {
             id: _,
             network,
@@ -2869,7 +2871,8 @@ upload_rate_limit = 0"#,
         // `upload_rate_limit`, which shares its name with a profile key.
         let dir = tempdir().unwrap();
         let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
-        let edits: Vec<(&str, fn(&mut Config))> = vec![
+        type TopLevelEdit = (&'static str, fn(&mut Config));
+        let edits: Vec<TopLevelEdit> = vec![
             ("connections_limit", |c| c.connections_limit = Some(20_000)),
             ("upload_rate_limit", |c| c.upload_rate_limit = Some(100_000)),
             ("max_concurrent_http_announces", |c| {
