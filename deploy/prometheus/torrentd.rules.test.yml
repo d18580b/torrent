@@ -1,0 +1,669 @@
+# promtool fixtures for torrentd.rules.yml: one per alert that shows it firing,
+# plus the quiet cases that matter (a seeded zero, one transient event).
+#
+#   promtool test rules deploy/prometheus/torrentd.rules.test.yml
+#
+# `cargo test -p torrentd` checks that every alert in the rules file has a test
+# here expecting it to fire.
+
+rule_files:
+  - torrentd.rules.yml
+
+evaluation_interval: 1m
+
+tests:
+  # ---- the daemon itself ------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'up{job="torrentd", instance="seedbox:8080"}'
+        values: '1 1 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdDown
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: TorrentdDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: torrentd
+              instance: seedbox:8080
+            exp_annotations:
+              summary: "torrentd on seedbox:8080 is not answering scrapes"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_alert_loop_heartbeat_age_seconds'
+        values: '0 0 30 60 90 120'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdAlertLoopStalled
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: TorrentdAlertLoopStalled
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "The alert loop has not advanced for 90s; seeding, resume saves and status updates have stopped"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_task_up{task="vpn_monitor"}'
+        values: '1 1 0 0 0 0'
+      - series: 'torrentd_task_up{task="reload"}'
+        values: '1 1 1 1 1 1'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: TorrentdTaskDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              task: vpn_monitor
+            exp_annotations:
+              summary: "Background task vpn_monitor has exited or panicked; what it watched is no longer watched"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_metrics_dropped_samples_total{reason="labels"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_metrics_dropped_samples_total{reason="registration"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdMetricsDropped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: labels
+            exp_annotations:
+              summary: "The exporter dropped samples (labels); some series are missing or stale"
+
+  # ---- profiles and tunnels ---------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_b"}'
+        values: '1 1 1'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_a"}'
+        values: '0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdProfileBootFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Profile acct_b got no session at boot and is not seeding"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_vpn_tunnel_up{profile_id="acct_a"}'
+        values: '1 1 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdVpnTunnelDown
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: TorrentdVpnTunnelDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Profile acct_a's tunnel is down; its torrents are fenced until the daemon restarts"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_fence_pause_errors_total{profile_id="acct_a"}'
+        values: '0 0 2 2'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdFencePauseFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Fencing profile acct_a failed to pause some torrents; they may still be seeding without the tunnel"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_vpn_handshake_probe_ok{profile_id="acct_a"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdHandshakeProbeUnavailable
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: TorrentdHandshakeProbeUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The WireGuard handshake probe cannot run for acct_a (wg missing or unprivileged); only IP presence is checked"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_port_forward_up{profile_id="acct_a"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: TorrentdPortForwardDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Profile acct_a holds no NAT-PMP lease; incoming connections are not forwarded"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_listen_failure_active{profile_id="acct_a"}'
+        values: '0 1 1'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdListenFailed
+        exp_alerts: []
+      - eval_time: 2m
+        alertname: TorrentdListenFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Profile acct_a's listen socket failed; it accepts no incoming connections"
+
+  # ---- kill switch ------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_kill_switch_active'
+        values: '1 1 1 1'
+      - series: 'torrentd_kill_switch_table_present'
+        values: '1 1 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdKillSwitchGone
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdKillSwitchGone
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "The nftables kill switch table disappeared; the daemon's egress is no longer confined to the tunnels"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_kill_switch_probe_errors_total'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdKillSwitchUnverifiable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The daemon cannot list nftables tables to confirm the kill switch is installed"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_last_shutdown_kill_switch_removal_failed'
+        values: '1 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdKillSwitchLeftInstalled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The previous run could not remove the kill switch on exit; check `nft list tables`"
+
+  # ---- resume data ------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_resume_write_errors_total{profile_id="acct_a"}'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdResumeWriteErrors
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdResumeWriteErrors
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Resume data for profile acct_a could not be written; a restart loses progress"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_resume_save_failures_total{profile_id="acct_a"}'
+        values: '0 0 0 0'
+      - series: 'torrentd_resume_save_dispatch_errors_total{profile_id="acct_a"}'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdResumeSaveFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "save_resume_data is failing for profile acct_a"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_last_shutdown_unsaved_resumes'
+        values: '4 4'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdShutdownLeftResumeUnsaved
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "The previous shutdown left 4 resume saves unsaved; those torrents restarted from older state"
+
+  # ---- libtorrent -------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_alert_queue_overflows_total{profile_id="acct_a"}'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdAlertQueueOverflow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "libtorrent dropped alerts for profile acct_a; the alert loop is falling behind"
+
+  # The alert is a fraction of announces held for 30 minutes.
+  #   acct_a: three of every four announces fail (a tracker outage). Fires.
+  #   acct_b: one dead tracker failing every minute, forever, among torrents
+  #           whose trackers reply four times as often. Never fires.
+  #   acct_c: one failed announce among steady replies. Never fires.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="error"}'
+        values: '0+3x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="reply"}'
+        values: '0+1x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_b", kind="error"}'
+        values: '0+1x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_b", kind="reply"}'
+        values: '0+4x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_c", kind="error"}'
+        values: '0 1x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_c", kind="reply"}'
+        values: '0+2x90'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TorrentdTrackerErrors
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: TorrentdTrackerErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Most tracker announces for profile acct_a have been failing for 30 minutes"
+      - eval_time: 90m
+        alertname: TorrentdTrackerErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Most tracker announces for profile acct_a have been failing for 30 minutes"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="scrape_failed"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="warning"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdTrackerWarnings
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              profile_id: acct_a
+              kind: scrape_failed
+            exp_annotations:
+              summary: "Trackers returned scrape_failed for profile acct_a"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_session_alerts_total{profile_id="acct_a", kind="portmap_error"}'
+        values: '0 0 0 0'
+      - series: 'torrentd_session_alerts_total{profile_id="acct_a", kind="fastresume_rejected"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_session_alerts_total{profile_id="acct_a", kind="performance_warning"}'
+        values: '0 0 5 5'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdSessionErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              kind: fastresume_rejected
+            exp_annotations:
+              summary: "libtorrent reported fastresume_rejected for profile acct_a"
+      - eval_time: 3m
+        alertname: TorrentdPerformanceWarning
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              profile_id: acct_a
+              kind: performance_warning
+            exp_annotations:
+              summary: "libtorrent raised a performance warning for profile acct_a; see the journal"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_errors_total{profile_id="acct_a"}'
+        values: '0 0 0 0'
+      - series: 'torrentd_torrent_add_errors_total{profile_id="acct_a"}'
+        values: '0 0 0 0'
+      - series: 'torrentd_storage_move_failures_total{profile_id="acct_a"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_upload_mode_retry_errors_total{profile_id="acct_a"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Torrents in profile acct_a are failing"
+
+  # disk_errors_total is labelled by libtorrent operation and so is not
+  # seeded; the first error creates the series, and the rule matches that.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_disk_errors_total{profile_id="acct_a", op="file_open"}'
+        values: '_ _ _ 1 1 1'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: TorrentdDiskErrors
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: TorrentdDiskErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              op: file_open
+            exp_annotations:
+              summary: "File errors (file_open) in profile acct_a; the torrent is in upload mode"
+
+  # ---- boot and persistence ---------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_boot_torrent_load_failures{profile_id="acct_a", source="torrent_dir_add"}'
+        values: '2 2'
+      - series: 'torrentd_boot_torrent_load_failures{profile_id="acct_a", source="resume_add"}'
+        values: '0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdBootLoadFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              source: torrent_dir_add
+            exp_annotations:
+              summary: "2 torrents in profile acct_a failed to load at boot (torrent_dir_add)"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_unloaded_registry_torrents{profile_id="acct_a"}'
+        values: '7 7'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdUnloadedRegistryTorrents
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "The registry claims 7 torrents for profile acct_a that no session loaded"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_assignment_registry_errors_total{profile_id="acct_a"}'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdRegistryErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Loads or adds for profile acct_a were refused by the assignment registry"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_file_persist_errors_total{profile_id="acct_a", source="metadata"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_torrent_file_persist_errors_total{profile_id="acct_a", source="api"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdTorrentPersistFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              source: metadata
+            exp_annotations:
+              summary: "A .torrent for profile acct_a could not be written (metadata)"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_store_write_errors_total{store="pool_index"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_store_write_errors_total{store="registry"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdStoreWriteFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              store: pool_index
+            exp_annotations:
+              summary: "A write to the pool_index failed; it no longer matches what the daemon did"
+
+  # ---- control plane ----------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_auth_login_failures_total{reason="throttled"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_auth_login_failures_total{reason="verification_budget"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdLoginThrottled
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: throttled
+            exp_annotations:
+              summary: "Logins are being throttled (throttled); someone is guessing passwords"
+
+  # One mistyped password is not an alert; five in a row is.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_auth_login_failures_total{reason="bad_password"}'
+        values: '0 1 1 6 6'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: TorrentdLoginFailures
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: TorrentdLoginFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              reason: bad_password
+            exp_annotations:
+              summary: "More than three failed logins in 15 minutes"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_auth_token_scope_denials_total'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdTokenScopeDenied
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "A valid API token was used for a route outside its scope"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_config_reload_failures_total{stage="load"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_config_reload_failures_total{stage="apply_settings"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdReloadFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              stage: load
+            exp_annotations:
+              summary: "A config reload failed at load; the daemon is running the previous settings"
+
+  # ---- pool -------------------------------------------------------------
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_plan_failures_total{kind="step_failed"}'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdPoolPlanFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              kind: step_failed
+            exp_annotations:
+              summary: "A pool plan stopped (step_failed); inspect it before resuming"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_scan_errors_total{kind="stat"}'
+        values: '0 0 3 3'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdPoolScanErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              kind: stat
+            exp_annotations:
+              summary: "A pool scan skipped entries (stat); the index may be incomplete"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_verify_failed_total'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdPoolVerifyFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Adopted torrents failed verification"
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_index_profile_disagreements'
+        values: '2 2'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdPoolIndexDisagrees
+        exp_alerts:
+          - exp_labels:
+              severity: info
+            exp_annotations:
+              summary: "The pool index and the assignment registry disagree about 2 torrents; run `torrentd pool scan`"
+
+  # ---- a freshly booted, healthy daemon is silent -----------------------
+  # Every counter seeded at zero, every gauge at its healthy value.
+  - interval: 1m
+    input_series:
+      - series: 'up{job="torrentd", instance="seedbox:8080"}'
+        values: '1x20'
+      - series: 'torrentd_alert_loop_heartbeat_age_seconds'
+        values: '0x20'
+      - series: 'torrentd_task_up{task="vpn_monitor"}'
+        values: '1x20'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_a"}'
+        values: '0x20'
+      - series: 'torrentd_listen_failure_active{profile_id="acct_a"}'
+        values: '0x20'
+      - series: 'torrentd_kill_switch_active'
+        values: '1x20'
+      - series: 'torrentd_kill_switch_table_present'
+        values: '1x20'
+      - series: 'torrentd_last_shutdown_unsaved_resumes'
+        values: '0x20'
+      - series: 'torrentd_resume_write_errors_total{profile_id="acct_a"}'
+        values: '0x20'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="error"}'
+        values: '0x20'
+      - series: 'torrentd_auth_login_failures_total{reason="bad_password"}'
+        values: '0x20'
+      - series: 'torrentd_boot_torrent_load_failures{profile_id="acct_a", source="resume_add"}'
+        values: '0x20'
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: TorrentdDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdAlertLoopStalled
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdTaskDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdProfileBootFailed
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdListenFailed
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdKillSwitchGone
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdShutdownLeftResumeUnsaved
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdResumeWriteErrors
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdTrackerErrors
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdLoginFailures
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdBootLoadFailures
+        exp_alerts: []

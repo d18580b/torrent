@@ -126,8 +126,8 @@ mod tests {
     #[test]
     fn recording_sink_aggregates() {
         let s = RecordingSink::new();
-        s.inc_counter("alerts_dropped_total", &[]);
-        s.add_counter("alerts_dropped_total", 4, &[]);
-        assert_eq!(s.count_for("alerts_dropped_total"), 5);
+        s.inc_counter("alert_queue_overflows_total", &[]);
+        s.add_counter("alert_queue_overflows_total", 4, &[]);
+        assert_eq!(s.count_for("alert_queue_overflows_total"), 5);
     }
 }

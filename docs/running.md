@@ -40,6 +40,13 @@ runtime and are easy to miss because nothing checks for them at startup:
 
 A deployment whose profiles are all `network = "host"` needs none of them.
 
+The daemon runs each of them by bare name, looked up on its own `PATH`, and
+treats that environment as trusted: whoever can set it can also change
+`ExecStart=`. The packaged unit sets no `PATH`, so systemd's default for
+system services applies. Do not put a directory writable by anyone but root
+on it. `--check-config` probes only `nft`; `torrentd --config <path> vpn
+check` (§9) checks the rest.
+
 **The shipped container image is WireGuard-only.** `deploy/Containerfile`'s
 runtime layer installs `iproute`, `wireguard-tools`, `nftables` and
 `procps-ng`, and no `openvpn`, so a profile configured `vpn_type = "openvpn"`
@@ -128,12 +135,21 @@ What the daemon does and does not create:
   scan-time error, not a config error.
 
 The daemon also writes small state files of its own, beside the resume data, in
-**the parent of `resume_dir`** (`/var/lib/torrentd` under the shipped unit).
-Each writer that puts a file there creates the directory first, so the
-directory appears the **first time one of those files is written** and not at
-startup: a deployment with no `vpn` profile has neither of the two files below, and may never have the directory at all. Both kinds are
-safe to delete **while the daemon is stopped**, and neither is safe to delete
+**the parent of `resume_dir`** (`/var/lib/torrentd` under the shipped unit),
+and creates that directory at startup if it is missing. Every file below is
+safe to delete **while the daemon is stopped**, and none is safe to delete
 while it is running:
+
+- **`torrentd.lock`** — the single-instance lock. Startup takes an exclusive
+  lock on it before anything else and holds it until the daemon has shut down,
+  so a second `torrentd` against the same state directory exits at once
+  (status 70) with `… is already running against this state directory` and the
+  running daemon's pid, having touched nothing (§12). The file holds that pid.
+  The lock is the kernel's and goes with the process, however it ends, so
+  there is never a stale one to clear after a crash. Delete the file while the
+  daemon runs and the next start no longer sees it.
+
+A deployment with no `vpn` profile has neither of the next two:
 
 - **`openvpn-<iface>.pid`** — the pid `openvpn --writepid` recorded for an
   OpenVPN profile. It is the only handle the teardown has on that process, and it
@@ -226,7 +242,7 @@ Every profile takes `id` plus `network`, and then:
 | `vpn_type`, `vpn_config`, `vpn_interface` | **required**. `vpn_interface` must equal `vpn_config`'s file stem — wg-quick derives one from the other in both directions. |
 | `listen_port` | required for `port_forward = "static"` (the default); omitted for `"natpmp"` |
 | `port_forward`, `port_forward_gateway` | default `static`, and `10.2.0.1` |
-| `peer_fingerprint_hex`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client. |
+| `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters, such as `"-XX0002-"` — in the same form as the top-level key it overrides. |
 
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
@@ -241,9 +257,73 @@ naming the other profile, and the rest of the daemon runs. Two accounts behind
 a provider that gives every client the same address cannot share one daemon;
 run the second in a daemon of its own, in its own network namespace.
 
+### ProtonVPN: a forwarded port over NAT-PMP
+
+Proton hands out no fixed forwarded port. The port is asked for over NAT-PMP
+through the tunnel, carries a 60-second lease, and can change whenever the
+tunnel reconnects. `port_forward = "natpmp"` does that for a profile.
+
+1. **Generate the WireGuard config with NAT-PMP on.** In Proton's WireGuard
+   configuration page, pick a P2P server and enable *NAT-PMP (Port
+   Forwarding)* before downloading. A config generated without it connects
+   normally and then answers every port request with an error, which fails
+   the profile at startup: `NAT-PMP negotiation failed`.
+2. **Configure the profile** with `port_forward = "natpmp"` and no
+   `listen_port`. `port_forward_gateway` defaults to `10.2.0.1`, the gateway
+   of Proton's WireGuard configs. The daemon does not derive it; **an OpenVPN
+   profile must set it** to its own tunnel's gateway, which `ip route show
+   dev <vpn_interface>` names once the tunnel is up.
+3. **Check it before seeding:** `torrentd vpn check --profile <id>` (§9)
+   asks the gateway for a port from the tunnel address, the same exchange
+   the daemon makes.
+
+What the daemon does with the port:
+
+- It negotiates it during that profile's bring-up and binds the session to
+  it. Failing to get a port disables the profile rather than seed on an
+  unforwarded one.
+- While later profiles are being brought up, it renews the ports already
+  negotiated before each bring-up, and the renewal monitor starts as soon
+  as every profile is built. No lease waits on the resume and `.torrent`
+  scans.
+- Each profile renews on its own schedule, 30 seconds after a success and
+  5 seconds after a failure, so one slow gateway cannot delay another
+  profile, and only two failures in a row let a lease lapse. A renewal asks
+  to keep the port the session is listening on. A failed renewal never
+  pauses anything: an expired mapping blocks new inbound peers and nothing
+  else.
+- When the gateway answers with a different port, the session is rebound to
+  it and **every torrent in the profile reannounces at once**, so trackers
+  learn the new port within seconds rather than at their next scheduled
+  announce, which may be up to an hour away.
+
+The requests name internal port `1`, the value Proton documents (`natpmpc -a
+1 0 tcp 60 -g 10.2.0.1`); RFC 6886 gives internal port `0` to its
+delete-all request. TCP is mapped first and UDP (uTP) is asked for on the
+same port.
+
+Metrics, each labelled `profile_id`:
+
+| Series | Meaning |
+| --- | --- |
+| `torrentd_profile_forwarded_port` | the port the session listens on |
+| `torrentd_profile_port_forward_up` | `1` while the last renewal succeeded and the session is bound to its result |
+| `torrentd_profile_port_forward_udp_mapped` | `0` while the gateway mapped TCP only; uTP peers cannot reach the session then |
+| `torrentd_profile_port_forward_renewals_total` | successful renewals |
+| `torrentd_profile_port_forward_failures_total` | every failed attempt: the gateway did not answer, or it answered with a port the session could not be rebound to |
+| `torrentd_profile_port_forward_rebind_failures_total` | the second kind alone |
+| `torrentd_profile_forwarded_port_changes_total` | port changes the session followed |
+| `torrentd_profile_port_change_reannounce_seconds` | histogram: from the gateway naming a new port to the last reannounce being handed to the session |
+| `torrentd_profile_vpn_gateway_reboots_total` | gateway epoch went backwards; the mapping was re-created on the spot |
+
+Several Proton accounts cannot share one daemon: every Proton WireGuard
+config gives the tunnel `10.2.0.2/32`, and the paragraph above says what
+happens to the second profile. Run each extra account in its own daemon and
+network namespace.
+
 Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
 `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
-`peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all
+`peer_fingerprint`, `user_agent`, `resume_dir` and `torrent_dir` must all
 be unique across profiles.
 
 **`[pool]`** (optional) — `roots` (required, must not nest and must not contain
@@ -284,8 +364,15 @@ that had no `[[slot]]` needs one `network = "host"` profile carrying the
   is valid either way. Leave the key out to inherit; any other value carries
   over unchanged.
 - Every other key — `id`, `vpn_type`, `vpn_interface`, `listen_port`,
-  `peer_fingerprint_hex`, `user_agent`, `allowed_tracker_domains`,
-  `port_forward`, `port_forward_gateway` — keeps its name and meaning.
+  `user_agent`, `allowed_tracker_domains`, `port_forward`,
+  `port_forward_gateway` — keeps its name and meaning.
+- **Replace `peer_fingerprint_hex` with `peer_fingerprint`.** The old key was
+  documented as sixteen hex characters, and nothing decoded them: libtorrent
+  was handed the sixteen characters themselves, not the eight bytes they
+  spelled. `peer_fingerprint` takes the 8-character prefix as written — the
+  same form as the top-level key — so write the prefix you meant, such as
+  `"-XX0002-"`. A profile that still sets `peer_fingerprint_hex` is refused at
+  load with that key named.
 
 **2. Give a profile the id your registry already uses, or clear the entries.**
 The assignment registry — which torrent belongs to which account — is migrated
@@ -757,7 +844,7 @@ is configured; `read` and `metrics` tokens are refused. It reloads exactly what
 `SIGHUP` reloads, and reports the same warnings for a `[[profile]]` field that
 changed and cannot be applied without a restart: the Safety Rule 7 warning
 (`profile identity change requires daemon restart`) where the field is an
-identity — the network block, `peer_fingerprint_hex`, `user_agent` — and the
+identity — the network block, `peer_fingerprint`, `user_agent` — and the
 ordinary non-reloadable-field warning where it is not: `upload_rate_limit`,
 `allowed_tracker_domains`, and the two store directories. The field name is on
 the event either way.
@@ -1081,6 +1168,34 @@ On a scratch pool, not your real one.
    The shipped container image runs the daemon as uid 1000 with no ambient
    capabilities, so it still cannot raise a link, and cannot run the kill
    switch with a working tunnel.
+7. **A Proton port change reaches the tracker.** With a `natpmp` profile
+   seeding a torrent on a private tracker (§5, "ProtonVPN"):
+   1. Note `torrentd_profile_forwarded_port` and the port the tracker's peer
+      list or client page shows for this client.
+   2. Force a new port by reconnecting the tunnel as root, quickly
+      (`wg-quick down <iface> && wg-quick up <iface>`), so the gateway
+      forgets the mapping. If the VPN monitor saw the tunnel down in
+      between, the profile is paused and fenced as in drill 5 and stays so
+      until a restart; that is the tunnel-loss path, not this one. Repeat
+      until the log shows `NAT-PMP port changed; rebound live session and
+      reannounced its torrents` with the profile still `active`.
+   3. Within 60 seconds of that line the tracker should show the new port.
+      `torrentd_profile_port_change_reannounce_seconds` shows how long the
+      reannounce took to go out.
+   4. Across a slow boot — several profiles, a large resume directory —
+      `torrentd_profile_port_forward_up` should never drop to `0` and
+      `torrentd_profile_port_forward_failures_total` should stay at `0`.
+
+   This drill has not yet been run against a live Proton gateway from this
+   repository: the renewal, rebind and reannounce are tested against a fake
+   NAT-PMP gateway and a mock session. Record the result here when it has.
+
+   The ruleset also confines the daemon's **replies**: a request to
+   `http_listen` that arrives on a physical interface — the web client, the
+   API, a Prometheus scrape of `/metrics` — connects and then hangs, because
+   the response leaves from a socket the daemon's uid owns. Over loopback, or
+   through a tunnel, it works. With the kill switch on, reach the API through
+   a reverse proxy on the same host (§6a) or scrape from inside the tunnel.
 
 ## 12. Capturing a log
 
@@ -1143,18 +1258,16 @@ per-service rate limit. A `Suppressed N messages` line in the journal means
 lines were dropped; say so in the report, and keep `debug` on only for the
 reproduction itself.
 
-**Do not start a second copy by hand to watch its output.** Nothing stops one:
-the daemon takes no single-instance lock. A second `torrentd --config …` reads
-the same config and state directory, and binds the HTTP port last: before it,
-wherever it has the privileges to get that far, it has replaced the
-kill-switch table (§11, drill 6), brought up tunnels, and opened the resume
-directory and pool index. When the bind then fails against the running
-daemon's port, it shuts down the way a signalled daemon does: it writes resume
-data, deletes the `inet torrentd_ks` table — the running daemon's kill switch,
-since there is only one — and brings down every `vpn` profile's interface by
-name, the running daemon's tunnels included. If you stop the service to run
-it by hand instead, start the service again afterwards: `Restart=on-failure`
-does not bring back a unit that was stopped.
+**A second copy started by hand will not run beside the service.** A second
+`torrentd --config …` against the same config finds the running daemon's
+`torrentd.lock` (§4) and exits at once, naming its pid, before it touches the
+kill switch, a tunnel or a state file — so it shows nothing of the running
+daemon's behaviour; the journal above is where that is. The lock is per state
+directory: a copy pointed at a different `resume_dir` is not stopped by it,
+and with `network_kill_switch` it would still replace the one `inet
+torrentd_ks` table the host has (§11, drill 6). If you stop the service to
+run it by hand instead, start the service again afterwards:
+`Restart=on-failure` does not bring back a unit that was stopped.
 
 ## Troubleshooting
 

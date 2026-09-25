@@ -38,13 +38,25 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             bytes = torrent.len(),
             "persisted magnet metadata as .torrent",
         ),
-        Err(e) => warn!(
-            target: "torrentd_engine::handler::metadata",
-            infohash = %ih,
-            error.kind = "torrent_write",
-            error.cause = %e,
-            "failed to persist magnet metadata",
-        ),
+        Err(e) => {
+            warn!(
+                target: "torrentd_engine::handler::metadata",
+                infohash = %ih,
+                error.kind = "torrent_write",
+                error.cause = %e,
+                "failed to persist magnet metadata",
+            );
+            // The torrent keeps seeding from resume data, so nothing else
+            // notices; lose the resume file too and it is gone at the next
+            // restart. `source` matches the API's own persist failure.
+            ctx.metrics.inc_counter(
+                "torrent_file_persist_errors_total",
+                &[
+                    ("profile_id", ctx.profile_id.as_str()),
+                    ("source", "metadata"),
+                ],
+            );
+        }
     }
 }
 
@@ -107,5 +119,44 @@ mod tests {
         expected.extend_from_slice(&info);
         expected.push(b'e');
         assert_eq!(saved[0].1, expected);
+    }
+
+    #[test]
+    fn a_failed_persist_is_counted_against_the_profile() {
+        // A regular file where the store's base directory should be: every
+        // write under it fails.
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"").unwrap();
+        let torrents = crate::torrent_store::FsTorrentStore::new(&blocker);
+
+        let alert = Alert::MetadataReceived {
+            hdr: AlertHeader {
+                kind: AlertKind::MetadataReceived,
+                infohash: Some(InfoHash([0x56; 20])),
+                handle: None,
+                timestamp_us: 0,
+            },
+            info_section: b"d6:lengthi5ee".to_vec(),
+        };
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let metrics = crate::metrics::RecordingSink::new();
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_id: ProfileId::new("p"),
+            span: tracing::info_span!("test"),
+        };
+
+        handle(&alert, &mut ctx);
+
+        assert_eq!(metrics.count_for("torrent_file_persist_errors_total"), 1);
     }
 }

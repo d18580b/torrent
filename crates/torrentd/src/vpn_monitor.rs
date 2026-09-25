@@ -255,8 +255,21 @@ pub async fn run(
             // Tunnel down, IP changed, or handshake stale → pause the profile.
             let mut paused = 0u64;
             for h in state.handles_for_profile(&profile_id) {
-                if e.engine.pause_torrent(h).is_ok() {
-                    paused += 1;
+                match e.engine.pause_torrent(h) {
+                    Ok(()) => paused += 1,
+                    // A torrent the fence did not pause keeps seeding from a
+                    // profile whose tunnel is down — the one thing fencing is
+                    // for. The failure was discarded, so nothing said so.
+                    Err(err) => {
+                        error!(
+                            target: "torrentd::vpn_monitor",
+                            profile_id = %profile_id,
+                            infohash = %h.infohash,
+                            error.cause = %err,
+                            "could not pause a torrent while fencing the profile",
+                        );
+                        metrics.inc_counter("profile_fence_pause_errors_total", &labels);
+                    }
                 }
             }
             e.update_health(|hh| {

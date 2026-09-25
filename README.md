@@ -225,7 +225,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 port_forward         = "natpmp"
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint     = "-XX0002-"     # 8-char peer-id prefix, as written
 user_agent           = "qBittorrent/5.0.3"
 ```
 

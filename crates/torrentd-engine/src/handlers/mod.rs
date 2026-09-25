@@ -12,6 +12,7 @@ pub mod resume;
 pub mod state_update;
 pub mod stats;
 pub mod storage;
+pub mod warning;
 
 use std::sync::Arc;
 

@@ -483,7 +483,18 @@ async fn do_add(
         ),
     };
     if let Err(e) = engine.add_torrent(params) {
-        let _ = s.registry.remove(&infohash);
+        // Release the claim so the add can be retried. A release that fails
+        // to persist comes back from the file at the next restart as a claim
+        // on a torrent no session holds.
+        if let Err(re) = s.registry.remove(&infohash) {
+            tracing::warn!(
+                infohash = %infohash,
+                error.cause = %re,
+                "could not release the claim of a torrent whose add failed",
+            );
+            s.metrics
+                .inc_counter("store_write_errors_total", &[("store", "registry")]);
+        }
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("{e}")})),
@@ -498,6 +509,10 @@ async fn do_add(
                 infohash = %infohash,
                 error.cause = %e,
                 "failed to persist .torrent file",
+            );
+            s.metrics.inc_counter(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile_id.as_str()), ("source", "api")],
             );
         }
     }
@@ -1657,6 +1672,36 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_torrent_file_that_cannot_be_persisted_is_counted_and_the_add_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_state(dir.path());
+        // A torrent store whose base is a regular file: every write fails, as
+        // on a torrent dir that is full, read-only or gone.
+        std::fs::write(dir.path().join("blocker"), b"not a directory").unwrap();
+        app.torrents = Arc::new(torrentd_engine::FsTorrentStore::new(
+            dir.path().join("blocker"),
+        ));
+        let mut torrent = b"d8:announce17:http://t/announce4:infod6:lengthi1e4:name1:a\
+12:piece lengthi16384e6:pieces20:"
+            .to_vec();
+        torrent.extend_from_slice(&[0u8; 20]);
+        torrent.extend_from_slice(b"ee");
+
+        let (code, _) = do_add(&app, Some("p".into()), None, AddSource::File(torrent))
+            .await
+            .expect("the add itself succeeds; only the recovery copy failed");
+
+        assert_eq!(code, StatusCode::CREATED);
+        let text = String::from_utf8(app.metrics.render()).unwrap();
+        assert!(
+            text.contains(
+                "torrentd_torrent_file_persist_errors_total{profile_id=\"p\",source=\"api\"} 1"
+            ),
+            "{text}"
+        );
     }
 
     #[tokio::test]

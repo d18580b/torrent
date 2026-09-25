@@ -1367,7 +1367,9 @@ fn profile_checks(
                 let req = PortMapRequest {
                     gateway,
                     bind_ip,
-                    internal_port: 0,
+                    internal_port: PortMapRequest::INTERNAL_PORT,
+                    // No preference: the check holds no port to keep.
+                    suggested_port: 0,
                     // The daemon's own lease. `LEASE_SECS` is public so both
                     // paths agree; re-deriving it here would silently move the
                     // pre-flight out of step with the daemon the first time
@@ -1906,7 +1908,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 resume_dir           = "/tmp/torrentd-test/state/resume/acct_a"
 torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
@@ -1952,7 +1954,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 "#;
 
@@ -1972,7 +1974,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 port_forward         = "natpmp"
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 resume_dir           = "/tmp/torrentd-test/state/resume/acct_a"
 torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
@@ -1996,7 +1998,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-b.conf"
 vpn_interface        = "wg-acct-b"
 listen_port          = 6882
-peer_fingerprint_hex = "b1b2c3d4e5f60718"
+peer_fingerprint = "-BB1000-"
 user_agent           = "Transmission/4.0.5"
 resume_dir           = "/tmp/torrentd-test/state/resume/acct_b"
 torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
@@ -2246,6 +2248,15 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
             "the pre-flight must ask for the daemon's lease, not a second copy of it",
         );
         assert_eq!(req.bind_ip, IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+        assert_eq!(
+            req.internal_port,
+            PortMapRequest::INTERNAL_PORT,
+            "the pre-flight must send the daemon's internal port",
+        );
+        assert_eq!(
+            req.suggested_port, 0,
+            "the pre-flight holds no port, so it must suggest none",
+        );
 
         let pf = find(&r.checks, "port_forward").expect("a port_forward line");
         assert_eq!(pf.verdict, Verdict::Pass, "detail: {}", pf.detail);
@@ -3068,7 +3079,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg}x.conf"
 vpn_interface        = "wg}x"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 "#,
         );
@@ -3108,7 +3119,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 
 [[profile]]
@@ -3118,7 +3129,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg}x.conf"
 vpn_interface        = "wg}x"
 listen_port          = 6882
-peer_fingerprint_hex = "b1b2c3d4e5f60718"
+peer_fingerprint = "-BB1000-"
 user_agent           = "Transmission/4.0.5"
 "#,
         );

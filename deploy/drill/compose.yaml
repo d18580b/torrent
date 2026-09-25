@@ -1,0 +1,62 @@
+# Alert-delivery drill: torrentd, Prometheus with deploy/prometheus's rules,
+# Alertmanager, and a webhook sink that records what it is sent.
+#
+# Not a deployment. run.sh writes the daemon's config and faults into
+# $DRILL_DIR, brings this up, injects faults through the daemon's own API, and
+# asserts each matching alert arrives at the sink:
+#
+#   deploy/drill/run.sh
+#
+# Every port is published on loopback only, for run.sh to reach.
+name: torrentd-drill
+
+services:
+  torrentd:
+    image: ${TORRENTD_IMAGE:-localhost/torrentd:drill}
+    build:
+      context: ../..
+      dockerfile: deploy/Containerfile
+    volumes:
+      # Rewritten in place by run.sh to make a reload fail, so a file mount
+      # rather than :ro.
+      - ${DRILL_DIR:?run through run.sh}/torrentd.toml:/etc/torrentd/torrentd.toml:z
+      # Holds a .torrent that is not one, which the boot scan fails to load.
+      - ${DRILL_DIR:?run through run.sh}/torrents:/drill/torrents:ro,z
+      - state:/var/lib/torrentd
+    ports:
+      - "127.0.0.1:18180:8080"
+
+  prometheus:
+    image: docker.io/prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro,z
+      - ../prometheus/torrentd.rules.yml:/etc/prometheus/torrentd.rules.yml:ro,z
+      - ${DRILL_DIR:?run through run.sh}/metrics.token:/etc/prometheus/metrics.token:ro,z
+    ports:
+      - "127.0.0.1:19090:9090"
+    depends_on:
+      - torrentd
+      - alertmanager
+
+  alertmanager:
+    image: docker.io/prom/alertmanager:v0.28.1
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro,z
+    depends_on:
+      - sink
+
+  sink:
+    image: docker.io/library/python:3.12-alpine
+    command: ["python", "-u", "/sink.py"]
+    volumes:
+      - ./sink.py:/sink.py:ro,z
+    ports:
+      - "127.0.0.1:19095:9095"
+
+volumes:
+  state:

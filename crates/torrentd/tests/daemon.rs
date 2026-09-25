@@ -166,6 +166,127 @@ fn daemon_end_to_end() {
     );
 }
 
+/// The rows of `deploy/metrics.md` a host-profile daemon with no pool and no
+/// kill switch must export from its first scrape: `(name, labels column)`.
+fn series_present_from_boot() -> Vec<(String, String)> {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/metrics.md"),
+    )
+    .expect("read deploy/metrics.md");
+    doc.lines()
+        .filter(|l| l.starts_with("| `torrentd_"))
+        .filter_map(|l| {
+            let cells: Vec<&str> = l.split(" | ").collect();
+            let name = cells[0]
+                .trim_start_matches("| ")
+                .trim_matches('`')
+                .to_string();
+            let (labels, instances, present) = (cells[2], cells[3], cells[4]);
+            let applies = matches!(instances, "daemon" | "each profile")
+                && matches!(
+                    present,
+                    "from boot, at 0" | "from boot: always" | "from boot: live profiles"
+                );
+            applies.then(|| (name, labels.to_string()))
+        })
+        .collect()
+}
+
+/// The values a labels column lists, as `label="value"` matchers.
+fn listed_values(labels: &str) -> Vec<String> {
+    labels
+        .split("; ")
+        .filter_map(|part| part.split_once(": "))
+        .flat_map(|(name, values)| {
+            let name = name.trim_matches('`').to_string();
+            values
+                .split(", ")
+                .map(move |v| format!("{name}=\"{}\"", v.trim_matches('`')))
+        })
+        .collect()
+}
+
+/// Everything an alert rule reads has to exist before the condition it
+/// watches first happens, or `increase()` never sees that first event. So the
+/// very first scrape of a fresh daemon must already hold every series the
+/// reference table says is there from boot, for this profile and for every
+/// listed label value. Then a reload that cannot parse its config is counted.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn the_first_scrape_holds_every_series_present_from_boot() {
+    const HTTP: &str = "127.0.0.1:18096";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let mut child = spawn_daemon(p, 16896, HTTP);
+    wait_healthy(HTTP);
+
+    let (code, metrics) = http(HTTP, "GET", "/metrics", None);
+    assert_eq!(code, 200);
+    let expected = series_present_from_boot();
+    assert!(expected.len() > 30, "parsed too few rows: {expected:?}");
+    let mut missing = Vec::new();
+    for (name, labels) in &expected {
+        if !metrics.contains(&format!("# TYPE {name} ")) {
+            missing.push(name.clone());
+            continue;
+        }
+        // `task_up` lists every task there is; only the ones this config
+        // starts exist.
+        if name == "torrentd_task_up" {
+            continue;
+        }
+        for value in listed_values(labels) {
+            let found = metrics.lines().any(|l| {
+                l.starts_with(&format!("{name}{{"))
+                    && l.contains(&value)
+                    && (!labels.contains("profile_id") || l.contains("profile_id=\"test\""))
+            });
+            if !found {
+                missing.push(format!("{name}{{{value}}}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "absent from the first scrape: {missing:?}\n\n{metrics}"
+    );
+    for task in ["vpn_monitor", "reload"] {
+        assert!(
+            metrics.contains(&format!("torrentd_task_up{{task=\"{task}\"}} 1")),
+            "{task} is supervised from boot:\n{metrics}"
+        );
+    }
+
+    // A reload that cannot parse the file keeps the old settings and says so
+    // in a series an alert can read, not only in the journal.
+    std::fs::write(p.join("cfg.toml"), "this is = = not toml").unwrap();
+    let (code, body) = http(HTTP, "POST", "/api/reload", None);
+    assert!((200..300).contains(&code), "reload trigger: {code} {body}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, metrics) = http(HTTP, "GET", "/metrics", None);
+        if metrics.contains("torrentd_config_reload_failures_total{stage=\"load\"} 1") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the failed reload was not counted:\n{metrics}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    sigterm(&child);
+    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+    // A clean exit still writes the report the next boot re-exports, and it
+    // says nothing was left behind.
+    let report = std::fs::read_to_string(p.join("last_shutdown.json")).expect("shutdown report");
+    assert!(report.contains("\"unsaved_resumes\":0"), "{report}");
+    assert!(
+        report.contains("\"kill_switch_removal_failed\":false"),
+        "{report}"
+    );
+}
+
 /// An HTTP bind failure happens after `boot` has handed teardown to the
 /// shutdown path, so it must run that path rather than return past it: exit
 /// 70, and drain exactly as a SIGTERM does. The dht profile's session state is
@@ -190,6 +311,76 @@ fn daemon_http_bind_failure_still_drains() {
     assert!(
         p.join(format!("session_state-{PROFILE}.dat")).exists(),
         "a bind failure must run the shutdown drain, which writes session state"
+    );
+}
+
+/// A second daemon against the same state directory refuses at once, naming
+/// the running one, and leaves it serving.
+///
+/// The second start is given ports of its own, so nothing but the
+/// single-instance lock can stop it. Without the lock it came up healthy
+/// beside the first — and with `network_kill_switch` it would have replaced
+/// the first one's nftables table on the way, which is the harm the lock is
+/// for and which needs a VPN to observe directly.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_second_daemon_on_the_same_state_dir_refuses_and_leaves_the_first_running() {
+    const HTTP: &str = "127.0.0.1:18095";
+    const HTTP_SECOND: &str = "127.0.0.1:18096";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let mut first = spawn_daemon(p, 16895, HTTP);
+    wait_healthy(HTTP);
+
+    // Same state directory, different ports. The first daemon has already
+    // read `cfg.toml`, so rewriting it for the second changes nothing for it.
+    let cfg = write_config(p, 16896, HTTP_SECOND);
+    let mut second = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn second daemon");
+
+    let exited = wait_exit(&mut second, Duration::from_secs(10));
+    let mut out = String::new();
+    second
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .unwrap();
+    second
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut out)
+        .unwrap();
+    assert!(
+        exited,
+        "the second daemon did not refuse within 10s; output: {out}"
+    );
+    assert_eq!(
+        second.wait().unwrap().code(),
+        Some(70),
+        "a refused start exits 70 like every other startup failure; output: {out}"
+    );
+    assert!(
+        out.contains("single-instance lock") && out.contains(&format!("pid {}", first.id())),
+        "the refusal names the lock and the running daemon's pid: {out}"
+    );
+    assert!(
+        TcpStream::connect(HTTP_SECOND).is_err(),
+        "the second daemon got as far as binding its HTTP port"
+    );
+
+    // The first is untouched and still serving.
+    assert_eq!(http(HTTP, "GET", "/healthz", None).0, 200);
+    sigterm(&first);
+    assert!(
+        wait_exit(&mut first, Duration::from_secs(30)),
+        "daemon did not exit within 30s of SIGTERM"
     );
 }
 
