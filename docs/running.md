@@ -128,12 +128,21 @@ What the daemon does and does not create:
   scan-time error, not a config error.
 
 The daemon also writes small state files of its own, beside the resume data, in
-**the parent of `resume_dir`** (`/var/lib/torrentd` under the shipped unit).
-Each writer that puts a file there creates the directory first, so the
-directory appears the **first time one of those files is written** and not at
-startup: a deployment with no `vpn` profile has neither of the two files below, and may never have the directory at all. Both kinds are
-safe to delete **while the daemon is stopped**, and neither is safe to delete
+**the parent of `resume_dir`** (`/var/lib/torrentd` under the shipped unit),
+and creates that directory at startup if it is missing. Every file below is
+safe to delete **while the daemon is stopped**, and none is safe to delete
 while it is running:
+
+- **`torrentd.lock`** — the single-instance lock. Startup takes an exclusive
+  lock on it before anything else and holds it until the daemon has shut down,
+  so a second `torrentd` against the same state directory exits at once
+  (status 70) with `… is already running against this state directory` and the
+  running daemon's pid, having touched nothing (§12). The file holds that pid.
+  The lock is the kernel's and goes with the process, however it ends, so
+  there is never a stale one to clear after a crash. Delete the file while the
+  daemon runs and the next start no longer sees it.
+
+A deployment with no `vpn` profile has neither of the next two:
 
 - **`openvpn-<iface>.pid`** — the pid `openvpn --writepid` recorded for an
   OpenVPN profile. It is the only handle the teardown has on that process, and it
@@ -1083,18 +1092,16 @@ per-service rate limit. A `Suppressed N messages` line in the journal means
 lines were dropped; say so in the report, and keep `debug` on only for the
 reproduction itself.
 
-**Do not start a second copy by hand to watch its output.** Nothing stops one:
-the daemon takes no single-instance lock. A second `torrentd --config …` reads
-the same config and state directory, and binds the HTTP port last: before it,
-wherever it has the privileges to get that far, it has replaced the
-kill-switch table (§11, drill 6), brought up tunnels, and opened the resume
-directory and pool index. When the bind then fails against the running
-daemon's port, it shuts down the way a signalled daemon does: it writes resume
-data, deletes the `inet torrentd_ks` table — the running daemon's kill switch,
-since there is only one — and brings down every `vpn` profile's interface by
-name, the running daemon's tunnels included. If you stop the service to run
-it by hand instead, start the service again afterwards: `Restart=on-failure`
-does not bring back a unit that was stopped.
+**A second copy started by hand will not run beside the service.** A second
+`torrentd --config …` against the same config finds the running daemon's
+`torrentd.lock` (§4) and exits at once, naming its pid, before it touches the
+kill switch, a tunnel or a state file — so it shows nothing of the running
+daemon's behaviour; the journal above is where that is. The lock is per state
+directory: a copy pointed at a different `resume_dir` is not stopped by it,
+and with `network_kill_switch` it would still replace the one `inet
+torrentd_ks` table the host has (§11, drill 6). If you stop the service to
+run it by hand instead, start the service again afterwards:
+`Restart=on-failure` does not bring back a unit that was stopped.
 
 ## Troubleshooting
 
