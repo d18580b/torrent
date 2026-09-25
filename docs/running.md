@@ -310,8 +310,8 @@ Metrics, each labelled `profile_id`:
 | `torrentd_profile_port_forward_up` | `1` while the last renewal succeeded and the session is bound to its result |
 | `torrentd_profile_port_forward_udp_mapped` | `0` while the gateway mapped TCP only; uTP peers cannot reach the session then |
 | `torrentd_profile_port_forward_renewals_total` | successful renewals |
-| `torrentd_profile_port_forward_failures_total` | every failed attempt: the gateway did not answer, or it answered with a port the session could not be rebound to |
-| `torrentd_profile_port_forward_rebind_failures_total` | the second kind alone |
+| `torrentd_profile_port_forward_failures_total` | every failed attempt, labelled `stage`: `renew` when the gateway did not answer or refused the lease, `rebind` when it answered with a port the session could not be rebound to |
+| `torrentd_profile_port_forward_rebind_failures_total` | the same count as `stage="rebind"` above |
 | `torrentd_profile_forwarded_port_changes_total` | port changes the session followed |
 | `torrentd_profile_port_change_reannounce_seconds` | histogram: from the gateway naming a new port to the last reannounce being handed to the session |
 | `torrentd_profile_vpn_gateway_reboots_total` | gateway epoch went backwards; the mapping was re-created on the spot |

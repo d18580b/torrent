@@ -67,16 +67,21 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(5);
 /// `rate()` and absence-based alerts resolve on a healthy daemon.
 const COUNTERS: &[&str] = &[
     "profile_port_forward_renewals_total",
-    // Every failure, renewal and rebind alike: kept as it was, so an alert
-    // written against it keeps meaning what it meant.
-    "profile_port_forward_failures_total",
-    // The subset of the above where the gateway answered with a new port
-    // and the session could not be rebound to it. The difference between
-    // the two is the renewals the gateway did not answer.
+    // Equal to `profile_port_forward_failures_total{stage="rebind"}`; kept so
+    // a query written against it keeps meaning what it meant.
     "profile_port_forward_rebind_failures_total",
     "profile_forwarded_port_changes_total",
     "profile_vpn_gateway_reboots_total",
 ];
+
+/// Every failed attempt, by the step that failed: `renew` when the gateway
+/// did not answer or refused the lease (a provider-side problem), `rebind`
+/// when it answered with a new port the session could not be rebound to (a
+/// local one).
+const FAILURES: &str = "profile_port_forward_failures_total";
+
+/// The `stage` values of [`FAILURES`], each seeded at zero.
+const FAILURE_STAGES: [&str; 2] = ["renew", "rebind"];
 
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
@@ -110,6 +115,13 @@ pub async fn run(
         }
         for name in COUNTERS {
             metrics.add_counter(name, 0, &labels);
+        }
+        for stage in FAILURE_STAGES {
+            metrics.add_counter(
+                FAILURES,
+                0,
+                &[("profile_id", e.id().as_str()), ("stage", stage)],
+            );
         }
     }
 
@@ -374,7 +386,10 @@ pub(crate) fn record_outcome(
             true
         }
         RenewOutcome::RebindFailed { previous, new } => {
-            metrics.inc_counter("profile_port_forward_failures_total", &labels);
+            metrics.inc_counter(
+                FAILURES,
+                &[("profile_id", profile_id.as_str()), ("stage", "rebind")],
+            );
             metrics.inc_counter("profile_port_forward_rebind_failures_total", &labels);
             metrics.set_gauge("profile_port_forward_up", 0.0, &labels);
             e.update_health(|h| h.port_forward_ok = false);
@@ -386,7 +401,10 @@ pub(crate) fn record_outcome(
             false
         }
         RenewOutcome::RenewFailed(err) => {
-            metrics.inc_counter("profile_port_forward_failures_total", &labels);
+            metrics.inc_counter(
+                FAILURES,
+                &[("profile_id", profile_id.as_str()), ("stage", "renew")],
+            );
             metrics.set_gauge("profile_port_forward_up", 0.0, &labels);
             e.update_health(|h| h.port_forward_ok = false);
             warn!(
@@ -606,6 +624,18 @@ mod tests {
         ));
 
         assert_eq!(sink.count_for("profile_port_forward_failures_total"), 2);
+        let stages: Vec<String> = sink
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                MetricCall::IncCounter { name, labels } if name == FAILURES => labels
+                    .into_iter()
+                    .find(|(k, _)| k == "stage")
+                    .map(|(_, v)| v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stages, ["renew", "rebind"], "each failure names its stage");
         assert_eq!(
             sink.count_for("profile_port_forward_rebind_failures_total"),
             1

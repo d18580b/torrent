@@ -75,7 +75,7 @@ hold.
 | `torrentd_profile_port_forward_up` | gauge | `profile_id` | each natpmp profile | from boot: live natpmp profiles | 1 while the NAT-PMP lease is held. |
 | `torrentd_profile_forwarded_port` | gauge | `profile_id` | each natpmp profile | from boot: live natpmp profiles | The forwarded port. |
 | `torrentd_profile_port_forward_renewals_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | NAT-PMP lease renewals. |
-| `torrentd_profile_port_forward_failures_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | NAT-PMP renewals or rebinds that failed. |
+| `torrentd_profile_port_forward_failures_total` | counter | `profile_id`; `stage`: `renew`, `rebind` | each natpmp profile | from boot: live natpmp profiles | NAT-PMP attempts that failed, by stage: renew when the gateway did not answer or refused the lease, rebind when it named a new port the session could not be rebound to. |
 | `torrentd_profile_port_forward_rebind_failures_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | The failures above where the gateway named a new port and the session could not be rebound to it. |
 | `torrentd_profile_forwarded_port_changes_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | Times the gateway handed out a different port. |
 | `torrentd_profile_vpn_gateway_reboots_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | Gateway epoch resets observed by NAT-PMP. |

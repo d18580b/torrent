@@ -197,6 +197,50 @@ tests:
             exp_annotations:
               summary: "Profile acct_a holds no NAT-PMP lease; incoming connections are not forwarded"
 
+  # Each stage fires its own alert and leaves the other quiet.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_port_forward_failures_total{profile_id="acct_a", stage="renew"}'
+        values: '0 0 1 1'
+      - series: 'torrentd_profile_port_forward_failures_total{profile_id="acct_a", stage="rebind"}'
+        values: '0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdPortForwardRenewFailed
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdPortForwardRenewFailed
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              profile_id: acct_a
+              stage: renew
+            exp_annotations:
+              summary: "The NAT-PMP gateway did not renew profile acct_a's lease; a provider-side problem, retried in seconds"
+      - eval_time: 3m
+        alertname: TorrentdPortForwardRebindFailed
+        exp_alerts: []
+
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_port_forward_failures_total{profile_id="acct_a", stage="renew"}'
+        values: '0 0 0 0'
+      - series: 'torrentd_profile_port_forward_failures_total{profile_id="acct_a", stage="rebind"}'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: TorrentdPortForwardRebindFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              stage: rebind
+            exp_annotations:
+              summary: "Profile acct_a's session could not be rebound to the port the gateway forwarded; it still listens on the old one"
+      - eval_time: 3m
+        alertname: TorrentdPortForwardRenewFailed
+        exp_alerts: []
+
   - interval: 1m
     input_series:
       - series: 'torrentd_listen_failure_active{profile_id="acct_a"}'
