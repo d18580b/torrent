@@ -924,13 +924,17 @@ fn host_checks(
                     .iter()
                     .filter_map(|p| p.vpn_interface().map(str::to_string))
                     .collect();
-                let ruleset = vpn::killswitch::render_ruleset(uid, &tunnels);
-                let verdict = judge_nft_check(
-                    host.nft_check(&ruleset),
-                    host.has_cap_net_admin(),
-                    uid,
-                    &ruleset,
-                );
+                // A name the renderer refuses is the same boot abort as a
+                // ruleset `nft` rejects, reported before any `nft` runs.
+                let verdict = match vpn::killswitch::render_ruleset(uid, &tunnels) {
+                    Ok(ruleset) => judge_nft_check(
+                        host.nft_check(&ruleset),
+                        host.has_cap_net_admin(),
+                        uid,
+                        &ruleset,
+                    ),
+                    Err(e) => Check::fail("kill_switch_ruleset", e.to_string()),
+                };
                 attribute_ruleset_rejection(verdict, cfg, only, uid, host)
             }
         });
@@ -986,7 +990,11 @@ fn attribute_ruleset_rejection(
         .iter()
         .filter_map(|p| p.vpn_interface().map(str::to_string))
         .collect();
-    let scoped_ruleset = vpn::killswitch::render_ruleset(uid, &scoped);
+    // The selected profile's own name cannot be rendered: it owns the
+    // rejection, and the verdict stands.
+    let Ok(scoped_ruleset) = vpn::killswitch::render_ruleset(uid, &scoped) else {
+        return verdict;
+    };
     let scoped_parses = match host.nft_check(&scoped_ruleset) {
         Ok(o) => {
             o.status.success() || !nft_rejected_the_ruleset(&String::from_utf8_lossy(&o.stderr))
@@ -3042,6 +3050,137 @@ http_listen = "127.0.0.1:8080"
             events.iter().any(|e| e.starts_with("tool_available ip"))
                 && events.iter().any(|e| e.starts_with("nft_check")),
             "host_checks reaches the host only through CheckHost: {events:?}",
+        );
+    }
+
+    /// #33: a name the renderer refuses is a `fail` naming it, reached before
+    /// any `nft` runs — not a ruleset handed to `nft` to reject with a line
+    /// number in stdin. Parsed without `Config::validate`, which would refuse
+    /// the name first, so this reaches the renderer's own guard.
+    #[test]
+    fn an_unrenderable_interface_fails_the_ruleset_check_without_nft() {
+        let mut cfg = cfg_with_tables(
+            r#"
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg}x.conf"
+vpn_interface        = "wg}x"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+"#,
+        );
+        cfg.network_kill_switch = true;
+        let host = FakeHost::new().with_uid(998).with_nft([(0, "")]);
+
+        let checks = host_checks(&cfg, None, None, &host);
+
+        let ruleset = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
+        assert_eq!(ruleset.verdict, Verdict::Fail, "detail: {}", ruleset.detail);
+        assert!(
+            ruleset.detail.contains("\"wg}x\""),
+            "detail: {}",
+            ruleset.detail
+        );
+        assert!(
+            !host.events().iter().any(|e| e.starts_with("nft_check")),
+            "nothing unparseable is handed to nft: {:?}",
+            host.events(),
+        );
+    }
+
+    /// #33 under `--profile`: a render refusal goes through
+    /// `attribute_ruleset_rejection` like an `nft` rejection does. When the
+    /// selected profile's own name is the one refused, the scoped render is
+    /// refused too and the `fail` stands. When only an excluded profile's name
+    /// is refused, the scoped ruleset renders and parses, and the verdict is
+    /// downgraded to `skip` naming the excluded profile.
+    #[test]
+    fn a_render_refusal_is_attributed_to_the_profile_whose_name_was_refused() {
+        let mut cfg = cfg_with_tables(
+            r#"
+[[profile]]
+id                   = "acct_a"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg-acct-a.conf"
+vpn_interface        = "wg-acct-a"
+listen_port          = 6881
+peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent           = "qBittorrent/5.0.3"
+
+[[profile]]
+id                   = "acct_b"
+network              = "vpn"
+vpn_type             = "wireguard"
+vpn_config           = "/etc/wireguard/wg}x.conf"
+vpn_interface        = "wg}x"
+listen_port          = 6882
+peer_fingerprint_hex = "b1b2c3d4e5f60718"
+user_agent           = "Transmission/4.0.5"
+"#,
+        );
+        cfg.network_kill_switch = true;
+
+        // The selected profile owns the refused name: the scoped render is
+        // refused as well, so the early return keeps the `fail`, and no
+        // ruleset of any kind reaches nft.
+        let host = FakeHost::new();
+        let checks = host_checks(&cfg, Some(2000), Some("acct_b"), &host);
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
+        assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+        assert!(c.detail.contains("\"wg}x\""), "detail: {}", c.detail);
+        assert!(
+            !host.events().iter().any(|e| e.starts_with("nft_check")),
+            "a refused scoped render hands nothing to nft: {:?}",
+            host.events(),
+        );
+        let report = Report {
+            host: checks,
+            profiles: Vec::new(),
+        };
+        assert_ne!(
+            report.exit_code(),
+            EXIT_OK,
+            "the selected profile's refusal decides the run"
+        );
+
+        // Only an excluded profile's name is refused: the selected profile's
+        // ruleset renders and parses, so the refusal is reported against the
+        // excluded profile without deciding the run.
+        let host = FakeHost::new().with_nft([(0, "")]);
+        let checks = host_checks(&cfg, Some(2000), Some("acct_a"), &host);
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
+        assert_eq!(c.verdict, Verdict::Skip, "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("\"wg}x\"") && c.detail.contains("wg}x (profile acct_b)"),
+            "the refused name and the excluded profile that owns it are both named: {}",
+            c.detail,
+        );
+        let nft_calls: Vec<String> = host
+            .events()
+            .into_iter()
+            .filter(|e| e.starts_with("nft_check"))
+            .collect();
+        assert_eq!(
+            nft_calls.len(),
+            1,
+            "only the scoped ruleset is dry-run: {nft_calls:?}"
+        );
+        assert!(
+            nft_calls[0].contains("wg-acct-a") && !nft_calls[0].contains("wg}x"),
+            "the dry-run ruleset holds the selected profile's interface alone: {nft_calls:?}",
+        );
+        let report = Report {
+            host: checks,
+            profiles: Vec::new(),
+        };
+        assert_eq!(
+            report.exit_code(),
+            EXIT_OK,
+            "an excluded profile's refusal does not colour a scoped run"
         );
     }
 

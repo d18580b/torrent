@@ -628,6 +628,13 @@ pub enum ProfileConfigError {
     MissingListenPort(String),
     #[error("vpn_interface {0:?} appears more than once")]
     DuplicateInterface(String),
+    #[error(
+        "profile {profile:?}: vpn_interface {iface:?} is not a usable interface name: a name \
+         may be 1-15 characters of [A-Za-z0-9_=+.-] only, and not \".\" or \"..\". The kernel \
+         refuses a longer device name, and the network kill switch writes this name into an \
+         nftables ruleset that cannot carry any other character"
+    )]
+    BadInterface { profile: String, iface: String },
     /// Two profiles announce one peer-id prefix.
     ///
     /// `key` is the key the *operator wrote*, which is not always the one this
@@ -787,6 +794,27 @@ impl ProfileConfig {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     }
 
+    /// `[A-Za-z0-9_=+.-]{1,15}`, excluding `.` and `..`.
+    ///
+    /// A `vpn_interface` is a Linux device name, and it is interpolated into
+    /// the kill switch's nftables ruleset as a quoted string. The kernel's own
+    /// rule (`dev_valid_name`) caps a name at 15 bytes (`IFNAMSIZ` less the
+    /// NUL) and refuses `/`, `:`, whitespace, `.` and `..`, but it accepts a
+    /// `"`, which closes the ruleset's quoted token early, so the kernel's rule
+    /// alone would still let a name through that the ruleset cannot carry.
+    /// This set is the one `wg-quick` enforces on the interface it names after
+    /// its config file; every character in it is also safe inside an nftables
+    /// quoted string.
+    pub fn is_valid_interface_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.len() <= 15
+            && name != "."
+            && name != ".."
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'=' | b'+' | b'.' | b'-'))
+    }
+
     /// Validate the whole configured set.
     ///
     /// Called at startup and on SIGHUP. Most rules here are uniqueness rules:
@@ -926,6 +954,17 @@ impl ProfileConfig {
                             // Assigned by the gateway at runtime, and unique by
                             // construction.
                         }
+                    }
+                    // Shape before uniqueness: a name the kernel would never
+                    // accept, or one the kill switch's ruleset cannot carry,
+                    // otherwise passes `--check-config` and then aborts boot
+                    // with an `nft` syntax error pointing at a file the
+                    // operator never wrote.
+                    if !Self::is_valid_interface_name(vpn_interface) {
+                        return Err(ProfileConfigError::BadInterface {
+                            profile: p.id.as_str().to_string(),
+                            iface: vpn_interface.clone(),
+                        });
                     }
                     if !seen_iface.insert(vpn_interface.clone()) {
                         return Err(ProfileConfigError::DuplicateInterface(
@@ -1491,6 +1530,56 @@ mod tests {
             cfg("b", 6882, "wg1", "9f8e7d6c5b4a3210", "Transmission/4.0.6"),
         ];
         ProfileConfig::validate_set(&profiles).unwrap();
+    }
+
+    /// A name the kill switch's ruleset cannot carry, or the kernel would
+    /// never create, is refused at load with the profile and value named —
+    /// rather than passing `--check-config` and aborting boot inside `nft`.
+    /// The config path is set to match, so the wireguard stem rule that runs
+    /// after this one cannot be what refuses it.
+    #[test]
+    fn malformed_vpn_interface_rejected() {
+        for bad in [
+            "",
+            "wg\"x",
+            "wg}x",
+            "wg\nx",
+            "wg x",
+            "wg/x",
+            "wg:x",
+            ".",
+            "..",
+            "sixteen-chars-xx",
+        ] {
+            let profiles = vec![cfg("a", 6881, bad, "a1b2c3d4e5f60718", "ua-a")];
+            match ProfileConfig::validate_set(&profiles) {
+                Err(ProfileConfigError::BadInterface { profile, iface }) => {
+                    assert_eq!(profile, "a");
+                    assert_eq!(iface, bad);
+                }
+                other => panic!("{bad:?} must be refused as BadInterface, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn well_formed_vpn_interface_names_accepted() {
+        for good in [
+            "wg0",
+            "proton-a",
+            "wg-acct-a",
+            "tun_b.1",
+            "wg=+",
+            "fifteen-chars-x",
+        ] {
+            assert!(
+                ProfileConfig::is_valid_interface_name(good),
+                "{good:?} is a usable device name",
+            );
+            let profiles = vec![cfg("a", 6881, good, "a1b2c3d4e5f60718", "ua-a")];
+            ProfileConfig::validate_set(&profiles)
+                .unwrap_or_else(|e| panic!("{good:?} must be accepted, got {e}"));
+        }
     }
 
     #[test]
