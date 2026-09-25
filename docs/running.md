@@ -40,6 +40,13 @@ runtime and are easy to miss because nothing checks for them at startup:
 
 A deployment whose profiles are all `network = "host"` needs none of them.
 
+The daemon runs each of them by bare name, looked up on its own `PATH`, and
+treats that environment as trusted: whoever can set it can also change
+`ExecStart=`. The packaged unit sets no `PATH`, so systemd's default for
+system services applies. Do not put a directory writable by anyone but root
+on it. `--check-config` probes only `nft`; `torrentd --config <path> vpn
+check` (§9) checks the rest.
+
 **The shipped container image is WireGuard-only.** `deploy/Containerfile`'s
 runtime layer installs `iproute`, `wireguard-tools`, `nftables` and
 `procps-ng`, and no `openvpn`, so a profile configured `vpn_type = "openvpn"`
@@ -128,12 +135,21 @@ What the daemon does and does not create:
   scan-time error, not a config error.
 
 The daemon also writes small state files of its own, beside the resume data, in
-**the parent of `resume_dir`** (`/var/lib/torrentd` under the shipped unit).
-Each writer that puts a file there creates the directory first, so the
-directory appears the **first time one of those files is written** and not at
-startup: a deployment with no `vpn` profile has neither of the two files below, and may never have the directory at all. Both kinds are
-safe to delete **while the daemon is stopped**, and neither is safe to delete
+**the parent of `resume_dir`** (`/var/lib/torrentd` under the shipped unit),
+and creates that directory at startup if it is missing. Every file below is
+safe to delete **while the daemon is stopped**, and none is safe to delete
 while it is running:
+
+- **`torrentd.lock`** — the single-instance lock. Startup takes an exclusive
+  lock on it before anything else and holds it until the daemon has shut down,
+  so a second `torrentd` against the same state directory exits at once
+  (status 70) with `… is already running against this state directory` and the
+  running daemon's pid, having touched nothing (§12). The file holds that pid.
+  The lock is the kernel's and goes with the process, however it ends, so
+  there is never a stale one to clear after a crash. Delete the file while the
+  daemon runs and the next start no longer sees it.
+
+A deployment with no `vpn` profile has neither of the next two:
 
 - **`openvpn-<iface>.pid`** — the pid `openvpn --writepid` recorded for an
   OpenVPN profile. It is the only handle the teardown has on that process, and it
@@ -226,7 +242,7 @@ Every profile takes `id` plus `network`, and then:
 | `vpn_type`, `vpn_config`, `vpn_interface` | **required**. `vpn_interface` must equal `vpn_config`'s file stem — wg-quick derives one from the other in both directions. |
 | `listen_port` | required for `port_forward = "static"` (the default); omitted for `"natpmp"` |
 | `port_forward`, `port_forward_gateway` | default `static`, and `10.2.0.1` |
-| `peer_fingerprint_hex`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client. |
+| `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters, such as `"-XX0002-"` — in the same form as the top-level key it overrides. |
 
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
@@ -307,7 +323,7 @@ network namespace.
 
 Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
 `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
-`peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all
+`peer_fingerprint`, `user_agent`, `resume_dir` and `torrent_dir` must all
 be unique across profiles.
 
 **`[pool]`** (optional) — `roots` (required, must not nest and must not contain
@@ -348,8 +364,15 @@ that had no `[[slot]]` needs one `network = "host"` profile carrying the
   is valid either way. Leave the key out to inherit; any other value carries
   over unchanged.
 - Every other key — `id`, `vpn_type`, `vpn_interface`, `listen_port`,
-  `peer_fingerprint_hex`, `user_agent`, `allowed_tracker_domains`,
-  `port_forward`, `port_forward_gateway` — keeps its name and meaning.
+  `user_agent`, `allowed_tracker_domains`, `port_forward`,
+  `port_forward_gateway` — keeps its name and meaning.
+- **Replace `peer_fingerprint_hex` with `peer_fingerprint`.** The old key was
+  documented as sixteen hex characters, and nothing decoded them: libtorrent
+  was handed the sixteen characters themselves, not the eight bytes they
+  spelled. `peer_fingerprint` takes the 8-character prefix as written — the
+  same form as the top-level key — so write the prefix you meant, such as
+  `"-XX0002-"`. A profile that still sets `peer_fingerprint_hex` is refused at
+  load with that key named.
 
 **2. Give a profile the id your registry already uses, or clear the entries.**
 The assignment registry — which torrent belongs to which account — is migrated
@@ -821,7 +844,7 @@ is configured; `read` and `metrics` tokens are refused. It reloads exactly what
 `SIGHUP` reloads, and reports the same warnings for a `[[profile]]` field that
 changed and cannot be applied without a restart: the Safety Rule 7 warning
 (`profile identity change requires daemon restart`) where the field is an
-identity — the network block, `peer_fingerprint_hex`, `user_agent` — and the
+identity — the network block, `peer_fingerprint`, `user_agent` — and the
 ordinary non-reloadable-field warning where it is not: `upload_rate_limit`,
 `allowed_tracker_domains`, and the two store directories. The field name is on
 the event either way.
@@ -1107,6 +1130,13 @@ On a scratch pool, not your real one.
    repository: the renewal, rebind and reannounce are tested against a fake
    NAT-PMP gateway and a mock session. Record the result here when it has.
 
+   The ruleset also confines the daemon's **replies**: a request to
+   `http_listen` that arrives on a physical interface — the web client, the
+   API, a Prometheus scrape of `/metrics` — connects and then hangs, because
+   the response leaves from a socket the daemon's uid owns. Over loopback, or
+   through a tunnel, it works. With the kill switch on, reach the API through
+   a reverse proxy on the same host (§6a) or scrape from inside the tunnel.
+
 ## 12. Capturing a log
 
 What a bug report needs ([`CONTRIBUTING.md`](../CONTRIBUTING.md#reporting-bugs)
@@ -1168,18 +1198,16 @@ per-service rate limit. A `Suppressed N messages` line in the journal means
 lines were dropped; say so in the report, and keep `debug` on only for the
 reproduction itself.
 
-**Do not start a second copy by hand to watch its output.** Nothing stops one:
-the daemon takes no single-instance lock. A second `torrentd --config …` reads
-the same config and state directory, and binds the HTTP port last: before it,
-wherever it has the privileges to get that far, it has replaced the
-kill-switch table (§11, drill 6), brought up tunnels, and opened the resume
-directory and pool index. When the bind then fails against the running
-daemon's port, it shuts down the way a signalled daemon does: it writes resume
-data, deletes the `inet torrentd_ks` table — the running daemon's kill switch,
-since there is only one — and brings down every `vpn` profile's interface by
-name, the running daemon's tunnels included. If you stop the service to run
-it by hand instead, start the service again afterwards: `Restart=on-failure`
-does not bring back a unit that was stopped.
+**A second copy started by hand will not run beside the service.** A second
+`torrentd --config …` against the same config finds the running daemon's
+`torrentd.lock` (§4) and exits at once, naming its pid, before it touches the
+kill switch, a tunnel or a state file — so it shows nothing of the running
+daemon's behaviour; the journal above is where that is. The lock is per state
+directory: a copy pointed at a different `resume_dir` is not stopped by it,
+and with `network_kill_switch` it would still replace the one `inet
+torrentd_ks` table the host has (§11, drill 6). If you stop the service to
+run it by hand instead, start the service again afterwards:
+`Restart=on-failure` does not bring back a unit that was stopped.
 
 ## Troubleshooting
 

@@ -193,6 +193,76 @@ fn daemon_http_bind_failure_still_drains() {
     );
 }
 
+/// A second daemon against the same state directory refuses at once, naming
+/// the running one, and leaves it serving.
+///
+/// The second start is given ports of its own, so nothing but the
+/// single-instance lock can stop it. Without the lock it came up healthy
+/// beside the first — and with `network_kill_switch` it would have replaced
+/// the first one's nftables table on the way, which is the harm the lock is
+/// for and which needs a VPN to observe directly.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_second_daemon_on_the_same_state_dir_refuses_and_leaves_the_first_running() {
+    const HTTP: &str = "127.0.0.1:18095";
+    const HTTP_SECOND: &str = "127.0.0.1:18096";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let mut first = spawn_daemon(p, 16895, HTTP);
+    wait_healthy(HTTP);
+
+    // Same state directory, different ports. The first daemon has already
+    // read `cfg.toml`, so rewriting it for the second changes nothing for it.
+    let cfg = write_config(p, 16896, HTTP_SECOND);
+    let mut second = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn second daemon");
+
+    let exited = wait_exit(&mut second, Duration::from_secs(10));
+    let mut out = String::new();
+    second
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .unwrap();
+    second
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut out)
+        .unwrap();
+    assert!(
+        exited,
+        "the second daemon did not refuse within 10s; output: {out}"
+    );
+    assert_eq!(
+        second.wait().unwrap().code(),
+        Some(70),
+        "a refused start exits 70 like every other startup failure; output: {out}"
+    );
+    assert!(
+        out.contains("single-instance lock") && out.contains(&format!("pid {}", first.id())),
+        "the refusal names the lock and the running daemon's pid: {out}"
+    );
+    assert!(
+        TcpStream::connect(HTTP_SECOND).is_err(),
+        "the second daemon got as far as binding its HTTP port"
+    );
+
+    // The first is untouched and still serving.
+    assert_eq!(http(HTTP, "GET", "/healthz", None).0, 200);
+    sigterm(&first);
+    assert!(
+        wait_exit(&mut first, Duration::from_secs(30)),
+        "daemon did not exit within 30s of SIGTERM"
+    );
+}
+
 /// Graceful shutdown must stay graceful under load: with many torrents added,
 /// a SIGTERM still drains and exits within the timeout and persists session
 /// state. Guards against a shutdown coordinator that hangs as torrent count

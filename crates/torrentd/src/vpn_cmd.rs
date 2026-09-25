@@ -1908,7 +1908,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 resume_dir           = "/tmp/torrentd-test/state/resume/acct_a"
 torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
@@ -1954,7 +1954,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 "#;
 
@@ -1974,7 +1974,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 port_forward         = "natpmp"
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 resume_dir           = "/tmp/torrentd-test/state/resume/acct_a"
 torrent_dir          = "/tmp/torrentd-test/torrents/acct_a"
@@ -1998,7 +1998,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-b.conf"
 vpn_interface        = "wg-acct-b"
 listen_port          = 6882
-peer_fingerprint_hex = "b1b2c3d4e5f60718"
+peer_fingerprint = "-BB1000-"
 user_agent           = "Transmission/4.0.5"
 resume_dir           = "/tmp/torrentd-test/state/resume/acct_b"
 torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
@@ -3079,7 +3079,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg}x.conf"
 vpn_interface        = "wg}x"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 "#,
         );
@@ -3119,7 +3119,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface        = "wg-acct-a"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 
 [[profile]]
@@ -3129,7 +3129,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg}x.conf"
 vpn_interface        = "wg}x"
 listen_port          = 6882
-peer_fingerprint_hex = "b1b2c3d4e5f60718"
+peer_fingerprint = "-BB1000-"
 user_agent           = "Transmission/4.0.5"
 "#,
         );
