@@ -48,6 +48,19 @@ enum AddSource {
 pub struct ListQuery {
     after: Option<String>,
     limit: Option<usize>,
+    /// Only the torrents the assignment registry gives this profile. 404 for
+    /// an id no `[[profile]]` declares, as `/profiles/:id/torrents` answers.
+    profile_id: Option<String>,
+}
+
+/// The cursor half of [`ListQuery`], for routes already scoped to one
+/// profile. Separate rather than `#[serde(flatten)]`ed: flattening through
+/// `serde_urlencoded` hands every value over as a string, so `limit` would no
+/// longer parse as a number.
+#[derive(Deserialize, Default)]
+pub struct PageQuery {
+    pub(crate) after: Option<String>,
+    pub(crate) limit: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -67,8 +80,8 @@ pub struct TorrentSummary {
 
 #[derive(Serialize)]
 pub struct ListResponse {
-    items: Vec<TorrentSummary>,
-    next_cursor: Option<String>,
+    pub(crate) items: Vec<TorrentSummary>,
+    pub(crate) next_cursor: Option<String>,
 }
 
 /// Build the wire summary for one torrent (registry profile + live state).
@@ -92,11 +105,45 @@ pub(crate) fn summarize(s: &AppState, ih: &InfoHash, profile: &ProfileId) -> Tor
     }
 }
 
-pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Json<ListResponse> {
+pub async fn list(
+    State(s): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<ListResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let mut all = s.registry.entries();
+    if let Some(id) = q.profile_id {
+        let profile_id = ProfileId::new(id);
+        // A failed profile's assignments are listed, as on
+        // `/profiles/:id/torrents`: this reads the registry, not an engine.
+        if matches!(
+            s.profiles.resolve(&profile_id),
+            crate::profile_registry::Resolution::Unknown
+        ) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "unknown profile_id"})),
+            ));
+        }
+        all.retain(|(_, p)| *p == profile_id);
+    }
+    let page = PageQuery {
+        after: q.after,
+        limit: q.limit,
+    };
+    Ok(Json(paginate(&s, all, &page)))
+}
+
+/// One page of `all`, ordered by info-hash, starting after the `after` cursor.
+///
+/// Shared by `GET /api/torrents` and `GET /api/profiles/:id/torrents`, so both
+/// read the same `?after=&limit=` and answer the same `{items, next_cursor}`.
+pub(crate) fn paginate(
+    s: &AppState,
+    mut all: Vec<(InfoHash, ProfileId)>,
+    q: &PageQuery,
+) -> ListResponse {
     let limit = q.limit.unwrap_or(DEFAULT_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE);
     let after = q.after.as_deref().and_then(InfoHash::from_hex);
 
-    let mut all = s.registry.entries();
     all.sort_by_key(|(ih, _)| ih.0);
     let start = match after {
         Some(a) => all
@@ -114,10 +161,10 @@ pub async fn list(State(s): State<AppState>, Query(q): Query<ListQuery>) -> Json
 
     let items = all[start..end]
         .iter()
-        .map(|(ih, profile)| summarize(&s, ih, profile))
+        .map(|(ih, profile)| summarize(s, ih, profile))
         .collect();
 
-    Json(ListResponse { items, next_cursor })
+    ListResponse { items, next_cursor }
 }
 
 pub async fn get(
@@ -713,6 +760,65 @@ pub async fn resume(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /api/torrents/:infohash/recheck`.
+///
+/// Re-hash the payload against the piece hashes. 202: libtorrent checks
+/// asynchronously and the torrent's `phase` reports the progress. This used to
+/// be reachable only through `POST /api/pool/verify`, so a daemon without
+/// `[pool]` had no way to re-verify a torrent at all.
+///
+/// A recheck drops `SEED_MODE`, which is safe because the no-download
+/// invariant rests on `UPLOAD_MODE` (see `torrentd_engine::policy`), and that
+/// flag survives it.
+pub async fn recheck(
+    State(s): State<AppState>,
+    Path(infohash): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (st, engine) = lookup_unfenced_engine(&s, &infohash)?;
+    engine.force_recheck(st.handle).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        )
+    })?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// `POST /api/torrents/:infohash/reannounce`.
+///
+/// Announce to every tracker now — after a passkey rotation or a tracker's
+/// "not registered", which otherwise waited for the next interval or a daemon
+/// restart. 202: the outcome arrives as tracker alerts.
+pub async fn reannounce(
+    State(s): State<AppState>,
+    Path(infohash): Path<String>,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
+    let (st, engine) = lookup_unfenced_engine(&s, &infohash)?;
+    engine.force_reannounce(st.handle).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        )
+    })?;
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// [`lookup_engine`], refusing a torrent whose profile the VPN monitor fenced.
+///
+/// Both routes that use it act on a torrent the fence paused: an announce
+/// with the tunnel down has nowhere safe to go, and a recheck is a step
+/// towards resuming, which `resume` already refuses there.
+fn lookup_unfenced_engine(
+    s: &AppState,
+    infohash: &str,
+) -> Result<(torrentd_engine::TorrentState, EngineRef), AddError> {
+    let (st, engine) = lookup_engine(s, infohash)?;
+    if s.profile_vpn_down(&st.profile_id) {
+        return Err(vpn_down());
+    }
+    Ok((st, engine))
+}
+
 #[derive(Deserialize)]
 pub struct UploadLimitBody {
     /// Bytes per second; 0 = unlimited.
@@ -1209,6 +1315,231 @@ mod tests {
             msg.contains("assignment could not be cleared"),
             "the operator has to know which half failed: {msg}",
         );
+    }
+
+    // -----------------------------------------------------------------
+    // #23 — recheck, reannounce, and the `profile_id` filter.
+    // -----------------------------------------------------------------
+
+    /// `test_state` with profile `p`'s engine kept where the test can read its
+    /// calls, and one torrent loaded into it.
+    fn state_with_a_loaded_torrent(
+        dir: &std::path::Path,
+        profiles: Option<Arc<crate::profile_registry::ProfileRegistry>>,
+    ) -> (
+        AppState,
+        Arc<torrentd_engine::MockEngine>,
+        torrentd_engine::TorrentHandle,
+    ) {
+        let mut app = test_state(dir);
+        if let Some(reg) = profiles {
+            app.profiles = reg;
+        }
+        let engine = Arc::new(torrentd_engine::MockEngine::new());
+        app.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            ProfileId::new("p"),
+            engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]));
+        let ih = InfoHash::from_hex(MAGNET_HEX).unwrap();
+        let h = torrentd_engine::TorrentHandle {
+            id: 7,
+            infohash: ih,
+        };
+        app.state.insert(
+            ih,
+            torrentd_engine::TorrentState::newly_added(
+                h,
+                ProfileId::new("p"),
+                std::time::Instant::now(),
+            ),
+        );
+        (app, engine, h)
+    }
+
+    #[tokio::test]
+    async fn recheck_hands_the_torrent_to_the_engine_without_a_pool() {
+        // Before this route a recheck needed `POST /api/pool/verify`, and so
+        // a `[pool]` section; `test_state` has none.
+        let dir = tempfile::tempdir().unwrap();
+        let (app, engine, h) = state_with_a_loaded_torrent(dir.path(), None);
+        assert!(app.pool.is_none(), "fixture is wrong: no pool configured");
+
+        let code = recheck(State(app), Path(MAGNET_HEX.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert!(engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::ForceRecheck(x) if *x == h)));
+    }
+
+    #[tokio::test]
+    async fn reannounce_hands_the_torrent_to_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, engine, h) = state_with_a_loaded_torrent(dir.path(), None);
+
+        let code = reannounce(State(app), Path(MAGNET_HEX.to_string()))
+            .await
+            .unwrap();
+
+        assert_eq!(code, StatusCode::ACCEPTED);
+        assert!(engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::ForceReannounce(x) if *x == h)));
+    }
+
+    #[tokio::test]
+    async fn recheck_and_reannounce_refuse_a_fenced_profile() {
+        use torrentd_engine::ProfileStatus;
+
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let reg = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "p",
+            ProfileStatus::VpnDown,
+        )]));
+        let (app, engine, _) = state_with_a_loaded_torrent(dir.path(), Some(reg));
+
+        let err = reannounce(State(app.clone()), Path(MAGNET_HEX.to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        let err = recheck(State(app), Path(MAGNET_HEX.to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert!(
+            engine.calls().is_empty(),
+            "a fenced profile's torrent must not announce with the tunnel down",
+        );
+    }
+
+    #[tokio::test]
+    async fn recheck_of_an_unloaded_torrent_is_404_and_bad_hex_is_400() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_state(dir.path());
+        let err = recheck(State(app.clone()), Path(MAGNET_HEX.to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        let err = reannounce(State(app), Path("zz".to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_engine_error_on_reannounce_is_500() {
+        let dir = tempfile::tempdir().unwrap();
+        let (app, engine, _) = state_with_a_loaded_torrent(dir.path(), None);
+        engine.inject_error(
+            "force_reannounce",
+            torrentd_engine::EngineError::MockInjected {
+                op: "force_reannounce",
+                message: "boom".into(),
+            },
+        );
+        let err = reannounce(State(app), Path(MAGNET_HEX.to_string()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    fn list_query(profile_id: Option<&str>) -> ListQuery {
+        ListQuery {
+            after: None,
+            limit: None,
+            profile_id: profile_id.map(str::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_torrent_list_filters_by_profile_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_state(dir.path());
+        app.registry
+            .assign(InfoHash([1; 20]), ProfileId::new("p"))
+            .unwrap();
+        app.registry
+            .assign(InfoHash([2; 20]), ProfileId::new("other"))
+            .unwrap();
+
+        let all = list(State(app.clone()), Query(list_query(None)))
+            .await
+            .unwrap_or_else(|_| panic!("an unfiltered list is served"))
+            .0;
+        assert_eq!(all.items.len(), 2);
+
+        let only_p = list(State(app), Query(list_query(Some("p"))))
+            .await
+            .unwrap_or_else(|_| panic!("a configured profile is a valid filter"))
+            .0;
+        assert_eq!(only_p.items.len(), 1);
+        assert_eq!(only_p.items[0].infohash, InfoHash([1; 20]).to_hex());
+        assert_eq!(only_p.items[0].profile_id, "p");
+    }
+
+    #[tokio::test]
+    async fn filtering_by_an_undeclared_profile_is_404_not_an_empty_list() {
+        // An empty 200 would read as "this account has nothing", which is
+        // what a typo would then tell the operator.
+        let dir = tempfile::tempdir().unwrap();
+        let app = test_state(dir.path());
+        match list(State(app), Query(list_query(Some("typo")))).await {
+            Err(e) => assert_eq!(e.0, StatusCode::NOT_FOUND),
+            Ok(_) => panic!("an id no [[profile]] declares must be 404"),
+        }
+    }
+
+    #[tokio::test]
+    async fn filtering_by_a_failed_profile_lists_its_assignments() {
+        // A profile that failed at bring-up has no engine, but the filter
+        // reads the assignment registry, so its torrents are still listed.
+        use crate::profile_registry::test_failed_profile;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_state(dir.path());
+        app.profiles = Arc::new(
+            ProfileRegistry::new(vec![])
+                .with_failed(vec![test_failed_profile("down", "wg-down did not come up")]),
+        );
+        assert!(
+            matches!(
+                app.profiles.resolve(&ProfileId::new("down")),
+                crate::profile_registry::Resolution::Failed(_)
+            ),
+            "fixture is wrong: `down` must resolve as failed",
+        );
+        app.registry
+            .assign(InfoHash([1; 20]), ProfileId::new("down"))
+            .unwrap();
+        app.registry
+            .assign(InfoHash([2; 20]), ProfileId::new("other"))
+            .unwrap();
+
+        let page = list(State(app), Query(list_query(Some("down"))))
+            .await
+            .unwrap_or_else(|e| panic!("a failed profile must be listed, got {:?}", e.0))
+            .0;
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].infohash, InfoHash([1; 20]).to_hex());
+        assert_eq!(page.items[0].profile_id, "down");
+    }
+
+    #[test]
+    fn the_list_query_parses_limit_as_a_number_alongside_profile_id() {
+        let uri: axum::http::Uri = "/api/torrents?after=00&limit=5&profile_id=acct_a"
+            .parse()
+            .unwrap();
+        let Query(q) = Query::<ListQuery>::try_from_uri(&uri).unwrap();
+        assert_eq!(q.limit, Some(5));
+        assert_eq!(q.profile_id.as_deref(), Some("acct_a"));
     }
 
     #[test]

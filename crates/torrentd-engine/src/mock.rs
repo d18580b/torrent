@@ -58,6 +58,7 @@ pub enum RecordedCall {
     PostUpdates,
     PostStats,
     ForceRecheck(TorrentHandle),
+    ForceReannounce(TorrentHandle),
     MoveStorage {
         handle: TorrentHandle,
         new_path: String,
@@ -336,6 +337,11 @@ impl TorrentEngine for MockEngine {
             });
         }
         Ok(())
+    }
+
+    fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        self.record(RecordedCall::ForceReannounce(h));
+        self.check_error("force_reannounce")
     }
 
     fn move_storage(

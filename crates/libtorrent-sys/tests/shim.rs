@@ -64,7 +64,13 @@ fn null_and_unknown_handle_ops_are_safe() {
         unsafe { lt_torrent_set_upload_limit(s, 999_999, 100) },
         LT_ERR
     );
+    assert_eq!(unsafe { lt_torrent_force_reannounce(s, 0) }, LT_ERR);
+    assert_eq!(unsafe { lt_torrent_force_reannounce(s, 999_999) }, LT_ERR);
     assert_eq!(unsafe { lt_torrent_pause(ptr::null_mut(), 1) }, LT_ERR);
+    assert_eq!(
+        unsafe { lt_torrent_force_reannounce(ptr::null_mut(), 1) },
+        LT_ERR
+    );
     unsafe { lt_session_destroy(s) };
 }
 
