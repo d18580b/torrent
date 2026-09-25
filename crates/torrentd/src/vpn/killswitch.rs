@@ -36,6 +36,20 @@
 //!   it started, when the profile's key matches the live link's (see
 //!   `vpn::wireguard`), and that link's socket is root's, outside the
 //!   ruleset. Neither shipped deployment arranges that on its own.
+//!
+//! **What it cuts off besides leaks: the HTTP API off loopback.** The chain
+//! hooks `output` and matches the socket's owner, and a reply on a connection
+//! someone else opened is still sent from a socket the daemon's uid owns. So a
+//! request to `http_listen` — the API, the web client, a Prometheus scrape of
+//! `/metrics` — that arrives on a physical interface is accepted and its reply
+//! dropped: the client sees a connection that opens and then hangs. Over
+//! loopback, or through a tunnel interface, it works. That is the ruleset
+//! doing what it is for, and it is kept: accepting replies by conntrack
+//! direction would let any of the daemon's listening sockets that accepts a
+//! connection on the bare interface talk over it, which makes the guarantee
+//! rest on how each socket is bound — the application-layer property this
+//! module exists not to depend on. Reach the API through a reverse proxy on the
+//! same host (loopback), or scrape from inside the tunnel.
 
 use std::io;
 use std::io::Write;
