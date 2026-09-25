@@ -40,6 +40,13 @@ runtime and are easy to miss because nothing checks for them at startup:
 
 A deployment whose profiles are all `network = "host"` needs none of them.
 
+The daemon runs each of them by bare name, looked up on its own `PATH`, and
+treats that environment as trusted: whoever can set it can also change
+`ExecStart=`. The packaged unit sets no `PATH`, so systemd's default for
+system services applies. Do not put a directory writable by anyone but root
+on it. `--check-config` probes only `nft`; `torrentd --config <path> vpn
+check` (§9) checks the rest.
+
 **The shipped container image is WireGuard-only.** `deploy/Containerfile`'s
 runtime layer installs `iproute`, `wireguard-tools`, `nftables` and
 `procps-ng`, and no `openvpn`, so a profile configured `vpn_type = "openvpn"`
@@ -1021,6 +1028,13 @@ On a scratch pool, not your real one.
      up and is not this profile's" row below for the refusals). The shipped
      container image runs the daemon as uid 1000 and raises no links, so it
      cannot run the kill switch with a working tunnel either.
+
+   The ruleset also confines the daemon's **replies**: a request to
+   `http_listen` that arrives on a physical interface — the web client, the
+   API, a Prometheus scrape of `/metrics` — connects and then hangs, because
+   the response leaves from a socket the daemon's uid owns. Over loopback, or
+   through a tunnel, it works. With the kill switch on, reach the API through
+   a reverse proxy on the same host (§6a) or scrape from inside the tunnel.
 
 ## Troubleshooting
 
