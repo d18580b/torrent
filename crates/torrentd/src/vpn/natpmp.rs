@@ -203,12 +203,13 @@ impl PortForwarder for NatpmpForwarder {
             .map_err(|e| PortForwardError::Io(format!("connect {}: {e}", req.gateway)))?;
 
         // TCP carries inbound BitTorrent peers, so map it first and let it be
-        // authoritative. Then ask for a UDP (uTP) mapping on the *same* external
-        // port so libtorrent — which binds TCP + uTP to one listen port — gets a
-        // consistent forward.
-        let (tcp_port, epoch) = self.map_one(&sock, OP_MAP_TCP, req, 0)?;
-        match self.map_one(&sock, OP_MAP_UDP, req, tcp_port) {
-            Ok((udp_port, _)) if udp_port == tcp_port => {}
+        // authoritative, suggesting the port the caller already holds (0 on
+        // the first negotiation) so a renewal asks to keep it. Then ask for a
+        // UDP (uTP) mapping on the *same* external port so libtorrent — which
+        // binds TCP + uTP to one listen port — gets a consistent forward.
+        let (tcp_port, epoch) = self.map_one(&sock, OP_MAP_TCP, req, req.suggested_port)?;
+        let udp_mapped = match self.map_one(&sock, OP_MAP_UDP, req, tcp_port) {
+            Ok((udp_port, _)) if udp_port == tcp_port => true,
             Ok((udp_port, _)) => {
                 // Gateway wouldn't honour the suggestion. A UDP mapping on a
                 // different port is useless (we can't split the listen port), so
@@ -236,20 +237,25 @@ impl PortForwarder for NatpmpForwarder {
                         "NAT-PMP gateway assigned divergent UDP/TCP ports; leaving the UDP mapping to expire (this client deletes nothing)",
                     );
                 }
+                false
             }
             Err(e) => {
-                // UDP is best-effort for a seeder; TCP already succeeded.
+                // UDP is best-effort for a seeder; TCP already succeeded. The
+                // caller reports `udp_mapped = false` as a metric, since uTP
+                // peers cannot reach the session until a renewal maps it.
                 warn!(
                     target: "torrentd::vpn::natpmp",
                     tcp_port,
                     error.cause = %e,
                     "NAT-PMP UDP mapping failed; proceeding with TCP only",
                 );
+                false
             }
-        }
+        };
         Ok(MapResult {
             port: tcp_port,
             epoch,
+            udp_mapped,
         })
     }
 }
@@ -438,6 +444,18 @@ mod tests {
         }
     }
 
+    /// A request against a loopback fake gateway, the way the daemon builds
+    /// one: the fixed internal port and the caller's suggested external port.
+    fn loopback_req(suggested_port: u16) -> PortMapRequest {
+        PortMapRequest {
+            gateway: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            internal_port: PortMapRequest::INTERNAL_PORT,
+            suggested_port,
+            lifetime_secs: 60,
+        }
+    }
+
     #[test]
     fn loopback_negotiates_port_over_udp_socket() {
         // Fake NAT-PMP gateway on localhost: answers UDP then TCP with 40001.
@@ -453,14 +471,74 @@ mod tests {
         });
 
         let fwd = test_forwarder(gw_port);
-        let req = PortMapRequest {
-            gateway: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            internal_port: 0,
-            lifetime_secs: 60,
-        };
-        assert_eq!(fwd.map(&req).unwrap().port, 40001);
+        let req = loopback_req(0);
+        let m = fwd.map(&req).unwrap();
+        assert_eq!(m.port, 40001);
+        assert!(m.udp_mapped, "UDP landed on the TCP port");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn a_renewal_names_internal_port_1_and_asks_to_keep_the_held_port() {
+        // What goes on the wire: RFC 6886 reserves internal port 0 for the
+        // delete-all request, and Proton documents `natpmpc -a 1 0 …`. The
+        // TCP request suggests the port the session already listens on; the
+        // UDP request then suggests whatever TCP was given.
+        let gw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let gw_port = gw.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..2 {
+                let mut buf = [0u8; 12];
+                let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+                seen.push(buf);
+                gw.send_to(&success_response(buf[1], 51413), peer).unwrap();
+            }
+            seen
+        });
+
+        let fwd = test_forwarder(gw_port);
+        assert_eq!(fwd.map(&loopback_req(51413)).unwrap().port, 51413);
+        let seen = server.join().unwrap();
+        assert_eq!(seen[0][1], OP_MAP_TCP);
+        assert_eq!(&seen[0][4..6], &1u16.to_be_bytes(), "internal port 1");
+        assert_eq!(
+            &seen[0][6..8],
+            &51413u16.to_be_bytes(),
+            "held port suggested"
+        );
+        assert_eq!(seen[1][1], OP_MAP_UDP);
+        assert_eq!(&seen[1][4..6], &1u16.to_be_bytes(), "internal port 1");
+        assert_eq!(
+            &seen[1][6..8],
+            &51413u16.to_be_bytes(),
+            "TCP's port suggested"
+        );
+    }
+
+    #[test]
+    fn a_failed_udp_mapping_is_reported_not_swallowed() {
+        // TCP maps; the gateway refuses UDP. The TCP port is still the
+        // answer, and the result says uTP peers cannot reach it.
+        let gw = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let gw_port = gw.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let mut buf = [0u8; 12];
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[1], OP_MAP_TCP);
+            gw.send_to(&success_response(buf[1], 40001), peer).unwrap();
+            let (_n, peer) = gw.recv_from(&mut buf).unwrap();
+            assert_eq!(buf[1], OP_MAP_UDP);
+            let mut refused = success_response(buf[1], 40001);
+            refused[2..4].copy_from_slice(&4u16.to_be_bytes()); // out of resources
+            gw.send_to(&refused, peer).unwrap();
+        });
+
+        let fwd = test_forwarder(gw_port);
+        let m = fwd.map(&loopback_req(0)).unwrap();
+        server.join().unwrap();
+        assert_eq!(m.port, 40001);
+        assert!(!m.udp_mapped);
     }
 
     #[test]
@@ -476,12 +554,7 @@ mod tests {
         });
 
         let fwd = test_forwarder(gw_port);
-        let req = PortMapRequest {
-            gateway: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            internal_port: 0,
-            lifetime_secs: 60,
-        };
+        let req = loopback_req(0);
         assert!(matches!(fwd.map(&req), Err(PortForwardError::Gateway(2))));
         server.join().unwrap();
     }
@@ -514,12 +587,7 @@ mod tests {
         });
 
         let fwd = test_forwarder(gw_port);
-        let req = PortMapRequest {
-            gateway: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            internal_port: 0,
-            lifetime_secs: 60,
-        };
+        let req = loopback_req(0);
         assert_eq!(fwd.map(&req).unwrap().port, 40001);
         server.join().unwrap();
         assert!(
@@ -565,12 +633,7 @@ mod tests {
         });
 
         let fwd = test_probe_forwarder(gw_port);
-        let req = PortMapRequest {
-            gateway: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            internal_port: 0,
-            lifetime_secs: 60,
-        };
+        let req = loopback_req(0);
         // The TCP port is still what the caller gets: refusing to delete does
         // not cost the answer the check exists to obtain.
         assert_eq!(fwd.map(&req).unwrap().port, 40001);

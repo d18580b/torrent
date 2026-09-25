@@ -571,6 +571,7 @@ pub async fn boot(
         &cfg,
         &mut cleanup,
         &vpn::NatpmpForwarder::for_startup(),
+        &*metrics,
         &mut boot_shutdown,
         real_engine,
     )
@@ -593,6 +594,24 @@ pub async fn boot(
     let profile_registry =
         Arc::new(ProfileRegistry::new(profile_entries).with_failed(failed_profiles));
     let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(source_entries));
+    // Empty until the alert loop sees each torrent added; created here so the
+    // port-forward monitor below can reannounce whatever it holds by the time
+    // a port changes.
+    let state = Arc::new(StateMap::new());
+
+    // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
+    // live session if the forwarded port changes, and reannounces. Started
+    // here, the moment every profile is built, rather than from
+    // `run_until_signal`: everything between the two — the kill switch, the
+    // resume and `.torrent` scans, opening the pool — is time a 60-second
+    // lease negotiated during bring-up spent unrenewed. It renews at once.
+    // If boot fails below, the process exits and the task with it.
+    tokio::spawn(crate::port_forward_monitor::run(
+        profile_registry.clone(),
+        state.clone(),
+        metrics.clone(),
+        shutdown_tx.subscribe(),
+    ));
 
     // Network-layer kill switch (defence-in-depth; multi-profile + opt-in).
     // Installed once, after every profile's tunnel is up, so the ruleset covers all
@@ -955,7 +974,6 @@ pub async fn boot(
 
     // Alert loop.
     let metrics_for_loop: Arc<dyn MetricsSink> = metrics.clone();
-    let state = Arc::new(StateMap::new());
     let clock: Arc<dyn torrentd_engine::Clock> = Arc::new(SystemClock);
 
     let alert_loop = AlertLoopBuilder::new(
@@ -1052,11 +1070,19 @@ fn real_engine(
 /// `MockVpn`, `MockForwarder` and `MockEngine`. `boot` constructed each of
 /// them inline, and the safety rules below were guaranteed only by reading.
 ///
+/// A natpmp profile's lease starts running when its port is negotiated, and
+/// every later profile's bring-up — up to 30 seconds for the tunnel and ~16
+/// for the negotiation — used to pass before anything renewed it. So before
+/// each bring-up the leases of the profiles already built are renewed here,
+/// which bounds a lease's age at boot to one profile's bring-up;
+/// `port_forward_monitor` takes over as soon as this returns.
+///
 /// `Err` only for a shutdown asked for between two profiles' bring-ups.
 async fn build_profiles<F, E>(
     cfg: &Config,
     cleanup: &mut BootCleanup,
     forwarder: &dyn PortForwarder,
+    metrics: &dyn MetricsSink,
     boot_shutdown: &mut broadcast::Receiver<ShutdownReason>,
     mut make_engine: F,
 ) -> anyhow::Result<(Vec<ProfileEntry>, Vec<FailedProfile>)>
@@ -1081,6 +1107,12 @@ where
         // honoured here rather than after every remaining tunnel is raised.
         if boot_shutdown.try_recv().is_ok() {
             anyhow::bail!("shutdown requested during profile bring-up");
+        }
+
+        // Keep the leases already negotiated alive across this bring-up. A
+        // failure is the monitor's to retry; it renews first thing.
+        for built in &profile_entries {
+            crate::port_forward_monitor::refresh_during_boot(built, forwarder, metrics);
         }
 
         match build_profile(
@@ -1292,7 +1324,9 @@ where
                     let req = PortMapRequest {
                         gateway,
                         bind_ip: ip,
-                        internal_port: 0,
+                        internal_port: PortMapRequest::INTERNAL_PORT,
+                        // Nothing held yet: the gateway picks.
+                        suggested_port: 0,
                         lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
                     };
                     match forwarder.map(&req) {
@@ -1386,24 +1420,15 @@ impl DaemonHandle {
         } = self;
 
         // VPN health monitor (multi-profile only). Spawned before AppState
-        // consumes the registry/state/metrics.
-        {
-            let profiles = profile_registry.clone();
-            tokio::spawn(crate::vpn_monitor::run(
-                profiles.clone(),
-                state.clone(),
-                metrics.clone(),
-                std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
-                shutdown_tx.subscribe(),
-            ));
-            // Port-forward renewal monitor: keeps NAT-PMP leases alive and
-            // rebinds the live session if the forwarded port changes.
-            tokio::spawn(crate::port_forward_monitor::run(
-                profiles,
-                metrics.clone(),
-                shutdown_tx.subscribe(),
-            ));
-        }
+        // consumes the registry/state/metrics. The port-forward monitor is
+        // not here: `boot` starts it as soon as the profiles are built.
+        tokio::spawn(crate::vpn_monitor::run(
+            profile_registry.clone(),
+            state.clone(),
+            metrics.clone(),
+            std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
+            shutdown_tx.subscribe(),
+        ));
 
         // Re-drive any plan a crash or a kill left mid-apply, before the API
         // can accept new ones. A half-applied reorganisation is exactly the
@@ -2722,6 +2747,7 @@ mod profile_construction_tests {
             cfg,
             &mut cleanup,
             forwarder,
+            &torrentd_engine::NoopSink,
             &mut boot_shutdown,
             move |settings: &Settings, state: Option<Vec<u8>>| {
                 let n = calls;
@@ -2844,6 +2870,50 @@ mod profile_construction_tests {
         assert_eq!(health.forwarded_port, Some(51413));
         assert_eq!(health.forwarded_epoch, 77);
         assert_eq!(health.tunnel_ip, Some(TUNNEL_IP));
+    }
+
+    #[tokio::test]
+    async fn an_earlier_profile_s_lease_is_renewed_before_the_next_bring_up() {
+        // Two natpmp profiles. The first's 60-second lease starts at its
+        // negotiation; the second's bring-up can take most of that, so the
+        // first is renewed — asking to keep its port — before it starts.
+        let dir = tempfile::tempdir().unwrap();
+        let second = "[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
+             vpn_config = \"/etc/wireguard/wg-b.conf\"\nvpn_interface = \"wg-b\"\n\
+             port_forward = \"natpmp\"\npeer_fingerprint_hex = \"b1b2c3d4e5f60719\"\n\
+             user_agent = \"ua-acct_b\"\n"
+            .to_string();
+        let cfg = cfg_with(dir.path(), &[natpmp("acct_a", "wg-a"), second]);
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", TUNNEL_IP);
+        vpn.set_ip("wg-b", OTHER_TUNNEL_IP);
+        let forwarder = MockForwarder::new();
+        forwarder.push_ok(51413); // acct_a negotiates
+        forwarder.push_ok(51413); // acct_a renewed, same port
+        forwarder.push_ok(40002); // acct_b negotiates
+
+        let out = build(&cfg, &vpn, &forwarder, None).await;
+
+        assert_eq!(out.up_ids(), vec!["acct_a", "acct_b"]);
+        let calls = forwarder.calls();
+        assert_eq!(calls.len(), 3, "negotiate a, renew a, negotiate b");
+        assert_eq!((calls[0].bind_ip, calls[0].suggested_port), (TUNNEL_IP, 0));
+        assert_eq!(
+            (calls[1].bind_ip, calls[1].suggested_port),
+            (TUNNEL_IP, 51413),
+            "the renewal asks to keep the port the session listens on",
+        );
+        assert_eq!(
+            (calls[2].bind_ip, calls[2].suggested_port),
+            (OTHER_TUNNEL_IP, 0)
+        );
+        assert!(
+            calls
+                .iter()
+                .all(|c| c.internal_port == PortMapRequest::INTERNAL_PORT),
+            "every request names the same internal port",
+        );
+        assert_eq!(out.up[1].health().forwarded_port, Some(40002));
     }
 
     #[tokio::test]
@@ -3036,6 +3106,7 @@ mod profile_construction_tests {
             &cfg,
             &mut cleanup,
             &MockForwarder::new(),
+            &torrentd_engine::NoopSink,
             &mut boot_shutdown,
             |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 panic!("no session is built after a shutdown was asked for")

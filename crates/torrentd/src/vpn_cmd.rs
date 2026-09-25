@@ -1367,7 +1367,9 @@ fn profile_checks(
                 let req = PortMapRequest {
                     gateway,
                     bind_ip,
-                    internal_port: 0,
+                    internal_port: PortMapRequest::INTERNAL_PORT,
+                    // No preference: the check holds no port to keep.
+                    suggested_port: 0,
                     // The daemon's own lease. `LEASE_SECS` is public so both
                     // paths agree; re-deriving it here would silently move the
                     // pre-flight out of step with the daemon the first time
