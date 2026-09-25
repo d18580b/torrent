@@ -507,4 +507,77 @@ mod tests {
         assert!(infohash_of(Some("zz".into())).is_err());
         assert_eq!(infohash_of(None).unwrap(), DEFAULT_INFOHASH);
     }
+
+    /// A state whose one live profile, `p`, is a fault engine.
+    fn state_with_fault_engine() -> (AppState, Arc<dyn TorrentEngine>) {
+        let (engine, _inner) = wrapped();
+        let mut state = crate::app_state::build_test_state(None);
+        state.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            ProfileId::new("p"),
+            Arc::clone(&engine),
+        )]));
+        (state, engine)
+    }
+
+    fn stall(profile_id: &str, secs: u64) -> Fault {
+        Fault::StallAlertLoop {
+            profile_id: profile_id.to_string(),
+            secs,
+        }
+    }
+
+    #[test]
+    fn a_stall_outside_one_to_max_secs_is_refused_before_anything_is_armed() {
+        let (state, engine) = state_with_fault_engine();
+        for secs in [0, MAX_STALL_SECS + 1] {
+            let (status, _) = apply(&state, stall("p", secs)).unwrap_err();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "secs = {secs}");
+        }
+        // Nothing was armed: the next drain returns at once.
+        let started = std::time::Instant::now();
+        engine.pop_alerts();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(apply(&state, stall("p", MAX_STALL_SECS)).is_ok());
+    }
+
+    #[test]
+    fn a_fault_for_an_unknown_profile_is_not_found() {
+        let (state, _engine) = state_with_fault_engine();
+        let (status, _) = apply(
+            &state,
+            Fault::PortmapError {
+                profile_id: "nope".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn a_profile_without_a_fault_engine_is_an_internal_error() {
+        // The plain test state's `p` is a bare `MockEngine`, never wrapped.
+        let state = crate::app_state::build_test_state(None);
+        let (status, _) = apply(
+            &state,
+            Fault::PortmapError {
+                profile_id: "p".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn a_queued_fault_reaches_the_profile_s_next_drain() {
+        let (state, engine) = state_with_fault_engine();
+        apply(
+            &state,
+            Fault::PortmapError {
+                profile_id: "p".to_string(),
+            },
+        )
+        .unwrap();
+        let kinds: Vec<AlertKind> = engine.pop_alerts().iter().map(Alert::kind).collect();
+        assert_eq!(kinds, vec![AlertKind::PortmapError]);
+    }
 }
