@@ -1182,14 +1182,11 @@ mod tests {
 
     #[test]
     fn wireguard_interface_must_match_its_profile_file() {
-        let s = with_vpn(
-            cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"),
-            |n| {
-                if let ProfileNetwork::Vpn { vpn_config, .. } = n {
-                    *vpn_config = PathBuf::from("/etc/wireguard/something-else.conf");
-                }
-            },
-        );
+        let s = with_vpn(cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"), |n| {
+            if let ProfileNetwork::Vpn { vpn_config, .. } = n {
+                *vpn_config = PathBuf::from("/etc/wireguard/something-else.conf");
+            }
+        });
         assert!(matches!(
             ProfileConfig::validate_set(&[s]),
             Err(ProfileConfigError::InterfaceConfigMismatch { .. })
@@ -1234,14 +1231,11 @@ mod tests {
         // `wg-quick down wg-a` resolves the bare name against /etc/wireguard,
         // finds nothing, and dies before `del_if` — so the tunnel survives
         // graceful shutdown and every restart.
-        let s = with_vpn(
-            cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"),
-            |n| {
-                if let ProfileNetwork::Vpn { vpn_config, .. } = n {
-                    *vpn_config = PathBuf::from("/etc/torrentd/wg-a.conf");
-                }
-            },
-        );
+        let s = with_vpn(cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"), |n| {
+            if let ProfileNetwork::Vpn { vpn_config, .. } = n {
+                *vpn_config = PathBuf::from("/etc/torrentd/wg-a.conf");
+            }
+        });
         assert!(matches!(
             ProfileConfig::validate_set(&[s]),
             Err(ProfileConfigError::InterfaceConfigMismatch { .. })
@@ -1252,14 +1246,11 @@ mod tests {
     fn a_wireguard_config_with_no_parent_directory_is_refused() {
         // `file_stem()` alone accepts a bare relative name; `wg-quick down`
         // still has only /etc/wireguard to look in.
-        let s = with_vpn(
-            cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"),
-            |n| {
-                if let ProfileNetwork::Vpn { vpn_config, .. } = n {
-                    *vpn_config = PathBuf::from("wg-a.conf");
-                }
-            },
-        );
+        let s = with_vpn(cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"), |n| {
+            if let ProfileNetwork::Vpn { vpn_config, .. } = n {
+                *vpn_config = PathBuf::from("wg-a.conf");
+            }
+        });
         assert!(matches!(
             ProfileConfig::validate_set(&[s]),
             Err(ProfileConfigError::InterfaceConfigMismatch { .. })
@@ -1270,20 +1261,17 @@ mod tests {
     fn openvpn_profiles_are_not_subject_to_the_wireguard_naming_rule() {
         // openvpn takes --dev explicitly, so its profile file name carries no
         // meaning for the interface.
-        let s = with_vpn(
-            cfg("acct_a", 6881, "tun0", "-AA1000-", "qB/5.0"),
-            |n| {
-                if let ProfileNetwork::Vpn {
-                    vpn_type,
-                    vpn_config,
-                    ..
-                } = n
-                {
-                    *vpn_type = VpnType::Openvpn;
-                    *vpn_config = PathBuf::from("/etc/openvpn/account-a.conf");
-                }
-            },
-        );
+        let s = with_vpn(cfg("acct_a", 6881, "tun0", "-AA1000-", "qB/5.0"), |n| {
+            if let ProfileNetwork::Vpn {
+                vpn_type,
+                vpn_config,
+                ..
+            } = n
+            {
+                *vpn_type = VpnType::Openvpn;
+                *vpn_config = PathBuf::from("/etc/openvpn/account-a.conf");
+            }
+        });
         assert!(ProfileConfig::validate_set(&[s]).is_ok());
     }
 
