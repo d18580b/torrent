@@ -226,7 +226,7 @@ Every profile takes `id` plus `network`, and then:
 | `vpn_type`, `vpn_config`, `vpn_interface` | **required**. `vpn_interface` must equal `vpn_config`'s file stem — wg-quick derives one from the other in both directions. |
 | `listen_port` | required for `port_forward = "static"` (the default); omitted for `"natpmp"` |
 | `port_forward`, `port_forward_gateway` | default `static`, and `10.2.0.1` |
-| `peer_fingerprint_hex`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client. |
+| `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters, such as `"-XX0002-"` — in the same form as the top-level key it overrides. |
 
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
@@ -243,7 +243,7 @@ run the second in a daemon of its own, in its own network namespace.
 
 Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
 `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
-`peer_fingerprint_hex`, `user_agent`, `resume_dir` and `torrent_dir` must all
+`peer_fingerprint`, `user_agent`, `resume_dir` and `torrent_dir` must all
 be unique across profiles.
 
 **`[pool]`** (optional) — `roots` (required, must not nest and must not contain
@@ -284,8 +284,15 @@ that had no `[[slot]]` needs one `network = "host"` profile carrying the
   is valid either way. Leave the key out to inherit; any other value carries
   over unchanged.
 - Every other key — `id`, `vpn_type`, `vpn_interface`, `listen_port`,
-  `peer_fingerprint_hex`, `user_agent`, `allowed_tracker_domains`,
-  `port_forward`, `port_forward_gateway` — keeps its name and meaning.
+  `user_agent`, `allowed_tracker_domains`, `port_forward`,
+  `port_forward_gateway` — keeps its name and meaning.
+- **Replace `peer_fingerprint_hex` with `peer_fingerprint`.** The old key was
+  documented as sixteen hex characters, and nothing decoded them: libtorrent
+  was handed the sixteen characters themselves, not the eight bytes they
+  spelled. `peer_fingerprint` takes the 8-character prefix as written — the
+  same form as the top-level key — so write the prefix you meant, such as
+  `"-XX0002-"`. A profile that still sets `peer_fingerprint_hex` is refused at
+  load with that key named.
 
 **2. Give a profile the id your registry already uses, or clear the entries.**
 The assignment registry — which torrent belongs to which account — is migrated
@@ -757,7 +764,7 @@ is configured; `read` and `metrics` tokens are refused. It reloads exactly what
 `SIGHUP` reloads, and reports the same warnings for a `[[profile]]` field that
 changed and cannot be applied without a restart: the Safety Rule 7 warning
 (`profile identity change requires daemon restart`) where the field is an
-identity — the network block, `peer_fingerprint_hex`, `user_agent` — and the
+identity — the network block, `peer_fingerprint`, `user_agent` — and the
 ordinary non-reloadable-field warning where it is not: `upload_rate_limit`,
 `allowed_tracker_domains`, and the two store directories. The field name is on
 the event either way.

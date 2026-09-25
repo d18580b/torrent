@@ -236,7 +236,11 @@ pub struct ProfileConfig {
     /// Peer identity. Required for a VPN profile, where two profiles sharing
     /// one is precisely the cross-contamination the separation exists to
     /// prevent; optional on the host, where there is one identity anyway.
-    pub peer_fingerprint_hex: Option<String>,
+    ///
+    /// The eight-character peer-id prefix itself (`"-XX1234-"`), in the same
+    /// raw encoding as the top-level `peer_fingerprint` it overrides: both
+    /// reach `libtorrent_safe::Settings::peer_fingerprint` verbatim.
+    pub peer_fingerprint: Option<String>,
     pub user_agent: Option<String>,
     /// Overrides the top-level directory, which is otherwise partitioned by
     /// profile id.
@@ -311,7 +315,18 @@ struct RawProfile {
 
     // either
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    peer_fingerprint_hex: Option<String>,
+    peer_fingerprint: Option<String>,
+    /// The key `peer_fingerprint` replaced, parsed only so that it can be
+    /// refused by name.
+    ///
+    /// It documented its value as sixteen hex characters, and nothing decoded
+    /// them: the string reached libtorrent as sixteen ASCII characters, not
+    /// the eight bytes it spelled. Left to `deny_unknown_fields` it would be
+    /// refused as an unknown field with no word of what replaced it; accepted
+    /// under either meaning it would change what a tracker sees without the
+    /// operator changing anything.
+    #[serde(default, skip_serializing)]
+    peer_fingerprint_hex: Option<serde::de::IgnoredAny>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     user_agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -347,6 +362,16 @@ impl TryFrom<RawProfile> for ProfileConfig {
 
     fn try_from(r: RawProfile) -> Result<Self, Self::Error> {
         let id = r.id.clone();
+        if r.peer_fingerprint_hex.is_some() {
+            return Err(format!(
+                "profile {:?} sets peer_fingerprint_hex, which is no longer read. Write the \
+                 eight-character peer-id prefix itself as peer_fingerprint (for example \
+                 peer_fingerprint = \"-XX1234-\"), the same form the top-level key takes. \
+                 The old key's sixteen hex characters were passed to libtorrent undecoded, so \
+                 the prefix a tracker saw was never the eight bytes they spelled",
+                id.as_str(),
+            ));
+        }
         let network = match r.network {
             NetworkKind::Host => {
                 r.reject(&id, r.vpn_type.is_some(), "vpn_type", "vpn")?;
@@ -418,7 +443,7 @@ impl TryFrom<RawProfile> for ProfileConfig {
         Ok(ProfileConfig {
             id,
             network,
-            peer_fingerprint_hex: r.peer_fingerprint_hex,
+            peer_fingerprint: r.peer_fingerprint,
             user_agent: r.user_agent,
             resume_dir: r.resume_dir,
             torrent_dir: r.torrent_dir,
@@ -449,7 +474,8 @@ impl ProfileConfig {
             listen_port: None,
             port_forward: None,
             port_forward_gateway: None,
-            peer_fingerprint_hex: c.peer_fingerprint_hex.clone(),
+            peer_fingerprint: c.peer_fingerprint.clone(),
+            peer_fingerprint_hex: None,
             user_agent: c.user_agent.clone(),
             resume_dir: c.resume_dir.clone(),
             torrent_dir: c.torrent_dir.clone(),
@@ -637,10 +663,11 @@ pub enum ProfileConfigError {
     BadInterface { profile: String, iface: String },
     /// Two profiles announce one peer-id prefix.
     ///
-    /// `key` is the key the *operator wrote*, which is not always the one this
-    /// field is called. A profile that declares nothing takes the top-level
-    /// `peer_fingerprint`, and naming `peer_fingerprint_hex` at it sent the
-    /// operator hunting a key that appears nowhere in their file.
+    /// `key` is the key the *operator wrote*: the profile's own
+    /// `peer_fingerprint`, or the top-level one a profile that declares
+    /// nothing inherits. The two share a name, so the inherited case says
+    /// "top-level" rather than sending the operator to a `[[profile]]` table
+    /// that does not contain it.
     #[error("{key} {value:?} appears more than once")]
     DuplicateFingerprint { key: &'static str, value: String },
     #[error("{key} {value:?} appears more than once")]
@@ -653,14 +680,17 @@ pub enum ProfileConfigError {
     ///
     /// `key` is the key the *operator wrote*, for the reason
     /// [`ProfileConfigError::DuplicateFingerprint`] carries one: the same value
-    /// reaches a session from the per-profile `peer_fingerprint_hex` and from
-    /// the top-level `peer_fingerprint` it inherits, and naming the wrong one
-    /// sends the operator hunting a key that appears nowhere in their file.
+    /// reaches a session from a profile's own `peer_fingerprint` and from the
+    /// top-level one it inherits.
     #[error("{key} must not equal libtorrent default (-LT20C0-)")]
     DefaultFingerprintForbidden { key: &'static str },
-    /// The value is not sixteen hex characters. `key` as above.
-    #[error("{key} {value:?} is not 16 hex chars")]
-    BadFingerprintLength { key: &'static str, value: String },
+    /// The value is not a peer-id prefix. `key` as above.
+    #[error(
+        "{key} {value:?} is not a peer-id prefix: it must be exactly 8 printable ASCII \
+         characters, such as \"-XX1234-\". The value is handed to libtorrent verbatim as the \
+         first 8 bytes of the peer id"
+    )]
+    BadFingerprint { key: &'static str, value: String },
     #[error(
         "no [[profile]] tables are configured. torrentd has no implicit profile: every \
          profile states how it reaches the network, because the alternative — defaulting \
@@ -731,29 +761,29 @@ impl ProfileConfig {
         }
     }
 
-    /// The hex form of libtorrent's default fingerprint `-LT20C0-` (16 hex
-    /// chars). A VPN profile must set a distinct fingerprint so peers cannot
-    /// trivially tie it back to the default client identity.
-    /// Whether `fp` is libtorrent's own default peer-id prefix, in either of
-    /// the two spellings this configuration accepts.
+    /// Whether `fp` is a peer-id prefix libtorrent can put on the wire as
+    /// written: exactly eight printable, non-space ASCII characters.
+    ///
+    /// Both `peer_fingerprint` keys — the top-level default and a profile's
+    /// own — reach `libtorrent_safe::Settings::peer_fingerprint` verbatim, and
+    /// libtorrent copies the string into the front of the 20-byte peer id. So
+    /// the rule is about bytes: eight of them, and ASCII so that eight
+    /// characters *are* eight bytes. Space is excluded because a prefix that
+    /// ends in one reads in the file as a shorter value than it is.
+    pub fn is_valid_fingerprint(fp: &str) -> bool {
+        fp.len() == 8 && fp.bytes().all(|b| b.is_ascii_graphic())
+    }
+
+    /// Whether `fp` is libtorrent's own default peer-id prefix.
     ///
     /// `-LT20C0-` is the eight bytes libtorrent puts at the front of a peer id
-    /// nobody configured. The two keys that can supply those bytes spell them
-    /// differently: `peer_fingerprint_hex` states them as sixteen hex
-    /// characters, and the top-level `peer_fingerprint` states them as
-    /// themselves — `deploy/torrentd.sample.toml` documented that key as
-    /// `peer_fingerprint = "-LT20C0-"` before this change and as
-    /// `"-XX1234-"` after it, and nothing between the config file and
-    /// libtorrent decodes either spelling.
-    ///
-    /// So a test that knew only the hex spelling read straight past the raw
-    /// one — which is both the spelling that actually reaches the wire from
-    /// that key and the one an operator copies out of libtorrent's own
-    /// documentation. Both are refused, and neither is refused *because of*
-    /// its length: that is a separate rule belonging to the key that declares
-    /// an encoding in its name.
+    /// nobody configured. Every key that supplies a fingerprint takes it in
+    /// that raw form and nothing decodes it, so there is one spelling to
+    /// refuse; the sixteen-hex spelling the retired `peer_fingerprint_hex`
+    /// key took is refused as a malformed prefix by
+    /// [`ProfileConfig::is_valid_fingerprint`] before this is asked.
     pub fn is_libtorrent_default_fingerprint(fp: &str) -> bool {
-        fp.eq_ignore_ascii_case("2d4c54323043302d") || fp == "-LT20C0-"
+        fp == "-LT20C0-"
     }
 
     /// The distinct ports a libtorrent `listen_interfaces` string binds.
@@ -822,22 +852,22 @@ impl ProfileConfig {
     /// enforces are distinct.
     ///
     /// Requiredness and uniqueness are separate questions, and they have
-    /// different answers. A host profile may *omit* `peer_fingerprint_hex` and
+    /// different answers. A host profile may *omit* `peer_fingerprint` and
     /// `user_agent` — it is the host, and two host profiles are one host, so
     /// requiring them to differ would be theatre. But a value a host profile
     /// does set must still be distinct from every other profile's, because a
     /// fingerprint shared with a tunnelled profile puts one peer-id prefix on
     /// the wire from both the tunnel address and the host's real address,
     /// which is exactly the cross-account correlation these rules exist to
-    /// prevent. So requiredness is checked per posture, below, and the length
-    /// and the libtorrent-default ban run for any profile that sets the field,
+    /// prevent. So requiredness is checked per posture, below, and the shape
+    /// rule and the libtorrent-default ban run for any profile that sets the field,
     /// whatever its posture.
     ///
     /// Two rules are deliberately **not** here, because they are not decidable
     /// from `&[ProfileConfig]` alone:
     ///
     /// - identity uniqueness, which has to compare each profile's *effective*
-    ///   `peer_fingerprint_hex` / `user_agent` — its own value or the
+    ///   `peer_fingerprint` / `user_agent` — its own value or the
     ///   top-level default it inherits when it sets none; and
     /// - store-directory uniqueness, which has to compare each profile's
     ///   *effective* resume and `.torrent` directory — its own override or the
@@ -1008,10 +1038,10 @@ impl ProfileConfig {
                     // profile with no fingerprint of its own announces under
                     // the default one, which ties it to every other default
                     // client the tracker sees.
-                    if p.peer_fingerprint_hex.is_none() {
+                    if p.peer_fingerprint.is_none() {
                         return Err(ProfileConfigError::MissingIdentity {
                             profile: p.id.as_str().to_string(),
-                            field: "peer_fingerprint_hex",
+                            field: "peer_fingerprint",
                         });
                     }
                     if p.user_agent.is_none() {
@@ -1042,7 +1072,7 @@ impl ProfileConfig {
             // Identity, for any profile that set one.
             //
             // Outside the match on purpose. `startup.rs` applies
-            // `peer_fingerprint_hex` to every session with no posture guard,
+            // `peer_fingerprint` to every session with no posture guard,
             // so a host profile that copies a VPN profile's table and edits
             // only `id`, `network` and `listen_interfaces` — which is how the
             // second profile in a config usually gets written — puts the same
@@ -1057,16 +1087,16 @@ impl ProfileConfig {
             // peer-id prefix on the wire from two postures. `Config::validate`
             // resolves each profile's effective identity and owns the
             // uniqueness rule.
-            if let Some(fp) = p.peer_fingerprint_hex.as_deref() {
-                if fp.len() != 16 {
-                    return Err(ProfileConfigError::BadFingerprintLength {
-                        key: "peer_fingerprint_hex",
+            if let Some(fp) = p.peer_fingerprint.as_deref() {
+                if !Self::is_valid_fingerprint(fp) {
+                    return Err(ProfileConfigError::BadFingerprint {
+                        key: "peer_fingerprint",
                         value: fp.to_string(),
                     });
                 }
                 if Self::is_libtorrent_default_fingerprint(fp) {
                     return Err(ProfileConfigError::DefaultFingerprintForbidden {
-                        key: "peer_fingerprint_hex",
+                        key: "peer_fingerprint",
                     });
                 }
             }
@@ -1118,7 +1148,7 @@ mod tests {
                 port_forward: PortForwardMode::Static,
                 port_forward_gateway: None,
             },
-            peer_fingerprint_hex: Some(fp.to_string()),
+            peer_fingerprint: Some(fp.to_string()),
             user_agent: Some(ua.to_string()),
             resume_dir: Some(PathBuf::from(format!("/var/lib/torrentd/resume/{id}"))),
             torrent_dir: Some(PathBuf::from(format!("/var/lib/torrentd/torrents/{id}"))),
@@ -1135,7 +1165,7 @@ mod tests {
                 listen_interfaces: listen.to_string(),
                 dht,
             },
-            peer_fingerprint_hex: None,
+            peer_fingerprint: None,
             user_agent: None,
             resume_dir: None,
             torrent_dir: None,
@@ -1153,7 +1183,7 @@ mod tests {
     #[test]
     fn wireguard_interface_must_match_its_profile_file() {
         let s = with_vpn(
-            cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0"),
+            cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"),
             |n| {
                 if let ProfileNetwork::Vpn { vpn_config, .. } = n {
                     *vpn_config = PathBuf::from("/etc/wireguard/something-else.conf");
@@ -1173,7 +1203,7 @@ mod tests {
         // operator configured for 4 GB/s seeds under a negative cap. The
         // sibling top-level key is range-checked; this one was not checked
         // at all.
-        let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+        let mut s = cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0");
         s.upload_rate_limit = Some(u32::MAX);
         assert!(matches!(
             ProfileConfig::validate_set(&[s]),
@@ -1188,7 +1218,7 @@ mod tests {
         // per-profile limit, so the check bounds the representable range and
         // nothing else. `0` -- explicitly unlimited -- is in range too.
         for v in [0, 1, ProfileConfig::MAX_UPLOAD_RATE_LIMIT] {
-            let mut s = cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0");
+            let mut s = cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0");
             s.upload_rate_limit = Some(v);
             assert!(
                 ProfileConfig::validate_set(&[s]).is_ok(),
@@ -1205,7 +1235,7 @@ mod tests {
         // finds nothing, and dies before `del_if` — so the tunnel survives
         // graceful shutdown and every restart.
         let s = with_vpn(
-            cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0"),
+            cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"),
             |n| {
                 if let ProfileNetwork::Vpn { vpn_config, .. } = n {
                     *vpn_config = PathBuf::from("/etc/torrentd/wg-a.conf");
@@ -1223,7 +1253,7 @@ mod tests {
         // `file_stem()` alone accepts a bare relative name; `wg-quick down`
         // still has only /etc/wireguard to look in.
         let s = with_vpn(
-            cfg("acct_a", 6881, "wg-a", "a1b2c3d4e5f60718", "qB/5.0"),
+            cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"),
             |n| {
                 if let ProfileNetwork::Vpn { vpn_config, .. } = n {
                     *vpn_config = PathBuf::from("wg-a.conf");
@@ -1241,7 +1271,7 @@ mod tests {
         // openvpn takes --dev explicitly, so its profile file name carries no
         // meaning for the interface.
         let s = with_vpn(
-            cfg("acct_a", 6881, "tun0", "a1b2c3d4e5f60718", "qB/5.0"),
+            cfg("acct_a", 6881, "tun0", "-AA1000-", "qB/5.0"),
             |n| {
                 if let ProfileNetwork::Vpn {
                     vpn_type,
@@ -1287,7 +1317,7 @@ mod tests {
         // and not the other costs nothing until something finally does
         // serialize a config.
         for original in [
-            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            cfg("acct_a", 6881, "wg0", "-AA1000-", "qB/5.0"),
             host("public", "0.0.0.0:6881,[::]:6881", true),
             host("public2", "0.0.0.0:6882", false),
         ] {
@@ -1317,7 +1347,7 @@ mod tests {
         // The port is what a tracker sees; which posture announced it makes no
         // difference to the correlation.
         let profiles = vec![
-            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            cfg("acct_a", 6881, "wg0", "-AA1000-", "qB/5.0"),
             host("public", "0.0.0.0:6881", false),
         ];
         assert!(matches!(
@@ -1437,15 +1467,15 @@ mod tests {
     // The tests live beside it, in `crates/torrentd/src/config.rs`.
 
     #[test]
-    fn a_host_profiles_fingerprint_is_length_checked_like_any_other() {
+    fn a_host_profiles_fingerprint_is_shape_checked_like_any_other() {
         // A fingerprint that is not 8 bytes is not a fingerprint, and the
         // posture that set it makes no difference to that.
         let mut public = host("public", "0.0.0.0:6881", false);
-        public.peer_fingerprint_hex = Some("abc".to_string());
+        public.peer_fingerprint = Some("abc".to_string());
         assert!(matches!(
             ProfileConfig::validate_set(&[public]),
-            Err(ProfileConfigError::BadFingerprintLength {
-                key: "peer_fingerprint_hex",
+            Err(ProfileConfigError::BadFingerprint {
+                key: "peer_fingerprint",
                 ..
             })
         ));
@@ -1457,11 +1487,11 @@ mod tests {
         // reads as a deliberate identity while being the one every unmodified
         // client already wears.
         let mut public = host("public", "0.0.0.0:6881", false);
-        public.peer_fingerprint_hex = Some("2d4c54323043302d".to_string());
+        public.peer_fingerprint = Some("-LT20C0-".to_string());
         assert!(matches!(
             ProfileConfig::validate_set(&[public]),
             Err(ProfileConfigError::DefaultFingerprintForbidden {
-                key: "peer_fingerprint_hex"
+                key: "peer_fingerprint"
             })
         ));
     }
@@ -1472,7 +1502,7 @@ mod tests {
         // VPN-only. Two host profiles are one host, and a config that names
         // neither field has to keep validating.
         let profiles = vec![
-            cfg("acct_a", 6881, "wg0", "a1b2c3d4e5f60718", "qB/5.0"),
+            cfg("acct_a", 6881, "wg0", "-AA1000-", "qB/5.0"),
             host("public", "0.0.0.0:6882", false),
             host("public2", "0.0.0.0:6883", false),
         ];
@@ -1481,14 +1511,14 @@ mod tests {
 
     #[test]
     fn a_vpn_profile_missing_only_its_fingerprint_is_refused() {
-        // The `peer_fingerprint_hex` arm of `MissingIdentity`; only the
+        // The `peer_fingerprint` arm of `MissingIdentity`; only the
         // `user_agent` arm was reached before.
-        let mut p = cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a");
-        p.peer_fingerprint_hex = None;
+        let mut p = cfg("a", 6881, "wg0", "-AA1000-", "ua-a");
+        p.peer_fingerprint = None;
         assert!(matches!(
             ProfileConfig::validate_set(&[p]),
             Err(ProfileConfigError::MissingIdentity {
-                field: "peer_fingerprint_hex",
+                field: "peer_fingerprint",
                 ..
             })
         ));
@@ -1496,7 +1526,7 @@ mod tests {
 
     #[test]
     fn a_vpn_profile_must_declare_its_identity() {
-        let mut p = cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a");
+        let mut p = cfg("a", 6881, "wg0", "-AA1000-", "ua-a");
         p.user_agent = None;
         assert!(matches!(
             ProfileConfig::validate_set(&[p]),
@@ -1518,7 +1548,7 @@ mod tests {
         // BEP 42 derives part of a node id from the external address, so a
         // tunnelled profile running DHT leaves a correlatable id behind. There
         // is deliberately no key that reaches this.
-        let p = cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a");
+        let p = cfg("a", 6881, "wg0", "-AA1000-", "ua-a");
         assert!(p.is_vpn());
         assert!(!p.dht_enabled());
     }
@@ -1526,8 +1556,8 @@ mod tests {
     #[test]
     fn validate_set_accepts_unique_profiles() {
         let profiles = vec![
-            cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "qBittorrent/5.0.3"),
-            cfg("b", 6882, "wg1", "9f8e7d6c5b4a3210", "Transmission/4.0.6"),
+            cfg("a", 6881, "wg0", "-AA1000-", "qBittorrent/5.0.3"),
+            cfg("b", 6882, "wg1", "-CC1000-", "Transmission/4.0.6"),
         ];
         ProfileConfig::validate_set(&profiles).unwrap();
     }
@@ -1551,7 +1581,7 @@ mod tests {
             "..",
             "sixteen-chars-xx",
         ] {
-            let profiles = vec![cfg("a", 6881, bad, "a1b2c3d4e5f60718", "ua-a")];
+            let profiles = vec![cfg("a", 6881, bad, "-AA1000-", "ua-a")];
             match ProfileConfig::validate_set(&profiles) {
                 Err(ProfileConfigError::BadInterface { profile, iface }) => {
                     assert_eq!(profile, "a");
@@ -1576,7 +1606,7 @@ mod tests {
                 ProfileConfig::is_valid_interface_name(good),
                 "{good:?} is a usable device name",
             );
-            let profiles = vec![cfg("a", 6881, good, "a1b2c3d4e5f60718", "ua-a")];
+            let profiles = vec![cfg("a", 6881, good, "-AA1000-", "ua-a")];
             ProfileConfig::validate_set(&profiles)
                 .unwrap_or_else(|e| panic!("{good:?} must be accepted, got {e}"));
         }
@@ -1585,8 +1615,8 @@ mod tests {
     #[test]
     fn duplicate_listen_port_rejected() {
         let profiles = vec![
-            cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a"),
-            cfg("b", 6881, "wg1", "9f8e7d6c5b4a3210", "ua-b"),
+            cfg("a", 6881, "wg0", "-AA1000-", "ua-a"),
+            cfg("b", 6881, "wg1", "-CC1000-", "ua-b"),
         ];
         assert!(matches!(
             ProfileConfig::validate_set(&profiles),
@@ -1596,36 +1626,49 @@ mod tests {
 
     #[test]
     fn libtorrent_default_fingerprint_rejected() {
-        let profiles = vec![cfg(
-            "a",
-            6881,
-            "wg0",
-            "2d4c54323043302d", // hex of "-LT20C0-"
-            "ua-a",
-        )];
+        let profiles = vec![cfg("a", 6881, "wg0", "-LT20C0-", "ua-a")];
         assert!(matches!(
             ProfileConfig::validate_set(&profiles),
             Err(ProfileConfigError::DefaultFingerprintForbidden {
-                key: "peer_fingerprint_hex"
+                key: "peer_fingerprint"
             })
         ));
     }
 
     #[test]
-    fn fingerprint_length_must_be_16() {
-        let profiles = vec![cfg("a", 6881, "wg0", "abcd", "ua-a")];
-        assert!(matches!(
-            ProfileConfig::validate_set(&profiles),
-            Err(ProfileConfigError::BadFingerprintLength {
-                key: "peer_fingerprint_hex",
-                ..
-            })
-        ));
+    fn a_fingerprint_must_be_eight_printable_ascii_characters() {
+        // The sixteen-hex spelling the retired `peer_fingerprint_hex` took is
+        // the first case: it reached libtorrent as sixteen ASCII characters,
+        // not the eight bytes it spelled, so it must not validate under the
+        // raw key either — including the hex of libtorrent's own default.
+        for bad in [
+            "a1b2c3d4e5f60718",
+            "2d4c54323043302d",
+            "abcd",
+            "",
+            "-XX123-",
+            "-XX12345-",
+            "-XX 234-",
+            "-XX\t234-",
+            "-XX1é4-",
+        ] {
+            let profiles = vec![cfg("a", 6881, "wg0", bad, "ua-a")];
+            match ProfileConfig::validate_set(&profiles) {
+                Err(ProfileConfigError::BadFingerprint { key, value }) => {
+                    assert_eq!(key, "peer_fingerprint");
+                    assert_eq!(value, bad);
+                }
+                other => panic!("{bad:?} must be refused as BadFingerprint, got {other:?}"),
+            }
+        }
+        for good in ["-XX1234-", "-qB5030-", "M7-2-3--"] {
+            assert!(ProfileConfig::is_valid_fingerprint(good), "{good:?}");
+        }
     }
 
     #[test]
     fn static_profile_without_listen_port_rejected() {
-        let s = with_vpn(cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a"), |n| {
+        let s = with_vpn(cfg("a", 6881, "wg0", "-AA1000-", "ua-a"), |n| {
             if let ProfileNetwork::Vpn { listen_port, .. } = n {
                 *listen_port = None; // stays in static mode
             }
@@ -1638,7 +1681,7 @@ mod tests {
 
     #[test]
     fn natpmp_profile_may_omit_listen_port() {
-        let s = with_vpn(cfg("a", 0, "wg0", "a1b2c3d4e5f60718", "ua-a"), |n| {
+        let s = with_vpn(cfg("a", 0, "wg0", "-AA1000-", "ua-a"), |n| {
             if let ProfileNetwork::Vpn {
                 port_forward,
                 listen_port,
@@ -1667,14 +1710,14 @@ mod tests {
                 *listen_port = None;
             }
         };
-        let a = with_vpn(cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a"), natpmp);
-        let b = with_vpn(cfg("b", 6881, "wg1", "9f8e7d6c5b4a3210", "ua-b"), natpmp);
+        let a = with_vpn(cfg("a", 6881, "wg0", "-AA1000-", "ua-a"), natpmp);
+        let b = with_vpn(cfg("b", 6881, "wg1", "-CC1000-", "ua-b"), natpmp);
         ProfileConfig::validate_set(&[a, b]).unwrap();
     }
 
     #[test]
     fn gateway_defaults_to_proton() {
-        let s = cfg("a", 6881, "wg0", "a1b2c3d4e5f60718", "ua-a");
+        let s = cfg("a", 6881, "wg0", "-AA1000-", "ua-a");
         assert_eq!(s.port_forward_gateway_or_default(), "10.2.0.1");
         let s2 = with_vpn(s, |n| {
             if let ProfileNetwork::Vpn {
