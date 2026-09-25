@@ -3079,7 +3079,11 @@ user_agent           = "qBittorrent/5.0.3"
 
         let ruleset = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
         assert_eq!(ruleset.verdict, Verdict::Fail, "detail: {}", ruleset.detail);
-        assert!(ruleset.detail.contains("\"wg}x\""), "detail: {}", ruleset.detail);
+        assert!(
+            ruleset.detail.contains("\"wg}x\""),
+            "detail: {}",
+            ruleset.detail
+        );
         assert!(
             !host.events().iter().any(|e| e.starts_with("nft_check")),
             "nothing unparseable is handed to nft: {:?}",

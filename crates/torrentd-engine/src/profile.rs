@@ -810,9 +810,9 @@ impl ProfileConfig {
             && name.len() <= 15
             && name != "."
             && name != ".."
-            && name.bytes().all(|b| {
-                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'=' | b'+' | b'.' | b'-')
-            })
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'=' | b'+' | b'.' | b'-'))
     }
 
     /// Validate the whole configured set.
@@ -1564,7 +1564,14 @@ mod tests {
 
     #[test]
     fn well_formed_vpn_interface_names_accepted() {
-        for good in ["wg0", "proton-a", "wg-acct-a", "tun_b.1", "wg=+", "fifteen-chars-x"] {
+        for good in [
+            "wg0",
+            "proton-a",
+            "wg-acct-a",
+            "tun_b.1",
+            "wg=+",
+            "fifteen-chars-x",
+        ] {
             assert!(
                 ProfileConfig::is_valid_interface_name(good),
                 "{good:?} is a usable device name",
