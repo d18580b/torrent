@@ -54,6 +54,7 @@ use crate::profile::ProfileId;
 use crate::resume_store::ResumeStore;
 use crate::source::AlertSource;
 use crate::state::StateMap;
+use crate::state::TorrentPhase;
 use crate::torrent_store::TorrentStore;
 
 const POLL_IDLE_INTERVAL: Duration = Duration::from_millis(100);
@@ -589,6 +590,30 @@ fn execute_due_retries(
         // recovered, an operator resumed it, or the error never paused it —
         // and resuming it anyway would undo an operator's pause every hour,
         // forever, because nothing else ever clears the timer. Retire it.
+        //
+        // Except while the torrent is checking. `clear_error` empties the
+        // error before the re-check it starts, so a check still running when
+        // the timer comes due shows no error although it has not recovered
+        // yet. Retiring then would let the check's own `file_error` re-arm
+        // the timer from `RetryState::first`, and a torrent whose check
+        // outlasts the delay would re-check every minute instead of backing
+        // off to hourly. Hold the timer, attempt count unchanged, for another
+        // delay at the current backoff, and decide once the check has ended.
+        if !st.has_error && st.phase == TorrentPhase::Checking {
+            debug!(
+                target: "torrentd_engine::alert_loop",
+                profile_id = %st.profile_id,
+                infohash = %handle.infohash,
+                "disk-error retry deferred: torrent is still checking",
+            );
+            state.update(&handle.infohash, |s| {
+                if let Some(r) = s.retry.as_mut() {
+                    r.next_attempt =
+                        clock.now() + crate::state::RetryState::delay_for_attempt(r.attempts);
+                }
+            });
+            continue;
+        }
         if !st.has_error {
             debug!(
                 target: "torrentd_engine::alert_loop",
@@ -942,6 +967,16 @@ mod tests {
     /// Drive one pass of the retry timer against a single mock-engine
     /// torrent whose retry is already due, and return what it did.
     fn run_due_retry(has_error: bool) -> (Arc<MockEngine>, Arc<StateMap>, Arc<RecordingSink>) {
+        run_due_retry_in(has_error, TorrentPhase::Paused, 1)
+    }
+
+    /// `run_due_retry` with the torrent's phase and the due timer's attempt
+    /// count chosen by the caller.
+    fn run_due_retry_in(
+        has_error: bool,
+        phase: TorrentPhase,
+        attempts: u32,
+    ) -> (Arc<MockEngine>, Arc<StateMap>, Arc<RecordingSink>) {
         let engine = Arc::new(MockEngine::new());
         let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
             Arc::clone(&engine) as Arc<dyn TorrentEngine>
@@ -955,9 +990,11 @@ mod tests {
         let now = std::time::Instant::now();
         let mut st = crate::state::TorrentState::newly_added(h, ProfileId::new("p"), now);
         st.has_error = has_error;
-        st.retry = Some(crate::state::RetryState::first(
-            now - Duration::from_secs(3600),
-        ));
+        st.phase = phase;
+        st.retry = Some(crate::state::RetryState {
+            next_attempt: now - Duration::from_secs(1),
+            attempts,
+        });
         state.insert(ih, st);
         let recording = Arc::new(RecordingSink::new());
         let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
@@ -1010,6 +1047,46 @@ mod tests {
             )),
             "a retired timer is not a retry attempt",
         );
+    }
+
+    #[test]
+    fn the_disk_error_retry_waits_out_the_check_its_resume_started() {
+        // `resume()` clears the error before the re-check it triggers, so a
+        // check still running when the timer comes due shows no error. If
+        // that retired the timer, the check's own failure would re-arm it
+        // from the first 60 s step, and a large torrent on broken storage
+        // would re-check every minute instead of backing off to hourly.
+        let before = std::time::Instant::now();
+        let (engine, state, metrics) = run_due_retry_in(false, TorrentPhase::Checking, 5);
+        assert!(!resumed(&engine), "a checking torrent was resumed");
+        let retry = state
+            .get(&InfoHash([9u8; 20]))
+            .unwrap()
+            .retry
+            .expect("the timer must survive a check in progress");
+        assert_eq!(retry.attempts, 5, "the backoff must not reset or advance");
+        assert!(
+            retry.next_attempt >= before + crate::state::RetryState::delay_for_attempt(5),
+            "the timer waits another delay at the current backoff",
+        );
+        assert!(
+            !metrics.calls().iter().any(|c| matches!(
+                c,
+                MetricCall::IncCounter { name, .. } if name.starts_with("disk_error_retry_")
+            )),
+            "a deferred timer is not a retry attempt",
+        );
+    }
+
+    #[test]
+    fn a_check_that_fails_again_resumes_on_the_kept_backoff() {
+        // The check the previous resume started failed: libtorrent paused the
+        // torrent and set its error again, and the timer held its count. The
+        // next resume must advance from there, not from the first step.
+        let (engine, state, _) = run_due_retry_in(true, TorrentPhase::Paused, 5);
+        assert!(resumed(&engine), "an errored torrent was not resumed");
+        let retry = state.get(&InfoHash([9u8; 20])).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 6);
     }
 
     #[test]

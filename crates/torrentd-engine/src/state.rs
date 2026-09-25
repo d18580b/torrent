@@ -61,7 +61,9 @@ impl TorrentPhase {
 /// Retry schedule for recovering a torrent after a disk error: 60→120→240→…
 /// →3600s. Armed by `file_error_alert`; each due attempt resumes the torrent
 /// while libtorrent still holds an error on it, and the timer is retired
-/// once none is left (`alert_loop::execute_due_retries`).
+/// once none is left and the torrent is not checking; a due timer on a
+/// torrent still checking waits another delay with its attempt count kept
+/// (`alert_loop::execute_due_retries`).
 #[derive(Clone, Debug)]
 pub struct RetryState {
     pub next_attempt: Instant,
