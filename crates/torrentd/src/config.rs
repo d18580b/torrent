@@ -211,6 +211,10 @@ const LEGACY_REGISTRY_FILE: &str = "slot_assignments.json";
 /// The single-instance lock `boot` holds for the life of the process.
 const INSTANCE_LOCK_FILE: &str = "torrentd.lock";
 
+/// How a fingerprint error names the top-level key, which shares its name
+/// with the per-profile key it is the default for.
+const TOP_LEVEL_FINGERPRINT: &str = "top-level peer_fingerprint";
+
 impl Config {
     fn default_http_listen() -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], 8080))
@@ -860,8 +864,12 @@ impl Config {
         Ok(())
     }
 
-    /// A profile's effective `peer_fingerprint_hex` and `user_agent` — its own
+    /// A profile's effective `peer_fingerprint` and `user_agent` — its own
     /// values, or the top-level defaults it inherits where it sets none.
+    ///
+    /// The two fingerprint keys share a name and an encoding (the raw
+    /// eight-character prefix), so either one is comparable with the other
+    /// as a plain string.
     ///
     /// `libtorrent_settings()` seeds every session from the top-level keys and
     /// `startup.rs` overrides only where the profile set its own, so this pair
@@ -871,7 +879,7 @@ impl Config {
         p: &'a ProfileConfig,
     ) -> (Option<&'a str>, Option<&'a str>) {
         (
-            p.peer_fingerprint_hex
+            p.peer_fingerprint
                 .as_deref()
                 .or(self.peer_fingerprint.as_deref()),
             p.user_agent.as_deref().or(self.user_agent.as_deref()),
@@ -905,10 +913,24 @@ impl Config {
     /// moved to *effective* values only explicit ones entered the sets, so
     /// two omitting profiles could not collide; the exemption restores that.
     ///
-    /// The error names the key the operator actually wrote. When the value
-    /// came from the top level that is `peer_fingerprint`, not
-    /// `peer_fingerprint_hex` — a key that appears nowhere in their file.
+    /// The error names the key the operator actually wrote. The per-profile
+    /// and top-level fingerprint keys share the name `peer_fingerprint`, so a
+    /// value that came from the top level is named `top-level
+    /// peer_fingerprint`, not left for the operator to hunt for in a
+    /// `[[profile]]` table that does not contain it.
     fn validate_effective_identities(&self) -> Result<(), ProfileConfigError> {
+        // The shape rule for the top-level key, whether or not any profile
+        // inherits it: `libtorrent_settings()` seeds every session from it,
+        // and it is the same field in the same encoding as the per-profile
+        // key `ProfileConfig::validate_set` already holds to this rule.
+        if let Some(fp) = self.peer_fingerprint.as_deref() {
+            if !ProfileConfig::is_valid_fingerprint(fp) {
+                return Err(ProfileConfigError::BadFingerprint {
+                    key: TOP_LEVEL_FINGERPRINT,
+                    value: fp.to_string(),
+                });
+            }
+        }
         let mut seen_fp: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         let mut seen_ua: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
         for p in &self.profile {
@@ -917,11 +939,16 @@ impl Config {
                 // Inherited by this profile *and* by the one already holding
                 // the value: both wrote nothing, so there is nothing to
                 // distinguish and nothing hidden.
-                let inherited = p.peer_fingerprint_hex.is_none();
+                let inherited = p.peer_fingerprint.is_none();
+                let key = if inherited {
+                    TOP_LEVEL_FINGERPRINT
+                } else {
+                    "peer_fingerprint"
+                };
                 // The default-prefix refusal, on the *effective* fingerprint.
                 //
                 // `ProfileConfig::validate_set` applies it to a declared
-                // `peer_fingerprint_hex` and to nothing else, so a value
+                // `peer_fingerprint` and to nothing else, so a value
                 // written once at the top level reached every session that
                 // inherited it unchecked — and the value it reached them with
                 // was libtorrent's own default prefix, which is what the
@@ -934,41 +961,19 @@ impl Config {
                 //
                 // Demonstrated before this check existed: a top-level
                 // `peer_fingerprint` plus one host profile that writes neither
-                // key printed `config OK`, for the hex spelling and for the
-                // raw one — while the identical string written as the
-                // profile's own `peer_fingerprint_hex` was refused.
-                //
-                // The *length* rule is deliberately not applied here. It is an
-                // encoding rule for the key that names an encoding:
-                // `peer_fingerprint_hex` is sixteen hex characters, while the
-                // top-level `peer_fingerprint` has been documented as a raw
-                // eight-character prefix in every sample this repository has
-                // shipped (`"-LT20C0-"` before this change, `"-XX1234-"`
-                // after). Applying "16 hex chars" to it would refuse the
-                // shipped sample's own value, and unifying the two encodings
-                // is a change to a pre-existing operator-facing key rather
-                // than to anything this change introduced.
+                // key printed `config OK`, while the identical string written
+                // as the profile's own fingerprint was refused.
                 //
                 // The key named is the one the operator wrote, as it is for
                 // the duplicate errors below.
                 if ProfileConfig::is_libtorrent_default_fingerprint(fp) {
-                    return Err(ProfileConfigError::DefaultFingerprintForbidden {
-                        key: if inherited {
-                            "peer_fingerprint"
-                        } else {
-                            "peer_fingerprint_hex"
-                        },
-                    });
+                    return Err(ProfileConfigError::DefaultFingerprintForbidden { key });
                 }
                 match seen_fp.insert(fp, p.id.as_str()) {
                     Some(prev) if inherited && self.inherits_fingerprint(prev) => {}
                     Some(_) => {
                         return Err(ProfileConfigError::DuplicateFingerprint {
-                            key: if inherited {
-                                "peer_fingerprint"
-                            } else {
-                                "peer_fingerprint_hex"
-                            },
+                            key,
                             value: fp.to_string(),
                         })
                     }
@@ -992,12 +997,12 @@ impl Config {
         Ok(())
     }
 
-    /// Whether the profile named `id` declares no `peer_fingerprint_hex`.
+    /// Whether the profile named `id` declares no `peer_fingerprint`.
     fn inherits_fingerprint(&self, id: &str) -> bool {
         self.profile
             .iter()
             .find(|p| p.id.as_str() == id)
-            .is_some_and(|p| p.peer_fingerprint_hex.is_none())
+            .is_some_and(|p| p.peer_fingerprint.is_none())
     }
 
     /// Whether the profile named `id` declares no `user_agent`.
@@ -1288,7 +1293,7 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
         let ProfileConfig {
             id: _,
             network,
-            peer_fingerprint_hex,
+            peer_fingerprint,
             user_agent,
             resume_dir,
             torrent_dir,
@@ -1298,7 +1303,7 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
         let ProfileConfig {
             id: _,
             network: b_network,
-            peer_fingerprint_hex: b_peer_fingerprint_hex,
+            peer_fingerprint: b_peer_fingerprint,
             user_agent: b_user_agent,
             resume_dir: b_resume_dir,
             torrent_dir: b_torrent_dir,
@@ -1311,8 +1316,8 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
         // from the top-level diff.
         field("network", network != b_network, Identity);
         field(
-            "peer_fingerprint_hex",
-            peer_fingerprint_hex != b_peer_fingerprint_hex,
+            "peer_fingerprint",
+            peer_fingerprint != b_peer_fingerprint,
             Identity,
         );
         field("user_agent", user_agent != b_user_agent, Identity);
@@ -1780,7 +1785,7 @@ listen_interfaces = "0.0.0.0:6881"
                 listen_interfaces: "0.0.0.0:6881".into(),
                 dht: false,
             },
-            peer_fingerprint_hex: None,
+            peer_fingerprint: None,
             user_agent: None,
             resume_dir: None,
             torrent_dir: None,
@@ -1800,7 +1805,7 @@ listen_interfaces = "0.0.0.0:6881"
                 port_forward: Default::default(),
                 port_forward_gateway: None,
             },
-            peer_fingerprint_hex: Some("a1b2c3d4e5f60718".into()),
+            peer_fingerprint: Some("-AA1000-".into()),
             user_agent: Some("qB/5.0".into()),
             resume_dir: None,
             torrent_dir: None,
@@ -1860,7 +1865,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg0.conf"
 vpn_interface        = "wg0"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint     = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 
 [[profile]]
@@ -1884,17 +1889,16 @@ listen_interfaces = "0.0.0.0:6882"
         // The configuration this is written from: the operator writes the VPN
         // profile, copies the table to make the public one, and edits `id`,
         // `network` and `listen_interfaces`. The fingerprint and user agent
-        // come along. `startup.rs` applies `peer_fingerprint_hex` to every
+        // come along. `startup.rs` applies `peer_fingerprint` to every
         // session with no posture guard, so the private tracker then sees one
         // peer-id prefix announcing from the tunnel address and from the
         // host's real address — the cross-account correlation whose stated
         // consequence is a permanent ban.
-        let msg = refusal(&vpn_plus_host(
-            "",
-            r#"peer_fingerprint_hex = "a1b2c3d4e5f60718""#,
-        ));
+        let msg = refusal(&vpn_plus_host("", r#"peer_fingerprint = "-AA1000-""#));
         assert!(
-            msg.contains("peer_fingerprint_hex") && msg.contains("a1b2c3d4e5f60718"),
+            msg.contains("peer_fingerprint")
+                && !msg.contains("top-level")
+                && msg.contains("-AA1000-"),
             "got: {msg}",
         );
     }
@@ -1920,7 +1924,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg0.conf"
 vpn_interface        = "wg0"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint     = "-AA1000-"
 user_agent           = "ua-a"
 
 [[profile]]
@@ -1930,13 +1934,16 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg1.conf"
 vpn_interface        = "wg1"
 listen_port          = 6882
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint     = "-AA1000-"
 user_agent           = "ua-b"
 "#
         );
         let p = write_cfg(dir.path(), &body);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
-        assert!(msg.contains("peer_fingerprint_hex"), "got: {msg}");
+        assert!(
+            msg.contains("peer_fingerprint") && !msg.contains("top-level"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1951,20 +1958,18 @@ user_agent           = "ua-b"
         // 8-byte peer-id prefix and one client string on the wire — one from
         // the tunnel address, one from the machine's real address.
         let msg = refusal(&vpn_plus_host(
-            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+            r#"peer_fingerprint = "-AA1000-"
 user_agent = "qBittorrent/5.0.3""#,
             "",
         ));
         assert!(
-            msg.contains("a1b2c3d4e5f60718"),
+            msg.contains("-AA1000-"),
             "the colliding value is named, got: {msg}",
         );
         // The key named is the one the *inheriting* profile would have to
-        // change — `peer_fingerprint`, which is what this operator wrote.
-        assert!(
-            msg.contains("peer_fingerprint") && !msg.contains("peer_fingerprint_hex"),
-            "got: {msg}",
-        );
+        // change — the top-level `peer_fingerprint`, which is what this
+        // operator wrote.
+        assert!(msg.contains("top-level peer_fingerprint"), "got: {msg}");
     }
 
     #[test]
@@ -1987,7 +1992,7 @@ vpn_type             = "wireguard"
 vpn_config           = "/etc/wireguard/wg0.conf"
 vpn_interface        = "wg0"
 listen_port          = 6881
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint     = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
 
 [[profile]]
@@ -2036,31 +2041,64 @@ user_agent = "libtorrent/2.0"
 
     #[test]
     fn a_top_level_fingerprint_may_not_be_the_libtorrent_default_either() {
-        // F49. The refusal bound to `peer_fingerprint_hex` and to nothing
-        // else, while `to_settings` hands the top-level `peer_fingerprint` to
-        // every session and `startup.rs:323` overrides it only for a profile
-        // that declared its own. So a host profile that writes neither key
+        // F49. The refusal bound to the per-profile key and to nothing else,
+        // while `to_settings` hands the top-level `peer_fingerprint` to every
+        // session and `startup.rs` overrides it only for a profile that
+        // declared its own. So a host profile that writes neither key
         // announced whatever the top level said, unchecked — including the one
         // value the refusal exists for, and `--check-config` printed
         // `config OK`.
-        //
-        // Both spellings, because the two keys spell those eight bytes
-        // differently and nothing decodes either: `-LT20C0-` is what actually
-        // reaches libtorrent from this key, and it is the value the sample
-        // documented for it before this change.
-        for spelling in ["-LT20C0-", "2d4c54323043302d"] {
+        let msg = refusal(&two_host_profiles_with_top(
+            r#"peer_fingerprint = "-LT20C0-""#,
+        ));
+        assert!(
+            msg.contains("must not equal libtorrent default"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("top-level peer_fingerprint "),
+            "and named as the key the operator actually wrote, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn a_top_level_fingerprint_must_be_an_eight_character_prefix() {
+        // The top-level key and the per-profile one are the same field in the
+        // same encoding, so they are held to the same shape. The hex spelling
+        // of libtorrent's default is the case that matters most: it was once
+        // refused as the default, and it is now refused before that question
+        // is asked, because it is not eight bytes at all.
+        for bad in ["2d4c54323043302d", "a1b2c3d4e5f60718", "-XX123-"] {
             let msg = refusal(&two_host_profiles_with_top(&format!(
-                "peer_fingerprint = {spelling:?}"
+                "peer_fingerprint = {bad:?}"
             )));
             assert!(
-                msg.contains("must not equal libtorrent default"),
-                "the {spelling:?} spelling must be refused, got: {msg}",
-            );
-            assert!(
-                msg.contains("peer_fingerprint ") && !msg.contains("peer_fingerprint_hex"),
-                "and named as the key the operator actually wrote, got: {msg}",
+                msg.contains("top-level peer_fingerprint")
+                    && msg.contains(bad)
+                    && msg.contains("exactly 8 printable ASCII characters"),
+                "{bad:?} must be refused as a malformed prefix, got: {msg}",
             );
         }
+    }
+
+    #[test]
+    fn the_retired_hex_key_is_refused_with_its_replacement_named() {
+        // `peer_fingerprint_hex` was documented as sixteen hex characters that
+        // nothing decoded. Reading it under either meaning would change the
+        // identity a tracker sees without the operator changing anything, and
+        // `deny_unknown_fields` alone would say only "unknown field".
+        let msg = refusal(&vpn_plus_host(
+            "",
+            r#"peer_fingerprint_hex = "b7c6d5e4f3a29180""#,
+        ));
+        assert!(
+            msg.contains("\"public\"")
+                && msg.contains("peer_fingerprint_hex")
+                && msg.contains("no longer read")
+                && msg.contains("as peer_fingerprint")
+                && msg.contains("-XX1234-"),
+            "got: {msg}",
+        );
     }
 
     #[test]
@@ -2100,31 +2138,26 @@ http_listen = "127.0.0.1:8080"
         // another declares — the shape where the file does not show that two
         // sessions share an identity. The exemption must not swallow it.
         let msg = refusal(&vpn_plus_host(
-            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+            r#"peer_fingerprint = "-AA1000-"
 user_agent = "qBittorrent/5.0.3""#,
             "",
         ));
-        assert!(msg.contains("a1b2c3d4e5f60718"), "got: {msg}");
+        assert!(msg.contains("-AA1000-"), "got: {msg}");
     }
 
     #[test]
     fn an_inherited_collision_names_the_key_the_operator_wrote() {
-        // The message named `peer_fingerprint_hex` — a key that appears
-        // nowhere in a file whose author wrote `peer_fingerprint` at the top
-        // level — so it described a line the operator could not find.
+        // The per-profile and top-level keys share a name. An inherited value
+        // is named as the top-level one, so the operator is not sent to a
+        // `[[profile]]` table that does not contain the line.
         let msg = refusal(&vpn_plus_host(
-            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+            r#"peer_fingerprint = "-AA1000-"
 user_agent = "qBittorrent/5.0.3""#,
             "",
         ));
         assert!(
-            !msg.contains("peer_fingerprint_hex"),
-            "naming peer_fingerprint_hex sends the operator to a key that appears nowhere \
-             in this file, got: {msg}",
-        );
-        assert!(
-            msg.contains("peer_fingerprint"),
-            "and the key it does name is the one they wrote, got: {msg}",
+            msg.contains("top-level peer_fingerprint"),
+            "the key it names is the one they wrote, got: {msg}",
         );
     }
 
@@ -2134,7 +2167,7 @@ user_agent = "qBittorrent/5.0.3""#,
         // keys outright would close F4 too, and break this.
         let dir = tempdir().unwrap();
         let body = with_top_level(
-            r#"peer_fingerprint = "a1b2c3d4e5f60718"
+            r#"peer_fingerprint = "-AA1000-"
 user_agent = "qBittorrent/5.0.3""#,
         );
         let p = write_cfg(dir.path(), &body);
@@ -2559,7 +2592,7 @@ listen_interfaces = "0.0.0.0:6882"
             listen_interfaces: "0.0.0.0:6899".into(),
             dht: true,
         };
-        p.peer_fingerprint_hex = Some("a1b2c3d4e5f60718".into());
+        p.peer_fingerprint = Some("-AA1000-".into());
         p.user_agent = Some("ua/1.0".into());
         p.resume_dir = Some("/var/lib/torrentd/resume-public".into());
         p.torrent_dir = Some("/var/lib/torrentd/torrents-public".into());
@@ -2574,7 +2607,7 @@ listen_interfaces = "0.0.0.0:6882"
         got.sort_by(|x, y| x.0.cmp(&y.0));
         let mut want = vec![
             ("public.network", ProfileChangeKind::Identity),
-            ("public.peer_fingerprint_hex", ProfileChangeKind::Identity),
+            ("public.peer_fingerprint", ProfileChangeKind::Identity),
             ("public.user_agent", ProfileChangeKind::Identity),
             ("public.resume_dir", ProfileChangeKind::NonIdentity),
             ("public.torrent_dir", ProfileChangeKind::NonIdentity),
@@ -2662,7 +2695,7 @@ listen_interfaces = "0.0.0.0:6882"
         let ProfileConfig {
             id: _,
             network,
-            peer_fingerprint_hex,
+            peer_fingerprint,
             user_agent,
             resume_dir,
             torrent_dir,
@@ -2679,14 +2712,14 @@ listen_interfaces = "0.0.0.0:6882"
             listen_interfaces: "0.0.0.0:6899".into(),
             dht: false,
         };
-        let new_fingerprint = Some("a1b2c3d4e5f60718".to_string());
+        let new_fingerprint = Some("-AA1000-".to_string());
         let new_user_agent = Some("ua/1.0".to_string());
         let new_resume_dir = Some(PathBuf::from("/var/lib/torrentd/resume-public"));
         let new_torrent_dir = Some(PathBuf::from("/var/lib/torrentd/torrents-public"));
         let new_domains = vec!["tracker.example.com".to_string()];
         let new_rate = Some(100_000);
         assert_ne!(network, &new_network);
-        assert_ne!(peer_fingerprint_hex, &new_fingerprint);
+        assert_ne!(peer_fingerprint, &new_fingerprint);
         assert_ne!(user_agent, &new_user_agent);
         assert_ne!(resume_dir, &new_resume_dir);
         assert_ne!(torrent_dir, &new_torrent_dir);
@@ -2702,9 +2735,9 @@ listen_interfaces = "0.0.0.0:6882"
                 with(&|p| p.network = new_network.clone()),
             ),
             (
-                "peer_fingerprint_hex",
+                "peer_fingerprint",
                 Identity,
-                with(&|p| p.peer_fingerprint_hex = new_fingerprint.clone()),
+                with(&|p| p.peer_fingerprint = new_fingerprint.clone()),
             ),
             (
                 "user_agent",
@@ -3125,7 +3158,7 @@ upload_rate_limit = 0"#,
             "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
              vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
              vpn_interface = \"wg0\"\nlisten_port = 6891\n\
-             peer_fingerprint_hex = \"a1b2c3d4e5f60718\"\nuser_agent = \"ua-a\"\n\
+             peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\n\
              dht = false\n"
         );
         let p = write_cfg(dir.path(), &body);
@@ -3146,7 +3179,7 @@ upload_rate_limit = 0"#,
             "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
              vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
              vpn_interface = \"wg0\"\nport_forward = \"natpmp\"\nlisten_port = 6891\n\
-             peer_fingerprint_hex = \"a1b2c3d4e5f60718\"\nuser_agent = \"ua-a\"\n"
+             peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\n"
         );
         let p = write_cfg(dir.path(), &body);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
@@ -3164,7 +3197,7 @@ upload_rate_limit = 0"#,
             "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
              vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
              vpn_interface = \"wg0\"\nport_forward = \"natpmp\"\n\
-             peer_fingerprint_hex = \"a1b2c3d4e5f60718\"\nuser_agent = \"ua-a\"\n"
+             peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\n"
         );
         let p = write_cfg(dir.path(), &body);
         Config::load(&p).expect("a natpmp profile names no port; that is the point");
@@ -3290,11 +3323,11 @@ upload_rate_limit = 0"#,
         let dir = tempdir().unwrap();
         let wg = "[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
                   vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
-                  listen_port = 6891\npeer_fingerprint_hex = \"a1b2c3d4e5f60718\"\n\
+                  listen_port = 6891\npeer_fingerprint = \"-AA1000-\"\n\
                   user_agent = \"ua-a\"\n";
         let ovpn = "[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\nvpn_type = \"openvpn\"\n\
                     vpn_config = \"/etc/openvpn/acct_b.conf\"\nvpn_interface = \"tun-b\"\n\
-                    listen_port = 6892\npeer_fingerprint_hex = \"b1b2c3d4e5f60718\"\n\
+                    listen_port = 6892\npeer_fingerprint = \"-BB1000-\"\n\
                     user_agent = \"ua-b\"\n";
 
         let body = format!("{TOP_LEVEL}\nnetwork_kill_switch = true\n\n{wg}\n{ovpn}");
@@ -3319,7 +3352,7 @@ upload_rate_limit = 0"#,
             "{TOP_LEVEL}\nnetwork_kill_switch = true\n\n[[profile]]\nid = \"acct_a\"\n\
              network = \"vpn\"\nvpn_type = \"wireguard\"\n\
              vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
-             listen_port = 6891\npeer_fingerprint_hex = \"a1b2c3d4e5f60718\"\n\
+             listen_port = 6891\npeer_fingerprint = \"-AA1000-\"\n\
              user_agent = \"ua-a\"\n"
         );
         let p = write_cfg(dir.path(), &body);
@@ -3341,7 +3374,7 @@ upload_rate_limit = 0"#,
              [[profile]]\nid = \"acct_a\"\n\
              network = \"vpn\"\nvpn_type = \"wireguard\"\n\
              vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
-             listen_port = 6891\npeer_fingerprint_hex = \"a1b2c3d4e5f60718\"\n\
+             listen_port = 6891\npeer_fingerprint = \"-AA1000-\"\n\
              user_agent = \"ua-a\"\n"
         );
         let p = write_cfg(dir.path(), &body);

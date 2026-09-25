@@ -1294,7 +1294,7 @@ where
         settings.user_agent = Some(ua.clone());
         settings.handshake_client_version = Some(ua.clone());
     }
-    if let Some(fp) = &p.peer_fingerprint_hex {
+    if let Some(fp) = &p.peer_fingerprint {
         settings.peer_fingerprint = Some(fp.clone());
     }
     // `is_some()`, not `> 0`. `0` is a legal per-profile value meaning
@@ -2871,7 +2871,7 @@ mod profile_construction_tests {
         format!(
             "[[profile]]\nid = \"{id}\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
              vpn_config = \"/etc/wireguard/{iface}.conf\"\nvpn_interface = \"{iface}\"\n\
-             listen_port = {port}\npeer_fingerprint_hex = \"a1b2c3d4e5f607{n:02x}\"\n\
+             listen_port = {port}\npeer_fingerprint = \"-AA10{n:02x}-\"\n\
              user_agent = \"ua-{id}\"\n",
             port = 6890 + u16::from(n),
         )
@@ -2881,7 +2881,7 @@ mod profile_construction_tests {
         format!(
             "[[profile]]\nid = \"{id}\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
              vpn_config = \"/etc/wireguard/{iface}.conf\"\nvpn_interface = \"{iface}\"\n\
-             port_forward = \"natpmp\"\npeer_fingerprint_hex = \"b1b2c3d4e5f60718\"\n\
+             port_forward = \"natpmp\"\npeer_fingerprint = \"-BB1000-\"\n\
              user_agent = \"ua-{id}\"\n"
         )
     }
