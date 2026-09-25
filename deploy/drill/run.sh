@@ -131,11 +131,19 @@ vpn_config = "/etc/wireguard/wg-drill.conf"
 vpn_interface = "wg-drill"
 listen_port = 6891
 peer_fingerprint_hex = "a1b2c3d4e5f60718"
+user_agent = "qBittorrent/5.0.3"
 EOF
+# Refuse to start a stack whose daemon would exit on its config: a compose
+# dependency on an exited service can wait indefinitely.
+tool_check() {
+  "$engine" run --rm -v "$DRILL_DIR:/drill:z" --entrypoint /usr/local/bin/torrentd \
+    "$TORRENTD_IMAGE" --config /drill/torrentd.toml --check-config
+}
 # Named for an info-hash, so the boot scan tries to add it, and not a torrent.
 printf 'not bencode' >"$DRILL_DIR/torrents/drill/$(printf 'd%.0s' {1..40}).torrent"
 chmod -R a+rX "$DRILL_DIR"
 chmod a+rw "$DRILL_DIR/torrentd.toml"
+tool_check || { echo "drill: the generated config does not load" >&2; exit 2; }
 
 "${compose[@]}" -f "$here/compose.yaml" up -d
 
@@ -145,6 +153,19 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 curl -fsS "$api/healthz" >/dev/null || { echo "drill: daemon never became healthy" >&2; exit 1; }
+
+# Prometheus must hold the seeded zeros before any fault: `increase()` over a
+# counter whose first stored sample is already the incremented value sees no
+# increase, and that is the whole failure the seeding exists to prevent.
+scraped() {
+  curl -fsS --get --data-urlencode 'query=torrentd_config_reload_failures_total' \
+    "$prom/api/v1/query" 2>/dev/null | grep -q '"result":\[{'
+}
+for _ in $(seq 1 60); do
+  scraped && break
+  sleep 1
+done
+scraped || { echo "drill: Prometheus never scraped the daemon" >&2; exit 1; }
 
 # ---- runtime faults ------------------------------------------------------
 for _ in 1 2 3 4 5 6; do
