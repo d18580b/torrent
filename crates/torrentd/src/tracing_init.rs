@@ -327,7 +327,7 @@ mod tests {
     fn ordinary_urls_pass_through_borrowed_or_unchanged() {
         assert!(matches!(redact_urls("no url here"), Cow::Borrowed(_)));
         for s in [
-            "udp://tracker.example:6969/announce?info_hash=x&key=ab12&port=1",
+            "udp://tracker.example:6969/announce?peer_id=x&key=ab12&port=1",
             "see https://example.com/docs/page.html.",
             "odd ://thing and 1://x",
         ] {
