@@ -283,20 +283,7 @@ impl Drop for BootCleanup {
             return;
         }
         if self.kill_switch {
-            match crate::vpn::killswitch::disable() {
-                Ok(()) => info!("boot failed: network kill switch removed"),
-                Err(e) => {
-                    warn!(error.cause = %e, "boot failed: could not remove kill switch");
-                    // The process is on its way out; the next boot reports it.
-                    write_shutdown_report(
-                        &self.run_dir,
-                        &ShutdownReport {
-                            unsaved_resumes: 0,
-                            kill_switch_removal_failed: true,
-                        },
-                    );
-                }
-            }
+            finish_boot_kill_switch_removal(&self.run_dir, crate::vpn::killswitch::disable());
         }
         for (t, iface) in std::mem::take(&mut self.tunnels) {
             warn!(vpn_iface = %iface, "boot failed: bringing tunnel down");
@@ -1674,21 +1661,11 @@ impl DaemonHandle {
         // tunnel is still up during a graceful shutdown, so the profiles' sockets
         // (still source-bound to the tunnel IP) can't leak in this window.
         if kill_switch_active {
-            match crate::vpn::killswitch::disable() {
-                Ok(()) => {
-                    info!("network kill switch removed");
-                    metrics.set_gauge("kill_switch_active", 0.0, &[]);
-                }
-                Err(e) => {
-                    error!(
-                        error.cause = %e,
-                        "failed to remove network kill switch; the daemon's uid stays \
-                         confined to the tunnels until the table is removed \
-                         (nft delete table inet torrentd_ks) or a kill-switch boot replaces it",
-                    );
-                    shutdown_report.kill_switch_removal_failed = true;
-                }
-            }
+            finish_kill_switch_removal(
+                crate::vpn::killswitch::disable(),
+                &metrics,
+                &mut shutdown_report,
+            );
         }
         write_shutdown_report(&run_dir, &shutdown_report);
 
@@ -1932,6 +1909,52 @@ fn take_shutdown_report(state_dir: &std::path::Path) -> ShutdownReport {
     report
 }
 
+/// Record the outcome of removing the kill switch on a clean shutdown.
+///
+/// On success `kill_switch_active` drops to 0. On failure it stays 1, because
+/// the table is still installed and still confines the uid, and the report
+/// carries the failure to the next boot.
+fn finish_kill_switch_removal(
+    outcome: std::io::Result<()>,
+    metrics: &PromSink,
+    report: &mut ShutdownReport,
+) {
+    match outcome {
+        Ok(()) => {
+            info!("network kill switch removed");
+            metrics.set_gauge("kill_switch_active", 0.0, &[]);
+        }
+        Err(e) => {
+            error!(
+                error.cause = %e,
+                "failed to remove network kill switch; the daemon's uid stays \
+                 confined to the tunnels until the table is removed \
+                 (nft delete table inet torrentd_ks) or a kill-switch boot replaces it",
+            );
+            report.kill_switch_removal_failed = true;
+        }
+    }
+}
+
+/// Record the outcome of removing the kill switch after a failed boot. The
+/// process is on its way out, so a failure goes to the report the next boot
+/// reads.
+fn finish_boot_kill_switch_removal(run_dir: &std::path::Path, outcome: std::io::Result<()>) {
+    match outcome {
+        Ok(()) => info!("boot failed: network kill switch removed"),
+        Err(e) => {
+            warn!(error.cause = %e, "boot failed: could not remove kill switch");
+            write_shutdown_report(
+                run_dir,
+                &ShutdownReport {
+                    unsaved_resumes: 0,
+                    kill_switch_removal_failed: true,
+                },
+            );
+        }
+    }
+}
+
 /// Export the previous run's [`ShutdownReport`] and warn about what it holds.
 fn export_shutdown_report(metrics: &PromSink, report: &ShutdownReport) {
     if report.unsaved_resumes > 0 {
@@ -2010,6 +2033,106 @@ fn unauthenticated_posture(cfg: &Config) -> Option<String> {
          reach it. Access control belongs to whatever sits in front of this daemon.",
         cfg.http_listen,
     ))
+}
+
+#[cfg(test)]
+mod shutdown_report_tests {
+    use super::*;
+
+    fn rendered(metrics: &PromSink) -> String {
+        String::from_utf8(metrics.render()).unwrap()
+    }
+
+    fn failed() -> std::io::Result<()> {
+        Err(std::io::Error::other("nft: permission denied"))
+    }
+
+    #[test]
+    fn a_written_report_is_read_back_once_and_then_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let report = ShutdownReport {
+            unsaved_resumes: 3,
+            kill_switch_removal_failed: true,
+        };
+        write_shutdown_report(dir.path(), &report);
+        assert_eq!(take_shutdown_report(dir.path()), report);
+        assert!(
+            !shutdown_report_path(dir.path()).exists(),
+            "the report is deleted once read"
+        );
+        // A second boot, with no exit in between that wrote one, reports zero.
+        assert_eq!(take_shutdown_report(dir.path()), ShutdownReport::default());
+    }
+
+    #[test]
+    fn a_malformed_report_reads_as_zero_and_is_still_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(shutdown_report_path(dir.path()), b"{not json").unwrap();
+        assert_eq!(take_shutdown_report(dir.path()), ShutdownReport::default());
+        assert!(!shutdown_report_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn a_non_zero_report_is_exported_as_non_zero_gauges() {
+        let metrics = PromSink::new();
+        export_shutdown_report(
+            &metrics,
+            &ShutdownReport {
+                unsaved_resumes: 7,
+                kill_switch_removal_failed: true,
+            },
+        );
+        let text = rendered(&metrics);
+        assert!(
+            text.contains("torrentd_last_shutdown_unsaved_resumes 7"),
+            "{text}"
+        );
+        assert!(
+            text.contains("torrentd_last_shutdown_kill_switch_removal_failed 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_kill_switch_removal_leaves_it_active_and_reports_it() {
+        let metrics = PromSink::new();
+        metrics.set_gauge("kill_switch_active", 1.0, &[]);
+        let mut report = ShutdownReport::default();
+        finish_kill_switch_removal(failed(), &metrics, &mut report);
+        assert!(report.kill_switch_removal_failed);
+        let text = rendered(&metrics);
+        assert!(text.contains("torrentd_kill_switch_active 1"), "{text}");
+    }
+
+    #[test]
+    fn a_removed_kill_switch_reads_inactive_and_reports_nothing() {
+        let metrics = PromSink::new();
+        metrics.set_gauge("kill_switch_active", 1.0, &[]);
+        let mut report = ShutdownReport::default();
+        finish_kill_switch_removal(Ok(()), &metrics, &mut report);
+        assert!(!report.kill_switch_removal_failed);
+        let text = rendered(&metrics);
+        assert!(text.contains("torrentd_kill_switch_active 0"), "{text}");
+    }
+
+    #[test]
+    fn a_failed_boot_that_cannot_remove_the_kill_switch_leaves_a_report() {
+        let dir = tempfile::tempdir().unwrap();
+        finish_boot_kill_switch_removal(dir.path(), failed());
+        assert_eq!(
+            take_shutdown_report(dir.path()),
+            ShutdownReport {
+                unsaved_resumes: 0,
+                kill_switch_removal_failed: true,
+            }
+        );
+
+        finish_boot_kill_switch_removal(dir.path(), Ok(()));
+        assert!(
+            !shutdown_report_path(dir.path()).exists(),
+            "a removal that worked writes no report"
+        );
+    }
 }
 
 #[cfg(test)]
