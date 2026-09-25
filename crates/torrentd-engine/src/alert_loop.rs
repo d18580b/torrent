@@ -8,9 +8,12 @@
 //!   - 30-minute tick: scan the state map for torrents flagged
 //!     `needs_save_resume` and call `save_resume_data` with
 //!     `ONLY_IF_MODIFIED`.
-//!   - Retry timer: torrents in upload-mode have a `RetryState`; when
-//!     `next_attempt <= now` we call `engine.resume_torrent(handle)` and
-//!     schedule the next attempt with exponential backoff.
+//!   - Disk-error retry timer: a `file_error_alert` arms a `RetryState`;
+//!     when `next_attempt <= now` and libtorrent still holds an error on the
+//!     torrent, we call `engine.resume_torrent(handle)` (which clears the
+//!     error and the pause libtorrent put on it) and schedule the next
+//!     attempt with exponential backoff. A torrent with no error left has
+//!     its timer retired instead.
 //!   - Shutdown: on signal, fire `save_resume_data` for every torrent
 //!     concurrently, then loop draining alerts until
 //!     `pending_resume_count == 0` or the global 30-second deadline
@@ -560,7 +563,7 @@ fn execute_due_retries(
         };
         // The VPN monitor pauses every torrent in a profile whose tunnel went
         // down and refuses to restart it without an operator. Resuming one on
-        // the upload-mode retry timer would un-quarantine it individually,
+        // the disk-error retry timer would un-quarantine it individually,
         // which is the thing fencing exists to prevent.
         if profile_fenced.is_some_and(|f| f(&st.profile_id)) {
             debug!(
@@ -569,6 +572,31 @@ fn execute_due_retries(
                 infohash = %handle.infohash,
                 "retry skipped: profile is fenced",
             );
+            continue;
+        }
+        // What a `file_error_alert` leaves behind under this daemon's flags
+        // (vendor/libtorrent/src/torrent.cpp, `handle_disk_error` and
+        // `on_piece_hashed`): a read failure, or any failure while checking,
+        // sets an error on the torrent and pauses it. A write failure of the
+        // disk-full / read-only kind only sets upload mode, which every
+        // torrent here already carries (`policy::no_download`), and ENOMEM
+        // only disconnects the peer. So the one thing there is to recover is
+        // an error-paused torrent, and `resume()` is what recovers it:
+        // `torrent::do_resume` unpauses and calls `clear_error`, which
+        // re-checks the files if the error came from a check.
+        //
+        // A torrent with no error left has nothing for the retry to do — it
+        // recovered, an operator resumed it, or the error never paused it —
+        // and resuming it anyway would undo an operator's pause every hour,
+        // forever, because nothing else ever clears the timer. Retire it.
+        if !st.has_error {
+            debug!(
+                target: "torrentd_engine::alert_loop",
+                profile_id = %st.profile_id,
+                infohash = %handle.infohash,
+                "disk-error retry retired: torrent carries no libtorrent error",
+            );
+            state.update(&handle.infohash, |s| s.retry = None);
             continue;
         }
         let Some(engine) = source.engine_for(&st.profile_id) else {
@@ -580,14 +608,14 @@ fn execute_due_retries(
                     target: "torrentd_engine::alert_loop",
                     profile_id = %st.profile_id,
                     infohash = %handle.infohash,
-                    "retry: resumed torrent from upload_mode",
+                    "disk-error retry: resumed torrent to clear its libtorrent error",
                 );
                 state.update(&handle.infohash, |s| {
                     let attempts = s.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
                     s.retry = Some(crate::state::RetryState::next(clock.now(), attempts));
                 });
                 metrics.inc_counter(
-                    "upload_mode_retry_attempts_total",
+                    "disk_error_retry_attempts_total",
                     &[("profile_id", st.profile_id.as_str())],
                 );
             }
@@ -597,10 +625,10 @@ fn execute_due_retries(
                     profile_id = %st.profile_id,
                     infohash = %handle.infohash,
                     error.cause = %e,
-                    "retry resume failed",
+                    "disk-error retry: resume failed",
                 );
                 metrics.inc_counter(
-                    "upload_mode_retry_errors_total",
+                    "disk_error_retry_errors_total",
                     &[("profile_id", st.profile_id.as_str())],
                 );
             }
@@ -736,6 +764,7 @@ mod tests {
 
     use super::*;
     use crate::clock::MockClock;
+    use crate::metrics::MetricCall;
     use crate::metrics::NoopSink;
     use crate::metrics::RecordingSink;
     use crate::mock::MockEngine;
@@ -869,7 +898,7 @@ mod tests {
     #[test]
     fn a_fenced_profile_is_not_resumed_by_the_retry_timer() {
         // The VPN monitor pauses every torrent in a profile whose tunnel dropped
-        // and deliberately does not restart it. The upload-mode retry timer
+        // and deliberately does not restart it. The disk-error retry timer
         // ran on its own schedule with no notion of that, so it un-quarantined
         // torrents one at a time — putting traffic back on a profile the operator
         // was told to go look at.
@@ -887,8 +916,10 @@ mod tests {
             "the add alert was never dispatched",
         );
 
-        // Make a retry due immediately, as `file_error` -> upload_mode does.
+        // Make a retry due immediately on a torrent libtorrent error-paused,
+        // which is the one case the retry would otherwise resume.
         handle.state().update(&ih, |s| {
+            s.has_error = true;
             s.retry = Some(crate::state::RetryState::first(
                 std::time::Instant::now() - Duration::from_secs(3600),
             ));
@@ -906,6 +937,72 @@ mod tests {
 
         assert!(handle.signal_shutdown(ShutdownReason::Test));
         handle.join().expect("loop thread panicked");
+    }
+
+    /// Drive one pass of the retry timer against a single mock-engine
+    /// torrent whose retry is already due, and return what it did.
+    fn run_due_retry(has_error: bool) -> (Arc<MockEngine>, Arc<StateMap>, Arc<RecordingSink>) {
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let state = Arc::new(StateMap::new());
+        let ih = InfoHash([9u8; 20]);
+        let h = TorrentHandle { id: 9, infohash: ih };
+        let now = std::time::Instant::now();
+        let mut st = crate::state::TorrentState::newly_added(h, ProfileId::new("p"), now);
+        st.has_error = has_error;
+        st.retry = Some(crate::state::RetryState::first(now - Duration::from_secs(3600)));
+        state.insert(ih, st);
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
+        let clock: Arc<dyn Clock> = Arc::new(crate::clock::SystemClock);
+        execute_due_retries(&source, &state, &metrics, &clock, None, now);
+        (engine, state, recording)
+    }
+
+    fn resumed(engine: &MockEngine) -> bool {
+        engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, crate::mock::RecordedCall::ResumeTorrent(_)))
+    }
+
+    #[test]
+    fn the_disk_error_retry_resumes_a_torrent_libtorrent_left_errored() {
+        // A read failure or a failed check leaves the torrent paused with an
+        // error set, and `resume()` is what clears both. That is the retry's
+        // whole job, so it must still happen, back off, and be counted.
+        let (engine, state, metrics) = run_due_retry(true);
+        assert!(resumed(&engine), "an errored torrent was not resumed");
+        let st = state.get(&InfoHash([9u8; 20])).unwrap();
+        let retry = st.retry.expect("the timer stays armed until the error is gone");
+        assert_eq!(retry.attempts, 2, "the next attempt backs off");
+        assert!(metrics.calls().iter().any(|c| matches!(
+            c,
+            MetricCall::IncCounter { name, .. } if name == "disk_error_retry_attempts_total"
+        )));
+    }
+
+    #[test]
+    fn the_disk_error_retry_retires_once_no_error_is_left() {
+        // Nothing cleared the timer before: once armed, a torrent was resumed
+        // every hour forever — undoing any operator pause on it — although
+        // libtorrent had nothing left to recover. With no error there is
+        // nothing to do, so the timer goes and the torrent is left alone.
+        let (engine, state, metrics) = run_due_retry(false);
+        assert!(!resumed(&engine), "a torrent with no error was resumed");
+        assert!(
+            state.get(&InfoHash([9u8; 20])).unwrap().retry.is_none(),
+            "the timer must be retired, or it fires again next tick",
+        );
+        assert!(
+            !metrics.calls().iter().any(|c| matches!(
+                c,
+                MetricCall::IncCounter { name, .. } if name.starts_with("disk_error_retry_")
+            )),
+            "a retired timer is not a retry attempt",
+        );
     }
 
     #[test]
