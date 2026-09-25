@@ -204,28 +204,78 @@ pub(crate) fn enable_for_uid(
 ///
 /// A missing table is success — shutdown must never fail on it, and the
 /// startup pre-clear runs against a table that usually is not there. Any other
-/// non-zero exit is reported: `nft` merges into an existing table rather than
+/// failure is reported: `nft` merges into an existing table rather than
 /// replacing it, so a stale table that failed to delete would silently survive
-/// alongside the new rules. Previously only a failure to *spawn* `nft` was
-/// noticed, and a non-zero exit looked identical to success.
+/// alongside the new rules.
+///
+/// Whether the table exists is asked directly, with `nft list tables`, rather
+/// than inferred from the text of a failed delete. That text is `strerror`
+/// output, which is localised: matching "No such file or directory" failed on
+/// any host whose `LC_MESSAGES` is not C or English, so the first boot with the
+/// kill switch on aborted on a delete of a table that was never there. The
+/// listing is ruleset syntax, which no locale translates, and it still fails —
+/// and so still reports — on the errors that matter, such as a missing
+/// `CAP_NET_ADMIN`.
 pub fn disable() -> io::Result<()> {
+    disable_with(list_tables, delete_table)
+}
+
+/// `disable`, with both `nft` calls handed in so the decision between them is
+/// reachable by a test on a host without `nft` or `CAP_NET_ADMIN`.
+pub(crate) fn disable_with(
+    list: impl Fn() -> io::Result<String>,
+    delete: impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    if !table_listed(&list()?) {
+        return Ok(());
+    }
+    delete()
+}
+
+/// Whether `nft list tables` output names this module's table. Each line is
+/// `table <family> <name>`; the table is matched on family and name exactly,
+/// so a same-named table in another family, or one whose name merely starts
+/// with [`TABLE`], is not taken for it.
+fn table_listed(listing: &str) -> bool {
+    listing
+        .lines()
+        .any(|line| line.split_whitespace().eq(["table", "inet", TABLE]))
+}
+
+/// `nft list tables`, returning its stdout.
+fn list_tables() -> io::Result<String> {
+    let out = Command::new("nft")
+        .args(["list", "tables"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "nft list tables exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// `nft delete table inet TABLE`. Any non-zero exit is an error: it is only
+/// called once the table has been listed, so there is no absent case to
+/// excuse.
+fn delete_table() -> io::Result<()> {
     let out = Command::new("nft")
         .args(["delete", "table", "inet", TABLE])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .output()?;
-    if out.status.success() {
-        return Ok(());
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "nft delete table exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        )));
     }
-    let err = String::from_utf8_lossy(&out.stderr);
-    if err.contains("No such file or directory") || err.contains("does not exist") {
-        return Ok(());
-    }
-    Err(io::Error::other(format!(
-        "nft delete table exited {}: {}",
-        out.status,
-        err.trim(),
-    )))
+    Ok(())
 }
 
 /// Feed a ruleset to `nft -f -`.
@@ -371,6 +421,96 @@ mod tests {
             !applied.get(),
             "a ruleset is never merged into a table that would not clear",
         );
+    }
+
+    /// The first boot with the kill switch on: no table yet. `disable` must
+    /// succeed without attempting the delete, whatever language `nft` would
+    /// have failed it in — the absence is read from the listing, not from a
+    /// localised error message.
+    #[test]
+    fn disable_succeeds_without_deleting_when_the_table_is_absent() {
+        let deleted = std::cell::Cell::new(false);
+        disable_with(
+            || Ok("table ip filter\ntable inet other\n".to_string()),
+            || {
+                deleted.set(true);
+                Err(io::Error::other(
+                    "nft delete table exited 1: Fehler: Datei oder Verzeichnis nicht gefunden",
+                ))
+            },
+        )
+        .expect("an absent table is success");
+        assert!(!deleted.get(), "nothing to delete, so no delete is run");
+
+        disable_with(|| Ok(String::new()), || panic!("no tables at all"))
+            .expect("an empty listing is an absent table");
+    }
+
+    #[test]
+    fn disable_deletes_a_listed_table_and_reports_its_failure() {
+        let deleted = std::cell::Cell::new(false);
+        disable_with(
+            || Ok(format!("table ip filter\ntable inet {TABLE}\n")),
+            || {
+                deleted.set(true);
+                Ok(())
+            },
+        )
+        .expect("a delete that succeeded");
+        assert!(deleted.get(), "a listed table is deleted");
+
+        let e = disable_with(
+            || Ok(format!("table inet {TABLE}\n")),
+            || Err(io::Error::other("nft delete table exited 1: busy")),
+        )
+        .expect_err("a table that exists and would not delete is not swallowed");
+        assert!(e.to_string().contains("nft delete table"), "got {e}");
+    }
+
+    /// A listing that fails — no `CAP_NET_ADMIN`, say — is an error, not an
+    /// absent table: otherwise a stale table this run cannot see would be
+    /// left in force beneath the new rules.
+    #[test]
+    fn disable_reports_a_failed_listing_without_deleting() {
+        let e = disable_with(
+            || {
+                Err(io::Error::other(
+                    "nft list tables exited 1: Operation not permitted",
+                ))
+            },
+            || panic!("nothing is deleted on a listing nobody could read"),
+        )
+        .expect_err("a failed listing is not an absent table");
+        assert!(e.to_string().contains("nft list tables"), "got {e}");
+    }
+
+    /// `disable` against a real `nft`: absent, then present, then absent
+    /// again. Needs `CAP_NET_ADMIN` in a network namespace of its own, so it
+    /// is ignored by default; run it unprivileged, under a non-English locale,
+    /// with
+    ///
+    /// ```text
+    /// LC_ALL=de_DE.UTF-8 unshare -rn cargo test -p torrentd --bin torrentd \
+    ///     disable_against_real_nft -- --ignored
+    /// ```
+    #[test]
+    #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
+    fn disable_against_real_nft() {
+        disable().expect("no table yet: success, in any locale");
+        apply(&render_ruleset(998, &["wg0".to_string()])).expect("install");
+        assert!(table_listed(&list_tables().expect("list")));
+        disable().expect("an installed table is deleted");
+        assert!(!table_listed(&list_tables().expect("list")));
+        disable().expect("and deleting it again is still success");
+    }
+
+    #[test]
+    fn only_this_family_and_name_count_as_the_table() {
+        assert!(table_listed(&format!("table inet {TABLE}\n")));
+        assert!(table_listed(&format!("table ip nat\ntable inet {TABLE}")));
+        assert!(!table_listed(&format!("table ip {TABLE}\n")));
+        assert!(!table_listed(&format!("table inet {TABLE}_old\n")));
+        assert!(!table_listed(""));
     }
 
     #[test]
