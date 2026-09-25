@@ -108,6 +108,26 @@ groups:
         annotations:
           summary: "Profile {{ $labels.profile_id }} holds no NAT-PMP lease; incoming connections are not forwarded"
 
+      - alert: TorrentdPortForwardRenewFailed
+        # Provider side: the gateway did not answer or refused the lease. The
+        # renewal is retried within seconds and one failure leaves the lease
+        # standing, so this is information; a lease actually lost is
+        # TorrentdPortForwardDown.
+        expr: increase(torrentd_profile_port_forward_failures_total{stage="renew"}[15m]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "The NAT-PMP gateway did not renew profile {{ $labels.profile_id }}'s lease; a provider-side problem, retried in seconds"
+
+      - alert: TorrentdPortForwardRebindFailed
+        # Local side: the gateway named a new port and the session could not
+        # be rebound to it, so the session still listens on the old port.
+        expr: increase(torrentd_profile_port_forward_failures_total{stage="rebind"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s session could not be rebound to the port the gateway forwarded; it still listens on the old one"
+
       - alert: TorrentdListenFailed
         expr: torrentd_listen_failure_active == 1
         labels:

@@ -490,12 +490,14 @@ pub const CATALOGUE: &[Series] = &[
         Seed::Owner("live natpmp profiles"),
         "NAT-PMP lease renewals.",
     ),
-    series(
+    labelled(
         "profile_port_forward_failures_total",
         Counter,
         NatpmpProfile,
+        ("stage", &["renew", "rebind"]),
         Seed::Owner("live natpmp profiles"),
-        "NAT-PMP renewals or rebinds that failed.",
+        "NAT-PMP attempts that failed, by stage: renew when the gateway did not answer or \
+         refused the lease, rebind when it named a new port the session could not be rebound to.",
     ),
     series(
         "profile_port_forward_rebind_failures_total",
