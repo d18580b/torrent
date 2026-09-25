@@ -490,12 +490,14 @@ pub const CATALOGUE: &[Series] = &[
         Seed::Owner("live natpmp profiles"),
         "NAT-PMP lease renewals.",
     ),
-    series(
+    labelled(
         "profile_port_forward_failures_total",
         Counter,
         NatpmpProfile,
+        ("stage", &["renew", "rebind"]),
         Seed::Owner("live natpmp profiles"),
-        "NAT-PMP renewals or rebinds that failed.",
+        "NAT-PMP attempts that failed, by stage: renew when the gateway did not answer or \
+         refused the lease, rebind when it named a new port the session could not be rebound to.",
     ),
     series(
         "profile_port_forward_rebind_failures_total",
@@ -1050,6 +1052,19 @@ mod tests {
             assert!(
                 catalogued(&name).is_some(),
                 "the alert rules read torrentd_{name}, which the daemon does not export",
+            );
+        }
+    }
+
+    #[test]
+    fn every_series_the_dashboard_reads_is_catalogued() {
+        let dashboard = deploy("dashboard.json");
+        let names = referenced(&dashboard);
+        assert!(!names.is_empty());
+        for name in names {
+            assert!(
+                catalogued(&name).is_some(),
+                "deploy/dashboard.json reads torrentd_{name}, which the daemon does not export",
             );
         }
     }
