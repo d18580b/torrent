@@ -118,7 +118,10 @@ fn apply_inner(
              resuming this plan",
             stuck.seq, stuck.op, stuck.src,
         );
-        let _ = pool.with_store(|s| s.set_plan_status(plan_id, plan_status::FAILED, None));
+        if let Err(e) = pool.with_store(|s| s.set_plan_status(plan_id, plan_status::FAILED, None)) {
+            pool.note_store_error("set_plan_status", &e);
+        }
+        pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
         return Err(msg);
     }
 
@@ -172,9 +175,11 @@ fn apply_inner(
                 // discard it.
                 out.failed += 1;
                 out.status = plan_status::FAILED.to_string();
-                let _ = pool.with_store(|s| {
+                if let Err(se) = pool.with_store(|s| {
                     s.set_step_status(plan_id, step.seq, step_status::FAILED, Some(&e))
-                });
+                }) {
+                    pool.note_store_error("set_step_status", &se);
+                }
                 error!(
                     target: "torrentd::pool::apply",
                     plan_id,
@@ -182,6 +187,7 @@ fn apply_inner(
                     error.cause = %e,
                     "stopping: the index no longer accounts for what is loaded",
                 );
+                pool.count("pool_plan_failures_total", &[("kind", "index_diverged")]);
                 break;
             }
             loaded_len = state.len();
@@ -190,8 +196,16 @@ fn apply_inner(
         // Steps were inserted `pending` up front and only updated afterwards,
         // which made "never started" and "started, outcome unknown"
         // indistinguishable to the resume path.
-        let _ = pool
-            .with_store(|s| s.set_step_status(plan_id, step.seq, step_status::IN_PROGRESS, None));
+        //
+        // A journal write that fails here leaves the step `pending`, so a
+        // crash during it re-runs the step instead of parking it for a human.
+        // The step still runs — refusing would strand the claimed plan — but
+        // the gap is reported.
+        if let Err(e) = pool
+            .with_store(|s| s.set_step_status(plan_id, step.seq, step_status::IN_PROGRESS, None))
+        {
+            pool.note_store_error("set_step_status", &e);
+        }
         let result = match step.op.as_str() {
             ops::MOVE_TORRENT => move_torrent(pool, source, state, &step),
             ops::MOVE_FILE => move_file(
@@ -205,8 +219,11 @@ fn apply_inner(
         match result {
             Ok(()) => {
                 out.done += 1;
-                let _ = pool
-                    .with_store(|s| s.set_step_status(plan_id, step.seq, step_status::DONE, None));
+                if let Err(e) = pool
+                    .with_store(|s| s.set_step_status(plan_id, step.seq, step_status::DONE, None))
+                {
+                    pool.note_store_error("set_step_status", &e);
+                }
             }
             Err(e) => {
                 out.failed += 1;
@@ -219,9 +236,12 @@ fn apply_inner(
                     error.cause = %e,
                     "plan step failed",
                 );
-                let _ = pool.with_store(|s| {
+                pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
+                if let Err(se) = pool.with_store(|s| {
                     s.set_step_status(plan_id, step.seq, step_status::FAILED, Some(&e))
-                });
+                }) {
+                    pool.note_store_error("set_step_status", &se);
+                }
                 // Stop at the first failure. Continuing would apply half a
                 // reorganisation and leave the operator reconciling it by hand.
                 out.status = plan_status::FAILED.to_string();
@@ -629,6 +649,7 @@ pub fn resume_unfinished(pool: &PoolService, source: &Arc<dyn AlertSource>, stat
         Ok(p) => p,
         Err(e) => {
             warn!(target: "torrentd::pool::apply", reason = %e, "cannot read unfinished plans");
+            pool.count("pool_plan_failures_total", &[("kind", "resume_failed")]);
             return;
         }
     };
@@ -639,8 +660,11 @@ pub fn resume_unfinished(pool: &PoolService, source: &Arc<dyn AlertSource>, stat
             kind = %plan.kind,
             "resuming a plan interrupted mid-apply",
         );
+        // A plan that ran and stopped at a failed step has already counted
+        // that; this counts the re-drive itself being refused or erroring.
         if let Err(e) = apply_inner(pool, source, state, plan.id, true) {
             error!(target: "torrentd::pool::apply", plan_id = plan.id, error.cause = %e, "resume failed");
+            pool.count("pool_plan_failures_total", &[("kind", "resume_failed")]);
         }
     }
 }

@@ -10,6 +10,7 @@ use axum::response::Response;
 use axum::Json;
 use serde::Deserialize;
 use serde::Serialize;
+use torrentd_engine::MetricsSink;
 use tracing::info;
 use tracing::warn;
 
@@ -62,7 +63,7 @@ pub async fn login(State(s): State<AppState>, req: Request) -> Response {
             .into_response();
     };
 
-    if let Err(res) = authenticate(auth, client, req).await {
+    if let Err(res) = authenticate(auth, client, req, s.metrics.as_ref()).await {
         return res;
     }
 
@@ -110,11 +111,21 @@ const MAX_LOGIN_BODY_BYTES: usize = 8 * 1024;
 ///
 /// `Ok(())` means the caller proved the password. Every `Err` is the response
 /// to send.
+///
+/// A refusal that is about the attempt — the wrong password, or a throttle
+/// turning it away — is counted in `auth_login_failures_total` by reason. A
+/// brute-force run was otherwise visible only as `warn` lines in the journal,
+/// which nothing alerts on. Malformed requests are not counted: they never
+/// became an attempt.
 async fn authenticate(
     auth: &crate::auth::Auth,
     client: Client,
     req: Request,
+    metrics: &dyn MetricsSink,
 ) -> Result<(), Response> {
+    let refused = |reason: &str| {
+        metrics.inc_counter("auth_login_failures_total", &[("reason", reason)]);
+    };
     // Checked first, before the throttle is consulted and before the body is
     // read at all.
     //
@@ -157,6 +168,7 @@ async fn authenticate(
             retry_after_secs = wait.as_secs(),
             "login throttled after repeated failures",
         );
+        refused("throttled");
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", wait.as_secs().max(1).to_string())],
@@ -195,6 +207,7 @@ async fn authenticate(
             retry_after_secs = wait.as_secs(),
             "login refused: daemon-wide password verification budget spent",
         );
+        refused("verification_budget");
         return Err((
             StatusCode::TOO_MANY_REQUESTS,
             [("retry-after", wait.as_secs().max(1).to_string())],
@@ -214,6 +227,7 @@ async fn authenticate(
             client_ip = client.ip.map(|i| i.to_string()).unwrap_or_default(),
             "failed login attempt",
         );
+        refused("bad_password");
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({"error": "invalid password"})),
@@ -309,6 +323,13 @@ fn authorized(state: &AppState, req: &Request, needed: Scope) -> bool {
                 token_name = %name,
                 "token presented without the required scope",
             );
+            // A valid credential used for something it was not issued for:
+            // a misconfigured client at best, a leaked scrape token probing
+            // the API at worst. Unauthenticated requests are not counted —
+            // an expired browser session produces them routinely.
+            state
+                .metrics
+                .inc_counter("auth_token_scope_denials_total", &[]);
         }
     }
     false
@@ -426,12 +447,14 @@ mod tests {
         //    throttle per client was supposed to have removed.
         let auth = test_auth();
         let client = a_client();
+        let metrics = torrentd_engine::RecordingSink::new();
 
         for _ in 0..5 {
             let res = authenticate(
                 &auth,
                 client,
                 login_req("text/plain", r#"{"password":"a=b"}"#),
+                &metrics,
             )
             .await
             .expect_err("a text/plain body is not a JSON login");
@@ -448,11 +471,17 @@ mod tests {
         // The same five with the correct declaration do reach the password,
         // and do accrue — which is what shows the assertion above is about
         // the gate rather than about the throttle being inert.
+        assert_eq!(
+            metrics.count_for("auth_login_failures_total"),
+            0,
+            "a refused media type never became an attempt",
+        );
         for _ in 0..5 {
             let res = authenticate(
                 &auth,
                 client,
                 login_req("application/json", r#"{"password":"wrong"}"#),
+                &metrics,
             )
             .await
             .expect_err("a wrong password is refused");
@@ -462,6 +491,41 @@ mod tests {
             auth.throttle.retry_after(client.ip).is_some(),
             "five declared-JSON failures do trip the lockout",
         );
+        let res = authenticate(
+            &auth,
+            client,
+            login_req("application/json", r#"{"password":"wrong"}"#),
+            &metrics,
+        )
+        .await
+        .expect_err("the locked-out client is turned away");
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            failures_by_reason(&metrics),
+            vec!["bad_password"; 5]
+                .into_iter()
+                .chain(["throttled"])
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    fn failures_by_reason(metrics: &torrentd_engine::RecordingSink) -> Vec<String> {
+        metrics
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                torrentd_engine::metrics::MetricCall::IncCounter { name, labels }
+                    if name == "auth_login_failures_total" =>
+                {
+                    labels
+                        .iter()
+                        .find(|(k, _)| k == "reason")
+                        .map(|(_, v)| v.clone())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[tokio::test]
@@ -477,6 +541,7 @@ mod tests {
                 "application/json",
                 r#"{"password":"correct-horse-battery"}"#,
             ),
+            &torrentd_engine::NoopSink,
         )
         .await
         .expect("the documented content type and the correct password");
@@ -499,6 +564,7 @@ mod tests {
         );
 
         let client = a_client();
+        let metrics = torrentd_engine::RecordingSink::new();
         let res = authenticate(
             &auth,
             client,
@@ -506,10 +572,12 @@ mod tests {
                 "application/json",
                 r#"{"password":"correct-horse-battery"}"#,
             ),
+            &metrics,
         )
         .await
         .expect_err("the budget is spent");
         assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(failures_by_reason(&metrics), vec!["verification_budget"]);
         assert!(res.headers().contains_key("retry-after"));
         assert!(
             auth.throttle.retry_after(client.ip).is_none(),

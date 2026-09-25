@@ -257,6 +257,68 @@ pub(crate) fn disable_with(
     delete()
 }
 
+/// How often [`watch`] checks the table is still installed.
+const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Check, for as long as the daemon runs, that the kill switch this boot
+/// installed is still there.
+///
+/// Installation is verified once; nothing after it noticed a table removed
+/// underneath the daemon — a firewall service reloading its ruleset with
+/// `nft flush ruleset` does exactly that — and the backstop was gone while
+/// `kill_switch_active` still read 1. Each check sets
+/// `kill_switch_table_present`; a check that cannot list the tables counts in
+/// `kill_switch_probe_errors_total` and leaves the gauge as it was, since not
+/// knowing is not the same as absent.
+///
+/// Only spawned when the kill switch is active.
+pub async fn watch(
+    metrics: std::sync::Arc<crate::metrics_sink::PromSink>,
+    mut shutdown: tokio::sync::broadcast::Receiver<torrentd_engine::ShutdownReason>,
+) {
+    use torrentd_engine::MetricsSink;
+    // Installed moments ago by `enable`, which checked it.
+    metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(WATCH_INTERVAL) => {}
+            _ = shutdown.recv() => return,
+        }
+        let listed = tokio::task::spawn_blocking(list_tables).await;
+        record_check(
+            &*metrics,
+            listed.unwrap_or_else(|e| Err(io::Error::other(e))),
+        );
+    }
+}
+
+/// Turn one `nft list tables` outcome into the watch's metrics and log.
+fn record_check(metrics: &dyn torrentd_engine::MetricsSink, listed: io::Result<String>) {
+    match listed {
+        Ok(listing) if table_listed(&listing) => {
+            metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
+        }
+        Ok(_) => {
+            metrics.set_gauge("kill_switch_table_present", 0.0, &[]);
+            tracing::error!(
+                target: "torrentd::vpn::killswitch",
+                table = TABLE,
+                "the network kill switch's nftables table is gone; the daemon's egress is no \
+                 longer confined to the tunnels. Restart the daemon to reinstall it",
+            );
+        }
+        Err(e) => {
+            metrics.inc_counter("kill_switch_probe_errors_total", &[]);
+            tracing::warn!(
+                target: "torrentd::vpn::killswitch",
+                table = TABLE,
+                error.cause = %e,
+                "could not check the network kill switch is still installed",
+            );
+        }
+    }
+}
+
 /// Whether `nft list tables` output names this module's table. Each line is
 /// `table <family> <name>`; the table is matched on family and name exactly,
 /// so a same-named table in another family, or one whose name merely starts
@@ -617,5 +679,41 @@ table inet torrentd_ks {
         .expect_err("an unquotable name stops the install");
         assert!(!cleared.get(), "the existing table is left in force");
         assert!(!applied.get(), "nothing is handed to nft");
+    }
+
+    fn gauge(metrics: &torrentd_engine::RecordingSink) -> Option<f64> {
+        metrics.calls().iter().rev().find_map(|c| match c {
+            torrentd_engine::metrics::MetricCall::SetGauge { name, value, .. }
+                if name == "kill_switch_table_present" =>
+            {
+                Some(*value)
+            }
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn the_watch_reads_a_listed_table_as_present() {
+        let metrics = torrentd_engine::RecordingSink::new();
+        record_check(
+            &metrics,
+            Ok(format!("table inet filter\ntable inet {TABLE}\n")),
+        );
+        assert_eq!(gauge(&metrics), Some(1.0));
+    }
+
+    #[test]
+    fn the_watch_reads_a_flushed_ruleset_as_absent() {
+        let metrics = torrentd_engine::RecordingSink::new();
+        record_check(&metrics, Ok("table inet filter\n".to_string()));
+        assert_eq!(gauge(&metrics), Some(0.0));
+    }
+
+    #[test]
+    fn a_failed_listing_is_counted_and_is_not_read_as_absent() {
+        let metrics = torrentd_engine::RecordingSink::new();
+        record_check(&metrics, Err(io::Error::other("nft: permission denied")));
+        assert_eq!(gauge(&metrics), None, "not knowing is not absent");
+        assert_eq!(metrics.count_for("kill_switch_probe_errors_total"), 1);
     }
 }

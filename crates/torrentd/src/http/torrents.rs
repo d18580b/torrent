@@ -483,7 +483,18 @@ async fn do_add(
         ),
     };
     if let Err(e) = engine.add_torrent(params) {
-        let _ = s.registry.remove(&infohash);
+        // Release the claim so the add can be retried. A release that fails
+        // to persist comes back from the file at the next restart as a claim
+        // on a torrent no session holds.
+        if let Err(re) = s.registry.remove(&infohash) {
+            tracing::warn!(
+                infohash = %infohash,
+                error.cause = %re,
+                "could not release the claim of a torrent whose add failed",
+            );
+            s.metrics
+                .inc_counter("store_write_errors_total", &[("store", "registry")]);
+        }
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("{e}")})),
@@ -498,6 +509,10 @@ async fn do_add(
                 infohash = %infohash,
                 error.cause = %e,
                 "failed to persist .torrent file",
+            );
+            s.metrics.inc_counter(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile_id.as_str()), ("source", "api")],
             );
         }
     }

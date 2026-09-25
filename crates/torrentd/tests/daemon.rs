@@ -166,6 +166,127 @@ fn daemon_end_to_end() {
     );
 }
 
+/// The rows of `deploy/metrics.md` a host-profile daemon with no pool and no
+/// kill switch must export from its first scrape: `(name, labels column)`.
+fn series_present_from_boot() -> Vec<(String, String)> {
+    let doc = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/metrics.md"),
+    )
+    .expect("read deploy/metrics.md");
+    doc.lines()
+        .filter(|l| l.starts_with("| `torrentd_"))
+        .filter_map(|l| {
+            let cells: Vec<&str> = l.split(" | ").collect();
+            let name = cells[0]
+                .trim_start_matches("| ")
+                .trim_matches('`')
+                .to_string();
+            let (labels, instances, present) = (cells[2], cells[3], cells[4]);
+            let applies = matches!(instances, "daemon" | "each profile")
+                && matches!(
+                    present,
+                    "from boot, at 0" | "from boot: always" | "from boot: live profiles"
+                );
+            applies.then(|| (name, labels.to_string()))
+        })
+        .collect()
+}
+
+/// The values a labels column lists, as `label="value"` matchers.
+fn listed_values(labels: &str) -> Vec<String> {
+    labels
+        .split("; ")
+        .filter_map(|part| part.split_once(": "))
+        .flat_map(|(name, values)| {
+            let name = name.trim_matches('`').to_string();
+            values
+                .split(", ")
+                .map(move |v| format!("{name}=\"{}\"", v.trim_matches('`')))
+        })
+        .collect()
+}
+
+/// Everything an alert rule reads has to exist before the condition it
+/// watches first happens, or `increase()` never sees that first event. So the
+/// very first scrape of a fresh daemon must already hold every series the
+/// reference table says is there from boot, for this profile and for every
+/// listed label value. Then a reload that cannot parse its config is counted.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn the_first_scrape_holds_every_series_present_from_boot() {
+    const HTTP: &str = "127.0.0.1:18096";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let mut child = spawn_daemon(p, 16896, HTTP);
+    wait_healthy(HTTP);
+
+    let (code, metrics) = http(HTTP, "GET", "/metrics", None);
+    assert_eq!(code, 200);
+    let expected = series_present_from_boot();
+    assert!(expected.len() > 30, "parsed too few rows: {expected:?}");
+    let mut missing = Vec::new();
+    for (name, labels) in &expected {
+        if !metrics.contains(&format!("# TYPE {name} ")) {
+            missing.push(name.clone());
+            continue;
+        }
+        // `task_up` lists every task there is; only the ones this config
+        // starts exist.
+        if name == "torrentd_task_up" {
+            continue;
+        }
+        for value in listed_values(labels) {
+            let found = metrics.lines().any(|l| {
+                l.starts_with(&format!("{name}{{"))
+                    && l.contains(&value)
+                    && (!labels.contains("profile_id") || l.contains("profile_id=\"test\""))
+            });
+            if !found {
+                missing.push(format!("{name}{{{value}}}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "absent from the first scrape: {missing:?}\n\n{metrics}"
+    );
+    for task in ["vpn_monitor", "reload"] {
+        assert!(
+            metrics.contains(&format!("torrentd_task_up{{task=\"{task}\"}} 1")),
+            "{task} is supervised from boot:\n{metrics}"
+        );
+    }
+
+    // A reload that cannot parse the file keeps the old settings and says so
+    // in a series an alert can read, not only in the journal.
+    std::fs::write(p.join("cfg.toml"), "this is = = not toml").unwrap();
+    let (code, body) = http(HTTP, "POST", "/api/reload", None);
+    assert!((200..300).contains(&code), "reload trigger: {code} {body}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (_, metrics) = http(HTTP, "GET", "/metrics", None);
+        if metrics.contains("torrentd_config_reload_failures_total{stage=\"load\"} 1") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the failed reload was not counted:\n{metrics}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    sigterm(&child);
+    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+    // A clean exit still writes the report the next boot re-exports, and it
+    // says nothing was left behind.
+    let report = std::fs::read_to_string(p.join("last_shutdown.json")).expect("shutdown report");
+    assert!(report.contains("\"unsaved_resumes\":0"), "{report}");
+    assert!(
+        report.contains("\"kill_switch_removal_failed\":false"),
+        "{report}"
+    );
+}
+
 /// An HTTP bind failure happens after `boot` has handed teardown to the
 /// shutdown path, so it must run that path rather than return past it: exit
 /// 70, and drain exactly as a SIGTERM does. The dht profile's session state is

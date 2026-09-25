@@ -141,7 +141,15 @@ pub async fn run(
     profiles: Arc<crate::profile_registry::ProfileRegistry>,
     mut reload_rx: Receiver<()>,
     log_handle: crate::tracing_init::LogReloadHandle,
+    metrics: Arc<crate::metrics_sink::PromSink>,
 ) {
+    use torrentd_engine::MetricsSink;
+    // A failed reload keeps the running settings, so the daemon looks fine and
+    // the operator's edit silently did not happen; the log line was the only
+    // trace. Counted by the step that failed.
+    let failed = |stage: &str| {
+        metrics.inc_counter("config_reload_failures_total", &[("stage", stage)]);
+    };
     let mut current = initial;
     while reload_rx.recv().await.is_some() {
         let next = match Config::load(&config_path) {
@@ -151,6 +159,7 @@ pub async fn run(
                     error.cause = %e,
                     "SIGHUP: failed to reload config; keeping current settings",
                 );
+                failed("load");
                 continue;
             }
         };
@@ -188,7 +197,10 @@ pub async fn run(
         if let Some(level) = diff.log_level {
             match log_handle.set_level(level) {
                 Ok(()) => info!(new_log_level = level.as_str(), "SIGHUP: log level applied"),
-                Err(e) => warn!(error.cause = %e, "SIGHUP: failed to apply log level"),
+                Err(e) => {
+                    warn!(error.cause = %e, "SIGHUP: failed to apply log level");
+                    failed("log_level");
+                }
             }
         }
         for profile in source.profiles() {
@@ -229,6 +241,7 @@ pub async fn run(
                     .context("apply_settings")
                 {
                     warn!(profile_id = %profile, error.cause = %e, "SIGHUP: apply_settings failed");
+                    failed("apply_settings");
                 } else {
                     info!(profile_id = %profile, "SIGHUP: settings applied");
                 }

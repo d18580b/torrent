@@ -16,6 +16,7 @@ use parking_lot::Mutex;
 use torrentd_engine::AddParams;
 use torrentd_engine::AlertSource;
 use torrentd_engine::AssignmentRegistry;
+use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
@@ -51,6 +52,9 @@ pub struct PoolService {
     verify: VerifyQueue,
     /// `[pool] allow_mutations`. Every path that can destroy data checks this.
     allow_mutations: bool,
+    /// Set once by the daemon after opening; absent for `torrentd pool …`,
+    /// which is a one-shot CLI with nothing to scrape it.
+    metrics: std::sync::OnceLock<Arc<dyn MetricsSink>>,
 }
 
 impl std::fmt::Debug for PoolService {
@@ -99,7 +103,36 @@ impl PoolService {
             library_dir: pool_cfg.library_dir.clone(),
             verify: VerifyQueue::new(pool_cfg.max_concurrent_verify),
             allow_mutations: pool_cfg.allow_mutations,
+            metrics: std::sync::OnceLock::new(),
         })))
+    }
+
+    /// Where the pool's failures are counted. The daemon sets this once after
+    /// opening; a second call is ignored.
+    pub fn set_metrics(&self, metrics: Arc<dyn MetricsSink>) {
+        let _ = self.metrics.set(metrics);
+    }
+
+    /// Count `name` with `labels`, if metrics are attached.
+    pub fn count(&self, name: &str, labels: &[(&str, &str)]) {
+        if let Some(m) = self.metrics.get() {
+            m.inc_counter(name, labels);
+        }
+    }
+
+    /// Report a pool-index write whose failure nothing else surfaces.
+    ///
+    /// These were `let _ =`: a failed write left the index saying something
+    /// that is no longer true — an adoption state, a plan step's outcome — with
+    /// no trace anywhere. The caller carries on either way, as before.
+    pub fn note_store_error(&self, what: &str, e: &dyn std::fmt::Display) {
+        warn!(
+            target: "torrentd::pool",
+            op = what,
+            error.cause = %e,
+            "pool index write failed; the index no longer matches what happened",
+        );
+        self.count("store_write_errors_total", &[("store", "pool_index")]);
     }
 
     pub fn with_store<T>(&self, f: impl FnOnce(&PoolStore) -> T) -> T {
@@ -136,6 +169,16 @@ impl PoolService {
     /// which matters because "this file is claimed by no torrent" is the
     /// predicate the delete path trusts.
     pub fn scan(&self) -> anyhow::Result<ScanSummary> {
+        // Each skipped entry was a `warn` line and a number in the API
+        // response; an unreadable root indexes as empty, and a delete plan
+        // built on an empty index is the dangerous case.
+        let count = |s: &torrentd_pool::ScanStats| {
+            for (kind, n) in &s.errors_by_kind {
+                if let Some(m) = self.metrics.get() {
+                    m.add_counter("pool_scan_errors_total", *n, &[("kind", kind)]);
+                }
+            }
+        };
         let mut store = self.store.lock();
         store.in_transaction(|store| {
             let mut summary = ScanSummary::default();
@@ -145,11 +188,13 @@ impl PoolService {
                 summary.files += s.files_indexed;
                 summary.bytes += s.bytes_indexed;
                 summary.errors += s.errors;
+                count(&s);
             }
             let lib = torrentd_pool::scan_library(store, &self.library_dir)
                 .with_context(|| format!("scan library {}", self.library_dir.display()))?;
             summary.torrents = lib.torrents_indexed;
             summary.errors += lib.errors;
+            count(&lib);
 
             let m = torrentd_pool::match_all(store)?;
             summary.matched = m.matched;
@@ -254,8 +299,6 @@ pub async fn run_verify_queue(
     registry: Arc<AssignmentRegistry>,
     mut shutdown: tokio::sync::broadcast::Receiver<torrentd_engine::ShutdownReason>,
 ) {
-    use torrentd_engine::MetricsSink;
-
     loop {
         tokio::select! {
             _ = tokio::time::sleep(ADMIT_INTERVAL) => {}
@@ -293,9 +336,9 @@ pub async fn run_verify_queue(
                         (AdoptionState::Drifted, None, Some(now_secs()), Some(reason))
                     }
                 };
-                pool.with_store(|s| {
+                let written = pool.with_store(|s| {
                     let base = s.adoption_base(ih).ok().flatten();
-                    let _ = s.set_adoption(
+                    s.set_adoption(
                         ih,
                         state_to_record,
                         base.as_ref().map(|(r, _)| *r),
@@ -303,8 +346,11 @@ pub async fn run_verify_queue(
                         verified_at,
                         drift_at,
                         note,
-                    );
+                    )
                 });
+                if let Err(e) = written {
+                    pool.note_store_error("set_adoption", &e);
+                }
                 false
             });
         }
@@ -569,9 +615,9 @@ pub fn execute_adopt(
                 return enqueue_verify(pool, infohash, torrent_path, save_path, profile);
             }
 
-            pool.with_store(|s| {
+            let (adoption, owner) = pool.with_store(|s| {
                 let base = s.adoption_base(infohash).ok().flatten();
-                let _ = s.set_adoption(
+                let adoption = s.set_adoption(
                     infohash,
                     AdoptionState::Adopted,
                     base.as_ref().map(|(r, _)| *r),
@@ -580,8 +626,14 @@ pub fn execute_adopt(
                     None,
                     None,
                 );
-                let _ = s.set_profile(infohash, Some(profile.as_str()));
+                (adoption, s.set_profile(infohash, Some(profile.as_str())))
             });
+            if let Err(e) = adoption {
+                pool.note_store_error("set_adoption", &e);
+            }
+            if let Err(e) = owner {
+                pool.note_store_error("set_profile", &e);
+            }
             Ok("fast_path")
         }
         AdoptPlan::Verify {
@@ -599,9 +651,9 @@ fn enqueue_verify(
     save_path: PathBuf,
     profile: ProfileId,
 ) -> Result<&'static str, String> {
-    pool.with_store(|s| {
-        let _ = s.set_profile(infohash, Some(profile.as_str()));
-    });
+    if let Err(e) = pool.with_store(|s| s.set_profile(infohash, Some(profile.as_str()))) {
+        pool.note_store_error("set_profile", &e);
+    }
     pool.verify_queue().enqueue(PendingVerify {
         infohash: infohash.to_string(),
         torrent_path,
