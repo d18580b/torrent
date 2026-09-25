@@ -73,6 +73,9 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     /// completion lands as `Alert::TorrentChecked`. This is the daemon's only
     /// verification path — piece hashing is never reimplemented.
     fn force_recheck(&self, h: TorrentHandle) -> Result<(), EngineError>;
+    /// Announce to every tracker now rather than at the next scheduled
+    /// interval. Fire-and-forget: the outcome arrives as tracker alerts.
+    fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError>;
     /// Relocate a torrent's payload via libtorrent, so its storage state stays
     /// consistent. Asynchronous: `Alert::StorageMoved{,Failed}`.
     fn move_storage(
@@ -119,6 +122,9 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn force_recheck(&self, h: TorrentHandle) -> Result<(), EngineError> {
         (**self).force_recheck(h)
+    }
+    fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        (**self).force_reannounce(h)
     }
     fn move_storage(
         &self,

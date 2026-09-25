@@ -2,6 +2,7 @@
 //! profile.
 
 use axum::extract::Path;
+use axum::extract::Query;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
@@ -9,10 +10,12 @@ use serde::Serialize;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
 use tracing::info;
+use tracing::warn;
 
 use crate::app_state::AppState;
-use crate::http::torrents::summarize;
-use crate::http::torrents::TorrentSummary;
+use crate::http::torrents::paginate;
+use crate::http::torrents::ListResponse;
+use crate::http::torrents::PageQuery;
 use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::Resolution;
 
@@ -182,23 +185,28 @@ pub async fn get(
 /// precisely so an operator can find the torrents stranded by a tunnel that
 /// did not come up. Answering 404 here made the one question that count raises
 /// unanswerable, thirty lines below `get`'s own comment arguing the opposite.
+///
+/// Paginated like `GET /api/torrents` — `?after=<infohash>&limit=<n>` →
+/// `{"items":[…],"next_cursor":…}` — because a profile can hold as many
+/// torrents as the daemon does, and this answered every one of them at once.
 pub async fn torrents(
     State(s): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Vec<TorrentSummary>>, (StatusCode, Json<serde_json::Value>)> {
+    Query(q): Query<PageQuery>,
+) -> Result<Json<ListResponse>, (StatusCode, Json<serde_json::Value>)> {
     let profiles = &s.profiles;
     let profile_id = ProfileId::new(id);
     // Active or failed alike: this route reads the registry, not an engine.
     if matches!(profiles.resolve(&profile_id), Resolution::Unknown) {
         return Err(no_such_profile());
     }
-    let items = s
+    let all = s
         .registry
         .for_profile(&profile_id)
-        .iter()
-        .map(|ih| summarize(&s, ih, &profile_id))
+        .into_iter()
+        .map(|ih| (ih, profile_id.clone()))
         .collect();
-    Ok(Json(items))
+    Ok(Json(paginate(&s, all, &q)))
 }
 
 pub async fn pause_all(
@@ -248,6 +256,125 @@ pub async fn resume_all(
     }
     info!(profile_id = %profile_id, torrent_count = count, "resumed all torrents in profile");
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What a daemon-wide pause or resume did, profile by profile.
+///
+/// 200 with a body rather than the per-profile routes' bare 204: this one
+/// spans profiles that can be in different states, and an operator stopping
+/// everything during an incident has to see what was not reached.
+#[derive(Serialize)]
+pub struct BulkOutcome {
+    /// Torrents the engine accepted the pause or resume for.
+    pub(crate) torrent_count: usize,
+    /// Torrents whose engine call failed. Nonzero means "not everything".
+    pub(crate) failed_count: usize,
+    /// Profiles this request did not act on, each with why.
+    pub(crate) skipped_profiles: Vec<SkippedProfile>,
+}
+
+#[derive(Serialize)]
+pub struct SkippedProfile {
+    pub(crate) profile_id: String,
+    pub(crate) reason: String,
+}
+
+/// Apply `op` to every torrent a live profile holds; `(accepted, failed)`.
+fn for_each_torrent(
+    s: &AppState,
+    entry: &ProfileEntry,
+    op: impl Fn(&ProfileEntry, torrentd_engine::TorrentHandle) -> bool,
+) -> (usize, usize) {
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for h in s.state.handles_for_profile(entry.id()) {
+        if op(entry, h) {
+            ok += 1;
+        } else {
+            failed += 1;
+        }
+    }
+    (ok, failed)
+}
+
+/// The profiles that never got a session: nothing of theirs is loaded, so a
+/// bulk route reports them rather than claiming to have reached them.
+fn skipped_failed(s: &AppState) -> Vec<SkippedProfile> {
+    s.profiles
+        .failed()
+        .iter()
+        .map(|f| SkippedProfile {
+            profile_id: f.config.id.as_str().to_string(),
+            reason: format!("profile has no session: {}", f.reason),
+        })
+        .collect()
+}
+
+/// `POST /api/pause-all` — pause every torrent in every live profile.
+///
+/// Fenced profiles are paused too: their torrents are already paused, and
+/// pausing again is harmless.
+pub async fn pause_everything(State(s): State<AppState>) -> Json<BulkOutcome> {
+    let mut out = BulkOutcome {
+        torrent_count: 0,
+        failed_count: 0,
+        skipped_profiles: skipped_failed(&s),
+    };
+    for entry in s.profiles.iter() {
+        let (ok, failed) = for_each_torrent(&s, entry, |e, h| e.engine.pause_torrent(h).is_ok());
+        out.torrent_count += ok;
+        out.failed_count += failed;
+    }
+    if out.failed_count > 0 {
+        warn!(
+            torrent_count = out.torrent_count,
+            failed_count = out.failed_count,
+            "daemon-wide pause did not reach every torrent"
+        );
+    }
+    info!(
+        torrent_count = out.torrent_count,
+        "paused all torrents in every profile"
+    );
+    Json(out)
+}
+
+/// `POST /api/resume-all` — resume every torrent in every live profile that is
+/// not fenced.
+///
+/// A fenced profile is skipped and reported, not refused wholesale: one
+/// account's dead tunnel must not stop the others resuming, and resuming it
+/// is exactly what `resume-all` on that profile already refuses.
+pub async fn resume_everything(State(s): State<AppState>) -> Json<BulkOutcome> {
+    let mut out = BulkOutcome {
+        torrent_count: 0,
+        failed_count: 0,
+        skipped_profiles: skipped_failed(&s),
+    };
+    for entry in s.profiles.iter() {
+        if entry.health().status == ProfileStatus::VpnDown {
+            out.skipped_profiles.push(SkippedProfile {
+                profile_id: entry.id().as_str().to_string(),
+                reason: "profile vpn_down; restart daemon to resume".to_string(),
+            });
+            continue;
+        }
+        let (ok, failed) = for_each_torrent(&s, entry, |e, h| e.engine.resume_torrent(h).is_ok());
+        out.torrent_count += ok;
+        out.failed_count += failed;
+    }
+    if out.failed_count > 0 {
+        warn!(
+            torrent_count = out.torrent_count,
+            failed_count = out.failed_count,
+            "daemon-wide resume did not reach every torrent"
+        );
+    }
+    info!(
+        torrent_count = out.torrent_count,
+        "resumed all torrents in every unfenced profile"
+    );
+    Json(out)
 }
 
 #[cfg(test)]
@@ -317,11 +444,15 @@ mod tests {
         // the one list the `torrent_count` on `/profiles` invites the operator
         // to ask for.
         let s = failed_only("acct_b", "wg-acct_b: no handshake");
-        let out = torrents(State(s), Path("acct_b".to_string()))
-            .await
-            .expect("a configured profile's registry entries are readable without a session");
+        let out = torrents(
+            State(s),
+            Path("acct_b".to_string()),
+            Query(PageQuery::default()),
+        )
+        .await
+        .expect("a configured profile's registry entries are readable without a session");
         assert!(
-            out.0.is_empty(),
+            out.0.items.is_empty(),
             "no assignments in this fixture, but the route answered rather than refusing",
         );
     }
@@ -331,7 +462,13 @@ mod tests {
         // The pairing must not turn every typo into a 200.
         let s = failed_only("acct_b", "wg-acct_b: no handshake");
         // `TorrentSummary` is not `Debug`, so match rather than `unwrap_err`.
-        match torrents(State(s), Path("typo".to_string())).await {
+        match torrents(
+            State(s),
+            Path("typo".to_string()),
+            Query(PageQuery::default()),
+        )
+        .await
+        {
             Err(e) => assert_eq!(e.0, StatusCode::NOT_FOUND),
             Ok(_) => panic!("an id no [[profile]] declares must still be 404"),
         }
@@ -364,6 +501,178 @@ mod tests {
         assert_eq!(err.0, StatusCode::CONFLICT);
         let body = err.1 .0.to_string();
         assert!(body.contains("wg-acct_b: no handshake"), "got: {body}");
+    }
+
+    // -----------------------------------------------------------------
+    // #23 — daemon-wide pause/resume, and pagination on a profile's torrents.
+    // -----------------------------------------------------------------
+
+    use torrentd_engine::InfoHash;
+    use torrentd_engine::MockEngine;
+    use torrentd_engine::RecordedCall;
+    use torrentd_engine::TorrentHandle;
+    use torrentd_engine::TorrentState;
+
+    /// A live profile whose engine the test keeps a handle on.
+    fn live(id: &str, status: ProfileStatus) -> (ProfileEntry, Arc<MockEngine>) {
+        let engine = Arc::new(MockEngine::new());
+        let entry = ProfileEntry::new(
+            crate::profile_registry::test_entry(id, ProfileStatus::Active).config,
+            engine.clone(),
+            None,
+            None,
+            0,
+        );
+        entry.update_health(|h| h.status = status);
+        (entry, engine)
+    }
+
+    /// Put one loaded torrent into `profile`'s slice of the state map.
+    fn load(s: &AppState, byte: u8, profile: &str) -> TorrentHandle {
+        let ih = InfoHash([byte; 20]);
+        let h = TorrentHandle {
+            id: u64::from(byte),
+            infohash: ih,
+        };
+        s.state.insert(
+            ih,
+            TorrentState::newly_added(h, ProfileId::new(profile), std::time::Instant::now()),
+        );
+        h
+    }
+
+    fn calls_matching(engine: &MockEngine, f: impl Fn(&RecordedCall) -> bool) -> usize {
+        engine.calls().iter().filter(|c| f(c)).count()
+    }
+
+    #[tokio::test]
+    async fn pause_everything_reaches_every_live_profile_and_reports_the_failed_one() {
+        let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+        // Fenced profiles are paused too; pausing a paused torrent is harmless.
+        let (b, eng_b) = live("acct_b", ProfileStatus::VpnDown);
+        let reg = Arc::new(ProfileRegistry::new(vec![a, b]).with_failed(vec![
+            crate::profile_registry::test_failed_profile("acct_c", "wg-acct_c: no handshake"),
+        ]));
+        let s = build_test_state(Some(reg));
+        let ha = load(&s, 1, "acct_a");
+        let hb = load(&s, 2, "acct_b");
+
+        let out = pause_everything(State(s)).await.0;
+
+        assert_eq!(out.torrent_count, 2);
+        assert_eq!(out.failed_count, 0);
+        assert_eq!(
+            calls_matching(
+                &eng_a,
+                |c| matches!(c, RecordedCall::PauseTorrent(h) if *h == ha)
+            ),
+            1
+        );
+        assert_eq!(
+            calls_matching(
+                &eng_b,
+                |c| matches!(c, RecordedCall::PauseTorrent(h) if *h == hb)
+            ),
+            1
+        );
+        assert_eq!(out.skipped_profiles.len(), 1);
+        assert_eq!(out.skipped_profiles[0].profile_id, "acct_c");
+        assert!(out.skipped_profiles[0].reason.contains("no handshake"));
+    }
+
+    #[tokio::test]
+    async fn pause_everything_counts_what_the_engine_refused() {
+        let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+        let s = build_test_state(Some(Arc::new(ProfileRegistry::new(vec![a]))));
+        load(&s, 1, "acct_a");
+        eng_a.inject_error(
+            "pause_torrent",
+            torrentd_engine::EngineError::MockInjected {
+                op: "pause_torrent",
+                message: "boom".into(),
+            },
+        );
+
+        let out = pause_everything(State(s)).await.0;
+
+        assert_eq!(out.torrent_count, 0);
+        assert_eq!(
+            out.failed_count, 1,
+            "a torrent left seeding must not read as paused"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_everything_skips_a_fenced_profile_and_resumes_the_rest() {
+        let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+        let (b, eng_b) = live("acct_b", ProfileStatus::VpnDown);
+        let reg = Arc::new(ProfileRegistry::new(vec![a, b]));
+        let s = build_test_state(Some(reg));
+        let ha = load(&s, 1, "acct_a");
+        load(&s, 2, "acct_b");
+
+        let out = resume_everything(State(s)).await.0;
+
+        assert_eq!(out.torrent_count, 1);
+        assert_eq!(
+            calls_matching(
+                &eng_a,
+                |c| matches!(c, RecordedCall::ResumeTorrent(h) if *h == ha)
+            ),
+            1
+        );
+        assert_eq!(
+            calls_matching(&eng_b, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
+            0,
+            "a fenced profile must never be un-quarantined by a bulk resume",
+        );
+        assert_eq!(out.skipped_profiles.len(), 1);
+        assert_eq!(out.skipped_profiles[0].profile_id, "acct_b");
+        assert!(out.skipped_profiles[0].reason.contains("vpn_down"));
+    }
+
+    #[tokio::test]
+    async fn a_profiles_torrents_are_paginated() {
+        let (a, _) = live("acct_a", ProfileStatus::Active);
+        let s = build_test_state(Some(Arc::new(ProfileRegistry::new(vec![a]))));
+        for byte in 1..=3u8 {
+            s.registry
+                .assign(InfoHash([byte; 20]), ProfileId::new("acct_a"))
+                .unwrap();
+        }
+        // Another profile's assignment must not appear on this one's list.
+        s.registry
+            .assign(InfoHash([9; 20]), ProfileId::new("acct_z"))
+            .unwrap();
+
+        let first = torrents(
+            State(s.clone()),
+            Path("acct_a".to_string()),
+            Query(PageQuery {
+                after: None,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("a live profile's list is served"))
+        .0;
+        assert_eq!(first.items.len(), 2);
+        let cursor = first.next_cursor.clone().expect("a third entry remains");
+        assert_eq!(cursor, InfoHash([2; 20]).to_hex());
+
+        let second = torrents(
+            State(s),
+            Path("acct_a".to_string()),
+            Query(PageQuery {
+                after: Some(cursor),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("a live profile's list is served"))
+        .0;
+        assert_eq!(second.items.len(), 1);
+        assert!(second.next_cursor.is_none());
     }
 
     #[tokio::test]
