@@ -34,7 +34,7 @@ runtime and are easy to miss because nothing checks for them at startup:
 | Binary | Package | Needed for |
 | --- | --- | --- |
 | `ip` | `iproute2` / `iproute` | Any deployment with a `vpn` profile. Polled every 30s per profile for the tunnel IP. |
-| `wg`, `wg-quick` | `wireguard-tools` | WireGuard profiles — bring-up, teardown, handshake age. |
+| `wg`, `wg-quick` | `wireguard-tools` | WireGuard profiles — bring-up, teardown, handshake age. `wg-quick` only when the daemon runs as root; as any other user it raises links with `ip` and `wg` (§11.6). |
 | `openvpn`, `kill` | `openvpn`, `util-linux` (`util-linux-core` on Fedora) | OpenVPN profiles. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. `kill` is spawned as a binary and not as a shell builtin, so `/usr/bin/kill` has to be on the host: that is `util-linux`, not `procps-ng`, which ships `pgrep` and `pkill` and no `kill`. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
 
@@ -150,7 +150,7 @@ while it is running:
   never believed for a link that merely has the same name. That second one is
   what makes it safe to delete a stuck interface by hand and let something else
   take the name — the record stops applying the moment the link does.
-  It is written once `wg-quick up` has succeeded, so a daemon killed in the
+  It is written once the link is up, so a daemon killed in the
   moment between leaves no record and the profile fails rather than adopting.
   The daemon discards it at startup if the interface it names is gone, and
   again whenever it declines to adopt one; it **keeps** it when a teardown
@@ -997,30 +997,86 @@ On a scratch pool, not your real one.
    leak, so that profile would send nothing while reporting itself healthy.
    Run host profiles in a separate daemon without the switch. **So is running
    as root**: `meta skuid 0` would drop every root-owned socket on the host —
-   the package manager, the NTP client, sshd's replies — and the WireGuard
-   tunnels' own encrypted traffic with them, since the kernel's WireGuard
-   socket belongs to the uid that raised the link. The daemon refuses to
+   the package manager, the NTP client, sshd's replies. The daemon refuses to
    install it rather than take the host off the network.
 
-   Because the ruleset confines everything the daemon's uid owns, a tunnel's
-   connection to its provider has to belong to some other uid, and that
-   decides what the kill switch can run with:
+   **The tunnel's own transport is exempted.** WireGuard encrypts a packet in
+   place, so the encrypted UDP datagram to the provider still belongs to the
+   daemon's socket and leaves by the physical interface — exactly what the
+   drop is for. The ruleset therefore accepts each tunnel's listen port as a
+   UDP *source* port for the daemon's uid, read with `wg show <iface>
+   listen-port` when the switch is installed; the table shows it as
+   `meta skuid <uid> udp sport { <port>, … } accept`. Nothing else the daemon
+   opens can hold that port, because the WireGuard socket binds it on every
+   address first. A tunnel whose listen port cannot be read fails the
+   install, and the daemon does not start. (Handshakes carry no socket and
+   pass either way, so a tunnel without the exemption handshakes and then
+   carries nothing — a `latest-handshake` alone does not show it working.)
+
+   What that leaves:
 
    - **OpenVPN profiles: not at all.** The daemon spawns `openvpn` under its
      own uid, so the provider connection is dropped. The config is refused at
      load (and by `--check-config`).
-   - **WireGuard profiles: only with the links raised by root before the
-     daemon starts.** A daemon running as its own user cannot raise them
-     itself: `wg-quick` re-execs through `sudo` unless it runs as uid 0, and
-     the packaged unit sets `NoNewPrivileges=yes`, so that `sudo` cannot
-     elevate. Raise each profile's link as root first (for example
-     `wg-quick up <iface>` from a root unit ordered before
-     `torrentd.service`), with the WireGuard config readable by the daemon's
-     user: its `wg-quick up` then fails and it adopts the standing link
-     because the config's public key matches the live one (see the "already
-     up and is not this profile's" row below for the refusals). The shipped
-     container image runs the daemon as uid 1000 and raises no links, so it
-     cannot run the kill switch with a working tunnel either.
+   - **WireGuard profiles: yes, with the daemon as its own user.** `wg-quick`
+     re-execs through `sudo` unless it runs as uid 0, and the packaged unit's
+     `NoNewPrivileges=yes` stops that `sudo` from elevating, so a daemon that
+     is not root raises its links itself with `ip` and `wg`, which need only
+     `CAP_NET_ADMIN`. A link root raised before the daemon started is still
+     adopted when its key matches, and is exempted the same way.
+
+   **The deployment**, with the packaged unit (§4, §8):
+
+   1. In `deploy/torrentd.service`, uncomment `AmbientCapabilities=CAP_NET_ADMIN`
+      and `CapabilityBoundingSet=CAP_NET_ADMIN`. `User=torrentd` stays.
+   2. Make each profile's config readable by the daemon, key included — the
+      daemon reads it itself and feeds it to `wg setconf`:
+
+      ```bash
+      sudo chgrp torrentd /etc/wireguard /etc/wireguard/wg-acct-a.conf
+      sudo chmod 0750 /etc/wireguard
+      sudo chmod 0640 /etc/wireguard/wg-acct-a.conf
+      ```
+
+   3. Keep the config to what `ip` and `wg` can apply without root.
+      `PreUp`/`PostUp`/`PreDown`/`PostDown` are refused, so the
+      `PostUp = wg set %i private-key …` pattern does not work here: put
+      `PrivateKey` in the file. `Table` may be `auto` or `off`; anything else
+      is refused. `DNS` and `SaveConfig` are ignored with a warning.
+   4. Set `network_kill_switch = true` and start the unit.
+
+   How the daemon raises a link: `ip link add <iface> type wireguard`,
+   `wg setconf`, each `Address`, `MTU` (default 1420), and then — instead of
+   `wg-quick`'s host-wide default route — **source-address routing**: each
+   peer's `AllowedIPs` go into a routing table of the link's own, and an
+   `ip rule` sends traffic *from* the link's address to it. Every profile's
+   sockets are bound to its tunnel address, so that is all the daemon needs,
+   and nothing else on the host is rerouted. Shutdown removes the rules and
+   the link. `ip rule show` lists them as `from <address> lookup <table>`.
+
+   **Name resolution does not go through the tunnel on this path.** The
+   daemon's lookups use the host's resolver, and under the kill switch only a
+   resolver on loopback is reachable — `systemd-resolved`'s stub at
+   `127.0.0.53` works, and a `/etc/resolv.conf` naming a remote server leaves
+   every tracker hostname unresolvable. The resolver then asks upstream from
+   the host's own address, so tracker hostnames are visible there even though
+   no announce is.
+
+   To check a running deployment: `nft list table inet torrentd_ks` shows the
+   `udp sport` line with the port `wg show <iface> listen-port` prints, and
+   `ip -s link show <iface>` shows transmitted *and* received packets growing.
+   The same sequence runs as a test, unprivileged, in a private network
+   namespace (ignored by default):
+
+   ```bash
+   cargo test -p torrentd --bin torrentd --no-run   # prints the binary's path
+   unshare --user --map-user=998 --map-group=998 --net --keep-caps \
+       target/debug/deps/torrentd-<hash> live_link --ignored
+   ```
+
+   The shipped container image runs the daemon as uid 1000 with no ambient
+   capabilities, so it still cannot raise a link, and cannot run the kill
+   switch with a working tunnel.
 
 ## 12. Capturing a log
 
@@ -1106,7 +1162,9 @@ does not bring back a unit that was stopped.
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
 | `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `/api/profiles`, which lists both kinds, bring the tunnels back, then restart — fenced profiles do not resume themselves by design. |
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
-| Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Running as `torrentd` with `CAP_NET_ADMIN` is necessary and not sufficient: that user cannot run `wg-quick`, so each WireGuard profile's link has to be raised by root before the daemon starts (§11.6). Otherwise unset `network_kill_switch`. |
+| Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
+| A WireGuard profile fails with "hooks are not run when the daemon raises the link itself" or "Table = … is not supported" | The daemon is not root, so it raises the link with `ip` and `wg` and cannot run `wg-quick`'s hooks or honour a named table (§11.6). Move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
+| Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port`; a link re-raised by hand after the daemon started has a new port. Restart the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it will not `wg-quick down` something it cannot vouch for, because that would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 and `vpn_down` | The profile is fenced. An operator restart is required by design. |
