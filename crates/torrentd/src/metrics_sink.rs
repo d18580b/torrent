@@ -173,7 +173,7 @@ pub const CATALOGUE: &[Series] = &[
         Profile,
         ("op", &[]),
         Seed::OnFirstEvent,
-        "File errors, by libtorrent operation; the torrent enters upload mode.",
+        "File errors, by libtorrent operation; the torrent enters the disk-error phase.",
     ),
     series(
         "hash_failures_total",
@@ -246,14 +246,14 @@ pub const CATALOGUE: &[Series] = &[
         "1 while the profile's listen socket is failed.",
     ),
     series(
-        "upload_mode_retry_attempts_total",
+        "disk_error_retry_attempts_total",
         Counter,
         Profile,
         Seed::Zero,
-        "Torrents resumed from upload mode by the retry timer.",
+        "Torrents the disk-error retry timer resumed to clear a libtorrent error.",
     ),
     series(
-        "upload_mode_retry_errors_total",
+        "disk_error_retry_errors_total",
         Counter,
         Profile,
         Seed::Zero,

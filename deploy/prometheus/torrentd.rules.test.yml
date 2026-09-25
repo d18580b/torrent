@@ -375,7 +375,7 @@ tests:
         values: '0 0 0 0'
       - series: 'torrentd_storage_move_failures_total{profile_id="acct_a"}'
         values: '0 0 1 1'
-      - series: 'torrentd_upload_mode_retry_errors_total{profile_id="acct_a"}'
+      - series: 'torrentd_disk_error_retry_errors_total{profile_id="acct_a"}'
         values: '0 0 0 0'
     alert_rule_test:
       - eval_time: 3m
@@ -405,7 +405,7 @@ tests:
               profile_id: acct_a
               op: file_open
             exp_annotations:
-              summary: "File errors (file_open) in profile acct_a; the torrent is in upload mode"
+              summary: "File errors (file_open) in profile acct_a; the torrent is in the disk-error phase"
 
   # ---- boot and persistence ---------------------------------------------
   - interval: 1m

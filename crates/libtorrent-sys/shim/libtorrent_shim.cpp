@@ -416,6 +416,11 @@ void fill_state_view(lt_torrent_status_view& v, lt_session* s, const lt::torrent
     v.needs_save_resume = st.need_save_resume ? 1 : 0;
     v.is_finished = st.is_finished ? 1 : 0;
     v.is_seeding = st.is_seeding ? 1 : 0;
+    // A disk error libtorrent cannot route to upload mode (a read failure, or
+    // any failure while checking) sets this and pauses the torrent;
+    // torrent_handle::resume() clears it again (torrent::do_resume calls
+    // clear_error). The engine's disk-error retry keys on it.
+    v.has_error = st.errc ? 1 : 0;
 }
 
 // Translate one libtorrent alert into our union. Returns false if the alert
