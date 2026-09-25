@@ -224,6 +224,12 @@ int         lt_remove_torrent(lt_session* s, lt_handle h, int delete_files);
  * hashing. */
 int         lt_torrent_force_recheck(lt_session* s, lt_handle h);
 
+/* Announce to every tracker now, rather than at the next scheduled interval.
+ * Fire-and-forget: the outcome arrives as ordinary tracker alerts. Used after a
+ * passkey rotation or a tracker's "not registered", and after a listen-port
+ * change so trackers learn the new port. */
+int         lt_torrent_force_reannounce(lt_session* s, lt_handle h);
+
 /* Move a torrent's payload to `new_path`, letting libtorrent perform the move
  * so its own storage state stays consistent. Completion arrives as
  * LT_ALERT_STORAGE_MOVED (or LT_ALERT_STORAGE_MOVED_FAILED).

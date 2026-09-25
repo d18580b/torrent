@@ -351,6 +351,17 @@ impl Session {
         }
     }
 
+    /// Announce to every tracker now instead of at the next scheduled
+    /// interval. Fire-and-forget — the outcome arrives as tracker alerts.
+    pub fn force_reannounce(&self, h: TorrentHandle) -> Result<()> {
+        let rc = unsafe { ffi::lt_torrent_force_reannounce(self.ptr, h.id as ffi::lt_handle) };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::TorrentNotFound(h.infohash))
+        }
+    }
+
     /// Relocate the torrent's payload, letting libtorrent perform the move so
     /// its storage state stays consistent. Asynchronous — completion arrives
     /// as `Alert::StorageMoved` or `Alert::StorageMovedFailed`.
