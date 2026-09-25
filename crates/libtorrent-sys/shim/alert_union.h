@@ -138,6 +138,17 @@ struct lt_alert_tracker_error {
     char    message[LT_MSG_MAX];
 };
 
+/* Shared by tracker_warning, scrape_failed, portmap_error, udp_error,
+ * fastresume_rejected and performance alerts: the daemon counts them per
+ * kind and logs the message, and needs nothing kind-specific beyond that.
+ * `warning_code` is performance_alert's `warning_code`, 0 for the others;
+ * `error_code` is the alert's error_code value, 0 where it has none. */
+struct lt_alert_warning {
+    int32_t error_code;
+    int32_t warning_code;
+    char    message[LT_MSG_MAX];
+};
+
 struct lt_alert_peer_disconnected {
     char    peer_address[LT_ADDR_MAX];
     int32_t error_code;
@@ -200,6 +211,7 @@ union lt_alert_payload_u {
     struct lt_alert_torrent_checked   torrent_checked;
     struct lt_alert_storage_moved     storage_moved;
     struct lt_alert_storage_moved_failed storage_moved_failed;
+    struct lt_alert_warning           warning;
 };
 
 struct lt_alert_union {

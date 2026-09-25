@@ -123,7 +123,16 @@ typedef enum {
     LT_ALERT_LOG,
     LT_ALERT_TORRENT_CHECKED,
     LT_ALERT_STORAGE_MOVED,
-    LT_ALERT_STORAGE_MOVED_FAILED
+    LT_ALERT_STORAGE_MOVED_FAILED,
+    /* Operational warnings. All six share `lt_alert_warning` as payload and
+     * are appended rather than inserted so every existing discriminant keeps
+     * its value. */
+    LT_ALERT_TRACKER_WARNING,
+    LT_ALERT_SCRAPE_FAILED,
+    LT_ALERT_PORTMAP_ERROR,
+    LT_ALERT_UDP_ERROR,
+    LT_ALERT_FASTRESUME_REJECTED,
+    LT_ALERT_PERFORMANCE
 } lt_alert_kind;
 
 /* ------------------------------------------------------------------ */

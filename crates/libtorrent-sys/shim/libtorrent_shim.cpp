@@ -627,6 +627,49 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
         fill_torrent_scope(out, s, x->handle);
         return true;
     }
+    // Operational warnings. Each is counted per profile and kind on the Rust
+    // side and nothing else is read from it, so they share one payload: the
+    // error code where the alert has one, performance_alert's warning code,
+    // and libtorrent's own rendering of the alert for the log line.
+    if (auto* x = lt::alert_cast<lt::tracker_warning_alert>(a)) {
+        out.kind = LT_ALERT_TRACKER_WARNING;
+        copy_str_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        fill_torrent_scope(out, s, x->handle);
+        return true;
+    }
+    if (auto* x = lt::alert_cast<lt::scrape_failed_alert>(a)) {
+        out.kind = LT_ALERT_SCRAPE_FAILED;
+        out.payload.warning.error_code = x->error.value();
+        copy_str_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        fill_torrent_scope(out, s, x->handle);
+        return true;
+    }
+    if (auto* x = lt::alert_cast<lt::portmap_error_alert>(a)) {
+        out.kind = LT_ALERT_PORTMAP_ERROR;
+        out.payload.warning.error_code = x->error.value();
+        copy_str_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        return true;
+    }
+    if (auto* x = lt::alert_cast<lt::udp_error_alert>(a)) {
+        out.kind = LT_ALERT_UDP_ERROR;
+        out.payload.warning.error_code = x->error.value();
+        copy_str_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        return true;
+    }
+    if (auto* x = lt::alert_cast<lt::fastresume_rejected_alert>(a)) {
+        out.kind = LT_ALERT_FASTRESUME_REJECTED;
+        out.payload.warning.error_code = x->error.value();
+        copy_str_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        fill_torrent_scope(out, s, x->handle);
+        return true;
+    }
+    if (auto* x = lt::alert_cast<lt::performance_alert>(a)) {
+        out.kind = LT_ALERT_PERFORMANCE;
+        out.payload.warning.warning_code = static_cast<std::int32_t>(x->warning_code);
+        copy_str_truncated(out.payload.warning.message, LT_MSG_MAX, x->message());
+        fill_torrent_scope(out, s, x->handle);
+        return true;
+    }
     return false;
 }
 

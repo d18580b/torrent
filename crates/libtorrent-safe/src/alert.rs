@@ -38,6 +38,12 @@ pub enum AlertKind {
     TorrentChecked,
     StorageMoved,
     StorageMovedFailed,
+    TrackerWarning,
+    ScrapeFailed,
+    PortmapError,
+    UdpError,
+    FastresumeRejected,
+    Performance,
 }
 
 impl AlertKind {
@@ -64,6 +70,12 @@ impl AlertKind {
             AlertKind::PeerDisconnected => "peer_disconnected",
             AlertKind::TorrentLog => "torrent_log",
             AlertKind::Log => "log",
+            AlertKind::TrackerWarning => "tracker_warning",
+            AlertKind::ScrapeFailed => "scrape_failed",
+            AlertKind::PortmapError => "portmap_error",
+            AlertKind::UdpError => "udp_error",
+            AlertKind::FastresumeRejected => "fastresume_rejected",
+            AlertKind::Performance => "performance",
         }
     }
 }
@@ -203,6 +215,19 @@ pub enum Alert {
         hdr: AlertHeader,
         message: String,
     },
+    /// Every operational warning the daemon counts but does not otherwise act
+    /// on: tracker warnings, scrape failures, port-mapping and UDP socket
+    /// errors, rejected fast-resume data, and performance warnings. Which one
+    /// it is lives in `hdr.kind`.
+    Warning {
+        hdr: AlertHeader,
+        /// The alert's error code, or 0 where the alert carries none.
+        error_code: i32,
+        /// `performance_alert::warning_code`, 0 for every other kind.
+        warning_code: i32,
+        /// libtorrent's rendering of the alert.
+        message: String,
+    },
 }
 
 impl Alert {
@@ -228,7 +253,8 @@ impl Alert {
             | Alert::TrackerError { hdr, .. }
             | Alert::PeerDisconnected { hdr, .. }
             | Alert::TorrentLog { hdr, .. }
-            | Alert::Log { hdr, .. } => hdr,
+            | Alert::Log { hdr, .. }
+            | Alert::Warning { hdr, .. } => hdr,
         }
     }
 
@@ -274,6 +300,12 @@ impl Alert {
             ffi::lt_alert_kind_LT_ALERT_TORRENT_CHECKED => AlertKind::TorrentChecked,
             ffi::lt_alert_kind_LT_ALERT_STORAGE_MOVED => AlertKind::StorageMoved,
             ffi::lt_alert_kind_LT_ALERT_STORAGE_MOVED_FAILED => AlertKind::StorageMovedFailed,
+            ffi::lt_alert_kind_LT_ALERT_TRACKER_WARNING => AlertKind::TrackerWarning,
+            ffi::lt_alert_kind_LT_ALERT_SCRAPE_FAILED => AlertKind::ScrapeFailed,
+            ffi::lt_alert_kind_LT_ALERT_PORTMAP_ERROR => AlertKind::PortmapError,
+            ffi::lt_alert_kind_LT_ALERT_UDP_ERROR => AlertKind::UdpError,
+            ffi::lt_alert_kind_LT_ALERT_FASTRESUME_REJECTED => AlertKind::FastresumeRejected,
+            ffi::lt_alert_kind_LT_ALERT_PERFORMANCE => AlertKind::Performance,
             _ => {
                 // Unknown — still free any payload to avoid leaks.
                 unsafe { ffi::lt_alert_payload_free(raw as *mut _) };
@@ -464,6 +496,20 @@ impl Alert {
                     hdr,
                     peer_address: c_str_to_owned(&p.peer_address),
                     error_code: p.error_code,
+                    message: c_str_to_owned(&p.message),
+                }
+            }
+            AlertKind::TrackerWarning
+            | AlertKind::ScrapeFailed
+            | AlertKind::PortmapError
+            | AlertKind::UdpError
+            | AlertKind::FastresumeRejected
+            | AlertKind::Performance => {
+                let p = unsafe { &raw.payload.warning };
+                Alert::Warning {
+                    hdr,
+                    error_code: p.error_code,
+                    warning_code: p.warning_code,
                     message: c_str_to_owned(&p.message),
                 }
             }
