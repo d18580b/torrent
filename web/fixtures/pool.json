@@ -4,7 +4,7 @@
     "seeding": 176,
     "paused": 0,
     "checking": 6,
-    "upload_mode": 0,
+    "disk_error": 0,
     "errored": 2,
     "upload_rate_total": 118403112,
     "download_rate_total": 0,

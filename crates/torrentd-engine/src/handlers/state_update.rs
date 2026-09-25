@@ -39,14 +39,15 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     // torrents were paused — including a whole profile the VPN
                     // monitor had fenced, which is exactly when someone looks.
                     //
-                    // `Errored` / `UploadMode` are deliberately *not* pinned
+                    // `Errored` / `DiskError` are deliberately *not* pinned
                     // above this. They are cleared by a healthy `seeding`
                     // update, which is how a torrent that recovered from a
-                    // disk error leaves upload_mode; making them sticky would
-                    // strand it there. While a torrent is both paused and in
-                    // upload_mode, paused shows — the state an operator acts
-                    // on first — and if the disk error is still there when it
-                    // resumes, the alert fires again.
+                    // disk error leaves `DiskError`; making them sticky would
+                    // strand it there. libtorrent pauses a torrent whose disk
+                    // error it cannot route to upload mode, so paused usually
+                    // shows — the state an operator acts on first — and if
+                    // the disk error is still there when it resumes, the
+                    // alert fires again.
                     let flags = TorrentFlags::from_bits_truncate(s.flags);
                     let phase = if flags.contains(TorrentFlags::PAUSED) {
                         TorrentPhase::Paused
@@ -61,7 +62,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                                 }
                             }
                             // Preserve the current phase; other states are not
-                            // seeder-relevant. `UploadMode` and `Errored` are
+                            // seeder-relevant. `DiskError` and `Errored` are
                             // set by the error handler and must survive here.
                             _ => st.phase,
                         }

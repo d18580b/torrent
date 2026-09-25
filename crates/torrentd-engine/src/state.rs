@@ -17,7 +17,7 @@ use crate::profile::ProfileId;
 
 /// Lifecycle phases the daemon tracks for a torrent. Mostly mirrors
 /// libtorrent's `torrent_status::state_t` but adds an explicit
-/// `UploadMode` bit because torrentd's the spec distinguishes that case.
+/// `DiskError` phase for the window after a `file_error_alert`.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TorrentPhase {
     /// libtorrent is hashing pieces; the torrent isn't seeding yet.
@@ -28,10 +28,17 @@ pub enum TorrentPhase {
     Seeding,
     /// Paused via the API or by the alert loop after a disk error.
     Paused,
-    /// Disk error pushed libtorrent into upload-mode. The retry timer
-    /// fires `resume_torrent` to attempt recovery.
-    UploadMode,
-    /// Terminal: a non-recoverable libtorrent error.
+    /// libtorrent reported a `file_error_alert`, and no state update has
+    /// said otherwise since. Not upload mode: every torrent here is in
+    /// upload mode from birth (`policy::no_download`). A read failure, or a
+    /// failure while checking, also sets an error and pauses the torrent, so
+    /// the next state update usually shows `Paused` (and the accompanying
+    /// `torrent_error_alert` `Errored`) instead. The disk-error retry timer
+    /// resumes the torrent, which clears that error, while one is held.
+    DiskError,
+    /// libtorrent set an error on the torrent (`torrent_error_alert`). Not
+    /// terminal when a disk error caused it: that one follows a
+    /// `file_error_alert`, whose retry timer resumes the torrent to clear it.
     Errored,
     /// Removed from the session; transient pre-cleanup state.
     Removed,
@@ -44,14 +51,17 @@ impl TorrentPhase {
             TorrentPhase::Idle => "idle",
             TorrentPhase::Seeding => "seeding",
             TorrentPhase::Paused => "paused",
-            TorrentPhase::UploadMode => "upload_mode",
+            TorrentPhase::DiskError => "disk_error",
             TorrentPhase::Errored => "errored",
             TorrentPhase::Removed => "removed",
         }
     }
 }
 
-/// Retry schedule for upload-mode exit. the spec: 60→120→240→…→3600s.
+/// Retry schedule for recovering a torrent after a disk error: 60→120→240→…
+/// →3600s. Armed by `file_error_alert`; each due attempt resumes the torrent
+/// while libtorrent still holds an error on it, and the timer is retired
+/// once none is left (`alert_loop::execute_due_retries`).
 #[derive(Clone, Debug)]
 pub struct RetryState {
     pub next_attempt: Instant,
