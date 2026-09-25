@@ -151,14 +151,17 @@ layer.)
 | `GET /api/status` | read | Counts by phase, aggregate rates, peers. |
 | `GET /api/events` | read | SSE change stream — a bare tick; the client refetches. |
 | `POST /api/reload` | write | Re-read the config file, as SIGHUP does. 202 accepted (queued behind any reload already running), 429 if the eight-deep reload queue is full, 503 if the daemon is shutting down or was built without the reload channel. |
-| `GET /api/torrents` | read | `?after=<infohash>&limit=<n>` (default 100, max 1000) → `{"items":[…],"next_cursor":…}`. |
+| `GET /api/torrents` | read | `?after=<infohash>&limit=<n>` (default 100, max 1000) → `{"items":[…],"next_cursor":…}`. `?profile_id=<id>` lists one profile's torrents; 404 for an id no `[[profile]]` declares. |
 | `POST /api/torrents` | write | `{"profile_id":…}` plus `{"magnet":…}`, `{"torrent_path":…}`, or a multipart `.torrent` in a field named `torrent`. `save_path` is optional and defaults to `default_save_path`. 409 on a duplicate info-hash. |
 | `GET`/`DELETE` `/api/torrents/:infohash` | read/write | `?delete_files=true` requires `[pool] allow_mutations`. |
 | `POST /api/torrents/:infohash/pause` \| `/resume` | write | `resume` is 409 while the profile is fenced. |
+| `POST /api/torrents/:infohash/recheck` \| `/reannounce` | write | 202. `recheck` re-hashes the payload (no `[pool]` needed); `reannounce` announces to every tracker now. Both 409 while the profile is fenced. |
 | `POST /api/torrents/:infohash/upload-limit` | write | `{"bytes_per_sec":…}`, 0 = unlimited. |
 | `POST /api/torrents/:infohash/file-priority` | write | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 1 low, 4 normal, 7 high). |
-| `GET /api/profiles`, `/profiles/:id`, `/profiles/:id/torrents` | read | |
+| `GET /api/profiles`, `/profiles/:id` | read | |
+| `GET /api/profiles/:id/torrents` | read | Paginated as `GET /api/torrents`: `?after=&limit=` → `{"items":[…],"next_cursor":…}`. |
 | `POST /api/profiles/:id/pause-all` \| `/resume-all` | write | `resume-all` is 409 while fenced. |
+| `POST /api/pause-all` \| `/api/resume-all` | write | Every live profile at once → `{"torrent_count":…,"failed_count":…,"skipped_profiles":[{"profile_id":…,"reason":…}]}`. `resume-all` skips and lists fenced profiles; both list profiles that never came up. |
 
 With `[pool]` configured: `GET /api/pool`, `/pool/tree`, `/pool/torrents`,
 `/pool/orphans`, `/pool/drift`; `POST /api/pool/scan`, `/pool/adopt`,
