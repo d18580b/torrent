@@ -48,7 +48,8 @@ struct lt_torrent_status_view {
     uint8_t  needs_save_resume;
     uint8_t  is_finished;
     uint8_t  is_seeding;
-    uint8_t  _pad[4];          /* explicit padding for stable layout */
+    uint8_t  has_error;        /* torrent_status::errc is set (e.g. after a disk error) */
+    uint8_t  _pad[3];          /* explicit padding for stable layout */
 };
 
 /* Heap-allocated array of lt_torrent_status_view; freed by lt_alert_payload_free. */

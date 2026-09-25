@@ -16,8 +16,8 @@ use parking_lot::Mutex;
 use crate::profile::ProfileId;
 
 /// Lifecycle phases the daemon tracks for a torrent. Mostly mirrors
-/// libtorrent's `torrent_status::state_t`, plus [`TorrentPhase::UploadMode`]
-/// for a torrent that hit a disk error.
+/// libtorrent's `torrent_status::state_t`, plus [`TorrentPhase::DiskError`]
+/// for the window after a `file_error_alert`.
 ///
 /// None of these phases reads libtorrent's `upload_mode` flag. Every torrent
 /// carries that flag from the moment it is added (`policy::no_download`), so
@@ -34,16 +34,17 @@ pub enum TorrentPhase {
     Seeding,
     /// Paused via the API or by the alert loop after a disk error.
     Paused,
-    /// A disk error happened: set by `handlers::error` on a file error and
-    /// cleared by the next healthy `seeding` update. The name and its
-    /// `"upload_mode"` string predate the add-time `upload_mode` flag and
-    /// mean only "disk error", not "libtorrent's `upload_mode` flag is set",
-    /// which is true of every torrent. The name is kept because the HTTP API
-    /// publishes it: `/status` counts this phase as `upload_mode`, and the
-    /// torrent list reports it as `"upload_mode"`. The retry timer fires `resume_torrent`; what that does
-    /// for a torrent in this phase is issue #46.
-    UploadMode,
-    /// Terminal: a non-recoverable libtorrent error.
+    /// libtorrent reported a `file_error_alert`, and no state update has
+    /// said otherwise since. Not upload mode: every torrent here is in
+    /// upload mode from birth (`policy::no_download`). A read failure, or a
+    /// failure while checking, also sets an error and pauses the torrent, so
+    /// the next state update usually shows `Paused` (and the accompanying
+    /// `torrent_error_alert` `Errored`) instead. The disk-error retry timer
+    /// resumes the torrent, which clears that error, while one is held.
+    DiskError,
+    /// libtorrent set an error on the torrent (`torrent_error_alert`). Not
+    /// terminal when a disk error caused it: that one follows a
+    /// `file_error_alert`, whose retry timer resumes the torrent to clear it.
     Errored,
     /// Removed from the session; transient pre-cleanup state.
     Removed,
@@ -56,14 +57,19 @@ impl TorrentPhase {
             TorrentPhase::Idle => "idle",
             TorrentPhase::Seeding => "seeding",
             TorrentPhase::Paused => "paused",
-            TorrentPhase::UploadMode => "upload_mode",
+            TorrentPhase::DiskError => "disk_error",
             TorrentPhase::Errored => "errored",
             TorrentPhase::Removed => "removed",
         }
     }
 }
 
-/// Retry schedule for upload-mode exit. the spec: 60→120→240→…→3600s.
+/// Retry schedule for recovering a torrent after a disk error: 60→120→240→…
+/// →3600s. Armed by `file_error_alert`; each due attempt resumes the torrent
+/// while libtorrent still holds an error on it, and the timer is retired
+/// once none is left and the torrent is not checking; a due timer on a
+/// torrent still checking waits another delay with its attempt count kept
+/// (`alert_loop::execute_due_retries`).
 #[derive(Clone, Debug)]
 pub struct RetryState {
     pub next_attempt: Instant,
@@ -129,6 +135,12 @@ pub struct TorrentState {
     pub progress: f32,
     pub is_finished: bool,
     pub is_seeding: bool,
+    /// libtorrent holds an error on this torrent, as of the last
+    /// state_update_alert. A disk error that libtorrent does not route to
+    /// upload mode (every read failure, and any failure while checking) sets
+    /// one *and* pauses the torrent; `resume()` clears both. This is what the
+    /// disk-error retry has to recover, so it is what the retry keys on.
+    pub has_error: bool,
     /// Outcome of the most recent `move_storage`, or `None` if none was ever
     /// requested.
     ///
@@ -166,6 +178,7 @@ impl TorrentState {
             progress: 0.0,
             is_finished: false,
             is_seeding: false,
+            has_error: false,
             checked_at: None,
             storage_move: None,
         }

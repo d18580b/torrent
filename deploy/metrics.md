@@ -28,7 +28,7 @@ The alert rules that read these are in
 | `torrentd_torrent_add_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Adds libtorrent rejected after accepting the call. |
 | `torrentd_torrents_finished_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents that finished downloading. |
 | `torrentd_torrent_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents that entered libtorrent's error state. |
-| `torrentd_disk_errors_total` | counter | `profile_id`; `op` | each profile | on first event | File errors, by libtorrent operation; the torrent enters upload mode. |
+| `torrentd_disk_errors_total` | counter | `profile_id`; `op` | each profile | on first event | File errors, by libtorrent operation; the torrent enters the disk-error phase. |
 | `torrentd_hash_failures_total` | counter | `profile_id` | each profile | from boot, at 0 | Pieces that failed their hash check. |
 | `torrentd_torrents_checked_total` | counter | `profile_id` | each profile | from boot, at 0 | Forced rechecks that completed. |
 | `torrentd_storage_moves_total` | counter | `profile_id` | each profile | from boot, at 0 | Storage moves that completed. |
@@ -39,8 +39,8 @@ The alert rules that read these are in
 | `torrentd_resume_save_dispatch_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | save_resume_data requests that failed before reaching libtorrent. |
 | `torrentd_listen_failures_total` | counter | `profile_id` | each profile | from boot, at 0 | Listen sockets that failed. |
 | `torrentd_listen_failure_active` | gauge | `profile_id` | each profile | from boot, at 0 | 1 while the profile's listen socket is failed. |
-| `torrentd_upload_mode_retry_attempts_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents resumed from upload mode by the retry timer. |
-| `torrentd_upload_mode_retry_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Retry-timer resumes that failed. |
+| `torrentd_disk_error_retry_attempts_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents the disk-error retry timer resumed to clear a libtorrent error. |
+| `torrentd_disk_error_retry_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Retry-timer resumes that failed. |
 | `torrentd_alert_queue_overflows_total` | counter | `profile_id` | each profile | from boot, at 0 | Times libtorrent's alert queue overflowed and dropped alerts. |
 | `torrentd_tracker_alerts_total` | counter | `profile_id`; `kind`: `error`, `reply`, `warning`, `scrape_failed` | each profile | from boot, at 0 | Tracker announce errors, successful announces (reply), tracker warnings, and scrape failures. |
 | `torrentd_session_alerts_total` | counter | `profile_id`; `kind`: `portmap_error`, `udp_error`, `fastresume_rejected`, `performance_warning` | each profile | from boot, at 0 | Port-mapping and UDP socket errors, rejected fast-resume data, and performance warnings. |

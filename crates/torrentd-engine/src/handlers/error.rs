@@ -1,8 +1,8 @@
 //! Error handlers: TorrentError, FileError, HashFailed.
 //!
 //! These set the relevant phase on the state map, increment metrics, and
-//! (for FileError) schedule the upload-mode retry timer
-//! Handling. The retry execution itself happens in `alert_loop::tick`.
+//! (for FileError) arm the disk-error retry timer. The retry itself runs in
+//! `alert_loop::execute_due_retries`.
 
 use libtorrent_safe::Alert;
 use tracing::error;
@@ -22,8 +22,12 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         } => {
             let _enter = ctx.span.enter();
             let Some(ih) = hdr.infohash else { return };
+            // `torrent_error_alert` is posted by `set_error` itself, so the
+            // error is known to be set; record it before the status update
+            // that would report it, for the same reason as `FileError`.
             ctx.state.update(&ih, |st| {
                 st.phase = TorrentPhase::Errored;
+                st.has_error = true;
             });
             error!(
                 target: "torrentd_engine::handler::error",
@@ -49,8 +53,19 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             let _enter = ctx.span.enter();
             let Some(ih) = hdr.infohash else { return };
             let now = ctx.clock.now();
+            // Record the error now rather than waiting for the next
+            // `state_update` to report it. libtorrent follows every
+            // `file_error_alert` a seeder can reach (a failed read, a failed
+            // check, a failed priority change) with `set_error` + `pause()`,
+            // but the status that carries `errc` arrives later. A retry timer
+            // that comes due in between would otherwise see no error and a
+            // phase other than `Checking`, and retire, leaving the torrent
+            // error-paused with no timer. Where libtorrent did not set an
+            // error (ENOMEM, or a write failure it routed to upload mode),
+            // the next status update for this torrent clears the flag again.
             ctx.state.update(&ih, |st| {
-                st.phase = TorrentPhase::UploadMode;
+                st.phase = TorrentPhase::DiskError;
+                st.has_error = true;
                 if st.retry.is_none() {
                     st.retry = Some(RetryState::first(now));
                 }
@@ -63,7 +78,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 error.kind = "file_error",
                 error.code = *error_code,
                 error.cause = %message,
-                "file error; entering upload_mode with retry timer",
+                "file error; disk-error retry timer armed",
             );
             ctx.metrics.inc_counter(
                 "disk_errors_total",
@@ -159,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn file_error_enters_upload_mode_with_retry() {
+    fn file_error_enters_disk_error_with_retry() {
         let state = StateMap::new();
         let metrics = RecordingSink::new();
         seed_state(&state, 0x11);
@@ -175,7 +190,8 @@ mod tests {
             &metrics,
         );
         let st = state.get(&ih(0x11)).unwrap();
-        assert_eq!(st.phase, TorrentPhase::UploadMode);
+        assert_eq!(st.phase, TorrentPhase::DiskError);
+        assert!(st.has_error, "file error must record the libtorrent error");
         assert!(st.retry.is_some(), "retry timer must be armed");
         assert!(metrics.calls().iter().any(
             |c| matches!(c, MetricCall::IncCounter { name, .. } if name == "disk_errors_total")
@@ -197,7 +213,12 @@ mod tests {
             &state,
             &metrics,
         );
-        assert_eq!(state.get(&ih(0x22)).unwrap().phase, TorrentPhase::Errored);
+        let st = state.get(&ih(0x22)).unwrap();
+        assert_eq!(st.phase, TorrentPhase::Errored);
+        assert!(
+            st.has_error,
+            "torrent error must record the libtorrent error"
+        );
     }
 
     #[test]

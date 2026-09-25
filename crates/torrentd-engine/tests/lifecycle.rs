@@ -22,6 +22,9 @@
 //!   - the no-download invariant: `UPLOAD_MODE` survives a real session, holds
 //!     for a magnet (which `SEED_MODE` cannot cover at all), and holds through
 //!     the verification failure that drops `SEED_MODE`.
+//!   - disk-error recovery: an unreadable payload leaves the torrent paused
+//!     with a libtorrent error (not newly in upload mode), and `resume()`
+//!     clears both and seeds, with `UPLOAD_MODE` untouched.
 
 mod support;
 
@@ -411,4 +414,85 @@ fn a_magnet_add_carries_upload_mode_without_metadata() {
         "upload_mode is what actually holds for a magnet; flags={flags:?}",
     );
     assert_eq!(last.download_rate, 0);
+}
+
+/// What the disk-error retry actually recovers, on a real session.
+///
+/// A payload the daemon cannot read fails the check with a disk error that is
+/// not end-of-file or a missing file, and libtorrent answers it with a
+/// `file_error_alert`, an error on the torrent, and a pause — not with upload
+/// mode, which the torrent carried from the add. `resume()` clears the error
+/// and the pause, re-checks, and the torrent seeds; upload mode is untouched
+/// throughout. The retry timer keys on exactly that error bit.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn resume_clears_the_error_a_disk_failure_left_and_keeps_upload_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let save = dir.path().to_str().unwrap().to_string();
+    let data = support::payload(4, FILE_LEN);
+    let file = dir.path().join("seed-D");
+    std::fs::write(&file, &data).unwrap();
+    let torrent = support::single_file_torrent("seed-D", &data, PIECE_LEN);
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&file).is_ok() {
+        // Root reads through mode 000; there is no read failure to observe.
+        eprintln!("skipped: this user can read a mode-000 file");
+        return;
+    }
+
+    let s = Session::new(&support::local_seed_settings()).unwrap();
+    // The pool's verify path: no SEED_MODE, so libtorrent reads to hash.
+    let h = s
+        .add_torrent(AddParams::File {
+            bytes: torrent,
+            save_path: save,
+            flags: TorrentFlags::UPLOAD_MODE,
+        })
+        .unwrap();
+
+    let mut saw_file_error = false;
+    let failed = support::pump_until(&s, Duration::from_secs(15), |a| match a {
+        Alert::FileError { hdr, .. } if hdr.infohash == Some(h.infohash) => {
+            saw_file_error = true;
+            None
+        }
+        Alert::StateUpdate { statuses, .. } if saw_file_error => statuses
+            .iter()
+            .find(|st| st.handle.infohash == h.infohash && st.has_error)
+            .cloned(),
+        _ => None,
+    })
+    .expect("an unreadable payload should raise file_error and leave an error on the torrent");
+    let flags = TorrentFlags::from_bits_truncate(failed.flags);
+    assert!(
+        flags.contains(TorrentFlags::PAUSED),
+        "libtorrent pauses a torrent on a read-class disk error; flags={flags:?}",
+    );
+    assert!(
+        flags.contains(TorrentFlags::UPLOAD_MODE),
+        "upload_mode is the add-time policy, not the disk error's doing; flags={flags:?}",
+    );
+
+    // The storage comes back; the retry's resume() is what recovers the torrent.
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    s.resume_torrent(h).unwrap();
+
+    let recovered = support::pump_until(&s, Duration::from_secs(20), |a| match a {
+        Alert::StateUpdate { statuses, .. } => statuses
+            .iter()
+            .find(|st| st.handle.infohash == h.infohash && st.is_seeding)
+            .cloned(),
+        _ => None,
+    })
+    .expect("resume() should clear the error, re-check, and seed");
+    let flags = TorrentFlags::from_bits_truncate(recovered.flags);
+    assert!(!recovered.has_error, "resume() clears libtorrent's error");
+    assert!(!flags.contains(TorrentFlags::PAUSED), "flags={flags:?}");
+    assert!(
+        flags.contains(TorrentFlags::UPLOAD_MODE),
+        "resume() never clears upload_mode; flags={flags:?}",
+    );
 }

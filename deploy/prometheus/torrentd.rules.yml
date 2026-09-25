@@ -191,7 +191,7 @@ groups:
           increase(torrentd_torrent_errors_total[15m]) > 0
           or increase(torrentd_torrent_add_errors_total[15m]) > 0
           or increase(torrentd_storage_move_failures_total[15m]) > 0
-          or increase(torrentd_upload_mode_retry_errors_total[15m]) > 0
+          or increase(torrentd_disk_error_retry_errors_total[15m]) > 0
         labels:
           severity: warning
         annotations:
@@ -204,7 +204,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "File errors ({{ $labels.op }}) in profile {{ $labels.profile_id }}; the torrent is in upload mode"
+          summary: "File errors ({{ $labels.op }}) in profile {{ $labels.profile_id }}; the torrent is in the disk-error phase"
 
       # ---- boot and persistence ----------------------------------------
       - alert: TorrentdBootLoadFailures

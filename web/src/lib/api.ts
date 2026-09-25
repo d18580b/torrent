@@ -109,7 +109,7 @@ export interface Status {
   torrents_total: number
   seeding: number
   paused: number
-  upload_mode: number
+  disk_error: number
   errored: number
   upload_rate_total: number
   download_rate_total: number

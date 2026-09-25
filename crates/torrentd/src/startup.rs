@@ -1169,7 +1169,7 @@ pub async fn boot(
             let _ = tx.send(reason);
         }) as torrentd_engine::FatalCallback
     })
-    // The engine resumes torrents on its own upload-mode retry schedule and
+    // The engine resumes torrents on its own disk-error retry schedule and
     // has no concept of a tunnel, so it has to be told which profiles the VPN
     // monitor has fenced.
     .profile_fenced({

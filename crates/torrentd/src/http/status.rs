@@ -14,7 +14,10 @@ pub struct StatusResponse {
     /// Torrents libtorrent is hashing. One of the four states the spec names,
     /// and the one that explains why a freshly adopted pool is not seeding yet.
     checking: usize,
-    upload_mode: usize,
+    /// Torrents in `TorrentPhase::DiskError`: a `file_error_alert` arrived
+    /// and no state update has superseded it. This was `upload_mode`, which
+    /// said nothing, since every torrent is in libtorrent's upload mode.
+    disk_error: usize,
     errored: usize,
     /// Peers connected across every torrent. Not derivable from the per-torrent
     /// endpoints without listing every torrent, which is the thing the status
@@ -30,7 +33,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
     let mut seeding = 0usize;
     let mut paused = 0usize;
     let mut checking = 0usize;
-    let mut upload_mode = 0usize;
+    let mut disk_error = 0usize;
     let mut errored = 0usize;
     let mut peers = 0i64;
     let mut up = 0i64;
@@ -48,7 +51,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
                 Seeding => seeding += 1,
                 Paused => paused += 1,
                 Checking => checking += 1,
-                UploadMode => upload_mode += 1,
+                DiskError => disk_error += 1,
                 Errored => errored += 1,
                 // Not counted: neither is a state an operator acts on here.
                 Idle | Removed => {}
@@ -61,7 +64,7 @@ pub async fn status(State(s): State<AppState>) -> Json<StatusResponse> {
         seeding,
         paused,
         checking,
-        upload_mode,
+        disk_error,
         errored,
         peers_total: peers,
         upload_rate_total: up,
