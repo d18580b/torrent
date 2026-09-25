@@ -226,6 +226,7 @@ fields have **one** spelling each, because log queries depend on it:
 | `error.kind` / `error.code` / `error.cause` | Short identifier, OS or libtorrent code, human-readable cause. |
 | `vpn_iface`, `tunnel_ip` | Tunnel networking, on `vpn` profiles. |
 | `pending_resume_count` | Outstanding `save_resume_data` calls. |
+| `span` | Object holding the current span's `name` and fields. Fields recorded on a span (e.g. `op`, `infohash` from `#[instrument]`) appear here, **not** at the top level; only the event's own fields are flat. Absent when the event is outside any span. |
 
 `error.kind` cannot be the first field in an `error!` macro — the macro name and
 the field path are ambiguous to the parser. Put another field first.
