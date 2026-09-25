@@ -38,6 +38,7 @@
 
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::Weak;
 use std::time::Duration;
 
 use axum::extract::State;
@@ -73,9 +74,9 @@ pub const MAX_STALL_SECS: u64 = 600;
 const DEFAULT_INFOHASH: InfoHash = InfoHash([0xfa; 20]);
 
 /// Every [`FaultEngine`] this process built, for the endpoint to find a
-/// profile's by identity. Only this build has one, and it lives as long as the
-/// process does, like the sessions in it.
-static ENGINES: Mutex<Vec<Arc<FaultEngine>>> = Mutex::new(Vec::new());
+/// profile's by identity. Weak, so a session is still dropped when the daemon
+/// drops it at shutdown rather than outliving it here.
+static ENGINES: Mutex<Vec<Weak<FaultEngine>>> = Mutex::new(Vec::new());
 
 /// A real session with a [`MockEngine`] layered over it.
 ///
@@ -96,10 +97,11 @@ impl FaultEngine {
             inner,
             faults: MockEngine::new().without_recording(),
         });
-        ENGINES
+        let mut engines = ENGINES
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(engine.clone());
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        engines.retain(|e| e.strong_count() > 0);
+        engines.push(Arc::downgrade(&engine));
         engine
     }
 
@@ -109,8 +111,8 @@ impl FaultEngine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
+            .filter_map(Weak::upgrade)
             .find(|f| std::ptr::addr_eq(Arc::as_ptr(f), Arc::as_ptr(engine)))
-            .cloned()
     }
 }
 
@@ -437,6 +439,13 @@ mod tests {
         assert!(FaultEngine::find(&engine).is_some());
         let other: Arc<dyn TorrentEngine> = inner;
         assert!(FaultEngine::find(&other).is_none());
+    }
+
+    #[test]
+    fn the_registry_does_not_keep_a_dropped_session_alive() {
+        let (engine, inner) = wrapped();
+        drop(engine);
+        assert_eq!(Arc::strong_count(&inner), 1);
     }
 
     #[test]
