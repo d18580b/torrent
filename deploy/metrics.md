@@ -20,6 +20,9 @@ The alert rules that read these are in
 [`prometheus/torrentd.rules.yml`](prometheus/torrentd.rules.yml), with a
 `promtool` fixture per alert in
 [`prometheus/torrentd.rules.test.yml`](prometheus/torrentd.rules.test.yml).
+The Grafana dashboard that graphs them is [`dashboard.json`](dashboard.json).
+`cargo test -p torrentd` fails if either reads a series this table does not
+hold.
 
 | Name | Type | Labels | Instances | Present | Meaning |
 | --- | --- | --- | --- | --- | --- |

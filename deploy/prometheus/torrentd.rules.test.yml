@@ -79,6 +79,45 @@ tests:
             exp_annotations:
               summary: "The exporter dropped samples (labels); some series are missing or stale"
 
+  # acct_a never came up; acct_b's tunnel drops at 2m, leaving nothing serving.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_a"}'
+        values: '1x6'
+      - series: 'torrentd_profile_boot_failed{job="torrentd", instance="seedbox:8080", profile_id="acct_b"}'
+        values: '0x6'
+      - series: 'torrentd_profile_vpn_tunnel_up{job="torrentd", instance="seedbox:8080", profile_id="acct_a"}'
+        values: '0x6'
+      - series: 'torrentd_profile_vpn_tunnel_up{job="torrentd", instance="seedbox:8080", profile_id="acct_b"}'
+        values: '1 1 0 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdUnready
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: TorrentdUnready
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: torrentd
+              instance: seedbox:8080
+            exp_annotations:
+              summary: "Every profile failed at boot or is fenced; the daemon is seeding nothing and /healthz answers 503"
+
+  # A live host profile is never fenced, so it keeps the daemon ready.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_boot_failed{profile_id="home"}'
+        values: '0x6'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_b"}'
+        values: '0x6'
+      - series: 'torrentd_profile_vpn_tunnel_up{profile_id="acct_b"}'
+        values: '0x6'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: TorrentdUnready
+        exp_alerts: []
+
   # ---- profiles and tunnels ---------------------------------------------
   - interval: 1m
     input_series:
@@ -176,6 +215,48 @@ tests:
               summary: "Profile acct_a's listen socket failed; it accepts no incoming connections"
 
   # ---- kill switch ------------------------------------------------------
+  # Two vpn profiles, kill switch off.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_kill_switch_active'
+        values: '0x10'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_a"}'
+        values: '0x10'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_b"}'
+        values: '0x10'
+      - series: 'torrentd_profile_vpn_tunnel_up{profile_id="acct_a"}'
+        values: '1x10'
+      - series: 'torrentd_profile_vpn_tunnel_up{profile_id="acct_b"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: TorrentdKillSwitchOff
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: TorrentdKillSwitchOff
+        exp_alerts:
+          - exp_labels:
+              severity: info
+            exp_annotations:
+              summary: "Every profile is vpn-backed but the nftables kill switch is off; the backstop confining egress to the tunnels is not installed"
+
+  # A host profile beside the vpn one: the daemon refuses the kill switch for
+  # that configuration, so off is the only option and nothing fires.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_kill_switch_active'
+        values: '0x10'
+      - series: 'torrentd_profile_boot_failed{profile_id="home"}'
+        values: '0x10'
+      - series: 'torrentd_profile_boot_failed{profile_id="acct_a"}'
+        values: '0x10'
+      - series: 'torrentd_profile_vpn_tunnel_up{profile_id="acct_a"}'
+        values: '1x10'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TorrentdKillSwitchOff
+        exp_alerts: []
+
   - interval: 1m
     input_series:
       - series: 'torrentd_kill_switch_active'
@@ -645,6 +726,12 @@ tests:
         exp_alerts: []
       - eval_time: 20m
         alertname: TorrentdProfileBootFailed
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdUnready
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: TorrentdKillSwitchOff
         exp_alerts: []
       - eval_time: 20m
         alertname: TorrentdListenFailed

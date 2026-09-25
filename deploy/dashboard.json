@@ -1,0 +1,391 @@
+{
+  "title": "torrentd",
+  "uid": "torrentd",
+  "description": "torrentd fleet, disk, durability and VPN health. Every series is described in deploy/metrics.md; the alerts on them are in deploy/prometheus/torrentd.rules.yml.",
+  "tags": ["torrentd"],
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "version": 1,
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "1m",
+  "timezone": "",
+  "annotations": { "list": [] },
+  "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1,
+        "hide": 0,
+        "current": {}
+      },
+      {
+        "name": "instance",
+        "label": "Instance",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": { "query": "label_values(torrentd_kill_switch_active, instance)", "refId": "instance" },
+        "definition": "label_values(torrentd_kill_switch_active, instance)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "sort": 1,
+        "hide": 0,
+        "current": {}
+      },
+      {
+        "name": "profile_id",
+        "label": "Profile",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": { "query": "label_values(torrentd_profile_boot_failed{instance=~\"$instance\"}, profile_id)", "refId": "profile_id" },
+        "definition": "label_values(torrentd_profile_boot_failed{instance=~\"$instance\"}, profile_id)",
+        "refresh": 2,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "sort": 1,
+        "hide": 0,
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Fleet",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Seeding torrents",
+      "description": "libtorrent ses.num_seeding_torrents.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_libtorrent_num_seeding_torrents{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Torrents in error",
+      "description": "libtorrent ses.num_error_torrents. Anything above zero is a torrent that is not seeding; TorrentdTorrentErrors and TorrentdDiskErrors say why.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_libtorrent_num_error_torrents{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Upload payload rate",
+      "description": "libtorrent net.sent_payload_bytes: piece data sent, without protocol overhead.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 1 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(torrentd_libtorrent_net_sent_payload_bytes_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval])", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Peers connected",
+      "description": "libtorrent peer.num_peers_connected.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_libtorrent_peers_connected{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Peers unchoked for upload",
+      "description": "libtorrent peer.num_peers_up_unchoked: the peers being uploaded to right now.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_libtorrent_peers_up_unchoked{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Tracker announces by outcome",
+      "description": "Announce replies and errors, tracker warnings and scrape failures. TorrentdTrackerErrors fires when errors are most of the announces for 30 minutes; on a private tracker that is the first sign of a banned passkey or a wrong announce port.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 9 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (profile_id, kind) (rate(torrentd_tracker_alerts_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval]))", "legendFormat": "{{profile_id}} {{kind}}" }
+      ]
+    },
+    {
+      "id": 8,
+      "type": "row",
+      "title": "Disk",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 17 },
+      "panels": []
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "Queued disk jobs",
+      "description": "libtorrent disk.queued_disk_jobs. A queue that keeps growing is a disk that cannot keep up with the upload rate.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_libtorrent_disk_queued_jobs{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Disk request latency",
+      "description": "libtorrent disk.request_latency, which libtorrent reports in microseconds.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "µs", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_libtorrent_disk_request_latency{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "File pool hit ratio",
+      "description": "Share of file opens the file pool served from an already-open handle. A low ratio under load means file_pool_size is too small for the number of files being seeded. Empty where the linked libtorrent build does not report the pool counters.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (profile_id) (rate(torrentd_libtorrent_disk_file_pool_hits_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval]))\n/\n(\n  sum by (profile_id) (rate(torrentd_libtorrent_disk_file_pool_hits_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval]))\n  + sum by (profile_id) (rate(torrentd_libtorrent_disk_file_pool_misses_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval]))\n)", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Disk errors by operation",
+      "description": "File errors, by the libtorrent operation that failed. Each one puts a torrent into the disk-error phase. The series appears with its first error.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (profile_id, op) (rate(torrentd_disk_errors_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval]))", "legendFormat": "{{profile_id}} {{op}}" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Hash failures",
+      "description": "Pieces that failed their hash check: data on disk that does not match the torrent.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 26 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(torrentd_hash_failures_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval])", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "row",
+      "title": "Durability",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 34 },
+      "panels": []
+    },
+    {
+      "id": 15,
+      "type": "timeseries",
+      "title": "Resume writes and write errors",
+      "description": "Resume files written, against resume data that could not be written. Any write error means a restart loses that torrent's progress and re-hashes it (TorrentdResumeWriteErrors).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 35 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(torrentd_resume_writes_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval])", "legendFormat": "{{profile_id}} written" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(torrentd_resume_write_errors_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval])", "legendFormat": "{{profile_id}} failed" }
+      ]
+    },
+    {
+      "id": 16,
+      "type": "timeseries",
+      "title": "Alert queue overflows",
+      "description": "Times libtorrent's alert queue overflowed and dropped alerts. Dropped alerts mean the daemon's view of its own torrents is incomplete (TorrentdAlertQueueOverflow).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 35 },
+      "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "rate(torrentd_alert_queue_overflows_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval])", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "Resumes left unsaved by the last shutdown",
+      "description": "Resume saves the previous run's shutdown drain left unsaved; those torrents restarted from older state (TorrentdShutdownLeftResumeUnsaved).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 35 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "value", "graphMode": "none", "textMode": "auto", "justifyMode": "auto", "orientation": "auto" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_last_shutdown_unsaved_resumes{instance=~\"$instance\"}", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "id": 18,
+      "type": "row",
+      "title": "VPN",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 43 },
+      "panels": []
+    },
+    {
+      "id": 19,
+      "type": "timeseries",
+      "title": "Tunnel up",
+      "description": "1 while the profile's tunnel is healthy; 0 once fenced, or if it never came up. A fenced profile seeds nothing until the daemon restarts (TorrentdVpnTunnelDown). vpn profiles only.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 44 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "decimals": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_vpn_tunnel_up{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "WireGuard handshake age",
+      "description": "Age of the last WireGuard handshake. The monitor fences the profile once it exceeds vpn_handshake_max_age_secs (default 180s).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 44 },
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_vpn_handshake_age_seconds{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Handshake probe running",
+      "description": "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or unprivileged), which leaves only IP presence checked (TorrentdHandshakeProbeUnavailable).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 44 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "decimals": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_vpn_handshake_probe_ok{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Port forward up",
+      "description": "1 while the NAT-PMP lease is held and the session is bound to it (TorrentdPortForwardDown). natpmp profiles only.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 52 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "decimals": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_port_forward_up{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Forwarded port",
+      "description": "The port the session listens on. A step is the gateway handing out a new port, which the daemon follows with a reannounce.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 52 },
+      "fieldConfig": { "defaults": { "unit": "none", "decimals": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_forwarded_port{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 24,
+      "type": "timeseries",
+      "title": "Torrents paused by a fence",
+      "description": "Torrents the VPN monitor paused when it fenced the profile.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 52 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_torrents_paused_vpn_down{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+      ]
+    },
+    {
+      "id": 25,
+      "type": "stat",
+      "title": "Kill switch",
+      "description": "Whether the daemon holds the nftables kill switch installed. Off is the default; TorrentdKillSwitchOff notes it when every profile is vpn-backed, and TorrentdKillSwitchGone fires if an installed table disappears.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 52 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [ { "type": "value", "options": { "0": { "text": "off", "color": "orange", "index": 0 }, "1": { "text": "on", "color": "green", "index": 1 } } } ],
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "orange", "value": null }, { "color": "green", "value": 1 } ] }
+        },
+        "overrides": []
+      },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "background", "graphMode": "none", "textMode": "value_and_name", "justifyMode": "auto", "orientation": "auto" },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_kill_switch_active{instance=~\"$instance\"}", "legendFormat": "{{instance}}" }
+      ]
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "Fences by reason",
+      "description": "Times the VPN monitor fenced a profile: its tunnel address was lost or changed, or its WireGuard handshake went stale.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 60 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (profile_id, reason) (increase(torrentd_profile_vpn_fenced_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval]))", "legendFormat": "{{profile_id}} {{reason}}" }
+      ]
+    }
+  ]
+}
