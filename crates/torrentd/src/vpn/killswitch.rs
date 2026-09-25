@@ -19,23 +19,28 @@
 //!
 //! **What that leaves runnable.** Matching by uid confines every socket that
 //! uid owns, and a tunnel's own connection to its provider leaves by the
-//! physical interface, so the tunnel's transport must be owned by a
-//! *different* uid:
+//! physical interface. The kernel's WireGuard socket belongs to the uid that
+//! raised the link, so the ruleset carries one exemption for it: each
+//! tunnel's UDP **listen port**, read off the live link with
+//! `wg show <iface> listen-port` when the ruleset is installed, is accepted
+//! as a source port for the daemon's uid on any interface
+//! ([`render_ruleset_with_transport`]). Nothing else the daemon owns can
+//! hold that port: the WireGuard socket binds it on the wildcard address
+//! without address reuse, so a libtorrent bind to it fails with
+//! `EADDRINUSE` rather than sharing it.
 //!
 //! - **OpenVPN: never.** The daemon spawns `openvpn` under its own uid, so the
 //!   ruleset drops the client's connection to the provider. `Config::validate`
 //!   refuses the kill switch beside an OpenVPN profile.
-//! - **WireGuard as uid 0: never.** The kernel's WireGuard socket is owned by
-//!   the uid that raised the link, so `meta skuid 0 counter drop` drops the
-//!   tunnel's own encrypted UDP along with every other root-owned socket on
-//!   the host. [`refusal_for_uid`] refuses it.
-//! - **WireGuard as a dedicated uid: only with the links raised by root.**
-//!   `wg-quick` re-execs itself through `sudo` unless its uid is 0, and the
-//!   packaged unit sets `NoNewPrivileges=yes`, so the daemon cannot raise a
-//!   WireGuard link itself in that shape. It can adopt one root raised before
-//!   it started, when the profile's key matches the live link's (see
-//!   `vpn::wireguard`), and that link's socket is root's, outside the
-//!   ruleset. Neither shipped deployment arranges that on its own.
+//! - **Any profile as uid 0: never.** `meta skuid 0 counter drop` drops every
+//!   other root-owned socket on the host. [`refusal_for_uid`] refuses it.
+//! - **WireGuard as a dedicated uid with `CAP_NET_ADMIN`: yes.** `wg-quick`
+//!   re-execs itself through `sudo` unless its uid is 0, so a non-root daemon
+//!   raises its links with `ip` and `wg` directly (see `vpn::wireguard`),
+//!   which need only the capability. Those links' sockets are the daemon's,
+//!   and the listen-port exemption is what lets them carry traffic. A link
+//!   root raised before the daemon started, and which the daemon adopted, has
+//!   a root-owned socket the ruleset never matches; its exemption is inert.
 
 use std::io;
 use std::io::Write;
@@ -64,6 +69,23 @@ pub const TABLE: &str = "torrentd_ks";
 /// validation refuses such a name first; this keeps the renderer from emitting
 /// an unparseable ruleset for any caller that did not.
 pub fn render_ruleset(uid: u32, tunnels: &[String]) -> io::Result<String> {
+    render_ruleset_with_transport(uid, tunnels, &[])
+}
+
+/// [`render_ruleset`], plus the tunnels' own transport: each port in
+/// `transport_ports` is accepted as a UDP source port for `uid` on any
+/// interface, ahead of the drop.
+///
+/// This is the ruleset `enable` installs. Without it a WireGuard link the
+/// daemon raised itself cannot carry anything: its encrypted UDP to the
+/// provider leaves by the physical interface from a socket `uid` owns, and
+/// the final `drop` takes it. Ports are de-duplicated and sorted, like the
+/// interface names, so the output is deterministic.
+pub fn render_ruleset_with_transport(
+    uid: u32,
+    tunnels: &[String],
+    transport_ports: &[u16],
+) -> io::Result<String> {
     if let Some(bad) = tunnels
         .iter()
         .find(|i| !ProfileConfig::is_valid_interface_name(i))
@@ -91,6 +113,19 @@ pub fn render_ruleset(uid: u32, tunnels: &[String]) -> io::Result<String> {
             .join(", ");
         chain.push_str(&format!(
             "\t\tmeta skuid {uid} oifname {{ {set} }} accept\n"
+        ));
+    }
+    let mut ports = transport_ports.to_vec();
+    ports.sort_unstable();
+    ports.dedup();
+    if !ports.is_empty() {
+        let set = ports
+            .iter()
+            .map(u16::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        chain.push_str(&format!(
+            "\t\tmeta skuid {uid} udp sport {{ {set} }} accept\n"
         ));
     }
     chain.push_str(&format!("\t\tmeta skuid {uid} counter drop\n"));
@@ -148,35 +183,69 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
     // on the host — the package manager, the NTP client, sshd's replies —
     // matches `meta skuid 0` and gets dropped. Refuse rather than install it.
     //
-    // It would not even protect the daemon: the kernel's WireGuard socket is
-    // owned by the uid that raised the link, so as root the tunnel's own
-    // encrypted UDP to the provider matches too and is dropped, and no
-    // WireGuard profile can carry traffic. Refusing costs no working shape.
-    //
     // `wg-quick` is usually a root tool, so reaching here as root is an easy
-    // mistake to make. Running as a dedicated uid is necessary but not
-    // sufficient: `wg-quick` re-execs through `sudo` unless its uid is 0, so
-    // that daemon only runs a WireGuard profile whose link root raised first —
-    // see this module's documentation.
+    // mistake to make. A dedicated uid with `CAP_NET_ADMIN` raises its
+    // WireGuard links itself with `ip` and `wg`, and the ruleset exempts
+    // their transport — see this module's documentation.
     (uid == 0).then(|| {
         io::Error::other(
             "network_kill_switch = true requires a dedicated non-root user: the ruleset \
              confines the daemon's uid to loopback and its tunnels, and as uid 0 that \
-             would drop every root-owned process's traffic on this host, the WireGuard \
-             tunnels' own traffic included. A non-root daemon cannot run `wg-quick` \
-             itself, so the WireGuard links must be raised by root before it starts \
-             (see docs/running.md, \"Kill switch\"); otherwise unset network_kill_switch.",
+             would drop every root-owned process's traffic on this host. Run the daemon \
+             as its own user with CAP_NET_ADMIN, which raises WireGuard links with `ip` \
+             and `wg` (see docs/running.md, \"Kill switch\"); otherwise unset \
+             network_kill_switch.",
         )
     })
 }
 
 /// Install the kill switch for the current process's uid, confining egress to
-/// loopback + `tunnels`. Returns the uid the ruleset was written for. Replaces
-/// any stale table left by a previous unclean exit first.
+/// loopback + `tunnels`, with each tunnel's own transport exempted (see
+/// [`render_ruleset_with_transport`]). Returns the uid the ruleset was written
+/// for. Replaces any stale table left by a previous unclean exit first.
 ///
 /// Refuses uid 0 outright — see [`refusal_for_uid`].
 pub fn enable(tunnels: &[String]) -> io::Result<u32> {
-    enable_for_uid(current_uid()?, tunnels, disable, apply)
+    enable_for_uid(current_uid()?, tunnels, listen_port, disable, apply)
+}
+
+/// The UDP port the WireGuard link `iface` listens on, from
+/// `wg show <iface> listen-port`.
+///
+/// Read when the ruleset is installed, because a link with no `ListenPort`
+/// is given a random one by the kernel when it comes up and no config holds
+/// it. `0` — a link that is down and has no socket — is an error: there is
+/// no transport to exempt, and the tunnel would not carry once it had one.
+pub(crate) fn listen_port(iface: &str) -> io::Result<u16> {
+    let out = Command::new("wg")
+        .args(["show", iface, "listen-port"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::other(format!(
+            "wg show {iface} listen-port exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        )));
+    }
+    parse_listen_port(iface, &String::from_utf8_lossy(&out.stdout))
+}
+
+/// `wg show <iface> listen-port`'s output, as a port the ruleset can exempt.
+fn parse_listen_port(iface: &str, text: &str) -> io::Result<u16> {
+    match text.trim().parse::<u16>() {
+        Ok(0) => Err(io::Error::other(format!(
+            "WireGuard link {iface} has no listen port (is it down?), so the kill \
+             switch has no transport to exempt for it",
+        ))),
+        Ok(port) => Ok(port),
+        Err(_) => Err(io::Error::other(format!(
+            "wg show {iface} listen-port printed {:?}, not a port",
+            text.trim(),
+        ))),
+    }
 }
 
 /// `enable`, with the uid and **both** `nft` calls handed in.
@@ -198,18 +267,30 @@ pub fn enable(tunnels: &[String]) -> io::Result<u32> {
 /// tunnel interfaces, from staying in force beside this run's. Both calls are
 /// handed in, so the order and the ruleset are asserted rather than reasoned
 /// about.
+///
+/// `transport_port` is the third host probe, handed in for the same reason:
+/// the exemption it feeds is the difference between a WireGuard link the
+/// daemon raised carrying traffic and carrying none.
 pub(crate) fn enable_for_uid(
     uid: u32,
     tunnels: &[String],
+    transport_port: impl Fn(&str) -> io::Result<u16>,
     clear: impl Fn() -> io::Result<()>,
     apply: impl Fn(&str) -> io::Result<()>,
 ) -> io::Result<u32> {
     if let Some(refusal) = refusal_for_uid(uid) {
         return Err(refusal);
     }
+    // Every port is read before anything is cleared. A tunnel whose transport
+    // cannot be exempted is a tunnel the ruleset would silence, so it fails
+    // the install — and leaves a previous run's kill switch armed.
+    let ports = tunnels
+        .iter()
+        .map(|iface| transport_port(iface))
+        .collect::<io::Result<Vec<u16>>>()?;
     // Rendered before the clear, so a name the ruleset cannot carry leaves a
     // previous run's kill switch armed rather than disarming it and failing.
-    let ruleset = render_ruleset(uid, tunnels)?;
+    let ruleset = render_ruleset_with_transport(uid, tunnels, &ports)?;
     // Clear a stale table before reloading. `nft -f -` merges into an existing
     // table rather than replacing it, so a delete that silently failed would
     // leave a previous run's rules in force alongside the new ones — with the
@@ -220,6 +301,7 @@ pub(crate) fn enable_for_uid(
         target: "torrentd::vpn::killswitch",
         uid,
         tunnels = ?tunnels,
+        transport_ports = ?ports,
         "network kill switch installed (nftables, fail-closed)",
     );
     Ok(uid)
@@ -304,7 +386,7 @@ fn delete_table() -> io::Result<()> {
 }
 
 /// Feed a ruleset to `nft -f -`.
-fn apply(ruleset: &str) -> io::Result<()> {
+pub(crate) fn apply(ruleset: &str) -> io::Result<()> {
     let mut child = Command::new("nft")
         .arg("-f")
         .arg("-")
@@ -346,6 +428,7 @@ mod tests {
         let e = enable_for_uid(
             0,
             &["wg-a".to_string()],
+            |_| Ok(51820),
             || {
                 cleared.set(true);
                 Ok(())
@@ -394,6 +477,7 @@ mod tests {
         let uid = enable_for_uid(
             998,
             &["wg-b".to_string(), "wg-a".to_string()],
+            |iface| Ok(if iface == "wg-a" { 51820 } else { 40001 }),
             || {
                 calls.borrow_mut().push("clear".to_string());
                 Ok(())
@@ -416,10 +500,76 @@ mod tests {
             calls[1],
             format!(
                 "apply:{}",
-                render_ruleset(998, &["wg-a".to_string(), "wg-b".to_string()]).unwrap()
+                render_ruleset_with_transport(
+                    998,
+                    &["wg-a".to_string(), "wg-b".to_string()],
+                    &[40001, 51820],
+                )
+                .unwrap()
             ),
-            "and the ruleset handed to nft is this uid's, over these tunnels",
+            "and the ruleset handed to nft is this uid's, over these tunnels, \
+             with each tunnel's own listen port exempted",
         );
+    }
+
+    /// A tunnel whose listen port will not read stops the install before
+    /// anything is cleared: installing without its exemption would silence
+    /// that tunnel, and clearing first would disarm a previous run's switch.
+    #[test]
+    fn a_transport_port_that_will_not_read_stops_the_install_before_clearing() {
+        let cleared = std::cell::Cell::new(false);
+        let applied = std::cell::Cell::new(false);
+        let e = enable_for_uid(
+            998,
+            &["wg-a".to_string()],
+            |_| Err(io::Error::other("wg show wg-a listen-port exited 1")),
+            || {
+                cleared.set(true);
+                Ok(())
+            },
+            |_| {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a port that will not read is not an absent exemption");
+        assert!(e.to_string().contains("listen-port"), "got {e}");
+        assert!(!cleared.get(), "the existing table is left in force");
+        assert!(!applied.get(), "nothing is handed to nft");
+    }
+
+    #[test]
+    fn a_listen_port_is_read_as_a_port_and_zero_is_refused() {
+        assert_eq!(parse_listen_port("wg-a", "51820\n").unwrap(), 51820);
+        let e = parse_listen_port("wg-a", "0\n").expect_err("a down link has no socket");
+        assert!(e.to_string().contains("no listen port"), "got {e}");
+        parse_listen_port("wg-a", "").expect_err("empty output is not a port");
+        parse_listen_port("wg-a", "70000\n").expect_err("out of range is not a port");
+    }
+
+    /// The exemption, byte for byte: after the tunnel accept and before the
+    /// drop, keyed on this uid **and** the source port, so it lets out the
+    /// WireGuard socket's encrypted UDP and nothing else this uid owns.
+    #[test]
+    fn ruleset_exempts_each_tunnels_transport_ahead_of_the_drop() {
+        let rs = render_ruleset_with_transport(
+            998,
+            &["wg-a".to_string(), "wg-b".to_string()],
+            &[51820, 40001, 51820],
+        )
+        .unwrap();
+        let expected = "\
+table inet torrentd_ks {
+\tchain output {
+\t\ttype filter hook output priority 0; policy accept;
+\t\tmeta skuid 998 oifname \"lo\" accept
+\t\tmeta skuid 998 oifname { \"wg-a\", \"wg-b\" } accept
+\t\tmeta skuid 998 udp sport { 40001, 51820 } accept
+\t\tmeta skuid 998 counter drop
+\t}
+}
+";
+        assert_eq!(rs, expected);
     }
 
     /// A pre-clear that fails is fatal: an `nft delete` that reported a real
@@ -430,6 +580,7 @@ mod tests {
         let e = enable_for_uid(
             998,
             &[],
+            |_| unreachable!("no tunnels, no ports"),
             || {
                 Err(io::Error::other(
                     "nft delete table exited 1: something else",
@@ -605,6 +756,7 @@ table inet torrentd_ks {
         enable_for_uid(
             998,
             &["wg\"x".to_string()],
+            |_| Ok(51820),
             || {
                 cleared.set(true);
                 Ok(())
