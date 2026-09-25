@@ -2248,6 +2248,15 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
             "the pre-flight must ask for the daemon's lease, not a second copy of it",
         );
         assert_eq!(req.bind_ip, IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+        assert_eq!(
+            req.internal_port,
+            PortMapRequest::INTERNAL_PORT,
+            "the pre-flight must send the daemon's internal port",
+        );
+        assert_eq!(
+            req.suggested_port, 0,
+            "the pre-flight holds no port, so it must suggest none",
+        );
 
         let pf = find(&r.checks, "port_forward").expect("a port_forward line");
         assert_eq!(pf.verdict, Verdict::Pass, "detail: {}", pf.detail);
