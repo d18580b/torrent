@@ -2629,6 +2629,273 @@ listen_interfaces = "0.0.0.0:6882"
         assert_eq!(d.profile_changes[0].kind, ProfileChangeKind::Identity);
     }
 
+    /// Every `[[profile]]` field of `base` changed alone, each paired with the
+    /// key and class `diff_profiles` owes it.
+    ///
+    /// `base` is destructured with no `..`, so a field added to
+    /// `ProfileConfig` stops this compiling until it has a row here, which is
+    /// the test-side twin of the pattern in `diff_profiles`. Each binding is
+    /// then read by an `assert_ne!` proving its row is a real change, so a
+    /// row cannot pass by setting a field to the value it already had.
+    fn each_profile_field_changed_alone(
+        base: &ProfileConfig,
+    ) -> Vec<(&'static str, ProfileChangeKind, ProfileConfig)> {
+        let ProfileConfig {
+            id: _,
+            network,
+            peer_fingerprint_hex,
+            user_agent,
+            resume_dir,
+            torrent_dir,
+            allowed_tracker_domains,
+            upload_rate_limit,
+        } = base;
+        let with = |edit: &dyn Fn(&mut ProfileConfig)| {
+            let mut p = base.clone();
+            edit(&mut p);
+            p
+        };
+
+        let new_network = torrentd_engine::ProfileNetwork::Host {
+            listen_interfaces: "0.0.0.0:6899".into(),
+            dht: false,
+        };
+        let new_fingerprint = Some("a1b2c3d4e5f60718".to_string());
+        let new_user_agent = Some("ua/1.0".to_string());
+        let new_resume_dir = Some(PathBuf::from("/var/lib/torrentd/resume-public"));
+        let new_torrent_dir = Some(PathBuf::from("/var/lib/torrentd/torrents-public"));
+        let new_domains = vec!["tracker.example.com".to_string()];
+        let new_rate = Some(100_000);
+        assert_ne!(network, &new_network);
+        assert_ne!(peer_fingerprint_hex, &new_fingerprint);
+        assert_ne!(user_agent, &new_user_agent);
+        assert_ne!(resume_dir, &new_resume_dir);
+        assert_ne!(torrent_dir, &new_torrent_dir);
+        assert_ne!(allowed_tracker_domains, &new_domains);
+        assert_ne!(upload_rate_limit, &new_rate);
+
+        use ProfileChangeKind::Identity;
+        use ProfileChangeKind::NonIdentity;
+        vec![
+            (
+                "network",
+                Identity,
+                with(&|p| p.network = new_network.clone()),
+            ),
+            (
+                "peer_fingerprint_hex",
+                Identity,
+                with(&|p| p.peer_fingerprint_hex = new_fingerprint.clone()),
+            ),
+            (
+                "user_agent",
+                Identity,
+                with(&|p| p.user_agent = new_user_agent.clone()),
+            ),
+            (
+                "resume_dir",
+                NonIdentity,
+                with(&|p| p.resume_dir = new_resume_dir.clone()),
+            ),
+            (
+                "torrent_dir",
+                NonIdentity,
+                with(&|p| p.torrent_dir = new_torrent_dir.clone()),
+            ),
+            (
+                "allowed_tracker_domains",
+                NonIdentity,
+                with(&|p| p.allowed_tracker_domains = new_domains.clone()),
+            ),
+            (
+                "upload_rate_limit",
+                NonIdentity,
+                with(&|p| p.upload_rate_limit = new_rate),
+            ),
+        ]
+    }
+
+    #[test]
+    fn each_profile_field_changed_alone_is_reported_alone_with_its_class() {
+        // Safety Rule 7's enforcement is `diff_profiles` and nothing else. A
+        // field it misses is a SIGHUP that neither applies the change nor
+        // reports it, so the operator believes a new identity is live while
+        // the session keeps announcing the old one. Changing every field at
+        // once cannot show that one of them is reported only by accident of
+        // another, so each is changed on its own here, and must produce
+        // exactly its own entry and no other.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        for (key, kind, changed) in each_profile_field_changed_alone(&a.profile[0]) {
+            let mut b = a.clone();
+            b.profile[0] = changed;
+            let d = Config::diff(&a, &b);
+            assert_eq!(
+                d.profile_changes,
+                vec![ProfileChange {
+                    what: format!("public.{key}"),
+                    kind,
+                }],
+                "{key} changed alone",
+            );
+            assert!(
+                !d.is_empty(),
+                "{key}: the file changed and the daemon must say so"
+            );
+            assert!(
+                d.non_reloadable_changes.is_empty(),
+                "{key} is a profile key, not a top-level one: got {:?}",
+                d.non_reloadable_changes,
+            );
+        }
+    }
+
+    #[test]
+    fn any_change_inside_the_network_block_is_one_identity_change() {
+        // The block is compared as one value so that a field added to
+        // `ProfileNetwork` cannot be forgotten. That only holds if every
+        // field it already has reaches the comparison, and if switching the
+        // variant does too: which tunnel, which port, whether DHT runs.
+        use torrentd_engine::ProfileNetwork;
+        let dir = tempdir().unwrap();
+        let host = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let mut vpn = host.clone();
+        vpn.profile[0].network = ProfileNetwork::Vpn {
+            vpn_type: torrentd_engine::VpnType::Wireguard,
+            vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
+            vpn_interface: "wg0".into(),
+            listen_port: Some(6881),
+            port_forward: Default::default(),
+            port_forward_gateway: None,
+        };
+
+        let edits: Vec<(&str, &Config, ProfileNetwork)> = vec![
+            (
+                "host listen_interfaces",
+                &host,
+                ProfileNetwork::Host {
+                    listen_interfaces: "0.0.0.0:6899".into(),
+                    dht: false,
+                },
+            ),
+            (
+                "host dht",
+                &host,
+                ProfileNetwork::Host {
+                    listen_interfaces: "0.0.0.0:6881".into(),
+                    dht: true,
+                },
+            ),
+            ("host to vpn", &host, vpn.profile[0].network.clone()),
+            (
+                "vpn interface",
+                &vpn,
+                ProfileNetwork::Vpn {
+                    vpn_type: torrentd_engine::VpnType::Wireguard,
+                    vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
+                    vpn_interface: "wg1".into(),
+                    listen_port: Some(6881),
+                    port_forward: Default::default(),
+                    port_forward_gateway: None,
+                },
+            ),
+            (
+                "vpn listen_port",
+                &vpn,
+                ProfileNetwork::Vpn {
+                    vpn_type: torrentd_engine::VpnType::Wireguard,
+                    vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
+                    vpn_interface: "wg0".into(),
+                    listen_port: Some(51413),
+                    port_forward: Default::default(),
+                    port_forward_gateway: None,
+                },
+            ),
+            ("vpn to host", &vpn, host.profile[0].network.clone()),
+        ];
+        for (label, old, network) in edits {
+            assert_ne!(old.profile[0].network, network, "{label} must be a change");
+            let mut new = old.clone();
+            new.profile[0].network = network;
+            assert_eq!(
+                Config::diff(old, &new).profile_changes,
+                vec![ProfileChange {
+                    what: "public.network".into(),
+                    kind: ProfileChangeKind::Identity,
+                }],
+                "{label}",
+            );
+        }
+    }
+
+    #[test]
+    fn an_unchanged_profile_set_produces_an_empty_diff() {
+        // The other half of "every change is reported": a SIGHUP over a file
+        // nobody edited must not warn about an identity change, or the
+        // privacy warning stops meaning anything. Profiles are matched by id,
+        // so the order they are written in is not a change either.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(
+            dir.path(),
+            &two_host_profiles(
+                r#"user_agent = "ua/1.0"
+upload_rate_limit = 0"#,
+                r#"allowed_tracker_domains = ["tracker.example.com"]"#,
+            ),
+        ))
+        .unwrap();
+        assert_eq!(a.profile.len(), 2);
+
+        let d = Config::diff(&a, &a.clone());
+        assert!(d.profile_changes.is_empty(), "got {:?}", d.profile_changes);
+        assert!(d.is_empty());
+
+        let mut reordered = a.clone();
+        reordered.profile.reverse();
+        let d = Config::diff(&a, &reordered);
+        assert!(
+            d.profile_changes.is_empty(),
+            "reordering profiles changes no account: got {:?}",
+            d.profile_changes,
+        );
+        assert!(d.is_empty());
+    }
+
+    #[test]
+    fn a_reloadable_top_level_change_does_not_leak_into_profile_changes() {
+        // `profile_changes` is what emits Safety Rule 7's warning. A key the
+        // reload applies live must reach its own field of `ConfigDiff` and
+        // nothing in that list — least of all the top-level
+        // `upload_rate_limit`, which shares its name with a profile key.
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let edits: Vec<(&str, fn(&mut Config))> = vec![
+            ("connections_limit", |c| c.connections_limit = Some(20_000)),
+            ("upload_rate_limit", |c| c.upload_rate_limit = Some(100_000)),
+            ("max_concurrent_http_announces", |c| {
+                c.max_concurrent_http_announces = Some(8)
+            }),
+            ("aio_threads", |c| c.aio_threads = Some(8)),
+            ("enable_lsd", |c| c.enable_lsd = Some(true)),
+        ];
+        for (key, edit) in edits {
+            let mut b = a.clone();
+            edit(&mut b);
+            let d = Config::diff(&a, &b);
+            assert!(
+                d.profile_changes.is_empty(),
+                "{key} is reloadable and not a profile change: got {:?}",
+                d.profile_changes,
+            );
+            assert!(
+                d.non_reloadable_changes.is_empty(),
+                "{key}: got {:?}",
+                d.non_reloadable_changes,
+            );
+            assert_eq!(d.reloadable_changes, vec![key], "{key} is still reported");
+        }
+    }
+
     #[test]
     fn parses_one_host_profile() {
         let dir = tempdir().unwrap();
