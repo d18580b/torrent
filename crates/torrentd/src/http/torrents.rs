@@ -1496,6 +1496,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn filtering_by_a_failed_profile_lists_its_assignments() {
+        // A profile that failed at bring-up has no engine, but the filter
+        // reads the assignment registry, so its torrents are still listed.
+        use crate::profile_registry::test_failed_profile;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_state(dir.path());
+        app.profiles = Arc::new(
+            ProfileRegistry::new(vec![])
+                .with_failed(vec![test_failed_profile("down", "wg-down did not come up")]),
+        );
+        assert!(
+            matches!(
+                app.profiles.resolve(&ProfileId::new("down")),
+                crate::profile_registry::Resolution::Failed(_)
+            ),
+            "fixture is wrong: `down` must resolve as failed",
+        );
+        app.registry
+            .assign(InfoHash([1; 20]), ProfileId::new("down"))
+            .unwrap();
+        app.registry
+            .assign(InfoHash([2; 20]), ProfileId::new("other"))
+            .unwrap();
+
+        let page = list(State(app), Query(list_query(Some("down"))))
+            .await
+            .unwrap_or_else(|e| panic!("a failed profile must be listed, got {:?}", e.0))
+            .0;
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].infohash, InfoHash([1; 20]).to_hex());
+        assert_eq!(page.items[0].profile_id, "down");
+    }
+
     #[test]
     fn the_list_query_parses_limit_as_a_number_alongside_profile_id() {
         let uri: axum::http::Uri = "/api/torrents?after=00&limit=5&profile_id=acct_a"
