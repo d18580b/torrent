@@ -32,6 +32,7 @@ use torrentd_engine::MetricsSink;
 pub enum MetricType {
     Counter,
     Gauge,
+    Histogram,
 }
 
 /// Which instances of a series exist.
@@ -112,6 +113,7 @@ const fn labelled(
 
 use MetricType::Counter;
 use MetricType::Gauge;
+use MetricType::Histogram;
 use Scope::Daemon;
 use Scope::NatpmpProfile;
 use Scope::Profile;
@@ -496,6 +498,13 @@ pub const CATALOGUE: &[Series] = &[
         "NAT-PMP renewals or rebinds that failed.",
     ),
     series(
+        "profile_port_forward_rebind_failures_total",
+        Counter,
+        NatpmpProfile,
+        Seed::Owner("live natpmp profiles"),
+        "The failures above where the gateway named a new port and the session could not be rebound to it.",
+    ),
+    series(
         "profile_forwarded_port_changes_total",
         Counter,
         NatpmpProfile,
@@ -508,6 +517,20 @@ pub const CATALOGUE: &[Series] = &[
         NatpmpProfile,
         Seed::Owner("live natpmp profiles"),
         "Gateway epoch resets observed by NAT-PMP.",
+    ),
+    series(
+        "profile_port_forward_udp_mapped",
+        Gauge,
+        NatpmpProfile,
+        Seed::OnFirstEvent,
+        "1 while the UDP (uTP) mapping sits on the forwarded port; 0 while the gateway mapped TCP only.",
+    ),
+    series(
+        "profile_port_change_reannounce_seconds",
+        Histogram,
+        NatpmpProfile,
+        Seed::OnFirstEvent,
+        "Seconds from the gateway naming a new port to the last reannounce being handed to the session.",
     ),
     // ---- daemon liveness --------------------------------------------------
     series(
@@ -750,6 +773,9 @@ impl PromSink {
                     match s.kind {
                         MetricType::Counter => self.add_counter(s.name, 0, &labels),
                         MetricType::Gauge => self.set_gauge(s.name, 0.0, &labels),
+                        // A histogram has no zero sample to write; none is
+                        // catalogued as `Seed::Zero`.
+                        MetricType::Histogram => {}
                     }
                 }
             }
@@ -952,6 +978,7 @@ mod tests {
         let kind = match s.kind {
             MetricType::Counter => "counter",
             MetricType::Gauge => "gauge",
+            MetricType::Histogram => "histogram",
         };
         format!(
             "| `torrentd_{}` | {kind} | {labels} | {instances} | {present} | {} |",
@@ -989,8 +1016,8 @@ mod tests {
         }
     }
 
-    /// Every `torrentd_*` name in `text`, with `_bucket`-style suffixes
-    /// irrelevant here: the daemon exports no histograms.
+    /// Every `torrentd_*` name in `text`. `_bucket`-style suffixes are not
+    /// stripped: no alert rule reads the daemon's one histogram.
     fn referenced(text: &str) -> BTreeSet<String> {
         let mut out = BTreeSet::new();
         let bytes = text.as_bytes();
@@ -1105,6 +1132,7 @@ mod tests {
                     match s.kind {
                         MetricType::Counter => "counter",
                         MetricType::Gauge => "gauge",
+                        MetricType::Histogram => "histogram",
                     }
                 )),
                 "{} is not exported with its type after seeding",

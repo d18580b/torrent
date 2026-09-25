@@ -73,8 +73,11 @@ The alert rules that read these are in
 | `torrentd_profile_forwarded_port` | gauge | `profile_id` | each natpmp profile | from boot: live natpmp profiles | The forwarded port. |
 | `torrentd_profile_port_forward_renewals_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | NAT-PMP lease renewals. |
 | `torrentd_profile_port_forward_failures_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | NAT-PMP renewals or rebinds that failed. |
+| `torrentd_profile_port_forward_rebind_failures_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | The failures above where the gateway named a new port and the session could not be rebound to it. |
 | `torrentd_profile_forwarded_port_changes_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | Times the gateway handed out a different port. |
 | `torrentd_profile_vpn_gateway_reboots_total` | counter | `profile_id` | each natpmp profile | from boot: live natpmp profiles | Gateway epoch resets observed by NAT-PMP. |
+| `torrentd_profile_port_forward_udp_mapped` | gauge | `profile_id` | each natpmp profile | on first event | 1 while the UDP (uTP) mapping sits on the forwarded port; 0 while the gateway mapped TCP only. |
+| `torrentd_profile_port_change_reannounce_seconds` | histogram | `profile_id` | each natpmp profile | on first event | Seconds from the gateway naming a new port to the last reannounce being handed to the session. |
 | `torrentd_alert_loop_heartbeat_age_seconds` | gauge | — | daemon | from boot: always | Seconds since the alert loop last completed an iteration; computed at scrape. |
 | `torrentd_task_up` | gauge | `task`: `vpn_monitor`, `port_forward_monitor`, `reload`, `verify_queue`, `kill_switch_watch` | daemon | from boot: always | 1 while a supervised background task runs; 0 once it has exited or panicked. Only the tasks this configuration starts are present. |
 | `torrentd_auth_login_failures_total` | counter | `reason`: `bad_password`, `throttled`, `verification_budget` | daemon | from boot, at 0 | Refused logins: a wrong password, a client locked out by the throttle, or the daemon-wide verification budget spent. |

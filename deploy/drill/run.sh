@@ -130,7 +130,7 @@ vpn_type = "wireguard"
 vpn_config = "/etc/wireguard/wg-drill.conf"
 vpn_interface = "wg-drill"
 listen_port = 6891
-peer_fingerprint_hex = "a1b2c3d4e5f60718"
+peer_fingerprint = "-qB5030-"
 user_agent = "qBittorrent/5.0.3"
 EOF
 # Refuse to start a stack whose daemon would exit on its config: a compose
