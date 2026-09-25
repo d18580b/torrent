@@ -2,17 +2,19 @@
 //!
 //! A `ListenFailed` is fatal when it happens to the **only live session** —
 //! there is nothing else listening, so seeding would otherwise stop silently.
-//! The alert loop decides that (`AlertLoopBuilder::fatal_listen_failure`,
-//! keyed on the live-session count rather than on the configured profile
-//! count) and sets the `listen_failure_fatal` flag on the state map via
-//! `MetricsSink`, so the daemon can flush logs and exit non-zero.
+//! The alert loop decides that, not this handler: with its
+//! `AlertLoopBuilder::fatal_listen_failure` hook set (keyed on the live-session
+//! count rather than on the configured profile count), a `ListenFailed` alert
+//! makes it record the failure, which the daemon reads back through
+//! `AlertLoopHandle::listen_failed`, and signal `ShutdownReason::ListenFailed`,
+//! so the daemon drains resume data and exits non-zero.
 //!
 //! With two or more live sessions it is not fatal: the affected profile is
 //! logged and counted here, the alert loop warns naming it, and the other
 //! sessions keep serving.
 //!
-//! This handler logs and records the metric; the torrentd binary's main loop
-//! reads the metric to decide whether to exit.
+//! This handler only logs and records metrics. Nothing in the daemon reads
+//! those metrics back; they are exported for scraping and alerting.
 
 use libtorrent_safe::Alert;
 use tracing::error;
@@ -45,7 +47,10 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 "listen_failures_total",
                 &[("profile_id", ctx.profile_id.as_str())],
             );
-            // Also set a gauge so the binary can poll it for fatal exit.
+            // Exported for alerting: 1 while this profile's listen socket is
+            // failed, back to 0 on `ListenSucceeded`. Nothing reads it back;
+            // the fatal exit is decided by the alert loop's
+            // `fatal_listen_failure` hook on this same `ListenFailed` alert.
             ctx.metrics.set_gauge(
                 "listen_failure_active",
                 1.0,
