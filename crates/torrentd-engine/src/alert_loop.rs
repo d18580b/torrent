@@ -948,11 +948,16 @@ mod tests {
         ));
         let state = Arc::new(StateMap::new());
         let ih = InfoHash([9u8; 20]);
-        let h = TorrentHandle { id: 9, infohash: ih };
+        let h = TorrentHandle {
+            id: 9,
+            infohash: ih,
+        };
         let now = std::time::Instant::now();
         let mut st = crate::state::TorrentState::newly_added(h, ProfileId::new("p"), now);
         st.has_error = has_error;
-        st.retry = Some(crate::state::RetryState::first(now - Duration::from_secs(3600)));
+        st.retry = Some(crate::state::RetryState::first(
+            now - Duration::from_secs(3600),
+        ));
         state.insert(ih, st);
         let recording = Arc::new(RecordingSink::new());
         let metrics: Arc<dyn MetricsSink> = Arc::clone(&recording) as Arc<dyn MetricsSink>;
@@ -976,7 +981,9 @@ mod tests {
         let (engine, state, metrics) = run_due_retry(true);
         assert!(resumed(&engine), "an errored torrent was not resumed");
         let st = state.get(&InfoHash([9u8; 20])).unwrap();
-        let retry = st.retry.expect("the timer stays armed until the error is gone");
+        let retry = st
+            .retry
+            .expect("the timer stays armed until the error is gone");
         assert_eq!(retry.attempts, 2, "the next attempt backs off");
         assert!(metrics.calls().iter().any(|c| matches!(
             c,
