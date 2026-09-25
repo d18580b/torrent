@@ -19,7 +19,8 @@
 //! span, crate, or libtorrent log message it arrived in. A URL is
 //! credential-carrying when it has userinfo (`user:pass@`), a query parameter
 //! named in [`CREDENTIAL_KEYS`], or a path segment of 32 or more ASCII
-//! alphanumerics (the shape of a passkey embedded in the path). Such a URL is
+//! alphanumerics (the shape of a passkey embedded in the path), or when a URL
+//! nested unencoded after its host is itself credential-carrying. Such a URL is
 //! replaced by its scheme and host plus a marker holding a short hash of the
 //! whole URL:
 //!
@@ -166,6 +167,10 @@ fn redact_url(url: &str, scheme_len: usize) -> Option<String> {
         None => (None, authority),
     };
     let rest = &after[authority_end..];
+    // A URL nested unencoded in this one (`/r?u=https://t/a?passkey=…`) is
+    // swallowed whole by `redact_urls`, so check it here: a credential in it
+    // makes this URL credential-carrying too.
+    let secret_nested = rest.contains("://") && redact_urls(rest) != rest;
     let rest = rest.split('#').next().unwrap_or_default();
     let (path, query) = match rest.split_once('?') {
         Some((path, query)) => (path, query),
@@ -179,7 +184,7 @@ fn redact_url(url: &str, scheme_len: usize) -> Option<String> {
         let key = pair.split('=').next().unwrap_or_default();
         CREDENTIAL_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
     });
-    if userinfo.is_none() && !secret_in_path && !secret_in_query {
+    if userinfo.is_none() && !secret_in_path && !secret_in_query && !secret_nested {
         return None;
     }
     let digest = Sha256::digest(url.as_bytes());
@@ -335,6 +340,23 @@ mod tests {
         assert!(!out.contains(PASSKEY), "{out}");
         assert!(out.contains("(http://t.example/[redacted:"), "{out}");
         assert!(out.ends_with(r#"]).","next":"x"}"#), "{out}");
+    }
+
+    #[test]
+    fn url_nested_in_another_urls_query_is_redacted() {
+        let secret = "SECRETVALUE";
+        for url in [
+            format!("http://proxy/r?u=https://t.example/announce?passkey={secret}"),
+            format!("http://proxy/r#u=https://t.example/announce?passkey={secret}"),
+            format!("http://a/r?u=http://b/r?v=https://t.example/a?token={secret}"),
+        ] {
+            let out = redacted(&format!("fetch {url} done"));
+            assert!(!out.contains(secret), "{url} -> {out}");
+            assert!(out.starts_with("fetch http://"), "{out}");
+            assert!(out.ends_with("] done"), "{out}");
+        }
+        let plain = "http://proxy/r?u=https://example.com/docs?page=2";
+        assert_eq!(redacted(plain), plain);
     }
 
     #[test]
