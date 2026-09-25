@@ -125,9 +125,8 @@ impl InstanceLock {
                 );
             }
             Err(std::fs::TryLockError::Error(e)) => {
-                return Err(e).with_context(|| {
-                    format!("take the single-instance lock {}", path.display())
-                });
+                return Err(e)
+                    .with_context(|| format!("take the single-instance lock {}", path.display()));
             }
         }
         // Record the holder for a later refusal to name. Written only once the
@@ -1963,8 +1962,14 @@ mod tests {
 
         let err = InstanceLock::acquire(&path).expect_err("second lock must refuse");
         let msg = format!("{err:#}");
-        assert!(msg.contains(&format!("pid {pid}")), "names the holder: {msg}");
-        assert!(msg.contains(&path.display().to_string()), "names the lock: {msg}");
+        assert!(
+            msg.contains(&format!("pid {pid}")),
+            "names the holder: {msg}"
+        );
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "names the lock: {msg}"
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap().trim(),
             pid,
