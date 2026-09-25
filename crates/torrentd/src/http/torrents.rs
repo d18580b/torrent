@@ -1675,6 +1675,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_torrent_file_that_cannot_be_persisted_is_counted_and_the_add_still_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_state(dir.path());
+        // A torrent store whose base is a regular file: every write fails, as
+        // on a torrent dir that is full, read-only or gone.
+        std::fs::write(dir.path().join("blocker"), b"not a directory").unwrap();
+        app.torrents = Arc::new(torrentd_engine::FsTorrentStore::new(
+            dir.path().join("blocker"),
+        ));
+        let mut torrent = b"d8:announce17:http://t/announce4:infod6:lengthi1e4:name1:a\
+12:piece lengthi16384e6:pieces20:"
+            .to_vec();
+        torrent.extend_from_slice(&[0u8; 20]);
+        torrent.extend_from_slice(b"ee");
+
+        let (code, _) = do_add(&app, Some("p".into()), None, AddSource::File(torrent))
+            .await
+            .expect("the add itself succeeds; only the recovery copy failed");
+
+        assert_eq!(code, StatusCode::CREATED);
+        let text = String::from_utf8(app.metrics.render()).unwrap();
+        assert!(
+            text.contains(
+                "torrentd_torrent_file_persist_errors_total{profile_id=\"p\",source=\"api\"} 1"
+            ),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
     async fn do_add_duplicate_is_409() {
         let dir = tempfile::tempdir().unwrap();
         let app = test_state(dir.path());
