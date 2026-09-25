@@ -20,7 +20,8 @@
 //! credential-carrying when it has userinfo (`user:pass@`), a query parameter
 //! named in [`CREDENTIAL_KEYS`], or a path segment of 32 or more ASCII
 //! alphanumerics (the shape of a passkey embedded in the path), or when a URL
-//! nested unencoded after its host is itself credential-carrying. Such a URL is
+//! nested unencoded after its host is itself credential-carrying, or when it
+//! nests URLs more than [`MAX_URL_NESTING`] deep. Such a URL is
 //! replaced by its scheme and host plus a marker holding a short hash of the
 //! whole URL:
 //!
@@ -71,6 +72,12 @@ const CREDENTIAL_KEYS: &[&str] = &[
 /// as an embedded passkey (`/<32 hex>/announce`, `/announce/<32 alnum>`).
 const PATH_SECRET_MIN_LEN: usize = 32;
 
+/// How many URLs deep, below the outermost, a nested URL is inspected for a
+/// credential. A URL nesting more than this is redacted without inspecting
+/// the rest, so a whitespace-free run of `://` in untrusted text costs at most
+/// this many passes over the line, never a recursion as deep as the run.
+const MAX_URL_NESTING: usize = 4;
+
 /// Wraps an event formatter and redacts credential-carrying URLs from the
 /// complete formatted line, so event fields and the span fields the JSON
 /// formatter nests under `span` are covered alike.
@@ -97,6 +104,11 @@ where
 /// Replace every credential-carrying URL in `text` with its redacted form.
 /// Borrows when `text` holds no URL at all, which is most lines.
 fn redact_urls(text: &str) -> Cow<'_, str> {
+    redact_urls_at(text, 0)
+}
+
+/// [`redact_urls`] for text nested `depth` URLs deep inside another URL.
+fn redact_urls_at(text: &str, depth: usize) -> Cow<'_, str> {
     if !text.contains("://") {
         return Cow::Borrowed(text);
     }
@@ -119,7 +131,7 @@ fn redact_urls(text: &str) -> Cow<'_, str> {
         let end = start + trim_trailing_punctuation(&rest[start..end]).len();
         let url = &rest[start..end];
         out.push_str(&rest[..start]);
-        match redact_url(url, sep - start) {
+        match redact_url(url, sep - start, depth) {
             Some(redacted) => out.push_str(&redacted),
             None => out.push_str(url),
         }
@@ -156,8 +168,9 @@ fn trim_trailing_punctuation(url: &str) -> &str {
 }
 
 /// The redacted form of `url` if it carries a credential, else `None`.
-/// `scheme_len` is the byte length of the scheme before `://`.
-fn redact_url(url: &str, scheme_len: usize) -> Option<String> {
+/// `scheme_len` is the byte length of the scheme before `://`; `depth` is how
+/// many URLs enclose this one.
+fn redact_url(url: &str, scheme_len: usize, depth: usize) -> Option<String> {
     let scheme = &url[..scheme_len];
     let after = &url[scheme_len + 3..];
     let authority_end = after.find(['/', '?', '#']).unwrap_or(after.len());
@@ -169,8 +182,10 @@ fn redact_url(url: &str, scheme_len: usize) -> Option<String> {
     let rest = &after[authority_end..];
     // A URL nested unencoded in this one (`/r?u=https://t/a?passkey=…`) is
     // swallowed whole by `redact_urls`, so check it here: a credential in it
-    // makes this URL credential-carrying too.
-    let secret_nested = rest.contains("://") && redact_urls(rest) != rest;
+    // makes this URL credential-carrying too. Past `MAX_URL_NESTING` the
+    // nested URL is not inspected and this one is redacted, failing closed.
+    let secret_nested = rest.contains("://")
+        && (depth >= MAX_URL_NESTING || redact_urls_at(rest, depth + 1) != rest);
     let rest = rest.split('#').next().unwrap_or_default();
     let (path, query) = match rest.split_once('?') {
         Some((path, query)) => (path, query),
@@ -357,6 +372,39 @@ mod tests {
         }
         let plain = "http://proxy/r?u=https://example.com/docs?page=2";
         assert_eq!(redacted(plain), plain);
+    }
+
+    /// A chain of `n` URLs, each nested unencoded in the query of the one before.
+    fn url_chain(n: usize) -> String {
+        (0..n)
+            .map(|i| format!("http://h{i}/r"))
+            .collect::<Vec<_>>()
+            .join("?u=")
+    }
+
+    #[test]
+    fn nesting_up_to_the_cap_is_inspected_and_deeper_fails_closed() {
+        let within = url_chain(MAX_URL_NESTING + 1);
+        assert_eq!(redacted(&within), within);
+        let secret = format!("{within}?passkey=SECRETVALUE");
+        assert!(!redacted(&secret).contains("SECRETVALUE"));
+        let deeper = url_chain(MAX_URL_NESTING + 2);
+        let out = redacted(&deeper);
+        assert!(out.starts_with("http://h0/[redacted:"), "{out}");
+        assert!(!out.contains("h1"), "{out}");
+    }
+
+    #[test]
+    fn a_long_run_of_nested_schemes_is_bounded() {
+        let line = format!("x {} y", "a://".repeat(16_000));
+        let out = std::thread::Builder::new()
+            .stack_size(64 * 1024)
+            .spawn(move || redacted(&line))
+            .expect("spawn")
+            .join()
+            .expect("no stack overflow");
+        assert!(out.starts_with("x a://a:/[redacted:"), "{}", &out[..40]);
+        assert!(out.ends_with("] y"), "{out}");
     }
 
     #[test]
