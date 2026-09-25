@@ -244,3 +244,20 @@ from the running service and raise the level with `log_level` and a reload
 rather than a restart. `RUST_LOG` is read only at startup, so it applies to a
 daemon you are starting anyway, such as one under `cargo run`; do not start a
 second copy beside a running service to get a log.
+
+The daemon redacts tracker credentials from its own JSON log before writing
+it, at every level. A URL carrying userinfo (`user:pass@`), a `passkey`,
+`apikey`, `api_key`, `authkey`, `torrent_pass` or `token` query parameter, or
+a path segment of 32 or more letters and digits (a passkey in the path) is
+logged as its scheme and host plus a marker, e.g.
+`https://tracker.example/[redacted:1a2b3c4d]`. The marker is a short hash of
+the full URL, stable across runs, so two announce URLs on one host stay
+distinguishable. What remains yours to check before pasting:
+
+- tracker hostnames, which are logged as-is and still say which private
+  trackers you use;
+- credentials in any other shape, such as a secret in a parameter not listed
+  above or one that is not in a URL at all;
+- anything that did not come from the JSON log on stdout: your config file,
+  shell history, or anything the daemon printed to stderr, such as a panic
+  or a startup error.
