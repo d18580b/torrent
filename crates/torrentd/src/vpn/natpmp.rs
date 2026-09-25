@@ -39,10 +39,12 @@ const RESP_OPCODE_FLAG: u8 = 0x80;
 
 /// Retransmission schedules (ms), one read timeout per attempt. RFC 6886 §3.1
 /// doubles the timeout each retry; the full 9-retry/~128s schedule would exceed
-/// our 45s renewal interval and 60s lease, so both profiles are bounded well
-/// under that. A lost *renewal* is soft (retried next tick), so it stays snappy;
-/// a lost *startup* negotiate disables the profile, so it gets the longer budget to
-/// ride out a lossy boot.
+/// the monitor's 30s renewal interval (`port_forward_monitor::RENEW_INTERVAL`)
+/// and 60s lease, so both profiles are bounded well under that. A lost
+/// *renewal* is soft (retried `port_forward_monitor::RETRY_INTERVAL`, 5s, after
+/// it gives up), so it stays snappy: a 30s renewal that times out by ~38s and
+/// its retry by ~51s both land inside the lease. A lost *startup* negotiate
+/// disables the profile, so it gets the longer budget to ride out a lossy boot.
 const RENEWAL_TIMEOUTS_MS: &[u64] = &[250, 500, 1000, 2000, 4000]; // ~7.75s
 const STARTUP_TIMEOUTS_MS: &[u64] = &[250, 500, 1000, 2000, 4000, 8000]; // ~15.75s
 /// Teardown is best-effort on the shutdown path; keep it quick.
