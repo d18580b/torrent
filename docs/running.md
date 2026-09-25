@@ -1062,10 +1062,21 @@ last loaded, and the level it applies replaces any `RUST_LOG` the process was
 started with. Where there is no `systemctl` — the container in `deploy/` has no
 unit, and its log is `docker compose logs torrentd` (or `podman logs`) rather
 than the journal — edit the mounted `torrentd.toml` and call `POST /api/reload`
-(§8) instead: it does what `SIGHUP` does. Edit that file in place: `compose.yaml`
-mounts it as a single file, which keeps the inode it was started with, so an
-editor that saves by writing a new file leaves the container reading the old
-one.
+(§8) instead: it does what `SIGHUP` does. §8's `curl localhost:8080/api/reload`
+does not work from the host here: `compose.yaml` does not publish the API, and
+the stack runs with `[auth]`, so the call needs a `write`-scoped token. Make it
+from inside the container, or through the proxy:
+
+```bash
+docker compose exec torrentd curl -sS -X POST \
+     -H "Authorization: Bearer $TOKEN" localhost:8080/api/reload
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" https://your.host/api/reload
+```
+
+A `202` means the reload was queued; its result is in the log. Edit that file
+in place: `compose.yaml` mounts it as a single file, which keeps the inode it
+was started with, so an editor that saves by writing a new file leaves the
+container reading the old one.
 
 `debug` is per-alert detail, and on a large pool it can exceed journald's
 per-service rate limit. A `Suppressed N messages` line in the journal means
