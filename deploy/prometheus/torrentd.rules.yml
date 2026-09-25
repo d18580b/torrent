@@ -1,0 +1,301 @@
+# Alert rules for torrentd. Every series read here is in ../metrics.md, and
+# every alert has a fixture in torrentd.rules.test.yml:
+#
+#   promtool test rules deploy/prometheus/torrentd.rules.test.yml
+#   mise run test-alerts      # the same, in a container
+#
+# Severity:
+#   critical  seeding has stopped, or a safety guarantee no longer holds
+#   warning   something failed and an operator should look
+#   info      worth knowing; routine on some trackers
+#
+# `increase(x[15m]) > 0` fires on the first evaluation after an event and
+# resolves 15 minutes after the last one. It needs a sample from before the
+# event, which is why the daemon writes every series these read at zero at
+# boot. A series that appears only with its first event is matched on its
+# appearance as well (`or (x unless x offset 15m)`).
+
+groups:
+  - name: torrentd_runtime
+    rules:
+      # ---- the daemon itself -------------------------------------------
+      - alert: TorrentdDown
+        expr: up{job="torrentd"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "torrentd on {{ $labels.instance }} is not answering scrapes"
+
+      - alert: TorrentdAlertLoopStalled
+        expr: torrentd_alert_loop_heartbeat_age_seconds > 15
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The alert loop has not advanced for {{ $value }}s; seeding, resume saves and status updates have stopped"
+
+      - alert: TorrentdTaskDown
+        expr: torrentd_task_up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Background task {{ $labels.task }} has exited or panicked; what it watched is no longer watched"
+
+      - alert: TorrentdMetricsDropped
+        expr: increase(torrentd_metrics_dropped_samples_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The exporter dropped samples ({{ $labels.reason }}); some series are missing or stale"
+
+      # ---- profiles and tunnels ----------------------------------------
+      - alert: TorrentdProfileBootFailed
+        expr: torrentd_profile_boot_failed == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Profile {{ $labels.profile_id }} got no session at boot and is not seeding"
+
+      - alert: TorrentdVpnTunnelDown
+        expr: torrentd_profile_vpn_tunnel_up == 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s tunnel is down; its torrents are fenced until the daemon restarts"
+
+      - alert: TorrentdFencePauseFailed
+        expr: increase(torrentd_profile_fence_pause_errors_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fencing profile {{ $labels.profile_id }} failed to pause some torrents; they may still be seeding without the tunnel"
+
+      - alert: TorrentdHandshakeProbeUnavailable
+        expr: torrentd_profile_vpn_handshake_probe_ok == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The WireGuard handshake probe cannot run for {{ $labels.profile_id }} (wg missing or unprivileged); only IP presence is checked"
+
+      - alert: TorrentdPortForwardDown
+        expr: torrentd_profile_port_forward_up == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Profile {{ $labels.profile_id }} holds no NAT-PMP lease; incoming connections are not forwarded"
+
+      - alert: TorrentdListenFailed
+        expr: torrentd_listen_failure_active == 1
+        labels:
+          severity: critical
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s listen socket failed; it accepts no incoming connections"
+
+      # ---- kill switch -------------------------------------------------
+      - alert: TorrentdKillSwitchGone
+        expr: torrentd_kill_switch_active == 1 and torrentd_kill_switch_table_present == 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "The nftables kill switch table disappeared; the daemon's egress is no longer confined to the tunnels"
+
+      - alert: TorrentdKillSwitchUnverifiable
+        expr: increase(torrentd_kill_switch_probe_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The daemon cannot list nftables tables to confirm the kill switch is installed"
+
+      - alert: TorrentdKillSwitchLeftInstalled
+        expr: torrentd_last_shutdown_kill_switch_removal_failed == 1
+        labels:
+          severity: warning
+        annotations:
+          summary: "The previous run could not remove the kill switch on exit; check `nft list tables`"
+
+      # ---- resume data -------------------------------------------------
+      - alert: TorrentdResumeWriteErrors
+        expr: increase(torrentd_resume_write_errors_total[15m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Resume data for profile {{ $labels.profile_id }} could not be written; a restart loses progress"
+
+      - alert: TorrentdResumeSaveFailures
+        expr: >
+          increase(torrentd_resume_save_failures_total[15m]) > 0
+          or increase(torrentd_resume_save_dispatch_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "save_resume_data is failing for profile {{ $labels.profile_id }}"
+
+      - alert: TorrentdShutdownLeftResumeUnsaved
+        expr: torrentd_last_shutdown_unsaved_resumes > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The previous shutdown left {{ $value }} resume saves unsaved; those torrents restarted from older state"
+
+      # ---- libtorrent --------------------------------------------------
+      - alert: TorrentdAlertQueueOverflow
+        expr: increase(torrentd_alert_queue_overflows_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "libtorrent dropped alerts for profile {{ $labels.profile_id }}; the alert loop is falling behind"
+
+      - alert: TorrentdTrackerErrors
+        # A fraction of announces, not any error: one dead tracker among many
+        # torrents fails on every retry forever, while the rest keep replying.
+        # This fires only when most announces fail, as in a tracker outage or
+        # a tunnel that blocks them. No announces at all divides 0 by 0 and
+        # stays silent.
+        expr: |
+          sum by (profile_id) (increase(torrentd_tracker_alerts_total{kind="error"}[30m]))
+            / sum by (profile_id) (increase(torrentd_tracker_alerts_total{kind=~"error|reply"}[30m]))
+            > 0.5
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Most tracker announces for profile {{ $labels.profile_id }} have been failing for 30 minutes"
+
+      - alert: TorrentdTrackerWarnings
+        expr: increase(torrentd_tracker_alerts_total{kind=~"warning|scrape_failed"}[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Trackers returned {{ $labels.kind }} for profile {{ $labels.profile_id }}"
+
+      - alert: TorrentdSessionErrors
+        expr: increase(torrentd_session_alerts_total{kind=~"portmap_error|udp_error|fastresume_rejected"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "libtorrent reported {{ $labels.kind }} for profile {{ $labels.profile_id }}"
+
+      - alert: TorrentdPerformanceWarning
+        expr: increase(torrentd_session_alerts_total{kind="performance_warning"}[1h]) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "libtorrent raised a performance warning for profile {{ $labels.profile_id }}; see the journal"
+
+      - alert: TorrentdTorrentErrors
+        expr: >
+          increase(torrentd_torrent_errors_total[15m]) > 0
+          or increase(torrentd_torrent_add_errors_total[15m]) > 0
+          or increase(torrentd_storage_move_failures_total[15m]) > 0
+          or increase(torrentd_upload_mode_retry_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Torrents in profile {{ $labels.profile_id }} are failing"
+
+      - alert: TorrentdDiskErrors
+        expr: >
+          increase(torrentd_disk_errors_total[15m]) > 0
+          or (torrentd_disk_errors_total unless torrentd_disk_errors_total offset 15m)
+        labels:
+          severity: warning
+        annotations:
+          summary: "File errors ({{ $labels.op }}) in profile {{ $labels.profile_id }}; the torrent is in upload mode"
+
+      # ---- boot and persistence ----------------------------------------
+      - alert: TorrentdBootLoadFailures
+        expr: torrentd_boot_torrent_load_failures > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} torrents in profile {{ $labels.profile_id }} failed to load at boot ({{ $labels.source }})"
+
+      - alert: TorrentdUnloadedRegistryTorrents
+        expr: torrentd_profile_unloaded_registry_torrents > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The registry claims {{ $value }} torrents for profile {{ $labels.profile_id }} that no session loaded"
+
+      - alert: TorrentdRegistryErrors
+        expr: increase(torrentd_profile_assignment_registry_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Loads or adds for profile {{ $labels.profile_id }} were refused by the assignment registry"
+
+      - alert: TorrentdTorrentPersistFailed
+        expr: increase(torrentd_torrent_file_persist_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A .torrent for profile {{ $labels.profile_id }} could not be written ({{ $labels.source }})"
+
+      - alert: TorrentdStoreWriteFailed
+        expr: increase(torrentd_store_write_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A write to the {{ $labels.store }} failed; it no longer matches what the daemon did"
+
+      # ---- control plane -----------------------------------------------
+      - alert: TorrentdLoginThrottled
+        expr: increase(torrentd_auth_login_failures_total{reason=~"throttled|verification_budget"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Logins are being throttled ({{ $labels.reason }}); someone is guessing passwords"
+
+      - alert: TorrentdLoginFailures
+        expr: increase(torrentd_auth_login_failures_total{reason="bad_password"}[15m]) > 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than three failed logins in 15 minutes"
+
+      - alert: TorrentdTokenScopeDenied
+        expr: increase(torrentd_auth_token_scope_denials_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A valid API token was used for a route outside its scope"
+
+      - alert: TorrentdReloadFailed
+        expr: increase(torrentd_config_reload_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A config reload failed at {{ $labels.stage }}; the daemon is running the previous settings"
+
+      # ---- pool --------------------------------------------------------
+      - alert: TorrentdPoolPlanFailed
+        expr: increase(torrentd_pool_plan_failures_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A pool plan stopped ({{ $labels.kind }}); inspect it before resuming"
+
+      - alert: TorrentdPoolScanErrors
+        expr: increase(torrentd_pool_scan_errors_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A pool scan skipped entries ({{ $labels.kind }}); the index may be incomplete"
+
+      - alert: TorrentdPoolVerifyFailed
+        expr: increase(torrentd_pool_verify_failed_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Adopted torrents failed verification"
+
+      - alert: TorrentdPoolIndexDisagrees
+        expr: torrentd_pool_index_profile_disagreements > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "The pool index and the assignment registry disagree about {{ $value }} torrents; run `torrentd pool scan`"

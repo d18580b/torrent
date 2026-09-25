@@ -1,0 +1,14 @@
+# Alertmanager for the alert drill: every alert straight to the sink, grouped
+# per alert name and sent within a second.
+route:
+  receiver: sink
+  group_by: ["alertname"]
+  group_wait: 1s
+  group_interval: 5s
+  repeat_interval: 1h
+
+receivers:
+  - name: sink
+    webhook_configs:
+      - url: http://sink:9095/
+        send_resolved: false
