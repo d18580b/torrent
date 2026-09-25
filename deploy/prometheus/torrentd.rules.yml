@@ -50,6 +50,26 @@ groups:
         annotations:
           summary: "The exporter dropped samples ({{ $labels.reason }}); some series are missing or stale"
 
+      - alert: TorrentdUnready
+        # The `no_sessions` and `all_profiles_fenced` cases of /healthz's 503,
+        # from the scrape rather than a probe: every configured profile either
+        # got no session at boot or is a vpn profile whose tunnel is down. A
+        # host profile is never fenced, so one live host profile keeps this
+        # quiet, as it keeps /healthz at 200. The third 503, a stalled alert
+        # loop, is TorrentdAlertLoopStalled.
+        expr: |
+          count by (instance, job) (torrentd_profile_boot_failed)
+            unless on (instance, job)
+          count by (instance, job) (
+            torrentd_profile_boot_failed == 0
+              unless on (instance, job, profile_id) (torrentd_profile_vpn_tunnel_up == 0)
+          )
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Every profile failed at boot or is fenced; the daemon is seeding nothing and /healthz answers 503"
+
       # ---- profiles and tunnels ----------------------------------------
       - alert: TorrentdProfileBootFailed
         expr: torrentd_profile_boot_failed == 1
@@ -96,6 +116,26 @@ groups:
           summary: "Profile {{ $labels.profile_id }}'s listen socket failed; it accepts no incoming connections"
 
       # ---- kill switch -------------------------------------------------
+      - alert: TorrentdKillSwitchOff
+        # Every profile is vpn-backed, which is the only shape the daemon
+        # accepts the kill switch for, and it is not installed. Off is the
+        # default and a deliberate choice for an OpenVPN profile, which the
+        # kill switch refuses and these series cannot tell apart, so this is
+        # information rather than a page: silence it where off is intended.
+        expr: |
+          torrentd_kill_switch_active == 0
+            and on (instance, job)
+          (
+            count by (instance, job) (torrentd_profile_vpn_tunnel_up)
+              == on (instance, job)
+            count by (instance, job) (torrentd_profile_boot_failed)
+          )
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          summary: "Every profile is vpn-backed but the nftables kill switch is off; the backstop confining egress to the tunnels is not installed"
+
       - alert: TorrentdKillSwitchGone
         expr: torrentd_kill_switch_active == 1 and torrentd_kill_switch_table_present == 0
         labels:
