@@ -28,6 +28,15 @@ pub struct Cli {
     /// config check that touched disk state would fail on a host whose state
     /// directory is not yet provisioned, which is the pre-flight case this
     /// flag exists for.
+    ///
+    /// Of the host, it probes one thing: that `nft` runs, when
+    /// `network_kill_switch = true`. It does not check VPN prerequisites —
+    /// that profile files are readable, that `ip`, `wg`, `wg-quick` or
+    /// `openvpn` are installed, or which uid the daemon runs as. Run
+    /// `torrentd --config <path> vpn check` for those. That command is kept
+    /// out of this flag on purpose: its checks can come back "could not be
+    /// checked" for want of a capability, and as `ExecStartPre=` that would
+    /// refuse to start a daemon nothing is known to be wrong with.
     #[arg(long, verbatim_doc_comment)]
     pub check_config: bool,
 
