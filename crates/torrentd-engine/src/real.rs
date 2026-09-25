@@ -102,6 +102,11 @@ impl TorrentEngine for RealEngine {
         Ok(self.session.lock().force_recheck(h)?)
     }
 
+    #[instrument(skip_all, fields(op = "force_reannounce", infohash = %h.infohash))]
+    fn force_reannounce(&self, h: TorrentHandle) -> Result<(), EngineError> {
+        Ok(self.session.lock().force_reannounce(h)?)
+    }
+
     #[instrument(skip_all, fields(op = "move_storage", infohash = %h.infohash, new_path))]
     fn move_storage(
         &self,
