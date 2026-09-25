@@ -118,9 +118,10 @@ enable_lsd = false
 #
 # WireGuard profiles only: `openvpn` runs under the daemon's uid, so the
 # ruleset would drop its own connection to the provider, and the daemon
-# refuses the kill switch beside an OpenVPN profile. And a non-root daemon
-# cannot run `wg-quick` itself, so each profile's link must be raised by root
-# before the daemon starts — docs/running.md §11.6.
+# refuses the kill switch beside an OpenVPN profile. A non-root daemon cannot
+# run `wg-quick`, so it raises each profile's link itself with `ip` and `wg`
+# under CAP_NET_ADMIN; that path runs no PostUp/PreDown hooks and applies no
+# DNS line — docs/running.md §11.6.
 #
 # Verify the whole tunnel setup before trusting it, without seeding anything:
 #   torrentd --config /etc/torrentd/torrentd.toml vpn check

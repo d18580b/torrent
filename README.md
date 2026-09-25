@@ -260,7 +260,9 @@ a `vpn` profile's isolation is layered:
   fails closed at the kernel regardless of socket binds or poll timing. It is
   refused beside a `network = "host"` profile, whose egress it would drop, and
   beside an OpenVPN profile, whose own connection to the provider it would
-  drop; WireGuard links must be raised by root before the daemon starts.
+  drop. Running as its own user, the daemon raises WireGuard links with `ip`
+  and `wg` under `CAP_NET_ADMIN`, and the ruleset exempts each tunnel's own
+  encrypted transport.
 
 **Checking a tunnel without seeding anything** — `vpn check` runs the VPN
 pre-flight the daemon depends on and reports each part separately, with no
