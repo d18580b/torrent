@@ -159,6 +159,15 @@ fn daemon_end_to_end() {
         "a duplicate is a torrent-exists problem: {body}"
     );
 
+    // The document the daemon serves is the one committed beside the code.
+    let (code, doc) = http(HTTP, "GET", "/v1/openapi.json", None);
+    assert_eq!(code, 200);
+    let committed = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api/openapi.json"),
+    )
+    .expect("read docs/api/openapi.json");
+    assert_eq!(doc, committed, "the served document is the committed one");
+
     let (code, metrics) = http(HTTP, "GET", "/metrics", None);
     assert_eq!(code, 200);
     assert!(metrics.contains("torrentd_"), "metrics output: {metrics}");

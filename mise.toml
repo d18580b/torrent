@@ -8,6 +8,7 @@
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|lint|test|check
 #   mise run test-shim|test-lifecycle|test-daemon|test-all|test-alerts
+#   mise run openapi|openapi-check|check-fault-injection
 #   mise run bench -- <subcommand>
 
 [tools]
@@ -100,6 +101,27 @@ run = [
 [tasks.bench]
 description = "Layer 4: memory and throughput at scale (manual; minutes, GBs of RAM). --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having."
 run = "cargo run --release -p torrentd-bench --"
+
+# The HTTP API's OpenAPI document, derived from the handlers by kynos and
+# committed so a change to the contract shows up in review. `openapi-check` is
+# the CI gate: it regenerates the file and fails if the committed copy differs.
+[tasks.openapi]
+description = "Regenerate docs/api/openapi.json from the handlers"
+run = "cargo run -q -p torrentd -- openapi --out docs/api/openapi.json"
+
+[tasks.openapi-check]
+description = "Fail if docs/api/openapi.json is stale against the handlers"
+run = [
+  "cargo run -q -p torrentd -- openapi --out docs/api/openapi.json",
+  "git diff --exit-code -- docs/api/openapi.json",
+]
+
+# The alert drill's build (deploy/drill). Checked rather than built: it proves
+# the fault-injection code compiles, including its tests, without a second
+# full link of the daemon.
+[tasks.check-fault-injection]
+description = "Type-check the fault-injection build and its tests"
+run = "cargo check -p torrentd --features fault-injection --all-targets"
 
 # Live verification against real VPN credentials. Deliberately separate from
 # every `test` task: it needs a real host with real tunnels, it is the one
