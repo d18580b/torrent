@@ -1640,29 +1640,37 @@ impl FilesFailure {
 
 /// A tracker's free-text message as the API shows it.
 ///
-/// Every URL in it — any run containing `://` — is shown by the rule a
-/// tracker's `url` is, so a passkey a tracker echoes back in one is never
-/// returned; a `://` with no scheme before it is hidden whole. A URL ends
-/// where the log's redactor would end it — whitespace, a quote, `<`/`>`, or
-/// prose punctuation and an unopened closing bracket at its end — so what
-/// surrounds it survives. Text outside a URL is the tracker's own words and
-/// is returned as they are.
+/// Every `scheme://` URL in it is shown by the rule a tracker's `url` is, so
+/// a passkey a tracker echoes back in one is never returned. A URL starts at
+/// its scheme — the ASCII scheme characters right before `://` — and a `://`
+/// with none before it is hidden whole. It ends where the log's redactor
+/// ends one — whitespace, a quote, `<`/`>`, or prose punctuation and an
+/// unopened closing bracket at its end — so what surrounds it survives. A
+/// backslash, which ends one in the log because log lines are JSON, does not
+/// end one here: a message is not JSON, and cutting there would show what
+/// follows it. Everything outside a URL, including text glued to
+/// the front of a scheme, is the tracker's own words and is returned as it
+/// is.
 fn display_message(message: &str) -> String {
-    let is_scheme_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.');
-    let is_end =
-        |c: char| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '`' | '<' | '>');
+    use crate::tracing_init::display_announce_url;
+    use crate::tracing_init::is_scheme_char;
+    use crate::tracing_init::is_url_terminator;
+    use crate::tracing_init::trim_trailing_punctuation;
+
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
     while let Some(sep) = rest.find("://") {
-        // Back up over the scheme: a run of ASCII scheme characters, so every
-        // index here is a character boundary whatever precedes it.
-        let start = sep - rest[..sep].len() + rest[..sep].trim_end_matches(is_scheme_char).len();
-        let end = rest[sep..].find(is_end).map_or(rest.len(), |i| sep + i);
-        let url = crate::tracing_init::trim_trailing_punctuation(&rest[start..end]);
+        // Back up over the scheme: a run of ASCII scheme characters, so the
+        // index lands on a character boundary whatever precedes it.
+        let start = rest[..sep].trim_end_matches(is_scheme_char).len();
+        let end = rest[sep..]
+            .find(|c| c != '\\' && is_url_terminator(c))
+            .map_or(rest.len(), |i| sep + i);
+        let url = trim_trailing_punctuation(&rest[start..end]);
         out.push_str(&rest[..start]);
-        // No scheme, or one that does not start with a letter: not a URL
-        // `display_announce_url` can read, and so shown only as its marker.
-        out.push_str(&crate::tracing_init::display_announce_url(url).url);
+        // A scheme that is empty or does not start with a letter is not one
+        // `display_announce_url` reads, so the run shows only as its marker.
+        out.push_str(&display_announce_url(url).url);
         rest = &rest[start + url.len()..];
     }
     out.push_str(rest);
@@ -1808,9 +1816,10 @@ pub struct Tracker {
     /// Where the tracker stands.
     pub status: TrackerStatus,
     /// The last announce's error when it failed, else the tracker's last
-    /// status message; `null` when there is neither. Every URL in it (any run
-    /// containing `://`) is shown by the same rule as `url`; the rest is the
-    /// tracker's own text, returned as it is.
+    /// status message; `null` when there is neither. Every `scheme://` URL in
+    /// it is shown by the same rule as `url`, and a `://` with no scheme is
+    /// hidden whole; everything else is the tracker's own text, returned as
+    /// it is.
     pub message: Option<String>,
     /// When the next announce is due; `null` when none is scheduled.
     pub next_announce_at: Option<jiff::Timestamp>,
@@ -2081,6 +2090,20 @@ mod tests {
         }
         assert!(display_message("→https://t.example/announce?pk=S")
             .starts_with("→https://t.example/[redacted:"));
+        // `://` at either end, doubled colons, and a scheme that starts with
+        // a digit: never a panic, never the passkey.
+        for text in [
+            "://",
+            "://SECRET",
+            "x ://",
+            "x::://y/?passkey=SECRET",
+            "1https://t.example/announce?passkey=SECRET",
+            "://://://SECRET",
+            "https://t.example/announce\\?passkey=SECRET",
+        ] {
+            let shown = display_message(text);
+            assert!(!shown.contains("SECRET"), "{text} -> {shown}");
+        }
         // A `://` with no scheme is hidden whole.
         let shown = display_message("bad ://t.example/announce?passkey=SECRET end");
         assert!(!shown.contains("SECRET"), "{shown}");

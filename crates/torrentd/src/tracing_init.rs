@@ -254,13 +254,13 @@ fn redact_urls_at(text: &str, depth: usize) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn is_scheme_char(c: char) -> bool {
+pub(crate) fn is_scheme_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')
 }
 
 /// Where a URL embedded in a formatted line ends. `"` and `\` end it because
 /// the line is JSON: a URL never spans a string boundary or an escape.
-fn is_url_terminator(c: char) -> bool {
+pub(crate) fn is_url_terminator(c: char) -> bool {
     c.is_whitespace() || c.is_control() || matches!(c, '"' | '\\' | '<' | '>' | '\'' | '`')
 }
 
