@@ -906,6 +906,34 @@ fn an_adoption_lost_in_transit_is_not_offered_again() {
     };
     assert_eq!(send(&mut state, Msg::Adopt(answer), true), 1, "a toast");
     assert!(state.adopt.is_none(), "nothing left to send again");
+
+    // A proxy's timeout is just as unclear.
+    let mut state = with_library(1, None);
+    press(&mut state, KeyCode::Char('a'), true);
+    let serial = state.adopt.as_ref().unwrap().serial;
+    send(
+        &mut state,
+        Msg::Adopt(adopt::Msg::Profiles {
+            serial,
+            result: Ok(profiles()),
+        }),
+        true,
+    );
+    press(&mut state, KeyCode::Enter, true);
+    let preview = adopt::Msg::Answered {
+        serial,
+        dry_run: true,
+        result: Ok(adoption(true)),
+    };
+    send(&mut state, Msg::Adopt(preview), true);
+    press(&mut state, KeyCode::Enter, true);
+    let answer = adopt::Msg::Answered {
+        serial,
+        dry_run: false,
+        result: Err(problem(504, "gateway-timeout", None)),
+    };
+    send(&mut state, Msg::Adopt(answer), true);
+    assert!(state.adopt.is_none());
 }
 
 #[test]

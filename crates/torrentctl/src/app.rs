@@ -348,7 +348,14 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             refresh_visible(model)
         }
         Msg::SessionChecked(Err(failure)) if failure.is_unauthenticated() => {
-            sign_out(model, &failure);
+            if model.pending_sign_out.is_some() || model.minted {
+                // A credential that worked is now refused.
+                sign_out(model, &failure);
+            } else {
+                // The first check, with no credential or a refused one: the
+                // sign-in is simply what comes next, not an error.
+                model.session = Session::SignedOut;
+            }
             Vec::new()
         }
         Msg::SessionChecked(Err(failure)) => {
@@ -422,7 +429,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
                 // A sign-in is in flight: its token is revoked when it lands
                 // (see `Msg::Login`), not left live on the daemon.
                 vec![Effect::toast(Toast::info(
-                    "finishing sign-in to revoke it; q again to quit now",
+                    "finishing sign-in to revoke it; Esc again to quit now",
                 ))]
             } else {
                 model.quit = true;
@@ -526,6 +533,12 @@ fn on_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
         };
     }
     if let Session::Checking = model.session {
+        // Re-checking after a 401 takes a moment the user did not ask for:
+        // a key meant for the screen underneath must not quit. Ctrl-C
+        // (above) still does.
+        if model.pending_sign_out.is_some() {
+            return Vec::new();
+        }
         return match key.code {
             KeyCode::Esc | KeyCode::Char('q') => update(model, Msg::Quit),
             _ => Vec::new(),
@@ -998,6 +1011,39 @@ mod tests {
         m.login.busy = true;
         update(&mut m, Msg::Quit);
         update(&mut m, Msg::Quit);
+        assert!(m.quit);
+    }
+
+    #[test]
+    fn the_first_check_asks_for_a_password_without_calling_it_an_error() {
+        let mut m = model();
+        update(&mut m, Msg::SessionChecked(Err(unauthorized())));
+        assert!(matches!(m.session, Session::SignedOut));
+        assert_eq!(m.login.error, None);
+    }
+
+    #[test]
+    fn keys_during_a_recheck_reach_nothing_and_do_not_quit() {
+        let mut m = signed_in(false);
+        update(&mut m, Msg::SignedOut(unauthorized()));
+        assert!(matches!(m.session, Session::Checking));
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            assert!(update(&mut m, Msg::Key(testing::key(code))).is_empty());
+        }
+        assert!(!m.quit && !m.quitting);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        update(&mut m, Msg::Key(ctrl_c));
+        assert!(m.quitting || m.quit, "Ctrl-C still quits");
+    }
+
+    #[test]
+    fn a_second_esc_during_a_sign_in_quits_at_once() {
+        let mut m = model();
+        update(&mut m, Msg::SessionChecked(Err(unauthorized())));
+        m.login.busy = true;
+        update(&mut m, Msg::Key(testing::key(KeyCode::Esc)));
+        assert!(!m.quit);
+        update(&mut m, Msg::Key(testing::key(KeyCode::Esc)));
         assert!(m.quit);
     }
 
