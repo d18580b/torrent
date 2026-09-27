@@ -1,0 +1,51 @@
+[package]
+name = "torrentctl"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Terminal operator client for torrentd's /v1 API."
+publish = false
+
+[[bin]]
+name = "torrentctl"
+path = "src/main.rs"
+
+[dependencies]
+# The generated client's runtime (see build.rs). Declared here with the
+# floors spargen's audit requires, which reads these requirement strings
+# rather than the lockfile — the workspace's plain `serde = "1"` would fail it.
+reqwest = { workspace = true, features = ["json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+bytes = { version = "1.12.1", features = ["serde"] }
+secrecy = { workspace = true }
+futures-core = { workspace = true }
+time = { workspace = true }
+
+# The terminal UI.
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+tui-input = { workspace = true }
+clap = { workspace = true }
+color-eyre = { workspace = true }
+etcetera = { workspace = true }
+toml = { workspace = true }
+base64 = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+thiserror = { workspace = true }
+
+[build-dependencies]
+spargen = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
