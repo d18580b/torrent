@@ -405,8 +405,8 @@ impl Config {
                     "trusted_proxies: {entry:?} trusts every peer there is. Anything listed \
                      here can claim to be any client, so a /0 prefix makes every forwarding \
                      header client-controlled: the login throttle keys on a value the caller \
-                     picks, the session cookie's Secure attribute is the caller's choice, and \
-                     the client_ip on the failed-login line is whatever the caller wrote. \
+                     picks, and the client_ip on the failed-login line is whatever the caller \
+                     wrote. \
                      List the address your reverse proxy connects from, and only that."
                 );
             }
@@ -696,7 +696,7 @@ impl Config {
         // are reported here for the same reason as everything above, and one
         // more: an operator who added `[auth]` and reloaded got
         // `SIGHUP: config unchanged` from the journal and `202 Accepted` from
-        // `POST /api/reload` while the daemon went on authenticating nothing.
+        // `POST /v1/config/reload` while the daemon went on authenticating nothing.
         // Silence there reads as confirmation, which is worse than no signal.
         if old.auth != *new_auth {
             d.non_reloadable_changes.push("auth");
@@ -1636,9 +1636,8 @@ listen_interfaces = "0.0.0.0:6881"
         // The property: `trusted_proxies` is validated for *posture*, not
         // only for syntax. A `/0` prefix is every address there is, so it
         // makes every caller a trusted proxy and every forwarding header
-        // client-controlled — the throttle key, the cookie's `Secure`
-        // attribute and the `client_ip` on the failed-login line all become
-        // the caller's to choose. README.md and docs/running.md §6a both
+        // client-controlled — the throttle key and the `client_ip` on the
+        // failed-login line both become the caller's to choose. README.md and docs/running.md §6a both
         // promise this key "fails safe rather than open"; without this
         // refusal the one value that defeats it is the one that validates.
         //
@@ -3170,7 +3169,7 @@ upload_rate_limit = 0"#,
     fn a_listen_port_under_natpmp_is_refused_rather_than_ignored() {
         // The gateway assigns the port at runtime and renews its lease, so
         // nothing binds the configured one and Safety Rule 8 never enters it
-        // into the uniqueness set — and `/api/profiles` then reports it back
+        // into the uniqueness set — and `/v1/profiles` then reports it back
         // under a field documented as `null` for natpmp profiles. Accepting
         // and ignoring a key is the shape every other rule in this conversion
         // exists to refuse.

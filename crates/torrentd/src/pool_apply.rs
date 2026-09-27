@@ -66,7 +66,7 @@ fn check_index_accounts_for_live_state(pool: &PoolService, state: &StateMap) -> 
     if !unindexed.is_empty() {
         return Err(format!(
             "{} loaded torrent(s) have no claims in the index, so it cannot prove what is \
-             unclaimed — the first is {}. Run `pool scan` (or POST /api/pool/scan) and \
+             unclaimed — the first is {}. Run `pool scan` (or POST /v1/pool/scan) and \
              rebuild this plan.",
             unindexed.len(),
             unindexed[0],
@@ -291,7 +291,7 @@ fn move_torrent(
     let infohash = torrent_at(pool, Path::new(&step.src))?;
 
     // Every refusal the planner made has to hold now, not when the plan was
-    // drafted. A rescan or a `POST /api/pool/drift` between the two can turn a
+    // drafted. A rescan or a `POST /v1/pool/drift-check` between the two can turn a
     // relocatable torrent into an overlapping or drifted one, and the whole
     // point of those states is that moving the payload breaks something.
     recheck_relocatable(pool, &infohash, Path::new(&step.src))?;

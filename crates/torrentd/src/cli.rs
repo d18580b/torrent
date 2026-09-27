@@ -13,9 +13,10 @@ use clap::Subcommand;
     long_about = "Setup and operation: docs/running.md. Annotated config: deploy/torrentd.sample.toml."
 )]
 pub struct Cli {
-    /// Path to the daemon's TOML configuration file.
+    /// Path to the daemon's TOML configuration file. Required for everything
+    /// but `openapi`, which describes the API and reads no configuration.
     #[arg(short, long, value_name = "PATH")]
-    pub config: PathBuf,
+    pub config: Option<PathBuf>,
 
     /// Validate the config file and exit. Useful for systemd
     /// `ExecStartPre=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config`.
@@ -58,6 +59,17 @@ pub enum Command {
     Vpn {
         #[command(subcommand)]
         cmd: VpnCmd,
+    },
+    /// Print the HTTP API's OpenAPI 3.2 document.
+    ///
+    /// The document is derived from the handlers this binary serves, so it is
+    /// exactly what `GET /v1/openapi.json` returns. CI regenerates
+    /// `docs/api/openapi.json` with it and fails when the committed copy is
+    /// stale.
+    Openapi {
+        /// Write the document here instead of to stdout.
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
     },
     /// Generate an API token and the hash to record in the config.
     NewToken {

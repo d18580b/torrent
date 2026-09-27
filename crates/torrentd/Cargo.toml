@@ -19,10 +19,10 @@ libtorrent-safe = { workspace = true }
 
 # Async runtime + HTTP
 tokio = { workspace = true }
-axum = { workspace = true }
-tower = { workspace = true }
-tower-http = { workspace = true }
-hyper = { workspace = true }
+kynos = { workspace = true }
+jiff = { workspace = true }
+base64 = { workspace = true }
+bytes = { workspace = true }
 
 # CLI / config
 clap = { workspace = true }
@@ -55,12 +55,13 @@ sha1 = { workspace = true }
 
 [features]
 # The alert drill's build (deploy/drill): layers a MockEngine over every
-# session and mounts `POST /api/fault` to queue alerts, stall the alert loop,
+# session and mounts `POST /v1/faults` to queue alerts, stall the alert loop,
 # or panic a task. Never enable it for a deployment; no release image does.
 fault-injection = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+kynos = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

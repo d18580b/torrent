@@ -103,8 +103,121 @@ where
 
 /// Replace every credential-carrying URL in `text` with its redacted form.
 /// Borrows when `text` holds no URL at all, which is most lines.
-fn redact_urls(text: &str) -> Cow<'_, str> {
+pub(crate) fn redact_urls(text: &str) -> Cow<'_, str> {
     redact_urls_at(text, 0)
+}
+
+/// An announce URL as the API may show it, and the host it names.
+pub(crate) struct DisplayedUrl {
+    /// The host, with its port when the URL names one; empty when the URL
+    /// could not be parsed.
+    pub host: String,
+    /// The URL, unchanged when every part of it is known to carry no
+    /// credential, else `scheme://host/[redacted:<hash>]`, or the bare marker
+    /// when it could not be parsed.
+    pub url: String,
+}
+
+/// Path segments an announce URL may show: the conventional endpoints, which
+/// name a protocol rather than an account.
+const SAFE_ANNOUNCE_SEGMENTS: &[&str] = &["announce", "announce.php", "scrape", "scrape.php"];
+
+/// One announce URL as the API may show it. Fails closed.
+///
+/// [`redact_urls`] reads free text for the log and redacts the credential
+/// shapes it recognises. The API is held to more than that, because it
+/// hands a tracker's URL to anyone holding `read`, and a passkey is an
+/// account: this keeps a URL only when every part of it is known to be safe
+/// — a scheme, a plain host and port, and a path made only of the
+/// conventional endpoints — and replaces everything after the host
+/// otherwise. A query, a fragment, userinfo, a path segment of any other
+/// shape (a UUID, a short key, a base64url key), or anything that does not
+/// parse as one well-formed URL is never echoed.
+pub(crate) fn display_announce_url(url: &str) -> DisplayedUrl {
+    let marker = || {
+        let digest = Sha256::digest(url.as_bytes());
+        format!("[redacted:{}]", hex::encode(&digest[..4]))
+    };
+    let opaque = || DisplayedUrl {
+        host: String::new(),
+        url: marker(),
+    };
+    let Some(sep) = url.find("://") else {
+        return opaque();
+    };
+    let scheme = &url[..sep];
+    let well_formed = scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+        && scheme.chars().all(is_scheme_char)
+        && !url.contains(is_url_terminator);
+    if !well_formed {
+        return opaque();
+    }
+    let rest = &url[sep + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let (userinfo, host) = match authority.rsplit_once('@') {
+        Some((_, host)) => (true, host),
+        None => (false, authority),
+    };
+    if !is_plain_host(host) {
+        return opaque();
+    }
+    let tail = &rest[authority_end..];
+    let path_end = tail.find(['?', '#']).unwrap_or(tail.len());
+    let (path, extra) = tail.split_at(path_end);
+    let path_safe = path.split('/').skip(1).all(|seg| {
+        SAFE_ANNOUNCE_SEGMENTS
+            .iter()
+            .any(|safe| seg.eq_ignore_ascii_case(safe))
+    });
+    let url = if !userinfo && path_safe && extra.is_empty() {
+        url.to_owned()
+    } else {
+        format!("{scheme}://{host}/{}", marker())
+    };
+    DisplayedUrl {
+        host: host.to_owned(),
+        url,
+    }
+}
+
+/// Whether `host` is a bare hostname, IPv4 address or bracketed IPv6
+/// address, with an optional numeric port — nothing a credential could hide
+/// in.
+fn is_plain_host(host: &str) -> bool {
+    let (name_ok, port) = match host.strip_prefix('[') {
+        Some(bracketed) => {
+            let Some((addr, after)) = bracketed.split_once(']') else {
+                return false;
+            };
+            let addr_ok = !addr.is_empty()
+                && addr
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+            let port = match after {
+                "" => None,
+                _ => match after.strip_prefix(':') {
+                    Some(port) => Some(port),
+                    None => return false,
+                },
+            };
+            (addr_ok, port)
+        }
+        None => {
+            let (name, port) = match host.split_once(':') {
+                Some((name, port)) => (name, Some(port)),
+                None => (host, None),
+            };
+            let name_ok = !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+            (name_ok, port)
+        }
+    };
+    let port_ok =
+        port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()));
+    name_ok && port_ok
 }
 
 /// [`redact_urls`] for text nested `depth` URLs deep inside another URL.
@@ -277,6 +390,75 @@ mod tests {
 
     fn redacted(s: &str) -> String {
         redact_urls(s).into_owned()
+    }
+
+    #[test]
+    fn a_url_shown_by_the_api_never_carries_its_credential() {
+        for clean in [
+            "udp://tracker.example:6969/announce",
+            "https://t.example/announce.php",
+            "http://[2001:db8::1]:8080/announce",
+            "http://10.0.0.1/scrape",
+            "https://t.example",
+        ] {
+            let shown = display_announce_url(clean);
+            assert_eq!(shown.url, clean);
+        }
+        assert_eq!(
+            display_announce_url("udp://t.example:6969/announce").host,
+            "t.example:6969"
+        );
+
+        // Every credential shape, including those the log's redactor does not
+        // recognise, is cut at the host.
+        for secret in [
+            format!("https://t.example/announce?passkey={PASSKEY}"),
+            format!("https://t.example/{PASSKEY}/announce"),
+            "https://user:pw@t.example/announce".to_owned(),
+            "https://t.example/announce/2f1c9a3e-6b1d-4c1e-9f0a-1234567890ab".to_owned(),
+            "https://t.example/announce/Ab-_x9Qz".to_owned(),
+            "https://t.example/announce?pk=abc123".to_owned(),
+            "https://t.example/announce?uk=abc123".to_owned(),
+            "https://t.example/announce?auth=abc123&rsskey=def".to_owned(),
+            "https://t.example/announce#frag-secret".to_owned(),
+            "https://t.example/a1b2c3".to_owned(),
+        ] {
+            let shown = display_announce_url(&secret);
+            assert!(
+                shown.url.starts_with("https://t.example/[redacted:"),
+                "{}",
+                shown.url
+            );
+            assert_eq!(shown.host, "t.example", "{secret}");
+            for leak in [
+                PASSKEY,
+                "pw@",
+                "2f1c9a3e",
+                "Ab-_x9Qz",
+                "abc123",
+                "frag-secret",
+                "a1b2c3",
+            ] {
+                assert!(!shown.url.contains(leak), "{}", shown.url);
+            }
+        }
+
+        // Not one well-formed URL, or a host a credential could hide in:
+        // replaced whole, and no host is claimed.
+        for odd in [
+            format!("t.example/announce?passkey={PASSKEY}"),
+            format!("http://t.example/a ?passkey={PASSKEY}"),
+            format!("http://t.example/a\"?passkey={PASSKEY}"),
+            format!("1http://t.example/?passkey={PASSKEY}"),
+            "http://u:p/q@h/announce".to_owned(),
+            "http://t.example:port/announce".to_owned(),
+            "http://[zz]/announce".to_owned(),
+        ] {
+            let shown = display_announce_url(&odd);
+            assert!(shown.url.starts_with("[redacted:"), "{}", shown.url);
+            assert!(shown.host.is_empty(), "{odd} -> {}", shown.host);
+            assert!(!shown.url.contains(PASSKEY), "{}", shown.url);
+        }
     }
 
     #[test]

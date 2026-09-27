@@ -577,7 +577,7 @@ pub const CATALOGUE: &[Series] = &[
         Daemon,
         ("stage", &["load", "log_level", "apply_settings"]),
         Seed::Zero,
-        "Reloads (SIGHUP or POST /api/reload) that failed, by the step that failed.",
+        "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.",
     ),
     // ---- kill switch ------------------------------------------------------
     series(

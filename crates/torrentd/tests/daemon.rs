@@ -47,6 +47,13 @@ fn http(addr: &str, method: &str, path: &str, body: Option<&str>) -> (u16, Strin
     (status, body)
 }
 
+/// The `POST /v1/torrents` body adding `magnet` to the test profile.
+fn add_magnet(magnet: &str) -> String {
+    format!(
+        "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"magnet\",\"uri\":\"{magnet}\"}}}}"
+    )
+}
+
 fn wait_healthy(addr: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while Instant::now() < deadline {
@@ -134,19 +141,23 @@ fn daemon_end_to_end() {
     wait_healthy(HTTP);
 
     let magnet = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101&dn=itest";
-    let payload = format!("{{\"magnet\":\"{magnet}\",\"profile_id\":\"{PROFILE}\"}}");
+    let payload = add_magnet(magnet);
     let ih = "0101010101010101010101010101010101010101";
 
-    let (code, body) = http(HTTP, "POST", "/api/torrents", Some(&payload));
+    let (code, body) = http(HTTP, "POST", "/v1/torrents", Some(&payload));
     assert_eq!(code, 201, "add should be 201: {body}");
     assert!(body.contains(ih), "add response: {body}");
 
-    let (code, body) = http(HTTP, "GET", "/api/torrents", None);
+    let (code, body) = http(HTTP, "GET", "/v1/torrents", None);
     assert_eq!(code, 200);
     assert!(body.contains(ih), "list should contain the torrent: {body}");
 
-    let (code, _) = http(HTTP, "POST", "/api/torrents", Some(&payload));
+    let (code, body) = http(HTTP, "POST", "/v1/torrents", Some(&payload));
     assert_eq!(code, 409, "duplicate add must be 409");
+    assert!(
+        body.contains("problems.md#torrent-exists"),
+        "a duplicate is a torrent-exists problem: {body}"
+    );
 
     let (code, metrics) = http(HTTP, "GET", "/metrics", None);
     assert_eq!(code, 200);
@@ -260,7 +271,7 @@ fn the_first_scrape_holds_every_series_present_from_boot() {
     // A reload that cannot parse the file keeps the old settings and says so
     // in a series an alert can read, not only in the journal.
     std::fs::write(p.join("cfg.toml"), "this is = = not toml").unwrap();
-    let (code, body) = http(HTTP, "POST", "/api/reload", None);
+    let (code, body) = http(HTTP, "POST", "/v1/config/reload", None);
     assert!((200..300).contains(&code), "reload trigger: {code} {body}");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -402,13 +413,12 @@ fn daemon_graceful_shutdown_under_load() {
     let n = 100;
     for i in 1..=n {
         let ih = format!("{i:040x}");
-        let payload =
-            format!("{{\"magnet\":\"magnet:?xt=urn:btih:{ih}\",\"profile_id\":\"{PROFILE}\"}}");
-        let (code, body) = http(HTTP, "POST", "/api/torrents", Some(&payload));
+        let payload = add_magnet(&format!("magnet:?xt=urn:btih:{ih}"));
+        let (code, body) = http(HTTP, "POST", "/v1/torrents", Some(&payload));
         assert_eq!(code, 201, "add #{i} should be 201: {body}");
     }
 
-    let (code, body) = http(HTTP, "GET", "/api/status", None);
+    let (code, body) = http(HTTP, "GET", "/v1/status", None);
     assert_eq!(code, 200, "status: {body}");
 
     // SIGTERM under load: must exit cleanly within the timeout.

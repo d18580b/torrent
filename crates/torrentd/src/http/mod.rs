@@ -1,131 +1,129 @@
-//! axum HTTP control plane.
+//! The HTTP control plane, served by kynos.
+//!
+//! The API lives under `/v1`; the readiness probe and the Prometheus scrape
+//! keep their conventional root paths. Every route — those two included — is
+//! described in one OpenAPI 3.2 document derived from the handlers and their
+//! types, published at `GET /v1/openapi.json` and committed at
+//! `docs/api/openapi.json`, where CI fails if it goes stale.
 
-mod auth_routes;
-mod events;
+pub mod ctx;
 #[cfg(feature = "fault-injection")]
 pub(crate) mod fault_injection;
 pub mod forwarded;
+mod headers;
 mod healthz;
 mod metrics;
-mod pool;
-mod profiles;
-mod reload;
-mod status;
-pub(crate) mod torrents;
+pub(crate) mod page;
+pub mod security;
+pub mod v1;
+pub(crate) mod validate;
 
-use axum::routing::get;
-use axum::routing::post;
-use axum::Router;
+#[cfg(test)]
+mod tests;
 
-use crate::app_state::AppState;
+use std::sync::Arc;
 
-/// Build the full router.
+use kynos::extract::body::binary::Binary;
+use kynos::extract::media;
+use kynos::openapi::Document;
+use kynos::openapi::ExternalDocumentation;
+use kynos::openapi::Info;
+use kynos::openapi::License;
+use kynos::prelude::*;
+use kynos::router::policy::FallbackPolicy;
+use kynos::router::policy::TrailingSlashPolicy;
+
+use crate::http::ctx::AppCtx;
+use crate::http::v1::Operations;
+
+/// The published document, rendered once at startup and served verbatim.
+#[derive(Clone)]
+pub struct OpenApiJson(pub Arc<bytes::Bytes>);
+
+/// Fetch this API's OpenAPI document.
 ///
-/// Everything is served under `/api`, and only under `/api`.
-///
-/// The bare paths used to be mounted a second time as "back-compat aliases".
-/// There was nothing to be compatible with — the daemon has never been
-/// released — so every route existed twice, under two gates, and any spec
-/// describing this surface would have had to describe both. Probes and scrapes
-/// keep their root paths (`/healthz`, `/metrics`) because those genuinely are
-/// conventional locations.
-///
-/// Pool routes are mounted only when `[pool]` is configured, so an
-/// unconfigured daemon returns 404 rather than a confusing empty success.
-pub fn router(state: AppState) -> Router {
-    let mut api = Router::new()
-        .route("/status", get(status::status))
-        // Live change notifications for the web client.
-        .route("/events", get(events::events))
-        .route("/reload", post(reload::trigger))
-        .route("/torrents", get(torrents::list).post(torrents::add))
-        .route(
-            "/torrents/:infohash",
-            get(torrents::get).delete(torrents::remove),
-        )
-        .route("/torrents/:infohash/pause", post(torrents::pause))
-        .route("/torrents/:infohash/resume", post(torrents::resume))
-        .route("/torrents/:infohash/recheck", post(torrents::recheck))
-        .route("/torrents/:infohash/reannounce", post(torrents::reannounce))
-        .route(
-            "/torrents/:infohash/upload-limit",
-            post(torrents::set_upload_limit),
-        )
-        .route(
-            "/torrents/:infohash/file-priority",
-            post(torrents::set_file_priority),
-        );
+/// OpenAPI 3.2 (Server-Sent Events need its `itemSchema`), derived from the
+/// handlers and types the daemon runs, so it cannot drift from them. It needs
+/// no credential: it describes the contract, not this daemon's state.
+#[kynos::get("/v1/openapi.json", tag = Operations)]
+pub async fn get_openapi(Inject(doc): Inject<OpenApiJson>) -> Binary<media::Json> {
+    Binary::new(bytes::Bytes::clone(&doc.0))
+}
 
-    // Always mounted: a daemon always has at least one profile.
-    {
-        api = api
-            // Daemon-wide: every live profile at once, for an incident.
-            .route("/pause-all", post(profiles::pause_everything))
-            .route("/resume-all", post(profiles::resume_everything))
-            .route("/profiles", get(profiles::list))
-            .route("/profiles/:profile_id", get(profiles::get))
-            .route("/profiles/:profile_id/torrents", get(profiles::torrents))
-            .route("/profiles/:profile_id/pause-all", post(profiles::pause_all))
-            .route(
-                "/profiles/:profile_id/resume-all",
-                post(profiles::resume_all),
-            );
-    }
-
-    if state.pool.is_some() {
-        api = api
-            .route("/pool", get(pool::overview))
-            .route("/pool/tree", get(pool::tree))
-            .route("/pool/torrents", get(pool::torrents))
-            .route("/pool/orphans", get(pool::orphans))
-            .route("/pool/drift", get(pool::drift))
-            .route("/pool/scan", post(pool::scan))
-            .route("/pool/adopt", post(pool::adopt))
-            .route("/pool/verify", post(pool::verify))
-            .route("/pool/plans", get(pool::list_plans).post(pool::create_plan))
-            .route(
-                "/pool/plans/:id",
-                get(pool::get_plan).delete(pool::delete_plan),
+/// Every route the daemon serves, as one router.
+///
+/// A macro rather than a function: each group and interceptor changes the
+/// router's type, and the two consumers — the running service and the
+/// document — each need the whole of it.
+macro_rules! daemon_router {
+    () => {{
+        let router = Router::<AppCtx>::new()
+            .info(info())
+            // On the router rather than a group, so every response — the
+            // root routes and the fallbacks included — carries them, and one
+            // id source serves every request.
+            .intercept(
+                kynos::middleware::request_id::RequestId::new()
+                    .source(crate::http::headers::RandomRequestId),
             )
-            .route("/pool/plans/:id/apply", post(pool::apply_plan));
-    }
+            .intercept(crate::http::headers::ApiHeaders)
+            // One event per request at each end, the closing one carrying the
+            // status, the latency and the request id: the line an operator
+            // quoting `X-Request-Id` is looking for.
+            .observe(
+                kynos::middleware::trace::Trace::new()
+                    .correlating::<kynos::middleware::request_id::XRequestId>(),
+            )
+            .not_found(FallbackPolicy::Problem)
+            .method_not_allowed(FallbackPolicy::Problem)
+            .trailing_slashes(TrailingSlashPolicy::Strict)
+            .mount(kynos::routes![
+                healthz::get_health,
+                metrics::get_metrics,
+                get_openapi
+            ]);
+        crate::http::v1::mount!(router)
+    }};
+}
 
-    // The alert drill's fault injection. Only a `fault-injection` build has
-    // it, and it sits behind the same write credential as everything below.
-    #[cfg(feature = "fault-injection")]
-    {
-        api = api.route("/fault", post(fault_injection::inject));
-    }
+/// The running service for `state`, serving `openapi` at
+/// `GET /v1/openapi.json`.
+pub fn service(
+    state: crate::app_state::AppState,
+    openapi: OpenApiJson,
+) -> kynos::Result<kynos::router::service::Service<AppCtx>> {
+    daemon_router!().build(AppCtx::new(state, openapi))
+}
 
-    // Everything in `api` requires a credential; read for safe methods, write
-    // for anything that changes state.
-    let api = api.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        auth_routes::require_api,
+/// The published document, with the document-level members kynos has no
+/// setter for.
+pub fn document() -> kynos::Result<Document> {
+    let mut doc = daemon_router!().openapi()?;
+    doc.external_docs = Some(ExternalDocumentation::new(
+        "https://github.com/d18580b/torrent/blob/master/docs/api/README.md",
     ));
+    // No document-level `security`: every operation declares its own, and a
+    // default would be inherited by the three that need no credential
+    // (`/healthz`, this document, `POST /v1/sessions`).
+    Ok(doc)
+}
 
-    // Scraping is gated separately so a Prometheus credential can never reach
-    // the control plane.
-    let metrics = Router::new()
-        .route("/metrics", get(metrics::metrics))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth_routes::require_metrics,
-        ));
+/// The document as the bytes `docs/api/openapi.json` holds: pretty-printed,
+/// with a trailing newline.
+pub fn document_json() -> anyhow::Result<String> {
+    let doc = document().map_err(|e| anyhow::anyhow!("describe the API: {e}"))?;
+    let mut json = serde_json::to_string_pretty(&doc)?;
+    json.push('\n');
+    Ok(json)
+}
 
-    let router = Router::new()
-        // /healthz is deliberately unauthenticated: it carries no data beyond
-        // liveness, and a probe that needs a credential is a probe that breaks
-        // during the incident it exists to detect.
-        .route("/healthz", get(healthz::healthz))
-        .merge(metrics)
-        // Login must sit outside the gate, or nobody can ever get in.
-        .route("/api/login", post(auth_routes::login))
-        .route("/api/logout", post(auth_routes::logout))
-        .nest("/api", api)
-        .layer(axum::extract::DefaultBodyLimit::max(
-            torrents::MAX_BODY_BYTES,
-        ));
-
-    router.with_state(state)
+fn info() -> Info {
+    Info::new("torrentd", "1.0.0")
+        .with_summary("Control plane of a headless, multi-account torrent seeding daemon.")
+        .with_description(
+            "The `/v1` HTTP API of `torrentd`. Conventions — authentication, pagination, \
+             errors, and what may change within v1 — are in `docs/api/README.md`; every \
+             problem `type` URI resolves to a heading in `docs/api/problems.md`.",
+        )
+        .with_license(License::spdx("Apache-2.0", "Apache-2.0"))
 }

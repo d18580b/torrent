@@ -11,7 +11,6 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::Router;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use torrentd_engine::AddParams;
@@ -467,7 +466,7 @@ pub struct DaemonHandle {
     /// arriving during startup is buffered rather than dropped on the floor.
     shutdown_rx: broadcast::Receiver<ShutdownReason>,
     reload_rx: mpsc::Receiver<()>,
-    /// Lets `POST /api/reload` ask for the same thing SIGHUP asks for.
+    /// Lets `POST /v1/config/reload` ask for the same thing SIGHUP asks for.
     reload_tx: mpsc::Sender<()>,
     metrics: Arc<PromSink>,
     pool: Option<Arc<crate::pool_service::PoolService>>,
@@ -1033,7 +1032,7 @@ pub async fn boot(
     // takes its own advice ("give one of the configured profiles the id the
     // registry names") and stops there boots successfully with every file
     // still at the old un-partitioned root: `resume scan complete
-    // torrent_count=0` at `info`, `/healthz` 200, and `GET /api/profiles`
+    // torrent_count=0` at `info`, `/healthz` 200, and `GET /v1/profiles`
     // reporting N torrents that no session holds, because it derives
     // `torrent_count` from the registry rather than from loaded state. A
     // silent total outage reported healthy is the failure mode this whole
@@ -1236,7 +1235,7 @@ fn boot_engine(
     #[cfg(feature = "fault-injection")]
     let engine = {
         warn!(
-            "fault-injection build: this session accepts injected faults over POST /api/fault; \
+            "fault-injection build: this session accepts injected faults over POST /v1/faults; \
              it exists for deploy/drill and must never seed for real",
         );
         crate::http::fault_injection::FaultEngine::wrap(engine)
@@ -1685,6 +1684,7 @@ impl DaemonHandle {
             reload_tx: Some(reload_tx.clone()),
             trusted_proxies: trusted_proxies.clone(),
             unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
+            shutdown: shutdown_tx.clone(),
         };
 
         // What the daemon decided to believe, in the journal, once. Anything
@@ -1712,7 +1712,21 @@ impl DaemonHandle {
             );
         }
 
-        let app: Router = http::router(app_state);
+        // The document is rendered once here and served verbatim, so
+        // `GET /v1/openapi.json` costs nothing per request and is byte-for-byte
+        // what `torrentd openapi` prints. Neither step can fail short of a bug
+        // in a route's description; if one does, the daemon exits 70 through
+        // the same teardown a bind failure takes.
+        let app = http::document_json()
+            .and_then(|openapi| {
+                http::service(
+                    app_state,
+                    http::OpenApiJson(Arc::new(bytes::Bytes::from(openapi))),
+                )
+                .map_err(|e| anyhow::anyhow!("build the HTTP router: {e}"))
+            })
+            .map_err(|e| error!(error.cause = %e, "build the HTTP API"))
+            .ok();
         let http_listen = cfg.http_listen;
 
         // SIGHUP pump.
@@ -1744,8 +1758,8 @@ impl DaemonHandle {
                 None
             }
         };
-        let mut exit_code = match listener {
-            Some(listener) => {
+        let mut exit_code = match listener.zip(app) {
+            Some((listener, app)) => {
                 serve_until_shutdown(
                     listener,
                     app,
@@ -1861,7 +1875,7 @@ impl DaemonHandle {
 /// and nothing else.
 async fn serve_until_shutdown(
     listener: tokio::net::TcpListener,
-    app: Router,
+    app: kynos::router::service::Service<http::ctx::AppCtx>,
     http_listen: std::net::SocketAddr,
     posture: Option<String>,
     shutdown_tx: &broadcast::Sender<ShutdownReason>,
@@ -1913,16 +1927,14 @@ async fn serve_until_shutdown(
         });
     }
 
-    // `into_make_service_with_connect_info` is what makes the peer address
-    // reach a handler at all. Without it nothing downstream — the login
-    // throttle, the auth failure log — could see who was calling.
-    let server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        let _ = shutdown_rx.recv().await;
-    });
+    // kynos records every connection's peer address, which is what lets the
+    // session throttle and the auth failure log see who was calling.
+    let server = kynos::server::Server::new(app)
+        .listener(listener)
+        .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
+            let _ = shutdown_rx.recv().await;
+        }))
+        .serve();
 
     match server.await {
         Ok(()) => 0,

@@ -31,7 +31,7 @@
 # design, so the drill checks the series through Prometheus instead.
 #
 # Faults with no trigger outside the engine go through the image's
-# fault-injection endpoint, POST /api/fault (crates/torrentd/src/http/
+# fault-injection endpoint, POST /v1/faults (crates/torrentd/src/http/
 # fault_injection.rs):
 #   libtorrent alerts, queued on the drill profile's session:
 #     alerts_dropped                                 TorrentdAlertQueueOverflow
@@ -203,28 +203,28 @@ scraped || { echo "drill: Prometheus never scraped the daemon" >&2; exit 1; }
 # ---- runtime faults ------------------------------------------------------
 for _ in 1 2 3 4 5 6; do
   curl -s -o /dev/null -H 'Content-Type: application/json' \
-    -d '{"password":"wrong"}' "$api/api/login"
+    -d '{"password":"wrong"}' "$api/v1/sessions"
 done
-curl -s -o /dev/null -H "Authorization: Bearer $metrics_token_out" "$api/api/torrents"
+curl -s -o /dev/null -H "Authorization: Bearer $metrics_token_out" "$api/v1/torrents"
 curl -s -o /dev/null -H "Authorization: Bearer $write_token" -H 'Content-Type: application/json' \
-  -d '{"magnet":"magnet:?xt=urn:btih:0202020202020202020202020202020202020202&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce","profile_id":"drill"}' \
-  "$api/api/torrents"
+  -d '{"profile_id":"drill","source":{"kind":"magnet","uri":"magnet:?xt=urn:btih:0202020202020202020202020202020202020202&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce"}}' \
+  "$api/v1/torrents"
 printf 'this is = = not toml\n' >"$DRILL_DIR/torrentd.toml"
-curl -s -o /dev/null -X POST -H "Authorization: Bearer $write_token" "$api/api/reload"
+curl -s -o /dev/null -X POST -H "Authorization: Bearer $write_token" "$api/v1/config/reload"
 
 # ---- engine faults, through the fault-injection endpoint -----------------
 # An unknown fault is refused as unparseable (422) by a fault-injection build;
 # any other build has no such route.
 probe=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $write_token" \
-  -H 'Content-Type: application/json' -d '{"fault":"none"}' "$api/api/fault")
+  -H 'Content-Type: application/json' -d '{"fault":"none"}' "$api/v1/faults")
 if [ "$probe" != 422 ]; then
-  echo "drill: $TORRENTD_IMAGE is not a fault-injection build (POST /api/fault answered $probe);" \
+  echo "drill: $TORRENTD_IMAGE is not a fault-injection build (POST /v1/faults answered $probe);" \
     "remove it and rerun to rebuild: $engine rmi $TORRENTD_IMAGE" >&2
   exit 2
 fi
 fault() {
   curl -fsS -o /dev/null -H "Authorization: Bearer $write_token" \
-    -H 'Content-Type: application/json' -d "$1" "$api/api/fault" \
+    -H 'Content-Type: application/json' -d "$1" "$api/v1/faults" \
     || { echo "drill: the daemon refused the fault $1" >&2; exit 1; }
 }
 fault '{"fault":"alert_queue_overflow","profile_id":"drill"}'
@@ -272,7 +272,7 @@ fault '{"fault":"stall_alert_loop","profile_id":"drill","secs":150}'
 # parses and changes a reloadable setting is what makes that call.
 fault '{"fault":"panic_apply_settings","profile_id":"drill"}'
 { echo 'connections_limit = 321'; cat "$DRILL_DIR/torrentd.good.toml"; } >"$DRILL_DIR/torrentd.toml"
-curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $write_token" "$api/api/reload" \
+curl -fsS -o /dev/null -X POST -H "Authorization: Bearer $write_token" "$api/v1/config/reload" \
   || { echo "drill: the reload that panics the reload task was refused" >&2; exit 1; }
 
 # ---- wait for delivery ---------------------------------------------------

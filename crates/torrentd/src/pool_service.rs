@@ -367,7 +367,7 @@ pub async fn run_verify_queue(
             let Some(item) = q.pending.lock().pop_front() else {
                 break;
             };
-            // `POST /api/pool/adopt` checks the profile's tunnel before queueing,
+            // `POST /v1/pool/adoptions` checks the profile's tunnel before queueing,
             // but the queue drains over minutes or hours and the tunnel can
             // drop in between. Admitting then would add torrents to a fenced
             // profile — the one thing fencing exists to prevent. Put it back and
@@ -457,7 +457,7 @@ pub async fn run_verify_queue(
 
 /// Release the registry claim of a verify item the worker is dropping.
 ///
-/// `POST /api/pool/adopt` claims the info-hash before it queues the item, and
+/// `POST /v1/pool/adoptions` claims the info-hash before it queues the item, and
 /// releases the claim itself only when `execute_adopt` fails synchronously. An
 /// item dropped here never reaches a session, so no `AddTorrent` alert will
 /// ever give it a state-map entry, and it is not in `unloaded_at_boot` either:

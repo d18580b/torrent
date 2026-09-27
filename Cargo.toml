@@ -24,10 +24,9 @@ all = "deny"
 [workspace.dependencies]
 # Core
 tokio = { version = "1.42", features = ["full"] }
-axum = { version = "0.7", features = ["multipart"] }
-tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "limit"] }
-hyper = "1"
+kynos = { version = "=0.3.0", features = ["openapi32", "time-jiff"] }
+jiff = { version = "0.2", features = ["serde"] }
+base64 = "0.22"
 
 # Serialization / config
 serde = { version = "1", features = ["derive"] }

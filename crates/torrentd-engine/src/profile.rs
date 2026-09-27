@@ -413,7 +413,7 @@ impl TryFrom<RawProfile> for ProfileConfig {
                 // `listen_port` under NAT-PMP is a value nothing reads. The
                 // gateway assigns the port at runtime, nothing binds the
                 // configured one, Safety Rule 8 does not enter it into
-                // `seen_port` — and `/api/profiles` then reports it back
+                // `seen_port` — and `/v1/profiles` then reports it back
                 // under a field documented as "`null` for natpmp profiles".
                 // Accepting and ignoring it is the shape every other
                 // wrong-posture rule in this function exists to refuse.
@@ -422,7 +422,7 @@ impl TryFrom<RawProfile> for ProfileConfig {
                         "profile {:?} sets port_forward = \"natpmp\" and listen_port. The \
                          gateway assigns the port at runtime and renews its lease, so nothing \
                          binds the configured one; read the negotiated port from \
-                         GET /api/profiles/{} instead.",
+                         GET /v1/profiles/{} instead.",
                         id.as_str(),
                         id.as_str(),
                     ));
@@ -458,7 +458,7 @@ impl ProfileConfig {
     ///
     /// Private, and reachable only through `Serialize` below. It shipped as a
     /// public `From<&ProfileConfig> for RawProfile` with no caller at all:
-    /// `/api/profiles` builds its own wire structs, and nothing serializes a
+    /// `/v1/profiles` builds its own wire structs, and nothing serializes a
     /// `Config`. A public conversion direction nobody exercises is how a
     /// serializer and a deserializer stop agreeing without anything saying so.
     fn to_raw(&self) -> RawProfile {
@@ -813,7 +813,7 @@ impl ProfileConfig {
     /// Deliberately narrower than what a filesystem accepts. The set excludes
     /// `.`, so `.` and `..` are unrepresentable without a special case, and
     /// excludes `/` and `\`, so an id is always exactly one path component. It
-    /// is also URL-safe unescaped, which is what `/api/profiles/<id>` needs.
+    /// is also URL-safe unescaped, which is what `/v1/profiles/<id>` needs.
     /// The 64-character bound keeps `session_state-<id>.dat` inside a
     /// filename-length limit on every platform the daemon targets.
     pub(crate) fn is_valid_id(id: &str) -> bool {
@@ -891,7 +891,7 @@ impl ProfileConfig {
         for p in profiles {
             // The id is not just a label. It is a path component in
             // `<resume_dir>/<id>`, `<torrent_dir>/<id>` and
-            // `session_state-<id>.dat`, and a segment of `/api/profiles/<id>`.
+            // `session_state-<id>.dat`, and a segment of `/v1/profiles/<id>`.
             // `PathBuf::join` with an absolute id replaces the base outright,
             // so `id = "/etc"` would write resume data to `/etc`, and
             // `id = "../.."` escapes upward. Constrain the id itself rather
