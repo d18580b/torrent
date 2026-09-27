@@ -260,6 +260,20 @@ async fn reads(cov: &Arc<Coverage>) {
     let inside: Value = h.read(&format!("{tree}?path=/movies/")).await.json();
     let paths = field(&inside, "path");
     assert_eq!(paths, ["movies/a.bin", "movies/b.bin"]);
+    // Paged inside it: the cursor is a child of this directory, and it
+    // resumes after the first entry.
+    let first: Value = h.read(&format!("{tree}?path=movies&limit=1")).await.json();
+    assert_eq!(field(&first, "path"), ["movies/a.bin"]);
+    let cursor = first["next_cursor"].as_str().unwrap().to_owned();
+    let rest: Value = h
+        .read(&format!("{tree}?path=movies&limit=1&cursor={cursor}"))
+        .await
+        .json();
+    assert_eq!(field(&rest, "path"), ["movies/b.bin"]);
+    assert_eq!(rest["next_cursor"], Value::Null);
+    // The same cursor is refused on the root listing.
+    let resp = h.read(&format!("{tree}?cursor={cursor}")).await;
+    assert_problem(&resp, 400, "invalid-cursor");
     assert_eq!(inside["items"][0]["bytes_matched"], 64);
     assert_eq!(inside["items"][0]["bytes_orphan"], 0);
     assert_eq!(inside["items"][0]["states"], json!(["matched"]));

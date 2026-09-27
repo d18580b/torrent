@@ -9378,7 +9378,7 @@
               "string",
               "null"
             ],
-            "description": "The last announce's error when it failed, else the tracker's last\nstatus message; `null` when there is neither. Every URL in it is shown\nby the same rule as `url`."
+            "description": "The last announce's error when it failed, else the tracker's last\nstatus message; `null` when there is neither. Every `scheme://` URL in\nit is shown by the same rule as `url`, and the log's redaction applies\nto the rest."
           },
           "next_announce_at": {
             "type": [

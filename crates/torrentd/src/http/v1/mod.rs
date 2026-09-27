@@ -87,10 +87,9 @@ pub struct Testing;
 
 /// A `/v1` group, with the body limit its operations admit.
 ///
-/// The interceptors every response shares — the request id and the API
+/// The interceptors every routed response shares — the request id and the API
 /// headers — sit on the router, not here: per group they would give each
-/// group its own id counter and leave the root routes and the fallbacks
-/// without them. Three groups share the prefix, differing only in what body
+/// group its own id counter and leave the root routes without them. Three groups share the prefix, differing only in what body
 /// they admit:
 /// operations that take no body declare no `413`, so the document does not
 /// promise a failure they cannot produce. A macro rather than a function

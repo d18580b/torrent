@@ -1638,31 +1638,39 @@ impl FilesFailure {
     }
 }
 
-/// A tracker's free-text message as the API shows it: every URL in it held to
-/// the rule `url` is, so a passkey a tracker echoes back is never returned.
+/// A tracker's free-text message as the API shows it.
 ///
-/// A token is treated as a URL when it contains `://`; the log's redactor
-/// runs first, for credential shapes that are not URLs at all.
+/// Every `scheme://` URL in it is shown by the rule a tracker's `url` is, so
+/// a passkey a tracker echoes back in one is never returned; the log's
+/// redactor then runs over the rest, for credential shapes it recognises
+/// outside a URL. A URL ends where the log's redactor would end it —
+/// whitespace, a quote or `<`/`>`, or prose punctuation and an unopened
+/// closing bracket at its end — so what surrounds it survives intact.
 fn display_message(message: &str) -> String {
-    let redacted = crate::tracing_init::redact_urls(message);
-    redacted
-        .split_inclusive(char::is_whitespace)
-        .map(|token| {
-            let word = token.trim_end_matches(char::is_whitespace);
-            if !word.contains("://") {
-                return token.to_owned();
-            }
-            let tail = &token[word.len()..];
-            let start = word.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(0);
-            let (lead, url) = word.split_at(start);
-            let url = url.trim_end_matches(|c: char| ",.;:)]}'\"".contains(c));
-            let trail = &word[start + url.len()..];
-            format!(
-                "{lead}{}{trail}{tail}",
-                crate::tracing_init::display_announce_url(url).url
-            )
-        })
-        .collect()
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(sep) = rest.find("://") {
+        // Back up over the scheme.
+        let start = rest[..sep]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+            .map_or(0, |i| i + 1);
+        if start == sep {
+            out.push_str(&rest[..sep + 3]);
+            rest = &rest[sep + 3..];
+            continue;
+        }
+        let end = rest[start..]
+            .find(|c: char| {
+                c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '`' | '<' | '>')
+            })
+            .map_or(rest.len(), |i| start + i);
+        let url = crate::tracing_init::trim_trailing_punctuation(&rest[start..end]);
+        out.push_str(&rest[..start]);
+        out.push_str(&crate::tracing_init::display_announce_url(url).url);
+        rest = &rest[start + url.len()..];
+    }
+    out.push_str(rest);
+    crate::tracing_init::redact_urls(&out).into_owned()
 }
 
 /// The trackers a magnet URI names, as libtorrent reads them.
@@ -1804,8 +1812,9 @@ pub struct Tracker {
     /// Where the tracker stands.
     pub status: TrackerStatus,
     /// The last announce's error when it failed, else the tracker's last
-    /// status message; `null` when there is neither. Every URL in it is shown
-    /// by the same rule as `url`.
+    /// status message; `null` when there is neither. Every `scheme://` URL in
+    /// it is shown by the same rule as `url`, and the log's redaction applies
+    /// to the rest.
     pub message: Option<String>,
     /// When the next announce is due; `null` when none is scheduled.
     pub next_announce_at: Option<jiff::Timestamp>,
@@ -2016,14 +2025,13 @@ mod tests {
         ] {
             assert!(hosts(uri).is_none(), "{uri}");
         }
-        // An underscore in a hostname is a host, as libtorrent reads it.
-        assert_eq!(
-            hosts(
-                "magnet:?xt=urn:btih:01&tr=udp%3A%2F%2Ftracker_x.foreign.example%3A6969%2Fannounce"
-            )
-            .unwrap(),
-            ["tracker_x.foreign.example"]
-        );
+        // A host with `_` is refused rather than read: libtorrent's
+        // `parse_url` rejects it outside an IPv6 literal, so it is never
+        // announced to either, and refusing is the stricter answer.
+        assert!(hosts(
+            "magnet:?xt=urn:btih:01&tr=udp%3A%2F%2Ftracker_x.foreign.example%3A6969%2Fannounce"
+        )
+        .is_none());
         assert!(host_matches_domain("tracker.example.org", "example.org"));
         assert!(host_matches_domain("example.org", "Example.org."));
         assert!(!host_matches_domain("badexample.org", "example.org"));
@@ -2042,6 +2050,28 @@ mod tests {
             "{shown}"
         );
         assert!(shown.ends_with("), retry later"), "{shown}");
+        // Brackets and angle quotes the URL sits in survive, and nothing is
+        // doubled or dropped around the marker.
+        let shown = display_message(
+            "[https://u:SECRET5@t.example/announce] <https://t.example/announce?pk=S>",
+        );
+        assert!(
+            !shown.contains("SECRET5") && !shown.contains("pk=S"),
+            "{shown}"
+        );
+        assert!(
+            shown.starts_with("[https://t.example/[redacted:"),
+            "{shown}"
+        );
+        assert!(shown.contains("] <https://t.example/[redacted:"), "{shown}");
+        assert!(shown.ends_with("]>"), "{shown}");
+        // The marker is the one the url field shows for the same URL.
+        let raw = "https://t.example/announce?pk=abc123";
+        assert!(
+            display_message(raw) == crate::tracing_init::display_announce_url(raw).url,
+            "{}",
+            display_message(raw)
+        );
         assert_eq!(
             display_message("torrent not registered"),
             "torrent not registered"

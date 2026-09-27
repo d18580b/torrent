@@ -525,8 +525,6 @@ page!(
     TreeEntry
 );
 
-/// The cursor key of a listing entry, ascending in the order the store lists
-/// children: directories first, then files, each by path.
 /// Whether `key` could be a [`tree_key`] of an immediate child of `prefix`:
 /// `d` or `f`, then a path directly under the listed directory.
 ///
@@ -545,6 +543,8 @@ fn is_child_key(key: &str, prefix: &str) -> bool {
     name.is_some_and(|n| !n.is_empty() && !n.contains('/'))
 }
 
+/// The cursor key of a listing entry, ascending in the order the store lists
+/// children: directories first, then files, each by path.
 fn tree_key(path: &str, is_dir: bool) -> String {
     format!("{}{path}", if is_dir { 'd' } else { 'f' })
 }

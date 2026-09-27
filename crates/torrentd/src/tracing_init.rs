@@ -208,12 +208,10 @@ fn is_plain_host(host: &str) -> bool {
                 Some((name, port)) => (name, Some(port)),
                 None => (host, None),
             };
-            // `_` is not a DNS hostname character, but trackers use it and
-            // libtorrent accepts it, so a host with one is a host.
             let name_ok = !name.is_empty()
                 && name
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
             (name_ok, port)
         }
     };
@@ -268,7 +266,7 @@ fn is_url_terminator(c: char) -> bool {
 
 /// Drop prose punctuation glued to the end of a URL (`… see http://x/a.`),
 /// and a closing bracket the URL itself never opened (`(http://x/a)`).
-fn trim_trailing_punctuation(url: &str) -> &str {
+pub(crate) fn trim_trailing_punctuation(url: &str) -> &str {
     let mut url = url;
     loop {
         let trimmed = match url.chars().last() {
