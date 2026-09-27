@@ -1640,37 +1640,33 @@ impl FilesFailure {
 
 /// A tracker's free-text message as the API shows it.
 ///
-/// Every `scheme://` URL in it is shown by the rule a tracker's `url` is, so
-/// a passkey a tracker echoes back in one is never returned; the log's
-/// redactor then runs over the rest, for credential shapes it recognises
-/// outside a URL. A URL ends where the log's redactor would end it —
-/// whitespace, a quote or `<`/`>`, or prose punctuation and an unopened
-/// closing bracket at its end — so what surrounds it survives intact.
+/// Every URL in it — any run containing `://` — is shown by the rule a
+/// tracker's `url` is, so a passkey a tracker echoes back in one is never
+/// returned; a `://` with no scheme before it is hidden whole. A URL ends
+/// where the log's redactor would end it — whitespace, a quote, `<`/`>`, or
+/// prose punctuation and an unopened closing bracket at its end — so what
+/// surrounds it survives. Text outside a URL is the tracker's own words and
+/// is returned as they are.
 fn display_message(message: &str) -> String {
+    let is_scheme_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.');
+    let is_end =
+        |c: char| c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '`' | '<' | '>');
     let mut out = String::with_capacity(message.len());
     let mut rest = message;
     while let Some(sep) = rest.find("://") {
-        // Back up over the scheme.
-        let start = rest[..sep]
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
-            .map_or(0, |i| i + 1);
-        if start == sep {
-            out.push_str(&rest[..sep + 3]);
-            rest = &rest[sep + 3..];
-            continue;
-        }
-        let end = rest[start..]
-            .find(|c: char| {
-                c.is_whitespace() || c.is_control() || matches!(c, '"' | '\'' | '`' | '<' | '>')
-            })
-            .map_or(rest.len(), |i| start + i);
+        // Back up over the scheme: a run of ASCII scheme characters, so every
+        // index here is a character boundary whatever precedes it.
+        let start = sep - rest[..sep].len() + rest[..sep].trim_end_matches(is_scheme_char).len();
+        let end = rest[sep..].find(is_end).map_or(rest.len(), |i| sep + i);
         let url = crate::tracing_init::trim_trailing_punctuation(&rest[start..end]);
         out.push_str(&rest[..start]);
+        // No scheme, or one that does not start with a letter: not a URL
+        // `display_announce_url` can read, and so shown only as its marker.
         out.push_str(&crate::tracing_init::display_announce_url(url).url);
         rest = &rest[start + url.len()..];
     }
     out.push_str(rest);
-    crate::tracing_init::redact_urls(&out).into_owned()
+    out
 }
 
 /// The trackers a magnet URI names, as libtorrent reads them.
@@ -1812,9 +1808,9 @@ pub struct Tracker {
     /// Where the tracker stands.
     pub status: TrackerStatus,
     /// The last announce's error when it failed, else the tracker's last
-    /// status message; `null` when there is neither. Every `scheme://` URL in
-    /// it is shown by the same rule as `url`, and the log's redaction applies
-    /// to the rest.
+    /// status message; `null` when there is neither. Every URL in it (any run
+    /// containing `://`) is shown by the same rule as `url`; the rest is the
+    /// tracker's own text, returned as it is.
     pub message: Option<String>,
     /// When the next announce is due; `null` when none is scheduled.
     pub next_announce_at: Option<jiff::Timestamp>,
@@ -2071,6 +2067,26 @@ mod tests {
             display_message(raw) == crate::tracing_init::display_announce_url(raw).url,
             "{}",
             display_message(raw)
+        );
+        // Non-ASCII right before a scheme, or as the scheme: no panic, and
+        // nothing leaks.
+        for text in [
+            "→https://t.example/announce?pk=S",
+            "é://x?pk=S",
+            "voir«https://u:p@t.example/announce?pk=S»",
+            "ü🙂https://t.example/announce?pk=S",
+        ] {
+            let shown = display_message(text);
+            assert!(!shown.contains("pk=S") && !shown.contains("u:p"), "{shown}");
+        }
+        assert!(display_message("→https://t.example/announce?pk=S")
+            .starts_with("→https://t.example/[redacted:"));
+        // A `://` with no scheme is hidden whole.
+        let shown = display_message("bad ://t.example/announce?passkey=SECRET end");
+        assert!(!shown.contains("SECRET"), "{shown}");
+        assert!(
+            shown.starts_with("bad [redacted:") && shown.ends_with(" end"),
+            "{shown}"
         );
         assert_eq!(
             display_message("torrent not registered"),
