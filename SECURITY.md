@@ -79,19 +79,19 @@ behaviour it only points at.
 
 - **The C++ FFI shim over libtorrent** — the suite that exercises it is named
   in [`README.md` § *Testing*](README.md#testing); the input path that reaches
-  it is [`README.md` § *HTTP API*](README.md#http-api). `POST /torrents`
+  it is [`README.md` § *HTTP API*](README.md#http-api). `POST /v1/torrents`
   accepts a `.torrent` body, so this is the memory-safety boundary:
   attacker-supplied bytes cross into C++ here. Anything that turns a crafted
   `.torrent`, alert or metadata payload into a crash, an out-of-bounds access,
   a use-after-free or a type confusion across that boundary is in scope.
 
-- **The web client** — described in
-  [`README.md` § *Web client*](README.md#web-client), and
-  [`README.md` § *Authentication*](README.md#authentication) is what makes it
-  safe to expose. Anything that lets a page or a request reach the API as a
-  session it should not have — session-cookie handling, request forgery,
-  injection of tracker- or torrent-supplied strings into the rendered view —
-  is in scope.
+- **The HTTP API's authentication** — described in
+  [`README.md` § *Authentication*](README.md#authentication) and
+  [`docs/api/README.md`](docs/api/README.md). Anything that lets a request
+  reach an operation without the scope it declares — token or session-token
+  handling, the password exchange and its throttle, a static token reaching
+  beyond its scopes, a tracker passkey leaking through a response — is in
+  scope.
 
 ## Out of scope
 

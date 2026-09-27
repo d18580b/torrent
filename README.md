@@ -2,8 +2,8 @@
 
 A headless, Linux-only **torrent seeding daemon** built on [libtorrent](https://github.com/arvidn/libtorrent), for
 serving a large library from a server you already own. It is controlled by a
-TOML file and an HTTP API, emits JSON logs and Prometheus metrics, and ships a
-web client embedded in the binary.
+TOML file and a versioned HTTP API described by an OpenAPI 3.2 document, and
+emits JSON logs and Prometheus metrics.
 
 Its distinguishing feature is that it understands the *pool*, not just the
 torrents: which bytes on disk a torrent protects, which nothing protects, and
@@ -29,12 +29,16 @@ which torrents point at data that moved or vanished.
       exercises a real tunnel with no torrents, no tracker and no session
 - [x] **Secure by default**: it will not start unauthenticated without being
       told to, and never at all on a routable address
-- [x] **Reverse-proxy native**: correct behind a cache, never terminates TLS
-- [x] HTTP API, JSON logs, Prometheus metrics, and an embedded web client
+- [x] **Reverse-proxy native**: never terminates TLS, reads forwarding headers
+      only from the proxies you name
+- [x] **A `/v1` HTTP API whose OpenAPI 3.2 document is derived from the code**
+      that serves it, so the two cannot drift; JSON logs; Prometheus metrics
 - [ ] **Downloading torrents.** Deliberately absent today; every piece of the
       machinery exists except the policy, and enabling it is a decision about
       what this daemon is, not a missing feature
-- [ ] **OpenAPI 3.1 description** of the HTTP API, replacing the table below
+- [ ] **An operator client.** A terminal UI on a generated client is in
+      progress ([#68](https://github.com/d18580b/torrent/issues/68)); a web
+      client is deferred ([#40](https://github.com/d18580b/torrent/issues/40))
 - [ ] **Grafana dashboard and alert rules** shipped in `deploy/`
 - [ ] **Sequential streaming, RSS, torrent creation, auto-discovery,
       multi-instance coordination.** Not planned. You tell it what to load.
@@ -52,10 +56,8 @@ cargo build --workspace --release
 `mise run native` fetches the vendored submodules and builds Boost and
 libtorrent into a content-addressed prefix outside `target/`, so you pay for
 it once per pinned version rather than once per build directory.
-[`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest of the developer setup. Node
-is a build dependency of the default feature set and the build panics without
-it; **§3 of [`docs/running.md`](docs/running.md#3-build) has how to build
-without it.**
+[`CONTRIBUTING.md`](CONTRIBUTING.md) has the rest of the developer setup, and
+§3 of [`docs/running.md`](docs/running.md#3-build) the build itself.
 
 **For a real deployment, follow [`docs/running.md`](docs/running.md).** It has
 the parts that are easy to get wrong: the service user, which directories must
@@ -109,7 +111,7 @@ starve what is already seeding.
 
 Requires `allow_mutations = true`. A mistake here destroys data, so:
 
-- **Plan, then apply.** `POST /api/pool/plans` computes the steps and touches
+- **Plan, then apply.** `POST /v1/pool/plans` computes the steps and touches
   nothing; you see the exact diff first.
 - **Journaled.** Each step is written before it is attempted, so a crash
   leaves a step whose outcome is unknown rather than a half-applied
@@ -130,49 +132,27 @@ Requires `allow_mutations = true`. A mistake here destroys data, so:
 
 ## HTTP API
 
-Everything is served under `/api/…`. `/healthz` and `/metrics` stay at the
+Everything is served under `/v1/…`; `/healthz` and `/metrics` stay at the
 root, where probes and scrapes conventionally look. Default bind
-`127.0.0.1:8080`. Safe methods need the `read` scope and everything else
-needs `write`, derived from the method rather than listed per route — so a
-route added under `/api` cannot be added without a gate. Three routes are
-mounted on the root router outside both middleware layers — `/healthz`,
-`/api/login` and `/api/logout`, the rows below carrying scope **none**. A
-route added at that level is ungated, and the method-derived scoping does not
-catch it. (`/metrics` also sits at the root, but under its own `metrics`-scope
-layer.)
+`127.0.0.1:8080`.
 
-| Method & path | Scope | Purpose |
-| --- | --- | --- |
-| `GET /healthz` | **none** | Liveness. 503 before a session is up, if the alert loop stops advancing, or if every profile is fenced. |
-| `GET /metrics` | `metrics` | Prometheus text format. |
-| `POST /api/login` \| `/api/logout` | **none** | Session cookie in, revocation out. 409 if the daemon runs unauthenticated. |
-| `GET /api/status` | read | Counts by phase, aggregate rates, peers. |
-| `GET /api/events` | read | SSE change stream — a bare tick; the client refetches. |
-| `POST /api/reload` | write | Re-read the config file, as SIGHUP does. 202 accepted (queued behind any reload already running), 429 if the eight-deep reload queue is full, 503 if the daemon is shutting down or was built without the reload channel. |
-| `GET /api/torrents` | read | `?after=<infohash>&limit=<n>` (default 100, max 1000) → `{"items":[…],"next_cursor":…}`. `?profile_id=<id>` lists one profile's torrents; 404 for an id no `[[profile]]` declares. |
-| `POST /api/torrents` | write | `{"profile_id":…}` plus `{"magnet":…}`, `{"torrent_path":…}`, or a multipart `.torrent` in a field named `torrent`. `save_path` is optional and defaults to `default_save_path`. 409 on a duplicate info-hash. |
-| `GET`/`DELETE` `/api/torrents/:infohash` | read/write | `?delete_files=true` requires `[pool] allow_mutations`. |
-| `POST /api/torrents/:infohash/pause` \| `/resume` | write | `resume` is 409 while the profile is fenced. |
-| `POST /api/torrents/:infohash/recheck` \| `/reannounce` | write | 202. `recheck` re-hashes the payload (no `[pool]` needed); `reannounce` announces to every tracker now. Both 409 while the profile is fenced. |
-| `POST /api/torrents/:infohash/upload-limit` | write | `{"bytes_per_sec":…}`, 0 = unlimited. |
-| `POST /api/torrents/:infohash/file-priority` | write | `{"file_idx":…,"priority":…}`, priority 0–7 (0 skip, 1 low, 4 normal, 7 high). |
-| `GET /api/profiles`, `/profiles/:id` | read | |
-| `GET /api/profiles/:id/torrents` | read | Paginated as `GET /api/torrents`: `?after=&limit=` → `{"items":[…],"next_cursor":…}`. |
-| `POST /api/profiles/:id/pause-all` \| `/resume-all` | write | `resume-all` is 409 while fenced. |
-| `POST /api/pause-all` \| `/api/resume-all` | write | Every live profile at once → `{"torrent_count":…,"failed_count":…,"skipped_profiles":[{"profile_id":…,"reason":…}]}`. `resume-all` skips and lists fenced profiles; both list profiles that never came up. |
+The contract is **[`docs/api/openapi.json`](docs/api/openapi.json)**, an
+OpenAPI 3.2 document the daemon derives from its own handlers and types
+([kynos](https://github.com/getkono/kynos)). It is served at
+`GET /v1/openapi.json`, and printed by `torrentd openapi` with no config
+needed. CI regenerates it and fails when the committed copy is stale, so it
+cannot drift from the code the way a hand-written table did.
+[`docs/api/README.md`](docs/api/README.md) sets out the conventions every
+operation follows: authentication and scopes, cursor pagination, RFC 9457
+errors, and what may change within `v1`. Every error `type` resolves to a
+heading in [`docs/api/problems.md`](docs/api/problems.md).
 
-With `[pool]` configured: `GET /api/pool`, `/pool/tree`, `/pool/torrents`,
-`/pool/orphans`, `/pool/drift`; `POST /api/pool/scan`, `/pool/adopt`,
-`/pool/verify`; and the plan surface `GET`/`POST /api/pool/plans`,
-`GET`/`DELETE /api/pool/plans/:id`, `POST /api/pool/plans/:id/apply`. Of
-these, only creating and applying a plan are gated on `allow_mutations`.
-
-**Input is confined, not just size-capped.** The 50 MiB body limit is the
-least of it: `torrent_path` reads from the daemon's own filesystem and is
-restricted to `torrent_dir`, the pool library and the managed roots, with a
-64 MiB cap and errors that do not disclose whether a path exists. `save_path`
-must be inside `default_save_path` or a managed root, so an add cannot drop
-payload into a managed tree where the matcher would read it as an orphan.
+**Input is confined, not just size-capped.** A `.torrent` named by
+`server_path` is read from the daemon's own filesystem, so it is restricted to
+`torrent_dir`, the pool library and the managed roots, with a 64 MiB cap and
+errors that do not disclose whether a path exists. `save_path` must be inside
+`default_save_path` or a managed root, so an add cannot drop payload into a
+managed tree where the matcher would read it as an orphan.
 
 **Configuration is not settable at runtime, deliberately.** Several keys are
 reloadable — `log_level`, `upload_rate_limit`, `connections_limit`,
@@ -181,17 +161,17 @@ belongs to the TOML file. A reloadable key is not always handed to every
 profile: `enable_lsd` is withheld from every `vpn` profile on reload, because
 such a profile has local discovery forced off with no key to turn it on, and a
 reload may not hand one back.
-`POST /api/reload` asks the daemon to re-read that file; nothing lets a client
+`POST /v1/config/reload` asks the daemon to re-read that file; nothing lets a client
 set a value, because then the file and the running daemon could disagree with
 nothing recording which had won.
 
-`GET /api/profiles` lists **live profiles in the order their `[[profile]]`
+`GET /v1/profiles` lists **live profiles in the order their `[[profile]]`
 tables appear in the config file, then the profiles that failed to come up**,
 in config order among themselves. That order is the contract; it is not a
 substitute for reading `status`, since the first entry is an `active` profile
 only when at least one came up. A client choosing a profile to act on filters
-on `status == "active"` — a failed profile has no session, and every route that
-needs one answers 409 naming the failure reason.
+on `status == "active"` — a failed profile has no session, and every operation
+that needs one answers `409 profile-unavailable` naming the failure reason.
 
 ## Profiles
 
@@ -207,7 +187,7 @@ and directories. At least one is required, and there is no default profile:
 every profile states how it reaches the network, because the alternative —
 the host's own interfaces with DHT enabled — is the least private posture the
 daemon has, and it should not be what you get by writing nothing. `POST
-/api/torrents` therefore always requires `profile_id`.
+/v1/torrents` therefore always requires `profile_id`.
 
 ```toml
 [[profile]]
@@ -325,60 +305,34 @@ are read once, at startup: changing any of the four takes a restart, not a
 `SIGHUP`. A `SIGHUP` that changes one says so — "requires daemon restart;
 ignored" — rather than reporting the config unchanged.
 
-Two credential kinds, hashed differently on purpose. The **operator password**
+Every credential is a **bearer token**, sent as `Authorization: Bearer …`, and
+there are two kinds, hashed differently on purpose. The **operator password**
 is human-chosen and therefore low-entropy, so it gets Argon2id at `m=19456,
 t=2, p=1` — pinned in `crates/torrentd/src/auth.rs` and held by a test, rather
 than inherited from the `argon2` crate's defaults so that a dependency bump
-cannot quietly move it — verified once at login and rate-limited. **API
-tokens** are 256 bits this daemon generated, so there is nothing to guess and
-SHA-256 is correct; Argon2 on every Prometheus scrape would burn ~50 ms of CPU
-per request by design.
+cannot quietly move it. It is verified once per `POST /v1/sessions`, which
+exchanges it for a **session token** (`tds_…`) and is rate-limited per client
+and daemon-wide. **Static tokens** (`tdp_…`) are 256 bits this daemon
+generated, so there is nothing to guess and SHA-256 is correct; Argon2 on
+every Prometheus scrape would burn ~50 ms of CPU per request by design.
 
 ```bash
 torrentd --config … hash-password
 torrentd --config … new-token --name prometheus --scopes metrics
 ```
 
-The token is printed once and never stored; only its hash goes in the config.
-`POST /api/login` returns an `HttpOnly; SameSite=Strict` cookie — `SameSite`
-is the CSRF defence for a cookie-authenticated mutating API. Sessions are
-opaque random ids looked up server-side, so there is nothing to forge and
-logout is a real revocation. They live in memory: a restart logs everyone out.
+A static token is printed once and never stored; only its hash goes in the
+config. Session tokens are looked up server-side by their hash, so there is
+nothing to forge, and `DELETE /v1/sessions/current` is a real revocation. They
+live in memory: a restart signs everyone out. With no cookies there is no
+cross-site request forgery to defend against.
 
-Scopes are coarse on purpose: `read` covers safe methods, `write` covers
-anything that changes state, and `metrics` covers `/metrics` **and nothing
-else**, so a scrape credential can never reach the control plane.
-
-## Web client
-
-Served at `/`, embedded in the binary, so a deployment stays one artifact. The
-pool browser above is the primary view; there is also a virtualised torrent
-list built for 100K rows and a profile view for VPN and port-forward health.
-
-It is a static bundle with no server-side rendering — the daemon serves files
-and JSON, and every route the client has is resolved in the browser. The
-origin behaves properly behind a cache: strong ETags and conditional requests,
-precompressed `.br`/`.gz` variants chosen on `Accept-Encoding` (226 KB of
-JavaScript becomes 62 KB), fingerprinted assets marked immutable, and
-`Vary: accept-encoding` so a shared cache keys on it.
-
-Updates arrive over SSE: the daemon emits a tick when something visible
-changes and the client refetches only the panels it has mounted. Polling every
-15s is the fallback when the stream drops.
-
-Routes use the fragment (`#/pool`). The compatibility aliases that once made
-`/pool` and `/torrents` real API paths are gone — every route is under `/api`
-now — so the reason is no longer a collision. It is that the client is served
-as a static bundle from the router's fallback: a bare `/pool` answers 200 with
-the SPA whatever the path is, which means a path-routed client would be
-indistinguishable from a typo, and a reload of a deep link would depend on the
-server knowing every client-side route. The fragment keeps that knowledge on
-the client.
-
-```bash
-cd web && npm run dev     # dev server, proxying the API to :8080
-mise run screenshot       # regenerate the image above from a fixture
-```
+Scopes are coarse on purpose. `read` covers every safe operation, and `write`
+covers everything that changes state and implies `read`. `metrics` covers
+`/metrics` **and nothing else**, so a scrape credential can never reach the
+control plane. A session token carries `read` and `write`, never `metrics`.
+Each operation declares the scope it needs in the document, and that same
+declaration is what the daemon checks.
 
 ## Reverse proxy
 
@@ -387,11 +341,10 @@ torrentd does not terminate TLS and will not; `deploy/Caddyfile` and
 `X-Forwarded-Proto` and RFC 7239 `Forwarded` — all three, which is what your
 proxy has to strip or overwrite — are read **only** from peers listed in
 `trusted_proxies`, empty by default, meaning no forwarding header is read at
-all and the socket's peer address is the client. They feed three things: a per-client
-login throttle instead of one shared bucket, `Secure` on the session cookie
-when the original request was over TLS, and the `client_ip` field on the login
-log lines — the record of who tried, which is the consumer this support exists
-to create.
+all and the socket's peer address is the client. They feed two things: a
+per-client throttle on `POST /v1/sessions` instead of one shared bucket, and
+the `client_ip` field on the login log lines — the record of who tried, which
+is the consumer this support exists to create.
 
 ## Metrics
 
@@ -471,6 +424,8 @@ mise run test            # unit + in-memory; no libtorrent, no network
 mise run test-shim       # Layer 2: the C ABI boundary
 mise run test-lifecycle  # Layer 3: real libtorrent against real disk
 mise run test-daemon     # Layer 3: spawns the binary, drives it over HTTP
+mise run openapi         # regenerate docs/api/openapi.json after an API change
+mise run openapi-check   # fail if the committed document is stale
 mise run test-all        # all of the above
 mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
 ```

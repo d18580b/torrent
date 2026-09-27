@@ -1,13 +1,10 @@
 # Reverse proxy for torrentd. TLS terminates here and nowhere else.
 #
 # torrentd deliberately does not speak TLS: it has no certificate handling, no
-# renewal, and no HTTP server configuration surface to get wrong. What it does
-# have is an origin that serves its assets correctly — ETags, conditional
-# requests, precompressed assets, and a `Vary` on Accept-Encoding. This proxy
-# terminates TLS, forwards, and passes conditional responses through, so a
-# browser that already holds an asset revalidates it and gets a 304. The stock
-# caddy:2-alpine image has no HTTP cache module, so every request still
-# reaches torrentd.
+# renewal, and no HTTP server configuration surface to get wrong. This proxy
+# terminates TLS and forwards. Every API response is `Cache-Control: no-store`
+# — it describes live daemon state behind a credential — so there is nothing
+# here to cache.
 #
 # Replace the site address with your own. `torrentd.example.com` gets an
 # automatic certificate; `:80` alone serves plain HTTP, which is fine on a
@@ -43,7 +40,7 @@ torrentd.example.com {
 		header_up -Forwarded
 	}
 
-	# Nothing here for /api/events, deliberately. The SSE stream must not be
+	# Nothing here for /v1/events, deliberately. The SSE stream must not be
 	# buffered or it arrives in one lump at timeout, and Caddy already
 	# disables buffering for a `text/event-stream` response, so the stream
 	# works by default rather than by configuration.
@@ -51,11 +48,11 @@ torrentd.example.com {
 	# A second `reverse_proxy @events` block would in any case be dead: Caddy
 	# preserves source order between two instances of one directive in a site
 	# block, and the block above carries no matcher, so it matches
-	# /api/events first and terminates the handler chain. Were it ever made
-	# reachable it would proxy /api/events *without* the `header_up` rules
+	# /v1/events first and terminates the handler chain. Were it ever made
+	# reachable it would proxy /v1/events *without* the `header_up` rules
 	# above, i.e. with client-supplied forwarding headers intact to a peer
 	# torrentd trusts.
 	#
 	# A hand-rolled nginx config is the common place this does go wrong:
-	# there it needs `proxy_buffering off` on /api/events.
+	# there it needs `proxy_buffering off` on /v1/events.
 }
