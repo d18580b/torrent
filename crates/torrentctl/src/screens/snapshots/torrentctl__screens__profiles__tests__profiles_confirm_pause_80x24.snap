@@ -1,0 +1,28 @@
+---
+source: crates/torrentctl/src/screens/profiles.rs
+expression: screen
+---
+╭ profiles (4) ────────────────────────────────────────────────────────────────╮
+│    profile          status     torrents tunnel          listen forward       │
+│▶   acct_a           ● active        900 10.2.0.2             — natpmp :51413 │
+│  ! acct_b           ✖ vpn_down      334 10.3.0.2         51414 static        │
+│    host             ● active          1 host              6881 static        │
+│  ! acct_c           ✖ failed         12 —                    — natpmp —      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+╭ acct_a ──────────────────────────────────────────────────────────────────────╮
+│● active — session up                                                         │
+│       ╭ Pause all — acct_a ──────────────────────────────────────────╮       │
+│       │Pause all 900 of its torrents in profile acct_a?              │       │
+│       │                                                              │       │
+│      t│y yes  n/Esc no                                               │       │
+│  vpn i│                                                              │       │
+│    lis╰──────────────────────────────────────────────────────────────╯       │
+│   port forward  natpmp :51413                                                │
+│ forward health  ● ok                                                         │
+│ paused for vpn  0                                                            │
+│     user agent  qBittorrent/4.6.2                                            │
+│       trackers  tracker.example.org, announce.example.net                    │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

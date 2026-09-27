@@ -1,0 +1,52 @@
+---
+source: crates/torrentctl/src/screens/torrents.rs
+expression: screen
+---
+╭ debian-13.1.0-amd64-netinst.iso · 01a1b2c3d4e5 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Overview │ Files │ Trackers │ Actions                                                                                                                        │
+│                                                                                                                                                              │
+│        infohash  01a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4               session                                                                              │
+│         profile  acct_a                                                    name  debian-13.1.0-amd64-netinst.iso                                             │
+│           phase  ● seeding                                                 size  756.0 MiB                                                                   │
+│        progress  100.0%                                               save path  /srv/seed/acct_a                                                            │
+│     upload rate  1.5 MiB/s                                         upload limit  2.0 MiB/s                                                                   │
+│   download rate  —                                                        added  2026-09-01 08:30 UTC (20d 5h ago)                                           │
+│        uploaded  5.0 GiB                                                                                                                                     │
+│payload uploaded  4.7 GiB                                                                                                                                     │
+│           peers  3                                                                                                                                           │
+│        finished  yes                                                                                                                                         │
+│         seeding  yes                                                                                                                                         │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+╰ ←/→ tab  Esc back  p/r pause/resume  l limit ────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

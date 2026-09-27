@@ -1,0 +1,52 @@
+---
+source: crates/torrentctl/src/screens/torrents.rs
+expression: screen
+---
+╭ debian-13.1.0-amd64-netinst.iso · 01a1b2c3d4e5 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Overview │ Files │ Trackers │ Actions                                                                                                                        │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│  tier host                         status          next          seeds  peers message                                                                        │
+│›    0 tracker.example.org:443      ● working       in 26m 40s    1,240     18                                                                                │
+│     1 backup.example.net           ✖ error         in 16m 40s        —      — unregistered torrent                                                           │
+│     2 udp.example.com:6969         ‖ not_contacted —                 —      —                                                                                │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+╰ ←/→ tab  Esc back  a reannounce  j/k move ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

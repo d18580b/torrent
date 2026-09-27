@@ -1,0 +1,52 @@
+---
+source: crates/torrentctl/src/screens/profiles.rs
+expression: screen
+---
+╭ profiles (4) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│    profile              status     torrents tunnel          listen forward        user agent                                                                 │
+│    acct_a               ● active        900 10.2.0.2             — natpmp :51413  qBittorrent/4.6.2                                                          │
+│▶ ! acct_b               ✖ vpn_down      334 10.3.0.2         51414 static         default                                                                    │
+│    host                 ● active          1 host              6881 static         default                                                                    │
+│  ! acct_c               ✖ failed         12 —                    — natpmp —       default                                                                    │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ acct_b ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│✖ FENCED — restart the daemon to resume                                                                                                                       │
+│Its tunnel failed after it came up, so the VPN monitor paused its torrents. It stays fenced until the daemon restarts; nothing lifts it before then.          │
+│                                                                                                                                                              │
+│         status  ✖ vpn_down                     allowed trackers                                                                                              │
+│       torrents  334                            · tracker.example.org                                                                                         │
+│      tunnel ip  10.3.0.2                                                                                                                                     │
+│  vpn interface  wg-b                           actions                                                                                                       │
+│    listen port  51414                          p     pause all 334 torrents                                                                                  │
+│   port forward  static                         r     ✖ resume all 334 torrents — refused: fenced until the daemon restarts                                   │
+│ forward health  ● ok                           Enter show its torrents                                                                                       │
+│ paused for vpn  334                                                                                                                                          │
+│     user agent  default                                                                                                                                      │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

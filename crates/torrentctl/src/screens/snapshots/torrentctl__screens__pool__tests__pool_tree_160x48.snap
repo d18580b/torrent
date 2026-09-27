@@ -1,0 +1,52 @@
+---
+source: crates/torrentctl/src/screens/pool/tests.rs
+expression: screen
+---
+ Overview  [Tree]  Library   Plans                                                                                                [ ] views  ● mutations allowed
+╭ #1 /srv/pool/a ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  name                                                                      total    adopted    matched     orphan    files  claimed by                       │
+│› ▸ movies/                                                             120.0 GiB   80.0 GiB   30.0 GiB   10.0 GiB      340  ● adopted ◐ matched              │
+│  ▸ series/                                                             120.0 GiB   80.0 GiB        0 B   10.0 GiB      340  ● adopted ◐ partial ✖ drifted    │
+│  ▸ stray/                                                              120.0 GiB        0 B        0 B  120.0 GiB      340                                   │
+│    readme.nfo                                                          120.0 GiB        0 B        0 B   10.0 GiB      340  ✖ overlap                        │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+╰ Enter open  h/⌫ up  o orphans  A adopt this directory ───────────────────────────────────────────────────────────────────────────────────────────────────────╯
