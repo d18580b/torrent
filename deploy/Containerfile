@@ -6,13 +6,9 @@
 
 FROM registry.fedoraproject.org/fedora:43 AS builder
 
-# nodejs/npm are build-time dependencies: the `web-ui` feature is on by
-# default and crates/torrentd/build.rs shells out to `npm` to build the
-# embedded client. Without them the build does not degrade — it panics.
 RUN dnf install -y \
         gcc-c++ make cmake ninja-build pkgconf-pkg-config \
         openssl-devel clang-devel \
-        nodejs npm \
         git curl ca-certificates \
     && dnf clean all
 

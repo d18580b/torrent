@@ -55,14 +55,6 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libssl-dev libclang-dev
 
-      # The default feature set embeds the web client, so the Rust build shells
-      # out to npm. The `daemon-only` job below proves that stays optional.
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-
       - uses: dtolnay/rust-toolchain@1.90
         with:
           components: clippy
@@ -203,49 +195,6 @@ jobs:
       - run: mise run test-lifecycle
       - run: mise run test-daemon
 
-  daemon-only:
-    name: daemon without the web UI
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-          fetch-depth: 1
-
-      - uses: ./.github/actions/native-cache
-        with:
-          path: ${{ env.LIBTORRENT_SYS_CACHE_DIR }}
-
-      - name: System deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
-            libssl-dev libclang-dev
-
-      - uses: dtolnay/rust-toolchain@1.90
-
-      - name: Cache cargo registry + target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-daemononly-${{ runner.os }}-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-daemononly-${{ runner.os }}-
-
-      # mise provides the build task; without it this job would be a second
-      # copy of the command mise.toml already owns.
-      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
-      - uses: cargo-bins/cargo-binstall@main
-      - uses: jdx/mise-action@v2
-
-      # No actions/setup-node here on purpose: this must build on a host with
-      # no Node whatsoever, which is what anyone running the headless daemon
-      # gets with `--no-default-features`.
-      - run: mise run daemon-only
-
   container:
     name: container image builds
     runs-on: ubuntu-24.04
@@ -254,9 +203,8 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 1
-      # Nothing built deploy/Containerfile, which is why it was able to sit
-      # broken: no Node in the builder stage while `web-ui` is a default
-      # feature, so crates/torrentd/build.rs panicked rather than degrading.
+      # Nothing built deploy/Containerfile once, which is how it sat broken
+      # for a while; building it here keeps the image's builder stage honest.
       - name: Build the image
         run: podman build -f deploy/Containerfile -t torrentd:ci .
 
@@ -273,29 +221,6 @@ jobs:
       - uses: cargo-bins/cargo-binstall@main
       - uses: jdx/mise-action@v2
       - run: mise run test-alerts
-
-  web:
-    name: web client
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: web/package-lock.json
-      # mise provides the task; without it this job would be a second copy of
-      # the two commands mise.toml already owns. Node still comes from
-      # setup-node above — mise.toml pins no node.
-      # cargo-binstall lets mise fetch a prebuilt convco (no compile / C build deps).
-      - uses: cargo-bins/cargo-binstall@main
-      - uses: jdx/mise-action@v2
-      # `[tasks.web]` runs `npm ci` then `npm run build` in `web/`, and stops
-      # at the first failure, so this is the type gate as well as the bundle
-      # build.
-      - run: mise run web
 
   commit-lint:
     name: conventional commits

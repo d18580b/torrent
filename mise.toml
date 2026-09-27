@@ -8,7 +8,6 @@
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|lint|test|check
 #   mise run test-shim|test-lifecycle|test-daemon|test-all|test-alerts
-#   mise run web|daemon-only
 #   mise run bench -- <subcommand>
 
 [tools]
@@ -101,33 +100,6 @@ run = [
 [tasks.bench]
 description = "Layer 4: memory and throughput at scale (manual; minutes, GBs of RAM). --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having."
 run = "cargo run --release -p torrentd-bench --"
-
-# `npm run build` is `tsc -b`, then the bundler, then the precompressor. `tsc
-# -b` runs in strict mode with noUnusedLocals/noUnusedParameters, so this task
-# is the web client's type gate as well as its build.
-[tasks.web]
-description = "Type-check and bundle the web client"
-dir = "web"
-run = ["npm ci", "npm run build"]
-
-# The headless build. No `--release`: this exists to prove the daemon still
-# compiles with `web-ui` off and no Node on the host, which a debug build
-# proves as well and in a fraction of the time. `docs/running.md` §3 is where
-# an operator is told to add `--release`.
-[tasks.daemon-only]
-description = "Build the daemon without the web client (no Node required)"
-run = "cargo build -p torrentd --no-default-features"
-
-[tasks.screenshot]
-description = "Screenshot the pool browser against a mocked API (docs/img/pool.png)"
-dir = "web"
-run = [
-  "npm ci",
-  "npm run build",
-  # Chromium only; the default `npx playwright install` pulls three browsers.
-  "npx --yes playwright install --with-deps chromium",
-  "npm run screenshot",
-]
 
 # Live verification against real VPN credentials. Deliberately separate from
 # every `test` task: it needs a real host with real tunnels, it is the one

@@ -9,8 +9,6 @@ Its distinguishing feature is that it understands the *pool*, not just the
 torrents: which bytes on disk a torrent protects, which nothing protects, and
 which torrents point at data that moved or vanished.
 
-![The pool browser: a filesystem tree annotated with what is protected](docs/img/pool.png)
-
 ## Features
 
 - [x] **Seeds torrents whose payload already exists on disk**, at library scale

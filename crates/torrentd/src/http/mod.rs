@@ -12,8 +12,6 @@ mod profiles;
 mod reload;
 mod status;
 pub(crate) mod torrents;
-#[cfg(feature = "web-ui")]
-mod ui;
 
 use axum::routing::get;
 use axum::routing::post;
@@ -128,12 +126,6 @@ pub fn router(state: AppState) -> Router {
         .layer(axum::extract::DefaultBodyLimit::max(
             torrents::MAX_BODY_BYTES,
         ));
-
-    // The UI goes last, as a fallback, so it can never shadow an API route.
-    // It is served unauthenticated on purpose: it is a static bundle with no
-    // data in it, and it has to load in order to present the login form.
-    #[cfg(feature = "web-ui")]
-    let router = router.fallback(ui::serve);
 
     router.with_state(state)
 }
