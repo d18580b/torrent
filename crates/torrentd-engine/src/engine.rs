@@ -16,7 +16,10 @@ pub use libtorrent_safe::MoveFlags;
 pub use libtorrent_safe::ResumeData;
 pub use libtorrent_safe::ResumeFlags;
 pub use libtorrent_safe::Settings;
+pub use libtorrent_safe::TorrentDetails;
+pub use libtorrent_safe::TorrentFile;
 pub use libtorrent_safe::TorrentHandle;
+pub use libtorrent_safe::TrackerEntry;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -86,6 +89,14 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     ) -> Result<(), EngineError>;
     fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError>;
     fn session_state(&self) -> Result<Vec<u8>, EngineError>;
+    /// Name, size, save path, upload limit and added time of one torrent.
+    /// Synchronous query; an unknown handle is `Safe(TorrentNotFound)`.
+    fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError>;
+    /// The torrent's files in index order, or `None` while its metadata has
+    /// not arrived yet.
+    fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError>;
+    /// The torrent's trackers, tier by tier, with their announce state.
+    fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError>;
 }
 
 // Convenience: any Arc<dyn TorrentEngine> is itself a TorrentEngine.
@@ -139,5 +150,14 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn session_state(&self) -> Result<Vec<u8>, EngineError> {
         (**self).session_state()
+    }
+    fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError> {
+        (**self).torrent_details(h)
+    }
+    fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
+        (**self).torrent_files(h)
+    }
+    fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
+        (**self).torrent_trackers(h)
     }
 }

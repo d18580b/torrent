@@ -61,7 +61,10 @@ use torrentd_engine::EngineError;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::MockEngine;
 use torrentd_engine::ProfileId;
+use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentEngine;
+use torrentd_engine::TorrentFile;
+use torrentd_engine::TrackerEntry;
 
 use crate::app_state::AppState;
 
@@ -174,6 +177,15 @@ impl TorrentEngine for FaultEngine {
     }
     fn session_state(&self) -> Result<Vec<u8>, EngineError> {
         self.inner.session_state()
+    }
+    fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError> {
+        self.inner.torrent_details(h)
+    }
+    fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
+        self.inner.torrent_files(h)
+    }
+    fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
+        self.inner.torrent_trackers(h)
     }
 }
 

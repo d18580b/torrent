@@ -23,6 +23,11 @@ use crate::settings::MoveFlags;
 use crate::settings::ResumeFlags;
 use crate::settings::Settings;
 use crate::settings::TorrentFlags;
+use crate::torrent_info::FileListGuard;
+use crate::torrent_info::TorrentDetails;
+use crate::torrent_info::TorrentFile;
+use crate::torrent_info::TrackerEntry;
+use crate::torrent_info::TrackerListGuard;
 
 /// Caller-friendly enum for `Session::add_torrent`.
 #[derive(Clone, Debug)]
@@ -392,6 +397,74 @@ impl Session {
         }
     }
 
+    /// Name, size, save path, upload limit and added time of one torrent.
+    /// Synchronous: libtorrent answers from its network thread.
+    pub fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails> {
+        // SAFETY: all-zero is a valid lt_torrent_details (plain data).
+        let mut raw: ffi::lt_torrent_details = unsafe { std::mem::zeroed() };
+        let mut err = ErrBuf::new();
+        let rc = unsafe {
+            ffi::lt_torrent_details(
+                self.ptr,
+                h.id as ffi::lt_handle,
+                &mut raw,
+                err.ptr(),
+                err.len() as i32,
+            )
+        };
+        if rc != ffi::LT_OK as i32 {
+            return Err(query_error(h, err));
+        }
+        Ok(TorrentDetails::from_raw(&raw))
+    }
+
+    /// The torrent's files in index order, or `None` while its metadata has
+    /// not arrived yet (a magnet still fetching it).
+    pub fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>> {
+        let mut list = FileListGuard::new();
+        let mut err = ErrBuf::new();
+        let rc = unsafe {
+            ffi::lt_torrent_files(
+                self.ptr,
+                h.id as ffi::lt_handle,
+                &mut list.0,
+                err.ptr(),
+                err.len() as i32,
+            )
+        };
+        if rc != ffi::LT_OK as i32 {
+            return Err(query_error(h, err));
+        }
+        if list.0.has_metadata == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            (0u32..)
+                .zip(list.entries())
+                .map(|(i, f)| TorrentFile::from_raw(i, f))
+                .collect(),
+        ))
+    }
+
+    /// The torrent's trackers, tier by tier, with their announce state.
+    pub fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>> {
+        let mut list = TrackerListGuard::new();
+        let mut err = ErrBuf::new();
+        let rc = unsafe {
+            ffi::lt_torrent_trackers(
+                self.ptr,
+                h.id as ffi::lt_handle,
+                &mut list.0,
+                err.ptr(),
+                err.len() as i32,
+            )
+        };
+        if rc != ffi::LT_OK as i32 {
+            return Err(query_error(h, err));
+        }
+        Ok(list.entries().iter().map(TrackerEntry::from_raw).collect())
+    }
+
     /// Triggers a `state_update_alert` covering all subscribed torrents.
     pub fn post_torrent_updates(&self) {
         unsafe { ffi::lt_post_torrent_updates(self.ptr) }
@@ -557,6 +630,21 @@ impl ErrBuf {
             unsafe { std::slice::from_raw_parts(self.buf.as_ptr() as *const u8, ERR_BUF_LEN) };
         let nul = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
         String::from_utf8_lossy(&bytes[..nul]).into_owned()
+    }
+}
+
+/// Map a failed per-torrent query to an error: the shim's unknown-handle
+/// marker (an id it never issued, or a torrent libtorrent already removed)
+/// becomes `TorrentNotFound`, anything else is a libtorrent failure.
+fn query_error(h: TorrentHandle, err: ErrBuf) -> Error {
+    let msg = err.into_string();
+    let marker = &ffi::LT_ERR_UNKNOWN_HANDLE_MSG[..ffi::LT_ERR_UNKNOWN_HANDLE_MSG.len() - 1];
+    if msg.as_bytes() == marker {
+        Error::TorrentNotFound(h.infohash)
+    } else if msg.is_empty() {
+        Error::Shim("unknown shim error".into())
+    } else {
+        Error::Shim(msg)
     }
 }
 

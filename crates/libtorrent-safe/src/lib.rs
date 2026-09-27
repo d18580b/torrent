@@ -15,6 +15,7 @@ pub mod metadata;
 pub mod resume;
 pub mod session;
 pub mod settings;
+pub mod torrent_info;
 
 pub use alert::Alert;
 pub use alert::AlertKind;
@@ -37,3 +38,6 @@ pub use settings::MoveFlags;
 pub use settings::ResumeFlags;
 pub use settings::Settings;
 pub use settings::TorrentFlags;
+pub use torrent_info::TorrentDetails;
+pub use torrent_info::TorrentFile;
+pub use torrent_info::TrackerEntry;

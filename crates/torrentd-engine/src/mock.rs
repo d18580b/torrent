@@ -9,6 +9,9 @@
 //!     EngineError::...)` makes the next call to that op fail.
 //!   - Synthetic handle issuance: `register_handle(infohash)` returns a
 //!     `TorrentHandle` the test can hold and pass back through the trait.
+//!   - Per-handle query data: `set_torrent_details` / `set_torrent_files` /
+//!     `set_torrent_trackers` preload what the matching query returns; an
+//!     unset handle gets a metadata-less default.
 //!   - Fault injection beyond errors: `inject_panic(op)` makes the next call
 //!     to that op panic, and `stall_next_pop(d)` makes the next `pop_alerts`
 //!     block for `d`, which wedges whatever loop is draining it.
@@ -35,7 +38,10 @@ use libtorrent_safe::MoveFlags;
 use libtorrent_safe::ResumeData;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::Settings;
+use libtorrent_safe::TorrentDetails;
+use libtorrent_safe::TorrentFile;
 use libtorrent_safe::TorrentHandle;
+use libtorrent_safe::TrackerEntry;
 use parking_lot::Mutex;
 
 use crate::engine::EngineError;
@@ -76,6 +82,9 @@ pub enum RecordedCall {
     },
     ApplySettings(Settings),
     SessionState,
+    TorrentDetails(TorrentHandle),
+    TorrentFiles(TorrentHandle),
+    TorrentTrackers(TorrentHandle),
 }
 
 /// Stripped-down view of `AddParams` so we can derive Clone/Debug
@@ -159,6 +168,12 @@ pub struct MockEngine {
     /// When set, `force_recheck` / `move_storage` synthesize their completion
     /// alert immediately, mirroring libtorrent's async behaviour.
     auto_check: AtomicBool,
+    /// infohash → what `torrent_details` returns. Unset: `default_details`.
+    details: DashMap<InfoHash, TorrentDetails>,
+    /// infohash → what `torrent_files` returns. Unset: `None` (no metadata).
+    files: DashMap<InfoHash, Option<Vec<TorrentFile>>>,
+    /// infohash → what `torrent_trackers` returns. Unset: empty.
+    trackers: DashMap<InfoHash, Vec<TrackerEntry>>,
 }
 
 impl Default for MockEngine {
@@ -180,6 +195,9 @@ impl MockEngine {
             handles: DashMap::new(),
             auto_save_resume: AtomicBool::new(false),
             auto_check: AtomicBool::new(false),
+            details: DashMap::new(),
+            files: DashMap::new(),
+            trackers: DashMap::new(),
         }
     }
 
@@ -226,7 +244,9 @@ impl MockEngine {
 
     /// Inject a one-shot error for a specific trait method (by name).
     /// Recognized op names: `add_torrent`, `remove_torrent`, `pause_torrent`,
-    /// `resume_torrent`, `save_resume_data`, `apply_settings`, `session_state`.
+    /// `resume_torrent`, `save_resume_data`, `apply_settings`, `session_state`,
+    /// `torrent_details`, `torrent_files`, `torrent_trackers` — in fact any
+    /// trait method's name except `pop_alerts` / `post_updates` / `post_stats`.
     pub fn inject_error(&self, op: &'static str, err: EngineError) {
         self.error_inject.insert(op, err);
     }
@@ -260,6 +280,35 @@ impl MockEngine {
 
     pub fn handle_count(&self) -> usize {
         self.handles.len()
+    }
+
+    /// What `torrent_details(h)` returns from now on.
+    pub fn set_torrent_details(&self, h: TorrentHandle, details: TorrentDetails) {
+        self.details.insert(h.infohash, details);
+    }
+
+    /// What `torrent_files(h)` returns from now on; `None` models a torrent
+    /// whose metadata has not arrived.
+    pub fn set_torrent_files(&self, h: TorrentHandle, files: Option<Vec<TorrentFile>>) {
+        self.files.insert(h.infohash, files);
+    }
+
+    /// What `torrent_trackers(h)` returns from now on.
+    pub fn set_torrent_trackers(&self, h: TorrentHandle, trackers: Vec<TrackerEntry>) {
+        self.trackers.insert(h.infohash, trackers);
+    }
+
+    /// What `torrent_details` returns for a handle nothing was preloaded for:
+    /// a torrent that has no metadata yet, saved at `/`.
+    pub fn default_details() -> TorrentDetails {
+        TorrentDetails {
+            name: None,
+            has_metadata: false,
+            total_size: None,
+            save_path: "/".to_string(),
+            upload_limit: None,
+            added_at: None,
+        }
     }
 
     // --- internal -----------------------------------------------------------
@@ -441,6 +490,32 @@ impl TorrentEngine for MockEngine {
         self.check_error("session_state")?;
         Ok(Vec::new())
     }
+
+    fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError> {
+        self.record(RecordedCall::TorrentDetails(h));
+        self.check_error("torrent_details")?;
+        Ok(self
+            .details
+            .get(&h.infohash)
+            .map(|d| d.clone())
+            .unwrap_or_else(Self::default_details))
+    }
+
+    fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
+        self.record(RecordedCall::TorrentFiles(h));
+        self.check_error("torrent_files")?;
+        Ok(self.files.get(&h.infohash).and_then(|f| f.clone()))
+    }
+
+    fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
+        self.record(RecordedCall::TorrentTrackers(h));
+        self.check_error("torrent_trackers")?;
+        Ok(self
+            .trackers
+            .get(&h.infohash)
+            .map(|t| t.clone())
+            .unwrap_or_default())
+    }
 }
 
 #[cfg(test)]
@@ -519,6 +594,95 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(m.pop_alerts().is_empty());
         assert!(started.elapsed() < Duration::from_millis(150));
+    }
+
+    #[test]
+    fn torrent_queries_default_to_a_metadata_less_torrent() {
+        let m = MockEngine::new();
+        let h = m.register_handle(InfoHash([4u8; 20]));
+        assert_eq!(m.torrent_details(h).unwrap(), MockEngine::default_details());
+        assert_eq!(m.torrent_details(h).unwrap().save_path, "/");
+        assert_eq!(m.torrent_files(h).unwrap(), None);
+        assert!(m.torrent_trackers(h).unwrap().is_empty());
+        let calls = m.calls();
+        assert!(matches!(calls[0], RecordedCall::TorrentDetails(c) if c == h));
+        assert!(matches!(calls[2], RecordedCall::TorrentFiles(c) if c == h));
+        assert!(matches!(calls[3], RecordedCall::TorrentTrackers(c) if c == h));
+    }
+
+    #[test]
+    fn torrent_queries_return_preloaded_data_per_handle() {
+        let m = MockEngine::new();
+        let a = m.register_handle(InfoHash([5u8; 20]));
+        let b = m.register_handle(InfoHash([6u8; 20]));
+        let details = TorrentDetails {
+            name: Some("a".into()),
+            has_metadata: true,
+            total_size: Some(10),
+            save_path: "/srv/a".into(),
+            upload_limit: Some(1000),
+            added_at: Some(1_700_000_000),
+        };
+        let files = vec![TorrentFile {
+            index: 0,
+            path: "a/x".into(),
+            size: 10,
+            downloaded: 10,
+            priority: 4,
+        }];
+        let trackers = vec![TrackerEntry {
+            url: "http://t/announce".into(),
+            tier: 0,
+            verified: true,
+            updating: false,
+            fails: 0,
+            message: None,
+            last_error: None,
+            next_announce: Some(1_700_000_900),
+            scrape_complete: Some(3),
+            scrape_incomplete: None,
+        }];
+        m.set_torrent_details(a, details.clone());
+        m.set_torrent_files(a, Some(files.clone()));
+        m.set_torrent_trackers(a, trackers.clone());
+
+        assert_eq!(m.torrent_details(a).unwrap(), details);
+        assert_eq!(m.torrent_files(a).unwrap(), Some(files));
+        assert_eq!(m.torrent_trackers(a).unwrap(), trackers);
+        // Another handle still gets the defaults.
+        assert_eq!(m.torrent_details(b).unwrap(), MockEngine::default_details());
+        assert_eq!(m.torrent_files(b).unwrap(), None);
+        assert!(m.torrent_trackers(b).unwrap().is_empty());
+
+        // Preloading `None` models metadata that has not arrived.
+        m.set_torrent_files(a, None);
+        assert_eq!(m.torrent_files(a).unwrap(), None);
+    }
+
+    #[test]
+    fn torrent_query_errors_inject_once_per_op() {
+        let m = MockEngine::new();
+        let h = m.register_handle(InfoHash([7u8; 20]));
+        m.inject_error("torrent_details", EngineError::Shutdown);
+        m.inject_error("torrent_files", EngineError::UnknownHandle(h.infohash));
+        m.inject_error(
+            "torrent_trackers",
+            EngineError::Safe(libtorrent_safe::Error::TorrentNotFound(h.infohash)),
+        );
+        assert!(matches!(m.torrent_details(h), Err(EngineError::Shutdown)));
+        assert!(matches!(
+            m.torrent_files(h),
+            Err(EngineError::UnknownHandle(_))
+        ));
+        assert!(matches!(
+            m.torrent_trackers(h),
+            Err(EngineError::Safe(libtorrent_safe::Error::TorrentNotFound(
+                _
+            )))
+        ));
+        assert!(m.torrent_details(h).is_ok());
+        assert!(m.torrent_files(h).is_ok());
+        assert!(m.torrent_trackers(h).is_ok());
     }
 
     #[test]
