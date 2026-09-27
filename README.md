@@ -1,6 +1,6 @@
 # torrentd
 
-A headless, Linux-only **torrent seeding daemon** built on libtorrent, for
+A headless, Linux-only **torrent seeding daemon** built on [libtorrent](https://github.com/arvidn/libtorrent), for
 serving a large library from a server you already own. It is controlled by a
 TOML file and an HTTP API, emits JSON logs and Prometheus metrics, and ships a
 web client embedded in the binary.
