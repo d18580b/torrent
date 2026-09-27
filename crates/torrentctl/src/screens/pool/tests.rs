@@ -872,6 +872,43 @@ fn a_refused_dry_run_returns_to_the_profile_and_says_why() {
 }
 
 #[test]
+fn an_adoption_lost_in_transit_is_not_offered_again() {
+    let mut state = with_library(1, None);
+    press(&mut state, KeyCode::Char('a'), true);
+    let serial = state.adopt.as_ref().unwrap().serial;
+    send(
+        &mut state,
+        Msg::Adopt(adopt::Msg::Profiles {
+            serial,
+            result: Ok(profiles()),
+        }),
+        true,
+    );
+    press(&mut state, KeyCode::Enter, true);
+    let preview = adopt::Msg::Answered {
+        serial,
+        dry_run: true,
+        result: Ok(adoption(true)),
+    };
+    send(&mut state, Msg::Adopt(preview), true);
+    press(&mut state, KeyCode::Enter, true);
+    assert!(matches!(
+        state.adopt.as_ref().unwrap().stage,
+        adopt::Stage::Applying(_)
+    ));
+
+    // No answer: the daemon may have adopted them all the same.
+    let failure = Failure::local("Cannot reach the daemon", None);
+    let answer = adopt::Msg::Answered {
+        serial,
+        dry_run: false,
+        result: Err(failure),
+    };
+    assert_eq!(send(&mut state, Msg::Adopt(answer), true), 1, "a toast");
+    assert!(state.adopt.is_none(), "nothing left to send again");
+}
+
+#[test]
 fn a_preview_with_nothing_to_adopt_cannot_be_applied() {
     let mut state = with_library(1, None);
     press(&mut state, KeyCode::Char('a'), true);

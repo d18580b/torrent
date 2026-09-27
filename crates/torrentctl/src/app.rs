@@ -169,6 +169,13 @@ pub struct Model {
     /// Whether the credential in use is a session token this client minted
     /// from the password, and so revokes on quit.
     pub minted: bool,
+    /// The user asked to quit and the client is finishing up first: revoking
+    /// a minted token, or waiting for an in-flight sign-in to answer so the
+    /// token it mints can be revoked too. A second quit leaves at once.
+    pub quitting: bool,
+    /// Why the credential is being re-checked after a 401, to show if the
+    /// re-check confirms it.
+    pub pending_sign_out: Option<Failure>,
     pub live: Live,
     pub toasts: VecDeque<(Toast, Instant)>,
     pub help: bool,
@@ -227,6 +234,8 @@ impl Model {
             tab: Tab::Dashboard,
             session: Session::Checking,
             minted: false,
+            quitting: false,
+            pending_sign_out: None,
             live: Live::Connecting,
             toasts: VecDeque::new(),
             help: false,
@@ -328,6 +337,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::SessionChecked(Ok((server, principal))) => {
+            model.pending_sign_out = None;
             model.session = Session::SignedIn {
                 server: Box::new(server),
                 principal: Box::new(principal),
@@ -338,7 +348,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             refresh_visible(model)
         }
         Msg::SessionChecked(Err(failure)) if failure.is_unauthenticated() => {
-            model.session = Session::SignedOut;
+            sign_out(model, &failure);
             Vec::new()
         }
         Msg::SessionChecked(Err(failure)) => {
@@ -365,20 +375,17 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             effects
         }
         Msg::SignedOut(failure) => {
-            model.session = Session::SignedOut;
-            model.minted = false;
-            // Whatever was open belongs to the credential that is gone.
-            model.dashboard = Default::default();
-            model.torrents = Default::default();
-            model.profiles = Default::default();
-            model.pool = Default::default();
-            model.palette = None;
-            model.help = false;
-            model.login.error = Some(match failure.detail {
-                Some(_) => failure.message(),
-                None => "signed out: the credential is no longer accepted".to_owned(),
-            });
-            Vec::new()
+            // A 401 may answer a request made with an earlier credential that
+            // a sign-in has since replaced. Ask again with the credential in
+            // use; only a 401 to that signs out (and only then is a minted
+            // token known to be gone).
+            if matches!(model.session, Session::SignedIn { .. }) {
+                model.pending_sign_out = Some(failure);
+                model.session = Session::Checking;
+                vec![check_session(&model.api)]
+            } else {
+                Vec::new()
+            }
         }
         Msg::ShowTorrentsOf(profile_id) => {
             model.tab = Tab::Torrents;
@@ -399,12 +406,24 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Quit => {
+            if model.quitting {
+                // Asked twice: leave now, whatever is outstanding.
+                model.quit = true;
+                return Vec::new();
+            }
+            model.quitting = true;
             // A session token this client minted is revoked on the way out,
-            // so it does not outlive the terminal it was typed into.
-            // Whatever the session looks like right now: a token minted a
-            // moment ago, still being described, is just as live.
+            // so it does not outlive the terminal it was typed into — in
+            // whatever state the session is, since a token minted a moment
+            // ago and still being described is just as live.
             if model.minted {
                 vec![revoke(&model.api, Some(Msg::Exit))]
+            } else if model.login.busy {
+                // A sign-in is in flight: its token is revoked when it lands
+                // (see `Msg::Login`), not left live on the daemon.
+                vec![Effect::toast(Toast::info(
+                    "finishing sign-in to revoke it; q again to quit now",
+                ))]
             } else {
                 model.quit = true;
                 Vec::new()
@@ -415,6 +434,20 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             Vec::new()
         }
         Msg::Key(key) => on_key(model, key),
+        Msg::Login(screens::login::Msg::Answered(result)) if model.quitting => {
+            // Quitting while this sign-in was in flight: revoke what it
+            // minted, then leave.
+            match result
+                .ok()
+                .and_then(|token| model.api.with_token(&token).ok())
+            {
+                Some(api) => vec![revoke(&api, Some(Msg::Exit))],
+                None => {
+                    model.quit = true;
+                    Vec::new()
+                }
+            }
+        }
         Msg::Login(msg) => {
             let (api, server, theme, tick) = model.ctx();
             let ctx = Ctx {
@@ -488,6 +521,12 @@ fn on_key(model: &mut Model, key: KeyEvent) -> Vec<Effect> {
                 model.session = Session::Checking;
                 vec![check_session(&model.api)]
             }
+            KeyCode::Esc | KeyCode::Char('q') => update(model, Msg::Quit),
+            _ => Vec::new(),
+        };
+    }
+    if let Session::Checking = model.session {
+        return match key.code {
             KeyCode::Esc | KeyCode::Char('q') => update(model, Msg::Quit),
             _ => Vec::new(),
         };
@@ -623,6 +662,26 @@ pub fn run_command(model: &mut Model, command: &str) -> Vec<Effect> {
     }
 }
 
+/// Sign out after the credential in use was refused: the session, the
+/// minted flag and every screen's state go with it.
+fn sign_out(model: &mut Model, failure: &Failure) {
+    model.session = Session::SignedOut;
+    model.minted = false;
+    // Whatever was open belongs to the credential that is gone.
+    model.dashboard = Default::default();
+    model.torrents = Default::default();
+    model.profiles = Default::default();
+    model.pool = Default::default();
+    model.palette = None;
+    model.help = false;
+    let reason = model.pending_sign_out.take();
+    let failure = reason.as_ref().unwrap_or(failure);
+    model.login.error = Some(match failure.detail {
+        Some(_) => failure.message(),
+        None => "signed out: the credential is no longer accepted".to_owned(),
+    });
+}
+
 /// Revoke the session token `api` holds, then deliver `then` (or a no-op
 /// tick).
 fn revoke(api: &Api, then: Option<Msg>) -> Effect {
@@ -670,6 +729,12 @@ mod tests {
         m
     }
 
+    /// A 401, confirmed by the re-check it triggers.
+    fn refused(m: &mut Model) {
+        update(m, Msg::SignedOut(unauthorized()));
+        update(m, Msg::SessionChecked(Err(unauthorized())));
+    }
+
     fn unauthorized() -> Failure {
         Failure {
             status: Some(401),
@@ -701,7 +766,10 @@ mod tests {
         assert!(matches!(m.session, Session::SignedOut));
 
         let mut m = signed_in(false);
-        update(&mut m, Msg::SignedOut(unauthorized()));
+        let effects = update(&mut m, Msg::SignedOut(unauthorized()));
+        assert_eq!(effects.len(), 1, "a 401 is re-checked first");
+        assert!(matches!(m.session, Session::Checking));
+        update(&mut m, Msg::SessionChecked(Err(unauthorized())));
         assert!(matches!(m.session, Session::SignedOut));
         assert!(m
             .login
@@ -882,11 +950,66 @@ mod tests {
             "the same confirm `R` opens"
         );
 
-        update(&mut m, Msg::SignedOut(unauthorized()));
+        refused(&mut m);
         assert!(
             m.dashboard.confirm_reload.is_none(),
             "stale dialogs are gone"
         );
+    }
+
+    #[test]
+    fn a_stale_401_does_not_sign_out_a_credential_that_still_works() {
+        let mut m = model();
+        update(&mut m, Msg::SignedIn(testing::api()));
+        update(
+            &mut m,
+            Msg::SessionChecked(Ok((testing::server(false, false), principal("session")))),
+        );
+        // A 401 answering a request made before this sign-in.
+        update(&mut m, Msg::SignedOut(unauthorized()));
+        update(
+            &mut m,
+            Msg::SessionChecked(Ok((testing::server(false, false), principal("session")))),
+        );
+        assert!(
+            matches!(m.session, Session::SignedIn { .. }),
+            "still signed in"
+        );
+        assert!(m.minted, "and the live token is still owed a revocation");
+    }
+
+    #[test]
+    fn quitting_during_a_sign_in_revokes_the_token_it_mints() {
+        let mut m = model();
+        update(&mut m, Msg::SessionChecked(Err(unauthorized())));
+        m.login.busy = true;
+        let effects = update(&mut m, Msg::Quit);
+        assert!(!m.quit, "waits for the sign-in");
+        assert_eq!(effects.len(), 1, "says so");
+        let effects = update(
+            &mut m,
+            Msg::Login(screens::login::Msg::Answered(Ok("tds_late".into()))),
+        );
+        assert_eq!(effects.len(), 1, "revokes what it minted");
+        assert!(!m.quit);
+
+        // A second quit leaves at once.
+        let mut m = model();
+        m.login.busy = true;
+        update(&mut m, Msg::Quit);
+        update(&mut m, Msg::Quit);
+        assert!(m.quit);
+    }
+
+    #[test]
+    fn keys_while_checking_do_not_type_into_a_hidden_password() {
+        let mut m = model();
+        assert!(matches!(m.session, Session::Checking));
+        update(&mut m, Msg::Key(testing::key(KeyCode::Char('r'))));
+        assert!(m.login.password.value().is_empty());
+        assert!(update(&mut m, Msg::Key(testing::key(KeyCode::Enter))).is_empty());
+        update(&mut m, Msg::Key(testing::key(KeyCode::Char('q'))));
+        assert!(m.quit);
     }
 
     impl Msg {

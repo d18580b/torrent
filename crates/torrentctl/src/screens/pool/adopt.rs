@@ -213,6 +213,16 @@ pub fn update(dialog: &mut Option<Dialog>, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effec
             result: Err(failure),
             ..
         } => {
+            // A real adoption that failed without an answer may still have
+            // reached the daemon; sending it again would refuse every
+            // torrent it already adopted. Close the dialog and say so.
+            if !dry_run && failure.status.is_none() {
+                *dialog = None;
+                return vec![Effect::toast(crate::app::Toast::failure(
+                    "adopting — it may still have gone through; refresh the library before retrying",
+                    &failure,
+                ))];
+            }
             d.error = Some(failure.message());
             d.stage = match std::mem::replace(&mut d.stage, Stage::Pick) {
                 Stage::Applying(preview) => Stage::Preview(preview),

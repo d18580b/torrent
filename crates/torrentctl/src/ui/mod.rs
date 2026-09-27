@@ -370,11 +370,11 @@ mod tests {
         let mut m = Model::new(testing::api(), testing::theme());
         app::update(
             &mut m,
-            Msg::SignedOut(crate::api::Failure {
+            Msg::SessionChecked(Err(crate::api::Failure {
                 status: Some(401),
                 title: "Unauthorized".into(),
                 ..Default::default()
-            }),
+            })),
         );
         let screen = draw(&m, 80, 24);
         assert!(screen.contains("password"), "{screen}");
