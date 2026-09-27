@@ -295,6 +295,27 @@ async fn reads(cov: &Arc<Coverage>) {
             ))
             .await;
         assert_problem(&resp, 400, "invalid-cursor");
+        // A cursor for this listing of another directory — including one
+        // whose path would make its name a prefix of this one's — or of
+        // another root, and a key no child of this directory could have.
+        let name = format!(
+            "pool-{}",
+            if listing == "tree" { "tree" } else { "orphans" }
+        );
+        for (listing_name, key) in [
+            (format!("{name}:{root_id}:5:a:dfo"), "da:dfo/x".to_owned()),
+            (format!("{name}:{}:0:", root_id + 1), "dx".to_owned()),
+            (format!("{name}:{root_id}:0:"), "zzz".to_owned()),
+            (format!("{name}:{root_id}:0:"), "fa/b".to_owned()),
+        ] {
+            let cursor = crate::http::page::encode(&listing_name, &key);
+            let resp = h
+                .read(&format!(
+                    "/v1/pool/roots/{root_id}/{listing}?cursor={cursor}"
+                ))
+                .await;
+            assert_problem(&resp, 400, "invalid-cursor");
+        }
         let resp = h
             .read(&format!("/v1/pool/roots/{root_id}/{listing}?limit=0"))
             .await;

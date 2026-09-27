@@ -527,6 +527,24 @@ page!(
 
 /// The cursor key of a listing entry, ascending in the order the store lists
 /// children: directories first, then files, each by path.
+/// Whether `key` could be a [`tree_key`] of an immediate child of `prefix`:
+/// `d` or `f`, then a path directly under the listed directory.
+///
+/// A key of that shape that names no entry is still a position — the next
+/// page starts after where it would sort — which is what a cursor is.
+fn is_child_key(key: &str, prefix: &str) -> bool {
+    let Some(path) = key.strip_prefix(['d', 'f']) else {
+        return false;
+    };
+    let name = if prefix.is_empty() {
+        Some(path)
+    } else {
+        path.strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('/'))
+    };
+    name.is_some_and(|n| !n.is_empty() && !n.contains('/'))
+}
+
 fn tree_key(path: &str, is_dir: bool) -> String {
     format!("{}{path}", if is_dir { 'd' } else { 'f' })
 }
@@ -549,14 +567,16 @@ fn list_children(
     let prefix = q.path.as_deref().unwrap_or("").trim_matches('/').to_owned();
     // Scoped to the directory listed, so a cursor from another root or path
     // is refused rather than read as "nothing follows".
-    let listing = format!("{listing}:{root_id}:{prefix}");
+    // The path's length goes in first, so no path — `:` and all — can make
+    // one directory's listing name a prefix of another's.
+    let listing = format!("{listing}:{root_id}:{}:{prefix}", prefix.len());
     let listing = listing.as_str();
     let mut invalid = Invalid::new();
     let page = PageRequest::parse(
         listing,
         q.cursor.as_deref(),
         q.limit,
-        |key| key.starts_with(['d', 'f']) && key.len() > 1,
+        |key| is_child_key(key, &prefix),
         &mut invalid,
     )?;
     invalid.finish()?;
@@ -1051,9 +1071,22 @@ pub async fn adopt_pool_torrents(
         let refuse = |resp: &mut AdoptionResult, reason: String| {
             resp.refused.push(RefusedTorrent { infohash, reason });
         };
-        let plan = pool
+        // Refused, not a 500: by now earlier targets may already be claimed
+        // and loaded, and a failure here must leave the response saying
+        // exactly which. The cause is logged; the reason says only that the
+        // index could not be read for this torrent.
+        let plan = match pool
             .with_store(|st| torrentd_pool::adopt::plan(st, &ih, |id| pool.root_path_of(id)))
-            .map_err(fail)?;
+        {
+            Ok(plan) => plan,
+            Err(e) => {
+                refuse(
+                    &mut resp,
+                    internal("reading the pool index for this torrent", e),
+                );
+                continue;
+            }
+        };
 
         // The two adoptable outcomes differ only in which bucket they land in
         // and whether their bytes are counted, so collapse them: everything
