@@ -59,9 +59,10 @@ macro_rules! daemon_router {
     () => {{
         let router = Router::<AppCtx>::new()
             .info(info())
-            // On the router rather than a group, so every response — the
-            // root routes and the fallbacks included — carries them, and one
-            // id source serves every request.
+            // On the router rather than a group, so every routed response —
+            // the root routes included — carries them, and one id source
+            // serves every request. kynos answers an unknown path or method
+            // before any interceptor runs, so those 404/405s carry neither.
             .intercept(
                 kynos::middleware::request_id::RequestId::new()
                     .source(crate::http::headers::RandomRequestId),

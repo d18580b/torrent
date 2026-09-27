@@ -27,8 +27,8 @@ operation can produce, so a generated client knows exactly which failures to
 expect from each call.
 
 Every problem a handler or the framework's validation returns also carries
-`X-Request-Id`. The daemon logs one line per request carrying it; quote it
-when reporting a failure.
+`X-Request-Id`. The daemon's trace line for the response carries it; quote
+it when reporting a failure.
 
 ## Failures the framework reports
 
@@ -249,7 +249,7 @@ run yet. The queued reload will read the same file.
 
 **500.** Something failed inside the daemon, most often the torrent engine or
 the pool index. `detail` says what was being attempted. The cause is logged at
-`ERROR`, just before the request's own log line, which carries its
+`ERROR`, just before the trace line for the response, which carries its
 `X-Request-Id`.
 
 [RFC 9457]: https://www.rfc-editor.org/rfc/rfc9457

@@ -123,9 +123,12 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
   every failure but the two below — carries these headers:
   - `Cache-Control: no-store`
   - `X-Content-Type-Options: nosniff`
-  - `X-Request-Id`: 32 random hex digits. The daemon logs one line per
-    request carrying it, with the operation, status and latency. Quote it
-    when reporting a failure.
+  - `X-Request-Id`: 32 random hex digits, chosen by the daemon; one a
+    client sends is not adopted. The daemon's trace line for the response
+    carries it with the operation, status and latency. Quote it when
+    reporting a failure. (The line logged when the request arrives is
+    written before the id is assigned, so it shows only whatever the client
+    sent.)
 
   The `404` for an unknown path and the `405` for a wrong method are answered
   by the framework before any of this runs, and carry none of them.
