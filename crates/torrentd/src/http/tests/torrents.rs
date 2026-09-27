@@ -597,15 +597,22 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
     assert_problem(&resp, 422, "tracker-not-allowed");
     // A magnet is held to it through its `tr=` trackers: a foreign one is
     // refused before anything is assigned.
-    let foreign = format!("{MAGNET}&tr=https%3A%2F%2Fother.example%2Fannounce");
-    let resp = h
-        .write_json(
-            "POST",
-            "/v1/torrents",
-            json!({"profile_id": "strict", "source": {"kind": "magnet", "uri": foreign}}),
-        )
-        .await;
-    assert_problem(&resp, 422, "tracker-not-allowed");
+    for tr in [
+        "tr=https%3A%2F%2Fother.example%2Fannounce",
+        "tr.1=https%3A%2F%2Fother.example%2Fannounce",
+        "TR=https%3A%2F%2Fother.example%2Fannounce",
+        "tr=not-a-url",
+    ] {
+        let foreign = format!("{MAGNET}&{tr}");
+        let resp = h
+            .write_json(
+                "POST",
+                "/v1/torrents",
+                json!({"profile_id": "strict", "source": {"kind": "magnet", "uri": foreign}}),
+            )
+            .await;
+        assert_problem(&resp, 422, "tracker-not-allowed");
+    }
     assert_ne!(
         h.state
             .registry
@@ -873,6 +880,15 @@ async fn files(h: &Harness, e: &Engines) {
     let torrents_cursor = crate::http::page::encode("torrents", &hex(LOADED));
     let resp = h.read(&format!("{list}?cursor={torrents_cursor}")).await;
     assert_problem(&resp, 400, "invalid-cursor");
+    // Another torrent's files cursor, and a key no file index could be.
+    for (listing, key) in [
+        (format!("files:{}", hex(ADDING)), "0000000001"),
+        (format!("files:{}", hex(LOADED)), "zzz"),
+    ] {
+        let cursor = crate::http::page::encode(&listing, key);
+        let resp = h.read(&format!("{list}?cursor={cursor}")).await;
+        assert_problem(&resp, 400, "invalid-cursor");
+    }
     let resp = h.read(&format!("{list}?limit=0")).await;
     assert_problem(&resp, 422, "validation-failed");
     assert_eq!(errors_at(&resp), ["#/query/limit"]);
@@ -934,6 +950,15 @@ async fn files(h: &Harness, e: &Engines) {
         .write_json("PUT", &priority(0), json!({"priority": 1}))
         .await;
     assert_problem(&resp, 500, "internal");
+    // Removed from its session between the count and the set.
+    e.p.inject_error(
+        "set_file_priority",
+        EngineError::Safe(libtorrent_safe::Error::TorrentNotFound(LOADED)),
+    );
+    let resp = h
+        .write_json("PUT", &priority(0), json!({"priority": 1}))
+        .await;
+    assert_problem(&resp, 404, "torrent-not-found");
     body_framework_rejections(h, "PUT", &priority(0)).await;
 }
 

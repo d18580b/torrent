@@ -690,17 +690,26 @@ pub async fn add_torrent(
     // session announces to until metadata arrives, so they are held to the
     // same rule. A magnet with no `tr=` names no tracker to check and is let
     // through: whatever trackers its metadata brings are the `.torrent`'s.
+    //
+    // One allowed tracker admits the magnet, as one does a `.torrent`: this
+    // guards against the wrong profile, and a torrent announcing to an
+    // allowed tracker belongs to it. A `tr` the daemon cannot read a host
+    // from is refused rather than skipped, since libtorrent may still
+    // announce to it.
     if let AddSource::Magnet(uri) = &source {
         let domains = &profile_cfg.allowed_tracker_domains;
-        let hosts = magnet_tracker_hosts(uri);
-        if !domains.is_empty()
-            && !hosts.is_empty()
-            && !hosts
-                .iter()
-                .any(|h| domains.iter().any(|d| host_matches_domain(h, d)))
-        {
-            registry_error();
-            return Err(AddTorrentError::TrackerNotAllowed);
+        if !domains.is_empty() {
+            let allowed = match magnet_tracker_hosts(uri) {
+                MagnetTrackers::None => true,
+                MagnetTrackers::Unreadable => false,
+                MagnetTrackers::Hosts(hosts) => hosts
+                    .iter()
+                    .any(|h| domains.iter().any(|d| host_matches_domain(h, d))),
+            };
+            if !allowed {
+                registry_error();
+                return Err(AddTorrentError::TrackerNotAllowed);
+            }
         }
     }
     if let AddSource::File(bytes) = &source {
@@ -1629,23 +1638,78 @@ impl FilesFailure {
     }
 }
 
-/// The hosts of a magnet URI's `tr=` trackers, lowercased, without ports.
-fn magnet_tracker_hosts(uri: &str) -> Vec<String> {
-    let query = uri.split_once('?').map_or("", |(_, q)| q);
-    query
-        .split('&')
-        .filter_map(|pair| pair.strip_prefix("tr="))
-        .filter_map(percent_decode)
-        .map(|url| crate::tracing_init::display_announce_url(&url).host)
-        .filter(|host| !host.is_empty())
-        .map(|host| {
-            let host = match host.strip_prefix('[') {
-                Some(v6) => v6.split(']').next().unwrap_or("").to_owned(),
-                None => host.split(':').next().unwrap_or("").to_owned(),
-            };
-            host.to_ascii_lowercase()
+/// A tracker's free-text message as the API shows it: every URL in it held to
+/// the rule `url` is, so a passkey a tracker echoes back is never returned.
+///
+/// A token is treated as a URL when it contains `://`; the log's redactor
+/// runs first, for credential shapes that are not URLs at all.
+fn display_message(message: &str) -> String {
+    let redacted = crate::tracing_init::redact_urls(message);
+    redacted
+        .split_inclusive(char::is_whitespace)
+        .map(|token| {
+            let word = token.trim_end_matches(char::is_whitespace);
+            if !word.contains("://") {
+                return token.to_owned();
+            }
+            let tail = &token[word.len()..];
+            let start = word.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(0);
+            let (lead, url) = word.split_at(start);
+            let url = url.trim_end_matches(|c: char| ",.;:)]}'\"".contains(c));
+            let trail = &word[start + url.len()..];
+            format!(
+                "{lead}{}{trail}{tail}",
+                crate::tracing_init::display_announce_url(url).url
+            )
         })
         .collect()
+}
+
+/// The trackers a magnet URI names, as libtorrent reads them.
+enum MagnetTrackers {
+    /// No `tr` parameter at all.
+    None,
+    /// The host of every tracker named, lowercased, without its port.
+    Hosts(Vec<String>),
+    /// A tracker the daemon cannot read a host from. libtorrent may still
+    /// announce to it, so it is never waved through as "no trackers".
+    Unreadable,
+}
+
+/// The trackers `uri` names in its `tr` parameters.
+///
+/// Read the way libtorrent reads them, so nothing it will announce to is
+/// missed here: the parameter name is matched case-insensitively and may carry
+/// a `.N` index (`tr.1=`), as `magnet_uri.cpp` accepts.
+fn magnet_tracker_hosts(uri: &str) -> MagnetTrackers {
+    let query = uri.split_once('?').map_or("", |(_, q)| q);
+    let mut hosts = Vec::new();
+    let mut any = false;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let base = name.split_once('.').map_or(name, |(base, _)| base);
+        if !base.eq_ignore_ascii_case("tr") {
+            continue;
+        }
+        any = true;
+        let Some(url) = percent_decode(value) else {
+            return MagnetTrackers::Unreadable;
+        };
+        let host = crate::tracing_init::display_announce_url(&url).host;
+        if host.is_empty() {
+            return MagnetTrackers::Unreadable;
+        }
+        let host = match host.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or("").to_owned(),
+            None => host.split(':').next().unwrap_or("").to_owned(),
+        };
+        hosts.push(host.to_ascii_lowercase());
+    }
+    if any {
+        MagnetTrackers::Hosts(hosts)
+    } else {
+        MagnetTrackers::None
+    }
 }
 
 /// `s` with `%XX` escapes (and `+` as a space) decoded; `None` when an escape
@@ -1740,8 +1804,8 @@ pub struct Tracker {
     /// Where the tracker stands.
     pub status: TrackerStatus,
     /// The last announce's error when it failed, else the tracker's last
-    /// status message; `null` when there is neither. URLs in it are redacted
-    /// as `url` is.
+    /// status message; `null` when there is neither. Every URL in it is shown
+    /// by the same rule as `url`.
     pub message: Option<String>,
     /// When the next announce is due; `null` when none is scheduled.
     pub next_announce_at: Option<jiff::Timestamp>,
@@ -1755,10 +1819,7 @@ pub struct Tracker {
 impl From<torrentd_engine::TrackerEntry> for Tracker {
     fn from(t: torrentd_engine::TrackerEntry) -> Self {
         let status = TrackerStatus::of(&t);
-        let message = t
-            .last_error
-            .or(t.message)
-            .map(|m| crate::tracing_init::redact_urls(&m).into_owned());
+        let message = t.last_error.or(t.message).map(|m| display_message(&m));
         let shown = crate::tracing_init::display_announce_url(&t.url);
         Self {
             tier: t.tier,
@@ -1925,19 +1986,67 @@ mod tests {
 
     #[test]
     fn a_magnets_trackers_are_read_from_tr_and_matched_by_domain() {
+        let hosts = |uri: &str| match magnet_tracker_hosts(uri) {
+            MagnetTrackers::Hosts(h) => Some(h),
+            MagnetTrackers::None => Some(Vec::new()),
+            MagnetTrackers::Unreadable => None,
+        };
         let uri = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101\
                    &tr=https%3A%2F%2FTracker.Example.org%3A443%2Fannounce%3Fpasskey%3Dx\
                    &dn=x&tr=udp%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%3A6969%2Fannounce";
+        assert_eq!(hosts(uri).unwrap(), ["tracker.example.org", "2001:db8::1"]);
+        // Every spelling libtorrent accepts is read.
+        for uri in [
+            "magnet:?xt=urn:btih:01&tr.1=https%3A%2F%2Ft.example%2Fannounce",
+            "magnet:?xt=urn:btih:01&TR=https%3A%2F%2Ft.example%2Fannounce",
+            "magnet:?xt=urn:btih:01&Tr.7=udp%3A%2F%2Ft.example%3A1%2Fannounce",
+        ] {
+            assert_eq!(hosts(uri).unwrap(), ["t.example"], "{uri}");
+        }
+        // No tracker named at all.
+        assert!(matches!(
+            magnet_tracker_hosts("magnet:?xt=urn:btih:01&dn=x"),
+            MagnetTrackers::None
+        ));
+        // A tracker whose host cannot be read is never skipped.
+        for uri in [
+            "magnet:?xt=urn:btih:01&tr=not-a-url",
+            "magnet:?xt=urn:btih:01&tr=http%3A%2F%2Fa%20b%2Fannounce",
+            "magnet:?xt=urn:btih:01&tr=%ZZ",
+        ] {
+            assert!(hosts(uri).is_none(), "{uri}");
+        }
+        // An underscore in a hostname is a host, as libtorrent reads it.
         assert_eq!(
-            magnet_tracker_hosts(uri),
-            ["tracker.example.org", "2001:db8::1"]
+            hosts(
+                "magnet:?xt=urn:btih:01&tr=udp%3A%2F%2Ftracker_x.foreign.example%3A6969%2Fannounce"
+            )
+            .unwrap(),
+            ["tracker_x.foreign.example"]
         );
-        assert!(magnet_tracker_hosts("magnet:?xt=urn:btih:01").is_empty());
         assert!(host_matches_domain("tracker.example.org", "example.org"));
         assert!(host_matches_domain("example.org", "Example.org."));
         assert!(!host_matches_domain("badexample.org", "example.org"));
         assert!(!host_matches_domain("example.org.evil", "example.org"));
         assert_eq!(percent_decode("a%2Fb+c"), Some("a/b c".to_owned()));
         assert_eq!(percent_decode("a%2"), None);
+    }
+
+    #[test]
+    fn a_tracker_message_never_carries_a_url_the_url_field_would_hide() {
+        let shown =
+            display_message("unregistered (see https://t.example/announce?pk=abc123), retry later");
+        assert!(!shown.contains("abc123"), "{shown}");
+        assert!(
+            shown.starts_with("unregistered (see https://t.example/[redacted:"),
+            "{shown}"
+        );
+        assert!(shown.ends_with("), retry later"), "{shown}");
+        assert_eq!(
+            display_message("torrent not registered"),
+            "torrent not registered"
+        );
+        let plain = display_message("moved to udp://t.example:6969/announce");
+        assert_eq!(plain, "moved to udp://t.example:6969/announce");
     }
 }

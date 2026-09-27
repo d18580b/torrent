@@ -208,10 +208,12 @@ fn is_plain_host(host: &str) -> bool {
                 Some((name, port)) => (name, Some(port)),
                 None => (host, None),
             };
+            // `_` is not a DNS hostname character, but trackers use it and
+            // libtorrent accepts it, so a host with one is a host.
             let name_ok = !name.is_empty()
                 && name
                     .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
             (name_ok, port)
         }
     };
