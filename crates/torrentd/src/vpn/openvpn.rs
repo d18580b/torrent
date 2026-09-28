@@ -573,8 +573,9 @@ mod tests {
     /// The package the operator-facing record names for `kill` is the package
     /// that actually provides the binary [`OpenvpnManager::signal`] spawns.
     ///
-    /// `signal` runs `Command::new("kill")`. `Command` spawns no shell, so the
-    /// shell builtin is unreachable and `/usr/bin/kill` has to be installed as
+    /// `signal` runs `kill` through `exec::run`, which spawns it with
+    /// `std::process::Command`. `Command` spawns no shell, so the shell
+    /// builtin is unreachable and `/usr/bin/kill` has to be installed as
     /// a file. On the image `deploy/Containerfile` itself pins —
     /// `registry.fedoraproject.org/fedora-minimal:43` — `rpm -qf /usr/bin/kill`
     /// prints `util-linux-core`; `procps-ng` ships `pgrep` and `pkill` and no
@@ -680,6 +681,10 @@ mod tests {
     /// `pgrep` call site and this fails, which is the signal that
     /// `docs/running.md` §1's prerequisite table needs a row for it — hosts
     /// that run the daemon outside this image get no install list at all.
+    ///
+    /// A call site is any string literal naming the tool, whitespace aside —
+    /// `exec::run`, `exec::run_ok`, `exec::available` and a bare `Command`
+    /// alike, however rustfmt wraps the call ([`names_tool`]).
     #[test]
     fn no_source_invokes_the_binaries_procps_ng_provides() {
         let mut offenders = Vec::new();
@@ -703,8 +708,8 @@ mod tests {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                for tool in ["pkill", "pgrep"] {
-                    if text.contains(&format!("Command::new(\"{tool}\")")) {
+                for tool in PROCPS_TOOLS {
+                    if names_tool(&text, tool) {
                         offenders.push(format!("{} invokes {tool}", path.display()));
                     }
                 }
@@ -715,6 +720,36 @@ mod tests {
             "the runtime image carries procps-ng for `wg-quick`'s `sysctl` and \
              not for this repository; these call its binaries, so the host \
              prerequisite table owes them a row: {offenders:?}",
+        );
+    }
+
+    /// The procps-ng binaries the guard above looks for. Split with
+    /// `concat!` so this file's own source never names them as a literal.
+    const PROCPS_TOOLS: [&str; 2] = [concat!("pk", "ill"), concat!("pg", "rep")];
+
+    /// Whether `source` names `tool` as a string literal — the program
+    /// argument of every way this repository spawns a binary.
+    fn names_tool(source: &str, tool: &str) -> bool {
+        source.contains(&format!("\"{tool}\""))
+    }
+
+    /// The guard can fail on the call shapes this repository actually uses.
+    /// At the head this replaces it matched a bare `Command::new` call
+    /// alone, and every tool now runs through `exec::run`.
+    #[test]
+    fn the_procps_guard_sees_every_way_a_tool_is_spawned() {
+        let tool = PROCPS_TOOLS[0];
+        for shape in [
+            format!("exec::run(\n        \"{tool}\",\n        &[\"-f\"],"),
+            format!("exec::run_ok(\"{tool}\", &[], None, exec::QUICK)"),
+            format!("exec::available(\"{tool}\", \"--version\")"),
+            format!("Command::new(\"{tool}\")"),
+        ] {
+            assert!(names_tool(&shape, tool), "missed: {shape}");
+        }
+        assert!(
+            !names_tool("`pkill` in a doc comment", tool),
+            "prose is not a call site",
         );
     }
 }

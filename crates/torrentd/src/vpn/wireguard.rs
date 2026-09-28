@@ -2083,14 +2083,17 @@ mod tests {
             .expect_err("the native parser refuses the hook");
         assert!(refused.contains("PostUp"), "got {refused}");
 
-        let source = include_str!("wireguard.rs");
-        let spawned = ["exec::run(\"wg-quick", "Command::new(\"wg-quick"];
-        for s in spawned {
-            assert!(
-                !source.contains(s),
-                "the daemon path must not spawn wg-quick"
-            );
-        }
+        // Whitespace removed, so a call rustfmt wrapped onto several lines is
+        // still seen: `exec::run(`, `exec::run_ok(`, `exec::available(` and
+        // `Command::new(` all take the program as their first argument.
+        let source: String = include_str!("wireguard.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        assert!(
+            !source.contains("(\"wg-quick\""),
+            "the daemon path must not spawn wg-quick"
+        );
     }
 
     const PROVIDER_CONF: &str = "\
