@@ -374,6 +374,12 @@ groups:
         # torrent can take a while to hash, which is why the window is an
         # hour and not minutes; nothing finishing at all for that long, with
         # work queued behind it, is a wedged queue or a stalled disk.
+        #
+        # `increase(...[1h]) == 0` alone is also true of a counter younger
+        # than an hour, so a large first adoption on a fresh deployment would
+        # page after `for:` rather than after an hour. The `offset 1h` term
+        # requires the counter to have existed an hour ago, whatever the
+        # scrape interval, so the window really spans an hour of history.
         expr: |
           torrentd_pool_verify_queue_depth > 0
             and on (instance, job)
@@ -382,6 +388,8 @@ groups:
               + on (instance, job)
             increase(torrentd_pool_verify_failed_total[1h])
           ) == 0
+            and on (instance, job)
+          torrentd_pool_verify_completed_total offset 1h
         for: 15m
         labels:
           severity: warning
