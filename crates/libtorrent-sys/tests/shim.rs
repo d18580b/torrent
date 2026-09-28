@@ -820,6 +820,101 @@ fn a_re_added_info_hash_gets_a_live_handle() {
     unsafe { lt_session_destroy(s) };
 }
 
+/// Remove a torrent and add the same info-hash again before a single alert is
+/// popped, then drain. The removed torrent's `add_torrent_alert` is translated
+/// while the re-added entry is stored (a non-add registration, which keeps the
+/// live entry), and its `torrent_removed_alert` names a torrent that is no
+/// longer the stored one (which leaves the entry alone). The new id must
+/// survive both.
+#[test]
+fn a_removal_drained_after_the_re_add_leaves_the_new_id_live() {
+    let s = make_session();
+    let bytes = multi_file_tracker_torrent();
+    let first = add_file(s, &bytes);
+    assert_eq!(unsafe { lt_remove_torrent(s, first, 0) }, LT_OK as i32);
+    let again = add_file(s, &bytes);
+    assert_ne!(again, first, "the re-add is registered under a fresh id");
+
+    // Drain until the removal's alert has been translated, then whatever
+    // follows it, so every alert either torrent posted has been through the
+    // registry before the new id is used.
+    let removed = wait_for(s, |u| {
+        (u.kind == lt_alert_kind_LT_ALERT_TORRENT_REMOVED).then_some(())
+    });
+    assert!(removed.is_some(), "no torrent_removed_alert");
+    let _ = wait_for(s, |_| None::<()>);
+
+    let mut d: lt_torrent_details = unsafe { std::mem::zeroed() };
+    let mut err = [0 as c_char; 512];
+    assert_eq!(
+        unsafe { lt_torrent_details(s, again, &mut d, err.as_mut_ptr(), 512) },
+        LT_OK as i32,
+        "the re-added id still resolves: {}",
+        c_buf(&err)
+    );
+    assert_eq!(
+        unsafe { lt_save_resume_data(s, again, 0) },
+        LT_OK as i32,
+        "the re-added id addresses a live torrent"
+    );
+    let saved = wait_for(s, |u| match u.kind {
+        k if k == lt_alert_kind_LT_ALERT_SAVE_RESUME_DATA => Some(true),
+        k if k == lt_alert_kind_LT_ALERT_SAVE_RESUME_DATA_FAILED => Some(false),
+        _ => None,
+    });
+    assert_eq!(saved, Some(true), "save_resume_data succeeds on the re-add");
+    unsafe { lt_session_destroy(s) };
+}
+
+/// `lt_add_torrent_resume` (no overrides) forces upload mode too: resume data
+/// that says `auto_managed`, `share_mode`, `super_seeding`,
+/// `sequential_download` and `stop_when_ready`, and not `upload_mode`, is
+/// added in upload mode with none of them.
+#[test]
+fn a_plain_resume_add_forces_upload_mode_over_the_resume_data() {
+    let s = make_session();
+    let ih = [0x0Au8; 20];
+    let mut resume = Vec::new();
+    resume.extend_from_slice(b"d12:auto_managedi1e");
+    resume.extend_from_slice(b"11:file-format22:libtorrent resume file");
+    resume.extend_from_slice(b"12:file-versioni1e");
+    resume.extend_from_slice(b"9:info-hash20:");
+    resume.extend_from_slice(&ih);
+    resume.extend_from_slice(b"6:pausedi1e");
+    resume.extend_from_slice(b"9:save_path4:/tmp");
+    resume.extend_from_slice(b"19:sequential_downloadi1e");
+    resume.extend_from_slice(b"10:share_modei1e");
+    resume.extend_from_slice(b"15:stop_when_readyi1e");
+    resume.extend_from_slice(b"13:super_seedingi1e");
+    resume.extend_from_slice(b"11:upload_modei0e");
+    resume.extend_from_slice(b"e");
+
+    let mut ih_out = [0u8; 20];
+    let mut err = [0 as c_char; 512];
+    let h = unsafe {
+        lt_add_torrent_resume(
+            s,
+            resume.as_ptr(),
+            resume.len(),
+            ih_out.as_mut_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_ne!(h, 0, "resume add failed: {}", c_buf(&err));
+    assert_eq!(ih_out, ih);
+
+    let forbidden = LT_TF_AUTO_MANAGED
+        | LT_TF_SHARE_MODE
+        | LT_TF_SUPER_SEEDING
+        | LT_TF_SEQUENTIAL_DOWNLOAD
+        | LT_TF_STOP_WHEN_READY;
+    let flags = status_flags(s, h);
+    assert_ne!(flags & LT_TF_UPLOAD_MODE, 0, "flags={flags:#x}");
+    assert_eq!(flags & forbidden, 0, "flags={flags:#x}");
+    unsafe { lt_session_destroy(s) };
+}
+
 /// An integer setting outside `int` is refused, not narrowed into some other
 /// value and applied.
 #[test]
