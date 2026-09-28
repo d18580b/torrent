@@ -235,9 +235,19 @@ pub async fn stream_events(
 
         loop {
             // The stream ends with the daemon, so a client that never
-            // disconnects cannot hold a graceful shutdown open. The first tick
-            // goes out at once, so a client has a fingerprint to compare
-            // against without waiting out a whole cadence.
+            // disconnects cannot hold a graceful shutdown open.
+            //
+            // The broadcast alone does not do that for a stream opened *after*
+            // the shutdown was sent — during the drain, on a kept-alive
+            // connection: `subscribe` starts at the channel's tail, so the
+            // send it missed never arrives, and the stream held the drain to
+            // its timeout. The latch is set once the shutdown is seen and
+            // stays set, so it is checked on every pass, the first included.
+            if s.work.is_cancelled() {
+                break;
+            }
+            // The first tick goes out at once, so a client has a fingerprint
+            // to compare against without waiting out a whole cadence.
             if !first {
                 tokio::select! {
                     _ = tokio::time::sleep(TICK) => {}

@@ -40,7 +40,13 @@ pub struct ApplyOutcome {
     pub status: String,
 }
 
-/// Apply every pending step of `plan_id`.
+/// Asked between steps: is the daemon shutting down? A plan stopped for it
+/// is left `applying` with its remaining steps `pending`, which is exactly
+/// what `resume_unfinished` re-drives on the next boot.
+pub type StopCheck<'a> = &'a (dyn Fn() -> bool + Send + Sync);
+
+/// Apply every pending step of `plan_id`, stopping between steps once `stop`
+/// says so.
 ///
 /// Already-`done` steps are skipped, which is what makes this safe to call
 /// again on a plan a crash interrupted.
@@ -49,8 +55,9 @@ pub fn apply(
     source: &Arc<dyn AlertSource>,
     state: &StateMap,
     plan_id: i64,
+    stop: StopCheck<'_>,
 ) -> Result<ApplyOutcome, String> {
-    apply_inner(pool, source, state, plan_id, false)
+    apply_inner(pool, source, state, plan_id, false, stop)
 }
 
 /// Whether the index accounts for everything the daemon currently serves.
@@ -81,6 +88,7 @@ fn apply_inner(
     state: &StateMap,
     plan_id: i64,
     resume: bool,
+    stop: StopCheck<'_>,
 ) -> Result<ApplyOutcome, String> {
     let Some(plan) = pool
         .with_store(|s| s.plan(plan_id))
@@ -133,6 +141,12 @@ fn apply_inner(
         check_index_accounts_for_live_state(pool, state)?;
     }
 
+    // Not claimed during a shutdown: the claim would hand the plan to the next
+    // boot to re-drive, which is not what a request made now asked for.
+    if stop() {
+        return Err("the daemon is shutting down; apply the plan again once it is back".into());
+    }
+
     // ---- claim -------------------------------------------------------------
     //
     // One conditional UPDATE. Reading the status and then setting it lets two
@@ -166,6 +180,22 @@ fn apply_inner(
         if step.status == step_status::DONE {
             out.skipped += 1;
             continue;
+        }
+        // Between steps, never inside one: a step is journalled
+        // `in_progress` before it runs, and a process killed inside it leaves
+        // a step whose outcome is unknown and a plan parked for a human. Stop
+        // here instead and the plan stays `applying` with this step still
+        // `pending`, which the next boot re-drives from exactly here.
+        if stop() {
+            warn!(
+                target: "torrentd::pool::apply",
+                plan_id,
+                next_step = step.seq,
+                done = out.done,
+                "stopping between steps for shutdown; the plan resumes at the next boot",
+            );
+            out.status = plan_status::APPLYING.to_string();
+            return Ok(out);
         }
         if deletes && step.op == ops::DELETE_FILE && state.len() != loaded_len {
             if let Err(e) = check_index_accounts_for_live_state(pool, state) {
@@ -633,7 +663,12 @@ fn libc_exdev() -> i32 {
 }
 
 /// Re-drive any plan a crash left mid-apply.
-pub fn resume_unfinished(pool: &PoolService, source: &Arc<dyn AlertSource>, state: &StateMap) {
+pub fn resume_unfinished(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    stop: StopCheck<'_>,
+) {
     if !pool.allow_mutations() {
         // Mutations were turned off between the interrupted apply and this
         // boot. Re-driving anyway would destroy data the operator has since
@@ -662,7 +697,10 @@ pub fn resume_unfinished(pool: &PoolService, source: &Arc<dyn AlertSource>, stat
         );
         // A plan that ran and stopped at a failed step has already counted
         // that; this counts the re-drive itself being refused or erroring.
-        if let Err(e) = apply_inner(pool, source, state, plan.id, true) {
+        if stop() {
+            return;
+        }
+        if let Err(e) = apply_inner(pool, source, state, plan.id, true, stop) {
             error!(target: "torrentd::pool::apply", plan_id = plan.id, error.cause = %e, "resume failed");
             pool.count("pool_plan_failures_total", &[("kind", "resume_failed")]);
         }
@@ -756,7 +794,7 @@ mod tests {
             ),
         );
 
-        let e = apply(&pool, &source, &state, plan_id).unwrap_err();
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
         assert!(e.contains("no claims in the index"), "got {e}");
         assert!(victim.exists(), "payload was deleted against a stale index");
 
@@ -800,7 +838,7 @@ mod tests {
         .unwrap();
 
         let (source, state) = engine_and_state();
-        let e = apply(&pool, &source, &state, plan_id).unwrap_err();
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
         assert!(
             e.contains("interrupted and its outcome is unknown"),
             "got {e}"
@@ -816,6 +854,73 @@ mod tests {
         assert_eq!(status, torrentd_pool::model::plan_status::FAILED);
         pool.with_store_mut(|st| st.delete_plan(plan_id)).unwrap();
         assert!(pool.with_store(|st| st.plan(plan_id)).unwrap().is_none());
+    }
+
+    /// Status and per-step statuses of `plan_id`.
+    fn plan_state(pool: &PoolService, plan_id: i64) -> (String, Vec<String>) {
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        (plan.status, steps.into_iter().map(|s| s.status).collect())
+    }
+
+    #[test]
+    fn a_shutdown_during_an_apply_stops_between_steps_and_the_next_boot_finishes_it() {
+        // SIGTERM mid-apply: the teardown used to run alongside the blocking
+        // apply until `process::exit` killed it — inside a step as often as
+        // not, which parks the plan `failed` for a human. Stopping between
+        // steps leaves it `applying`, the state the next boot re-drives.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = write(&root, "a/one.bin", 16);
+        let b = write(&root, "b/two.bin", 16);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (_, steps) = plan_state(&pool, plan_id);
+        assert_eq!(steps.len(), 2, "one delete per orphan");
+
+        // The shutdown lands once the first step is done: asked before the
+        // claim, before step 0, then before step 1.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2;
+        let (source, state) = engine_and_state();
+        let out = apply(&pool, &source, &state, plan_id, &stop).unwrap();
+        assert_eq!(out.done, 1);
+        assert_eq!(out.status, plan_status::APPLYING);
+
+        let (status, steps) = plan_state(&pool, plan_id);
+        assert_eq!(status, plan_status::APPLYING, "left for the next boot");
+        assert_eq!(steps, vec![step_status::DONE, step_status::PENDING]);
+        assert_eq!(
+            [a.exists(), b.exists()].iter().filter(|e| **e).count(),
+            1,
+            "exactly one step ran",
+        );
+
+        // Next boot.
+        resume_unfinished(&pool, &source, &state, &|| false);
+        let (status, steps) = plan_state(&pool, plan_id);
+        assert_eq!(status, plan_status::APPLIED);
+        assert_eq!(steps, vec![step_status::DONE, step_status::DONE]);
+        assert!(!a.exists() && !b.exists());
+    }
+
+    #[test]
+    fn an_apply_asked_for_during_a_shutdown_is_refused_unclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = write(&root, "a/one.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (source, state) = engine_and_state();
+        let e = apply(&pool, &source, &state, plan_id, &|| true).unwrap_err();
+        assert!(e.contains("shutting down"), "got {e}");
+        assert_eq!(plan_state(&pool, plan_id).0, plan_status::DRAFT);
+        assert!(a.exists());
     }
 
     #[test]

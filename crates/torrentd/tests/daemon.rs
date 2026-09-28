@@ -442,6 +442,69 @@ fn daemon_graceful_shutdown_under_load() {
     );
 }
 
+/// Clients that do not let go cannot turn a SIGTERM into a failure.
+///
+/// An events stream and a request whose body never finishes arriving are both
+/// open when the signal lands. The stream must end with the daemon; the stuck
+/// request holds the HTTP drain to its bound, and a drain that runs out is a
+/// warning, not exit 70 — which `Restart=on-failure` would have answered by
+/// starting the daemon it had just been asked to stop. Against kynos's
+/// default 25 s bound and the old exit code this fails on the status.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_sigterm_with_a_stream_and_a_stuck_request_open_exits_zero_within_the_bound() {
+    const HTTP: &str = "127.0.0.1:18094";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let mut child = spawn_daemon(p, 16894, HTTP);
+    wait_healthy(HTTP);
+
+    // The events stream, read until its first tick so it is established.
+    let mut events = TcpStream::connect(HTTP).expect("connect");
+    events
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    events
+        .write_all(
+            b"GET /v1/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n",
+        )
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !String::from_utf8_lossy(&seen).contains("event: tick") {
+        let n = events
+            .read(&mut buf)
+            .expect("the stream sends its first tick");
+        assert!(n > 0, "the stream closed before its first tick");
+        seen.extend_from_slice(&buf[..n]);
+    }
+
+    // A request whose declared body never arrives: in flight until the drain
+    // gives up on it.
+    let mut stuck = TcpStream::connect(HTTP).expect("connect");
+    stuck
+        .write_all(
+            b"POST /v1/torrents HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+              Content-Length: 4096\r\n\r\n{\"profile_id\":",
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let started = Instant::now();
+    sigterm(&child);
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(45)),
+        "daemon did not exit within 45s of SIGTERM with clients holding on"
+    );
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "a drain cut short by a client is not a failure: {status:?} after {:?}",
+        started.elapsed(),
+    );
+    drop((stuck, events));
+}
+
 /// The upgrade every pre-profiles deployment takes, and the one the published
 /// upgrade note does not cover.
 ///

@@ -61,6 +61,20 @@ use crate::vpn;
 /// healthy is the worst of both answers.
 const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long the HTTP server's graceful shutdown waits for open requests
+/// before cutting them off. A drain that runs out exits 0 with a warning
+/// (`http_exit_code`).
+///
+/// One stage of the stop budget `deploy/torrentd.service` sizes
+/// `TimeoutStopSec` to: this, then [`POOL_WORK_DRAIN`], then the resume
+/// drain (`shutdown_drain_secs`), then the network teardown.
+const HTTP_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the teardown waits for pool work — a scan, a drift check, an
+/// apply finishing its current step — before stopping the alert loop around
+/// it. See `WorkGate`.
+const POOL_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// An exclusive `flock` on [`Config::instance_lock_path`], held for the life
 /// of the daemon.
 ///
@@ -1697,14 +1711,22 @@ impl DaemonHandle {
             );
         }
 
+        // Long-running pool work and the shutdown latch it checks; the
+        // teardown below waits for it before stopping the alert loop.
+        let work: Arc<crate::app_state::WorkGate> = Arc::default();
+
         // Re-drive any plan a crash or a kill left mid-apply, before the API
         // can accept new ones. A half-applied reorganisation is exactly the
-        // state an operator cannot reason about.
+        // state an operator cannot reason about. Held in the work gate like an
+        // API apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
             let src = source.clone();
             let st = state.clone();
+            let work = Arc::clone(&work);
+            let guard = work.enter();
             tokio::task::spawn_blocking(move || {
-                crate::pool_apply::resume_unfinished(&pool, &src, &st)
+                let _guard = guard;
+                crate::pool_apply::resume_unfinished(&pool, &src, &st, &|| work.is_cancelled())
             });
         }
 
@@ -1745,6 +1767,7 @@ impl DaemonHandle {
             trusted_proxies: trusted_proxies.clone(),
             unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
             shutdown: shutdown_tx.clone(),
+            work: Arc::clone(&work),
         };
 
         // What the daemon decided to believe, in the journal, once. Anything
@@ -1828,15 +1851,39 @@ impl DaemonHandle {
                     &shutdown_tx,
                     shutdown_rx,
                     &alert_loop,
+                    &work,
                 )
                 .await
             }
             None => 70,
         };
+        // Already latched when the server saw the shutdown; this covers the
+        // bind failure, which never served.
+        work.cancel();
 
         // Tell systemd we're stopping before the resume drain, which may take
-        // the full 30s deadline — otherwise the watchdog can fire mid-drain.
+        // its whole deadline — otherwise the watchdog can fire mid-drain.
         sd_notify::stopping();
+
+        // Pool work a drained request left behind, or the boot-time re-drive:
+        // stopping the alert loop and closing the sessions under a plan that
+        // is moving storage through them is the mid-step kill the latch
+        // exists to prevent. Applies stop at their next step boundary; a scan
+        // or drift check runs to its end or to this bound.
+        if work.in_flight() > 0 {
+            sd_notify::status("waiting for pool work to stop");
+            info!(
+                in_flight = work.in_flight(),
+                bound_secs = POOL_WORK_DRAIN.as_secs(),
+                "waiting for pool work to stop",
+            );
+            if !work.wait_idle(POOL_WORK_DRAIN).await {
+                warn!(
+                    in_flight = work.in_flight(),
+                    "pool work still running at its bound; tearing down around it",
+                );
+            }
+        }
         sd_notify::status("draining resume data");
 
         // Trigger alert-loop shutdown and join (saves all resume data). If the
@@ -1937,6 +1984,7 @@ impl DaemonHandle {
 /// Split out of `run_until_signal` so that function has no early return
 /// between `boot`'s `disarm` and its teardown: a failure to bind skips this
 /// and nothing else.
+#[allow(clippy::too_many_arguments)]
 async fn serve_until_shutdown(
     listener: tokio::net::TcpListener,
     app: kynos::router::service::Service<http::ctx::AppCtx>,
@@ -1945,6 +1993,7 @@ async fn serve_until_shutdown(
     shutdown_tx: &broadcast::Sender<ShutdownReason>,
     mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
     alert_loop: &torrentd_engine::AlertLoopHandle,
+    work: &Arc<crate::app_state::WorkGate>,
 ) -> i32 {
     info!(addr = %http_listen, "HTTP server listening");
     if let Some(posture) = posture {
@@ -1993,15 +2042,45 @@ async fn serve_until_shutdown(
 
     // kynos records every connection's peer address, which is what lets the
     // session throttle and the auth failure log see who was calling.
+    let work = Arc::clone(work);
     let server = kynos::server::Server::new(app)
         .listener(listener)
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             let _ = shutdown_rx.recv().await;
+            // Latched first, so an apply still running stops at its next step
+            // and a `/v1/events` stream opened from here on ends at once.
+            work.cancel();
+            sd_notify::stopping();
+            sd_notify::status("draining HTTP requests");
         }))
+        // Explicit rather than kynos's 25 s default: the drain is one stage
+        // of a stop budget (`deploy/torrentd.service` `TimeoutStopSec`) that
+        // the pool-work wait, the resume drain and the teardown share.
+        .shutdown_timeout(HTTP_DRAIN_TIMEOUT)
         .serve();
 
-    match server.await {
+    http_exit_code(server.await)
+}
+
+/// The exit code the HTTP server's outcome implies.
+///
+/// A drain that ran out of time is not a failure of the daemon: a client
+/// holding a request open past the bound — a slow scan, a stream that did not
+/// notice the shutdown — is cut off, and everything after the drain still
+/// runs. Exiting 70 for it made `Restart=on-failure` restart a daemon that was
+/// asked to stop.
+fn http_exit_code(outcome: kynos::Result<()>) -> i32 {
+    match outcome {
         Ok(()) => 0,
+        Err(kynos::Error::Server(kynos::server::error::ServerError::ShutdownTimeout {
+            timeout,
+        })) => {
+            warn!(
+                timeout_secs = timeout.as_secs(),
+                "HTTP drain timed out; the requests still open were cut off",
+            );
+            0
+        }
         Err(e) => {
             error!(error.cause = %e, "HTTP server exited with error");
             70
@@ -2338,6 +2417,24 @@ mod shutdown_report_tests {
 
     fn failed() -> std::io::Result<()> {
         Err(std::io::Error::other("nft: permission denied"))
+    }
+
+    #[test]
+    fn an_http_drain_that_times_out_exits_zero() {
+        // A client holding a request past the drain bound is cut off; the
+        // daemon was still asked to stop, and 70 would have had
+        // `Restart=on-failure` start it again.
+        let timed_out = Err(kynos::Error::Server(
+            kynos::server::error::ServerError::ShutdownTimeout {
+                timeout: HTTP_DRAIN_TIMEOUT,
+            },
+        ));
+        assert_eq!(http_exit_code(timed_out), 0);
+        assert_eq!(http_exit_code(Ok(())), 0);
+        let broken = Err(kynos::Error::Server(
+            kynos::server::error::ServerError::NoListeners,
+        ));
+        assert_eq!(http_exit_code(broken), 70, "a real server failure stays 70");
     }
 
     #[test]
