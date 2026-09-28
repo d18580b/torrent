@@ -121,12 +121,12 @@ where
     ) -> fmt::Result {
         let mut line = String::new();
         self.0.format_event(ctx, Writer::new(&mut line), event)?;
-        let mode = if event.metadata().target() == LIBTORRENT_LOG_TARGET {
-            Mode::HostOnly
+        let redacted = if event.metadata().target() == LIBTORRENT_LOG_TARGET {
+            redact_urls_host_only(&line)
         } else {
-            Mode::Credentials
+            redact_urls(&line)
         };
-        writer.write_str(&redact_urls_at(&line, 0, mode))
+        writer.write_str(&redacted)
     }
 }
 
@@ -148,7 +148,6 @@ pub(crate) fn redact_urls(text: &str) -> Cow<'_, str> {
 
 /// Replace every URL in `text` that is not known to be safe with its scheme,
 /// host and a marker: what a line quoting tracker URLs may keep.
-#[cfg(test)]
 fn redact_urls_host_only(text: &str) -> Cow<'_, str> {
     redact_urls_at(text, 0, Mode::HostOnly)
 }
