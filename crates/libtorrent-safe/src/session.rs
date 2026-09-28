@@ -63,14 +63,21 @@ pub enum AddParams {
 }
 
 impl AddParams {
-    /// Re-add from resume data with no overrides — the common restart path.
+    /// Re-add from resume data with no relocation and no `.torrent` — the
+    /// plain restart path. Asserts `UPLOAD_MODE` and clears every flag that
+    /// could lift it, as the shim does on every add anyway: a constructor that
+    /// reads as "no overrides" must not be the one path that says otherwise.
     pub fn resume(bytes: Vec<u8>) -> Self {
         Self::Resume {
             bytes,
             torrent: None,
             save_path: None,
-            flags_set: TorrentFlags::empty(),
-            flags_clear: TorrentFlags::empty(),
+            flags_set: TorrentFlags::UPLOAD_MODE,
+            flags_clear: TorrentFlags::AUTO_MANAGED
+                | TorrentFlags::SHARE_MODE
+                | TorrentFlags::SUPER_SEEDING
+                | TorrentFlags::SEQUENTIAL_DOWNLOAD
+                | TorrentFlags::STOP_WHEN_READY,
         }
     }
 }

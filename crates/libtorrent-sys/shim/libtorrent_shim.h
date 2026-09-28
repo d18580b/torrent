@@ -64,6 +64,14 @@ typedef uintptr_t lt_handle;
 #define LT_TF_PAUSED          (1u << 5)
 #define LT_TF_UPLOAD_MODE     (1u << 6)
 #define LT_TF_APPLY_IP_FILTER (1u << 7)
+/* The flags below can each take a torrent out of upload mode, or make it
+ * request pieces once it is out. Every lt_add_torrent_* clears them and sets
+ * LT_TF_UPLOAD_MODE whatever the caller passes; they are named here so the
+ * caller can say the same thing, and so a status view can report them. */
+#define LT_TF_SHARE_MODE          (1u << 8)
+#define LT_TF_SUPER_SEEDING       (1u << 9)
+#define LT_TF_SEQUENTIAL_DOWNLOAD (1u << 10)
+#define LT_TF_STOP_WHEN_READY     (1u << 11)
 
 /* ------------------------------------------------------------------ */
 /* save_resume_data flags                                              */

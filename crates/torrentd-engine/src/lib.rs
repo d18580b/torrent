@@ -61,6 +61,8 @@ pub use metrics::RecordingSink;
 pub use mock::MockEngine;
 pub use mock::RecordedCall;
 pub use policy::discovery_guards;
+pub use policy::forbidden;
+pub use policy::resume_flags_clear;
 pub use policy::resume_flags_set;
 pub use policy::seed_flags;
 pub use policy::verify_flags;

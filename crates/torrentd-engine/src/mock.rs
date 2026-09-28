@@ -40,6 +40,7 @@ use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::Settings;
 use libtorrent_safe::TorrentDetails;
 use libtorrent_safe::TorrentFile;
+use libtorrent_safe::TorrentFlags;
 use libtorrent_safe::TorrentHandle;
 use libtorrent_safe::TrackerEntry;
 use parking_lot::Mutex;
@@ -106,7 +107,44 @@ pub enum AddParamsSummary {
         /// Whether `.torrent` bytes were supplied to repair missing metadata.
         has_torrent: bool,
         save_path: Option<String>,
+        /// Set on top of the resume data's own flags.
+        flags_set: u32,
+        /// Cleared from them, after `flags_set`.
+        flags_clear: u32,
     },
+}
+
+impl AddParamsSummary {
+    /// The flags the add asserts: `flags` for a `.torrent` or magnet add,
+    /// `flags_set` for a resume add.
+    pub fn flags_set(&self) -> TorrentFlags {
+        TorrentFlags::from_bits_retain(match self {
+            Self::File { flags_bits, .. } | Self::Magnet { flags_bits, .. } => *flags_bits,
+            Self::Resume { flags_set, .. } => *flags_set,
+        })
+    }
+
+    /// The flags the add clears from what it starts from: nothing for a
+    /// `.torrent` or magnet add, which starts from no flags at all.
+    pub fn flags_clear(&self) -> TorrentFlags {
+        match self {
+            Self::File { .. } | Self::Magnet { .. } => TorrentFlags::empty(),
+            Self::Resume { flags_clear, .. } => TorrentFlags::from_bits_retain(*flags_clear),
+        }
+    }
+
+    /// Whether the add, as the caller asked for it, leaves the torrent in
+    /// upload mode with no [`crate::policy::forbidden`] flag in force whatever
+    /// its resume data carried.
+    pub fn forbids_downloading(&self) -> bool {
+        let forbidden = crate::policy::forbidden();
+        self.flags_set().contains(TorrentFlags::UPLOAD_MODE)
+            && !self.flags_set().intersects(forbidden)
+            && match self {
+                Self::Resume { .. } => self.flags_clear().contains(forbidden),
+                Self::File { .. } | Self::Magnet { .. } => true,
+            }
+    }
 }
 
 impl From<&AddParams> for AddParamsSummary {
@@ -134,11 +172,14 @@ impl From<&AddParams> for AddParamsSummary {
                 bytes,
                 torrent,
                 save_path,
-                ..
+                flags_set,
+                flags_clear,
             } => AddParamsSummary::Resume {
                 byte_len: bytes.len(),
                 has_torrent: torrent.as_ref().is_some_and(|t| !t.is_empty()),
                 save_path: save_path.clone(),
+                flags_set: flags_set.bits(),
+                flags_clear: flags_clear.bits(),
             },
         }
     }

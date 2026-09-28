@@ -69,6 +69,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -197,9 +198,16 @@ class json_parser {
         bool neg = false;
         if (*p == '-') { neg = true; ++p; }
         if (p >= end || *p < '0' || *p > '9') throw std::runtime_error("expected number");
+        // Accumulated with an overflow check: a signed overflow here is
+        // undefined behaviour, not a wrapped value. Every libtorrent integer
+        // setting is an int, so anything this rejects the caller would have
+        // refused anyway.
         std::int64_t n = 0;
         while (p < end && *p >= '0' && *p <= '9') {
-            n = n * 10 + (*p - '0');
+            int const d = *p - '0';
+            if (n > (std::numeric_limits<std::int64_t>::max() - d) / 10)
+                throw std::runtime_error("integer out of range");
+            n = n * 10 + d;
             ++p;
         }
         if (p < end && (*p == '.' || *p == 'e' || *p == 'E'))
@@ -252,6 +260,12 @@ void apply_settings_from_json(lt::settings_pack& pack, const char* json) {
             case lt::settings_pack::int_type_base:
                 if (v.k != json_value::kind::Int)
                     throw std::runtime_error("expected integer for setting " + key);
+                // settings_pack stores an int. A narrowing cast would turn
+                // an out-of-range value into an unrelated one (2^32 + 1
+                // becomes 1) and apply it silently; refuse it instead.
+                if (v.i < std::numeric_limits<int>::min()
+                    || v.i > std::numeric_limits<int>::max())
+                    throw std::runtime_error("integer out of range for setting " + key);
                 pack.set_int(idx, static_cast<int>(v.i));
                 break;
             case lt::settings_pack::bool_type_base:
@@ -276,6 +290,10 @@ std::uint32_t map_torrent_flags(lt::torrent_flags_t f) {
     if (f & lt::torrent_flags::auto_managed) out |= LT_TF_AUTO_MANAGED;
     if (f & lt::torrent_flags::upload_mode)  out |= LT_TF_UPLOAD_MODE;
     if (f & lt::torrent_flags::apply_ip_filter) out |= LT_TF_APPLY_IP_FILTER;
+    if (f & lt::torrent_flags::share_mode)   out |= LT_TF_SHARE_MODE;
+    if (f & lt::torrent_flags::super_seeding) out |= LT_TF_SUPER_SEEDING;
+    if (f & lt::torrent_flags::sequential_download) out |= LT_TF_SEQUENTIAL_DOWNLOAD;
+    if (f & lt::torrent_flags::stop_when_ready) out |= LT_TF_STOP_WHEN_READY;
     return out;
 }
 
@@ -297,15 +315,48 @@ lt::torrent_flags_t translate_torrent_flags(std::uint32_t caller_flags) {
     if (caller_flags & LT_TF_DISABLE_DHT)       f |= lt::torrent_flags::disable_dht;
     if (caller_flags & LT_TF_DISABLE_LSD)       f |= lt::torrent_flags::disable_lsd;
     if (caller_flags & LT_TF_APPLY_IP_FILTER)   f |= lt::torrent_flags::apply_ip_filter;
+    if (caller_flags & LT_TF_SHARE_MODE)        f |= lt::torrent_flags::share_mode;
+    if (caller_flags & LT_TF_SUPER_SEEDING)     f |= lt::torrent_flags::super_seeding;
+    if (caller_flags & LT_TF_SEQUENTIAL_DOWNLOAD) f |= lt::torrent_flags::sequential_download;
+    if (caller_flags & LT_TF_STOP_WHEN_READY)   f |= lt::torrent_flags::stop_when_ready;
     return f;
+}
+
+// Flags that must never be in force on a torrent this daemon adds.
+//
+//   - auto_managed: libtorrent takes a torrent out of upload mode on its own
+//     only when it is auto-managed — torrent::second_tick lifts upload mode
+//     once `optimistic_disk_retry` has passed — and read_resume_data restores
+//     the bit from any .fastresume that carries it (qBittorrent and Deluge
+//     write auto_managed=1). The torrent then starts requesting pieces.
+//   - share_mode: a different download strategy altogether; it requests
+//     pieces to trade them on.
+//   - super_seeding, sequential_download, stop_when_ready: none is a download
+//     by itself, but each is a downloading client's knob, and none has a
+//     meaning for a torrent that must never leave upload mode.
+const lt::torrent_flags_t forbidden_torrent_flags =
+      lt::torrent_flags::auto_managed
+    | lt::torrent_flags::share_mode
+    | lt::torrent_flags::super_seeding
+    | lt::torrent_flags::sequential_download
+    | lt::torrent_flags::stop_when_ready;
+
+// The no-download invariant, applied last on every add path so neither the
+// caller nor resume data can undo it: upload_mode on, and every flag that can
+// take the torrent out of it, or make it request pieces, off.
+void enforce_no_download(lt::torrent_flags_t& f) {
+    f &= ~forbidden_torrent_flags;
+    f |= lt::torrent_flags::upload_mode;
 }
 
 lt::torrent_flags_t build_torrent_flags(std::uint32_t caller_flags) {
     // Start from a quiet default: not paused, not auto-managed, but with
     // update_subscribe so state_update_alert reaches us.
-    return lt::torrent_flags::update_subscribe
-         | lt::torrent_flags::duplicate_is_error
-         | translate_torrent_flags(caller_flags);
+    lt::torrent_flags_t f = lt::torrent_flags::update_subscribe
+                          | lt::torrent_flags::duplicate_is_error
+                          | translate_torrent_flags(caller_flags);
+    enforce_no_download(f);
+    return f;
 }
 
 lt::move_flags_t build_move_flags(std::uint32_t flags) {
@@ -348,14 +399,36 @@ struct lt_session {
 
     explicit lt_session(lt::session_params&& p) : ses(std::move(p)) {}
 
-    // Register a torrent_handle, returning a stable lt_handle id. Idempotent
-    // on repeat adds: the same infohash always maps to the same id.
-    std::uintptr_t register_handle(const lt::torrent_handle& h) {
+    // Register a torrent_handle, returning a stable lt_handle id. The same
+    // torrent always maps to the same id.
+    //
+    // An infohash can outlive the torrent it named. torrent_handle::is_valid()
+    // only asks whether the torrent object still exists, and a removed torrent
+    // lingers until its disk jobs finish, so an alert it posted before the
+    // removal can still register it after lt_remove_torrent unregistered it.
+    // A stored handle is therefore replaced, under a fresh id, when:
+    //
+    //   - `authoritative` is set: the handle is what session::add_torrent just
+    //     returned, so it is the torrent the session holds for this infohash
+    //     and whatever was stored is a removed one; or
+    //   - the stored handle's torrent no longer exists.
+    //
+    // Otherwise the stored id wins. A late alert from a removed torrent then
+    // resolves to the live torrent that replaced it, rather than displacing it.
+    std::uintptr_t register_handle(const lt::torrent_handle& h, bool authoritative = false) {
         if (!h.is_valid()) return 0;
         auto ih = h.info_hashes().get_best();
         std::lock_guard<std::mutex> lk(handle_mutex);
         auto it = ids_by_ih.find(ih);
-        if (it != ids_by_ih.end()) return it->second;
+        if (it != ids_by_ih.end()) {
+            auto const stored = handles_by_id.find(it->second);
+            bool const keep = stored != handles_by_id.end()
+                && (stored->second == h
+                    || (!authoritative && stored->second.is_valid()));
+            if (keep) return it->second;
+            if (stored != handles_by_id.end()) handles_by_id.erase(stored);
+            ids_by_ih.erase(it);
+        }
         std::uintptr_t id = next_handle_id.fetch_add(1, std::memory_order_relaxed);
         handles_by_id.emplace(id, h);
         ids_by_ih.emplace(ih, id);
@@ -378,6 +451,22 @@ struct lt_session {
         auto it = ids_by_ih.find(ih);
         if (it == ids_by_ih.end()) return;
         handles_by_id.erase(it->second);
+        ids_by_ih.erase(it);
+    }
+
+    // torrent_removed_alert: drop `ih`'s entry if it still names the removed
+    // torrent `h` (or a torrent that no longer exists). The infohash alone is
+    // not enough: the same infohash may already have been re-added by the
+    // time the alert is translated, and that entry is live. torrent_handle's
+    // operator== compares owners, so it holds for a torrent already destroyed.
+    void unregister_removed(const lt::sha1_hash& ih, const lt::torrent_handle& h) {
+        std::lock_guard<std::mutex> lk(handle_mutex);
+        auto it = ids_by_ih.find(ih);
+        if (it == ids_by_ih.end()) return;
+        auto const stored = handles_by_id.find(it->second);
+        if (stored != handles_by_id.end()
+            && !(stored->second == h) && stored->second.is_valid()) return;
+        if (stored != handles_by_id.end()) handles_by_id.erase(stored);
         ids_by_ih.erase(it);
     }
 };
@@ -443,9 +532,13 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
     }
     if (auto* x = lt::alert_cast<lt::torrent_removed_alert>(a)) {
         out.kind = LT_ALERT_TORRENT_REMOVED;
-        // x->info_hashes carries the infohash; the handle is already invalid here.
+        // x->info_hashes carries the infohash; the handle may already be
+        // invalid here. Forget the id: an alert the torrent posted before its
+        // removal may have registered it again after lt_remove_torrent
+        // unregistered it.
         auto ih = x->info_hashes.get_best();
         std::memcpy(out.infohash, ih.data(), 20);
+        s->unregister_removed(ih, x->handle);
         return true;
     }
     if (auto* x = lt::alert_cast<lt::state_update_alert>(a)) {
@@ -709,6 +802,39 @@ void drain_session_alerts(lt_session* s) {
 // Public API: session lifecycle
 // -------------------------------------------------------------------------
 
+// The value of a boolean shim pseudo-setting (an underscore-prefixed key,
+// not a libtorrent setting) in the settings JSON, or -1 when it is absent.
+static int pseudo_bool(const char* json, const char* name) {
+    if (!json || !*json) return -1;
+    int out = -1;
+    json_parser pp(json, std::strlen(json));
+    pp.parse_object([&out, name](const std::string& key, const json_value& v) {
+        if (key == name && v.k == json_value::kind::Bool) out = v.b ? 1 : 0;
+    });
+    return out;
+}
+
+// The alert categories the session posts.
+//
+// Only what the daemon translates: every alert libtorrent posts is allocated,
+// queued, popped and translated under the session lock, and the queue holds at
+// most alert_queue_size before libtorrent starts dropping — a dropped
+// save_resume_data_alert is resume data never written. `peer`, `dht`,
+// `ip_block` and `stats` fed nothing translate_alert surfaces, and the two
+// log categories are the bulk of all traffic, so they are posted only when
+// `_alert_logs` asks for them (the daemon does when its libtorrent log target
+// is at debug). session_stats_alert has no category and is always posted.
+static lt::alert_category_t alert_mask(bool logs) {
+    lt::alert_category_t mask = lt::alert_category::error
+                              | lt::alert_category::port_mapping
+                              | lt::alert_category::storage
+                              | lt::alert_category::tracker
+                              | lt::alert_category::status
+                              | lt::alert_category::performance_warning;
+    if (logs) mask |= lt::alert_category::session_log | lt::alert_category::torrent_log;
+    return mask;
+}
+
 static lt::settings_pack make_seed_settings(const char* settings_json) {
     lt::settings_pack pack = lt::high_performance_seed();
     apply_settings_from_json(pack, settings_json);
@@ -718,34 +844,16 @@ static lt::settings_pack make_seed_settings(const char* settings_json) {
         pack.set_int(lt::settings_pack::alert_queue_size, 10000);
     }
     pack.set_int(lt::settings_pack::alert_mask,
-                 lt::alert_category::error
-               | lt::alert_category::peer
-               | lt::alert_category::port_mapping
-               | lt::alert_category::storage
-               | lt::alert_category::tracker
-               | lt::alert_category::status
-               | lt::alert_category::ip_block
-               | lt::alert_category::performance_warning
-               | lt::alert_category::dht
-               | lt::alert_category::stats
-               | lt::alert_category::session_log
-               | lt::alert_category::torrent_log);
+                 alert_mask(pseudo_bool(settings_json, "_alert_logs") == 1));
     return pack;
 }
 
-// Scan the settings JSON for the `_disabled_disk_io` pseudo-setting (a shim
-// directive, not a libtorrent setting). When true the session is built with
+// The `_disabled_disk_io` pseudo-setting. When true the session is built with
 // libtorrent's no-op disk backend — used by the load harness to measure the
 // true per-torrent memory footprint of seeding torrents without provisioning
 // real payload on disk. Has no effect on normal daemon operation.
 static bool disabled_disk_io_requested(const char* json) {
-    if (!json || !*json) return false;
-    bool out = false;
-    json_parser pp(json, std::strlen(json));
-    pp.parse_object([&out](const std::string& key, const json_value& v) {
-        if (key == "_disabled_disk_io" && v.k == json_value::kind::Bool) out = v.b;
-    });
-    return out;
+    return pseudo_bool(json, "_disabled_disk_io") == 1;
 }
 
 extern "C" lt_session* lt_session_create_with_state(const char* settings_json,
@@ -796,6 +904,10 @@ extern "C" int lt_session_apply_settings(lt_session* s,
     LT_SHIM_TRY
     lt::settings_pack pack;
     apply_settings_from_json(pack, settings_json);
+    // A reload that says whether it wants libtorrent's logs re-derives the
+    // mask; one that does not leaves it as the session was built.
+    int const logs = pseudo_bool(settings_json, "_alert_logs");
+    if (logs >= 0) pack.set_int(lt::settings_pack::alert_mask, alert_mask(logs == 1));
     s->ses.apply_settings(std::move(pack));
     return LT_OK;
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)
@@ -870,7 +982,7 @@ extern "C" lt_handle lt_add_torrent_file(lt_session* s,
         auto ih = h.info_hashes().get_best();
         std::memcpy(infohash_out, ih.data(), 20);
     }
-    return s->register_handle(h);
+    return s->register_handle(h, /*authoritative=*/true);
     LT_SHIM_CATCH(err_out, err_len, 0)
 }
 
@@ -894,7 +1006,7 @@ extern "C" lt_handle lt_add_torrent_magnet(lt_session* s,
         auto ih = h.info_hashes().get_best();
         std::memcpy(infohash_out, ih.data(), 20);
     }
-    return s->register_handle(h);
+    return s->register_handle(h, /*authoritative=*/true);
     LT_SHIM_CATCH(err_out, err_len, 0)
 }
 
@@ -909,7 +1021,11 @@ extern "C" lt_handle lt_add_torrent_resume(lt_session* s,
     lt::add_torrent_params atp = lt::read_resume_data(
         lt::span<char const>(reinterpret_cast<const char*>(resume_buf), resume_len), ec);
     if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
-    // Resume data already carries flags + save_path + ti; we layer no overrides.
+    // Resume data already carries flags + save_path + ti; the only override is
+    // the no-download invariant and the status subscription, for the reasons
+    // lt_add_torrent_resume_ex gives.
+    atp.flags |= lt::torrent_flags::update_subscribe;
+    enforce_no_download(atp.flags);
     lt::torrent_handle h = s->ses.add_torrent(std::move(atp), ec);
     if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
     if (!h.is_valid()) { set_err(err_out, err_len, "invalid handle"); return 0; }
@@ -917,7 +1033,7 @@ extern "C" lt_handle lt_add_torrent_resume(lt_session* s,
         auto ih = h.info_hashes().get_best();
         std::memcpy(infohash_out, ih.data(), 20);
     }
-    return s->register_handle(h);
+    return s->register_handle(h, /*authoritative=*/true);
     LT_SHIM_CATCH(err_out, err_len, 0)
 }
 
@@ -960,6 +1076,12 @@ extern "C" lt_handle lt_add_torrent_resume_ex(lt_session* s,
     // reporting zero progress and never advancing out of its initial state.
     atp.flags |= lt::torrent_flags::update_subscribe;
 
+    // Last, so neither the resume data nor flags_set can undo it. A foreign
+    // .fastresume carrying auto_managed=1 would otherwise have libtorrent lift
+    // upload mode after optimistic_disk_retry, and our own resume saves would
+    // then persist the bit for every later restart.
+    enforce_no_download(atp.flags);
+
     lt::torrent_handle h = s->ses.add_torrent(std::move(atp), ec);
     if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
     if (!h.is_valid()) { set_err(err_out, err_len, "invalid handle"); return 0; }
@@ -967,7 +1089,7 @@ extern "C" lt_handle lt_add_torrent_resume_ex(lt_session* s,
         auto ih = h.info_hashes().get_best();
         std::memcpy(infohash_out, ih.data(), 20);
     }
-    return s->register_handle(h);
+    return s->register_handle(h, /*authoritative=*/true);
     LT_SHIM_CATCH(err_out, err_len, 0)
 }
 

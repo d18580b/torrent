@@ -646,6 +646,21 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
     let resp = h.write_json("POST", "/v1/torrents", body).await;
     resp.assert_status(StatusCode::CREATED);
 
+    // Every add the API made — the magnet, the metainfo and the server path —
+    // kept its torrent in upload mode with no flag that could lift it.
+    let adds: Vec<_> =
+        e.p.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::AddTorrent(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(adds.len(), 3, "{adds:?}");
+    for a in &adds {
+        assert!(a.forbids_downloading(), "{a:?}");
+    }
+
     // A session that refuses the torrent releases the claim for a retry.
     e.p.inject_error("add_torrent", injected("add_torrent"));
     let resp = h

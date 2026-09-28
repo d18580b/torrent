@@ -418,12 +418,11 @@ pub async fn run_verify_queue(
                 release_dropped_claim(&registry, &item);
                 continue;
             };
-            let flags = torrentd_engine::verify_flags(profile_cfg);
-            match engine.add_torrent(AddParams::File {
+            match engine.add_torrent(verify_add_params(
+                profile_cfg,
                 bytes,
-                save_path: item.save_path.to_string_lossy().into_owned(),
-                flags,
-            }) {
+                item.save_path.to_string_lossy().into_owned(),
+            )) {
                 Ok(_) => {
                     q.in_flight.lock().push(item.infohash.clone());
                     info!(
@@ -490,6 +489,41 @@ enum VerifyOutcome {
     Waiting,
     Verified,
     Failed(&'static str),
+}
+
+/// What pool adoption hands a session to verify a payload before seeding it.
+fn verify_add_params(
+    profile: &torrentd_engine::ProfileConfig,
+    bytes: Vec<u8>,
+    save_path: String,
+) -> AddParams {
+    AddParams::File {
+        bytes,
+        save_path,
+        flags: torrentd_engine::verify_flags(profile),
+    }
+}
+
+/// What pool adoption hands a session to seed a payload straight from resume
+/// data another client wrote.
+///
+/// `PAUSED` is cleared because adoption is the operator asking for the torrent
+/// to seed. Everything that could lift upload mode is cleared too: resume data
+/// from qBittorrent or Deluge carries `auto_managed=1`, which is exactly what
+/// lets libtorrent take a torrent out of upload mode on its own.
+fn adoption_resume_params(
+    profile: &torrentd_engine::ProfileConfig,
+    resume: Vec<u8>,
+    torrent: Option<Vec<u8>>,
+    save_path: String,
+) -> AddParams {
+    AddParams::Resume {
+        bytes: resume,
+        torrent,
+        save_path: Some(save_path),
+        flags_set: torrentd_engine::seed_flags(profile),
+        flags_clear: TorrentFlags::PAUSED | torrentd_engine::resume_flags_clear(),
+    }
 }
 
 /// Decide an in-flight torrent's fate from its state-map entry alone.
@@ -593,14 +627,12 @@ pub fn execute_adopt(
             let Some(profile_cfg) = profiles.config(&profile) else {
                 return Err(format!("profile {profile} is not live"));
             };
-            let flags = torrentd_engine::seed_flags(profile_cfg);
-            if let Err(e) = engine.add_torrent(AddParams::Resume {
-                bytes: resume,
-                torrent: torrent.clone(),
-                save_path: Some(save_path.to_string_lossy().into_owned()),
-                flags_set: flags,
-                flags_clear: TorrentFlags::PAUSED,
-            }) {
+            if let Err(e) = engine.add_torrent(adoption_resume_params(
+                profile_cfg,
+                resume,
+                torrent.clone(),
+                save_path.to_string_lossy().into_owned(),
+            )) {
                 // Resume data another client wrote can be truncated, from an
                 // incompatible version, or simply not libtorrent's format at
                 // all. None of that is a reason to leave the payload
@@ -685,6 +717,58 @@ mod tests {
     use super::VerifyOutcome;
 
     const SETTLE: Duration = Duration::from_secs(5);
+
+    /// Both adoption adds keep the torrent in upload mode, and the resume one
+    /// clears every flag another client's resume data could carry to lift it.
+    #[test]
+    fn both_adoption_adds_forbid_downloading() {
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::ProfileConfig;
+        use torrentd_engine::ProfileNetwork;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::TorrentEngine;
+
+        let profile = ProfileConfig {
+            id: ProfileId::new("public"),
+            network: ProfileNetwork::Host {
+                listen_interfaces: "0.0.0.0:6881".into(),
+                dht: true,
+            },
+            peer_fingerprint: None,
+            user_agent: None,
+            resume_dir: None,
+            torrent_dir: None,
+            allowed_tracker_domains: vec![],
+            upload_rate_limit: None,
+        };
+        let engine = MockEngine::new();
+        engine
+            .add_torrent(super::verify_add_params(&profile, vec![1; 32], "/p".into()))
+            .unwrap();
+        engine
+            .add_torrent(super::adoption_resume_params(
+                &profile,
+                vec![2; 32],
+                None,
+                "/p".into(),
+            ))
+            .unwrap();
+        let adds: Vec<_> = engine
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::AddTorrent(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(adds.len(), 2);
+        for a in &adds {
+            assert!(a.forbids_downloading(), "{a:?}");
+        }
+        assert!(adds[1]
+            .flags_clear()
+            .contains(torrentd_engine::TorrentFlags::PAUSED));
+    }
 
     fn st(phase: TorrentPhase, checked_ago: Option<Duration>) -> TorrentState {
         let now = Instant::now();

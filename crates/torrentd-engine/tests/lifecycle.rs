@@ -383,6 +383,87 @@ fn upload_mode_survives_a_failed_verification() {
     );
 }
 
+/// Resume data written by another client carries `auto_managed=1`
+/// (qBittorrent and Deluge both write it), and libtorrent takes an
+/// auto-managed torrent out of upload mode once `optimistic_disk_retry` has
+/// passed (`torrent::second_tick`). The shim clears the flag on every add
+/// whatever the caller asks for, so upload mode outlasts the retry window.
+///
+/// The caller here clears nothing on purpose: the guard must not depend on
+/// every add path remembering to ask for it.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn resume_data_carrying_auto_managed_cannot_lift_upload_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = dir.path().to_str().unwrap().to_string();
+    // No payload on disk: the torrent is incomplete, so out of upload mode it
+    // would be downloading.
+    let torrent = support::single_file_torrent("absent", &support::payload(9, FILE_LEN), PIECE_LEN);
+    let mut settings = support::local_seed_settings();
+    settings.optimistic_disk_retry = Some(1);
+
+    let blob = {
+        let s1 = Session::new(&settings).unwrap();
+        let h = s1
+            .add_torrent(AddParams::File {
+                bytes: torrent,
+                save_path: save,
+                flags: TorrentFlags::UPLOAD_MODE,
+            })
+            .unwrap();
+        support::settle_status(&s1, h, Duration::from_secs(2))
+            .expect("the torrent should report status");
+        s1.save_resume_data(h, ResumeFlags::SAVE_INFO_DICT).unwrap();
+        support::pump_until(&s1, Duration::from_secs(15), |a| match a {
+            Alert::SaveResumeData { data, .. } => Some(data.as_bytes().to_vec()),
+            Alert::SaveResumeDataFailed { message, .. } => {
+                panic!("save_resume_data failed: {message}")
+            }
+            _ => None,
+        })
+        .expect("a save_resume_data alert should arrive")
+    };
+    // Rewrite the flag as another client's resume data would carry it.
+    let (off, on) = (b"12:auto_managedi0e", b"12:auto_managedi1e");
+    let at = blob
+        .windows(off.len())
+        .position(|w| w == off)
+        .expect("resume data records auto_managed");
+    let mut foreign = blob.clone();
+    foreign[at..at + on.len()].copy_from_slice(on);
+
+    let s2 = Session::new(&settings).unwrap();
+    let h = s2
+        .add_torrent(AddParams::Resume {
+            bytes: foreign,
+            torrent: None,
+            save_path: None,
+            flags_set: TorrentFlags::empty(),
+            flags_clear: TorrentFlags::empty(),
+        })
+        .unwrap();
+    // Several retry windows and second_ticks.
+    let last = support::settle_status(&s2, h, Duration::from_secs(4))
+        .expect("the torrent should report status");
+    let flags = TorrentFlags::from_bits_truncate(last.flags);
+    assert!(
+        !flags.contains(TorrentFlags::AUTO_MANAGED),
+        "auto_managed from resume data must be cleared; flags={flags:?}",
+    );
+    assert!(
+        flags.contains(TorrentFlags::UPLOAD_MODE),
+        "upload_mode must outlast optimistic_disk_retry; flags={flags:?}",
+    );
+    assert!(
+        !last.is_seeding && last.progress < 1.0,
+        "the payload is absent"
+    );
+    assert_eq!(
+        last.download_rate, 0,
+        "a torrent in upload_mode never requests a piece"
+    );
+}
+
 /// The case `SEED_MODE` cannot cover: libtorrent documents it as a no-op for a
 /// torrent added without metadata, so a magnet add was previously unguarded and
 /// would fetch the whole payload once metadata arrived. `UPLOAD_MODE` is not
