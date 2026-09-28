@@ -109,7 +109,10 @@ pub struct Dialog {
     pub selector: Selector,
     /// The profiles that can take torrents; `None` until loaded.
     pub profiles: Option<Vec<String>>,
-    pub profile: usize,
+    /// The chosen profile. Nothing is chosen until the operator moves to
+    /// one: adopting into the wrong profile announces one account's
+    /// torrents from another account's session.
+    pub profile: Option<usize>,
     pub stage: Stage,
     pub error: Option<String>,
 }
@@ -118,7 +121,7 @@ impl Dialog {
     fn profile_id(&self) -> Option<&str> {
         self.profiles
             .as_ref()?
-            .get(self.profile)
+            .get(self.profile?)
             .map(String::as_str)
     }
 }
@@ -150,7 +153,7 @@ pub fn open(serial: u64, selector: Selector, ctx: &Ctx<'_>) -> (Dialog, Vec<Effe
         serial,
         selector,
         profiles: None,
-        profile: 0,
+        profile: None,
         stage: Stage::Pick,
         error: None,
     };
@@ -255,11 +258,15 @@ fn on_key(dialog: &mut Option<Dialog>, key: KeyEvent, ctx: &Ctx<'_>) -> Vec<Effe
         }
         (Stage::Pick, KeyCode::Char('j') | KeyCode::Down) => {
             let len = d.profiles.as_ref().map_or(0, Vec::len);
-            d.profile = (d.profile + 1).min(len.saturating_sub(1));
+            if len > 0 {
+                d.profile = Some(d.profile.map_or(0, |i| (i + 1).min(len - 1)));
+            }
             Vec::new()
         }
         (Stage::Pick, KeyCode::Char('k') | KeyCode::Up) => {
-            d.profile = d.profile.saturating_sub(1);
+            if d.profiles.as_ref().is_some_and(|p| !p.is_empty()) {
+                d.profile = Some(d.profile.map_or(0, |i| i.saturating_sub(1)));
+            }
             Vec::new()
         }
         (Stage::Pick, KeyCode::Enter) => send(d, true, ctx),
@@ -334,7 +341,7 @@ pub fn view(d: &Dialog, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
                 ))),
                 Some(profiles) => {
                     for (i, p) in profiles.iter().enumerate() {
-                        let selected = i == d.profile;
+                        let selected = Some(i) == d.profile;
                         lines.push(Line::from(vec![
                             Span::raw(if selected { "      › " } else { "        " }),
                             Span::styled(
@@ -384,6 +391,7 @@ pub fn view(d: &Dialog, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
     }
     lines.push(Line::from(""));
     let keys: Vec<(&str, &str)> = match &d.stage {
+        Stage::Pick if d.profile.is_none() => vec![("j/k", "choose a profile"), ("Esc", "cancel")],
         Stage::Pick => vec![("j/k", "profile"), ("Enter", "preview"), ("Esc", "cancel")],
         Stage::Previewing => vec![("Esc", "cancel")],
         Stage::Preview(result) if adoptable(result) > 0 => {

@@ -77,6 +77,9 @@ async fn follow_events(mut api_rx: watch::Receiver<Api>, tx: mpsc::UnboundedSend
     let mut backoff = Duration::from_secs(1);
     loop {
         let api = api_rx.borrow_and_update().clone();
+        // A refused credential stays refused: asking again only counts
+        // against it on the daemon. Wait for another one instead.
+        let mut refused = false;
         let reason = match api.client.stream_events().await {
             Ok(mut stream) => {
                 let _ = tx.send(Msg::LiveChanged(Live::Streaming));
@@ -99,7 +102,11 @@ async fn follow_events(mut api_rx: watch::Receiver<Api>, tx: mpsc::UnboundedSend
                     }
                 }
             }
-            Err(e) => crate::api::Failure::from(e).message(),
+            Err(e) => {
+                let failure = crate::api::Failure::from(e);
+                refused = matches!(failure.status, Some(401 | 403));
+                failure.message()
+            }
         };
         if tx
             .send(Msg::LiveChanged(Live::Reconnecting {
@@ -110,8 +117,9 @@ async fn follow_events(mut api_rx: watch::Receiver<Api>, tx: mpsc::UnboundedSend
             return;
         }
         tracing::debug!(target: "torrentctl::events", reason, "event stream down");
+        let wait = if refused { Duration::MAX } else { backoff };
         tokio::select! {
-            _ = tokio::time::sleep(backoff) => {}
+            _ = tokio::time::sleep(wait) => {}
             changed = api_rx.changed() => {
                 if changed.is_err() {
                     return;

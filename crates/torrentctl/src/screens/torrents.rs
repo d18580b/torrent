@@ -2345,15 +2345,12 @@ mod tests {
         testing::with_ctx(None, |ctx| {
             dialog(&mut state, ctx);
             let add = state.add.as_ref().unwrap();
-            assert_eq!(
-                add.profile.as_deref(),
-                Some("acct_a"),
-                "the first active profile"
-            );
+            assert_eq!(add.profile, None, "no profile is chosen for the operator");
             let msg = on_key(&state, testing::key(KeyCode::Enter)).unwrap();
             assert!(update(&mut state, msg, ctx).is_empty(), "nothing is sent");
             let add = state.add.as_ref().unwrap();
             assert_eq!(add.errors.source.as_deref(), Some("enter a magnet URI"));
+            assert_eq!(add.errors.profile.as_deref(), Some("choose a profile"));
 
             keys(&mut state, ctx, "http://x");
             update(&mut state, Msg::AddKey(testing::key(KeyCode::Enter)), ctx);
@@ -2387,6 +2384,11 @@ mod tests {
             let add = state.add.as_mut().unwrap();
             add.source = Input::new("/srv/torrents/x.torrent".into());
             add.focus = add::Field::Profile;
+            update(&mut state, Msg::AddKey(testing::key(KeyCode::Right)), ctx);
+            assert_eq!(
+                state.add.as_ref().unwrap().profile.as_deref(),
+                Some("acct_a")
+            );
             update(&mut state, Msg::AddKey(testing::key(KeyCode::Right)), ctx);
             assert_eq!(
                 state.add.as_ref().unwrap().profile.as_deref(),

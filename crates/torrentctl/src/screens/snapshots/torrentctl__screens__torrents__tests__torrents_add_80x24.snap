@@ -13,7 +13,7 @@ expression: screen
 │ │▸ server path › /home/op/x.torrent                                        │B│
 │ │              ✖ Refused: the server_path must be inside the daemon's      │B│
 │ │              torrent directory                                           │ │
-│ │  profile     ‹ acct_a ›  active only: 2 of them                          │ │
+│ │  profile     ‹ choose ›  active only: 2 of them                          │ │
 │ │  save path   › /srv/seed/acct_a                                          │ │
 │ │                                                                          │ │
 │ │                                                                          │ │

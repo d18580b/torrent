@@ -126,18 +126,20 @@ fn resolve_from(
     })
 }
 
-/// A token from `path`, which must be private to its owner.
+/// A token from `path`, which must be private to its owner. The file is
+/// opened once and its mode read from that handle, so what is checked is
+/// what is read.
 pub fn read_token_file(path: &Path) -> Result<String, ConfigError> {
+    use std::io::Read as _;
+    let read_error = |source| ConfigError::Read {
+        path: path.to_owned(),
+        source,
+    };
+    let mut file = std::fs::File::open(path).map_err(read_error)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        let mode = std::fs::metadata(path)
-            .map_err(|source| ConfigError::Read {
-                path: path.to_owned(),
-                source,
-            })?
-            .permissions()
-            .mode();
+        let mode = file.metadata().map_err(read_error)?.permissions().mode();
         if mode & 0o077 != 0 {
             return Err(ConfigError::TokenFileNotPrivate {
                 path: path.to_owned(),
@@ -145,10 +147,8 @@ pub fn read_token_file(path: &Path) -> Result<String, ConfigError> {
             });
         }
     }
-    let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path.to_owned(),
-        source,
-    })?;
+    let mut text = String::new();
+    file.read_to_string(&mut text).map_err(read_error)?;
     let token = text.trim();
     if token.is_empty() {
         return Err(ConfigError::EmptyTokenFile {

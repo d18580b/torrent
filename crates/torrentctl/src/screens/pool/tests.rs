@@ -779,7 +779,16 @@ fn adopting_previews_a_dry_run_then_applies_the_same_request() {
         "active only"
     );
 
+    assert_eq!(
+        press(&mut state, KeyCode::Enter, true),
+        0,
+        "no profile is chosen for the operator"
+    );
+    assert!(state.adopt.as_ref().unwrap().profile.is_none());
     press(&mut state, KeyCode::Char('j'), true);
+    press(&mut state, KeyCode::Char('j'), true);
+    press(&mut state, KeyCode::Char('k'), true);
+    assert_eq!(state.adopt.as_ref().unwrap().profile, Some(0));
     assert_eq!(press(&mut state, KeyCode::Enter, true), 1, "the dry run");
     assert!(matches!(
         state.adopt.as_ref().unwrap().stage,
@@ -858,6 +867,7 @@ fn a_refused_dry_run_returns_to_the_profile_and_says_why() {
         }),
         true,
     );
+    press(&mut state, KeyCode::Char('j'), true);
     press(&mut state, KeyCode::Enter, true);
     let failure = problem(409, "profile-unavailable", Some("acct_a is vpn_down"));
     let answer = adopt::Msg::Answered {
@@ -884,6 +894,7 @@ fn an_adoption_lost_in_transit_is_not_offered_again() {
         }),
         true,
     );
+    press(&mut state, KeyCode::Char('j'), true);
     press(&mut state, KeyCode::Enter, true);
     let preview = adopt::Msg::Answered {
         serial,
@@ -919,6 +930,7 @@ fn an_adoption_lost_in_transit_is_not_offered_again() {
         }),
         true,
     );
+    press(&mut state, KeyCode::Char('j'), true);
     press(&mut state, KeyCode::Enter, true);
     let preview = adopt::Msg::Answered {
         serial,
@@ -949,6 +961,7 @@ fn a_preview_with_nothing_to_adopt_cannot_be_applied() {
         }),
         true,
     );
+    press(&mut state, KeyCode::Char('j'), true);
     press(&mut state, KeyCode::Enter, true);
     let mut nothing = adoption(true);
     nothing.fast_path.clear();
@@ -1323,6 +1336,7 @@ fn the_adopt_preview_renders() {
         }),
         true,
     );
+    press(&mut state, KeyCode::Char('j'), true);
     press(&mut state, KeyCode::Enter, true);
     send(
         &mut state,

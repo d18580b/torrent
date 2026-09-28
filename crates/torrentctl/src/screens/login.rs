@@ -122,20 +122,23 @@ pub fn view(state: &State, session: &Session, ctx: &Ctx<'_>, frame: &mut Frame, 
             ))
             .centered(),
         ),
-        Session::Unreachable { reason, since } => {
+        Session::Unreachable {
+            reason,
+            since,
+            retry,
+        } => {
             let wait = crate::app::RETRY_INTERVAL.saturating_sub(since.elapsed());
             lines.push(Line::from(Span::styled(
                 format!("✖ {reason}"),
                 theme.fg(Tone::Bad),
             )));
             lines.push(Line::from(""));
-            lines.push(
-                Line::from(Span::styled(
-                    format!("retrying in {}s", wait.as_secs() + 1),
-                    theme.fg(Tone::Muted),
-                ))
-                .centered(),
-            );
+            let note = if *retry {
+                format!("retrying in {}s", wait.as_secs() + 1)
+            } else {
+                "this token lacks the read scope; not retried".to_owned()
+            };
+            lines.push(Line::from(Span::styled(note, theme.fg(Tone::Muted))).centered());
             lines.push(Line::from(""));
             lines.push(key_hints(theme, &[("r", "retry now"), ("Esc", "quit")]).centered());
         }

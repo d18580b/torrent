@@ -72,7 +72,8 @@ pub fn relative(at: time::OffsetDateTime, now: time::OffsetDateTime) -> String {
 
 /// An infohash shortened for a table: the first 12 hex digits.
 pub fn short_hash(hex: &str) -> &str {
-    &hex[..hex.len().min(12)]
+    // By character: the daemon's data is not trusted to be ASCII.
+    hex.char_indices().nth(12).map_or(hex, |(at, _)| &hex[..at])
 }
 
 #[cfg(test)]

@@ -178,24 +178,25 @@ pub enum AddFailure {
 }
 
 impl Dialog {
-    /// A dialog preselecting `profile` when it is one of `active`, else the
-    /// first active profile.
+    /// A dialog preselecting `profile`, the list's profile filter, when it
+    /// is one of `active`. Otherwise nothing is chosen: a torrent added to
+    /// the wrong profile announces one account's passkey from another
+    /// account's session, so the operator picks.
     pub fn new(profile: Option<&str>, active: &[String]) -> Self {
         let profile = profile
             .filter(|p| active.iter().any(|a| a == p))
-            .map(str::to_owned)
-            .or_else(|| active.first().cloned());
+            .map(str::to_owned);
         Self {
             profile,
             ..Self::default()
         }
     }
 
-    /// Choose a profile when none is, now that `active` has arrived; drop a
-    /// choice that is no longer active.
+    /// Drop a choice that is no longer active, now that `active` has
+    /// arrived.
     pub fn profiles_arrived(&mut self, active: &[String]) {
-        if self.profile.as_ref().is_none_or(|p| !active.contains(p)) {
-            self.profile = active.first().cloned();
+        if self.profile.as_ref().is_some_and(|p| !active.contains(p)) {
+            self.profile = None;
         }
     }
 

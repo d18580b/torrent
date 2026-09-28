@@ -102,9 +102,17 @@ pub enum Live {
 pub enum Session {
     /// Asking the daemon.
     Checking,
-    /// The daemon could not be asked; retried every [`RETRY_INTERVAL`]. Not a
-    /// sign-out: the credential in use may be fine.
-    Unreachable { reason: String, since: Instant },
+    /// The daemon could not be asked, or refused what was asked; retried
+    /// every [`RETRY_INTERVAL`] unless it refused. Not a sign-out: the
+    /// credential in use may be fine.
+    Unreachable {
+        reason: String,
+        since: Instant,
+        /// Whether to ask again unprompted. Not after a 403: a token
+        /// without the `read` scope stays without it, and every refusal
+        /// raises the daemon's scope-denial alert.
+        retry: bool,
+    },
     /// The daemon wants a password.
     SignedOut,
     /// Signed in, or authentication is disabled.
@@ -305,8 +313,8 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             {
                 model.toasts.pop_front();
             }
-            if let Session::Unreachable { since, .. } = model.session {
-                if now.duration_since(since) >= RETRY_INTERVAL {
+            if let Session::Unreachable { since, retry, .. } = model.session {
+                if retry && now.duration_since(since) >= RETRY_INTERVAL {
                     model.session = Session::Checking;
                     return vec![check_session(&model.api)];
                 }
@@ -365,6 +373,7 @@ pub fn update(model: &mut Model, msg: Msg) -> Vec<Effect> {
             model.session = Session::Unreachable {
                 reason: failure.message(),
                 since: Instant::now(),
+                retry: failure.status != Some(403),
             };
             Vec::new()
         }
@@ -929,6 +938,25 @@ mod tests {
         assert_eq!(
             update(&mut m, Msg::Key(testing::key(KeyCode::Char('r')))).len(),
             1
+        );
+    }
+
+    #[test]
+    fn a_token_without_the_read_scope_is_not_asked_again_unprompted() {
+        let mut m = model();
+        let refused = Failure {
+            status: Some(403),
+            ..Failure::local("Forbidden", None)
+        };
+        update(&mut m, Msg::SessionChecked(Err(refused)));
+        if let Session::Unreachable { since, .. } = &mut m.session {
+            *since -= RETRY_INTERVAL;
+        }
+        assert!(update(&mut m, Msg::Tick).is_empty(), "no retry loop");
+        assert_eq!(
+            update(&mut m, Msg::Key(testing::key(KeyCode::Char('r')))).len(),
+            1,
+            "`r` still asks"
         );
     }
 

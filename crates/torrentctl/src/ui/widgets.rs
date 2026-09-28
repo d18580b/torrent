@@ -196,7 +196,9 @@ impl Confirm {
         match (key.code, &self.typed) {
             (KeyCode::Esc, _) => Confirmed::No,
             (KeyCode::Char('n' | 'N'), None) => Confirmed::No,
-            (KeyCode::Char('y' | 'Y') | KeyCode::Enter, None) => Confirmed::Yes,
+            // Not `Enter`: the key that opened the dialog, repeated or
+            // double-tapped, must not also answer it.
+            (KeyCode::Char('y' | 'Y'), None) => Confirmed::Yes,
             (KeyCode::Enter, Some(word)) if self.input.value() == word => Confirmed::Yes,
             (KeyCode::Enter, Some(_)) => Confirmed::Pending,
             (_, Some(_)) => {
@@ -264,6 +266,18 @@ mod tests {
         c.input = Input::new("delete".into());
         assert_eq!(c.on_key(key(KeyCode::Enter)), Confirmed::Yes);
         assert_eq!(c.on_key(key(KeyCode::Esc)), Confirmed::No);
+    }
+
+    #[test]
+    fn only_y_answers_an_untyped_confirmation() {
+        let mut c = Confirm::new("Remove", "really?");
+        assert_eq!(
+            c.on_key(key(KeyCode::Enter)),
+            Confirmed::Pending,
+            "the Enter that opened it, repeated"
+        );
+        assert_eq!(c.on_key(key(KeyCode::Char('y'))), Confirmed::Yes);
+        assert_eq!(c.on_key(key(KeyCode::Char('n'))), Confirmed::No);
     }
 
     #[test]
