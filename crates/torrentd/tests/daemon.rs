@@ -505,6 +505,54 @@ fn a_sigterm_with_a_stream_and_a_stuck_request_open_exits_zero_within_the_bound(
     drop((stuck, events));
 }
 
+/// A configured `shutdown_drain_secs` is the deadline the alert loop's drain
+/// runs under, read from the loop's own report of the drain it starts.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn the_configured_drain_deadline_reaches_the_alert_loop() {
+    const HTTP: &str = "127.0.0.1:18097";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, 16897, HTTP);
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    // Neither the config default (60) nor the engine's (30).
+    let text = text.replace(
+        "log_level = \"warn\"\n",
+        "log_level = \"info\"\nshutdown_drain_secs = 7\n",
+    );
+    std::fs::write(&cfg, text).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .env_remove("RUST_LOG")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    // Read on its own thread, so a full pipe cannot stall the daemon.
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).unwrap();
+        out
+    });
+    wait_healthy(HTTP);
+
+    sigterm(&child);
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(30)),
+        "daemon did not exit within 30s of SIGTERM"
+    );
+    let out = reader.join().unwrap();
+    let drain = out
+        .lines()
+        .find(|l| l.contains("shutdown: requesting resume save for every torrent"))
+        .unwrap_or_else(|| panic!("the drain did not report its start:\n{out}"));
+    assert!(
+        drain.contains("\"deadline_secs\":7"),
+        "the drain ran under another deadline: {drain}"
+    );
+}
+
 /// The upgrade every pre-profiles deployment takes, and the one the published
 /// upgrade note does not cover.
 ///

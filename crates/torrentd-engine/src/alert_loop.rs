@@ -1669,4 +1669,48 @@ mod tests {
         handle.join().expect("loop thread");
         assert_eq!(unsaved.load(Ordering::Relaxed), 1);
     }
+
+    #[test]
+    fn the_builders_shutdown_deadline_is_the_one_the_drain_waits_out() {
+        // The daemon sets it from `shutdown_drain_secs`. A save that never
+        // settles holds the drain to the deadline, so the time the drain
+        // slept on the mock clock is the deadline the loop actually used:
+        // 600 s here, where the default would stop at 30. Only the drain
+        // sleeps `SHUTDOWN_DRAIN_INTERVAL`; the idle loop before the signal
+        // sleeps `POLL_IDLE_INTERVAL`, so it is not counted.
+        let engine = Arc::new(MockEngine::new());
+        let h = engine.register_handle(InfoHash([0xC2; 20]));
+        let state = Arc::new(StateMap::new());
+        let clock = Arc::new(MockClock::new());
+        state.insert(
+            h.infohash,
+            crate::state::TorrentState::newly_added(h, ProfileId::new("p"), clock.now()),
+        );
+        let deadline = Duration::from_secs(600);
+        assert!(deadline > DEFAULT_SHUTDOWN_DEADLINE * 2);
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine)),
+            state,
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            Arc::new(NoopSink),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .shutdown_deadline(deadline)
+        .spawn();
+        let unsaved = handle.unsaved_at_shutdown();
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread");
+        assert_eq!(unsaved.load(Ordering::Relaxed), 1);
+        assert_ne!(POLL_IDLE_INTERVAL, SHUTDOWN_DRAIN_INTERVAL);
+        let waited: Duration = clock
+            .observed_sleeps()
+            .into_iter()
+            .filter(|d| *d == SHUTDOWN_DRAIN_INTERVAL)
+            .sum();
+        assert!(
+            waited + SHUTDOWN_DRAIN_INTERVAL >= deadline && waited <= deadline,
+            "the drain waited {waited:?}, not the configured {deadline:?}",
+        );
+    }
 }
