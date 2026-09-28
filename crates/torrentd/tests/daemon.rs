@@ -518,8 +518,12 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
         "must say what declares a profile: {err}"
     );
     assert!(
-        err.contains("profile_assignments.json"),
-        "must name the file to edit: {err}"
+        err.contains("registry.db"),
+        "must name the database to edit: {err}"
+    );
+    assert!(
+        err.contains("DELETE FROM assignment WHERE profile_id IN ('default')"),
+        "and the statement that clears those rows: {err}"
     );
 
     // And it must not have been a silent success followed by a crash: nothing
@@ -530,16 +534,17 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
     );
 }
 
-/// The reconciliation warning on a migration boot names the file to edit, not
-/// only the file the entries came from.
+/// The reconciliation warning on an import boot names the database to edit,
+/// not only the file the entries came from.
 ///
 /// A registry that survives the boot check — every id it names is configured —
 /// can still claim torrents no scan loaded, which is the silent total outage
-/// that warning exists to catch. On this one boot the entries were read from
-/// the pre-rename `slot_assignments.json`, and that is the file
+/// that warning exists to catch. On this one boot the entries were imported
+/// from the pre-rename `slot_assignments.json`, and that is the file
 /// `docs/running.md` tells the operator explicitly *not* to edit: the daemon
-/// writes `profile_assignments.json` on the same boot and reads only that one
-/// from here on. Naming the old file alone sent them to the wrong one.
+/// imports it into `registry.db` on the same boot, renames it, and reads only
+/// the database from here on. Naming the old file alone sent them to the
+/// wrong one.
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn the_reconciliation_warning_names_both_registry_files() {
@@ -587,11 +592,45 @@ fn the_reconciliation_warning_names_both_registry_files() {
         .unwrap_or_else(|| panic!("the reconciliation warning did not fire; output: {out}"));
 
     assert!(
-        warning.contains("\"registry_path\":\"") && warning.contains("profile_assignments.json"),
-        "must name the file the operator edits from here on: {warning}",
+        warning.contains("\"registry_path\":\"") && warning.contains("registry.db"),
+        "must name the database the operator edits from here on: {warning}",
     );
     assert!(
-        warning.contains("\"registry_read_from\":\"") && warning.contains("slot_assignments.json"),
-        "and the file these entries were read from: {warning}",
+        warning.contains("\"registry_read_from\":\"")
+            && warning.contains("slot_assignments.json.imported"),
+        "and the file these entries were imported from, where it now is: {warning}",
+    );
+
+    // The import happened once: the JSON is moved aside and a second boot
+    // reads the database alone, still holding both entries — which is why
+    // the same warning fires again, counting the same two.
+    assert!(!p.join("slot_assignments.json").exists());
+    assert!(p.join("slot_assignments.json.imported").exists());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    wait_healthy(HTTP);
+    sigterm(&child);
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(30)),
+        "daemon did not exit within 30s of SIGTERM"
+    );
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .unwrap();
+    let warning = out
+        .lines()
+        .find(|l| l.contains("the assignment registry claims more torrents"))
+        .unwrap_or_else(|| panic!("the second boot lost the imported entries; output: {out}"));
+    assert!(
+        warning.contains("\"registry_torrents\":2"),
+        "both entries survive into the second boot: {warning}",
     );
 }

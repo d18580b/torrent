@@ -34,7 +34,6 @@ use torrentd_engine::ShutdownReason;
 use torrentd_engine::StateMap;
 use torrentd_engine::SystemClock;
 use torrentd_engine::TorrentEngine;
-use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentStore;
 use tracing::error;
 use tracing::info;
@@ -643,13 +642,13 @@ pub async fn boot(
 
     // Assignment registry.
     let registry = Arc::new(
-        AssignmentRegistry::load_from(cfg.registry_path(), cfg.legacy_registry_path())
+        AssignmentRegistry::open(cfg.registry_path(), cfg.registry_import())
             .context("load assignment registry")?,
     );
 
     // Reconcile it against the configured profiles before anything reads it.
     //
-    // The migration above carries a pre-profiles registry over verbatim, which
+    // The import above carries a pre-profiles registry over verbatim, which
     // means it still names that deployment's ids — `default`, on the
     // single-session layout this release replaces. Nothing reconciles those
     // with the `[[profile]]` tables, and nothing prunes them, so an id with no
@@ -680,22 +679,31 @@ pub async fn boot(
                 .map(|p| p.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            // Name the file the entries were *read from*. On the path this
-            // fires on — a migrated registry, which is what produces ids like
-            // `default` — that is the pre-rename `slot_assignments.json`, and
-            // quoting the post-rename name sent the operator to look at a
-            // file whose contents are a copy made moments earlier. Both are
-            // named, because both now exist and only one is the one the
-            // daemon will read next time.
+            // Name the file the entries were *read from* as well as the
+            // database. On the path this fires on — an imported registry,
+            // which is what produces ids like `default` — that is the JSON
+            // file, now under its `.imported` name, and editing it changes
+            // nothing: the database is what the daemon reads from here on.
+            // The database is not a file to open in an editor, so the remedy
+            // is the exact statement that clears those rows.
             let source = registry.source_path().display().to_string();
-            let current = cfg.registry_path().display().to_string();
+            let current = registry.path().display().to_string();
+            let ids = unknown
+                .keys()
+                .map(|id| format!("'{id}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delete = format!(
+                "sqlite3 {} \"DELETE FROM assignment WHERE profile_id IN ({ids})\"",
+                sh_single_quote(&current)
+            );
             let where_to_edit = if source == current {
-                format!("remove those entries from {current}")
+                format!("remove those entries from {current} (`{delete}`)")
             } else {
                 format!(
-                    "remove those entries from {current} (they were read from {source}, which is \
-                     left intact for a rollback; editing that file alone will not help, because \
-                     {current} is what the daemon reads from here on)"
+                    "remove those entries from {current} (`{delete}`; they were imported from \
+                     {source}, which is kept for a rollback; editing that file will not help, \
+                     because {current} is what the daemon reads from here on)"
                 )
             };
             anyhow::bail!(
@@ -941,15 +949,7 @@ pub async fn boot(
             // mistake that ends an account. A pool that comes back paused is
             // visible in `/status` and fixed with `resume-all`; a pool that
             // comes back seeding when it was told not to is not recoverable.
-            let flags_set = torrentd_engine::resume_flags_set(profile_cfg);
-            let flags_clear = TorrentFlags::empty();
-            match engine.add_torrent(AddParams::Resume {
-                bytes: data.into_inner(),
-                torrent,
-                save_path: None,
-                flags_set,
-                flags_clear,
-            }) {
+            match engine.add_torrent(resume_scan_params(profile_cfg, data.into_inner(), torrent)) {
                 Ok(_) => {
                     added_from_resume += 1;
                     loaded.insert(ih);
@@ -1012,12 +1012,11 @@ pub async fn boot(
                 );
                 continue;
             }
-            let flags = torrentd_engine::seed_flags(profile_cfg);
-            match engine.add_torrent(AddParams::File {
+            match engine.add_torrent(torrent_dir_scan_params(
+                profile_cfg,
                 bytes,
-                save_path: scan_save_path.clone(),
-                flags,
-            }) {
+                scan_save_path.clone(),
+            )) {
                 Ok(_) => {
                     added += 1;
                     loaded.insert(ih);
@@ -1100,15 +1099,11 @@ pub async fn boot(
                 loaded_torrents = loaded,
                 resume_dir = %dirs_of(&cfg, &profile).0.display(),
                 torrent_dir = %dirs_of(&cfg, &profile).1.display(),
-                // Both files, as the refusal above names both. On the
-                // migration boot `source_path()` is the pre-rename
-                // `slot_assignments.json` — the file `docs/running.md` tells
-                // the operator explicitly not to edit — so naming it alone
-                // pointed at the wrong one. Its own justification for being
-                // the name to quote, that the current file is "by
-                // construction not on disk", stopped holding when the
-                // migration began writing that file unconditionally.
-                registry_path = %cfg.registry_path().display(),
+                // Both, as the refusal above names both. On the import boot
+                // `source_path()` is the JSON file under its `.imported` name
+                // — the file `docs/running.md` tells the operator explicitly
+                // not to edit — so naming it alone pointed at the wrong one.
+                registry_path = %registry.path().display(),
                 registry_read_from = %registry.source_path().display(),
                 "the assignment registry claims more torrents for this profile than the scans \
                  loaded; the files are probably still at the pre-profiles root — point this \
@@ -1144,7 +1139,7 @@ pub async fn boot(
     }
 
     // Two artefacts persist a torrent→profile mapping, and nothing reconciled
-    // them: `profile_assignments.json`, which the resume scan above writes and
+    // them: the assignment registry, which the resume scan above writes and
     // every load is gated on, and the pool index's `torrent.profile` column,
     // which `pool scan` writes and an operator may never run. The registry is
     // the authority and the column is a cache of it — said so in both module
@@ -1258,6 +1253,56 @@ pub async fn boot(
     })
 }
 
+/// The settings a profile's session is built with: the config's, plus whether
+/// libtorrent posts its log alerts at all.
+///
+/// Those alerts are the bulk of libtorrent's alert traffic and feed only
+/// `handlers::log_msg`'s debug lines, so a session subscribes to them only
+/// when that target is at debug as the daemon starts. Raising the level at
+/// runtime does not subscribe a running session.
+fn session_settings(cfg: &Config) -> torrentd_engine::Settings {
+    let mut s = cfg.libtorrent_settings();
+    s.alert_logs = Some(tracing::enabled!(
+        target: "torrentd_engine::handler::log",
+        tracing::Level::DEBUG
+    ));
+    s
+}
+
+/// What the boot resume scan hands a session for one saved torrent.
+///
+/// Its flags are `torrentd_engine::policy`'s: the no-download guards are
+/// re-asserted, and every flag that could lift upload mode is cleared from
+/// whatever the resume data carried, since it may have been written by another
+/// client.
+fn resume_scan_params(
+    profile: &ProfileConfig,
+    resume: Vec<u8>,
+    torrent: Option<Vec<u8>>,
+) -> AddParams {
+    AddParams::Resume {
+        bytes: resume,
+        torrent,
+        save_path: None,
+        flags_set: torrentd_engine::resume_flags_set(profile),
+        flags_clear: torrentd_engine::resume_flags_clear(),
+    }
+}
+
+/// What the boot torrent-dir scan hands a session for a `.torrent` no resume
+/// data covered.
+fn torrent_dir_scan_params(
+    profile: &ProfileConfig,
+    bytes: Vec<u8>,
+    save_path: String,
+) -> AddParams {
+    AddParams::File {
+        bytes,
+        save_path,
+        flags: torrentd_engine::seed_flags(profile),
+    }
+}
+
 /// The production engine factory for [`build_profiles`]: a real libtorrent
 /// session, restored from `state` where a host profile with DHT kept one.
 fn real_engine(
@@ -1352,7 +1397,7 @@ where
 
         match build_profile(
             p,
-            cfg.libtorrent_settings(),
+            session_settings(cfg),
             &cfg.session_state_path(&p.id),
             cleanup,
             forwarder,
@@ -2043,6 +2088,13 @@ where
 }
 
 /// Read the persisted DHT/session-state blob, or `None` if absent/empty.
+/// `s` as one POSIX shell word: single-quoted, with each `'` closed, escaped
+/// and reopened. The registry refusal prints a command to paste, and a state
+/// directory holding a space or a shell metacharacter must not break it.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 fn load_session_state(path: &std::path::Path) -> Option<Vec<u8>> {
     match std::fs::read(path) {
         Ok(b) if !b.is_empty() => Some(b),
@@ -2417,6 +2469,25 @@ mod tests {
     use torrentd_engine::VpnType;
 
     use super::*;
+
+    /// The database path in the registry refusal's `sqlite3` command reaches
+    /// the shell as one word, whatever the state directory is called.
+    #[test]
+    fn the_refusal_command_quotes_a_path_the_shell_would_split() {
+        for path in [
+            "/var/lib/torrentd/registry.db",
+            "/srv/my state/registry.db",
+            "/srv/it's; $(rm -rf ~) `x` \"q\" *&|/registry.db",
+        ] {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' {}", sh_single_quote(path)))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
+        }
+    }
 
     /// A second holder of the same lock file is refused while the first is
     /// alive, told the first one's pid, and leaves that pid in place. `flock`
@@ -3778,5 +3849,34 @@ mod profile_construction_tests {
             vpn.bring_up_calls().is_empty(),
             "no tunnel is raised after the shutdown",
         );
+    }
+
+    /// Both boot scans hand the session an add that keeps the torrent in
+    /// upload mode and clears every flag resume data could carry to lift it.
+    #[test]
+    fn both_boot_scans_forbid_downloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[host("public", true), vpn("a", "wg-a", 1)]);
+        for p in &cfg.profile {
+            let engine = MockEngine::new();
+            engine
+                .add_torrent(resume_scan_params(p, vec![1; 32], None))
+                .unwrap();
+            engine
+                .add_torrent(torrent_dir_scan_params(p, vec![2; 32], "/data".into()))
+                .unwrap();
+            let adds: Vec<_> = engine
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    torrentd_engine::RecordedCall::AddTorrent(a) => Some(a),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(adds.len(), 2);
+            for a in adds {
+                assert!(a.forbids_downloading(), "{}: {a:?}", p.id);
+            }
+        }
     }
 }

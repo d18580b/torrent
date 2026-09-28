@@ -14,6 +14,7 @@ use std::path::PathBuf;
 use anyhow::Context;
 use serde::Deserialize;
 use serde::Serialize;
+use torrentd_engine::JsonImport;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileConfigError;
 use torrentd_engine::ProfileId;
@@ -100,8 +101,9 @@ pub struct Config {
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
 
-    /// Where the assignment registry lives. Defaults to
-    /// `<resume_dir parent>/profile_assignments.json`.
+    /// Where the assignment registry database lives. Defaults to
+    /// `<resume_dir parent>/registry.db`. A path ending in `.json` is a
+    /// pre-SQLite config naming the JSON file: see [`Config::registry_path`].
     #[serde(default)]
     pub registry_path: Option<PathBuf>,
 
@@ -204,12 +206,20 @@ impl PoolConfig {
 }
 
 /// Where torrent-to-profile assignments are persisted.
-const REGISTRY_FILE: &str = "profile_assignments.json";
-/// Its name before profiles replaced slots. Read once, then written under the
-/// current name.
+const REGISTRY_FILE: &str = "registry.db";
+/// The JSON file the database replaced. Imported once, then renamed.
+const JSON_REGISTRY_FILE: &str = "profile_assignments.json";
+/// Its name before profiles replaced slots. Imported once, then renamed, where
+/// neither the database nor the JSON file above exists.
 const LEGACY_REGISTRY_FILE: &str = "slot_assignments.json";
 /// The single-instance lock `boot` holds for the life of the process.
 const INSTANCE_LOCK_FILE: &str = "torrentd.lock";
+
+/// Whether a configured `registry_path` names a pre-SQLite JSON registry.
+fn is_json(p: &Path) -> bool {
+    p.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"))
+}
 
 /// How a fingerprint error names the top-level key, which shares its name
 /// with the per-profile key it is the default for.
@@ -1088,26 +1098,53 @@ impl Config {
         Ok(())
     }
 
-    /// Where the assignment registry should be persisted.
+    /// The assignment registry database.
+    ///
+    /// `registry_path` as configured, or `registry.db` in [`Config::state_dir`].
+    /// A configured path ending in `.json` predates the database: it names
+    /// the JSON file, which [`Config::registry_import`] imports, and the
+    /// database goes beside it with a `.db` extension. Opening a JSON file as
+    /// SQLite would refuse the boot on every config that set the key before.
     pub fn registry_path(&self) -> PathBuf {
-        self.registry_path
-            .clone()
-            .unwrap_or_else(|| self.state_dir().join(REGISTRY_FILE))
+        match &self.registry_path {
+            Some(p) if is_json(p) => p.with_extension("db"),
+            Some(p) => p.clone(),
+            None => self.state_dir().join(REGISTRY_FILE),
+        }
     }
 
-    /// The pre-rename registry file, if it is the only one present.
+    /// The JSON registry to import into the database on open, if one is on
+    /// disk.
     ///
-    /// Renaming slots to profiles renamed this file too, and a daemon that
-    /// simply started with an empty registry would have no record of which
-    /// profile owns which info-hash — which is the authority for the
-    /// cross-profile uniqueness rule. It would then happily load the same
-    /// torrent into two profiles. Read the old name once instead.
-    pub fn legacy_registry_path(&self) -> Option<PathBuf> {
-        if self.registry_path.is_some() {
-            return None;
+    /// Every boot asks, and the import renames what it read, so a file is
+    /// read once. In order:
+    ///
+    /// - a configured `registry_path` ending in `.json`, as above;
+    /// - otherwise, with no `registry_path` configured,
+    ///   `profile_assignments.json` in the state directory;
+    /// - failing that, the pre-profiles `slot_assignments.json`, but only
+    ///   while the database does not exist yet. Renaming slots to profiles
+    ///   renamed this file too, and a daemon that simply started with an empty
+    ///   registry would have no record of which profile owns which info-hash —
+    ///   the authority for the cross-profile uniqueness rule — and would load
+    ///   the same torrent into two profiles. Once the database exists, a slot
+    ///   file beside it is the rollback copy an earlier release kept after
+    ///   writing `profile_assignments.json`, and it is not read.
+    pub fn registry_import(&self) -> Option<JsonImport> {
+        let found = |path: PathBuf, pre_profiles: bool| {
+            path.exists().then_some(JsonImport { path, pre_profiles })
+        };
+        match &self.registry_path {
+            Some(p) if is_json(p) => found(p.clone(), false),
+            Some(_) => None,
+            None => found(self.state_dir().join(JSON_REGISTRY_FILE), false).or_else(|| {
+                if self.registry_path().exists() {
+                    None
+                } else {
+                    found(self.state_dir().join(LEGACY_REGISTRY_FILE), true)
+                }
+            }),
         }
-        let legacy = self.state_dir().join(LEGACY_REGISTRY_FILE);
-        (legacy.exists() && !self.registry_path().exists()).then_some(legacy)
     }
 
     /// Where the pool index lives.
@@ -3227,8 +3264,8 @@ upload_rate_limit = 0"#,
 
     #[test]
     fn a_registry_file_naming_an_escaping_profile_id_does_not_load() {
-        // The file the rule above exists for. `AssignmentRegistry` maps its
-        // JSON values straight into `ProfileId`.
+        // The file the rule above exists for. `AssignmentRegistry`'s import
+        // maps its JSON values straight into `ProfileId`.
         let dir = tempdir().unwrap();
         let path = dir.path().join("profile_assignments.json");
         fs::write(
@@ -3236,9 +3273,90 @@ upload_rate_limit = 0"#,
             r#"{"0101010101010101010101010101010101010101":"../../etc"}"#,
         )
         .unwrap();
+        let import = JsonImport {
+            path: path.clone(),
+            pre_profiles: false,
+        };
         assert!(
-            torrentd_engine::AssignmentRegistry::load(&path).is_err(),
+            torrentd_engine::AssignmentRegistry::open(dir.path().join("registry.db"), Some(import))
+                .is_err(),
             "a registry naming an id that escapes its directory must not load",
+        );
+        assert!(path.exists(), "and a refused import moves nothing aside");
+    }
+
+    #[test]
+    fn the_registry_is_a_database_in_the_state_dir_importing_the_json_beside_it() {
+        let dir = tempdir().unwrap();
+        let mut cfg = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        cfg.resume_dir = dir.path().join("resume");
+        let state = cfg.state_dir();
+        assert_eq!(state, dir.path());
+        assert_eq!(cfg.registry_path(), state.join("registry.db"));
+        assert_eq!(
+            cfg.registry_import(),
+            None,
+            "nothing on disk, nothing to import"
+        );
+
+        fs::write(state.join("slot_assignments.json"), "{}").unwrap();
+        assert_eq!(
+            cfg.registry_import(),
+            Some(JsonImport {
+                path: state.join("slot_assignments.json"),
+                pre_profiles: true,
+            }),
+            "a slot-era deployment's only file",
+        );
+
+        fs::write(state.join("profile_assignments.json"), "{}").unwrap();
+        assert_eq!(
+            cfg.registry_import(),
+            Some(JsonImport {
+                path: state.join("profile_assignments.json"),
+                pre_profiles: false,
+            }),
+            "the current JSON file wins; the slot file beside it is a rollback copy",
+        );
+
+        fs::remove_file(state.join("profile_assignments.json")).unwrap();
+        fs::write(cfg.registry_path(), b"").unwrap();
+        assert_eq!(
+            cfg.registry_import(),
+            None,
+            "once the database exists, a slot file is never read again",
+        );
+    }
+
+    #[test]
+    fn a_configured_json_registry_path_is_imported_into_a_database_beside_it() {
+        // A config written before the database named the JSON file here.
+        // Opening that as SQLite refuses the boot; reading it as the import
+        // keeps those configs working.
+        let dir = tempdir().unwrap();
+        let mut cfg = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        cfg.resume_dir = dir.path().join("resume");
+        let json = dir.path().join("assignments.json");
+        cfg.registry_path = Some(json.clone());
+        assert_eq!(cfg.registry_path(), dir.path().join("assignments.db"));
+        assert_eq!(cfg.registry_import(), None);
+        fs::write(&json, "{}").unwrap();
+        assert_eq!(
+            cfg.registry_import(),
+            Some(JsonImport {
+                path: json,
+                pre_profiles: false,
+            }),
+        );
+
+        let db = dir.path().join("elsewhere.db");
+        cfg.registry_path = Some(db.clone());
+        assert_eq!(cfg.registry_path(), db);
+        fs::write(cfg.state_dir().join("profile_assignments.json"), "{}").unwrap();
+        assert_eq!(
+            cfg.registry_import(),
+            None,
+            "a configured database path imports nothing from the state dir",
         );
     }
 

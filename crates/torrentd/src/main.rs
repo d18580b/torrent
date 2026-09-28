@@ -331,7 +331,7 @@ fn openapi_cmd(out: Option<&std::path::Path>) -> anyhow::Result<()> {
 /// test: `main` parses the CLI and has no other seam.
 ///
 /// The one boot refusal deliberately *not* here is the registry cross-check,
-/// which reads `profile_assignments.json` from the state directory. A config
+/// which reads the assignment registry from the state directory. A config
 /// check that touched disk state would fail on a host where that directory is
 /// not yet provisioned, which is the pre-flight case this flag exists for. The
 /// flag's own help text says so.

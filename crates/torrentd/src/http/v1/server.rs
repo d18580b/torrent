@@ -169,8 +169,9 @@ pub async fn get_status(
                 Checking => status.checking += 1,
                 DiskError => status.disk_error += 1,
                 Errored => status.errored += 1,
-                // Not counted: neither is a state an operator acts on here.
-                Idle | Removed => {}
+                // Not counted: none has a counter of its own in this
+                // payload. `phase` on the listing filters for each.
+                Idle | Removed | Incomplete | AwaitingMetadata => {}
             }
         }
     });

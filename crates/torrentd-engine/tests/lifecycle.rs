@@ -17,6 +17,8 @@
 //!     must survive the clear mask).
 //!   - verification & corruption: a full-check add seeds when on-disk bytes
 //!     match the piece hashes and never seeds when they don't.
+//!   - bounded drains: a bounded drain leaves the rest queued, and
+//!     `RealEngine::pop_alerts` returns at most `MAX_ALERTS_PER_POP`.
 //!   - alert-queue overflow: a tiny `alert_queue_size` flooded without draining
 //!     surfaces `alerts_dropped` and keeps draining cleanly (no hang/panic).
 //!   - the no-download invariant: `UPLOAD_MODE` survives a real session, holds
@@ -298,6 +300,84 @@ fn full_check_verifies_and_rejects_corrupt_payload() {
     }
 }
 
+/// A bounded drain returns at most its bound and leaves the rest queued, so
+/// the engine can release the session lock between batches without losing an
+/// alert.
+#[test]
+#[ignore = "real libtorrent; run with --ignored"]
+fn a_bounded_drain_leaves_the_rest_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Session::new(&support::local_seed_settings()).unwrap();
+    for i in 0..20u8 {
+        s.add_torrent(AddParams::Magnet {
+            uri: format!("magnet:?xt=urn:btih:{}", hex::encode([i + 1; 20])),
+            save_path: dir.path().to_str().unwrap().to_string(),
+            flags: TorrentFlags::PAUSED | TorrentFlags::UPLOAD_MODE,
+        })
+        .unwrap();
+    }
+    let first = s.drain_alerts_up_to(5);
+    assert_eq!(first.len(), 5);
+    let mut added = first
+        .iter()
+        .filter(|a| matches!(a, Alert::AddTorrent { .. }))
+        .count();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while added < 20 && std::time::Instant::now() < deadline {
+        added += s
+            .drain_alerts_up_to(5)
+            .iter()
+            .filter(|a| matches!(a, Alert::AddTorrent { .. }))
+            .count();
+    }
+    assert_eq!(added, 20, "every add_torrent_alert arrives across batches");
+}
+
+/// `RealEngine::pop_alerts` converts at most `MAX_ALERTS_PER_POP` alerts per
+/// call, and the rest arrive on the next pops.
+#[test]
+#[ignore = "real libtorrent; run with --ignored"]
+fn the_engine_pops_at_most_its_cap_per_call() {
+    use torrentd_engine::real::MAX_ALERTS_PER_POP;
+    use torrentd_engine::RealEngine;
+    use torrentd_engine::TorrentEngine;
+
+    let count = MAX_ALERTS_PER_POP + 100;
+    let mut settings = support::local_seed_settings();
+    settings.alert_queue_size = Some(10_000);
+    let dir = tempfile::tempdir().unwrap();
+    let engine = RealEngine::new(&settings).unwrap();
+    for i in 0..count {
+        let mut ih = [0u8; 20];
+        ih[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+        engine
+            .add_torrent(AddParams::Magnet {
+                uri: format!("magnet:?xt=urn:btih:{}", hex::encode(ih)),
+                save_path: dir.path().to_str().unwrap().to_string(),
+                flags: TorrentFlags::PAUSED | TorrentFlags::UPLOAD_MODE,
+            })
+            .unwrap();
+    }
+    // Every add posted its `add_torrent_alert` before returning, so more
+    // than the cap is queued now.
+    let first = engine.pop_alerts();
+    assert_eq!(first.len(), MAX_ALERTS_PER_POP);
+    let mut added = first
+        .iter()
+        .filter(|a| matches!(a, Alert::AddTorrent { .. }))
+        .count();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while added < count && std::time::Instant::now() < deadline {
+        let batch = engine.pop_alerts();
+        assert!(batch.len() <= MAX_ALERTS_PER_POP, "{}", batch.len());
+        added += batch
+            .iter()
+            .filter(|a| matches!(a, Alert::AddTorrent { .. }))
+            .count();
+    }
+    assert_eq!(added, count, "every add_torrent_alert arrives across pops");
+}
+
 #[test]
 #[ignore = "real libtorrent; run with --ignored"]
 fn alert_queue_overflow_surfaces_drop_and_keeps_draining() {
@@ -380,6 +460,87 @@ fn upload_mode_survives_a_failed_verification() {
     assert_eq!(
         last.download_rate, 0,
         "a torrent in upload_mode must never request a piece",
+    );
+}
+
+/// Resume data written by another client carries `auto_managed=1`
+/// (qBittorrent and Deluge both write it), and libtorrent takes an
+/// auto-managed torrent out of upload mode once `optimistic_disk_retry` has
+/// passed (`torrent::second_tick`). The shim clears the flag on every add
+/// whatever the caller asks for, so upload mode outlasts the retry window.
+///
+/// The caller here clears nothing on purpose: the guard must not depend on
+/// every add path remembering to ask for it.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn resume_data_carrying_auto_managed_cannot_lift_upload_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let save = dir.path().to_str().unwrap().to_string();
+    // No payload on disk: the torrent is incomplete, so out of upload mode it
+    // would be downloading.
+    let torrent = support::single_file_torrent("absent", &support::payload(9, FILE_LEN), PIECE_LEN);
+    let mut settings = support::local_seed_settings();
+    settings.optimistic_disk_retry = Some(1);
+
+    let blob = {
+        let s1 = Session::new(&settings).unwrap();
+        let h = s1
+            .add_torrent(AddParams::File {
+                bytes: torrent,
+                save_path: save,
+                flags: TorrentFlags::UPLOAD_MODE,
+            })
+            .unwrap();
+        support::settle_status(&s1, h, Duration::from_secs(2))
+            .expect("the torrent should report status");
+        s1.save_resume_data(h, ResumeFlags::SAVE_INFO_DICT).unwrap();
+        support::pump_until(&s1, Duration::from_secs(15), |a| match a {
+            Alert::SaveResumeData { data, .. } => Some(data.as_bytes().to_vec()),
+            Alert::SaveResumeDataFailed { message, .. } => {
+                panic!("save_resume_data failed: {message}")
+            }
+            _ => None,
+        })
+        .expect("a save_resume_data alert should arrive")
+    };
+    // Rewrite the flag as another client's resume data would carry it.
+    let (off, on) = (b"12:auto_managedi0e", b"12:auto_managedi1e");
+    let at = blob
+        .windows(off.len())
+        .position(|w| w == off)
+        .expect("resume data records auto_managed");
+    let mut foreign = blob.clone();
+    foreign[at..at + on.len()].copy_from_slice(on);
+
+    let s2 = Session::new(&settings).unwrap();
+    let h = s2
+        .add_torrent(AddParams::Resume {
+            bytes: foreign,
+            torrent: None,
+            save_path: None,
+            flags_set: TorrentFlags::empty(),
+            flags_clear: TorrentFlags::empty(),
+        })
+        .unwrap();
+    // Several retry windows and second_ticks.
+    let last = support::settle_status(&s2, h, Duration::from_secs(4))
+        .expect("the torrent should report status");
+    let flags = TorrentFlags::from_bits_truncate(last.flags);
+    assert!(
+        !flags.contains(TorrentFlags::AUTO_MANAGED),
+        "auto_managed from resume data must be cleared; flags={flags:?}",
+    );
+    assert!(
+        flags.contains(TorrentFlags::UPLOAD_MODE),
+        "upload_mode must outlast optimistic_disk_retry; flags={flags:?}",
+    );
+    assert!(
+        !last.is_seeding && last.progress < 1.0,
+        "the payload is absent"
+    );
+    assert_eq!(
+        last.download_rate, 0,
+        "a torrent in upload_mode never requests a piece"
     );
 }
 
