@@ -28,9 +28,15 @@
 //! [`BatchWriter::delete_now`] drops the queued write and unlinks under that
 //! same lock, so a queued write can never land after (and resurrect) a delete
 //! that followed it — without the delete, which the alert loop calls when a
-//! torrent is removed, waiting out a batch's flushes. [`BatchWriter::write_now`]
-//! takes the I/O lock a batch holds instead: it is the API's synchronous path,
-//! and flushes of its own.
+//! torrent is removed, waiting out a batch's flushes. [`BatchWriter::write_now`],
+//! the API's synchronous path, drops the queued write the same way and then
+//! flushes its own file through a temp file of its own, so it does not wait
+//! out a batch either.
+//!
+//! `syncfs(2)` flushes the whole filesystem holding the state directory, not
+//! only the batch's files, so a batch's flush also pays for whatever else is
+//! dirty there — torrent payload, where it shares that filesystem. Only the
+//! writer thread and [`BatchWriter::flush`] wait on it.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -81,7 +87,8 @@ struct Pending {
 struct Shared {
     pending: Mutex<Pending>,
     wake: Condvar,
-    /// Held for the whole of a batch and for every synchronous operation.
+    /// Held for the whole of a batch, so the thread's batches and
+    /// [`BatchWriter::flush`] do not run at once.
     io: Mutex<()>,
     stop: AtomicBool,
     on_error: Option<WriteErrorHook>,
@@ -153,11 +160,19 @@ impl BatchWriter {
             .map(|q| Arc::clone(&q.data))
     }
 
-    /// Write `path` now, durably, superseding anything queued for it.
+    /// Write `path` now, durably, superseding anything queued for it. Never
+    /// waits for a batch, as [`BatchWriter::delete_now`] does not: the API's
+    /// add calls this, and a batch holds its I/O lock across a `syncfs` of
+    /// the whole filesystem.
+    ///
+    /// Dropping the queued write under the queue's lock is what keeps a batch
+    /// that already took it from landing over this one: its rename finds the
+    /// write no longer queued and is skipped. The temp file is this path's
+    /// own, so a batch writing or removing `<path>.tmp` meanwhile cannot touch
+    /// it.
     pub fn write_now(&self, path: &Path, data: &[u8]) -> io::Result<()> {
-        let _io = self.shared.io.lock();
         self.shared.pending.lock().by_path.remove(path);
-        write_atomic(path, data)
+        write_atomic_via(path, &now_tmp_for(path), data)
     }
 
     /// Delete `path` now, dropping anything queued for it. A missing file is
@@ -216,6 +231,14 @@ fn run(shared: &Shared) {
 fn tmp_for(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".tmp");
+    PathBuf::from(s)
+}
+
+/// The temp file [`BatchWriter::write_now`] goes through, distinct from a
+/// batch's: `<path>.now.tmp`.
+fn now_tmp_for(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".now.tmp");
     PathBuf::from(s)
 }
 
@@ -358,19 +381,23 @@ fn syncfs(f: &fs::File) -> io::Result<()> {
 /// Replace `path` with `data` durably: temp file → `fsync` → `rename` →
 /// `fsync(dir)`. A crash at any point leaves the previous file intact.
 pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    write_atomic_via(path, &tmp_for(path), data)
+}
+
+/// [`write_atomic`] through the temp file `tmp`.
+fn write_atomic_via(path: &Path, tmp: &Path, data: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
-    let tmp = tmp_for(path);
     {
         let mut f = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&tmp)?;
+            .open(tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, path)?;
+    fs::rename(tmp, path)?;
     // Best effort: a filesystem that cannot fsync a directory is rare on
     // Linux, and the file itself is already durable.
     if let Ok(d) = fs::File::open(dir) {
@@ -443,6 +470,42 @@ mod tests {
             !path.exists(),
             "the queued write resurrected a deleted file"
         );
+        assert!(w.pending(&path).is_none());
+    }
+
+    #[test]
+    fn a_write_now_does_not_wait_out_a_batch() {
+        // A batch holds the I/O lock across its `syncfs`, which on a
+        // filesystem shared with payload can take as long as flushing all of
+        // it. The API's add writes through `write_now` on a runtime worker.
+        let dir = tempdir().unwrap();
+        let w = Arc::new(BatchWriter::spawn("test-writer", None));
+        let path = dir.path().join("a.torrent");
+        let _batch = w.shared.io.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn({
+            let w = Arc::clone(&w);
+            let path = path.clone();
+            move || tx.send(w.write_now(&path, b"now").is_ok()).unwrap()
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(true),
+            "write_now waited for the batch in progress",
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"now");
+        assert!(!now_tmp_for(&path).exists());
+    }
+
+    #[test]
+    fn a_queued_write_does_not_land_over_a_later_write_now() {
+        let dir = tempdir().unwrap();
+        let w = BatchWriter::spawn("test-writer", None);
+        let path = dir.path().join("a.torrent");
+        w.enqueue(path.clone(), &ProfileId::new("p"), &ih(1), b"stale");
+        w.write_now(&path, b"fresh").unwrap();
+        w.flush();
+        assert_eq!(fs::read(&path).unwrap(), b"fresh");
         assert!(w.pending(&path).is_none());
     }
 
