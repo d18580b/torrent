@@ -272,6 +272,11 @@ pub async fn run(
 ///   `apply_settings` call failed, in which case the next reload retries them;
 /// - `log_level`, once `set_level` succeeded.
 ///
+/// A key withheld from some profile (`enable_lsd` on a vpn profile, a
+/// top-level `upload_rate_limit` under a per-profile one) advances like any
+/// applied key. The withholding is policy, not a pending restart: it was
+/// reported on this reload and would be withheld again on every later one.
+///
 /// Every other field — non-reloadable top-level keys and `[[profile]]` — stays
 /// at the value the daemon booted with, so a change to one is reported on
 /// every reload until a restart takes it, and a file edited back to the
