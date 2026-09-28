@@ -651,6 +651,50 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
     );
 }
 
+/// A resume file and a torrent-dir `.torrent` the boot scans cannot read are
+/// skipped, the daemon comes up anyway, and boot exports each under its own
+/// `source` of `boot_torrent_load_failures`. A directory stands where each
+/// file goes, which no uid can read as a file.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn unreadable_scan_files_are_exported_by_source_at_boot() {
+    const HTTP: &str = "127.0.0.1:18100";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, 16900, HTTP);
+    let ih = "ab".repeat(20);
+    std::fs::create_dir_all(p.join("resume").join(PROFILE).join(format!("{ih}.resume"))).unwrap();
+    std::fs::create_dir_all(
+        p.join("torrents")
+            .join(PROFILE)
+            .join(format!("{ih}.torrent")),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .expect("spawn daemon");
+    wait_healthy(HTTP);
+
+    let (code, metrics) = http(HTTP, "GET", "/metrics", None);
+    assert_eq!(code, 200);
+    for source in ["resume_file", "torrent_file"] {
+        assert!(
+            metrics.lines().any(|l| {
+                l.starts_with("torrentd_boot_torrent_load_failures{")
+                    && l.contains(&format!("profile_id=\"{PROFILE}\""))
+                    && l.contains(&format!("source=\"{source}\""))
+                    && l.ends_with(" 1")
+            }),
+            "boot_torrent_load_failures{{source={source}}} should read 1:\n{metrics}"
+        );
+    }
+
+    sigterm(&child);
+    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+}
+
 /// Run the binary against `cfg` to its exit, with `--check-config` when
 /// `check`, and `PATH` limited to `path` when given. Returns the exit code
 /// and both output streams.
