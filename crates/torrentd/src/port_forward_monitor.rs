@@ -798,6 +798,7 @@ mod tests {
         let (entry, engine) = natpmp_entry("acct_a", 6881);
         let sink = RecordingSink::new();
         let fwd = MockForwarder::with_ports([40001]);
+        assert!(entry.health().port_forward_ok, "a fresh entry starts up");
 
         assert!(!refresh_during_boot(&entry, &fwd, &sink));
 
@@ -810,6 +811,9 @@ mod tests {
         );
         assert!(failure_stages(&sink).is_empty(), "a deferral is no failure");
         assert_eq!(entry.health().forwarded_port, Some(6881));
+        // Deferred, not ignored: the session is still on the old port, so the
+        // profile reports the forward down until the retried rebind lands.
+        assert!(!entry.health().port_forward_ok);
         assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
     }
 
