@@ -74,8 +74,10 @@ impl TorrentPhase {
 /// →3600s. Armed by `file_error_alert`; each due attempt resumes the torrent
 /// while libtorrent still holds an error on it, and the timer is retired
 /// once none is left and the torrent is not checking; a due timer on a
-/// torrent still checking waits another delay with its attempt count kept
-/// (`alert_loop::execute_due_retries`).
+/// torrent still checking waits another delay with its attempt count kept,
+/// one whose profile is fenced or has no session is looked at again after
+/// `INITIAL_DELAY` with its count kept, and a failed resume backs off like a
+/// successful one (`alert_loop::execute_due_retries`).
 #[derive(Clone, Debug)]
 pub struct RetryState {
     pub next_attempt: Instant,

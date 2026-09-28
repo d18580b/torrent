@@ -620,6 +620,11 @@ fn execute_due_retries(
         // down and refuses to restart it without an operator. Resuming one on
         // the disk-error retry timer would un-quarantine it individually,
         // which is the thing fencing exists to prevent.
+        //
+        // `retries_due` popped this torrent's deadline, so a skip has to
+        // schedule another look itself, or a torrent whose fence later lifts
+        // is never retried again. Look again after the initial delay, attempt
+        // count unchanged: skipping is not an attempt.
         if profile_fenced.is_some_and(|f| f(&st.profile_id)) {
             debug!(
                 target: "torrentd_engine::alert_loop",
@@ -627,6 +632,7 @@ fn execute_due_retries(
                 infohash = %handle.infohash,
                 "retry skipped: profile is fenced",
             );
+            defer_retry(state, clock, &handle.infohash);
             continue;
         }
         // What a `file_error_alert` leaves behind under this daemon's flags
@@ -678,7 +684,10 @@ fn execute_due_retries(
             state.update(&handle.infohash, |s| s.retry = None);
             continue;
         }
+        // No session for the profile right now: look again later, as for a
+        // fenced profile.
         let Some(engine) = source.engine_for(&st.profile_id) else {
+            defer_retry(state, clock, &handle.infohash);
             continue;
         };
         match engine.resume_torrent(handle) {
@@ -710,9 +719,26 @@ fn execute_due_retries(
                     "disk_error_retry_errors_total",
                     &[("profile_id", st.profile_id.as_str())],
                 );
+                // A failed resume is still an attempt: back off and schedule
+                // the next one, or the popped deadline was the last.
+                state.update(&handle.infohash, |s| {
+                    let attempts = s.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
+                    s.retry = Some(crate::state::RetryState::next(clock.now(), attempts));
+                });
             }
         }
     }
+}
+
+/// Schedule another look at a due retry that was skipped without an attempt,
+/// [`RetryState::INITIAL_DELAY`](crate::state::RetryState::INITIAL_DELAY)
+/// from now, keeping its attempt count.
+fn defer_retry(state: &StateMap, clock: &Arc<dyn Clock>, ih: &libtorrent_safe::InfoHash) {
+    state.update(ih, |s| {
+        if let Some(r) = s.retry.as_mut() {
+            r.next_attempt = clock.now() + crate::state::RetryState::INITIAL_DELAY;
+        }
+    });
 }
 
 /// Hand queued resume saves to libtorrent until [`RESUME_SAVES_IN_FLIGHT`]
@@ -1047,6 +1073,121 @@ mod tests {
 
         assert!(handle.signal_shutdown(ShutdownReason::Test));
         handle.join().expect("loop thread panicked");
+    }
+
+    /// One errored torrent in profile `p` whose retry is due at `now`.
+    fn state_with_a_due_retry(now: Instant) -> (Arc<StateMap>, TorrentHandle) {
+        let state = Arc::new(StateMap::new());
+        let ih = InfoHash([9u8; 20]);
+        let h = TorrentHandle {
+            id: 9,
+            infohash: ih,
+        };
+        let mut st = crate::state::TorrentState::newly_added(h, ProfileId::new("p"), now);
+        st.has_error = true;
+        st.phase = TorrentPhase::Paused;
+        st.retry = Some(crate::state::RetryState {
+            next_attempt: now - Duration::from_secs(1),
+            attempts: 1,
+        });
+        state.insert(ih, st);
+        (state, h)
+    }
+
+    #[test]
+    fn a_fenced_torrent_is_retried_once_its_fence_lifts() {
+        // `retries_due` pops the deadline it returns. A skip that scheduled
+        // nothing left the torrent with no deadline at all, and `file_error`
+        // arms only a torrent with no timer, so it was never retried again.
+        let clock = Arc::new(MockClock::new());
+        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+        let (state, h) = state_with_a_due_retry(clock.now());
+        let fenced = Arc::new(AtomicBool::new(true));
+        let fence: ProfileFenced = {
+            let fenced = Arc::clone(&fenced);
+            Arc::new(move |_: &ProfileId| fenced.load(Ordering::SeqCst))
+        };
+
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            Some(&fence),
+            clock.now(),
+        );
+        assert!(!resumed(&engine), "a fenced torrent was resumed");
+        let retry = state.get(&h.infohash).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 1, "a skip is not an attempt");
+        assert!(
+            retry.next_attempt > clock.now(),
+            "the skip scheduled another look"
+        );
+
+        fenced.store(false, Ordering::SeqCst);
+        clock.advance(crate::state::RetryState::INITIAL_DELAY);
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            Some(&fence),
+            clock.now(),
+        );
+        assert!(
+            resumed(&engine),
+            "the torrent was not retried after its fence lifted"
+        );
+    }
+
+    #[test]
+    fn a_retry_with_no_session_or_a_failed_resume_stays_scheduled() {
+        // The two other paths that popped a deadline and scheduled none.
+        let clock = Arc::new(MockClock::new());
+        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+
+        // No engine for the torrent's profile.
+        let empty: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![]));
+        let (state, h) = state_with_a_due_retry(clock.now());
+        execute_due_retries(&empty, &state, &metrics, &dyn_clock, None, clock.now());
+        let retry = state.get(&h.infohash).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 1);
+        assert!(retry.next_attempt > clock.now());
+        clock.advance(crate::state::RetryState::INITIAL_DELAY);
+        assert_eq!(
+            state.retries_due(clock.now()),
+            vec![h],
+            "the look was scheduled"
+        );
+
+        // `resume_torrent` fails: an attempt, so it backs off.
+        let engine = Arc::new(MockEngine::new());
+        engine.inject_error("resume_torrent", crate::engine::EngineError::Shutdown);
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let (state, h) = state_with_a_due_retry(clock.now());
+        execute_due_retries(&source, &state, &metrics, &dyn_clock, None, clock.now());
+        assert!(resumed(&engine));
+        let retry = state.get(&h.infohash).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 2, "a failed resume backs off");
+        clock.advance(crate::state::RetryState::delay_for_attempt(2));
+        execute_due_retries(&source, &state, &metrics, &dyn_clock, None, clock.now());
+        assert_eq!(
+            engine
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, crate::mock::RecordedCall::ResumeTorrent(_)))
+                .count(),
+            2,
+            "the retry after a failed resume never ran",
+        );
     }
 
     /// Drive one pass of the retry timer against a single mock-engine
