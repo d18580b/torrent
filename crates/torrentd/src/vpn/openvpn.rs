@@ -637,14 +637,16 @@ mod tests {
     /// substitution yields the empty string, the `&&` chain reaches the final
     /// `cmd sysctl`, that exits 127, and `cmd_up`'s `trap 'del_if; exit' EXIT`
     /// deletes the link it has just created — so a full-tunnel
-    /// `AllowedIPs = 0.0.0.0/0` profile, the shape every commercial provider
-    /// uses, cannot come up in the image at all and the daemon exits because
-    /// no profile came up.
+    /// `AllowedIPs = 0.0.0.0/0` link, the shape every commercial provider
+    /// uses, cannot be raised with `wg-quick` in the image. The daemon no
+    /// longer runs `wg-quick` on any path; the package stays for an operator
+    /// raising a link by hand inside the image, which is the consumer this
+    /// pins.
     ///
     /// **What this does and does not establish.** It pins the install list and
     /// the recorded reason, which is what a `grep` of this repository's own
     /// source for `pkill`/`pgrep` could never have reached — the consumer is a
-    /// third binary in a tool the daemon execs. It does **not** build the
+    /// third binary in a tool outside this repository. It does **not** build the
     /// image or bring a tunnel up in it; nothing in this repository does, and
     /// that gap is what let the regression ship. Remove `procps-ng` from the
     /// install list and this fails.
@@ -660,8 +662,8 @@ mod tests {
             install.contains("procps-ng"),
             "`wg-quick` runs `sysctl` on the IPv4 default-route path under \
              `set -e`, and /usr/sbin/sysctl is procps-ng's; without it no \
-             full-tunnel WireGuard profile can come up in this image; got: \
-             {install}",
+             full-tunnel WireGuard link can be raised by hand in this image; \
+             got: {install}",
         );
         assert!(
             containerfile.contains("sysctl") && containerfile.contains("wg-quick"),
