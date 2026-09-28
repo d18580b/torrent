@@ -118,6 +118,22 @@ pub(crate) fn ports_held_by_others<'a>(
     held
 }
 
+/// Whether a port is one every profile but `id` holds, read from `profiles`
+/// each time it is asked rather than copied up front.
+///
+/// A renewal's NAT-PMP exchange can take the best part of eight seconds.
+/// A copy made before it missed a rebind another profile's renewal made in
+/// that window, and both profiles then bound the port the two gateways had
+/// handed out. Read when the gateway has answered, the window is the other
+/// profile's `apply_settings` alone, and what still gets through is reported
+/// on the next renewal ([`renew_and_rebind`] asks of an unchanged port too).
+fn held_by_others_now(
+    profiles: Arc<ProfileRegistry>,
+    id: ProfileId,
+) -> impl Fn(u16) -> bool + Send + 'static {
+    move |p| ports_held_by_others(profiles.iter(), &id).contains(&p)
+}
+
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -234,7 +250,7 @@ async fn renew_profile(
         let Some(e) = profiles.resolve(&id).active() else {
             break;
         };
-        let taken = ports_held_by_others(profiles.iter(), &id);
+        let taken = held_by_others_now(profiles.clone(), id.clone());
         let next = renew_once(e, &*metrics, &forwarder, taken).await;
         delay = next.delay;
         if let Some(detected) = next.rebound_at {
@@ -344,12 +360,13 @@ fn record_reannounce(metrics: &dyn MetricsSink, id: &ProfileId, r: Reannounce) {
 }
 
 /// Renew `e`'s mapping once, record what happened, and say when the next
-/// attempt is due. `taken` is every port another profile holds.
+/// attempt is due. `taken` says whether another profile holds a port; it is
+/// asked once the gateway has answered ([`held_by_others_now`]).
 async fn renew_once(
     e: &ProfileEntry,
     metrics: &dyn MetricsSink,
     forwarder: &Arc<dyn PortForwarder>,
-    taken: BTreeSet<u16>,
+    taken: impl Fn(u16) -> bool + Send + 'static,
 ) -> Next {
     let profile_id = e.id().clone();
     let health = e.health();
@@ -396,7 +413,7 @@ async fn renew_once(
                 previous_port,
                 previous_epoch,
                 tunnel_ip,
-                |p| taken.contains(&p),
+                taken,
             )
         })
         .await
@@ -559,12 +576,22 @@ pub(crate) fn record_outcome(
             );
             metrics.set_gauge("profile_port_forward_up", 0.0, &labels);
             e.update_health(|h| h.port_forward_ok = false);
-            warn!(
-                target: "torrentd::port_forward_monitor",
-                profile_id = %profile_id, previous_port = previous, new_port = new,
-                "NAT-PMP renewed onto a port another profile holds; not binding it, since two \
-                 profiles announcing one port are correlatable. Still seeding on the old port",
-            );
+            if previous == new {
+                warn!(
+                    target: "torrentd::port_forward_monitor",
+                    profile_id = %profile_id, forwarded_port = new,
+                    "the forwarded port this profile is bound to is also another profile's; \
+                     two profiles announcing one port are correlatable",
+                );
+            } else {
+                warn!(
+                    target: "torrentd::port_forward_monitor",
+                    profile_id = %profile_id, previous_port = previous, new_port = new,
+                    "NAT-PMP renewed onto a port another profile holds; not binding it, since \
+                     two profiles announcing one port are correlatable. Still seeding on the \
+                     old port",
+                );
+            }
             false
         }
         RenewOutcome::RebindFailed { previous, new } => {
@@ -691,6 +718,11 @@ mod tests {
         Arc::new(m.clone())
     }
 
+    /// No other profile holds any port.
+    fn free(_: u16) -> bool {
+        false
+    }
+
     fn gauge(sink: &RecordingSink, name: &str) -> Option<f64> {
         sink.calls().into_iter().rev().find_map(|c| match c {
             MetricCall::SetGauge { name: n, value, .. } if n == name => Some(value),
@@ -726,11 +758,11 @@ mod tests {
         });
         fwd.push_ok(6881);
 
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), BTreeSet::new()).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), free).await;
         assert_eq!(next.delay, RETRY_INTERVAL, "a failure is retried promptly");
         assert!(!entry.health().port_forward_ok);
 
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), BTreeSet::new()).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), free).await;
         assert_eq!(next.delay, RENEW_INTERVAL);
         assert!(entry.health().port_forward_ok);
 
@@ -748,24 +780,12 @@ mod tests {
         let (entry, _) = natpmp_entry("acct_a", 6881);
         let fwd = MockForwarder::new();
         fwd.push_ok_lifetime(6881, 40);
-        let next = renew_once(
-            &entry,
-            &RecordingSink::new(),
-            &forwarder(&fwd),
-            BTreeSet::new(),
-        )
-        .await;
+        let next = renew_once(&entry, &RecordingSink::new(), &forwarder(&fwd), free).await;
         assert_eq!(next.delay, Duration::from_secs(20));
 
         // Longer than asked for: still half the requested lease.
         fwd.push_ok_lifetime(6881, 3600);
-        let next = renew_once(
-            &entry,
-            &RecordingSink::new(),
-            &forwarder(&fwd),
-            BTreeSet::new(),
-        )
-        .await;
+        let next = renew_once(&entry, &RecordingSink::new(), &forwarder(&fwd), free).await;
         assert_eq!(next.delay, RENEW_INTERVAL);
     }
 
@@ -773,13 +793,7 @@ mod tests {
     async fn a_renewal_asks_to_keep_the_held_port() {
         let (entry, _) = natpmp_entry("acct_a", 51413);
         let fwd = MockForwarder::with_ports([51413]);
-        renew_once(
-            &entry,
-            &RecordingSink::new(),
-            &forwarder(&fwd),
-            BTreeSet::new(),
-        )
-        .await;
+        renew_once(&entry, &RecordingSink::new(), &forwarder(&fwd), free).await;
         let calls = fwd.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].suggested_port, 51413);
@@ -804,7 +818,7 @@ mod tests {
         let sink = Arc::new(RecordingSink::new());
         let fwd = MockForwarder::with_ports([40001]);
 
-        let next = renew_once(&entry, &*sink, &forwarder(&fwd), BTreeSet::new()).await;
+        let next = renew_once(&entry, &*sink, &forwarder(&fwd), free).await;
         assert_eq!(next.delay, RENEW_INTERVAL);
         let detected = next.rebound_at.expect("the session was rebound");
         assert!(
@@ -963,7 +977,7 @@ mod tests {
         let (entry, engine) = natpmp_entry("acct_a", 6881);
         let sink = RecordingSink::new();
         let fwd = MockForwarder::with_ports([40001]);
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), BTreeSet::from([40001])).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), |p| p == 40001).await;
         assert_eq!(next.delay, RETRY_INTERVAL);
         assert!(next.rebound_at.is_none());
         assert_eq!(
@@ -976,6 +990,77 @@ mod tests {
             .iter()
             .any(|c| matches!(c, torrentd_engine::RecordedCall::ApplySettings(_))));
         assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
+    }
+
+    /// A forwarder that, while its exchange is on the wire, has another
+    /// profile's renewal rebind onto the port it is about to hand out.
+    #[derive(Debug)]
+    struct RacedForwarder {
+        profiles: Arc<ProfileRegistry>,
+        other: ProfileId,
+        port: u16,
+    }
+
+    impl PortForwarder for RacedForwarder {
+        fn map(&self, _: &PortMapRequest) -> Result<torrentd_engine::MapResult, PortForwardError> {
+            let other = self.profiles.resolve(&self.other).active().unwrap();
+            other.update_health(|h| h.forwarded_port = Some(self.port));
+            Ok(torrentd_engine::MapResult {
+                port: self.port,
+                epoch: 1,
+                udp_mapped: true,
+                lifetime_secs: LEASE_SECS,
+            })
+        }
+    }
+
+    /// The held ports are read once the gateway has answered, not copied
+    /// before the exchange. At the head this replaces they were copied first,
+    /// and a port another profile rebound onto during the (up to ~8s)
+    /// exchange was bound a second time.
+    #[tokio::test]
+    async fn a_port_another_profile_took_during_the_exchange_is_not_bound() {
+        let (a, engine) = natpmp_entry("acct_a", 6881);
+        let (b, _) = natpmp_entry("acct_b", 6882);
+        let profiles = Arc::new(ProfileRegistry::new(vec![a, b]));
+        let fwd: Arc<dyn PortForwarder> = Arc::new(RacedForwarder {
+            profiles: profiles.clone(),
+            other: ProfileId::new("acct_b"),
+            port: 40001,
+        });
+        let id = ProfileId::new("acct_a");
+        let a = profiles.resolve(&id).active().unwrap();
+        let sink = RecordingSink::new();
+
+        let next = renew_once(
+            a,
+            &sink,
+            &fwd,
+            held_by_others_now(profiles.clone(), id.clone()),
+        )
+        .await;
+
+        assert!(next.rebound_at.is_none(), "not rebound");
+        assert_eq!(a.health().forwarded_port, Some(6881));
+        assert!(!engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::ApplySettings(_))));
+        assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
+    }
+
+    /// Two profiles already bound to one port — the race above won by both —
+    /// are reported on the next renewal, and counted under `port_taken`.
+    #[tokio::test]
+    async fn a_port_two_profiles_are_already_bound_to_is_reported() {
+        let (entry, _) = natpmp_entry("acct_a", 40001);
+        let sink = RecordingSink::new();
+        let fwd = MockForwarder::with_ports([40001]);
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), |p| p == 40001).await;
+        assert_eq!(next.delay, RETRY_INTERVAL);
+        assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
+        assert_eq!(sink.count_for(FAILURES), 1);
+        assert!(!entry.health().port_forward_ok);
     }
 
     #[test]

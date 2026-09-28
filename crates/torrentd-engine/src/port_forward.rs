@@ -219,10 +219,13 @@ pub enum RenewOutcome {
     /// Renewed with a new port but re-applying the listen interface failed; the
     /// session is still bound to the old port.
     RebindFailed { previous: u16, new: u16 },
-    /// Renewed with a new port that another profile already listens on, so
-    /// the session was **not** rebound to it: two profiles announcing one
-    /// port are correlatable by a tracker operator even from different
-    /// addresses (profile Safety Rule 8). The session stays on the old port.
+    /// Renewed onto a port that another profile already listens on. When
+    /// `new` differs from `previous` the session was **not** rebound to it:
+    /// two profiles announcing one port are correlatable by a tracker
+    /// operator even from different addresses (profile Safety Rule 8), and
+    /// the session stays on the old port. When they are equal, the session
+    /// is already on it — two renewals raced onto one port — and this is
+    /// the collision being reported rather than prevented.
     PortTaken { previous: u16, new: u16 },
     /// The renewal request itself failed; the previous mapping is kept.
     RenewFailed(PortForwardError),
@@ -259,7 +262,11 @@ pub struct Reannounce {
 /// `port_taken` says whether another profile already listens on a port; a new
 /// port it claims is not bound ([`RenewOutcome::PortTaken`]). Gateways assign
 /// ports independently, so two profiles on two gateways can be handed the same
-/// one.
+/// one. It is asked once the gateway has answered, so a caller that reads the
+/// other profiles' ports live sees any rebind that landed during the
+/// exchange; and it is asked of an unchanged port too, so two renewals that
+/// both rebound onto one port before either saw the other are reported on
+/// the next renewal instead of standing unseen.
 ///
 /// A gateway reboot (epoch regression vs `previous_epoch`) needs no special
 /// recovery here: the `map` call above already re-created the dropped mapping,
@@ -282,6 +289,15 @@ pub fn renew_and_rebind(
         }) => {
             let detected = Instant::now();
             let rebooted = gateway_rebooted(previous_epoch, epoch);
+            // Asked on the unchanged path too: a port bound already can have
+            // become another profile's since, and a collision that got past
+            // the rebind check is then still seen and counted.
+            if port_taken(port) {
+                return RenewOutcome::PortTaken {
+                    previous: previous_port,
+                    new: port,
+                };
+            }
             if port == previous_port {
                 return RenewOutcome::Unchanged {
                     port,
@@ -289,12 +305,6 @@ pub fn renew_and_rebind(
                     rebooted,
                     udp_mapped,
                     lifetime_secs,
-                };
-            }
-            if port_taken(port) {
-                return RenewOutcome::PortTaken {
-                    previous: previous_port,
-                    new: port,
                 };
             }
             let settings = Settings {
@@ -486,9 +496,7 @@ mod tests {
         let fwd = MockForwarder::with_ports([6881]);
         let eng = MockEngine::new();
         let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel, |_| {
-            panic!("a steady-state renewal does not look at other profiles' ports")
-        });
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel, port_free);
         assert!(matches!(
             out,
             RenewOutcome::Unchanged {
@@ -597,6 +605,28 @@ mod tests {
             .calls()
             .iter()
             .any(|c| matches!(c, RecordedCall::ApplySettings(_))));
+    }
+
+    /// Two renewals on two gateways can both rebind onto one port before
+    /// either sees the other's. The next renewal of either finds its port
+    /// unchanged; asked only of a new port, the collision (Safety Rule 8)
+    /// then went unreported for as long as it stood.
+    #[test]
+    fn an_unchanged_port_another_profile_now_holds_is_reported() {
+        let fwd = MockForwarder::with_ports([40001]);
+        let eng = MockEngine::new();
+        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
+        let out = renew_and_rebind(&fwd, &eng, &req(), 40001, 0, tunnel, |p| p == 40001);
+        assert!(
+            matches!(
+                out,
+                RenewOutcome::PortTaken {
+                    previous: 40001,
+                    new: 40001
+                }
+            ),
+            "got {out:?}"
+        );
     }
 
     /// Half the granted lease, with a floor. At a9eb5a1 the lease the gateway
