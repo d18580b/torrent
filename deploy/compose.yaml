@@ -5,6 +5,18 @@ services:
       dockerfile: deploy/Containerfile
     image: torrentd:latest
     restart: unless-stopped
+    # A tini-style init as PID 1: it forwards SIGTERM to the daemon and reaps
+    # the `ip`/`wg`/`nft` children it execs. Without it the daemon is PID 1,
+    # which the kernel shields from signals it installed no handler for, and
+    # nothing reaps an orphaned child.
+    init: true
+    # How long `stop` waits between SIGTERM and SIGKILL. The default is 10s;
+    # a graceful shutdown flushes resume data for every torrent and removes
+    # the kill switch, which at tens of thousands of torrents takes longer.
+    # A SIGKILL mid-drain leaves resume saves unwritten
+    # (torrentd_last_shutdown_unsaved_resumes on the next boot), and with the
+    # kill switch on, the nftables table installed.
+    stop_grace_period: 180s
     # Only a `network = "vpn"` profile needs these: bringing up WireGuard
     # tunnels, and installing the nftables table when
     # network_kill_switch = true. Granted by default is granted to deployments
@@ -14,6 +26,21 @@ services:
     # non-root uid with no ambient and no file capabilities gets nothing
     # effective from it, so the tunnel still fails with EPERM. The
     # Containerfile's own comment beside that USER line says the same thing.
+    #
+    # **A vpn profile and `network_kill_switch = true` cannot be combined in
+    # this container.** The two requirements exclude each other:
+    #
+    # - the tunnel needs CAP_NET_ADMIN *effective*, which a compose file can
+    #   only deliver by running as root (`user: "0:0"`), for the reason above;
+    # - the kill switch matches the daemon's traffic by uid and refuses uid 0,
+    #   because `meta skuid 0 drop` would drop every other root-owned socket in
+    #   the namespace (`vpn::killswitch::refusal_for_uid`).
+    #
+    # Neither half is fixable here: compose has no key that raises an ambient
+    # capability for a non-root user. Run a vpn profile in this container
+    # without the kill switch, or run the daemon from deploy/torrentd.service,
+    # which grants CAP_NET_ADMIN to its own non-root user with
+    # `AmbientCapabilities=` and supports both together.
     # user: "0:0"
     # cap_add:
     #   - NET_ADMIN
@@ -50,6 +77,18 @@ services:
       - front
     volumes:
       - ./torrentd.toml:/etc/torrentd/torrentd.toml:ro
+      # The state directory itself, not only the two stores inside it. The
+      # daemon keeps its state beside resume_dir: the assignment registry
+      # (profile_assignments.json), the pool index (pool.db), each profile's
+      # DHT state (session_state-<id>.dat), last_shutdown.json and the
+      # single-instance lock. Mounting only resume/ and torrents/ left those in
+      # the container layer, so a rebuild or `compose up --force-recreate` lost
+      # which torrent belongs to which account — the record the cross-profile
+      # uniqueness rule is enforced from — and the pool index with it.
+      #
+      # resume/ and torrents/ keep their own volumes, nested inside this one,
+      # so a deployment upgrading from the two-volume layout keeps its data.
+      - torrentd-state:/var/lib/torrentd
       - torrentd-resume:/var/lib/torrentd/resume
       - torrentd-torrents:/var/lib/torrentd/torrents
       # Only needed by a `network = "vpn"` profile.
@@ -116,6 +155,7 @@ networks:
           ip_range: 172.28.0.128/25
 
 volumes:
+  torrentd-state:
   torrentd-resume:
   torrentd-torrents:
   caddy-data:
