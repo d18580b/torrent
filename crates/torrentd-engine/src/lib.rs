@@ -14,6 +14,7 @@ pub mod clock;
 pub mod engine;
 pub mod handlers;
 pub mod metrics;
+#[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 pub mod policy;
 pub mod port_forward;
@@ -58,7 +59,9 @@ pub use libtorrent_safe::TrackerEntry;
 pub use metrics::MetricsSink;
 pub use metrics::NoopSink;
 pub use metrics::RecordingSink;
+#[cfg(any(test, feature = "test-support"))]
 pub use mock::MockEngine;
+#[cfg(any(test, feature = "test-support"))]
 pub use mock::RecordedCall;
 pub use policy::discovery_guards;
 pub use policy::resume_flags_set;
@@ -66,6 +69,7 @@ pub use policy::seed_flags;
 pub use policy::verify_flags;
 pub use port_forward::renew_and_rebind;
 pub use port_forward::MapResult;
+#[cfg(any(test, feature = "test-support"))]
 pub use port_forward::MockForwarder;
 pub use port_forward::PortForwardError;
 pub use port_forward::PortForwardMode;
@@ -94,6 +98,7 @@ pub use state::TorrentState;
 pub use torrent_store::FsTorrentStore;
 pub use torrent_store::MemoryTorrentStore;
 pub use torrent_store::TorrentStore;
+#[cfg(any(test, feature = "test-support"))]
 pub use vpn::MockVpn;
 pub use vpn::VpnError;
 pub use vpn::VpnManager;

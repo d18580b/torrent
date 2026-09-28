@@ -34,6 +34,13 @@ hex = { workspace = true }
 once_cell = { workspace = true }
 tempfile = { workspace = true }
 
+[features]
+# The test doubles: `MockEngine`, `MockVpn` and `MockForwarder`. Compiled into
+# this crate's own tests regardless; a dependent crate enables this for its
+# tests (a dev-dependency) or for the alert drill's `fault-injection` build,
+# and a release build of the daemon carries none of them.
+test-support = []
+
 [dev-dependencies]
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

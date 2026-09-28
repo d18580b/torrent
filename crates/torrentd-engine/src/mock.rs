@@ -21,6 +21,10 @@
 //! loop, or panic a task. A long-running process calls `pop_alerts` many
 //! times a second, so that build turns the call recorder off with
 //! `without_recording`.
+//!
+//! Compiled only for this crate's tests and under the `test-support` feature,
+//! which `torrentd` enables for its own tests and for `fault-injection`. A
+//! release daemon carries no test double.
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
@@ -80,7 +84,8 @@ pub enum RecordedCall {
         new_path: String,
         flags: MoveFlags,
     },
-    ApplySettings(Settings),
+    /// Boxed: `Settings` is several times the size of every other variant.
+    ApplySettings(Box<Settings>),
     SessionState,
     TorrentDetails(TorrentHandle),
     TorrentFiles(TorrentHandle),
@@ -481,7 +486,7 @@ impl TorrentEngine for MockEngine {
     }
 
     fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError> {
-        self.record(RecordedCall::ApplySettings(settings.clone()));
+        self.record(RecordedCall::ApplySettings(Box::new(settings.clone())));
         self.check_error("apply_settings")
     }
 

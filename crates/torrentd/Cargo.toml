@@ -57,9 +57,11 @@ sha1 = { workspace = true }
 # The alert drill's build (deploy/drill): layers a MockEngine over every
 # session and mounts `POST /v1/faults` to queue alerts, stall the alert loop,
 # or panic a task. Never enable it for a deployment; no release image does.
-fault-injection = []
+fault-injection = ["torrentd-engine/test-support"]
 
 [dev-dependencies]
+# The engine's test doubles, for this crate's unit tests only.
+torrentd-engine = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 kynos = { workspace = true, features = ["test-util"] }
 
