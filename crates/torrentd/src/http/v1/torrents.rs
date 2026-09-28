@@ -88,6 +88,12 @@ macro_rules! torrent_error {
 pub enum TorrentPhase {
     /// libtorrent is hashing pieces; the torrent is not seeding yet.
     Checking,
+    /// A magnet whose metadata has not arrived yet.
+    AwaitingMetadata,
+    /// Pieces are missing from the payload, and the torrent never downloads
+    /// them: its check failed, or the payload was never there. Supply the
+    /// payload and recheck.
+    Incomplete,
     /// Has metadata but no peers yet; rare for a seeder.
     Idle,
     /// Seeding.
@@ -107,8 +113,10 @@ pub enum TorrentPhase {
 }
 
 impl TorrentPhase {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 10] = [
         Self::Checking,
+        Self::AwaitingMetadata,
+        Self::Incomplete,
         Self::Idle,
         Self::Seeding,
         Self::Paused,
@@ -121,6 +129,8 @@ impl TorrentPhase {
     fn as_str(self) -> &'static str {
         match self {
             Self::Checking => "checking",
+            Self::AwaitingMetadata => "awaiting_metadata",
+            Self::Incomplete => "incomplete",
             Self::Idle => "idle",
             Self::Seeding => "seeding",
             Self::Paused => "paused",
@@ -135,6 +145,8 @@ impl TorrentPhase {
         use torrentd_engine::TorrentPhase as P;
         match state.map(|s| s.phase) {
             Some(P::Checking) => Self::Checking,
+            Some(P::AwaitingMetadata) => Self::AwaitingMetadata,
+            Some(P::Incomplete) => Self::Incomplete,
             Some(P::Idle) => Self::Idle,
             Some(P::Seeding) => Self::Seeding,
             Some(P::Paused) => Self::Paused,

@@ -1104,6 +1104,19 @@ mod tests {
     }
 
     #[test]
+    fn a_torrent_whose_check_found_pieces_missing_retires_its_timer() {
+        // The check ended and libtorrent reports `downloading`: pieces are
+        // missing, and there is no error left for a resume to clear. It used
+        // to keep reporting `Checking`, so the timer deferred for as long.
+        let (engine, state, _) = run_due_retry_in(false, TorrentPhase::Incomplete, 5);
+        assert!(!resumed(&engine));
+        assert!(
+            state.get(&InfoHash([9u8; 20])).unwrap().retry.is_none(),
+            "the timer retires once the check is over",
+        );
+    }
+
+    #[test]
     fn a_check_that_fails_again_resumes_on_the_kept_backoff() {
         // The check the previous resume started failed: libtorrent paused the
         // torrent and set its error again, and the timer held its count. The

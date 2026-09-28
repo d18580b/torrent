@@ -9092,6 +9092,8 @@
         "type": "string",
         "enum": [
           "checking",
+          "awaiting_metadata",
+          "incomplete",
           "idle",
           "seeding",
           "paused",
