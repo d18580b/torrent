@@ -118,6 +118,14 @@ pub struct Config {
     pub max_concurrent_http_announces: Option<u32>,
     #[serde(default)]
     pub upload_rate_limit: Option<u32>,
+    /// A fixed number of peers to unchoke per session.
+    ///
+    /// Absent, the session runs libtorrent's rate-based choker, which opens
+    /// slots while the upload rate achieved to them supports it (see
+    /// `Settings::server_seed_overrides`). Set, it selects the fixed-slots
+    /// choker with exactly this many. Read at startup.
+    #[serde(default)]
+    pub unchoke_slots_limit: Option<u32>,
     #[serde(default)]
     pub peer_fingerprint: Option<String>,
     #[serde(default)]
@@ -442,6 +450,14 @@ impl Config {
             0,
             i32::MAX as u32,
         )?;
+        // Zero unchokes nobody, which is a seeder that uploads nothing; the
+        // upper end keeps the value inside libtorrent's int setting.
+        range(
+            "unchoke_slots_limit",
+            self.unchoke_slots_limit,
+            1,
+            1_000_000,
+        )?;
 
         if let Some(auth) = &self.auth {
             auth.validate()?;
@@ -594,6 +610,7 @@ impl Config {
             aio_threads: new_aio_threads,
             max_concurrent_http_announces: new_max_concurrent_http_announces,
             upload_rate_limit: new_upload_rate_limit,
+            unchoke_slots_limit: new_unchoke_slots_limit,
             peer_fingerprint: new_peer_fingerprint,
             user_agent: new_user_agent,
             vpn_handshake_max_age_secs: new_vpn_handshake_max_age_secs,
@@ -684,6 +701,12 @@ impl Config {
             // field in this list.
             d.non_reloadable_changes.push("file_pool_size");
         }
+        // Not reloadable: it also chooses the choker, and a reload that
+        // switched algorithms under live peers is not something this daemon
+        // has ever tested.
+        if old.unchoke_slots_limit != *new_unchoke_slots_limit {
+            d.non_reloadable_changes.push("unchoke_slots_limit");
+        }
         if old.peer_fingerprint != *new_peer_fingerprint {
             d.non_reloadable_changes.push("peer_fingerprint");
         }
@@ -768,6 +791,11 @@ impl Config {
         }
         if let Some(v) = self.upload_rate_limit {
             s.upload_rate_limit = Some(v);
+        }
+        if let Some(v) = self.unchoke_slots_limit {
+            // `validate` holds it to 1..=1_000_000, so it fits the i32.
+            s.choking_algorithm = Some(libtorrent_safe::Settings::FIXED_SLOTS_CHOKER);
+            s.unchoke_slots_limit = Some(i32::try_from(v).unwrap_or(i32::MAX));
         }
         if let Some(v) = self.peer_fingerprint.as_ref() {
             s.peer_fingerprint = Some(v.clone());
@@ -1571,6 +1599,7 @@ impl Config {
             aio_threads: None,
             max_concurrent_http_announces: None,
             upload_rate_limit: None,
+            unchoke_slots_limit: None,
             peer_fingerprint: None,
             user_agent: None,
             vpn_handshake_max_age_secs: Self::default_handshake_max_age(),
@@ -3524,6 +3553,48 @@ library_dir = "{d}/library"
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("upload_rate_limit"), "got: {msg}");
         assert!(msg.contains("out of range"), "got: {msg}");
+    }
+
+    #[test]
+    fn an_absent_unchoke_slots_limit_leaves_the_rate_based_choker() {
+        let dir = tempdir().unwrap();
+        let c = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let s = c.libtorrent_settings();
+        assert_eq!(
+            s.choking_algorithm,
+            Some(libtorrent_safe::Settings::RATE_BASED_CHOKER)
+        );
+        assert_eq!(
+            s.unchoke_slots_limit,
+            Some(libtorrent_safe::Settings::DEFAULT_UNCHOKE_SLOTS)
+        );
+    }
+
+    #[test]
+    fn an_unchoke_slots_limit_selects_the_fixed_slots_choker_with_that_many() {
+        let dir = tempdir().unwrap();
+        let body = with_top_level("unchoke_slots_limit = 64");
+        let c = Config::load(&write_cfg(dir.path(), &body)).unwrap();
+        let s = c.libtorrent_settings();
+        assert_eq!(
+            s.choking_algorithm,
+            Some(libtorrent_safe::Settings::FIXED_SLOTS_CHOKER)
+        );
+        assert_eq!(s.unchoke_slots_limit, Some(64));
+
+        let zero = with_top_level("unchoke_slots_limit = 0");
+        let msg = format!(
+            "{:#}",
+            Config::load(&write_cfg(dir.path(), &zero)).unwrap_err()
+        );
+        assert!(msg.contains("unchoke_slots_limit"), "got: {msg}");
+
+        let mut other = c.clone();
+        other.unchoke_slots_limit = Some(128);
+        assert_eq!(
+            Config::diff(&c, &other).non_reloadable_changes,
+            vec!["unchoke_slots_limit"],
+        );
     }
 
     #[test]

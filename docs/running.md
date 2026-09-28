@@ -207,6 +207,7 @@ authentication posture, and at least one `[[profile]]`:
 | `vpn_handshake_max_age_secs` | `180` |
 | `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN profile**; see §11.6 |
 | `connections_limit`, `file_pool_size`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
+| `unchoke_slots_limit` | unset: libtorrent's rate-based choker, which unchokes as many peers as the achieved upload rate supports. Set, it unchokes exactly that many per session (fixed-slots choker). Read once, at startup. |
 | `peer_fingerprint`, `user_agent` | libtorrent's own; a profile may override |
 
 Numeric overrides are range-checked at startup, so `aio_threads = 0` is refused
