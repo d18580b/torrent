@@ -266,6 +266,14 @@ pub const CATALOGUE: &[Series] = &[
         Seed::Zero,
         "Times libtorrent's alert queue overflowed and dropped alerts.",
     ),
+    series(
+        "resume_saves_requeued_total",
+        Counter,
+        Daemon,
+        Seed::Zero,
+        "Resume saves asked for again because an alert-queue overflow may have dropped their \
+         answer.",
+    ),
     labelled(
         "tracker_alerts_total",
         Counter,

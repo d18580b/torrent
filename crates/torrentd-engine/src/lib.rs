@@ -36,6 +36,8 @@ pub use alert_loop::AlertLoopHandle;
 pub use alert_loop::FatalCallback;
 pub use alert_loop::ProfileFenced;
 pub use alert_loop::ShutdownReason;
+pub use alert_loop::DEFAULT_SHUTDOWN_DEADLINE;
+pub use alert_loop::POST_UPDATES_INTERVAL;
 pub use clock::Clock;
 pub use clock::MockClock;
 pub use clock::SystemClock;

@@ -1,9 +1,9 @@
 //! Resume-data success / failure handlers.
 //!
 //! These are the two alerts that resolve an outstanding
-//! `engine.save_resume_data(handle, flags)`. The state map's
-//! `pending_resume_count` is decremented here; the shutdown coordinator
-//! waits for it to reach zero.
+//! `engine.save_resume_data(handle, flags)`. The state map's in-flight entry
+//! for the torrent is settled here; the shutdown coordinator waits for every
+//! one to settle.
 
 use libtorrent_safe::Alert;
 use tracing::debug;
@@ -20,7 +20,6 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     target: "torrentd_engine::handler::resume",
                     "save_resume_data alert missing infohash",
                 );
-                ctx.state.note_resume_settled();
                 return;
             };
             match ctx.resume.write(&ctx.profile_id, &ih, data.as_bytes()) {
@@ -53,7 +52,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     );
                 }
             }
-            ctx.state.note_resume_settled();
+            ctx.state.note_resume_settled(&ih);
         }
         Alert::SaveResumeDataFailed {
             hdr,
@@ -79,7 +78,9 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     &[("profile_id", ctx.profile_id.as_str())],
                 );
             }
-            ctx.state.note_resume_settled();
+            if let Some(ih) = hdr.infohash {
+                ctx.state.note_resume_settled(&ih);
+            }
         }
         _ => unreachable!("resume::handle called with non-resume alert"),
     }

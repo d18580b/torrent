@@ -5,11 +5,17 @@
 //! belongs to, its libtorrent state, and timer / counter state used by
 //! the alert handlers and the shutdown coordinator.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::time::Duration;
 use std::time::Instant;
 
 use dashmap::DashMap;
 use libtorrent_safe::InfoHash;
+use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::TorrentHandle;
 use parking_lot::Mutex;
 
@@ -185,24 +191,56 @@ impl TorrentState {
     }
 }
 
+/// Resume saves the daemon wants and has not yet seen settle, per info-hash.
+///
+/// Two sets rather than one counter. A single counter could not say *which*
+/// saves were outstanding, so a save whose alert libtorrent dropped on an
+/// overflow held the shutdown drain open until its deadline with nothing able
+/// to re-request it, and a stray settle for a torrent never asked about
+/// decremented somebody else's save.
+///
+/// * `queued` — wanted, not yet handed to libtorrent. Filled without bound;
+///   one entry per info-hash, so a second request for a queued torrent is a
+///   no-op.
+/// * `in_flight` — handed to libtorrent, alert not back yet. Capped by the
+///   dispatcher (`StateMap::dispatch_resume_saves`), because every request
+///   becomes an alert, and a 100K-torrent burst into a bounded alert queue is
+///   exactly how alerts get dropped.
+#[derive(Debug, Default)]
+struct ResumeSaves {
+    queued: VecDeque<(InfoHash, ResumeFlags)>,
+    queued_set: HashSet<InfoHash>,
+    in_flight: HashMap<InfoHash, ResumeFlags>,
+}
+
+/// Retry deadlines, earliest on top: `(next_attempt, infohash bytes)`.
+type RetrySchedule = BinaryHeap<Reverse<(Instant, [u8; 20])>>;
+
 /// Concurrent state map: `infohash → TorrentState`. Insertion is
 /// thread-safe (`DashMap`), reads use lock-free shards.
 ///
-/// `pending_resume_count` is a single atomic-ish counter used by the
-/// shutdown coordinator: every `save_resume_data` increments it; every
-/// `SaveResumeData{Failed}` alert handler decrements it. Shutdown blocks
-/// until it reaches zero.
+/// Also owns the bookkeeping the shutdown coordinator waits on — the resume
+/// saves still outstanding, per info-hash ([`ResumeSaves`]) — and the
+/// disk-error retry schedule as a min-heap, so the alert loop's per-iteration
+/// "is any retry due" costs a peek rather than a walk of every torrent.
 #[derive(Debug)]
 pub struct StateMap {
     inner: DashMap<InfoHash, TorrentState>,
-    pending_resume_count: Mutex<u64>,
+    saves: Mutex<ResumeSaves>,
+    /// `(next_attempt, infohash)` for every retry ever armed, earliest first.
+    /// Entries go stale when a retry is re-armed or retired; `retries_due`
+    /// checks each popped entry against the torrent's current `retry` and
+    /// drops the stale ones, so nothing has to find and remove them eagerly.
+    /// The info-hash is held as its bytes, which order; `InfoHash` does not.
+    retry_heap: Mutex<RetrySchedule>,
 }
 
 impl Default for StateMap {
     fn default() -> Self {
         Self {
             inner: DashMap::new(),
-            pending_resume_count: Mutex::new(0),
+            saves: Mutex::new(ResumeSaves::default()),
+            retry_heap: Mutex::new(BinaryHeap::new()),
         }
     }
 }
@@ -230,7 +268,11 @@ impl StateMap {
     }
 
     pub fn insert(&self, ih: InfoHash, state: TorrentState) {
+        let armed = state.retry.as_ref().map(|r| r.next_attempt);
         self.inner.insert(ih, state);
+        if let Some(at) = armed {
+            self.retry_heap.lock().push(Reverse((at, ih.0)));
+        }
     }
 
     pub fn remove(&self, ih: &InfoHash) -> Option<TorrentState> {
@@ -261,27 +303,62 @@ impl StateMap {
 
     /// Mutate the entry in place via a closure. Returns `false` if the
     /// entry doesn't exist (caller should log and move on).
+    ///
+    /// A closure that arms or re-arms the entry's retry timer is noticed here
+    /// and the new deadline scheduled, so no writer of `retry` has to know the
+    /// schedule exists.
     pub fn update<F: FnOnce(&mut TorrentState)>(&self, ih: &InfoHash, f: F) -> bool {
-        if let Some(mut entry) = self.inner.get_mut(ih) {
+        let rearmed = {
+            let Some(mut entry) = self.inner.get_mut(ih) else {
+                return false;
+            };
+            let before = entry.retry.as_ref().map(|r| r.next_attempt);
             f(entry.value_mut());
-            true
-        } else {
-            false
+            let after = entry.retry.as_ref().map(|r| r.next_attempt);
+            after.filter(|at| Some(*at) != before)
+        };
+        if let Some(at) = rearmed {
+            self.retry_heap.lock().push(Reverse((at, ih.0)));
         }
+        true
     }
 
     /// Snapshot every entry whose retry timer is due at `now`.
+    ///
+    /// Pops the schedule up to `now` instead of walking the map: at 100K
+    /// torrents the walk ran on every alert-loop iteration, ten times a
+    /// second, to find what is almost always nothing. A popped entry that no
+    /// longer matches the torrent's timer — re-armed later, retired, or the
+    /// torrent removed — is stale and dropped; the timer's live deadline has
+    /// its own entry.
     pub fn retries_due(&self, now: Instant) -> Vec<TorrentHandle> {
-        self.inner
-            .iter()
-            .filter_map(|e| {
-                e.value()
-                    .retry
+        let mut popped = Vec::new();
+        {
+            let mut heap = self.retry_heap.lock();
+            while heap.peek().is_some_and(|Reverse((at, _))| *at <= now) {
+                if let Some(Reverse((_, ih))) = heap.pop() {
+                    popped.push(InfoHash(ih));
+                }
+            }
+        }
+        let mut seen = HashSet::new();
+        popped
+            .into_iter()
+            .filter(|ih| seen.insert(*ih))
+            .filter_map(|ih| {
+                let e = self.inner.get(&ih)?;
+                e.retry
                     .as_ref()
                     .filter(|r| r.next_attempt <= now)
-                    .map(|_| e.value().handle)
+                    .map(|_| e.handle)
             })
             .collect()
+    }
+
+    /// How many retry-schedule entries are held, stale ones included.
+    #[cfg(test)]
+    fn retry_schedule_len(&self) -> usize {
+        self.retry_heap.lock().len()
     }
 
     /// Snapshot every torrent flagged with `needs_save_resume`.
@@ -293,19 +370,76 @@ impl StateMap {
             .collect()
     }
 
-    // --- pending_resume_count -----------------------------------------------
+    // --- resume saves ---------------------------------------------------------
 
-    pub fn note_resume_requested(&self) {
-        *self.pending_resume_count.lock() += 1;
-    }
-    pub fn note_resume_settled(&self) {
-        let mut g = self.pending_resume_count.lock();
-        if *g > 0 {
-            *g -= 1;
+    /// Ask for a resume save of `ih`. Returns `false` when one is already
+    /// queued or in flight: libtorrent answers each request with its own alert,
+    /// so a second request for the same torrent is a second alert for nothing.
+    pub fn queue_resume_save(&self, ih: InfoHash, flags: ResumeFlags) -> bool {
+        let mut s = self.saves.lock();
+        if s.in_flight.contains_key(&ih) || !s.queued_set.insert(ih) {
+            return false;
         }
+        s.queued.push_back((ih, flags));
+        true
     }
+
+    /// Move queued saves to in flight until `cap` are in flight, returning
+    /// the ones moved for the caller to hand to libtorrent. The caller reports
+    /// a request that never reached libtorrent through
+    /// [`StateMap::note_resume_settled`].
+    pub fn dispatch_resume_saves(&self, cap: usize) -> Vec<(InfoHash, ResumeFlags)> {
+        let mut s = self.saves.lock();
+        let room = cap.saturating_sub(s.in_flight.len());
+        let mut out = Vec::with_capacity(room.min(s.queued.len()));
+        while out.len() < room {
+            let Some((ih, flags)) = s.queued.pop_front() else {
+                break;
+            };
+            s.queued_set.remove(&ih);
+            s.in_flight.insert(ih, flags);
+            out.push((ih, flags));
+        }
+        out
+    }
+
+    /// The save for `ih` resolved — written, failed, not modified, or never
+    /// dispatched. Returns whether one was in flight; a settle for a torrent
+    /// nobody asked about (a save the API's fault injection queued, or a
+    /// duplicate answer to a re-request) changes nothing.
+    pub fn note_resume_settled(&self, ih: &InfoHash) -> bool {
+        self.saves.lock().in_flight.remove(ih).is_some()
+    }
+
+    /// Put every in-flight save back at the front of the queue, to be asked
+    /// for again with `flags`.
+    ///
+    /// For an `alerts_dropped_alert` that names the resume alerts: libtorrent
+    /// says only *which types* it dropped, never which torrents, so any save in
+    /// flight may be one whose answer is gone and will never settle. Asking
+    /// again is cheap and idempotent; waiting is the shutdown deadline. Returns
+    /// how many were re-queued.
+    pub fn requeue_in_flight_resume_saves(&self, flags: ResumeFlags) -> usize {
+        let mut s = self.saves.lock();
+        let lost: Vec<InfoHash> = s.in_flight.drain().map(|(ih, _)| ih).collect();
+        for ih in lost.iter().rev() {
+            if s.queued_set.insert(*ih) {
+                s.queued.push_front((*ih, flags));
+            }
+        }
+        lost.len()
+    }
+
+    /// Saves wanted and not yet settled, queued and in flight together. This
+    /// is what the shutdown drain waits to reach zero.
     pub fn pending_resume_count(&self) -> u64 {
-        *self.pending_resume_count.lock()
+        let s = self.saves.lock();
+        (s.queued.len() + s.in_flight.len()) as u64
+    }
+
+    /// Saves handed to libtorrent whose alert has not come back.
+    pub fn resume_saves_in_flight(&self) -> usize {
+        self.saves.lock().in_flight.len()
     }
 }
 
@@ -347,14 +481,124 @@ mod tests {
     }
 
     #[test]
-    fn pending_resume_counter_floors_at_zero() {
+    fn a_settle_for_a_torrent_nobody_asked_about_changes_nothing() {
+        // The global counter this replaced was decremented by any settle, so
+        // a stray one for torrent B released the drain while torrent A's save
+        // was still outstanding.
         let m = StateMap::new();
-        m.note_resume_settled();
-        assert_eq!(m.pending_resume_count(), 0);
-        m.note_resume_requested();
-        m.note_resume_requested();
-        m.note_resume_settled();
+        assert!(m.queue_resume_save(ih(1), ResumeFlags::empty()));
+        assert_eq!(m.dispatch_resume_saves(10).len(), 1);
+        assert!(!m.note_resume_settled(&ih(2)));
         assert_eq!(m.pending_resume_count(), 1);
+        assert!(m.note_resume_settled(&ih(1)));
+        assert_eq!(m.pending_resume_count(), 0);
+    }
+
+    #[test]
+    fn one_torrent_is_asked_for_once_however_often_it_is_queued() {
+        let m = StateMap::new();
+        assert!(m.queue_resume_save(ih(1), ResumeFlags::empty()));
+        assert!(!m.queue_resume_save(ih(1), ResumeFlags::empty()));
+        assert_eq!(m.dispatch_resume_saves(10).len(), 1);
+        // In flight counts as asked for, too.
+        assert!(!m.queue_resume_save(ih(1), ResumeFlags::empty()));
+        assert_eq!(m.pending_resume_count(), 1);
+    }
+
+    #[test]
+    fn dispatch_never_puts_more_than_the_cap_in_flight() {
+        let m = StateMap::new();
+        for b in 0..10 {
+            m.queue_resume_save(ih(b), ResumeFlags::empty());
+        }
+        assert_eq!(m.dispatch_resume_saves(4).len(), 4);
+        assert_eq!(
+            m.dispatch_resume_saves(4).len(),
+            0,
+            "the cap is already full"
+        );
+        m.note_resume_settled(&ih(0));
+        m.note_resume_settled(&ih(1));
+        assert_eq!(
+            m.dispatch_resume_saves(4).len(),
+            2,
+            "topped up as saves settle"
+        );
+        assert_eq!(m.resume_saves_in_flight(), 4);
+        assert_eq!(m.pending_resume_count(), 8);
+    }
+
+    #[test]
+    fn lost_saves_are_asked_for_again_first_with_the_new_flags() {
+        let m = StateMap::new();
+        for b in 0..3 {
+            m.queue_resume_save(ih(b), ResumeFlags::ONLY_IF_MODIFIED);
+        }
+        m.dispatch_resume_saves(2);
+        assert_eq!(m.requeue_in_flight_resume_saves(ResumeFlags::empty()), 2);
+        assert_eq!(m.resume_saves_in_flight(), 0);
+        assert_eq!(m.pending_resume_count(), 3);
+        let again = m.dispatch_resume_saves(2);
+        let mut got: Vec<u8> = again.iter().map(|(h, _)| h.0[0]).collect();
+        got.sort();
+        assert_eq!(got, vec![0, 1], "the lost ones go ahead of the queue");
+        assert!(again.iter().all(|(_, f)| f.is_empty()));
+    }
+
+    #[test]
+    fn a_rearmed_retry_fires_at_its_new_deadline_only() {
+        let m = StateMap::new();
+        let now = Instant::now();
+        let h = handle(1, 1);
+        let mut s = TorrentState::newly_added(h, ProfileId::new("p"), now);
+        s.retry = Some(RetryState {
+            next_attempt: now,
+            attempts: 1,
+        });
+        m.insert(h.infohash, s);
+        // Re-armed further out before it came due: the old entry is stale.
+        m.update(&h.infohash, |s| {
+            s.retry = Some(RetryState {
+                next_attempt: now + Duration::from_secs(60),
+                attempts: 2,
+            })
+        });
+        assert!(m.retries_due(now).is_empty(), "the stale deadline fired");
+        assert_eq!(
+            m.retries_due(now + Duration::from_secs(60)),
+            vec![h],
+            "the live deadline did not"
+        );
+        assert_eq!(m.retry_schedule_len(), 0, "popped entries are gone");
+    }
+
+    #[test]
+    fn a_retired_or_removed_retry_never_fires() {
+        let m = StateMap::new();
+        let now = Instant::now();
+        for (id, b) in [(1, 1u8), (2, 2)] {
+            let h = handle(id, b);
+            let mut s = TorrentState::newly_added(h, ProfileId::new("p"), now);
+            s.retry = Some(RetryState::first(now));
+            m.insert(h.infohash, s);
+        }
+        m.update(&ih(1), |s| s.retry = None);
+        m.remove(&ih(2));
+        assert!(m.retries_due(now + RetryState::MAX_DELAY).is_empty());
+    }
+
+    #[test]
+    fn an_update_that_leaves_the_retry_alone_schedules_nothing() {
+        let m = StateMap::new();
+        let now = Instant::now();
+        let h = handle(1, 1);
+        let mut s = TorrentState::newly_added(h, ProfileId::new("p"), now);
+        s.retry = Some(RetryState::first(now));
+        m.insert(h.infohash, s);
+        for _ in 0..100 {
+            m.update(&h.infohash, |s| s.num_peers += 1);
+        }
+        assert_eq!(m.retry_schedule_len(), 1);
     }
 
     #[test]
