@@ -1310,8 +1310,10 @@ where
             &cfg.session_state_path(&p.id),
             cleanup,
             forwarder,
-            &tunnel_owner,
-            &ports_taken_at_boot(cfg, &profile_entries, &p.id),
+            Held {
+                tunnels: &tunnel_owner,
+                ports: &ports_taken_at_boot(cfg, &profile_entries, &p.id),
+            },
             &mut make_engine,
         )
         .await
@@ -1330,6 +1332,17 @@ where
         }
     }
     Ok((profile_entries, failed_profiles))
+}
+
+/// What the profiles built so far already hold, which the next one must not
+/// share.
+#[derive(Clone, Copy)]
+struct Held<'a> {
+    /// Which profile holds each tunnel address.
+    tunnels: &'a std::collections::HashMap<IpAddr, ProfileId>,
+    /// Every port another profile holds or is configured with
+    /// ([`ports_taken_at_boot`]).
+    ports: &'a std::collections::BTreeSet<u16>,
 }
 
 /// The ports a NAT-PMP port for profile `except` must not collide with while
@@ -1361,8 +1374,7 @@ async fn build_profile<F, E>(
     session_state_path: &std::path::Path,
     cleanup: &mut BootCleanup,
     forwarder: &dyn PortForwarder,
-    tunnel_owner: &std::collections::HashMap<IpAddr, ProfileId>,
-    ports_taken: &std::collections::BTreeSet<u16>,
+    held: Held<'_>,
     make_engine: &mut F,
 ) -> Result<ProfileEntry, FailedProfile>
 where
@@ -1484,7 +1496,7 @@ where
                     fail_profile!(format!("VPN bring-up failed: {e}"));
                 }
             };
-            if let Some(owner) = tunnel_owner.get(&ip) {
+            if let Some(owner) = held.tunnels.get(&ip) {
                 error!(
                     profile_id = %p.id,
                     tunnel_ip = %ip,
@@ -1537,7 +1549,7 @@ where
                         lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
                     };
                     match forwarder.map(&req) {
-                        Ok(m) if ports_taken.contains(&m.port) => {
+                        Ok(m) if held.ports.contains(&m.port) => {
                             // Two gateways assign ports independently. A
                             // second profile announcing the same port is
                             // correlatable with the first by a tracker
