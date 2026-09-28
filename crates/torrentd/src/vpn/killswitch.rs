@@ -9,8 +9,19 @@
 //! This module adds an independent, **fail-closed** nftables ruleset so the
 //! daemon's own egress can only leave via loopback or a configured tunnel
 //! interface. If a tunnel disappears its `oifname` is gone and the packets are
-//! dropped by the kernel — no dependency on the source-bind or the 30s poll,
-//! and it also forces tracker DNS through the tunnel.
+//! dropped by the kernel — no dependency on the source-bind or the 30s poll.
+//!
+//! **It does not put DNS through the tunnel.** The ruleset matches sockets the
+//! daemon's uid owns. A tracker hostname is resolved by libc, and on a host
+//! with a local stub resolver — `systemd-resolved` on `127.0.0.53`, `dnsmasq`,
+//! `unbound` — the daemon's query goes to loopback, which the ruleset accepts,
+//! and the resolver forwards it upstream from *its own* uid over whatever
+//! interface its configuration picks, usually the physical one. Only a host
+//! whose `/etc/resolv.conf` names a remote resolver directly has the daemon's
+//! own socket send the query, and then the query is dropped unless it would
+//! leave by a tunnel. Which tracker hostnames the daemon looks up is therefore
+//! visible to the host's upstream resolver unless the resolver itself is
+//! pointed through a tunnel; see `docs/running.md`, "Kill switch".
 //!
 //! Opt-in (`network_kill_switch = true`); needs `CAP_NET_ADMIN` (the packaged
 //! systemd unit already grants it). The daemon's traffic is matched by its
@@ -38,12 +49,18 @@
 //!   refuses the kill switch beside an OpenVPN profile.
 //! - **Any profile as uid 0: never.** `meta skuid 0 counter drop` drops every
 //!   other root-owned socket on the host. [`refusal_for_uid`] refuses it.
-//! - **WireGuard as a dedicated uid with `CAP_NET_ADMIN`: yes.** `wg-quick`
-//!   re-execs itself through `sudo` unless its uid is 0, so a non-root daemon
+//! - **WireGuard as a dedicated uid with `CAP_NET_ADMIN`: yes.** The daemon
 //!   raises its links with `ip` and `wg` directly (see `vpn::wireguard`),
 //!   which need only the capability. A link root raised before the daemon
 //!   started, and which the daemon adopted, needs the same exemption and gets
 //!   it: the packets are the daemon's either way.
+//!
+//! **Installed in one transaction.** [`install_script`] declares the table,
+//! deletes it, and defines it again, and the whole script is one `nft -f`,
+//! which nftables commits atomically. The install used to be a delete and
+//! then a load, two commands with a window between them in which no kill
+//! switch was in force at all — and a load that failed after the delete
+//! succeeded left none in force for the rest of the run.
 //!
 //! **What it cuts off besides leaks: the HTTP API off loopback.** The chain
 //! hooks `output` and matches the socket's owner, and a reply on a connection
@@ -60,12 +77,11 @@
 //! same host (loopback), or scrape from inside the tunnel.
 
 use std::io;
-use std::io::Write;
-use std::process::Command;
-use std::process::Stdio;
 
 use torrentd_engine::profile::ProfileConfig;
 use tracing::info;
+
+use super::exec;
 
 /// nftables table this module owns. Torn down on graceful shutdown.
 pub const TABLE: &str = "torrentd_ks";
@@ -85,6 +101,11 @@ pub const TABLE: &str = "torrentd_ks";
 /// rejects with a syntax error in a file the operator never wrote. Config
 /// validation refuses such a name first; this keeps the renderer from emitting
 /// an unparseable ruleset for any caller that did not.
+///
+/// Test-only since the kill switch and `vpn check` both render through
+/// [`install_script`]: without the transport exemption this is the negative
+/// control the live tests install, not a ruleset anything ships.
+#[cfg(test)]
 pub fn render_ruleset(uid: u32, tunnels: &[String]) -> io::Result<String> {
     render_ruleset_with_transport(uid, tunnels, &[])
 }
@@ -152,6 +173,28 @@ pub fn render_ruleset_with_transport(
     ))
 }
 
+/// The script `enable` hands to `nft -f`, and the one `torrentd vpn check`
+/// dry-runs: [`render_ruleset_with_transport`], preceded by the two lines that
+/// make it replace whatever table of this name is standing in the same
+/// transaction.
+///
+/// `add table` creates the table if it is absent and is a no-op if it is not,
+/// so the `delete table` after it always has something to delete; the
+/// definition after that is then loaded into an empty table. `nft -f` commits
+/// a script as one transaction, so the kernel goes from the old ruleset to the
+/// new one with no instant in which neither is in force, and a script that
+/// fails anywhere changes nothing — a previous run's kill switch stays armed.
+///
+/// A replace is needed at all because `nft -f` *merges* a table definition
+/// into an existing table: loaded over a stale one, the old run's tunnel
+/// interfaces would still be accepted.
+pub fn install_script(uid: u32, tunnels: &[String], transport_ports: &[u16]) -> io::Result<String> {
+    let table = render_ruleset_with_transport(uid, tunnels, transport_ports)?;
+    Ok(format!(
+        "add table inet {TABLE}\ndelete table inet {TABLE}\n{table}"
+    ))
+}
+
 /// Effective uid of this process, read from `/proc/self/status` (Linux-only,
 /// which the daemon already requires) so no `libc` dependency is needed.
 pub fn current_uid() -> io::Result<u32> {
@@ -176,13 +219,7 @@ pub fn current_uid() -> io::Result<u32> {
 /// Whether the `nft` binary is usable. Used by `--check-config` to fail early
 /// when the kill switch is requested on a host without nftables.
 pub fn nft_available() -> bool {
-    Command::new("nft")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    exec::available("nft", "--version")
 }
 
 /// Why `enable` must refuse to install a ruleset for `uid`, or `None` if it
@@ -219,11 +256,12 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
 /// Install the kill switch for the current process's uid, confining egress to
 /// loopback + `tunnels`, with each tunnel's own transport exempted (see
 /// [`render_ruleset_with_transport`]). Returns the uid the ruleset was written
-/// for. Replaces any stale table left by a previous unclean exit first.
+/// for. Replaces any stale table left by a previous unclean exit in the same
+/// transaction ([`install_script`]).
 ///
 /// Refuses uid 0 outright — see [`refusal_for_uid`].
 pub fn enable(tunnels: &[String]) -> io::Result<u32> {
-    enable_for_uid(current_uid()?, tunnels, listen_port, disable, apply)
+    enable_for_uid(current_uid()?, tunnels, listen_port, apply)
 }
 
 /// The UDP port the WireGuard link `iface` listens on, from
@@ -234,19 +272,12 @@ pub fn enable(tunnels: &[String]) -> io::Result<u32> {
 /// it. `0` — a link that is down and has no socket — is an error: there is
 /// no transport to exempt, and the tunnel would not carry once it had one.
 pub(crate) fn listen_port(iface: &str) -> io::Result<u16> {
-    let out = Command::new("wg")
-        .args(["show", iface, "listen-port"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "wg show {iface} listen-port exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim(),
-        )));
-    }
+    let out = exec::run_ok(
+        "wg",
+        &["show", exec::iface(iface)?, "listen-port"],
+        None,
+        exec::QUICK,
+    )?;
     parse_listen_port(iface, &String::from_utf8_lossy(&out.stdout))
 }
 
@@ -265,7 +296,7 @@ fn parse_listen_port(iface: &str, text: &str) -> io::Result<u16> {
     }
 }
 
-/// `enable`, with the uid and **both** `nft` calls handed in.
+/// `enable`, with the uid and the host calls handed in.
 ///
 /// Making `refusal_for_uid` pure was half a fix: it left the guard *reachable*
 /// by a test and the **call site** still unreachable by any of them, so
@@ -276,44 +307,35 @@ fn parse_listen_port(iface: &str, text: &str) -> io::Result<u16> {
 /// — so the control flow the guard sits in lives here, where a test can drive
 /// uid 0 through it and watch `apply` not be called.
 ///
-/// Injecting `apply` alone was half a seam, for the same reason one step on:
-/// the refusal arm became reachable and the whole success path stayed
-/// unreached, because `disable` still shelled out unconditionally and no test
-/// could drive a non-zero uid past it. Deleting the `clear()?` line left the
-/// suite green — and that line is what keeps a previous run's rules, and its
-/// tunnel interfaces, from staying in force beside this run's. Both calls are
-/// handed in, so the order and the ruleset are asserted rather than reasoned
-/// about.
+/// `apply` is the one `nft` call: the install is a single transaction
+/// ([`install_script`]) that replaces a stale table and loads the new one
+/// together. It used to be a separate `disable` and then a load, and between
+/// the two no kill switch was in force; a load that then failed left none for
+/// the rest of the run.
 ///
-/// `transport_port` is the third host probe, handed in for the same reason:
+/// `transport_port` is the other host probe, handed in for the same reason:
 /// the exemption it feeds is the difference between a WireGuard link the
 /// daemon raised carrying traffic and carrying none.
 pub(crate) fn enable_for_uid(
     uid: u32,
     tunnels: &[String],
     transport_port: impl Fn(&str) -> io::Result<u16>,
-    clear: impl Fn() -> io::Result<()>,
     apply: impl Fn(&str) -> io::Result<()>,
 ) -> io::Result<u32> {
     if let Some(refusal) = refusal_for_uid(uid) {
         return Err(refusal);
     }
-    // Every port is read before anything is cleared. A tunnel whose transport
-    // cannot be exempted is a tunnel the ruleset would silence, so it fails
-    // the install — and leaves a previous run's kill switch armed.
+    // Every port is read before anything is handed to nft. A tunnel whose
+    // transport cannot be exempted is a tunnel the ruleset would silence, so
+    // it fails the install — and leaves a previous run's kill switch armed.
     let ports = tunnels
         .iter()
         .map(|iface| transport_port(iface))
         .collect::<io::Result<Vec<u16>>>()?;
-    // Rendered before the clear, so a name the ruleset cannot carry leaves a
-    // previous run's kill switch armed rather than disarming it and failing.
-    let ruleset = render_ruleset_with_transport(uid, tunnels, &ports)?;
-    // Clear a stale table before reloading. `nft -f -` merges into an existing
-    // table rather than replacing it, so a delete that silently failed would
-    // leave a previous run's rules in force alongside the new ones — with the
-    // old run's tunnel interfaces still accepted.
-    clear()?;
-    apply(&ruleset)?;
+    // A name the ruleset cannot carry fails here, before nft, so a previous
+    // run's kill switch stays armed.
+    let script = install_script(uid, tunnels, &ports)?;
+    apply(&script)?;
     info!(
         target: "torrentd::vpn::killswitch",
         uid,
@@ -430,18 +452,7 @@ fn table_listed(listing: &str) -> bool {
 
 /// `nft list tables`, returning its stdout.
 fn list_tables() -> io::Result<String> {
-    let out = Command::new("nft")
-        .args(["list", "tables"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "nft list tables exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim(),
-        )));
-    }
+    let out = exec::run_ok("nft", &["list", "tables"], None, exec::QUICK)?;
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -449,45 +460,30 @@ fn list_tables() -> io::Result<String> {
 /// called once the table has been listed, so there is no absent case to
 /// excuse.
 fn delete_table() -> io::Result<()> {
-    let out = Command::new("nft")
-        .args(["delete", "table", "inet", TABLE])
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "nft delete table exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim(),
-        )));
-    }
-    Ok(())
+    exec::run_ok(
+        "nft",
+        &["delete", "table", "inet", TABLE],
+        None,
+        exec::CHANGE,
+    )
+    .map(|_| ())
 }
 
-/// Feed a ruleset to `nft -f -`.
-pub(crate) fn apply(ruleset: &str) -> io::Result<()> {
-    let mut child = Command::new("nft")
-        .arg("-f")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| io::Error::other("nft stdin unavailable"))?;
-    stdin.write_all(ruleset.as_bytes())?;
-    drop(stdin); // close so nft sees EOF
-    let out = child.wait_with_output()?;
-    if !out.status.success() {
-        return Err(io::Error::other(format!(
-            "nft -f - exited {}: {}",
-            out.status,
-            String::from_utf8_lossy(&out.stderr).trim(),
-        )));
-    }
-    Ok(())
+/// Feed a script to `nft -f -`, which commits it as one transaction.
+pub(crate) fn apply(script: &str) -> io::Result<()> {
+    exec::run_ok("nft", &["-f", "-"], Some(script.as_bytes()), exec::CHANGE).map(|_| ())
+}
+
+/// Dry-run a script through `nft --check --file -`: nftables parses it and
+/// validates it against the live kernel, and installs nothing. The output is
+/// returned whatever the status, for the caller to classify.
+pub(crate) fn check(script: &str) -> io::Result<std::process::Output> {
+    exec::run(
+        "nft",
+        &["--check", "--file", "-"],
+        Some(script.as_bytes()),
+        exec::QUICK,
+    )
 }
 
 #[cfg(test)]
@@ -503,15 +499,10 @@ mod tests {
         // deleted with the suite still green while a host running the daemon
         // as root lost every root-owned socket on it.
         let called = std::cell::Cell::new(false);
-        let cleared = std::cell::Cell::new(false);
         let e = enable_for_uid(
             0,
             &["wg-a".to_string()],
             |_| Ok(51820),
-            || {
-                cleared.set(true);
-                Ok(())
-            },
             |_| {
                 called.set(true);
                 Ok(())
@@ -524,12 +515,8 @@ mod tests {
         );
         assert!(
             !called.get(),
-            "the refusal comes before anything is handed to nft",
-        );
-        assert!(
-            !cleared.get(),
-            "and before the existing table is deleted — a refused enable must \
-             not disarm a kill switch a previous run installed",
+            "the refusal comes before anything is handed to nft — so a refused \
+             enable cannot disarm a kill switch a previous run installed either",
         );
     }
 
@@ -539,30 +526,23 @@ mod tests {
         assert!(e.to_string().contains("non-root user"), "got {e}");
     }
 
-    /// The success path, driven through `enable_for_uid`'s real control flow.
+    /// The success path, driven through `enable_for_uid`'s real control flow:
+    /// exactly one `nft` call, carrying the replace and the new table in one
+    /// transaction.
     ///
-    /// This test used to assert `refusal_for_uid(998).is_none()` — a function
-    /// its name does not mention, and a duplicate of the test above it — so
-    /// `render_ruleset`, the pre-clear and `apply` were reached by nothing at
-    /// all. Deleting the `clear()?` line left the whole suite green, and that
-    /// line is the one whose absence lets a previous run's rules stay in
-    /// force beside this run's: `nft -f -` merges into an existing table
-    /// rather than replacing it, so the old run's tunnel interfaces would
-    /// still be accepted by a ruleset that does not own them.
+    /// At a9eb5a1 this was two calls — a `disable` and then the load — with no
+    /// kill switch in force between them, and none at all for the rest of the
+    /// run if the load then failed. Split the install into a delete and a load
+    /// again and the call count fails.
     #[test]
-    fn enable_clears_the_stale_table_before_it_installs_the_new_one() {
-        // One log, so the order is asserted and not just the two calls.
+    fn enable_replaces_the_stale_table_and_installs_the_new_one_in_one_transaction() {
         let calls = std::cell::RefCell::new(Vec::<String>::new());
         let uid = enable_for_uid(
             998,
             &["wg-b".to_string(), "wg-a".to_string()],
             |iface| Ok(if iface == "wg-a" { 51820 } else { 40001 }),
-            || {
-                calls.borrow_mut().push("clear".to_string());
-                Ok(())
-            },
-            |rs| {
-                calls.borrow_mut().push(format!("apply:{rs}"));
+            |script| {
+                calls.borrow_mut().push(script.to_string());
                 Ok(())
             },
         )
@@ -570,42 +550,37 @@ mod tests {
 
         assert_eq!(uid, 998, "the uid the ruleset was written for is returned");
         let calls = calls.borrow();
-        assert_eq!(calls.len(), 2, "one clear and one apply; got {calls:?}");
+        assert_eq!(calls.len(), 1, "one transaction; got {calls:?}");
+        let expected = "\
+add table inet torrentd_ks
+delete table inet torrentd_ks
+table inet torrentd_ks {
+\tchain output {
+\t\ttype filter hook output priority 0; policy accept;
+\t\tmeta skuid 998 oifname \"lo\" accept
+\t\tmeta skuid 998 oifname { \"wg-a\", \"wg-b\" } accept
+\t\tmeta skuid 998 udp sport { 40001, 51820 } accept
+\t\tmeta skuid 998 counter drop
+\t}
+}
+";
         assert_eq!(
-            calls[0], "clear",
-            "the stale table goes before the new one is merged in",
-        );
-        assert_eq!(
-            calls[1],
-            format!(
-                "apply:{}",
-                render_ruleset_with_transport(
-                    998,
-                    &["wg-a".to_string(), "wg-b".to_string()],
-                    &[40001, 51820],
-                )
-                .unwrap()
-            ),
-            "and the ruleset handed to nft is this uid's, over these tunnels, \
-             with each tunnel's own listen port exempted",
+            calls[0], expected,
+            "the stale table is replaced and this uid's ruleset, over these \
+             tunnels with each one's listen port exempted, loaded — together",
         );
     }
 
     /// A tunnel whose listen port will not read stops the install before
-    /// anything is cleared: installing without its exemption would silence
-    /// that tunnel, and clearing first would disarm a previous run's switch.
+    /// anything reaches nft: installing without its exemption would silence
+    /// that tunnel, and the previous run's switch stays armed.
     #[test]
-    fn a_transport_port_that_will_not_read_stops_the_install_before_clearing() {
-        let cleared = std::cell::Cell::new(false);
+    fn a_transport_port_that_will_not_read_stops_the_install_before_nft() {
         let applied = std::cell::Cell::new(false);
         let e = enable_for_uid(
             998,
             &["wg-a".to_string()],
             |_| Err(io::Error::other("wg show wg-a listen-port exited 1")),
-            || {
-                cleared.set(true);
-                Ok(())
-            },
             |_| {
                 applied.set(true);
                 Ok(())
@@ -613,7 +588,6 @@ mod tests {
         )
         .expect_err("a port that will not read is not an absent exemption");
         assert!(e.to_string().contains("listen-port"), "got {e}");
-        assert!(!cleared.get(), "the existing table is left in force");
         assert!(!applied.get(), "nothing is handed to nft");
     }
 
@@ -651,31 +625,23 @@ table inet torrentd_ks {
         assert_eq!(rs, expected);
     }
 
-    /// A pre-clear that fails is fatal: an `nft delete` that reported a real
-    /// error leaves a table whose rules this run would be merging into.
+    /// A transaction nft refuses is reported, not swallowed. Because it is
+    /// one transaction, nft has changed nothing: the previous table, if any,
+    /// is still in force.
     #[test]
-    fn a_failed_pre_clear_stops_the_install() {
-        let applied = std::cell::Cell::new(false);
+    fn a_refused_transaction_is_reported() {
         let e = enable_for_uid(
             998,
             &[],
             |_| unreachable!("no tunnels, no ports"),
-            || {
+            |_| {
                 Err(io::Error::other(
-                    "nft delete table exited 1: something else",
+                    "`nft -f -` exited 1: Operation not permitted",
                 ))
             },
-            |_| {
-                applied.set(true);
-                Ok(())
-            },
         )
-        .expect_err("a pre-clear failure is not swallowed");
-        assert!(e.to_string().contains("nft delete table"), "got {e}");
-        assert!(
-            !applied.get(),
-            "a ruleset is never merged into a table that would not clear",
-        );
+        .expect_err("a failed install is not swallowed");
+        assert!(e.to_string().contains("nft -f"), "got {e}");
     }
 
     /// The first boot with the kill switch on: no table yet. `disable` must
@@ -752,7 +718,17 @@ table inet torrentd_ks {
     #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
     fn disable_against_real_nft() {
         disable().expect("no table yet: success, in any locale");
-        apply(&render_ruleset(998, &["wg0".to_string()]).unwrap()).expect("install");
+        apply(&install_script(998, &["wg0".to_string()], &[]).unwrap())
+            .expect("install onto no table");
+        apply(&install_script(998, &["wg1".to_string()], &[51820]).unwrap())
+            .expect("and replace a standing one in the same transaction");
+        let listed = exec::run_ok("nft", &["list", "table", "inet", TABLE], None, exec::QUICK)
+            .expect("list the table");
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            listed.contains("wg1") && !listed.contains("wg0"),
+            "the replace leaves only this install's rules: {listed}"
+        );
         assert!(table_listed(&list_tables().expect("list")));
         disable().expect("an installed table is deleted");
         assert!(!table_listed(&list_tables().expect("list")));
@@ -829,25 +805,22 @@ table inet torrentd_ks {
     /// And `enable` refuses it before the pre-clear, so a previous run's kill
     /// switch stays armed rather than being deleted and never replaced.
     #[test]
-    fn enable_refuses_an_unquotable_name_before_clearing() {
-        let cleared = std::cell::Cell::new(false);
+    fn enable_refuses_an_unquotable_name_before_nft() {
         let applied = std::cell::Cell::new(false);
         enable_for_uid(
             998,
             &["wg\"x".to_string()],
             |_| Ok(51820),
-            || {
-                cleared.set(true);
-                Ok(())
-            },
             |_| {
                 applied.set(true);
                 Ok(())
             },
         )
         .expect_err("an unquotable name stops the install");
-        assert!(!cleared.get(), "the existing table is left in force");
-        assert!(!applied.get(), "nothing is handed to nft");
+        assert!(
+            !applied.get(),
+            "nothing is handed to nft, so the existing table is left in force"
+        );
     }
 
     fn gauge(metrics: &torrentd_engine::RecordingSink) -> Option<f64> {

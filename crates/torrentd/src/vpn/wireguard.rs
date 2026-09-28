@@ -3,16 +3,23 @@
 //! Bring-up: raise the link, then poll the interface IP via `ip addr` every
 //! 250ms until either an address appears or the 30-second timeout fires.
 //!
-//! How the link is raised depends on the daemon's uid ([`Raiser`]). As root it
-//! is `wg-quick up <profile>`. As any other uid `wg-quick` cannot run — it
-//! re-execs itself through `sudo` — so the daemon raises the link with `ip`
-//! and `wg`, which need only `CAP_NET_ADMIN` ([`native`]). That is the shape
-//! the network kill switch runs in: a dedicated uid, with each tunnel's
-//! encrypted transport exempted by the ruleset (`vpn::killswitch`).
+//! The daemon raises every link itself with `ip` and `wg` ([`native`]), as
+//! root or not, and never runs `wg-quick`. `wg-quick up` installs a host-wide
+//! default route and an fwmark rule, so as root every profile's tunnel
+//! competed for the host's default route and a second full-tunnel profile
+//! rerouted the first one's traffic; the native path installs per-source
+//! routing instead (`vpn::route`), which is the same on every uid. As a
+//! non-root uid it needs only `CAP_NET_ADMIN`, which is the shape the network
+//! kill switch runs in: a dedicated uid, with each tunnel's encrypted
+//! transport exempted by the ruleset (`vpn::killswitch`).
+//!
+//! What that costs a root deployment: `PreUp`/`PostUp`/`PreDown`/`PostDown`
+//! hooks and a named `Table` are refused rather than run (see [`native`]). A
+//! link root raised from such a config before the daemon started is still
+//! adopted by its key, exactly as for a non-root daemon.
 
 use std::net::IpAddr;
 use std::path::Path;
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -25,6 +32,8 @@ use torrentd_engine::VpnTunnel;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
+
+use super::exec;
 
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -70,12 +79,14 @@ impl ProbeUnavailable {
 pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavailable> {
     // `wg show <iface> latest-handshakes` prints `<pubkey>\t<unix_secs>` per
     // peer; 0 means "never". Take the freshest across peers.
-    let out = Command::new("wg")
-        .arg("show")
-        .arg(iface)
-        .arg("latest-handshakes")
-        .output()
-        .map_err(|_| ProbeUnavailable::NoTool)?;
+    let name = exec::iface(iface).map_err(|_| ProbeUnavailable::Refused)?;
+    let out = exec::run(
+        "wg",
+        &["show", name, "latest-handshakes"],
+        None,
+        exec::QUICK,
+    )
+    .map_err(|_| ProbeUnavailable::NoTool)?;
     if !out.status.success() {
         return Err(ProbeUnavailable::Refused);
     }
@@ -118,16 +129,23 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
     Ok(Some(Duration::from_secs(now - latest)))
 }
 
-/// Whether a link of this name exists on the host, read from sysfs rather
-/// than shelled out for.
+/// Whether a link of this name is standing, as `ip` sees it from this
+/// process's network namespace.
 ///
 /// [`interface_public_key`] cannot answer this. It returns `None` for a link
 /// that is not a WireGuard device, for a host with no usable `wg`, and for no
 /// link at all, alike — and the teardown exemption turns on telling the first
-/// two from the third. `/sys/class/net/<iface>` is the kernel's own list of
-/// links, it needs no privilege, and it spawns nothing.
+/// two from the third.
+///
+/// Asked of `ip` rather than read from `/sys/class/net`, which shows the
+/// namespace sysfs was mounted in: the native path creates, configures and
+/// deletes links through `ip`, and ownership has to be decided from the same
+/// view the teardown acts on. A probe that could not be answered reads as
+/// **standing**, because every `false` here licenses something — a teardown,
+/// or dropping the record a later adoption needs. See
+/// [`super::ip_lookup::link_standing`].
 fn interface_exists(iface: &str) -> bool {
-    Path::new("/sys/class/net").join(iface).exists()
+    super::ip_lookup::link_standing(iface)
 }
 
 /// The host's boot id, or `None` if it could not be read.
@@ -398,10 +416,8 @@ pub fn sweep_raised_records(state_dir: &Path) {
 /// The public key WireGuard reports for a live interface, or `None` if the
 /// interface does not exist or `wg` cannot be run.
 fn interface_public_key(iface: &str) -> Option<String> {
-    let out = Command::new("wg")
-        .args(["show", iface, "public-key"])
-        .output()
-        .ok()?;
+    let name = exec::iface(iface).ok()?;
+    let out = exec::run("wg", &["show", name, "public-key"], None, exec::QUICK).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -419,18 +435,7 @@ fn profile_public_key(config_path: &Path) -> Option<String> {
             .eq_ignore_ascii_case("PrivateKey")
             .then(|| v.trim().to_string())
     })?;
-    let mut child = std::process::Command::new("wg")
-        .arg("pubkey")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    {
-        use std::io::Write;
-        child.stdin.take()?.write_all(private.as_bytes()).ok()?;
-    }
-    let out = child.wait_with_output().ok()?;
+    let out = exec::run("wg", &["pubkey"], Some(private.as_bytes()), exec::QUICK).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -438,51 +443,17 @@ fn profile_public_key(config_path: &Path) -> Option<String> {
     (!key.is_empty()).then_some(key)
 }
 
-/// How this process raises and lowers a WireGuard link.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum Raiser {
-    /// `wg-quick up` / `wg-quick down`: routing, DNS and hooks exactly as
-    /// the config says. Only as uid 0, because `wg-quick` re-execs itself
-    /// through `sudo` otherwise, and under the packaged unit's
-    /// `NoNewPrivileges=yes` that `sudo` cannot elevate.
-    WgQuick,
-    /// `ip` and `wg` directly, which need `CAP_NET_ADMIN` and not uid 0 —
-    /// see [`native`] for what that does and does not carry over.
-    Native,
-}
-
-impl Raiser {
-    /// `wg-quick` for root, and wherever the uid could not be read (the
-    /// behaviour before the native path existed); `ip`/`wg` for every other
-    /// uid, where `wg-quick` could only fail.
-    fn for_uid(uid: Option<u32>) -> Self {
-        match uid {
-            Some(0) | None => Raiser::WgQuick,
-            Some(_) => Raiser::Native,
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Raiser::WgQuick => "wg_quick",
-            Raiser::Native => "ip_wg",
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct WireguardManager {
     /// Where this boot's raised-interface records live — `Config::state_dir()`,
     /// beside the OpenVPN pid file. See [`RaisedInterfaces`].
     raised: RaisedInterfaces,
-    raiser: Raiser,
 }
 
 impl WireguardManager {
     pub fn new(run_dir: std::path::PathBuf) -> Self {
         Self {
             raised: RaisedInterfaces::new(run_dir),
-            raiser: Raiser::for_uid(super::killswitch::current_uid().ok()),
         }
     }
 
@@ -492,30 +463,17 @@ impl WireguardManager {
     /// that is real.
     #[cfg(test)]
     fn with_raised(raised: RaisedInterfaces) -> Self {
-        Self {
-            raised,
-            raiser: Raiser::WgQuick,
-        }
+        Self { raised }
     }
 
     /// Raise `profile`'s link. `Ok(Err(text))` is a refusal — the link could
     /// not be raised, which the caller answers by asking whether one it may
     /// adopt is already standing; `Err` is a tool that could not be run.
+    ///
+    /// Always the native path (`ip` and `wg`), whatever the uid; see the
+    /// module documentation for why `wg-quick` is not run.
     fn raise(&self, profile: &VpnTunnel) -> Result<Result<(), String>, std::io::Error> {
-        match self.raiser {
-            Raiser::WgQuick => {
-                let status = Command::new("wg-quick")
-                    .arg("up")
-                    .arg(&profile.config_path)
-                    .status()?;
-                Ok(if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!("wg-quick up exited with {status}"))
-                })
-            }
-            Raiser::Native => Ok(native::up(&profile.interface, &profile.config_path)),
-        }
+        Ok(native::up(&profile.interface, &profile.config_path))
     }
 
     /// The IP of an existing interface that is safe to adopt as `profile`'s
@@ -881,8 +839,7 @@ impl VpnManager for WireguardManager {
             target: "torrentd::vpn::wireguard",
             vpn_iface = %profile.interface,
             config = %profile.config_path.display(),
-            raiser = self.raiser.as_str(),
-            "raising wireguard link",
+            "raising wireguard link with ip and wg",
         );
         if let Err(refused) = self.raise(profile).map_err(VpnError::Io)? {
             // `wg-quick up` refuses an interface that already exists, which is
@@ -1002,43 +959,34 @@ impl VpnManager for WireguardManager {
     }
 
     fn bring_down(&self, iface: &str) {
-        match self.raiser {
-            Raiser::WgQuick => {
-                let _ = Command::new("wg-quick").arg("down").arg(iface).status();
-            }
-            Raiser::Native => {
-                let live = interface_public_key(iface);
-                if !self.native_teardown_permitted(iface, live.as_deref()) {
-                    warn!(
-                        target: "torrentd::vpn::wireguard",
-                        vpn_iface = %iface,
-                        "not removing a link no daemon on this boot recorded raising \
-                         (raised by root, or adopted); leaving it standing",
-                    );
-                    return;
-                }
-                native::down(iface);
-            }
+        let live = interface_public_key(iface);
+        if !self.native_teardown_permitted(iface, live.as_deref()) {
+            warn!(
+                target: "torrentd::vpn::wireguard",
+                vpn_iface = %iface,
+                "not removing a link no daemon on this boot recorded raising \
+                 (raised outside the daemon, or adopted); leaving it standing",
+            );
+            return;
         }
+        native::down(iface);
         self.drop_record_if_gone(iface, interface_exists);
     }
 }
 
 impl WireguardManager {
-    /// Whether the native path may remove the link standing as `iface`, which
+    /// Whether the daemon may remove the link standing as `iface`, which
     /// carries `live_key`: only when this host boot's raised-interface record
     /// names it by that key.
     ///
-    /// `wg-quick down` as a non-root uid fails through `sudo`, so before the
-    /// native path a link root raised and the daemon adopted survived the
-    /// daemon's shutdown. `ip link delete` does not fail, and removing that
-    /// link leaves a config with hooks — which the native path refuses to
-    /// raise — with nothing to adopt at the next start. A link the daemon
-    /// raised itself carries a record written right after it came up, so it
-    /// is still removed. The cost: where the record could not be written (no
-    /// boot id, an unwritable state directory, a key that would not read) the
-    /// daemon's own link is left standing too, and the next start adopts it by
-    /// its key.
+    /// A link raised outside the daemon — by root with `wg-quick`, typically
+    /// from a config with hooks the daemon refuses to run — and adopted by it
+    /// is left standing at shutdown: removing it leaves that config with
+    /// nothing to adopt at the next start. A link the daemon raised itself
+    /// carries a record written right after it came up, so it is still
+    /// removed. The cost: where the record could not be written (no boot id,
+    /// an unwritable state directory, a key that would not read) the daemon's
+    /// own link is left standing too, and the next start adopts it by its key.
     fn native_teardown_permitted(&self, iface: &str, live_key: Option<&str>) -> bool {
         self.raised.recorded(iface, live_key)
     }
@@ -1052,23 +1000,20 @@ impl WireguardManager {
     /// restores exactly the permanently-dark state the record exists to
     /// remove.
     ///
-    /// `wg-quick`'s `cmd_down` runs `execute_hooks "${PRE_DOWN[@]}"` before
-    /// `del_if`, under `set -e`, so a provider-style `PreDown` hook that fails
-    /// — and a `.conf` that has gone missing, which fails one step earlier —
-    /// leaves the command non-zero and the link up, still carrying its key.
-    /// For the keyless `PostUp = wg set %i private-key …` profile the record
-    /// was introduced for, discarding the record there means the next start
-    /// meets a standing link, no record, and no profile key: `Unestablished`,
-    /// then `ForeignInterface`, and the profile is dark until an operator runs
+    /// `ip link delete` can fail — a busy link, a timed-out `ip` — and leave
+    /// the link up, still carrying its key. Discarding the record there means
+    /// the next start meets a standing link, no record, and (for a profile
+    /// whose key it cannot derive) no profile key: `Unestablished`, then
+    /// `ForeignInterface`, and the profile is dark until an operator runs
     /// `ip link delete` by hand. `sweep_raised_records` cannot recover it —
     /// the sweep only ever deletes records, never writes one.
     ///
     /// `exists` is a parameter for the reason
     /// [`RaisedInterfaces::sweep_with`]'s is: the rule is the whole of the
-    /// defect and `/sys/class/net` is what made it unreachable by a test. The
-    /// exit status of `wg-quick down` is deliberately not consulted — it
-    /// reports what the *command* did, and the question here is what the
-    /// *host* is left holding.
+    /// defect and the host probe is what made it unreachable by a test. The
+    /// exit status of the teardown is deliberately not consulted — it reports
+    /// what the *command* did, and the question here is what the *host* is
+    /// left holding.
     fn drop_record_if_gone(&self, iface: &str, exists: impl Fn(&str) -> bool) {
         if exists(iface) {
             warn!(
@@ -1083,8 +1028,8 @@ impl WireguardManager {
     }
 }
 
-/// Raising and lowering a WireGuard link with `ip` and `wg`, for a daemon that
-/// is not uid 0.
+/// Raising and lowering a WireGuard link with `ip` and `wg` — the only way the
+/// daemon raises one, as root or not.
 ///
 /// This is `wg-quick up`'s sequence, reduced to what `CAP_NET_ADMIN` can do
 /// and what the daemon needs:
@@ -1100,7 +1045,8 @@ impl WireguardManager {
 ///    sends traffic *from* each of the link's addresses to that table. Every
 ///    profile's sockets are bound to its tunnel address, so that is all the
 ///    daemon's own traffic needs, and nothing else on the host is rerouted.
-///    `Table = off` skips this step, as it does for `wg-quick`.
+///    `Table = off` skips this step, as it does for `wg-quick`. The rules and
+///    table are `vpn::route`'s, shared with OpenVPN.
 ///
 /// Any failure after step 1 removes what this call made — the rules and the
 /// link — the same way `wg-quick`'s own exit trap does.
@@ -1108,36 +1054,28 @@ impl WireguardManager {
 /// **What does not carry over.** `DNS` needs `resolvconf` and root, and
 /// `SaveConfig` writes the config back as root; both are ignored with a
 /// warning. `PreUp`/`PostUp`/`PreDown`/`PostDown` hooks are refused rather
-/// than run: they are shell the operator wrote for a root `wg-quick`, and
-/// running them under the daemon's uid would either fail part-way or do
-/// something different from what they were written for. A named or numeric
+/// than run: they are shell the operator wrote for `wg-quick`, and running
+/// them from the daemon — under its own uid, or as root inside its sandbox —
+/// would either fail part-way or do something different from what they were
+/// written for. A named or numeric
 /// `Table` is refused too, because the teardown finds its rules by the table
 /// this module derives.
 ///
 /// A refused config still reaches adoption: a link root raised from it before
 /// the daemon started is adopted when its key matches, as before.
 mod native {
-    use std::io::Write;
     use std::path::Path;
-    use std::process::Command;
-    use std::process::Stdio;
 
     use tracing::warn;
+
+    use super::super::exec;
+    use super::super::route;
+    use super::super::route::family;
 
     /// `wg-quick`'s MTU for a 1500-byte path, used when the config sets none.
     /// `wg-quick` derives it from the route MTU instead (minus 80); this path
     /// fixes it, so a config on a smaller path should set `MTU`.
     const DEFAULT_MTU: u32 = 1420;
-
-    /// The routing tables this module uses are `TABLE_BASE + ifindex`: unique
-    /// per live link, derivable again at teardown from the link alone, and
-    /// clear of `wg-quick`'s 51820 and the kernel's reserved 253-255.
-    const TABLE_BASE: u32 = 0x7464_0000;
-
-    /// Upper bound on `ip rule del` per family at teardown. One rule is added
-    /// per `Address`, so this is far above any real config; it only stops a
-    /// loop on an `ip` that reports success without deleting.
-    const MAX_RULES: usize = 64;
 
     /// A WireGuard config split into what `wg` takes and what `wg-quick`
     /// would have done around it.
@@ -1201,8 +1139,9 @@ mod native {
                             "auto" => p.route = true,
                             _ => {
                                 return Err(format!(
-                                    "Table = {value:?} is not supported when the daemon raises \
-                                     the link itself (not uid 0); use auto or off"
+                                    "Table = {value:?} is not supported: the daemon raises the \
+                                     link itself and routes it by source address; use auto or \
+                                     off"
                                 ));
                             }
                         }
@@ -1214,8 +1153,8 @@ mod native {
                     }
                     "preup" | "postup" | "predown" | "postdown" => {
                         return Err(format!(
-                            "{key} hooks are not run when the daemon raises the link itself \
-                             (not uid 0); remove them, or raise the link as root before \
+                            "{key} hooks are not run: the daemon raises the link itself with \
+                             `ip` and `wg`; remove them, or raise the link as root before \
                              the daemon starts"
                         ));
                     }
@@ -1231,76 +1170,17 @@ mod native {
         Ok(p)
     }
 
-    fn family(addr: &str) -> &'static str {
-        if addr.contains(':') {
-            "-6"
-        } else {
-            "-4"
-        }
-    }
-
-    /// Run `args`, feeding `stdin` if given. The error names the command and
-    /// what it printed; `stdin` — which carries the private key — never
-    /// appears in it.
-    fn run(args: &[&str], stdin: Option<&str>) -> Result<(), String> {
-        let shown = args.join(" ");
-        let mut child = Command::new(args[0])
-            .args(&args[1..])
-            .stdin(if stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("`{shown}` could not run: {e}"))?;
-        if let Some(input) = stdin {
-            let mut pipe = child
-                .stdin
-                .take()
-                .ok_or_else(|| format!("`{shown}`: stdin unavailable"))?;
-            pipe.write_all(input.as_bytes())
-                .map_err(|e| format!("`{shown}`: {e}"))?;
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("`{shown}`: {e}"))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "`{shown}` exited {}: {}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim(),
-            ))
-        }
-    }
-
-    /// The routing table this module uses for the live link `iface`.
-    ///
-    /// The ifindex is asked of `ip` rather than read from `/sys/class/net`,
-    /// which shows the network namespace sysfs was mounted in and not
-    /// necessarily this process's.
-    pub(super) fn table_for(iface: &str) -> Result<u32, String> {
-        let out = Command::new("ip")
-            .args(["-o", "link", "show", "dev", iface])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .map_err(|e| format!("`ip -o link show dev {iface}` could not run: {e}"))?;
-        let text = String::from_utf8_lossy(&out.stdout);
-        let index = out
-            .status
-            .success()
-            .then(|| text.split(':').next())
-            .flatten()
-            .and_then(|i| i.trim().parse::<u32>().ok())
-            .ok_or_else(|| format!("no ifindex for {iface}"))?;
-        Ok(TABLE_BASE.wrapping_add(index))
+    /// [`exec::run_ok`], with the error as the text a refusal carries. The
+    /// error names the command and what it printed; `stdin` — which carries
+    /// the private key — never appears in it.
+    fn run(program: &str, args: &[&str], stdin: Option<&str>) -> Result<(), String> {
+        exec::run_ok(program, args, stdin.map(str::as_bytes), exec::CHANGE)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
     pub(super) fn up(iface: &str, config: &Path) -> Result<(), String> {
+        let iface = exec::iface(iface).map_err(|e| e.to_string())?;
         let text = std::fs::read_to_string(config)
             .map_err(|e| format!("read {}: {e}", config.display()))?;
         let parsed = parse(&text)?;
@@ -1309,11 +1189,12 @@ mod native {
                 target: "torrentd::vpn::wireguard",
                 vpn_iface = %iface,
                 key = %key,
-                "ignoring a wg-quick-only key the daemon cannot apply without root",
+                "ignoring a wg-quick-only key the daemon does not apply",
             );
         }
         run(
-            &["ip", "link", "add", "dev", iface, "type", "wireguard"],
+            "ip",
+            &["link", "add", "dev", iface, "type", "wireguard"],
             None,
         )?;
         // The link is this call's from here on, so a failure removes it.
@@ -1325,83 +1206,44 @@ mod native {
     }
 
     fn configure(iface: &str, p: &Parsed) -> Result<(), String> {
-        run(&["wg", "setconf", iface, "/dev/stdin"], Some(&p.wg_conf))?;
+        run("wg", &["setconf", iface, "/dev/stdin"], Some(&p.wg_conf))?;
         for addr in &p.addresses {
             run(
-                &["ip", family(addr), "address", "add", addr, "dev", iface],
+                "ip",
+                &[family(addr), "address", "add", addr, "dev", iface],
                 None,
             )?;
         }
         let mtu = p.mtu.unwrap_or(DEFAULT_MTU).to_string();
         run(
-            &["ip", "link", "set", "mtu", &mtu, "up", "dev", iface],
+            "ip",
+            &["link", "set", "mtu", &mtu, "up", "dev", iface],
             None,
         )?;
         if !p.route {
             return Ok(());
         }
-        let table = table_for(iface)?.to_string();
-        for prefix in &p.allowed_ips {
-            // A route in a family the link has no address in could never be
-            // chosen — the rules below are keyed on those addresses — and on
-            // a host with IPv6 disabled it fails the whole bring-up.
-            if !p.addresses.iter().any(|a| family(a) == family(prefix)) {
-                continue;
-            }
-            run(
-                &[
-                    "ip",
-                    family(prefix),
-                    "route",
-                    "replace",
-                    prefix,
-                    "dev",
-                    iface,
-                    "table",
-                    &table,
-                ],
-                None,
-            )?;
-        }
-        for addr in &p.addresses {
-            let host = addr.split('/').next().unwrap_or(addr);
-            run(
-                &[
-                    "ip",
-                    family(addr),
-                    "rule",
-                    "add",
-                    "from",
-                    host,
-                    "table",
-                    &table,
-                ],
-                None,
-            )?;
-        }
-        Ok(())
+        route::install(iface, &p.addresses, &p.allowed_ips).map_err(|e| e.to_string())
     }
 
     /// Remove the rules this module added for `iface`, then the link. Routes
-    /// in its table go with the link. Best effort, like `wg-quick down`: the
-    /// caller decides what a link still standing afterwards means.
+    /// in its table go with the link. Best effort: the caller decides what a
+    /// link still standing afterwards means.
     pub(super) fn down(iface: &str) {
-        if let Ok(table) = table_for(iface) {
-            let table = table.to_string();
-            for fam in ["-4", "-6"] {
-                for _ in 0..MAX_RULES {
-                    if run(&["ip", fam, "rule", "del", "table", &table], None).is_err() {
-                        break;
-                    }
-                }
-            }
+        let Ok(iface) = exec::iface(iface) else {
+            return;
+        };
+        if let Ok(table) = route::table_for(iface) {
+            route::remove(table);
         }
-        let _ = run(&["ip", "link", "delete", "dev", iface], None);
+        let _ = run("ip", &["link", "delete", "dev", iface], None);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
 
     #[test]
@@ -2216,19 +2058,39 @@ mod tests {
         );
     }
 
-    /// `wg-quick` for root, `ip`/`wg` for everyone else. A non-root daemon
-    /// handed to `wg-quick` re-execs through `sudo`, which the packaged
-    /// unit's `NoNewPrivileges=yes` stops from elevating, so every WireGuard
-    /// profile failed there.
+    /// Every uid raises with `ip` and `wg`; nothing in the daemon's path runs
+    /// `wg-quick`, whose host-wide default route and fwmark rule made a second
+    /// full-tunnel profile reroute the first one's traffic as root. The
+    /// manager `for_type` builds refuses a hooked config — which `wg-quick`
+    /// would have run — before anything reaches the host.
     #[test]
-    fn a_non_root_daemon_raises_its_links_with_ip_and_wg() {
-        assert_eq!(Raiser::for_uid(Some(0)), Raiser::WgQuick);
-        assert_eq!(Raiser::for_uid(Some(998)), Raiser::Native);
-        assert_eq!(
-            Raiser::for_uid(None),
-            Raiser::WgQuick,
-            "an unreadable uid keeps the behaviour from before the native path",
-        );
+    fn every_uid_raises_its_links_with_ip_and_wg_and_never_wg_quick() {
+        let dir = tempfile::tempdir().unwrap();
+        let hooked = dir.path().join("tdnx-hook.conf");
+        std::fs::write(
+            &hooked,
+            PROVIDER_CONF.replace("DNS = 10.2.0.1", "PostUp = wg set %i private-key /k"),
+        )
+        .unwrap();
+        let mgr = WireguardManager::new(dir.path().join("state"));
+        let refused = mgr
+            .raise(&VpnTunnel {
+                r#type: torrentd_engine::VpnType::Wireguard,
+                interface: "tdnx-hook".to_string(),
+                config_path: hooked,
+            })
+            .expect("a refusal is not an I/O error")
+            .expect_err("the native parser refuses the hook");
+        assert!(refused.contains("PostUp"), "got {refused}");
+
+        let source = include_str!("wireguard.rs");
+        let spawned = ["exec::run(\"wg-quick", "Command::new(\"wg-quick"];
+        for s in spawned {
+            assert!(
+                !source.contains(s),
+                "the daemon path must not spawn wg-quick"
+            );
+        }
     }
 
     const PROVIDER_CONF: &str = "\
@@ -2293,10 +2155,7 @@ Endpoint = 203.0.113.7:51820 # the exit
     }
 
     fn native_manager(raised: RaisedInterfaces) -> WireguardManager {
-        WireguardManager {
-            raised,
-            raiser: Raiser::Native,
-        }
+        WireguardManager::with_raised(raised)
     }
 
     /// A native bring-up that is refused — a config it will not apply, or
@@ -2473,7 +2332,6 @@ Endpoint = 203.0.113.7:51820 # the exit
         )
         .unwrap();
         let manager = WireguardManager::new(dir.path().join("state"));
-        assert_eq!(manager.raiser, Raiser::Native);
         let ip = manager
             .bring_up(&VpnTunnel {
                 r#type: torrentd_engine::VpnType::Wireguard,
@@ -2482,7 +2340,7 @@ Endpoint = 203.0.113.7:51820 # the exit
             })
             .expect("the daemon raises its own link without wg-quick");
         assert_eq!(ip.to_string(), "10.200.0.1");
-        let table = native::table_for(iface).unwrap();
+        let table = super::super::route::table_for(iface).unwrap();
 
         // What arrives is counted on the peer's side of the tunnel: packets
         // the peer's link decrypted and delivered. Handshakes are not among
@@ -2557,7 +2415,7 @@ Endpoint = 203.0.113.7:51820 # the exit
 
         manager.bring_down(iface);
         assert!(
-            native::table_for(iface).is_err(),
+            super::super::route::table_for(iface).is_err(),
             "the link is gone (asked of `ip`: /sys/class/net is the host's here)",
         );
         assert!(
@@ -2584,7 +2442,7 @@ Endpoint = 203.0.113.7:51820 # the exit
     #[ignore = "needs CAP_NET_ADMIN in a private network namespace"]
     fn live_link_a_native_failure_rolls_back_and_teardown_spares_links_it_did_not_raise() {
         let dir = tempfile::tempdir().unwrap();
-        let gone = |iface: &str| native::table_for(iface).is_err();
+        let gone = |iface: &str| super::super::route::table_for(iface).is_err();
 
         // 1. `ip address add` fails after the link exists.
         let conf = dir.path().join("wg-rb.conf");

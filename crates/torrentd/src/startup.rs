@@ -67,8 +67,8 @@ const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::fro
 /// Nothing else stops a second `torrentd` against the same config, and the
 /// HTTP bind that eventually refuses one comes last. Before it, the second
 /// process used to replace the running daemon's kill-switch table with one
-/// naming only its own tunnels (`killswitch::enable` deletes the table before
-/// loading its own), run the resume scan, and then — failing the bind — tear
+/// naming only its own tunnels (`killswitch::enable` replaces whatever table
+/// is standing with its own), run the resume scan, and then — failing the bind — tear
 /// down the table and the tunnels on its way out. The running daemon was left
 /// seeding with no backstop, and nothing in it could notice.
 ///
@@ -1534,7 +1534,17 @@ where
             };
 
             settings.listen_interfaces = Some(torrentd_engine::bind_endpoint(ip, effective_port));
-            settings.outgoing_interfaces = Some(ip.to_string());
+            // The device, not the address. libtorrent binds an outgoing
+            // connection to a device named here with `SO_BINDTODEVICE` as well
+            // as to the device's address, so the kernel sends it out of the
+            // tunnel whatever the routing table says. Bound to the address
+            // alone, a socket's route still came from the rules — and with
+            // the source-address rule gone (a firewall reload, `ip rule
+            // flush`) the lookup fell through to the main table and the
+            // packets left by the physical interface with the tunnel's source
+            // address. The health monitor fences that within a poll
+            // (`vpn_monitor`'s route check); this makes the window empty.
+            settings.outgoing_interfaces = Some(iface.to_string());
             // Not configurable, by construction: there is no key on a vpn
             // profile that reaches these.
             settings.enable_dht = Some(false);
@@ -3548,7 +3558,13 @@ mod profile_construction_tests {
                 .contains("0.0.0.0"),
             "never the wildcard",
         );
-        assert_eq!(settings.outgoing_interfaces.as_deref(), Some("10.2.0.2"));
+        assert_eq!(
+            settings.outgoing_interfaces.as_deref(),
+            Some("wg-a"),
+            "outgoing connections are bound to the tunnel device (SO_BINDTODEVICE), \
+             not only to its address, so a lost routing rule cannot send them out \
+             of the physical interface",
+        );
         assert_eq!(settings.user_agent.as_deref(), Some("ua-acct_a"));
         assert_eq!(state, &None, "a vpn session restores no session state");
         assert!(

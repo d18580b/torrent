@@ -13,6 +13,24 @@
 //! * `--writepid <file>` records the daemonised pid where `bring_down` can
 //!   read it.
 //!
+//! # Routing
+//!
+//! `openvpn` runs with `--route-noexec --pull-filter ignore redirect-gateway`:
+//! it installs **no** routes, and a server's pushed `redirect-gateway` — which
+//! would take over the host's default route and move every other process
+//! (and every other profile) into this tunnel — is dropped before it is
+//! applied. Once the tunnel has its address, the daemon installs the same
+//! per-source routing the native WireGuard path uses (`vpn::route`): a default
+//! route via the tunnel in a table of its own, and a rule sending traffic from
+//! the tunnel address to that table. The profile's sockets are bound to that
+//! address and device, so that is all they need, and nothing else on the host
+//! is rerouted. The rules are removed at `bring_down`, before the process that
+//! owns the link is signalled, since the table is derived from the live link.
+//!
+//! This assumes a routed (`tun`) device: a default route with no gateway is
+//! what a point-to-point link takes. A bridged `tap` profile would need the
+//! pushed gateway, which `--route-noexec` withholds, and is not supported.
+//!
 //! The pid is verified against `/proc/<pid>/cmdline` before it is signalled, so
 //! a stale pid file whose number has been recycled cannot make the daemon kill
 //! an unrelated process.
@@ -38,7 +56,6 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -48,6 +65,42 @@ use torrentd_engine::VpnManager;
 use torrentd_engine::VpnTunnel;
 use tracing::info;
 use tracing::warn;
+
+use super::exec;
+use super::route;
+
+/// The arguments `bring_up` hands to `openvpn`, in order. Split out so the
+/// routing flags are asserted without an `openvpn` binary.
+fn openvpn_args<'a>(config: &'a str, iface: &'a str, pid_file: &'a str) -> Vec<&'a str> {
+    vec![
+        "--daemon",
+        "--config",
+        config,
+        // Authoritative, so the OpenVPN profile file cannot disagree with the
+        // profile config.
+        "--dev",
+        iface,
+        "--writepid",
+        pid_file,
+        // No routes from openvpn at all, and never the server's
+        // default-gateway redirect: routing is the daemon's, per source
+        // address (see the module docs).
+        "--route-noexec",
+        "--pull-filter",
+        "ignore",
+        "redirect-gateway",
+    ]
+}
+
+/// The per-source routing an OpenVPN tunnel gets: everything, via the tunnel,
+/// for traffic from the tunnel's own address.
+fn route_tunnel(iface: &str, ip: IpAddr) -> std::io::Result<()> {
+    let default = match ip {
+        IpAddr::V4(_) => "0.0.0.0/0",
+        IpAddr::V6(_) => "::/0",
+    };
+    route::install(iface, &[ip.to_string()], &[default.to_string()])
+}
 
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -101,15 +154,18 @@ impl OpenvpnManager {
     /// `kill` rather than libc, matching the kill switch's reason for reading
     /// /proc directly: one fewer dependency for one syscall.
     fn signal(&self, iface: &str, pid: u32, sig: &str) -> bool {
-        match Command::new("kill").arg(sig).arg(pid.to_string()).status() {
-            Ok(st) if st.success() => true,
-            Ok(st) => {
+        let pid_arg = pid.to_string();
+        match exec::run("kill", &[sig, &pid_arg], None, exec::QUICK) {
+            Ok(out) if out.status.success() => true,
+            Ok(out) => {
                 warn!(
                     target: "torrentd::vpn::openvpn",
                     vpn_iface = %iface,
                     pid,
                     signal = sig,
-                    "kill exited with {st}",
+                    "kill exited with {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim(),
                 );
                 false
             }
@@ -161,20 +217,22 @@ impl VpnManager for OpenvpnManager {
             pid_file = %pid_file.display(),
             "openvpn --daemon",
         );
-        let status = Command::new("openvpn")
-            .arg("--daemon")
-            .arg("--config")
-            .arg(&profile.config_path)
-            // Authoritative, so the OpenVPN profile file cannot disagree with
-            // the profile config.
-            .arg("--dev")
-            .arg(&profile.interface)
-            .arg("--writepid")
-            .arg(&pid_file)
-            .status()
-            .map_err(VpnError::Io)?;
-        if !status.success() {
-            return Err(VpnError::Spawn(format!("openvpn exited with {status}")));
+        let iface = exec::iface(&profile.interface).map_err(VpnError::Io)?;
+        let config = profile.config_path.to_string_lossy();
+        let pid_path = pid_file.to_string_lossy();
+        let out = exec::run(
+            "openvpn",
+            &openvpn_args(&config, iface, &pid_path),
+            None,
+            exec::CHANGE,
+        )
+        .map_err(VpnError::Io)?;
+        if !out.status.success() {
+            return Err(VpnError::Spawn(format!(
+                "openvpn exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )));
         }
 
         let deadline = Instant::now() + BRING_UP_TIMEOUT;
@@ -182,11 +240,30 @@ impl VpnManager for OpenvpnManager {
             match super::ip_lookup::first_ipv4(&profile.interface) {
                 Ok(ip) => {
                     let addr = IpAddr::V4(ip);
+                    if let Err(e) = route_tunnel(&profile.interface, addr) {
+                        // Without its rule the tunnel address routes by the
+                        // main table: a profile bound to it would send out of
+                        // the physical interface. What this call started is
+                        // this call's to stop.
+                        warn!(
+                            target: "torrentd::vpn::openvpn",
+                            vpn_iface = %profile.interface,
+                            tunnel_ip = %addr,
+                            error.cause = %e,
+                            "could not install the tunnel's source-address routing; \
+                             taking it down",
+                        );
+                        self.stop(&profile.interface);
+                        return Err(VpnError::Spawn(format!(
+                            "source-address routing for {}: {e}",
+                            profile.interface
+                        )));
+                    }
                     info!(
                         target: "torrentd::vpn::openvpn",
                         vpn_iface = %profile.interface,
                         tunnel_ip = %addr,
-                        "openvpn tunnel up",
+                        "openvpn tunnel up, routed by source address",
                     );
                     return Ok(addr);
                 }
@@ -227,6 +304,19 @@ impl VpnManager for OpenvpnManager {
     /// process that is still running, and the next boot's `live_pid` then
     /// finds nothing — leaving an orphan no code path can ever reach again.
     fn bring_down(&self, iface: &str) {
+        self.stop(iface);
+    }
+}
+
+impl OpenvpnManager {
+    /// [`VpnManager::bring_down`]'s body, also used by `bring_up` to undo a
+    /// tunnel whose routing could not be installed.
+    ///
+    /// The source-address rules go first, while the link still stands: the
+    /// table they point at is derived from the link's ifindex, and once
+    /// openvpn has exited there is no link to derive it from and the rules
+    /// would outlive it.
+    fn stop(&self, iface: &str) {
         let Some(pid) = self.live_pid(iface) else {
             // No pid file, or it does not describe a live openvpn on this
             // interface. Either the tunnel is already down or it was started
@@ -238,6 +328,9 @@ impl VpnManager for OpenvpnManager {
             );
             return;
         };
+        if let Ok(table) = route::table_for(iface) {
+            route::remove(table);
+        }
         info!(
             target: "torrentd::vpn::openvpn",
             vpn_iface = %iface,
@@ -286,6 +379,24 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let m = OpenvpnManager::new(d.path().to_path_buf());
         (d, m)
+    }
+
+    /// openvpn installs no routes and never takes the default gateway: at
+    /// a9eb5a1 a server's pushed `redirect-gateway` moved the host's default
+    /// route — every other process and every other profile — into this
+    /// tunnel. Drop either flag and this fails.
+    #[test]
+    fn openvpn_runs_with_no_routes_of_its_own_and_no_gateway_redirect() {
+        let args = openvpn_args("/etc/openvpn/a.conf", "tun-a", "/var/lib/torrentd/p.pid");
+        assert!(args.contains(&"--route-noexec"), "{args:?}");
+        let filter = args
+            .windows(3)
+            .any(|w| w == ["--pull-filter", "ignore", "redirect-gateway"]);
+        assert!(filter, "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["--dev", "tun-a"]),
+            "the interface is still pinned: {args:?}"
+        );
     }
 
     #[test]

@@ -63,6 +63,14 @@ pub struct Settings {
     // ---- Listen / network identity ----
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listen_interfaces: Option<String>,
+    /// Comma-separated devices or addresses outgoing connections bind to.
+    ///
+    /// A **device name** makes libtorrent bind each outgoing socket to that
+    /// device with `SO_BINDTODEVICE` (and to one of its addresses), so the
+    /// kernel cannot route the connection out of any other interface. An
+    /// **address** only sets the source; the route is still the routing
+    /// table's. A tunnelled profile names its tunnel device here for that
+    /// reason. On Linux before 5.7, `SO_BINDTODEVICE` needs `CAP_NET_RAW`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outgoing_interfaces: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
