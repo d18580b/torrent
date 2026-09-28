@@ -266,13 +266,26 @@ impl Harness {
         );
         stream.write_all(head.as_bytes()).await.unwrap();
 
+        // A request nothing bounds would otherwise wait forever. The guard is
+        // a thread on the real clock, not a tokio timer: a paused clock jumps
+        // to the earliest tokio timer the moment nothing can run, which may
+        // be before the server has armed its own deadline, and a guard timer
+        // would then be what fires.
+        let (done, done_rx) = std::sync::mpsc::channel::<()>();
+        let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            if done_rx.recv_timeout(std::time::Duration::from_secs(60))
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                let _ = fire.send(());
+            }
+        });
+
         tokio::time::pause();
         let started = tokio::time::Instant::now();
         let mut response = Vec::new();
         let mut buf = [0u8; 1024];
-        // A request nothing bounds would otherwise wait forever; an hour of
-        // paused clock elapses at once and fails the test instead.
-        let read = tokio::time::timeout(std::time::Duration::from_secs(3600), async {
+        let read = async {
             while !response.windows(2).any(|w| w == b"\r\n") {
                 let n = stream.read(&mut buf).await.unwrap();
                 assert!(
@@ -281,14 +294,18 @@ impl Harness {
                 );
                 response.extend_from_slice(&buf[..n]);
             }
-        })
-        .await;
+        };
+        let answered = tokio::select! {
+            () = read => true,
+            _ = fired => false,
+        };
         let waited = started.elapsed();
-        assert!(
-            read.is_ok(),
-            "{method} {path}: no response to a stalled body within an hour"
-        );
+        drop(done);
         tokio::time::resume();
+        assert!(
+            answered,
+            "{method} {path}: no response to a stalled body in a minute of real time"
+        );
         server.abort();
 
         let line = String::from_utf8_lossy(&response);

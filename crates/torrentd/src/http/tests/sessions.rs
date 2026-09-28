@@ -210,7 +210,10 @@ async fn a_login_whose_body_stalls_is_cut_off_at_the_deadline_with_408() {
     assert_eq!(status.as_u16(), 408);
     let deadline = crate::http::v1::REQUEST_DEADLINE;
     assert!(
-        waited >= deadline && waited < deadline + std::time::Duration::from_secs(1),
+        // The server arms its deadline a moment before the clock is paused,
+        // so the paused clock sees a hair less than the whole of it.
+        waited + std::time::Duration::from_secs(1) > deadline
+            && waited <= deadline + std::time::Duration::from_secs(1),
         "cut off at the deadline, not before or long after: {waited:?}",
     );
 }

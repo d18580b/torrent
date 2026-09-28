@@ -2085,7 +2085,7 @@ mod tests {
     #[test]
     fn a_bulk_outcome_says_what_was_not_reached() {
         let outcome: types::BulkOutcome = testing::from_json(json!({
-            "torrent_count": 1200, "failed_count": 0,
+            "torrent_count": 1200, "failed_count": 0, "failed_infohashes": [],
             "skipped_profiles": [{"profile_id": "acct_b", "reason": "vpn_down",
                                   "detail": "profile vpn_down; restart daemon to resume"}],
         }));
@@ -2096,7 +2096,10 @@ mod tests {
             "resumed 1,200 torrents; skipped acct_b (vpn_down: profile vpn_down; restart daemon to resume)"
         );
         let outcome: types::BulkOutcome = testing::from_json(json!({
-            "torrent_count": 10, "failed_count": 2, "skipped_profiles": [],
+            "torrent_count": 10, "failed_count": 2,
+            "failed_infohashes": ["0101010101010101010101010101010101010101",
+                                  "0202020202020202020202020202020202020202"],
+            "skipped_profiles": [],
         }));
         let toast = bulk_toast(true, &outcome);
         assert_eq!(toast.kind, ToastKind::Error);
