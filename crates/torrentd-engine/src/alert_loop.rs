@@ -1571,6 +1571,55 @@ mod tests {
     }
 
     #[test]
+    fn the_shutdown_drains_a_capped_backlog_before_requesting_saves() {
+        // Four torrents' `AddTorrent` alerts are queued behind a source that
+        // surfaces one per drain. The saves are requested for the torrents the
+        // state map knows, so a single pre-save drain would learn of one and
+        // leave the other three unsaved while reporting nothing outstanding.
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        let handles: Vec<TorrentHandle> = (1..=4u8)
+            .map(|byte| engine.register_handle(InfoHash([byte; 20])))
+            .collect();
+        engine.push_alerts(
+            handles
+                .iter()
+                .map(|h| add_torrent_alert(h.infohash.0[0], h.id)),
+        );
+        let state = Arc::new(StateMap::new());
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        let source: Arc<dyn AlertSource> = Arc::new(OneAlertPerDrain {
+            inner: single_profile_source(engine.clone()),
+            backlog: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+
+        let unsaved = run_shutdown(
+            ShutdownReason::Test,
+            Duration::from_secs(30),
+            &source,
+            &state,
+            &resume,
+            &torrents,
+            &metrics,
+            &clock,
+        );
+
+        assert_eq!(unsaved, 0);
+        assert_eq!(state.len(), 4, "every queued add reached the state map");
+        for h in &handles {
+            assert!(
+                engine.calls().iter().any(|c| matches!(
+                    c,
+                    crate::mock::RecordedCall::SaveResumeData { handle, .. } if handle == h
+                )),
+                "no save was requested for {h:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_handle_reports_what_the_shutdown_drain_left_unsaved() {
         // Saves are accepted and never settle, so the whole 30 s default
         // deadline runs — on the mock clock, which advances on every sleep
