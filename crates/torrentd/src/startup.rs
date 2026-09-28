@@ -2268,9 +2268,8 @@ async fn teardown_network<K>(
 /// `TERM_GRACE + KILL_GRACE` — seven seconds — per OpenVPN profile, serialized,
 /// which is the `7N` this series named as the thing it was avoiding. Each
 /// tunnel is an independent interface and an independent process, so there is
-/// nothing to serialise for, and `deploy/torrentd.service` sets no
-/// `TimeoutStopSec`, which leaves systemd's default as the only bound on the
-/// drain.
+/// nothing to serialise for, and every serialized second comes out of the
+/// stop budget `deploy/torrentd.service`'s `TimeoutStopSec` bounds.
 ///
 /// Spawning happens in one pass and the awaits in a second, so the jobs run
 /// concurrently and the log still reads in profile order. A `JoinError` — the
@@ -3451,8 +3450,8 @@ mod tests {
     /// thread waits, not how long the daemon takes to stop: awaiting each
     /// job before spawning the next left the wall-clock stop time at up to
     /// seven seconds per OpenVPN profile, serialized, which is the `7N` this
-    /// series named as the thing it was avoiding. `deploy/torrentd.service`
-    /// sets no `TimeoutStopSec`, so systemd's default is the only bound.
+    /// series named as the thing it was avoiding, out of the stop budget
+    /// `deploy/torrentd.service`'s `TimeoutStopSec` bounds.
     ///
     /// The property is overlap, so overlap is what is counted.
     ///

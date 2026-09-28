@@ -168,7 +168,10 @@ A deployment with no `vpn` profile has neither of the next two:
 > **`ProtectSystem=strict` will refuse to start the unit** if anything in
 > `ReadWritePaths=` does not exist. The shipped unit lists
 > `/var/lib/torrentd /data/torrents`. If you point any path at somewhere else,
-> edit `ReadWritePaths` to match or every write fails with `EROFS`.
+> edit `ReadWritePaths` to match or every write fails with `EROFS`. That
+> includes **every `[pool] roots` entry and its `library_dir`**: a mutation
+> plan moves and deletes payload there, and a root the unit leaves read-only
+> fails every such plan at its first step.
 > `ProtectHome=yes` likewise makes any path under `/home` invisible — worth
 > knowing if you try it on your own box first.
 
@@ -801,7 +804,9 @@ The daemon sets none of these itself.
 - **`LimitNOFILE`.** The sample config's `connections_limit = 10000` and
   `file_pool_size = 1000` will exhaust a default 1024-descriptor limit
   immediately. The systemd unit sets 65536 and the compose file matches; **a
-  bare-metal run outside either gets nothing** and will hit `EMFILE`.
+  bare-metal run outside either gets nothing** and will hit `EMFILE`. The
+  daemon warns at boot when the soft limit is below `connections_limit +
+  file_pool_size` per profile plus the API's 10 000-connection cap.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on
@@ -819,9 +824,20 @@ sudo systemctl enable --now torrentd
 ```
 
 The unit is `Type=notify`: `READY=1` once the HTTP listener is bound,
-`WATCHDOG=1` while the alert loop is making progress, `STOPPING=1` before the
-resume drain. The watchdog ping is withheld if the alert loop stops advancing,
-so a wedged daemon gets restarted rather than reported healthy.
+`WATCHDOG=1` while the alert loop is making progress, `STOPPING=1` as the
+shutdown begins, and `EXTEND_TIMEOUT_USEC` while a long boot or drain is
+still running, so `TimeoutStartSec`/`TimeoutStopSec` bound a phase that has
+stalled rather than one that is merely large. The watchdog ping is withheld if
+the alert loop stops advancing, so a wedged daemon gets restarted rather than
+reported healthy.
+
+A refused configuration exits `78` (`EX_CONFIG`), and the unit's
+`RestartPreventExitStatus=78` leaves it stopped with the reason as the last
+journal line rather than restarting it every five seconds. A stop runs the
+HTTP drain (10 s; a client that holds on past it is cut off and the exit is
+still `0`), lets pool work finish its current step (up to 20 s), drains resume
+data (`shutdown_drain_secs`), then closes the sessions, takes the tunnels
+down, and removes the kill switch last.
 
 Uncomment `AmbientCapabilities=CAP_NET_ADMIN` and
 `CapabilityBoundingSet=CAP_NET_ADMIN` for a deployment **with** a `vpn`
