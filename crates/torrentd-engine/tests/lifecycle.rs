@@ -17,6 +17,8 @@
 //!     must survive the clear mask).
 //!   - verification & corruption: a full-check add seeds when on-disk bytes
 //!     match the piece hashes and never seeds when they don't.
+//!   - bounded drains: a bounded drain leaves the rest queued, and
+//!     `RealEngine::pop_alerts` returns at most `MAX_ALERTS_PER_POP`.
 //!   - alert-queue overflow: a tiny `alert_queue_size` flooded without draining
 //!     surfaces `alerts_dropped` and keeps draining cleanly (no hang/panic).
 //!   - the no-download invariant: `UPLOAD_MODE` survives a real session, holds
@@ -329,6 +331,51 @@ fn a_bounded_drain_leaves_the_rest_queued() {
             .count();
     }
     assert_eq!(added, 20, "every add_torrent_alert arrives across batches");
+}
+
+/// `RealEngine::pop_alerts` converts at most `MAX_ALERTS_PER_POP` alerts per
+/// call, and the rest arrive on the next pops.
+#[test]
+#[ignore = "real libtorrent; run with --ignored"]
+fn the_engine_pops_at_most_its_cap_per_call() {
+    use torrentd_engine::real::MAX_ALERTS_PER_POP;
+    use torrentd_engine::RealEngine;
+    use torrentd_engine::TorrentEngine;
+
+    let count = MAX_ALERTS_PER_POP + 100;
+    let mut settings = support::local_seed_settings();
+    settings.alert_queue_size = Some(10_000);
+    let dir = tempfile::tempdir().unwrap();
+    let engine = RealEngine::new(&settings).unwrap();
+    for i in 0..count {
+        let mut ih = [0u8; 20];
+        ih[..8].copy_from_slice(&(i as u64 + 1).to_be_bytes());
+        engine
+            .add_torrent(AddParams::Magnet {
+                uri: format!("magnet:?xt=urn:btih:{}", hex::encode(ih)),
+                save_path: dir.path().to_str().unwrap().to_string(),
+                flags: TorrentFlags::PAUSED | TorrentFlags::UPLOAD_MODE,
+            })
+            .unwrap();
+    }
+    // Every add posted its `add_torrent_alert` before returning, so more
+    // than the cap is queued now.
+    let first = engine.pop_alerts();
+    assert_eq!(first.len(), MAX_ALERTS_PER_POP);
+    let mut added = first
+        .iter()
+        .filter(|a| matches!(a, Alert::AddTorrent { .. }))
+        .count();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while added < count && std::time::Instant::now() < deadline {
+        let batch = engine.pop_alerts();
+        assert!(batch.len() <= MAX_ALERTS_PER_POP, "{}", batch.len());
+        added += batch
+            .iter()
+            .filter(|a| matches!(a, Alert::AddTorrent { .. }))
+            .count();
+    }
+    assert_eq!(added, count, "every add_torrent_alert arrives across pops");
 }
 
 #[test]
