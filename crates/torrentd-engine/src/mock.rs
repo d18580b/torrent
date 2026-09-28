@@ -81,7 +81,8 @@ pub enum RecordedCall {
         new_path: String,
         flags: MoveFlags,
     },
-    ApplySettings(Settings),
+    /// Boxed: `Settings` is several times larger than every other variant.
+    ApplySettings(Box<Settings>),
     SessionState,
     TorrentDetails(TorrentHandle),
     TorrentFiles(TorrentHandle),
@@ -522,7 +523,7 @@ impl TorrentEngine for MockEngine {
     }
 
     fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError> {
-        self.record(RecordedCall::ApplySettings(settings.clone()));
+        self.record(RecordedCall::ApplySettings(Box::new(settings.clone())));
         self.check_error("apply_settings")
     }
 
