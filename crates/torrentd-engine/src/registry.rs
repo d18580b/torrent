@@ -430,6 +430,16 @@ impl AssignmentRegistry {
                 )
                 .map_err(|e| self.db_err(e))?;
             drop(tx);
+            // A row this process did not write gets the check `read_all`
+            // applies at load; only then may it enter the map.
+            if !crate::profile::ProfileConfig::is_valid_id(&existing) {
+                return Err(RegistryError::BadRow {
+                    path: self.path.clone(),
+                    infohash: hex,
+                    id: existing,
+                    reason: crate::profile::ID_CHARSET_RULE.to_string(),
+                });
+            }
             let existing = ProfileId::new(existing);
             self.inner.write().insert(ih, existing.clone());
             if existing == profile {
@@ -975,6 +985,48 @@ mod tests {
             matches!(&err, RegistryError::BadRow { id, .. } if id == "../.."),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_row_another_process_wrote_after_load_answers_assign_as_a_conflict() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("registry.db");
+        let r = AssignmentRegistry::open(&db, None).unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO assignment VALUES ('0101010101010101010101010101010101010101', 'other')",
+                [],
+            )
+            .unwrap();
+        let ih = InfoHash([1u8; 20]);
+        let err = r.assign(ih, ProfileId::new("mine")).unwrap_err();
+        assert!(
+            matches!(&err, RegistryError::Conflict { existing, .. } if existing.as_str() == "other"),
+            "{err:?}"
+        );
+        assert_eq!(r.lookup(&ih), Some(ProfileId::new("other")));
+    }
+
+    #[test]
+    fn a_row_another_process_wrote_with_an_escaping_profile_id_is_refused_by_assign() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("registry.db");
+        let r = AssignmentRegistry::open(&db, None).unwrap();
+        Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO assignment VALUES ('0101010101010101010101010101010101010101', '../..')",
+                [],
+            )
+            .unwrap();
+        let ih = InfoHash([1u8; 20]);
+        let err = r.assign(ih, ProfileId::new("mine")).unwrap_err();
+        assert!(
+            matches!(&err, RegistryError::BadRow { id, .. } if id == "../.."),
+            "{err:?}"
+        );
+        assert_eq!(r.lookup(&ih), None);
     }
 
     #[test]
