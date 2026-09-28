@@ -18,8 +18,9 @@ pub struct Cli {
     #[arg(short, long, value_name = "PATH")]
     pub config: Option<PathBuf>,
 
-    /// Validate the config file and exit. Useful for systemd
-    /// `ExecStartPre=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config`.
+    /// Validate the config file and exit, 78 on a refusal. Run it before
+    /// restarting the daemon onto a changed config; the daemon makes the same
+    /// checks itself when it starts, so the unit needs no `ExecStartPre`.
     ///
     /// Checks everything decidable from the file itself, including the boot
     /// refusals for `network_kill_switch = true` with no `network = "vpn"`
@@ -36,7 +37,7 @@ pub struct Cli {
     /// `openvpn` are installed, or which uid the daemon runs as. Run
     /// `torrentd --config <path> vpn check` for those. That command is kept
     /// out of this flag on purpose: its checks can come back "could not be
-    /// checked" for want of a capability, and as `ExecStartPre=` that would
+    /// checked" for want of a capability, and as a start-up check that would
     /// refuse to start a daemon nothing is known to be wrong with.
     #[arg(long, verbatim_doc_comment)]
     pub check_config: bool,

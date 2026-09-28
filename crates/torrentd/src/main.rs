@@ -226,15 +226,6 @@ fn is_exempt_operator_tool(command: &Command) -> bool {
     }
 }
 
-/// Load the config with the validation this invocation actually needs.
-///
-/// The daemon and `--check-config` get the full check, authentication posture
-/// included: one is about to serve, and the other exists to answer "would it".
-/// An operator subcommand gets everything but the posture — it constructs no
-/// session and binds nothing, and holding it to a check about serving is what
-/// made `hash-password` unreachable from the very configs the refusal sends an
-/// operator to it to fix. `vpn check --bring-up` is excluded from that, per
-/// [`is_exempt_operator_tool`].
 /// `EX_CONFIG` (sysexits.h): the configuration is wrong, and starting again
 /// will not change that.
 const EX_CONFIG: i32 = 78;
@@ -251,6 +242,15 @@ fn refuse_config(e: &anyhow::Error) -> ! {
     std::process::exit(EX_CONFIG);
 }
 
+/// Load the config with the validation this invocation actually needs.
+///
+/// The daemon and `--check-config` get the full check, authentication posture
+/// included: one is about to serve, and the other exists to answer "would it".
+/// An operator subcommand gets everything but the posture — it constructs no
+/// session and binds nothing, and holding it to a check about serving is what
+/// made `hash-password` unreachable from the very configs the refusal sends an
+/// operator to it to fix. `vpn check --bring-up` is excluded from that, per
+/// [`is_exempt_operator_tool`].
 fn load_config(cli: &Cli) -> anyhow::Result<config::Config> {
     let Some(path) = cli.config.as_deref() else {
         anyhow::bail!("--config <PATH> is required");
@@ -282,10 +282,11 @@ fn openapi_cmd(out: Option<&std::path::Path>) -> anyhow::Result<()> {
 
 /// What `--check-config` establishes beyond the file parsing and validating.
 ///
-/// `deploy/torrentd.service` runs it as `ExecStartPre`, so every refusal
-/// reproduced here is one that lands before `ExecStart` rather than under
-/// `Restart=on-failure`. Split out of `main` so the wiring is reachable from a
-/// test: `main` parses the CLI and has no other seam.
+/// The daemon runs it too, before it starts anything, and exits 78 for what it
+/// refuses, so the unit's `RestartPreventExitStatus=78` leaves a refused
+/// config stopped rather than under `Restart=on-failure`. Split out of `main`
+/// so the wiring is reachable from a test: `main` parses the CLI and has no
+/// other seam.
 ///
 /// The one boot refusal deliberately *not* here is the registry cross-check,
 /// which reads `profile_assignments.json` from the state directory. A config
@@ -379,6 +380,14 @@ fn main() -> anyhow::Result<()> {
             // Handled before the config is loaded, above.
             Command::Openapi { out } => openapi_cmd(out.as_deref()),
         };
+    }
+
+    // The daemon makes the host probe `--check-config` makes, and refuses it
+    // the same way. The unit runs no `ExecStartPre`, because systemd's
+    // `RestartPreventExitStatus=78` reads only the main process's status: a
+    // refusal has to come from here for the unit to stay stopped.
+    if let Err(e) = check_config(&cfg) {
+        refuse_config(&e);
     }
 
     let log_handle = tracing_init::init(cfg.log_level);
@@ -658,10 +667,9 @@ http_listen = "127.0.0.1:8080"
 
     #[test]
     fn check_config_reproduces_the_kill_switch_boot_refusal() {
-        // `deploy/torrentd.service` runs `--check-config` as its
-        // `ExecStartPre`. `boot` refuses this configuration, and the
-        // pre-flight used to green-light it — so the failure landed at
-        // `ExecStart` under `Restart=on-failure` instead of before it.
+        // `--check-config` is the operator's pre-flight. `boot` refuses this
+        // configuration, and the pre-flight used to green-light it — so the
+        // failure surfaced only when the daemon started.
         //
         // The refusal now lives in `Config::validate`, above the posture
         // check, because it is a pure function of the file; `--check-config`

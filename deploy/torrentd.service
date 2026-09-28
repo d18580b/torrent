@@ -6,15 +6,19 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStartPre=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config
+# No `ExecStartPre=... --check-config`: the daemon makes every check that flag
+# makes before it starts anything, and exits 78 for the same refusals.
+# RestartPreventExitStatus= reads only the main process's status, so a refusal
+# from an ExecStartPre would be restarted every RestartSec regardless.
 ExecStart=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml
 ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=5s
-# 78 (EX_CONFIG) is a configuration the daemon refuses: --check-config
-# failing, a config that does not load, or a boot refusal no restart can
-# change. Restarting it every RestartSec only buries the reason in the journal.
+# 78 (EX_CONFIG) is a configuration the daemon refuses: a config that does not
+# load, `nft` missing under `network_kill_switch = true`, or a boot refusal no
+# restart can change. Restarting it every RestartSec only buries the reason in
+# the journal.
 RestartPreventExitStatus=78
 WatchdogSec=60s
 

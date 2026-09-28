@@ -812,10 +812,9 @@ impl Config {
     ///
     /// `startup::boot` refuses `network_kill_switch = true` with no tunnel to
     /// confine egress to, or with a host profile the ruleset would silently
-    /// cut off, and `--check-config` — which
-    /// `deploy/torrentd.service` runs as its `ExecStartPre`, so that a bad
-    /// configuration fails before `ExecStart` rather than under
-    /// `Restart=on-failure` — did not. The configuration that reaches it, a
+    /// cut off, and `--check-config` — the pre-flight that exists so a bad
+    /// configuration is caught before the daemon is restarted onto it — did
+    /// not. The configuration that reaches it, a
     /// set of profiles with zero tunnels, is new in this change.
     ///
     /// Called from [`Config::validate_inner`], above the authentication
@@ -3274,9 +3273,8 @@ upload_rate_limit = 0"#,
 
     #[test]
     fn check_config_refuses_a_kill_switch_with_no_tunnel_to_confine_egress_to() {
-        // `deploy/torrentd.service` runs `--check-config` as its
-        // `ExecStartPre` so a bad configuration fails before `ExecStart`
-        // rather than under `Restart=on-failure`. This refusal is a pure
+        // `--check-config` is the pre-flight that catches a bad configuration
+        // before the daemon is restarted onto it. This refusal is a pure
         // function of the file and `boot` makes it anyway, so the pre-flight
         // has no reason not to.
         //

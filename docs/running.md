@@ -519,8 +519,10 @@ has been running for months with a WireGuard config somewhere else will not
 start after the upgrade. That is deliberate — such a tunnel comes up and can
 never be torn down, which is the defect the rule exists to make unreachable —
 and it is catchable before the running daemon stops: `--check-config` refuses
-the same config, and `deploy/torrentd.service` runs it as `ExecStartPre`. Move
-the file to `/etc/wireguard/<vpn_interface>.conf` and update `vpn_config`.
+the same config, so run it before restarting onto the upgrade. A daemon started
+on it anyway exits `78`, which `deploy/torrentd.service` leaves stopped rather
+than restarting. Move the file to `/etc/wireguard/<vpn_interface>.conf` and
+update `vpn_config`.
 
 **`[[profile]] upload_rate_limit`** (optional, bytes/sec) is applied to that
 profile's session at boot. **Omit it to inherit the top-level
@@ -833,7 +835,11 @@ reported healthy.
 
 A refused configuration exits `78` (`EX_CONFIG`), and the unit's
 `RestartPreventExitStatus=78` leaves it stopped with the reason as the last
-journal line rather than restarting it every five seconds. A stop runs the
+journal line rather than restarting it every five seconds. That directive reads
+only the main process's exit status, so the unit has no `ExecStartPre`
+`--check-config`: the daemon makes the same checks as it starts, and a refusal
+from an `ExecStartPre` would be restarted every five seconds regardless. A
+stop runs the
 HTTP drain (10 s; a client that holds on past it is cut off and the exit is
 still `0`), lets pool work finish its current step (up to 20 s), drains resume
 data (`shutdown_drain_secs`), then closes the sessions, takes the tunnels
