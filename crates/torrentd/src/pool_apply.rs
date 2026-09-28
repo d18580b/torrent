@@ -82,6 +82,10 @@ fn check_index_accounts_for_live_state(pool: &PoolService, state: &StateMap) -> 
     Ok(())
 }
 
+/// What `apply_inner` answers when a shutdown stops it before the claim. The
+/// boot re-drive tells a stop from a failure by it.
+const SHUTTING_DOWN: &str = "the daemon is shutting down; apply the plan again once it is back";
+
 fn apply_inner(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
@@ -144,7 +148,7 @@ fn apply_inner(
     // Not claimed during a shutdown: the claim would hand the plan to the next
     // boot to re-drive, which is not what a request made now asked for.
     if stop() {
-        return Err("the daemon is shutting down; apply the plan again once it is back".into());
+        return Err(SHUTTING_DOWN.into());
     }
 
     // ---- claim -------------------------------------------------------------
@@ -716,9 +720,22 @@ pub fn resume_unfinished(
         if stop() {
             return;
         }
-        if let Err(e) = apply_inner(pool, source, state, plan.id, true, stop) {
-            error!(target: "torrentd::pool::apply", plan_id = plan.id, error.cause = %e, "resume failed");
-            pool.count("pool_plan_failures_total", &[("kind", "resume_failed")]);
+        match apply_inner(pool, source, state, plan.id, true, stop) {
+            Ok(_) => {}
+            // A stop latched after the check above: the plan was stopped,
+            // not failed, and stays `applying` for the next boot.
+            Err(e) if e == SHUTTING_DOWN => {
+                warn!(
+                    target: "torrentd::pool::apply",
+                    plan_id = plan.id,
+                    "not resuming for shutdown; the plan resumes at the next boot",
+                );
+                return;
+            }
+            Err(e) => {
+                error!(target: "torrentd::pool::apply", plan_id = plan.id, error.cause = %e, "resume failed");
+                pool.count("pool_plan_failures_total", &[("kind", "resume_failed")]);
+            }
         }
     }
 }
@@ -1030,6 +1047,44 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLIED);
+    }
+
+    #[test]
+    fn a_stop_latched_inside_the_redrive_is_not_counted_as_a_failure() {
+        // The re-drive checks the stop, then `apply_inner` checks it again
+        // before its claim. A shutdown landing between the two used to come
+        // back as an error and count as `resume_failed`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a/one.bin", 16);
+        write(&root, "b/two.bin", 16);
+        let pool = service(dir.path(), true);
+        let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+        pool.set_metrics(metrics.clone());
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (source, state) = engine_and_state();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        apply(&pool, &source, &state, plan_id, &stop).unwrap();
+        assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLYING);
+
+        // Clear for the re-drive's own check, latched for `apply_inner`'s.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        resume_unfinished(&pool, &source, &state, &stop);
+
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let (status, steps) = plan_state(&pool, plan_id);
+        assert_eq!(
+            status,
+            plan_status::APPLYING,
+            "a stopped plan is left for the next boot"
+        );
+        assert_eq!(steps, vec![step_status::PENDING, step_status::PENDING]);
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(!text.contains("kind=\"resume_failed\"} 1"), "{text}");
     }
 
     #[test]
