@@ -647,6 +647,107 @@ mod tests {
         assert_eq!(second.reloadable_changes, vec!["connections_limit"]);
     }
 
+    #[tokio::test]
+    async fn run_retries_a_failed_apply_and_does_not_reapply_an_applied_log_level() {
+        // The property, at the level of `run` rather than `running_config`:
+        // the pump itself sets `settings_applied = false` when `apply_settings`
+        // fails and `log_level_applied = true` when `set_level` succeeds. The
+        // `running_config` tests above pass both flags by hand, so neither
+        // assignment in `run` was reached by any test.
+        //
+        // Boot at `connections_limit = 10000`, `log_level = "info"`; the file
+        // says 20000 and `debug`; three SIGHUPs of that one file. The first
+        // applies the level and fails the settings. The second retries only
+        // the settings, which the one-shot fault no longer fails. The third
+        // has nothing left to do. Dropping either assignment changes the
+        // count of one line below.
+        use torrentd_engine::EngineError;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::ProfileSource;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::TorrentEngine;
+
+        const TOP_LEVEL: &str = r#"
+default_save_path = "/data/torrents"
+resume_dir = "/var/lib/torrentd/resume"
+torrent_dir = "/var/lib/torrentd/torrents"
+http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
+"#;
+        const PROFILE: &str = r#"
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("torrentd.toml");
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}log_level = \"info\"\nconnections_limit = 10000\n{PROFILE}"),
+        )
+        .unwrap();
+        let boot = Config::load(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("{TOP_LEVEL}log_level = \"debug\"\nconnections_limit = 20000\n{PROFILE}"),
+        )
+        .unwrap();
+
+        let mock = Arc::new(MockEngine::new());
+        mock.inject_error(
+            "apply_settings",
+            EngineError::MockInjected {
+                op: "apply_settings",
+                message: "boom".into(),
+            },
+        );
+        let engine: Arc<dyn TorrentEngine> = mock.clone();
+        let profile = boot.profile[0].clone();
+        let id = profile.id.clone();
+        let registry = Arc::new(crate::profile_registry::ProfileRegistry::new(vec![
+            crate::profile_registry::ProfileEntry::new(profile, engine.clone(), None, None, 0),
+        ]));
+        let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![(id, engine)]));
+        let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+
+        let log = crate::tracing_init::Buf::default();
+        let (log_handle, subscriber) = crate::tracing_init::for_tests(LogLevel::Info, log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (tx, rx) = tokio::sync::mpsc::channel(3);
+        for _ in 0..3 {
+            tx.try_send(()).unwrap();
+        }
+        drop(tx);
+        run(path, boot, source, registry, rx, log_handle, metrics).await;
+
+        let applies: Vec<_> = mock
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::ApplySettings(s) => Some(s.connections_limit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            applies,
+            vec![Some(20_000), Some(20_000)],
+            "the failed apply is retried once, and not again once it took",
+        );
+
+        let log = log.text();
+        let count = |line: &str| log.matches(line).count();
+        assert_eq!(count("SIGHUP: apply_settings failed"), 1, "{log}");
+        assert_eq!(count("SIGHUP: settings applied"), 1, "{log}");
+        assert_eq!(
+            count("SIGHUP: log level applied"),
+            1,
+            "an applied level advances and is not set again on the retry: {log}",
+        );
+        assert_eq!(count("SIGHUP: config unchanged"), 1, "{log}");
+    }
+
     #[test]
     fn an_edit_reverted_to_the_running_value_is_unchanged() {
         let dir = tempfile::tempdir().unwrap();
