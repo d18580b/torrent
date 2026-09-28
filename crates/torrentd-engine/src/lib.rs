@@ -83,6 +83,7 @@ pub use profile::ProfileNetwork;
 pub use profile::ProfileStatus;
 pub use real::RealEngine;
 pub use registry::AssignmentRegistry;
+pub use registry::JsonImport;
 pub use registry::RegistryError;
 pub use resume_store::FsResumeStore;
 pub use resume_store::MemoryResumeStore;

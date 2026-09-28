@@ -1226,14 +1226,18 @@ async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering
     let mut engine = None;
     let h = Harness::authed(&Coverage::new(), |s| {
         engine = Some(fixture(s, dir.path()).p);
-        // A registry whose "directory" is a regular file: every write fails.
-        std::fs::write(dir.path().join("blocker"), b"not a directory").unwrap();
-        s.registry = Arc::new(AssignmentRegistry::new_empty(
-            dir.path().join("blocker").join("reg.json"),
-        ));
-        // `assign` inserts in memory and then fails to persist: the registry
-        // knows who owns it and cannot write that down.
-        assert!(s.registry.assign(LOADED, ProfileId::new("p")).is_err());
+        // The torrent is assigned, and from then on every write to the
+        // registry fails, as on a full or read-only state directory.
+        let db = dir.path().join("failing.db");
+        s.registry = Arc::new(AssignmentRegistry::new_empty(&db));
+        s.registry.assign(LOADED, ProfileId::new("p")).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_delete BEFORE DELETE ON assignment \
+                   BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
     });
     let resp = h
         .write("DELETE", &format!("/v1/torrents/{}", hex(LOADED)))
@@ -1249,6 +1253,14 @@ async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering
         .calls()
         .iter()
         .any(|c| matches!(c, RecordedCall::RemoveTorrent { .. })));
+    // The detail says to retry. That only works if the failed write left the
+    // claim in memory too; dropping it there first made the retry a 404 and
+    // the claim came back from disk at the next restart.
+    assert_eq!(
+        h.state.registry.lookup(&LOADED),
+        Some(ProfileId::new("p")),
+        "a remove that failed to persist releases nothing",
+    );
 }
 
 /// Wait, up to ten seconds, for `cond` to hold.

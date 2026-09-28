@@ -1002,10 +1002,10 @@ pub async fn delete_torrent(
     // may be cleared.
     //
     // An entry the startup scans left unloaded — its resume add failed, or a
-    // delete whose registry write failed left it in the file for the next
+    // delete whose registry write failed left it in the registry for the next
     // boot — is held by no session, so the assignment is all there is to
     // clear. Answering 404 there would leave it uncleared by any means but
-    // hand-editing `profile_assignments.json`.
+    // hand-editing `registry.db`.
     //
     // Any other entry was assigned in this process, by the add or adopt
     // path, and handed to a session whose `AddTorrent` alert has not been
@@ -1078,7 +1078,7 @@ fn clear_assignment(s: &AppState, ih: &InfoHash) -> Result<(), DeleteTorrentErro
 /// nothing to remove from one; what is left is the registry entry, and that
 /// entry is what makes `POST /v1/torrents` answer `torrent-exists` for this
 /// infohash. Clearing it is the whole of the work; refusing would leave an
-/// operator no way to clear it but hand-editing `profile_assignments.json`.
+/// operator no way to clear it but hand-editing `registry.db`.
 fn clear_sessionless(
     s: &AppState,
     ih: &InfoHash,
