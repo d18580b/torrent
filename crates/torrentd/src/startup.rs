@@ -964,8 +964,9 @@ pub async fn boot(
             // with a startup log line as the only trace.
             //
             // `--check-config` reproduces the configured-set half of this
-            // (`Config::check_boot_rules`), so a config with no vpn profile
-            // fails the systemd pre-flight. This check stays because it reads
+            // (`Config::check_boot_rules`), so an operator's pre-flight run
+            // refuses a config with no vpn profile, and the daemon refuses it
+            // as it loads the config, exiting 78. This check stays because it reads
             // the profiles that actually came up: a config with one vpn
             // profile whose tunnel failed lands here too, and no config check
             // could have known.
