@@ -647,8 +647,10 @@ pub async fn boot(
                 .map(|id| format!("'{id}'"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let delete =
-                format!("sqlite3 {current} \"DELETE FROM assignment WHERE profile_id IN ({ids})\"");
+            let delete = format!(
+                "sqlite3 {} \"DELETE FROM assignment WHERE profile_id IN ({ids})\"",
+                sh_single_quote(&current)
+            );
             let where_to_edit = if source == current {
                 format!("remove those entries from {current} (`{delete}`)")
             } else {
@@ -1987,6 +1989,13 @@ where
 }
 
 /// Read the persisted DHT/session-state blob, or `None` if absent/empty.
+/// `s` as one POSIX shell word: single-quoted, with each `'` closed, escaped
+/// and reopened. The registry refusal prints a command to paste, and a state
+/// directory holding a space or a shell metacharacter must not break it.
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
 fn load_session_state(path: &std::path::Path) -> Option<Vec<u8>> {
     match std::fs::read(path) {
         Ok(b) if !b.is_empty() => Some(b),
@@ -2361,6 +2370,25 @@ mod tests {
     use torrentd_engine::VpnType;
 
     use super::*;
+
+    /// The database path in the registry refusal's `sqlite3` command reaches
+    /// the shell as one word, whatever the state directory is called.
+    #[test]
+    fn the_refusal_command_quotes_a_path_the_shell_would_split() {
+        for path in [
+            "/var/lib/torrentd/registry.db",
+            "/srv/my state/registry.db",
+            "/srv/it's; $(rm -rf ~) `x` \"q\" *&|/registry.db",
+        ] {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf '%s' {}", sh_single_quote(path)))
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), path);
+        }
+    }
 
     /// A second holder of the same lock file is refused while the first is
     /// alive, told the first one's pid, and leaves that pid in place. `flock`
