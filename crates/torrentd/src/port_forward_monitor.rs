@@ -924,7 +924,11 @@ mod tests {
         let (engine, sink, stop_tx, task) = two_batch_profile(&fwd, Duration::from_secs(10));
 
         tokio::time::sleep(Duration::from_secs(5)).await;
-        assert_eq!(reannounced(&engine).len(), REANNOUNCE_BATCH, "the first batch");
+        assert_eq!(
+            reannounced(&engine).len(),
+            REANNOUNCE_BATCH,
+            "the first batch"
+        );
         stop_tx.send(true).unwrap();
         task.await.unwrap();
 
@@ -934,7 +938,10 @@ mod tests {
             REANNOUNCE_BATCH,
             "nothing after the stop",
         );
-        assert_eq!(histograms(&sink, "profile_port_change_reannounce_seconds"), 0);
+        assert_eq!(
+            histograms(&sink, "profile_port_change_reannounce_seconds"),
+            0
+        );
     }
 
     /// Profile Safety Rule 8, for the ports a gateway assigns: a renewal that
