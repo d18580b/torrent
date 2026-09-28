@@ -23,6 +23,54 @@ pub const MAX_LIMIT: u32 = 1000;
 
 const VERSION: &str = "v1";
 
+/// `limit` as a listing's query parameter carries it: a page size, `1` to
+/// [`MAX_LIMIT`].
+///
+/// A type rather than a `u32` field with `#[schema(minimum = 1, maximum =
+/// 1000)]`: kynos describes a query parameter by its type alone and drops a
+/// field's constraints, so the published document said `0` to `4294967295`.
+/// The bound is this type's schema, so every listing that takes a `limit`
+/// publishes it.
+///
+/// Parsing takes any `u32`, as the field did. An out-of-range value is then
+/// a `422 validation-failed` from [`PageRequest::parse`], reported beside the
+/// request's other violations, rather than the framework's `400` for a
+/// parameter that does not parse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageLimit(pub u32);
+
+impl PageLimit {
+    /// The page size as the request spelled it, not yet range-checked.
+    pub fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl kynos::schema::Schema for PageLimit {
+    fn schema(registry: &mut kynos::schema::registry::Registry) -> kynos::openapi::Schema {
+        let mut bounds = kynos::schema::constraints::Constraints::default();
+        bounds.minimum = Some(1.0);
+        bounds.maximum = Some(f64::from(MAX_LIMIT));
+        bounds.apply(u32::schema(registry))
+    }
+}
+
+impl std::str::FromStr for PageLimit {
+    type Err = std::num::ParseIntError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self)
+    }
+}
+
+impl std::fmt::Display for PageLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl kynos::schema::ParamValue for PageLimit {}
+
 /// A validated page request: where to resume, and how many items to return.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PageRequest {

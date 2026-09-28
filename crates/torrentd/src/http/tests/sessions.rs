@@ -141,6 +141,9 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         )
         .await;
     assert_eq!(resp.status().as_u16(), 413);
+    // A body that never finishes arriving is cut off, unauthenticated.
+    let (status, _) = h.slow_body("POST", "/v1/sessions", None).await;
+    assert_eq!(status.as_u16(), 408);
 
     // Wrong passwords, until the per-client throttle answers with a wait.
     for _ in 0..5 {
@@ -195,6 +198,73 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
 #[tokio::test]
 async fn sessions_behave_as_documented() {
     scenarios(&Coverage::new()).await;
+}
+
+#[tokio::test]
+async fn a_login_whose_body_stalls_is_cut_off_at_the_deadline_with_408() {
+    // The attack: declare a length, send part of the body, stop. Before the
+    // deadline nothing ended the exchange, so enough of these held every
+    // connection the server would accept, `/healthz` included.
+    let h = Harness::authed(&Coverage::new(), |_| {});
+    let (status, waited) = h.slow_body("POST", "/v1/sessions", None).await;
+    assert_eq!(status.as_u16(), 408);
+    let deadline = crate::http::v1::REQUEST_DEADLINE;
+    assert!(
+        waited >= deadline && waited < deadline + std::time::Duration::from_secs(1),
+        "cut off at the deadline, not before or long after: {waited:?}",
+    );
+}
+
+#[tokio::test]
+async fn the_login_throttle_keys_on_the_client_a_trusted_proxy_names() {
+    // Behind a trusted proxy every request's socket peer is the proxy. The
+    // throttle has to key on the client the proxy names, or one client's
+    // failures lock out everyone behind the same proxy.
+    let proxy = "192.0.2.10"; // the harness's socket peer
+    let h = Harness::authed(&Coverage::new(), |s| {
+        s.trusted_proxies = crate::http::forwarded::TrustedProxies::parse(&[proxy.to_owned()])
+            .expect("a literal address parses");
+    });
+    let from = |client: &'static str| [("x-forwarded-for", client)];
+    for _ in 0..5 {
+        let resp = h
+            .send_with(
+                "POST",
+                "/v1/sessions",
+                None,
+                Some(json!({"password": "nope"})),
+                &from("203.0.113.7"),
+            )
+            .await;
+        assert_problem(&resp, 401, "invalid-credentials");
+    }
+    let resp = h
+        .send_with(
+            "POST",
+            "/v1/sessions",
+            None,
+            Some(json!({"password": PASSWORD})),
+            &from("203.0.113.7"),
+        )
+        .await;
+    assert_problem(&resp, 429, "login-throttled");
+    // Another client behind the same proxy is not locked out.
+    let resp = h
+        .send_with(
+            "POST",
+            "/v1/sessions",
+            None,
+            Some(json!({"password": PASSWORD})),
+            &from("203.0.113.8"),
+        )
+        .await;
+    resp.assert_status(kynos::http::StatusCode::CREATED);
+    // And the proxy's own address holds no bucket: the key was the client.
+    let auth = h.state.auth.as_ref().unwrap();
+    assert!(auth
+        .throttle
+        .retry_after(Some(proxy.parse().unwrap()))
+        .is_none());
 }
 
 #[tokio::test]

@@ -661,7 +661,7 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
     body_framework_rejections(h, "POST", "/v1/torrents").await;
 }
 
-/// `400`, `415` and `413` for an operation with a JSON body.
+/// `400`, `415`, `413` and `408` for an operation with a JSON body.
 async fn body_framework_rejections(h: &Harness, method: &str, path: &str) {
     let token = h.tokens.write.clone();
     let resp = h
@@ -695,6 +695,9 @@ async fn body_framework_rejections(h: &Harness, method: &str, path: &str) {
         )
         .await;
     assert_eq!(resp.status().as_u16(), 413, "{method} {path}");
+    // A body that stalls is cut off at the operation's deadline.
+    let (status, _) = h.slow_body(method, path, Some(&token)).await;
+    assert_eq!(status.as_u16(), 408, "{method} {path}: stalled body");
 }
 
 async fn controls(h: &Harness, e: &Engines) {
@@ -1255,6 +1258,98 @@ async fn a_torrent_file_that_cannot_be_persisted_is_counted_and_the_add_still_su
         ),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn a_magnet_whose_trackers_are_all_allowed_is_added() {
+    // The allow-list's other half: refusing a foreign tracker is only useful
+    // if a magnet naming nothing but allowed ones still gets through,
+    // whichever spelling of `tr` it uses.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let allowed = format!(
+        "{MAGNET}&tr=https%3A%2F%2Ftracker.allowed.example%2Fannounce\
+         &tr.1=udp%3A%2F%2Fsub.tracker.allowed.example%3A6969%2Fannounce"
+    );
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "strict", "source": {"kind": "magnet", "uri": allowed}}),
+        )
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap())
+            .unwrap()
+            .as_str(),
+        "strict"
+    );
+}
+
+#[tokio::test]
+async fn a_server_path_that_is_a_symlink_is_refused_even_to_a_real_torrent() {
+    // The path is opened once, refusing a symlink at the last component, and
+    // everything after is read from that descriptor. A symlink planted in a
+    // confined directory therefore cannot point the read anywhere else.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let real = dir.path().join("real.torrent");
+    std::fs::write(&real, torrent_bytes('r')).unwrap();
+    let link = dir.path().join("link.torrent");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "p", "source": {"kind": "server_path", "path": link}}),
+        )
+        .await;
+    assert_problem(&resp, 422, "invalid-metainfo");
+    // The file it names is still readable by its own path.
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "p", "source": {"kind": "server_path", "path": real}}),
+        )
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn status_counts_every_phase_across_profiles() {
+    // Every counter `GET /v1/status` reports, each non-zero, so a counter
+    // wired to the wrong phase cannot hide behind a zero.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let e = fixture(s, dir.path());
+        load(s, &e.p, InfoHash([20; 20]), "p", TorrentPhase::Seeding);
+        load(s, &e.p, InfoHash([21; 20]), "p", TorrentPhase::Checking);
+        load(s, &e.p, InfoHash([22; 20]), "p", TorrentPhase::DiskError);
+        load(s, &e.p, InfoHash([23; 20]), "p", TorrentPhase::Errored);
+        load(s, &e.f, InfoHash([24; 20]), "f", TorrentPhase::Paused);
+    });
+    let status: Value = h.read("/v1/status").await.json();
+    // LOADED seeding, FENCED paused, ADDING and STALE assigned but not
+    // loaded, and the five above.
+    assert_eq!(status["torrents_total"], 9);
+    assert_eq!(status["seeding"], 2);
+    assert_eq!(status["paused"], 2);
+    assert_eq!(status["checking"], 1);
+    assert_eq!(status["disk_error"], 1);
+    assert_eq!(status["errored"], 1);
+    // Seven loaded torrents at 3 peers and 1234 B/s each.
+    assert_eq!(status["peers_total"], 21);
+    assert_eq!(status["upload_rate_total"], 7 * 1234);
+    assert_eq!(status["download_rate_total"], 0);
+    assert_eq!(status["profile_count"], 3);
 }
 
 #[tokio::test]

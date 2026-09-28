@@ -61,6 +61,32 @@ use crate::vpn;
 /// healthy is the worst of both answers.
 const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// The most HTTP connections the API holds open at once; the next waits in
+/// the listen backlog until one closes.
+///
+/// Sized against the descriptor limit the daemon shares with libtorrent,
+/// which is what `LimitNOFILE=65536` in `deploy/torrentd.service` is for:
+/// each profile's `connections_limit` (10,000 in the sample config) and
+/// `file_pool_size` draw on the same table. kynos' default of 10,000 would let
+/// the API alone take a sixth of it, and every descriptor the API holds is one
+/// a profile cannot open a peer or a file with. The API's own callers — an
+/// operator or two, `torrentctl`, a Prometheus scrape, a reverse proxy's
+/// pool — need a few dozen; 256 leaves room for a proxy that does not reuse
+/// connections, at under 0.4% of the table.
+const HTTP_MAX_CONNECTIONS: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(256) {
+    Some(n) => n,
+    None => unreachable!(),
+};
+
+/// How long an HTTP/1 client has to send a request head, including the wait
+/// for the next request on a kept-alive connection.
+///
+/// A head is a few hundred bytes. kynos' default of 30 s lets a client that
+/// never finishes one hold a connection — one of [`HTTP_MAX_CONNECTIONS`] —
+/// three times as long for no reason; the body's own deadline is
+/// `http::v1::REQUEST_DEADLINE`.
+const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// An exclusive `flock` on [`Config::instance_lock_path`], held for the life
 /// of the daemon.
 ///
@@ -1929,8 +1955,19 @@ async fn serve_until_shutdown(
 
     // kynos records every connection's peer address, which is what lets the
     // session throttle and the auth failure log see who was calling.
+    //
+    // The limits are set here rather than left to kynos' defaults, which are
+    // sized for a public web service: 10,000 connections and a 30 s header
+    // timeout. This is a single-operator control plane sharing one descriptor
+    // limit (`LimitNOFILE`) with libtorrent, whose peer connections and file
+    // pool are what the limit is for; see `HTTP_MAX_CONNECTIONS`.
     let server = kynos::server::Server::new(app)
         .listener(listener)
+        .max_connections(HTTP_MAX_CONNECTIONS)
+        .http1(
+            kynos::server::protocol::Http1Config::default()
+                .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT)),
+        )
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             let _ = shutdown_rx.recv().await;
         }))

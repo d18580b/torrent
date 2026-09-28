@@ -969,6 +969,13 @@ async fn malformed_requests(cov: &Arc<Coverage>) {
             .send(method, path, Some(&w), Some(json!({"pad": huge})))
             .await;
         assert_eq!(resp.status().as_u16(), 413, "{method} {path}");
+        // Applying a plan waits for every step and carries no deadline, so
+        // a stalled body there is bounded by nothing but `write`; every
+        // other operation cuts one off.
+        if !path.ends_with("/apply") {
+            let (status, _) = h.slow_body(method, path, Some(&w)).await;
+            assert_eq!(status.as_u16(), 408, "{method} {path}: stalled body");
+        }
     }
     h.assert_conformance();
 }

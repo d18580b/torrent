@@ -70,7 +70,7 @@ Refusals:
   `WWW-Authenticate: Bearer`. The API never says which of those it was.
 - A valid token without the scope is a `403`
   [`insufficient-scope`](problems.md#insufficient-scope).
-- `POST /v1/sessions` is throttled per client, and against a daemon-wide
+- `POST /v1/sessions` is throttled per client (per /64 for IPv6), and against a daemon-wide
   budget for its memory-hard password check. A throttled attempt is a `429`
   [`login-throttled`](problems.md#login-throttled) with `Retry-After`.
 
@@ -80,8 +80,13 @@ no CORS: the API has no browser clients.
 **A daemon without `[auth]`.** With `allow_unauthenticated = true`, which the
 daemon permits only on a loopback `http_listen`, every operation admits every
 request, with or without a token. An `Authorization` header that is present
-but malformed is still a `401`: a client that sent a broken credential is not
-an anonymous one. The document still describes the bearer
+but is not a well-formed bearer credential is still a `401`: a client that
+sent a credential nobody checked is not an anonymous one. That includes any
+other scheme — a `Basic` header a reverse proxy adds or passes through from
+its own login is a `401` on every operation — so a proxy in front of such a
+daemon must strip `Authorization` before forwarding (nginx:
+`proxy_set_header Authorization "";`, Caddy: `header_up -Authorization`).
+The document still describes the bearer
 requirement, because it is the contract every deployment with credentials
 keeps. `GET /v1/server` reports which case applies as `auth.mode`.
 
@@ -135,6 +140,13 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
 - **Body limits.** A request body is capped at 64 KiB, except for
   `POST /v1/torrents`, which takes 96 MiB so it can carry a base64-encoded
   64 MiB `.torrent`. An operation that takes no body declares no `413`.
+- **Deadlines.** An operation that takes a body must have received it and
+  answered within 30 seconds of the request head — 300 seconds for
+  `POST /v1/torrents` — or it is answered `408` and the request is abandoned.
+  `POST /v1/pool/plans/{plan_id}/apply`, which waits for every step of a plan,
+  has no deadline. The server also closes a connection whose request head
+  takes more than 10 seconds to arrive, and holds at most 256 connections at
+  once.
 - **Trailing slashes are not accepted.** `/v1/status/` is a `404`.
 
 ## Pagination
@@ -186,8 +198,9 @@ described in [`problems.md`](problems.md):
 - The first event carries `retry: 5000`, the reconnect delay in milliseconds.
 - A comment line every fifteen seconds keeps the connection alive through
   proxies.
-- The stream ends when the daemon shuts down. Reconnect, and poll while the
-  stream is down.
+- The stream ends when the daemon shuts down, and within a second of the
+  session token it was opened with expiring or being revoked. Reconnect with
+  a live credential, and poll while the stream is down.
 
 ## Optional surfaces
 

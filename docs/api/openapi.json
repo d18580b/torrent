@@ -483,7 +483,7 @@
           "server"
         ],
         "summary": "Stream change notifications.",
-        "description": "Server-Sent Events. Each message's `data` is a JSON `ServerEvent`; today\nthat is only `tick`, sent when anything a client renders may have changed\nand at least every ten seconds. A comment line keeps the connection alive\nevery fifteen seconds through proxies that drop idle ones. The stream ends\nwhen the daemon shuts down; reconnect after the `retry` the first event\ncarries.",
+        "description": "Server-Sent Events. Each message's `data` is a JSON `ServerEvent`; today\nthat is only `tick`, sent when anything a client renders may have changed\nand at least every ten seconds. A comment line keeps the connection alive\nevery fifteen seconds through proxies that drop idle ones. The stream ends\nwhen the daemon shuts down, and within a second of the session token it was\nopened with expiring or being revoked; reconnect after the `retry` the\nfirst event carries, with a live credential.",
         "operationId": "stream_events",
         "responses": {
           "401": {
@@ -1104,8 +1104,8 @@
                 "integer",
                 "null"
               ],
-              "maximum": 4294967295.0,
-              "minimum": 0.0,
+              "maximum": 1000.0,
+              "minimum": 1.0,
               "format": "uint32"
             }
           }
@@ -1653,6 +1653,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
                         }
                       }
                     }
@@ -3016,8 +3038,8 @@
                 "integer",
                 "null"
               ],
-              "maximum": 4294967295.0,
-              "minimum": 0.0,
+              "maximum": 1000.0,
+              "minimum": 1.0,
               "format": "uint32"
             }
           }
@@ -4642,8 +4664,8 @@
                 "integer",
                 "null"
               ],
-              "maximum": 4294967295.0,
-              "minimum": 0.0,
+              "maximum": 1000.0,
+              "minimum": 1.0,
               "format": "uint32"
             }
           }
@@ -4945,8 +4967,8 @@
                 "integer",
                 "null"
               ],
-              "maximum": 4294967295.0,
-              "minimum": 0.0,
+              "maximum": 1000.0,
+              "minimum": 1.0,
               "format": "uint32"
             }
           }
@@ -5242,8 +5264,8 @@
                 "integer",
                 "null"
               ],
-              "maximum": 4294967295.0,
-              "minimum": 0.0,
+              "maximum": 1000.0,
+              "minimum": 1.0,
               "format": "uint32"
             }
           }
@@ -5854,8 +5876,8 @@
                 "integer",
                 "null"
               ],
-              "maximum": 4294967295.0,
-              "minimum": 0.0,
+              "maximum": 1000.0,
+              "minimum": 1.0,
               "format": "uint32"
             }
           }
@@ -6351,6 +6373,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
                         }
                       }
                     }
@@ -7082,6 +7126,28 @@
               }
             }
           },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "413": {
             "description": "the request body exceeds the configured limit",
             "content": {
@@ -7356,6 +7422,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
                         }
                       }
                     }
@@ -7708,6 +7796,28 @@
               }
             }
           },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "413": {
             "description": "the request body exceeds the configured limit",
             "content": {
@@ -8052,6 +8162,28 @@
               }
             }
           },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "413": {
             "description": "the request body exceeds the configured limit",
             "content": {
@@ -8307,6 +8439,28 @@
                         "type": {
                           "type": "string",
                           "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#pool-not-configured"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
                         }
                       }
                     }
@@ -9626,6 +9780,13 @@
             "format": "uint32",
             "description": "Torrents whose engine call failed. Nonzero means not everything was\nreached."
           },
+          "failed_infohashes": {
+            "items": {
+              "$ref": "#/components/schemas/InfoHashHex"
+            },
+            "type": "array",
+            "description": "Which torrents those were: the 100 smallest infohashes among them, in\ninfohash order. Retry each with its own\n`POST /v1/torrents/{infohash}/pause` or `/resume`; when\n`failed_count` is larger, repeat the bulk operation after those."
+          },
           "skipped_profiles": {
             "items": {
               "$ref": "#/components/schemas/SkippedProfile"
@@ -9638,6 +9799,7 @@
         "required": [
           "torrent_count",
           "failed_count",
+          "failed_infohashes",
           "skipped_profiles"
         ],
         "description": "What a pause or resume of many torrents did.\n\nA body rather than a bare `204`: a daemon-wide pause spans profiles that\ncan be in different states, and an operator stopping everything during an\nincident has to see what was not reached."

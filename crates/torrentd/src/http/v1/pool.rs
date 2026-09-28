@@ -26,6 +26,7 @@ use crate::app_state::AppState;
 use crate::http::page::page;
 use crate::http::page::paginate;
 use crate::http::page::InvalidCursor;
+use crate::http::page::PageLimit;
 use crate::http::page::PageRequest;
 use crate::http::security::Bearer;
 use crate::http::security::Read;
@@ -495,7 +496,7 @@ pub struct TreeQuery {
     pub cursor: Option<String>,
     /// Entries per page; 100 when absent.
     #[schema(minimum = 1, maximum = 1000)]
-    pub limit: Option<u32>,
+    pub limit: Option<PageLimit>,
 }
 
 /// One entry of a directory listing.
@@ -575,7 +576,7 @@ fn list_children(
     let page = PageRequest::parse(
         listing,
         q.cursor.as_deref(),
-        q.limit,
+        q.limit.map(PageLimit::get),
         |key| is_child_key(key, &prefix),
         &mut invalid,
     )?;
@@ -766,7 +767,7 @@ pub struct PoolTorrentQuery {
     pub cursor: Option<String>,
     /// Torrents per page; 100 when absent.
     #[schema(minimum = 1, maximum = 1000)]
-    pub limit: Option<u32>,
+    pub limit: Option<PageLimit>,
 }
 
 /// A torrent in the pool's library.
@@ -821,7 +822,7 @@ pub async fn list_pool_torrents(
     let page = PageRequest::parse(
         LISTING,
         q.cursor.as_deref(),
-        q.limit,
+        q.limit.map(PageLimit::get),
         crate::http::validate::is_infohash_hex,
         &mut invalid,
     )?;
@@ -1533,7 +1534,7 @@ pub struct PlanQuery {
     pub cursor: Option<String>,
     /// Plans per page; 100 when absent.
     #[schema(minimum = 1, maximum = 1000)]
-    pub limit: Option<u32>,
+    pub limit: Option<PageLimit>,
 }
 
 /// List mutation plans.
@@ -1552,7 +1553,7 @@ pub async fn list_plans(
     let page = PageRequest::parse(
         LISTING,
         q.cursor.as_deref(),
-        q.limit,
+        q.limit.map(PageLimit::get),
         |key| crate::http::page::is_padded_decimal(key, PLAN_KEY_WIDTH),
         &mut invalid,
     )?;
@@ -1969,18 +1970,27 @@ macro_rules! bodyless_routes {
 }
 pub(crate) use bodyless_routes;
 
-/// Operations whose body is bounded by `MAX_BODY_BYTES`.
+/// Operations whose body is bounded by `MAX_BODY_BYTES` and whose request is
+/// bounded by `REQUEST_DEADLINE`.
 macro_rules! body_routes {
     ($group:expr) => {
         $group.mount(kynos::routes![
             crate::http::v1::pool::adopt_pool_torrents,
             crate::http::v1::pool::verify_pool_torrents,
             crate::http::v1::pool::create_plan,
-            crate::http::v1::pool::apply_plan,
         ])
     };
 }
 pub(crate) use body_routes;
+
+/// Operations whose body is bounded by `MAX_BODY_BYTES` and that may run for
+/// minutes, so carry no deadline: applying a plan waits for every step.
+macro_rules! long_body_routes {
+    ($group:expr) => {
+        $group.mount(kynos::routes![crate::http::v1::pool::apply_plan])
+    };
+}
+pub(crate) use long_body_routes;
 
 #[cfg(test)]
 mod tests {

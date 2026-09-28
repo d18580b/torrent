@@ -61,6 +61,9 @@ fault-injection = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `test-util` pauses the clock, so a test can watch a 30-second request
+# deadline expire without waiting for it (`http::tests::support::slow_body`).
+tokio = { workspace = true, features = ["test-util"] }
 kynos = { workspace = true, features = ["test-util"] }
 
 [lints]
