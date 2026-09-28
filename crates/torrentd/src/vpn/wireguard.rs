@@ -209,14 +209,15 @@ pub(super) fn current_boot_id() -> Option<String> {
 /// The boot sweep cannot close it: the sweep drops a record only when the name
 /// is **free**, and here it is occupied.
 ///
-/// So the record names a *link*, not a name: it is written **after**
-/// `wg-quick up` has succeeded, carrying the public key the live interface
-/// carries at that moment, and it establishes ownership only while the link
-/// standing under that name still carries the same key. The witness is
-/// link-derived, which a file under `/var/lib` cannot be on its own.
+/// So the record names a *link*, not a name: it is written **after** the
+/// native `ip`/`wg` bring-up ([`WireguardManager::raise`]) has succeeded,
+/// carrying the public key the live interface carries at that moment, and it
+/// establishes ownership only while the link standing under that name still
+/// carries the same key. The witness is link-derived, which a file under
+/// `/var/lib` cannot be on its own.
 ///
 /// The cost, stated rather than traded away: a daemon killed **between** a
-/// successful `wg-quick up` and this write leaves an interface with no record,
+/// successful bring-up and this write leaves an interface with no record,
 /// so a later boot fences the profile instead of adopting it. That window is
 /// narrow, and a fenced profile is the safe side of it.
 #[derive(Debug, Clone)]
@@ -249,7 +250,7 @@ impl RaisedInterfaces {
     /// it carries.
     ///
     /// `live_key` is what [`interface_public_key`] read off the interface
-    /// immediately after `wg-quick up` returned success — not anything the
+    /// immediately after the native `ip`/`wg` bring-up succeeded — not anything the
     /// profile configures, which for the configuration this record exists for
     /// is nothing at all. A record with no key in it establishes nothing, so a
     /// link whose key would not read is claimed by nobody rather than by name.
@@ -886,7 +887,7 @@ impl VpnManager for WireguardManager {
 
         // Claim the link this call just raised, by the key it is carrying.
         //
-        // **After** `wg-quick up`, not before, because there is no link to
+        // **After** the link is raised, not before, because there is no link to
         // read a key from before it. The record used to be written ahead of
         // the spawn and to carry the boot id alone, so what it asserted was
         // "no link of this name was standing when this boot called
@@ -902,7 +903,7 @@ impl VpnManager for WireguardManager {
         // free.
         //
         // The cost of moving the write down here is a narrower window in the
-        // opposite direction: a daemon killed between this `wg-quick up` and
+        // opposite direction: a daemon killed between this `raise` and
         // this write leaves a link with no record, so a later boot fences the
         // profile rather than adopting it. A fenced profile is the safe side, and it
         // is the same direction taken for a link that is ours and carries no
