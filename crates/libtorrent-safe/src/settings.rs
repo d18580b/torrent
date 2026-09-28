@@ -283,7 +283,9 @@ mod tests {
         // slot count follows the achieved upload rate.
         let s = Settings::server_seed_overrides();
         assert_eq!(s.choking_algorithm, Some(Settings::RATE_BASED_CHOKER));
-        let slots = s.unchoke_slots_limit.expect("never left at the preset's -1");
+        let slots = s
+            .unchoke_slots_limit
+            .expect("never left at the preset's -1");
         assert!(slots > 0, "{slots}");
         assert!(s.send_buffer_watermark.unwrap() < 3 * 1024 * 1024);
         assert!(s.send_buffer_low_watermark.unwrap() < s.send_buffer_watermark.unwrap());
