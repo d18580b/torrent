@@ -32,8 +32,8 @@ pub struct Cli {
     ///
     /// Of the host, it probes one thing: that `nft` runs, when
     /// `network_kill_switch = true`. It does not check VPN prerequisites —
-    /// that profile files are readable, that `ip`, `wg`, `wg-quick` or
-    /// `openvpn` are installed, or which uid the daemon runs as. Run
+    /// that profile files are readable, that `ip`, `wg` or `openvpn` are
+    /// installed, or which uid the daemon runs as. Run
     /// `torrentd --config <path> vpn check` for those. That command is kept
     /// out of this flag on purpose: its checks can come back "could not be
     /// checked" for want of a capability, and as `ExecStartPre=` that would
@@ -122,11 +122,10 @@ pub enum VpnCmd {
         /// checked and left alone. This is the only option here that modifies
         /// the host.
         ///
-        /// Needs root: `wg-quick` re-execs itself under `sudo` when it is not
-        /// uid 0, so on a TTY-less invocation with no askpass helper it
-        /// prompts for a password it cannot read and the bring-up fails. Run
-        /// it under `sudo`, or from something already running as root. Every
-        /// other flag here works unprivileged.
+        /// Needs `CAP_NET_ADMIN`: a WireGuard link is raised with `ip` and
+        /// `wg`, exactly as the daemon raises it, and `openvpn` and its
+        /// routing need the same. Run it under `sudo`, or as a user holding
+        /// that capability. Every other flag here works unprivileged.
         ///
         /// Because it modifies the host, this is also the one `vpn check`
         /// invocation that is NOT exempt from the authentication-posture
