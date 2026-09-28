@@ -184,9 +184,9 @@ pub enum RenewOutcome {
 /// Why a rebind to a new port did not take.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RebindFailure {
-    /// Nothing publishes the session's listen outcomes yet (the alert loop
-    /// has not started), so a rebind could not be confirmed. The session
-    /// was left alone.
+    /// Nothing publishes the session's listen outcomes promptly yet (the
+    /// alert loop has not cleared its boot backlog), so a rebind could not
+    /// be confirmed. The session was left alone.
     Unobserved,
     /// The session refused the new `listen_interfaces`.
     Apply,
@@ -209,9 +209,18 @@ impl std::fmt::Display for RebindFailure {
 }
 
 /// How long a rebind waits for the session to report a listen outcome on
-/// the new port. Reopening a socket takes milliseconds on the session's
-/// network thread and the alert loop drains at least every 100ms, so this is
-/// generous; a lapse is treated as a failed rebind.
+/// the new port; a lapse is treated as a failed rebind.
+///
+/// Reopening a socket takes milliseconds on the session's network thread.
+/// What the wait covers is the alert loop reaching the outcome: it sleeps
+/// 100ms when idle and otherwise drains back to back, dispatching each
+/// batch before popping the next, so an outcome waits behind whatever was
+/// queued ahead of it. A rebind is not attempted until the loop has
+/// cleared its boot backlog ([`ListenEvents::attach`]), so the wait is
+/// against steady-state drain latency, for which 5s is generous. It is not
+/// a guarantee: a burst queued ahead of the outcome, such as the periodic
+/// resume-save walking every torrent, can still delay it past the bound.
+/// That fails safe: the rebind is reverted, counted, and retried.
 pub const LISTEN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How many listen outcomes [`ListenEvents`] keeps. A waiter that falls
@@ -256,14 +265,15 @@ impl ListenEvents {
         Self::default()
     }
 
-    /// Mark a publisher as running. The alert loop calls this when it is
-    /// spawned; until then no outcome can arrive and a waiter would only
-    /// ever time out.
+    /// Mark a publisher as running. The alert loop calls this once a drain
+    /// first comes back empty, i.e. once its boot backlog is cleared; before
+    /// then an outcome could queue behind thousands of alerts and a waiter
+    /// would likely time out, so a rebind is deferred instead of attempted.
     pub fn attach(&self) {
         self.attached.store(true, Ordering::Release);
     }
 
-    /// Whether a publisher is running.
+    /// Whether a publisher is running and has cleared its boot backlog.
     pub fn is_attached(&self) -> bool {
         self.attached.load(Ordering::Acquire)
     }

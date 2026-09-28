@@ -92,7 +92,8 @@ const FAILURES: &str = "profile_port_forward_failures_total";
 const FAILURE_STAGES: [&str; 2] = ["renew", "rebind"];
 
 /// `listen` is the stream the alert loop publishes listen outcomes into; a
-/// rebind waits on it, and defers while the loop has not started.
+/// rebind waits on it, and defers until the loop has cleared its boot
+/// backlog.
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -299,8 +300,8 @@ pub(crate) fn renewal_request(gateway: IpAddr, tunnel_ip: IpAddr, held: u16) -> 
 ///
 /// The alert loop has not started at this point, so a rebind could never be
 /// confirmed: a port change found here leaves the session alone and is
-/// deferred to the monitor, which retries it within seconds and confirms it
-/// once the loop runs.
+/// deferred to the monitor, which retries it every few seconds and confirms
+/// it once the loop has cleared its boot backlog.
 ///
 /// Returns whether the mapping is current. A profile with nothing to renew
 /// (no tunnel address or no forwarded port) is left alone and reported
@@ -329,7 +330,7 @@ pub(crate) fn refresh_during_boot(
         RebindTarget {
             tunnel_ip,
             profile: e.id(),
-            // Never attached: nothing publishes before the alert loop runs.
+            // Never attached: the alert loop is not running yet.
             listen: &ListenEvents::new(),
             timeout: LISTEN_CONFIRM_TIMEOUT,
         },
@@ -420,7 +421,8 @@ pub(crate) fn record_outcome(
         // Not a failure: the rebind was not tried, because nothing could
         // confirm it yet. Uncounted, so a port change during boot does not
         // raise the rebind alert; the gauge still says the session is not on
-        // the forwarded port, and the retry comes within seconds.
+        // the forwarded port, and the retry comes within seconds and repeats
+        // until the alert loop has cleared its boot backlog.
         RenewOutcome::RebindFailed {
             previous,
             new,
@@ -431,8 +433,9 @@ pub(crate) fn record_outcome(
             info!(
                 target: "torrentd::port_forward_monitor",
                 profile_id = %profile_id, previous_port = previous, new_port = new,
-                "NAT-PMP renewed with a new port before the alert loop started; the rebind \
-                 waits until it can be confirmed, still seeding on the old port",
+                "NAT-PMP renewed with a new port before the alert loop cleared its boot \
+                 backlog; the rebind waits until it can be confirmed, still seeding on the \
+                 old port",
             );
             false
         }
