@@ -1833,14 +1833,12 @@ impl DaemonHandle {
         // state an operator cannot reason about. Held in the work gate like an
         // API apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
-            let src = source.clone();
-            let st = state.clone();
-            let work = Arc::clone(&work);
-            let guard = work.enter();
-            tokio::task::spawn_blocking(move || {
-                let _guard = guard;
-                crate::pool_apply::resume_unfinished(&pool, &src, &st, &|| work.is_cancelled())
-            });
+            crate::pool_apply::spawn_resume_unfinished(
+                pool,
+                source.clone(),
+                state.clone(),
+                Arc::clone(&work),
+            );
         }
 
         // Verify queue: admits a bounded number of adopt-time re-hashes so a
@@ -1992,20 +1990,7 @@ impl DaemonHandle {
         // is moving storage through them is the mid-step kill the latch
         // exists to prevent. Applies stop at their next step boundary; a scan
         // or drift check runs to its end or to this bound.
-        if work.in_flight() > 0 {
-            sd_notify::status("waiting for pool work to stop");
-            info!(
-                in_flight = work.in_flight(),
-                bound_secs = POOL_WORK_DRAIN.as_secs(),
-                "waiting for pool work to stop",
-            );
-            if !work.wait_idle(POOL_WORK_DRAIN).await {
-                warn!(
-                    in_flight = work.in_flight(),
-                    "pool work still running at its bound; tearing down around it",
-                );
-            }
-        }
+        wait_for_pool_work(&work, POOL_WORK_DRAIN).await;
         sd_notify::status("draining resume data");
 
         // Trigger alert-loop shutdown and join (saves all resume data). If the
@@ -2102,6 +2087,28 @@ impl DaemonHandle {
         info!("torrentd: clean exit");
         exit_code
     }
+}
+
+/// Wait up to `bound` for pool work still in flight, returning whether none
+/// is left. Past the bound the teardown goes on around the work, warning.
+async fn wait_for_pool_work(work: &crate::app_state::WorkGate, bound: std::time::Duration) -> bool {
+    if work.in_flight() == 0 {
+        return true;
+    }
+    sd_notify::status("waiting for pool work to stop");
+    info!(
+        in_flight = work.in_flight(),
+        bound_secs = bound.as_secs(),
+        "waiting for pool work to stop",
+    );
+    let idle = work.wait_idle(bound).await;
+    if !idle {
+        warn!(
+            in_flight = work.in_flight(),
+            "pool work still running at its bound; tearing down around it",
+        );
+    }
+    idle
 }
 
 /// Serve the API on a bound listener until a shutdown is signalled, returning
@@ -3542,6 +3549,43 @@ mod tests {
                     "tunnel {iface} down (every session closed: {closed})"
                 ));
         }
+    }
+
+    /// The teardown's wait for pool work: nothing in flight passes straight
+    /// through, work that finishes inside the bound is waited for, and work
+    /// still running at the bound is torn down around rather than waited on.
+    #[tokio::test]
+    async fn the_teardown_waits_for_pool_work_up_to_its_bound() {
+        use std::time::Duration;
+
+        let work: Arc<crate::app_state::WorkGate> = Arc::default();
+        let started = std::time::Instant::now();
+        assert!(wait_for_pool_work(&work, Duration::from_secs(30)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "nothing in flight"
+        );
+
+        let guard = work.enter();
+        let finisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(guard);
+        });
+        assert!(
+            wait_for_pool_work(&work, Duration::from_secs(30)).await,
+            "work that finishes inside the bound is waited for",
+        );
+        finisher.await.unwrap();
+        assert_eq!(work.in_flight(), 0);
+
+        let _stuck = work.enter();
+        let started = std::time::Instant::now();
+        assert!(
+            !wait_for_pool_work(&work, Duration::from_millis(100)).await,
+            "work still running at the bound is reported, not waited on",
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(work.in_flight(), 1);
     }
 
     /// The teardown order that leaks nothing: every session closed before any

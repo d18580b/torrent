@@ -662,6 +662,22 @@ fn libc_exdev() -> i32 {
     18
 }
 
+/// [`resume_unfinished`] on the blocking pool, as boot runs it: `work` is
+/// held by the blocking task for as long as the re-drive runs, so the
+/// teardown waits for it, and its latch is the stop check between steps.
+pub fn spawn_resume_unfinished(
+    pool: Arc<PoolService>,
+    source: Arc<dyn AlertSource>,
+    state: Arc<StateMap>,
+    work: Arc<crate::app_state::WorkGate>,
+) -> tokio::task::JoinHandle<()> {
+    let guard = work.enter();
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        resume_unfinished(&pool, &source, &state, &|| work.is_cancelled());
+    })
+}
+
 /// Re-drive any plan a crash left mid-apply.
 pub fn resume_unfinished(
     pool: &PoolService,
@@ -921,6 +937,99 @@ mod tests {
         assert!(e.contains("shutting down"), "got {e}");
         assert_eq!(plan_state(&pool, plan_id).0, plan_status::DRAFT);
         assert!(a.exists());
+    }
+
+    /// Hold the pool store's lock on another thread until the returned sender
+    /// is sent to (or dropped), so work that needs the store blocks there.
+    fn hold_the_store(
+        pool: &Arc<PoolService>,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = Arc::clone(pool);
+        let holder = std::thread::spawn(move || {
+            held.with_store(|_| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+        });
+        locked_rx.recv().unwrap();
+        (release_tx, holder)
+    }
+
+    #[tokio::test]
+    async fn the_boot_redrive_holds_the_work_gate_until_it_finishes() {
+        // The teardown waits on the gate before it stops the alert loop and
+        // closes the sessions a re-driven move goes through. A re-drive that
+        // did not hold it would be torn down around mid-step.
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a/one.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let (source, state) = engine_and_state();
+        let work: Arc<crate::app_state::WorkGate> = Arc::default();
+
+        // The re-drive's first act is reading the store, so it blocks here.
+        let (release, holder) = hold_the_store(&pool);
+        let task = spawn_resume_unfinished(
+            Arc::clone(&pool),
+            source,
+            Arc::new(state),
+            Arc::clone(&work),
+        );
+        assert!(
+            !work.wait_idle(Duration::from_millis(200)).await,
+            "the teardown saw no work while the re-drive was running",
+        );
+        assert_eq!(work.in_flight(), 1);
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        task.await.unwrap();
+        assert_eq!(work.in_flight(), 0, "released once the re-drive is done");
+    }
+
+    #[tokio::test]
+    async fn the_boot_redrive_stops_on_the_work_gates_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a/one.bin", 16);
+        write(&root, "b/two.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (source, state) = engine_and_state();
+
+        // Left `applying` with nothing done, as a shutdown right after the
+        // claim leaves it.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        apply(&pool, &source, &state, plan_id, &stop).unwrap();
+        let state = Arc::new(state);
+
+        let work: Arc<crate::app_state::WorkGate> = Arc::default();
+        work.cancel();
+        spawn_resume_unfinished(
+            Arc::clone(&pool),
+            Arc::clone(&source),
+            Arc::clone(&state),
+            Arc::clone(&work),
+        )
+        .await
+        .unwrap();
+        let (status, steps) = plan_state(&pool, plan_id);
+        assert_eq!(status, plan_status::APPLYING, "a latched gate stops it");
+        assert_eq!(steps, vec![step_status::PENDING, step_status::PENDING]);
+
+        spawn_resume_unfinished(Arc::clone(&pool), source, state, Arc::default())
+            .await
+            .unwrap();
+        assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLIED);
     }
 
     #[test]
