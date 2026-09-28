@@ -153,8 +153,10 @@ fn interface_exists(iface: &str) -> bool {
 /// `/proc/sys/kernel/random/boot_id` changes on every boot of the *host*, and
 /// a WireGuard link cannot outlive one. It is what makes a record of a raised
 /// interface safe to trust across a restart of the daemon and unsafe to trust
-/// across a restart of the machine — see [`RaisedInterfaces`].
-fn current_boot_id() -> Option<String> {
+/// across a restart of the machine — see [`RaisedInterfaces`]. The OpenVPN
+/// manager scopes its `openvpn-<iface>.table` record by it for the same
+/// reason.
+pub(super) fn current_boot_id() -> Option<String> {
     std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
         .ok()
         .map(|s| s.trim().to_string())

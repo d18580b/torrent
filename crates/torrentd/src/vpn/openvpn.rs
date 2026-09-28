@@ -37,7 +37,10 @@
 //! back.
 //!
 //! The table a bring-up routed through is recorded next to the pid file, as
-//! `openvpn-<iface>.table`, before any rule is added. Teardown removes the
+//! `openvpn-<iface>.table`, before any rule is added, together with the host's
+//! boot id: a table number is an ifindex, ifindexes restart with the kernel,
+//! and a record from an earlier boot is not believed, since its number may
+//! name a live link's table now (`recorded_table`). Teardown removes the
 //! rules pointing at that recorded table whether or not an openvpn is still
 //! running, and — when one is — those pointing at the live link's table too,
 //! before the process is signalled. So a device recreated with a new ifindex,
@@ -134,11 +137,26 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub struct OpenvpnManager {
     run_dir: PathBuf,
+    /// The host's boot id, read at construction: what scopes the
+    /// `openvpn-<iface>.table` record to the boot that wrote it. `None` when
+    /// it could not be read, and then no record is believed.
+    boot_id: Option<String>,
 }
 
 impl OpenvpnManager {
     pub fn new(run_dir: PathBuf) -> Self {
-        Self { run_dir }
+        Self {
+            run_dir,
+            boot_id: super::wireguard::current_boot_id(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_boot_id(run_dir: PathBuf, boot_id: Option<&str>) -> Self {
+        Self {
+            run_dir,
+            boot_id: boot_id.map(str::to_string),
+        }
     }
 
     fn pid_file(&self, iface: &str) -> PathBuf {
@@ -150,12 +168,26 @@ impl OpenvpnManager {
         self.run_dir.join(format!("openvpn-{iface}.table"))
     }
 
+    /// The table recorded for `iface`, if a bring-up on *this* boot of the
+    /// host recorded it.
+    ///
+    /// The record is `<boot id>\n<table>\n`. A table is `TABLE_BASE +
+    /// ifindex`, and ifindexes restart with the kernel: after a reboot the
+    /// number a dead openvpn's record names is as likely as not the table of
+    /// a live WireGuard link that took the same ifindex, and removing its
+    /// rules would have the monitor fence that healthy profile with
+    /// `route_mismatch`. So a record from another boot — or one this process
+    /// cannot scope, having no boot id — is *detected*, not trusted, as the
+    /// WireGuard `.raised` record and the pid check are. Its rules went with
+    /// the kernel that held them.
     fn recorded_table(&self, iface: &str) -> Option<u32> {
-        std::fs::read_to_string(self.table_file(iface))
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
+        let boot_id = self.boot_id.as_deref()?;
+        let text = std::fs::read_to_string(self.table_file(iface)).ok()?;
+        let mut lines = text.lines();
+        if lines.next()?.trim() != boot_id {
+            return None;
+        }
+        lines.next()?.trim().parse().ok()
     }
 
     /// The per-source routing an OpenVPN tunnel gets: everything, via the
@@ -163,13 +195,18 @@ impl OpenvpnManager {
     ///
     /// The table is recorded before the first rule goes in, so a partial
     /// install is still found by teardown. A table left recorded by an
-    /// earlier run that never tore down has its rules removed first.
+    /// earlier run on this boot that never tore down has its rules removed
+    /// first; one recorded on an earlier boot is not believed
+    /// ([`Self::recorded_table`]) and is overwritten.
     fn route_tunnel(&self, iface: &str, ip: IpAddr) -> std::io::Result<()> {
         let table = route::table_for(iface)?;
         if let Some(old) = self.recorded_table(iface).filter(|t| *t != table) {
             route::remove(old);
         }
-        std::fs::write(self.table_file(iface), format!("{table}\n"))?;
+        std::fs::write(
+            self.table_file(iface),
+            format!("{}\n{table}\n", self.boot_id.as_deref().unwrap_or_default()),
+        )?;
         let default = match ip {
             IpAddr::V4(_) => "0.0.0.0/0",
             IpAddr::V6(_) => "::/0",
@@ -438,9 +475,11 @@ impl OpenvpnManager {
 mod tests {
     use super::*;
 
+    const BOOT: &str = "boot-a";
+
     fn mgr() -> (tempfile::TempDir, OpenvpnManager) {
         let d = tempfile::tempdir().unwrap();
-        let m = OpenvpnManager::new(d.path().to_path_buf());
+        let m = OpenvpnManager::with_boot_id(d.path().to_path_buf(), Some(BOOT));
         (d, m)
     }
 
@@ -497,13 +536,36 @@ mod tests {
         // An ifindex no host has, so the `ip rule del` this runs matches
         // nothing whatever the privilege.
         let table = route::TABLE_BASE.wrapping_add(0xFFFE);
-        std::fs::write(m.table_file("tun0"), format!("{table}\n")).unwrap();
+        std::fs::write(m.table_file("tun0"), format!("{BOOT}\n{table}\n")).unwrap();
         assert_eq!(m.recorded_table("tun0"), Some(table));
         m.bring_down("tun0");
         assert!(
             !m.table_file("tun0").exists(),
             "the recorded table was cleared even with nothing to signal",
         );
+    }
+
+    /// A table recorded on an earlier boot of the host is not believed: its
+    /// number is an ifindex, and after a reboot a WireGuard link that took
+    /// the same ifindex owns that table. Believing it had `route_tunnel`
+    /// delete that link's rules and the monitor fence a healthy profile.
+    /// Drop the boot-id comparison from `recorded_table` and this fails.
+    #[test]
+    fn a_table_recorded_on_an_earlier_boot_is_not_believed() {
+        let (_d, m) = mgr();
+        let table = route::TABLE_BASE.wrapping_add(0xFFFE);
+        std::fs::write(m.table_file("tun0"), format!("boot-b\n{table}\n")).unwrap();
+        assert_eq!(m.recorded_table("tun0"), None, "another boot's record");
+
+        // The format this replaces carried the table alone.
+        std::fs::write(m.table_file("tun0"), format!("{table}\n")).unwrap();
+        assert_eq!(m.recorded_table("tun0"), None, "an unscoped record");
+
+        // A process that cannot read the boot id believes no record at all.
+        let blind = OpenvpnManager::with_boot_id(m.run_dir.clone(), None);
+        std::fs::write(m.table_file("tun0"), format!("{BOOT}\n{table}\n")).unwrap();
+        assert_eq!(blind.recorded_table("tun0"), None);
+        assert_eq!(m.recorded_table("tun0"), Some(table), "this boot's record");
     }
 
     #[test]

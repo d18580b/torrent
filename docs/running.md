@@ -149,7 +149,9 @@ A deployment with no `vpn` profile has none of the next three:
   source-address rules point at (§11.6), written before the first rule is
   added. Teardown removes the rules pointing at it even when the openvpn
   process has already died, then deletes the file; the next bring-up clears a
-  table left recorded by a run that never tore down. Delete it while the
+  table left recorded by a run that never tore down. It carries the host's
+  **boot id** and is never believed after a reboot: a table number is an
+  ifindex, and after a reboot it may be a live WireGuard link's. Delete it while the
   daemon is running and a tunnel whose openvpn dies on its own leaves its
   `ip rule` entries behind.
 - **`wireguard-<iface>.raised`** — a note that *this boot of this host* raised
