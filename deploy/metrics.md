@@ -36,7 +36,7 @@ hold.
 | `torrentd_torrents_checked_total` | counter | `profile_id` | each profile | from boot, at 0 | Forced rechecks that completed. |
 | `torrentd_storage_moves_total` | counter | `profile_id` | each profile | from boot, at 0 | Storage moves that completed. |
 | `torrentd_storage_move_failures_total` | counter | `profile_id` | each profile | from boot, at 0 | Storage moves that failed; the torrent is still served from its old path. |
-| `torrentd_resume_writes_total` | counter | `profile_id` | each profile | from boot, at 0 | Resume files written. |
+| `torrentd_resume_writes_total` | counter | `profile_id` | each profile | from boot, at 0 | Resume data accepted for writing; a write that later fails also counts in resume_write_errors_total. |
 | `torrentd_resume_write_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Resume data libtorrent produced that could not be written to disk. |
 | `torrentd_resume_save_failures_total` | counter | `profile_id` | each profile | from boot, at 0 | save_resume_data requests libtorrent failed. |
 | `torrentd_resume_save_dispatch_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | save_resume_data requests that failed before reaching libtorrent. |
@@ -52,7 +52,7 @@ hold.
 | `torrentd_profile_assignment_registry_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Loads and adds refused because the assignment registry disagreed or could not be written. |
 | `torrentd_profile_fence_pause_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents the VPN monitor failed to pause while fencing the profile. |
 | `torrentd_profile_boot_failed` | gauge | `profile_id` | each profile | from boot: always | 1 if the profile got no session at boot (tunnel, port forward, or session construction failed). |
-| `torrentd_boot_torrent_load_failures` | gauge | `profile_id`; `source`: `resume_add`, `torrent_read`, `torrent_dir_add` | each profile | from boot: always | Torrents the boot scans could not load: a resume add that failed, a .torrent that could not be read, a torrent-dir add that failed. |
+| `torrentd_boot_torrent_load_failures` | gauge | `profile_id`; `source`: `resume_add`, `torrent_read`, `torrent_dir_add`, `resume_file`, `torrent_file` | each profile | from boot: always | Torrents the boot scans could not load: a resume add that failed, a .torrent that could not be read, a torrent-dir add that failed, or a resume or torrent-dir file the scan could not read and skipped. |
 | `torrentd_profile_unloaded_registry_torrents` | gauge | `profile_id` | each profile | from boot: live profiles | Torrents the assignment registry claims for the profile that no boot scan loaded. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |

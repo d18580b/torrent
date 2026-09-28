@@ -10,6 +10,7 @@
 #![warn(missing_debug_implementations)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod batch_writer;
 pub mod clock;
 pub mod engine;
 pub mod handlers;
@@ -38,6 +39,7 @@ pub use alert_loop::ProfileFenced;
 pub use alert_loop::ShutdownReason;
 pub use alert_loop::DEFAULT_SHUTDOWN_DEADLINE;
 pub use alert_loop::POST_UPDATES_INTERVAL;
+pub use batch_writer::WriteErrorHook;
 pub use clock::Clock;
 pub use clock::MockClock;
 pub use clock::SystemClock;
@@ -86,6 +88,7 @@ pub use registry::RegistryError;
 pub use resume_store::FsResumeStore;
 pub use resume_store::MemoryResumeStore;
 pub use resume_store::ResumeStore;
+pub use resume_store::Scan;
 pub use source::AlertSource;
 pub use source::ProfileSource;
 pub use state::RetryState;

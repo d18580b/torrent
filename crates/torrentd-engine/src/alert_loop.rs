@@ -807,6 +807,13 @@ fn run_shutdown(
         clock.sleep(SHUTDOWN_DRAIN_INTERVAL);
     }
 
+    // The answers that did arrive are queued on the stores' writers; they are
+    // not saved until they are on disk. Not bounded by the deadline: dropping
+    // data libtorrent already produced would be the worse outcome, and a
+    // batch is a handful of flushes.
+    resume.flush();
+    torrents.flush();
+
     let outstanding = state.pending_resume_count();
     if outstanding > 0 {
         warn!(

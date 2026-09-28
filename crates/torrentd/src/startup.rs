@@ -571,28 +571,71 @@ pub async fn boot(
     // nftables table confining a uid that no longer exists, and no daemon.
     let mut cleanup = BootCleanup::new(run_dir.clone());
 
+    // Metrics sink — created before the stores, whose batched writers count
+    // their failures in it, and the startup scans, which record registry
+    // rejections (profile_assignment_registry_errors_total).
+    let metrics = Arc::new(PromSink::new());
+
     // Resume store — rooted at the top-level `resume_dir` and partitioned by
     // profile id, except where a `[[profile]]` names its own directory. Those keys
     // were validated for uniqueness and then ignored, so files landed under
     // the derived path and only matched the configured one by coincidence.
-    let resume_store: Arc<dyn ResumeStore> = Arc::new(cfg.profile.iter().fold(
-        FsResumeStore::new(cfg.resume_dir.clone()),
-        |st, profile| match &profile.resume_dir {
-            Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
-            None => st,
-        },
-    ));
+    //
+    // The alert loop's writes are batched onto the store's own thread, and a
+    // write that fails there is counted as the handler used to count it.
+    let resume_store: Arc<dyn ResumeStore> = Arc::new(
+        cfg.profile
+            .iter()
+            .fold(
+                FsResumeStore::new(cfg.resume_dir.clone()),
+                |st, profile| match &profile.resume_dir {
+                    Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
+                    None => st,
+                },
+            )
+            .with_batched_writes(Some({
+                let metrics = metrics.clone();
+                Arc::new(
+                    move |profile: &ProfileId,
+                          _: &libtorrent_safe::InfoHash,
+                          _: &std::io::Error| {
+                        metrics.inc_counter(
+                            "resume_write_errors_total",
+                            &[("profile_id", profile.as_str())],
+                        );
+                    },
+                ) as torrentd_engine::WriteErrorHook
+            })),
+    );
 
     // Torrent store — same per-profile partitioning as the resume store; holds
     // the raw .torrent files for the startup inventory scan, magnet-metadata
-    // persistence, and removal cleanup.
-    let torrent_store: Arc<dyn TorrentStore> = Arc::new(cfg.profile.iter().fold(
-        FsTorrentStore::new(cfg.torrent_dir.clone()),
-        |st, profile| match &profile.torrent_dir {
-            Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
-            None => st,
-        },
-    ));
+    // persistence, and removal cleanup. Its one batched writer is the
+    // magnet-metadata handler, whose failures it counts under that source.
+    let torrent_store: Arc<dyn TorrentStore> = Arc::new(
+        cfg.profile
+            .iter()
+            .fold(
+                FsTorrentStore::new(cfg.torrent_dir.clone()),
+                |st, profile| match &profile.torrent_dir {
+                    Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
+                    None => st,
+                },
+            )
+            .with_batched_writes(Some({
+                let metrics = metrics.clone();
+                Arc::new(
+                    move |profile: &ProfileId,
+                          _: &libtorrent_safe::InfoHash,
+                          _: &std::io::Error| {
+                        metrics.inc_counter(
+                            "torrent_file_persist_errors_total",
+                            &[("profile_id", profile.as_str()), ("source", "metadata")],
+                        );
+                    },
+                ) as torrentd_engine::WriteErrorHook
+            })),
+    );
 
     // Assignment registry.
     let registry = Arc::new(
@@ -661,10 +704,6 @@ pub async fn boot(
             );
         }
     }
-
-    // Metrics sink — created early so the startup scans can record registry
-    // rejections (profile_assignment_registry_errors_total).
-    let metrics = Arc::new(PromSink::new());
 
     // One libtorrent session per configured profile. There is no other shape:
     // a deployment with one profile is this with n = 1, not a mode of its own.
@@ -804,11 +843,11 @@ pub async fn boot(
     // of entry `DELETE` may clear without a state-map entry to remove.
     let mut loaded: std::collections::HashSet<libtorrent_safe::InfoHash> =
         std::collections::HashSet::new();
-    // What the scans could not load, per profile, as
-    // `(resume_add, torrent_read, torrent_dir_add)`. Exported as gauges once
-    // both have run: these happen before any scrape can, so a counter would
-    // appear already incremented and `increase()` would never see it move.
-    let mut load_failures: std::collections::HashMap<ProfileId, (u64, u64, u64)> =
+    // What the scans could not load, per profile, by the `source` label of
+    // `boot_torrent_load_failures`. Exported as gauges once both have run:
+    // these happen before any scrape can, so a counter would appear already
+    // incremented and `increase()` would never see it move.
+    let mut load_failures: std::collections::HashMap<ProfileId, BootLoadFailures> =
         std::collections::HashMap::new();
 
     // Resume scan: load every saved resume file per profile. The shim
@@ -818,7 +857,14 @@ pub async fn boot(
         let Some(profile_cfg) = profile_registry.config(&profile) else {
             continue;
         };
-        let entries = resume_store.load_all(&profile).context("scan resume dir")?;
+        // A file that cannot be read is skipped, logged and counted by the
+        // store; only the directory itself failing to open stops the boot.
+        let scan = resume_store.scan(&profile).context("scan resume dir")?;
+        load_failures
+            .entry(profile.clone())
+            .or_default()
+            .resume_file += scan.unreadable;
+        let entries = scan.entries;
         let count = entries.len();
         let mut missing_metadata = 0usize;
         let mut added_from_resume = 0usize;
@@ -874,7 +920,10 @@ pub async fn boot(
                 Err(e) => {
                     warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
                           "could not read .torrent for resume add; continuing without metadata");
-                    load_failures.entry(profile.clone()).or_default().1 += 1;
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_read += 1;
                     None
                 }
             };
@@ -909,7 +958,7 @@ pub async fn boot(
                 }
                 Err(e) => {
                     warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed");
-                    load_failures.entry(profile.clone()).or_default().0 += 1;
+                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
                 }
             }
         }
@@ -935,9 +984,12 @@ pub async fn boot(
         let Some(profile_cfg) = profile_registry.config(&profile) else {
             continue;
         };
-        let entries = torrent_store
-            .load_all(&profile)
-            .context("scan torrent dir")?;
+        let scan = torrent_store.scan(&profile).context("scan torrent dir")?;
+        load_failures
+            .entry(profile.clone())
+            .or_default()
+            .torrent_file += scan.unreadable;
+        let entries = scan.entries;
         let engine = source
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
@@ -982,7 +1034,10 @@ pub async fn boot(
                         error.cause = %e,
                         "torrent-dir add failed",
                     );
-                    load_failures.entry(profile.clone()).or_default().2 += 1;
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_dir_add += 1;
                     // Release the claim so a later run can retry the add. A
                     // release that fails to persist leaves the claim on disk,
                     // and the next boot skips this torrent as already loaded.
@@ -1009,12 +1064,13 @@ pub async fn boot(
 
     // Every configured profile, so a failed one reads zero rather than absent.
     for profile in cfg.profile.iter().map(|p| &p.id) {
-        let (resume_add, torrent_read, torrent_dir_add) =
-            load_failures.get(profile).copied().unwrap_or_default();
+        let f = load_failures.get(profile).copied().unwrap_or_default();
         for (what, n) in [
-            ("resume_add", resume_add),
-            ("torrent_read", torrent_read),
-            ("torrent_dir_add", torrent_dir_add),
+            ("resume_add", f.resume_add),
+            ("torrent_read", f.torrent_read),
+            ("torrent_dir_add", f.torrent_dir_add),
+            ("resume_file", f.resume_file),
+            ("torrent_file", f.torrent_file),
         ] {
             metrics.set_gauge(
                 "boot_torrent_load_failures",
@@ -2018,6 +2074,22 @@ fn save_session_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
         }
     }
     Ok(())
+}
+
+/// What one profile's boot scans could not load, by the `source` label of
+/// `boot_torrent_load_failures`.
+#[derive(Clone, Copy, Debug, Default)]
+struct BootLoadFailures {
+    /// A resume file that read but libtorrent refused to add.
+    resume_add: u64,
+    /// A `.torrent` that could not be read to re-attach metadata.
+    torrent_read: u64,
+    /// A torrent-dir `.torrent` libtorrent refused to add.
+    torrent_dir_add: u64,
+    /// A resume file the scan could not read at all, skipped.
+    resume_file: u64,
+    /// A torrent-dir `.torrent` the scan could not read at all, skipped.
+    torrent_file: u64,
 }
 
 /// What a run's exit left behind that no scrape of that run could see.

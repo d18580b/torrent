@@ -208,7 +208,8 @@ pub const CATALOGUE: &[Series] = &[
         Counter,
         Profile,
         Seed::Zero,
-        "Resume files written.",
+        "Resume data accepted for writing; a write that later fails also counts in \
+         resume_write_errors_total.",
     ),
     series(
         "resume_write_errors_total",
@@ -327,10 +328,20 @@ pub const CATALOGUE: &[Series] = &[
         "boot_torrent_load_failures",
         Gauge,
         Profile,
-        ("source", &["resume_add", "torrent_read", "torrent_dir_add"]),
+        (
+            "source",
+            &[
+                "resume_add",
+                "torrent_read",
+                "torrent_dir_add",
+                "resume_file",
+                "torrent_file",
+            ],
+        ),
         Seed::Owner("always"),
         "Torrents the boot scans could not load: a resume add that failed, a .torrent that \
-         could not be read, a torrent-dir add that failed.",
+         could not be read, a torrent-dir add that failed, or a resume or torrent-dir file \
+         the scan could not read and skipped.",
     ),
     series(
         "profile_unloaded_registry_torrents",

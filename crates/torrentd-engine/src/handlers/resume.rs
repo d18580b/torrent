@@ -22,13 +22,21 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 );
                 return;
             };
-            match ctx.resume.write(&ctx.profile_id, &ih, data.as_bytes()) {
+            // Batched: two fsyncs per file on this thread were what made a
+            // 100K-torrent drain outlast its deadline. The shutdown drain
+            // flushes the store before it returns, and a failure the writer
+            // meets later is counted by the store's error hook under
+            // `resume_write_errors_total`, as one here is.
+            match ctx
+                .resume
+                .write_batched(&ctx.profile_id, &ih, data.as_bytes())
+            {
                 Ok(()) => {
                     debug!(
                         target: "torrentd_engine::handler::resume",
                         infohash = %ih,
                         bytes = data.as_bytes().len(),
-                        "resume data persisted",
+                        "resume data accepted for writing",
                     );
                     ctx.metrics.inc_counter(
                         "resume_writes_total",

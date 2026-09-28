@@ -3564,6 +3564,7 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "hex",
+ "libc",
  "libtorrent-safe",
  "once_cell",
  "parking_lot",
