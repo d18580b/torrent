@@ -1163,8 +1163,11 @@ On a scratch pool, not your real one.
    the rules come back with the tunnel.
 
    A WireGuard tunnel that comes up and **never handshakes** — a wrong key,
-   a dead endpoint — is fenced once `vpn_handshake_max_age_secs` has passed
-   since the daemon started, with `reason=no_handshake`.
+   a dead endpoint — is fenced with `reason=no_handshake` once it has gone
+   `vpn_handshake_max_age_secs` with torrents in its profile and no
+   handshake. The clock runs only while the profile has torrents: WireGuard
+   handshakes on the first packet sent into the tunnel, and an empty profile
+   sends none.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
    interfaces for the daemon's uid. Setting it with no `vpn` profile, or
@@ -1220,7 +1223,11 @@ On a scratch pool, not your real one.
       `PreUp`/`PostUp`/`PreDown`/`PostDown` are refused, so the
       `PostUp = wg set %i private-key …` pattern does not work here: put
       `PrivateKey` in the file. `Table` may be `auto` or `off`; anything else
-      is refused. `DNS` and `SaveConfig` are ignored with a warning.
+      is refused. `DNS` and `SaveConfig` are ignored with a warning. With
+      `Table = off` the routing is yours: traffic *from* the tunnel address
+      must still route by the tunnel, because the health monitor checks
+      exactly that every poll and fences the profile (`route_mismatch`) when
+      it does not.
    4. Set `network_kill_switch = true` and start the unit.
 
    How the daemon raises a link: `ip link add <iface> type wireguard`,

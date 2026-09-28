@@ -31,11 +31,13 @@
 //!    the host's public IP. The profile is recorded failed and reported; the
 //!    others proceed.
 //! 2. **No cross-profile announce.** `outgoing_interfaces` is pinned to the
-//!    tunnel device, so libtorrent binds outgoing connections to it at the
-//!    socket level (`SO_BINDTODEVICE`, and the device's address). If the
-//!    tunnel drops, subsequent attempts fail at `bind()` rather than falling
-//!    out over the bare interface, and a lost routing rule cannot route them
-//!    there either.
+//!    tunnel device, so libtorrent binds outgoing peer connections to it at
+//!    the socket level (`SO_BINDTODEVICE`). If the tunnel drops, subsequent
+//!    attempts fail at `bind()` rather than falling out over the bare
+//!    interface, and a lost routing rule cannot route them there either.
+//!    Everything else — the listen sockets and what answers on them — is
+//!    bound to the tunnel address, and routed by the tunnel's source rule,
+//!    which the health monitor checks every poll.
 //! 3. **Global info-hash uniqueness.** An add is refused with 409 if the
 //!    info-hash is loaded in *any* profile, not just the target. The same torrent
 //!    seeding under two accounts is visible to the tracker as one info-hash

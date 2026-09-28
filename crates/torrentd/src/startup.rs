@@ -1566,10 +1566,11 @@ where
             };
 
             settings.listen_interfaces = Some(torrentd_engine::bind_endpoint(ip, effective_port));
-            // The device, not the address. libtorrent binds an outgoing
-            // connection to a device named here with `SO_BINDTODEVICE` as well
-            // as to the device's address, so the kernel sends it out of the
-            // tunnel whatever the routing table says. Bound to the address
+            // The device, not the address. libtorrent binds an outgoing TCP
+            // peer connection to a device named here with `SO_BINDTODEVICE`
+            // (falling back to one of the device's addresses where that is
+            // refused), so the kernel sends it out of the tunnel whatever the
+            // routing table says. Bound to the address
             // alone, a socket's route still came from the rules — and with
             // the source-address rule gone (a firewall reload, `ip rule
             // flush`) the lookup fell through to the main table and the

@@ -47,9 +47,10 @@ pub(crate) enum DownReason {
     /// The address is intact but the WireGuard handshake is older than allowed.
     HandshakeStale,
     /// A WireGuard tunnel that has never handshaked, for longer than the
-    /// handshake threshold since it came up: wrong key, dead endpoint, or a
-    /// peer that never answered. Its address and route look healthy, and the
-    /// stale-handshake rule cannot fire because there is no handshake to age.
+    /// handshake threshold while its profile had torrents to carry: wrong key,
+    /// dead endpoint, or a peer that never answered. Its address and route
+    /// look healthy, and the stale-handshake rule cannot fire because there is
+    /// no handshake to age.
     NoHandshake,
 }
 
@@ -95,10 +96,17 @@ pub(crate) struct Observation {
     /// verdict to the other checks.
     pub route: Option<vpn::route::RouteProbe>,
     pub handshake: Handshake,
-    /// How long the tunnel has been up, at least. The monitor measures it
-    /// from its own start, which is after every profile's bring-up, so it
-    /// errs towards waiting longer, never towards fencing sooner.
-    pub since_up: Duration,
+    /// How long a never-handshaked WireGuard tunnel has had traffic to carry
+    /// and carried none: measured from the first poll that saw it with no
+    /// handshake **and** torrents in its profile, reset when either stops
+    /// being true.
+    ///
+    /// Not time since bring-up. WireGuard handshakes on the first packet sent
+    /// into the tunnel, and a profile with no torrents sends none — a fresh
+    /// deployment's empty profile would be fenced for having nothing to do,
+    /// and fencing, which pauses nothing there, would still need an operator
+    /// to undo.
+    pub unanswered_for: Duration,
 }
 
 /// Decide whether a profile's tunnel is still healthy. Pure (no I/O) so it is
@@ -117,7 +125,7 @@ pub(crate) fn evaluate(obs: &Observation, max_age: Duration) -> Result<(), DownR
     }
     match obs.handshake {
         Handshake::Age(age) if age > max_age => Err(DownReason::HandshakeStale),
-        Handshake::Never if obs.since_up > max_age => Err(DownReason::NoHandshake),
+        Handshake::Never if obs.unanswered_for > max_age => Err(DownReason::NoHandshake),
         _ => Ok(()),
     }
 }
@@ -208,6 +216,26 @@ fn seed_baselines(profiles: &ProfileRegistry, metrics: &PromSink) {
     }
 }
 
+/// Advance one profile's no-handshake clock and read it.
+///
+/// Running only while the tunnel has never handshaked **and** the profile has
+/// torrents — traffic that would have made WireGuard handshake — and started
+/// from the first poll that saw both. Anything else stops and resets it.
+fn unanswered_clock(
+    since: &mut std::collections::HashMap<torrentd_engine::ProfileId, Instant>,
+    id: &torrentd_engine::ProfileId,
+    handshake: Handshake,
+    carrying: bool,
+    now: Instant,
+) -> Duration {
+    if handshake == Handshake::Never && carrying {
+        now.saturating_duration_since(*since.entry(id.clone()).or_insert(now))
+    } else {
+        since.remove(id);
+        Duration::ZERO
+    }
+}
+
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -216,9 +244,11 @@ pub async fn run(
     mut shutdown: broadcast::Receiver<ShutdownReason>,
 ) {
     seed_baselines(&profiles, &metrics);
-    // Every profile in the registry was brought up before this ran, so the
-    // time since this instant is a lower bound on each tunnel's uptime.
-    let started = Instant::now();
+    // Per profile: when a poll first saw its WireGuard tunnel never
+    // handshaked while it had torrents to carry. See
+    // `Observation::unanswered_for`.
+    let mut unanswered_since: std::collections::HashMap<torrentd_engine::ProfileId, Instant> =
+        std::collections::HashMap::new();
 
     loop {
         tokio::select! {
@@ -333,12 +363,20 @@ pub async fn run(
                     Handshake::Age(age)
                 }
             };
+            let carrying = !state.handles_for_profile(&profile_id).is_empty();
+            let unanswered_for = unanswered_clock(
+                &mut unanswered_since,
+                &profile_id,
+                handshake,
+                carrying,
+                Instant::now(),
+            );
             let observation = Observation {
                 current,
                 expected: health.tunnel_ip,
                 route: route.clone(),
                 handshake,
-                since_up: started.elapsed(),
+                unanswered_for,
             };
 
             let reason = match evaluate(&observation, handshake_max_age) {
@@ -431,7 +469,7 @@ mod tests {
             expected: ip(2),
             route: Some(RouteProbe::ViaTunnel),
             handshake: Handshake::Age(Duration::from_secs(20)),
-            since_up: Duration::from_secs(600),
+            unanswered_for: Duration::ZERO,
         }
     }
 
@@ -518,7 +556,7 @@ mod tests {
     fn a_wireguard_tunnel_that_never_handshakes_fences_once_the_threshold_passes() {
         let fresh = Observation {
             handshake: Handshake::Never,
-            since_up: Duration::from_secs(30),
+            unanswered_for: Duration::from_secs(30),
             ..healthy()
         };
         assert_eq!(
@@ -527,10 +565,53 @@ mod tests {
             "a tunnel that has just come up gets the threshold to handshake",
         );
         let dark = Observation {
-            since_up: MAX + Duration::from_secs(1),
+            unanswered_for: MAX + Duration::from_secs(1),
             ..fresh
         };
         assert_eq!(evaluate(&dark, MAX), Err(DownReason::NoHandshake));
+    }
+
+    /// The clock runs only while there is traffic that should have made the
+    /// tunnel handshake. An empty profile on a fresh deployment sends nothing
+    /// into its tunnel, so WireGuard never handshakes, and fencing it would
+    /// need an operator to undo for a profile that had nothing to do.
+    #[test]
+    fn the_no_handshake_clock_runs_only_while_the_profile_has_torrents() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(600);
+
+        assert_eq!(
+            unanswered_clock(&mut since, &id, Handshake::Never, false, t0),
+            Duration::ZERO
+        );
+        assert_eq!(
+            unanswered_clock(&mut since, &id, Handshake::Never, false, later),
+            Duration::ZERO,
+            "no torrents, however long: nothing was sent to answer",
+        );
+
+        assert_eq!(
+            unanswered_clock(&mut since, &id, Handshake::Never, true, later),
+            Duration::ZERO,
+            "starts when the first torrent is there",
+        );
+        let then = later + MAX + Duration::from_secs(1);
+        assert!(unanswered_clock(&mut since, &id, Handshake::Never, true, then) > MAX);
+
+        assert_eq!(
+            unanswered_clock(
+                &mut since,
+                &id,
+                Handshake::Age(Duration::from_secs(1)),
+                true,
+                then
+            ),
+            Duration::ZERO,
+            "a handshake resets it",
+        );
+        assert!(since.is_empty());
     }
 
     #[test]

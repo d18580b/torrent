@@ -1394,9 +1394,10 @@ fn profile_checks(
 
     // 5b. The health monitor's own verdict on what was just observed, from
     //     the function the monitor itself calls. The session the monitor would
-    //     compare against is bound to the address the tunnel has now, and the
-    //     tunnel is taken as just raised, so a WireGuard link that has not
-    //     handshaked yet is still inside its threshold.
+    //     compare against is bound to the address the tunnel has now, and no
+    //     torrent has been waiting on this tunnel, so a WireGuard link that has
+    //     not handshaked yet is still inside its threshold (the `handshake`
+    //     line above reports it).
     if let Some(ip) = tunnel_ip {
         let observation = crate::vpn_monitor::Observation {
             current: Some(ip),
@@ -1407,7 +1408,7 @@ fn profile_checks(
                 Some(Ok(None)) => crate::vpn_monitor::Handshake::Never,
                 Some(Err(_)) | None => crate::vpn_monitor::Handshake::NoSignal,
             },
-            since_up: Duration::ZERO,
+            unanswered_for: Duration::ZERO,
         };
         checks.push(match crate::vpn_monitor::evaluate(&observation, max) {
             Ok(()) => Check::pass(
