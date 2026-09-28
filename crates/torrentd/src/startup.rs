@@ -87,6 +87,27 @@ const HTTP_MAX_CONNECTIONS: std::num::NonZeroUsize = match std::num::NonZeroUsiz
 /// `http::v1::REQUEST_DEADLINE`.
 const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How often an HTTP/2 (h2c) connection is pinged, and how long the peer has
+/// to acknowledge before the connection is closed.
+///
+/// kynos leaves HTTP/2 keep-alive off, and HTTP/2 has no counterpart to
+/// [`HTTP_HEADER_READ_TIMEOUT`]: a peer that sent the preface and then went
+/// silent — crashed, partitioned, or never reading — would hold one of
+/// [`HTTP_MAX_CONNECTIONS`] until the daemon stopped. With pings, such a peer
+/// is dropped within 30 s.
+///
+/// This does not bound a peer that acknowledges pings and sends nothing
+/// else, nor a plaintext connection that sends no byte at all: hyper-util
+/// sniffs the protocol before either driver starts, with no timer, and kynos
+/// exposes neither a first-byte deadline nor an HTTP/2 idle timeout. Both are
+/// recorded in `docs/running.md` §7; a non-loopback `http_listen` belongs
+/// behind a proxy that bounds them.
+const HTTP2_KEEP_ALIVE: kynos::server::protocol::Http2KeepAlive =
+    kynos::server::protocol::Http2KeepAlive {
+        interval: std::time::Duration::from_secs(20),
+        timeout: std::time::Duration::from_secs(10),
+    };
+
 /// An exclusive `flock` on [`Config::instance_lock_path`], held for the life
 /// of the daemon.
 ///
@@ -1968,6 +1989,7 @@ async fn serve_until_shutdown(
             kynos::server::protocol::Http1Config::default()
                 .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT)),
         )
+        .http2(kynos::server::protocol::Http2Config::default().keep_alive(Some(HTTP2_KEEP_ALIVE)))
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             let _ = shutdown_rx.recv().await;
         }))

@@ -144,9 +144,11 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
   answered within 30 seconds of the request head — 300 seconds for
   `POST /v1/torrents` — or it is answered `408` and the request is abandoned.
   `POST /v1/pool/plans/{plan_id}/apply`, which waits for every step of a plan,
-  has no deadline. The server also closes a connection whose request head
-  takes more than 10 seconds to arrive, and holds at most 256 connections at
-  once.
+  has no deadline. The server also closes an HTTP/1 connection whose request
+  head takes more than 10 seconds to arrive, closes an HTTP/2 connection that
+  leaves a ping unanswered for 10 seconds (pings go every 20), and holds at
+  most 256 connections at once. A connection that sends nothing at all is
+  not closed; see `docs/running.md` §7.
 - **Trailing slashes are not accepted.** `/v1/status/` is a `404`.
 
 ## Pagination

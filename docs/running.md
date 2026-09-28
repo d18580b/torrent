@@ -818,10 +818,19 @@ The daemon sets none of these itself.
   immediately. The systemd unit sets 65536 and the compose file matches; **a
   bare-metal run outside either gets nothing** and will hit `EMFILE`. The
   HTTP API draws on the same table and holds at most 256 connections; the
-  next waits in the listen backlog. It closes a connection whose request head
-  takes more than 10 seconds, and answers `408` to a request whose body has
-  not arrived and been answered within 30 seconds (300 for
-  `POST /v1/torrents`), so a slow client cannot pin those connections.
+  next waits in the listen backlog. It closes an HTTP/1 connection whose
+  request head takes more than 10 seconds, closes an HTTP/2 connection that
+  stops answering pings for 30 seconds, and answers `408` to a request whose
+  body has not arrived and been answered within 30 seconds (300 for
+  `POST /v1/torrents`). **Two idle cases are not bounded:** a connection that
+  sends no byte at all (or stops partway through the HTTP/2 preface), and an
+  HTTP/2 connection that answers pings but sends no request. 256 such sockets
+  hold every API connection, and `/healthz` and `/metrics` stop answering
+  until they close. The default loopback bind keeps them out of reach of
+  anyone who cannot already run code on the host; a non-loopback
+  `http_listen` belongs behind the proxy of §6 with its own client idle
+  timeouts (nginx `client_header_timeout`, Caddy `timeouts.read_header`),
+  which close such a connection before it reaches the daemon.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on
