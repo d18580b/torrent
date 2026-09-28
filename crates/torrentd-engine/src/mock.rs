@@ -85,6 +85,7 @@ pub enum RecordedCall {
     TorrentDetails(TorrentHandle),
     TorrentFiles(TorrentHandle),
     TorrentTrackers(TorrentHandle),
+    Close,
 }
 
 /// Stripped-down view of `AddParams` so we can derive Clone/Debug
@@ -555,6 +556,10 @@ impl TorrentEngine for MockEngine {
             .get(&h.infohash)
             .map(|t| t.clone())
             .unwrap_or_default())
+    }
+
+    fn close(&self) {
+        self.record(RecordedCall::Close);
     }
 }
 

@@ -367,12 +367,16 @@ impl Drop for BootCleanup {
         if !self.armed {
             return;
         }
-        if self.kill_switch {
-            finish_boot_kill_switch_removal(&self.run_dir, crate::vpn::killswitch::disable());
-        }
+        // Tunnels before the kill switch, as on a clean shutdown
+        // (`teardown_network`): the switch is what confines the uid to the
+        // tunnels while they go, and removing it first opened the host's own
+        // interface to anything still bound for one.
         for (t, iface) in std::mem::take(&mut self.tunnels) {
             warn!(vpn_iface = %iface, "boot failed: bringing tunnel down");
             (self.vpn_for)(t, &self.run_dir).bring_down(&iface);
+        }
+        if self.kill_switch {
+            finish_boot_kill_switch_removal(&self.run_dir, crate::vpn::killswitch::disable());
         }
     }
 }
@@ -1861,7 +1865,7 @@ impl DaemonHandle {
         // Persist DHT routing tables for the next start. Only a host profile
         // with DHT enabled has one; a tunnelled profile runs with DHT off by
         // construction and has nothing to save. The sessions are still alive
-        // here — they are dropped when `source` goes out of scope.
+        // here — `teardown_network` below closes them.
         for p in cfg.profile.iter().filter(|p| p.dht_enabled()) {
             let Some(engine) = source.engine_for(&p.id) else {
                 continue;
@@ -1882,25 +1886,19 @@ impl DaemonHandle {
             }
         }
 
-        // Remove the network kill switch last, once seeding has drained. The
-        // tunnel is still up during a graceful shutdown, so the profiles' sockets
-        // (still source-bound to the tunnel IP) can't leak in this window.
-        if kill_switch_active {
-            finish_kill_switch_removal(
-                crate::vpn::killswitch::disable(),
-                &metrics,
-                &mut shutdown_report,
-            );
-        }
-        write_shutdown_report(&run_dir, &shutdown_report);
-
-        // Then bring the tunnels down, after the sessions are gone. The daemon
-        // brought them up, so it owns tearing them down; leaving them up meant
-        // every restart accumulated interfaces and left an idle tunnel
-        // connected to the provider indefinitely. This runs on every exit from
-        // `run_until_signal`, the HTTP bind failure included — a failure
-        // inside `boot` is torn down by `BootCleanup` instead.
-        let jobs: Vec<_> = profile_registry
+        // Sessions, then tunnels, then the kill switch — see
+        // `teardown_network`. The daemon brought the tunnels up, so it owns
+        // tearing them down; leaving them up meant every restart accumulated
+        // interfaces and left an idle tunnel connected to the provider
+        // indefinitely. This runs on every exit from `run_until_signal`, the
+        // HTTP bind failure included — a failure inside `boot` is torn down
+        // by `BootCleanup` instead.
+        let engines: Vec<Arc<dyn TorrentEngine>> = source
+            .profiles()
+            .iter()
+            .filter_map(|p| source.engine_for(p))
+            .collect();
+        let tunnels: Vec<_> = profile_registry
             .iter()
             .filter_map(|entry| {
                 // A host profile has no tunnel to take down.
@@ -1909,14 +1907,24 @@ impl DaemonHandle {
                 else {
                     return None;
                 };
-                let vpn = crate::vpn::for_type(vpn_type, &run_dir);
-                let iface = iface.to_string();
-                Some((entry.config.id.clone(), iface.clone(), move || {
-                    vpn.bring_down(&iface)
-                }))
+                Some((
+                    entry.config.id.clone(),
+                    iface.to_string(),
+                    crate::vpn::for_type(vpn_type, &run_dir),
+                ))
             })
             .collect();
-        join_teardowns(jobs).await;
+        teardown_network(engines, tunnels, || {
+            if kill_switch_active {
+                finish_kill_switch_removal(
+                    crate::vpn::killswitch::disable(),
+                    &metrics,
+                    &mut shutdown_report,
+                );
+            }
+        })
+        .await;
+        write_shutdown_report(&run_dir, &shutdown_report);
 
         info!("torrentd: clean exit");
         exit_code
@@ -1999,6 +2007,52 @@ async fn serve_until_shutdown(
             70
         }
     }
+}
+
+/// Take the daemon off the network in the one order that leaks nothing:
+///
+/// 1. **Close every session.** Peer and tracker sockets are bound to a
+///    tunnel's address; closing them first means nothing is left to send when
+///    the tunnel goes. Dropping the sessions was left to `source` going out of
+///    scope at the end of `run_until_signal`, after both steps below — and to
+///    every other task holding a clone letting go of it, which nothing waited
+///    for.
+/// 2. **Bring the tunnels down**, link before rules (`wireguard::native`).
+/// 3. **Remove the kill switch last.** It confines the daemon's uid to the
+///    tunnels; removing it before they were down, as the teardown did, opened
+///    the host's own interface to every socket still bound for one.
+///
+/// Each session closes on the blocking pool — libtorrent's destructor waits for
+/// its sockets and disk threads — and all of them at once, then the tunnels
+/// the same way (`join_teardowns`).
+async fn teardown_network<K>(
+    engines: Vec<Arc<dyn TorrentEngine>>,
+    tunnels: Vec<(ProfileId, String, Arc<dyn torrentd_engine::VpnManager>)>,
+    remove_kill_switch: K,
+) where
+    K: FnOnce(),
+{
+    let closing: Vec<_> = engines
+        .into_iter()
+        .map(|e| tokio::task::spawn_blocking(move || e.close()))
+        .collect();
+    for c in closing {
+        if let Err(e) = c.await {
+            warn!(error.cause = %e, "closing a session failed");
+        }
+    }
+    info!("sessions closed");
+    join_teardowns(
+        tunnels
+            .into_iter()
+            .map(|(id, iface, vpn)| {
+                let job_iface = iface.clone();
+                (id, iface, move || vpn.bring_down(&job_iface))
+            })
+            .collect(),
+    )
+    .await;
+    remove_kill_switch();
 }
 
 /// Put every tunnel teardown in flight at once, then join them.
@@ -3184,6 +3238,124 @@ mod tests {
             SLOTS,
             "at most this many teardowns were ever inside the job at once; \
              a deployment's stop time must not scale with its profile count",
+        );
+    }
+
+    /// A `VpnManager` that writes each teardown into a log the whole teardown
+    /// shares, so the order across sessions, tunnels and the kill switch is
+    /// one sequence to assert on.
+    #[derive(Clone, Debug)]
+    struct RecordingVpn {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        engines: Vec<Arc<torrentd_engine::MockEngine>>,
+    }
+
+    impl torrentd_engine::VpnManager for RecordingVpn {
+        fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, torrentd_engine::VpnError> {
+            Err(torrentd_engine::VpnError::BringUpTimeout {
+                iface: profile.interface.clone(),
+            })
+        }
+
+        fn current_ip(&self, iface: &str) -> Result<IpAddr, torrentd_engine::VpnError> {
+            Err(torrentd_engine::VpnError::NoAddress {
+                iface: iface.to_string(),
+            })
+        }
+
+        fn bring_down(&self, iface: &str) {
+            let closed = self.engines.iter().all(|e| {
+                e.calls()
+                    .iter()
+                    .any(|c| matches!(c, torrentd_engine::RecordedCall::Close))
+            });
+            self.log
+                .lock()
+                .expect("no panics holding this")
+                .push(format!(
+                    "tunnel {iface} down (every session closed: {closed})"
+                ));
+        }
+    }
+
+    /// The teardown order that leaks nothing: every session closed before any
+    /// tunnel goes, and the kill switch removed only after every tunnel has.
+    ///
+    /// The shutdown removed the kill switch first, then brought the tunnels
+    /// down with the sessions still open — they were dropped only when
+    /// `run_until_signal` returned — so for the length of the teardown the
+    /// uid was unconfined and its sockets still bound to tunnel addresses.
+    #[tokio::test]
+    async fn teardown_closes_sessions_then_tunnels_then_the_kill_switch() {
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let engines: Vec<Arc<torrentd_engine::MockEngine>> = (0..2)
+            .map(|_| Arc::new(torrentd_engine::MockEngine::new()))
+            .collect();
+        let vpn = RecordingVpn {
+            log: Arc::clone(&log),
+            engines: engines.clone(),
+        };
+        let tunnels = ["wg-a", "wg-b"]
+            .into_iter()
+            .map(|iface| {
+                (
+                    ProfileId::new(iface),
+                    iface.to_string(),
+                    Arc::new(vpn.clone()) as Arc<dyn torrentd_engine::VpnManager>,
+                )
+            })
+            .collect();
+
+        teardown_network(
+            engines
+                .iter()
+                .map(|e| Arc::clone(e) as Arc<dyn TorrentEngine>)
+                .collect(),
+            tunnels,
+            {
+                let log = Arc::clone(&log);
+                move || log.lock().unwrap().push("kill switch removed".into())
+            },
+        )
+        .await;
+
+        let log = log.lock().unwrap().clone();
+        let mut tunnels_down: Vec<&String> = log[..2].iter().collect();
+        tunnels_down.sort();
+        assert_eq!(
+            tunnels_down,
+            vec![
+                "tunnel wg-a down (every session closed: true)",
+                "tunnel wg-b down (every session closed: true)",
+            ],
+            "each tunnel went down after every session closed: {log:?}",
+        );
+        assert_eq!(
+            log[2], "kill switch removed",
+            "the switch goes last: {log:?}"
+        );
+        assert_eq!(log.len(), 3);
+    }
+
+    /// A failed boot's teardown keeps the same order between the two things
+    /// it owns: tunnels first, then the kill switch.
+    #[test]
+    fn a_failed_boot_takes_its_tunnels_down_before_the_kill_switch() {
+        let text = include_str!("startup.rs");
+        let drop_impl = text
+            .split("impl Drop for BootCleanup")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("BootCleanup has a Drop impl");
+        let tunnels = drop_impl
+            .find("bring_down")
+            .expect("drop brings tunnels down");
+        let switch = drop_impl
+            .find("killswitch::disable")
+            .expect("drop removes the kill switch");
+        assert!(
+            tunnels < switch,
+            "tunnels must come down before the kill switch goes"
         );
     }
 
