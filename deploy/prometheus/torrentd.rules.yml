@@ -100,6 +100,21 @@ groups:
         annotations:
           summary: "The WireGuard handshake probe cannot run for {{ $labels.profile_id }} (wg missing or unprivileged); only IP presence is checked"
 
+      - alert: TorrentdHandshakeAgeRising
+        # The trend before the fence. WireGuard re-handshakes every two
+        # minutes while traffic flows, so a healthy tunnel's handshake age is
+        # a sawtooth averaging about a minute. An average past 90s over half
+        # an hour means handshakes are repeatedly late — a provider endpoint
+        # dropping initiations, or a path losing UDP — while each one still
+        # lands inside vpn_handshake_max_age_secs, so nothing has fenced yet.
+        # A stale handshake that does fence is TorrentdVpnTunnelDown.
+        expr: avg_over_time(torrentd_profile_vpn_handshake_age_seconds[30m]) > 90
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Profile {{ $labels.profile_id }}'s WireGuard handshakes have averaged {{ $value | printf \"%.0f\" }}s old over 30 minutes; a healthy tunnel re-handshakes every 2 minutes"
+
       - alert: TorrentdPortForwardDown
         expr: torrentd_profile_port_forward_up == 0
         for: 5m
@@ -352,6 +367,26 @@ groups:
           severity: warning
         annotations:
           summary: "Adopted torrents failed verification"
+
+      - alert: TorrentdPoolVerifyStuck
+        # Adoptions are waiting and not one has finished, verified or failed,
+        # in an hour: the verify queue has stopped draining. A single large
+        # torrent can take a while to hash, which is why the window is an
+        # hour and not minutes; nothing finishing at all for that long, with
+        # work queued behind it, is a wedged queue or a stalled disk.
+        expr: |
+          torrentd_pool_verify_queue_depth > 0
+            and on (instance, job)
+          (
+            increase(torrentd_pool_verify_completed_total[1h])
+              + on (instance, job)
+            increase(torrentd_pool_verify_failed_total[1h])
+          ) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} adoptions are queued for verification and none has finished in an hour; the verify queue is not draining"
 
       - alert: TorrentdPoolIndexDisagrees
         expr: torrentd_pool_index_profile_disagreements > 0
