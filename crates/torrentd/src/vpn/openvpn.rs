@@ -354,10 +354,10 @@ impl VpnManager for OpenvpnManager {
                              taking it down",
                         );
                         self.stop(&profile.interface);
-                        return Err(VpnError::Spawn(format!(
-                            "source-address routing for {}: {e}",
-                            profile.interface
-                        )));
+                        return Err(VpnError::RoutingFailed {
+                            iface: profile.interface.clone(),
+                            cause: e.to_string(),
+                        });
                     }
                     info!(
                         target: "torrentd::vpn::openvpn",

@@ -53,6 +53,7 @@ use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
 use torrentd_engine::ProfileConfig;
+use torrentd_engine::VpnError;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
 
@@ -1291,6 +1292,11 @@ fn profile_checks(
                             "; {iface} is there even so, so this command raised it and is \
                              lowering it again"
                         )
+                    } else if matches!(e, VpnError::RoutingFailed { .. }) {
+                        // The tunnel did appear; the bring-up lowered it
+                        // itself. Nothing is missing, and nothing was
+                        // left running for want of a pid.
+                        String::new()
                     } else {
                         match vpn_type {
                             VpnType::Openvpn => format!(
@@ -3480,6 +3486,40 @@ user_agent           = "Transmission/4.0.5"
             "the one thing it cannot observe is named, for the manager that can do it: {}",
             bu.detail,
         );
+    }
+
+    /// An OpenVPN tunnel whose routing could not be installed did come up,
+    /// and the bring-up has already stopped it. The report said "no tun
+    /// appeared … may have left a process running", which is wrong on both
+    /// counts.
+    #[test]
+    fn a_tunnel_lowered_for_want_of_routing_is_reported_as_having_come_up() {
+        let mut cfg = cfg_with_profile("");
+        match &mut cfg.profile[0].network {
+            torrentd_engine::ProfileNetwork::Vpn { vpn_type, .. } => {
+                *vpn_type = VpnType::Openvpn;
+            }
+            torrentd_engine::ProfileNetwork::Host { .. } => unreachable!("a vpn profile"),
+        }
+        let host = FakeHost::new().with_exists_seq([false, false]);
+        host.vpn.set_unroutable("wg-acct-a");
+
+        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
+
+        let bu = find(&r.checks, "bring_up").expect("a bring_up line");
+        assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
+        assert!(
+            bu.detail.contains("came up") && bu.detail.contains("taken down again"),
+            "the tunnel appeared and is gone: {}",
+            bu.detail,
+        );
+        assert!(
+            !bu.detail.contains("no wg-acct-a appeared")
+                && !bu.detail.contains("may have left a process running"),
+            "{}",
+            bu.detail,
+        );
+        assert!(host.vpn.bring_down_calls().is_empty());
     }
 
     #[test]

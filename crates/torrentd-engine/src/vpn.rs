@@ -48,6 +48,13 @@ pub enum VpnError {
     /// failure it tears the interface down.
     #[error("vpn interface {iface} exists but belongs to something else")]
     ForeignInterface { iface: String },
+    /// The tunnel came up, but its source-address routing could not be
+    /// installed, so the bring-up has already taken it down again.
+    ///
+    /// Distinct from `Spawn` so a report can say that a tunnel did appear
+    /// and is gone, rather than guess at what a failed start left behind.
+    #[error("vpn interface {iface} came up but its routing could not be installed ({cause}); it was taken down again")]
+    RoutingFailed { iface: String, cause: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
@@ -78,6 +85,7 @@ pub struct MockVpn {
 struct MockVpnInner {
     ips: HashMap<String, IpAddr>,
     foreign: Vec<String>,
+    unroutable: Vec<String>,
     bring_up_calls: Vec<String>,
     bring_down_calls: Vec<String>,
 }
@@ -100,6 +108,12 @@ impl MockVpn {
         self.inner.lock().foreign.push(iface.to_string());
     }
 
+    /// Make `bring_up` of `iface` fail the way a tunnel whose routing could
+    /// not be installed does: up, then taken down again by the bring-up.
+    pub fn set_unroutable(&self, iface: &str) {
+        self.inner.lock().unroutable.push(iface.to_string());
+    }
+
     pub fn bring_up_calls(&self) -> Vec<String> {
         self.inner.lock().bring_up_calls.clone()
     }
@@ -115,6 +129,12 @@ impl VpnManager for MockVpn {
         if g.foreign.contains(&profile.interface) {
             return Err(VpnError::ForeignInterface {
                 iface: profile.interface.clone(),
+            });
+        }
+        if g.unroutable.contains(&profile.interface) {
+            return Err(VpnError::RoutingFailed {
+                iface: profile.interface.clone(),
+                cause: "ip rule add: Operation not permitted".to_string(),
             });
         }
         match g.ips.get(&profile.interface) {
