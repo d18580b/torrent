@@ -534,6 +534,39 @@ fn nofile_soft_limit() -> Option<u64> {
 /// Cheap enough to check every time; every 256 keeps it out of profiles.
 const SCAN_SHUTDOWN_CHECK_EVERY: usize = 256;
 
+/// The resume store's batch-writer error hook: count the failure as the
+/// handler used to, and mark the torrent's file stale. The handler has
+/// already cleared `needs_save_resume` by then, and libtorrent its modified
+/// bit, so without the mark no `ONLY_IF_MODIFIED` save, the shutdown drain's
+/// included, would ever rewrite it.
+fn resume_write_error_hook(
+    metrics: Arc<dyn MetricsSink>,
+    state: Arc<StateMap>,
+) -> torrentd_engine::WriteErrorHook {
+    Arc::new(
+        move |profile: &ProfileId, ih: &libtorrent_safe::InfoHash, _: &std::io::Error| {
+            metrics.inc_counter(
+                "resume_write_errors_total",
+                &[("profile_id", profile.as_str())],
+            );
+            state.note_resume_write_failed(ih);
+        },
+    )
+}
+
+/// The torrent store's batch-writer error hook. Its one batched writer is the
+/// magnet-metadata handler, so a failure counts under that source.
+fn torrent_write_error_hook(metrics: Arc<dyn MetricsSink>) -> torrentd_engine::WriteErrorHook {
+    Arc::new(
+        move |profile: &ProfileId, _: &libtorrent_safe::InfoHash, _: &std::io::Error| {
+            metrics.inc_counter(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile.as_str()), ("source", "metadata")],
+            );
+        },
+    )
+}
+
 /// Whether a shutdown has been signalled on `rx`. A lagged or closed channel
 /// counts: either means signals went past this receiver unread.
 fn shutdown_requested(rx: &mut broadcast::Receiver<ShutdownReason>) -> bool {
@@ -740,21 +773,10 @@ pub async fn boot(
                     None => st,
                 },
             )
-            .with_batched_writes(Some({
-                let metrics = metrics.clone();
-                let state = Arc::clone(&state);
-                Arc::new(
-                    move |profile: &ProfileId,
-                          ih: &libtorrent_safe::InfoHash,
-                          _: &std::io::Error| {
-                        metrics.inc_counter(
-                            "resume_write_errors_total",
-                            &[("profile_id", profile.as_str())],
-                        );
-                        state.note_resume_write_failed(ih);
-                    },
-                ) as torrentd_engine::WriteErrorHook
-            })),
+            .with_batched_writes(Some(resume_write_error_hook(
+                metrics.clone(),
+                Arc::clone(&state),
+            ))),
     );
 
     // Torrent store — same per-profile partitioning as the resume store; holds
@@ -771,19 +793,7 @@ pub async fn boot(
                     None => st,
                 },
             )
-            .with_batched_writes(Some({
-                let metrics = metrics.clone();
-                Arc::new(
-                    move |profile: &ProfileId,
-                          _: &libtorrent_safe::InfoHash,
-                          _: &std::io::Error| {
-                        metrics.inc_counter(
-                            "torrent_file_persist_errors_total",
-                            &[("profile_id", profile.as_str()), ("source", "metadata")],
-                        );
-                    },
-                ) as torrentd_engine::WriteErrorHook
-            })),
+            .with_batched_writes(Some(torrent_write_error_hook(metrics.clone()))),
     );
 
     // Assignment registry.
@@ -2623,6 +2633,84 @@ mod shutdown_report_tests {
         tx.send(ShutdownReason::Sigterm).unwrap();
         tx.send(ShutdownReason::Sigint).unwrap();
         assert!(shutdown_requested(&mut rx));
+    }
+
+    /// A store rooted at `dir/store` whose profile `p` cannot be written: a
+    /// file stands where its directory goes.
+    fn refusing_store_root(dir: &std::path::Path) -> std::path::PathBuf {
+        let base = dir.join("store");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("p"), b"x").unwrap();
+        base
+    }
+
+    /// The labels of every `IncCounter` of `name` the sink recorded.
+    fn counted(sink: &torrentd_engine::RecordingSink, name: &str) -> Vec<Vec<(String, String)>> {
+        sink.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                torrentd_engine::metrics::MetricCall::IncCounter { name: n, labels }
+                    if n == name =>
+                {
+                    Some(labels)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The hook boot installs on the torrent store counts a magnet-metadata
+    /// write that fails on the batch writer under `source=metadata`.
+    #[test]
+    fn a_failed_batched_torrent_write_counts_under_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(torrentd_engine::RecordingSink::new());
+        let store = FsTorrentStore::new(refusing_store_root(dir.path()))
+            .with_batched_writes(Some(torrent_write_error_hook(sink.clone())));
+        let p = ProfileId::new("p");
+        store
+            .write_batched(&p, &libtorrent_safe::InfoHash([0x21; 20]), b"d4:infoe")
+            .unwrap();
+        store.flush();
+        assert_eq!(
+            counted(&sink, "torrent_file_persist_errors_total"),
+            vec![vec![
+                ("profile_id".to_string(), "p".to_string()),
+                ("source".to_string(), "metadata".to_string()),
+            ]],
+        );
+    }
+
+    /// The hook boot installs on the resume store counts a write that fails
+    /// on the batch writer and marks the torrent's file stale.
+    #[test]
+    fn a_failed_batched_resume_write_counts_and_marks_the_torrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(torrentd_engine::RecordingSink::new());
+        let state = Arc::new(StateMap::new());
+        let ih = libtorrent_safe::InfoHash([0x22; 20]);
+        let p = ProfileId::new("p");
+        state.insert(
+            ih,
+            torrentd_engine::TorrentState::newly_added(
+                libtorrent_safe::TorrentHandle {
+                    id: 1,
+                    infohash: ih,
+                },
+                p.clone(),
+                std::time::Instant::now(),
+            ),
+        );
+        let store = FsResumeStore::new(refusing_store_root(dir.path())).with_batched_writes(Some(
+            resume_write_error_hook(sink.clone(), Arc::clone(&state)),
+        ));
+        store.write_batched(&p, &ih, b"resume").unwrap();
+        store.flush();
+        assert_eq!(
+            counted(&sink, "resume_write_errors_total"),
+            vec![vec![("profile_id".to_string(), "p".to_string())]],
+        );
+        assert!(state.get(&ih).unwrap().resume_write_failed);
     }
 
     #[test]
