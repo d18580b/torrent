@@ -270,10 +270,10 @@ pub const CATALOGUE: &[Series] = &[
     series(
         "resume_saves_requeued_total",
         Counter,
-        Daemon,
+        Profile,
         Seed::Zero,
-        "Resume saves asked for again because an alert-queue overflow may have dropped their \
-         answer.",
+        "Resume saves asked for again because an overflow of this profile's alert queue may \
+         have dropped their answer.",
     ),
     labelled(
         "tracker_alerts_total",

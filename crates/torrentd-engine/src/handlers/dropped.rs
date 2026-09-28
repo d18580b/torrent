@@ -53,8 +53,13 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             "resume-data answers were among the dropped alerts; asking again for every save in \
              flight",
         );
-        ctx.metrics
-            .add_counter("resume_saves_requeued_total", requeued as u64, &[]);
+        // Under the profile whose queue overflowed, like every other counter
+        // this loop emits: that is the session falling behind.
+        ctx.metrics.add_counter(
+            "resume_saves_requeued_total",
+            requeued as u64,
+            &[("profile_id", ctx.profile_id.as_str())],
+        );
     }
     // One per overflow. libtorrent reports *which alert types* it dropped, as
     // a bitset, and never how many alerts; this used to add the bitset's
@@ -135,6 +140,24 @@ mod tests {
             // libtorrent's modified bit.
             let again = state.dispatch_resume_saves(usize::MAX);
             assert!(again.iter().all(|(_, f)| f.is_empty()));
+            // Counted, under the profile whose queue overflowed.
+            let requeued: Vec<_> = metrics
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    crate::metrics::MetricCall::AddCounter {
+                        name,
+                        value,
+                        labels,
+                    } if name == "resume_saves_requeued_total" => Some((value, labels)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                requeued,
+                vec![(3, vec![("profile_id".to_string(), "p".to_string())])],
+                "type {ty}",
+            );
         }
     }
 
@@ -149,6 +172,7 @@ mod tests {
         bits[0] &= !(1u64 << SAVE_RESUME_DATA_FAILED_TYPE);
         run(&state, &metrics, bits);
         assert_eq!(state.resume_saves_in_flight(), 3);
+        assert_eq!(metrics.count_for("resume_saves_requeued_total"), 0);
     }
 
     #[test]
