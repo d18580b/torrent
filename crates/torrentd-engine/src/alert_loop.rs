@@ -18,6 +18,9 @@
 //!     concurrently, then loop draining alerts until
 //!     `pending_resume_count == 0` or the global 30-second deadline
 //!     expires.
+//!   - Listen outcomes: every `listen_succeeded` / `listen_failed` alert is
+//!     published into the `ListenEvents` the daemon supplies, which a NAT-PMP
+//!     rebind waits on before it reports and announces a new port.
 //!   - Liveness: every iteration stamps a wall-clock heartbeat that
 //!     `GET /healthz` reads. A wedged or panicked loop makes the daemon
 //!     report unready instead of quietly serving a stale state map.
@@ -50,6 +53,7 @@ use crate::engine::TorrentEngine;
 use crate::handlers::HandlerCtx;
 use crate::handlers::{self};
 use crate::metrics::MetricsSink;
+use crate::port_forward::ListenEvents;
 use crate::profile::ProfileId;
 use crate::resume_store::ResumeStore;
 use crate::source::AlertSource;
@@ -90,6 +94,7 @@ pub struct AlertLoopBuilder {
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
+    listen_events: Option<Arc<ListenEvents>>,
 }
 
 /// Invoked once, from the loop thread, when a fatal condition is detected —
@@ -128,7 +133,18 @@ impl AlertLoopBuilder {
             fatal_listen_failure: false,
             on_fatal: None,
             profile_fenced: None,
+            listen_events: None,
         }
+    }
+
+    /// Publish every profile's `listen_succeeded` / `listen_failed` outcome
+    /// into `events`, which a NAT-PMP rebind waits on to confirm the session
+    /// listens on its new port. The loop is the only consumer of those
+    /// alerts, so without this nothing else can learn whether a rebind took.
+    /// `spawn` marks `events` attached.
+    pub fn listen_events(mut self, events: Arc<ListenEvents>) -> Self {
+        self.listen_events = Some(events);
+        self
     }
 
     /// Treat `listen_failed_alert` as fatal.
@@ -192,6 +208,7 @@ impl AlertLoopBuilder {
                 let fatal_listen_failure = self.fatal_listen_failure;
                 let on_fatal = self.on_fatal.clone();
                 let profile_fenced = self.profile_fenced.clone();
+                let listen_events = self.listen_events.clone();
                 move || {
                     let span = info_span!(parent: parent, "alert_loop");
                     let _enter = span.enter();
@@ -218,6 +235,7 @@ impl AlertLoopBuilder {
                                 on_fatal,
                                 profile_fenced,
                                 unsaved_at_shutdown,
+                                listen_events,
                             },
                         );
                     }));
@@ -239,6 +257,11 @@ impl AlertLoopBuilder {
                 }
             })
             .expect("spawn alert loop thread");
+        // After the thread exists, so a waiter that sees it attached has a
+        // publisher behind it.
+        if let Some(events) = &self.listen_events {
+            events.attach();
+        }
 
         AlertLoopHandle {
             join,
@@ -354,6 +377,7 @@ struct LoopHooks {
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
     unsaved_at_shutdown: Arc<AtomicU64>,
+    listen_events: Option<Arc<ListenEvents>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -416,6 +440,17 @@ fn run(
                         "listen socket failed; this profile accepts no incoming connections. \
                          Other sessions are still live, so the daemon keeps running",
                     );
+                }
+            }
+            if let Some(events) = &hooks.listen_events {
+                match &alert {
+                    Alert::ListenSucceeded { endpoint, .. } => {
+                        events.publish(&profile, endpoint, None)
+                    }
+                    Alert::ListenFailed {
+                        endpoint, message, ..
+                    } => events.publish(&profile, endpoint, Some(message.clone())),
+                    _ => {}
                 }
             }
             dispatch_alert(
@@ -1238,6 +1273,40 @@ mod tests {
         // Give the loop a chance to process the alert and keep going.
         std::thread::sleep(Duration::from_millis(200));
         assert!(!handle.listen_failed());
+
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread panicked");
+    }
+
+    #[test]
+    fn listen_outcomes_are_published_for_a_rebind_to_wait_on() {
+        use crate::port_forward::ListenConfirmation;
+
+        let engine = Arc::new(MockEngine::new());
+        let events = Arc::new(ListenEvents::new());
+        let cursor = events.cursor();
+        engine.push_alert(listen_failed_alert());
+        engine.push_alert(Alert::ListenSucceeded {
+            hdr: AlertHeader {
+                kind: AlertKind::ListenSucceeded,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            endpoint: "10.2.0.2:40001".into(),
+        });
+        assert!(!events.is_attached());
+        let handle = builder_with(engine).listen_events(events.clone()).spawn();
+        assert!(events.is_attached(), "spawning attaches the publisher");
+
+        let p = ProfileId::new("p");
+        let wait =
+            |ep: &str| events.wait_for(&p, cursor, ep.parse().unwrap(), Duration::from_secs(5));
+        assert_eq!(
+            wait("0.0.0.0:6881"),
+            ListenConfirmation::Failed("address already in use".into()),
+        );
+        assert_eq!(wait("10.2.0.2:40001"), ListenConfirmation::Succeeded);
 
         assert!(handle.signal_shutdown(ShutdownReason::Test));
         handle.join().expect("loop thread panicked");

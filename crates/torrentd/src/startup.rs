@@ -727,10 +727,17 @@ pub async fn boot(
     // If boot fails below, the process exits and the task with it.
     // It returns at once when no live profile negotiates a port, which is
     // not a death, so it is supervised only where it has work.
+    //
+    // A rebind is confirmed against the session's listen outcomes, which only
+    // the alert loop sees; it publishes them into `listen_events`, handed to
+    // it below. Until it is spawned the monitor defers a port change rather
+    // than report a port nothing has confirmed.
+    let listen_events = Arc::new(torrentd_engine::port_forward::ListenEvents::new());
     let pf = crate::port_forward_monitor::run(
         profile_registry.clone(),
         state.clone(),
         metrics.clone(),
+        listen_events.clone(),
         shutdown_tx.subscribe(),
     );
     if profile_registry
@@ -1180,6 +1187,7 @@ pub async fn boot(
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })
+    .listen_events(listen_events)
     .spawn();
 
     // Boot succeeded: the shutdown path owns the tunnels and the kill switch
