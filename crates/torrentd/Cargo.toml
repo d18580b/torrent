@@ -61,6 +61,8 @@ fault-injection = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Fault injection into the assignment registry's database.
+rusqlite = { workspace = true }
 kynos = { workspace = true, features = ["test-util"] }
 
 [lints]

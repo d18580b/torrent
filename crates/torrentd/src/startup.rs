@@ -596,13 +596,13 @@ pub async fn boot(
 
     // Assignment registry.
     let registry = Arc::new(
-        AssignmentRegistry::load_from(cfg.registry_path(), cfg.legacy_registry_path())
+        AssignmentRegistry::open(cfg.registry_path(), cfg.registry_import())
             .context("load assignment registry")?,
     );
 
     // Reconcile it against the configured profiles before anything reads it.
     //
-    // The migration above carries a pre-profiles registry over verbatim, which
+    // The import above carries a pre-profiles registry over verbatim, which
     // means it still names that deployment's ids — `default`, on the
     // single-session layout this release replaces. Nothing reconciles those
     // with the `[[profile]]` tables, and nothing prunes them, so an id with no
@@ -633,22 +633,30 @@ pub async fn boot(
                 .map(|p| p.id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            // Name the file the entries were *read from*. On the path this
-            // fires on — a migrated registry, which is what produces ids like
-            // `default` — that is the pre-rename `slot_assignments.json`, and
-            // quoting the post-rename name sent the operator to look at a
-            // file whose contents are a copy made moments earlier. Both are
-            // named, because both now exist and only one is the one the
-            // daemon will read next time.
+            // Name the file the entries were *read from* as well as the
+            // database. On the path this fires on — an imported registry,
+            // which is what produces ids like `default` — that is the JSON
+            // file, now under its `.imported` name, and editing it changes
+            // nothing: the database is what the daemon reads from here on.
+            // The database is not a file to open in an editor, so the remedy
+            // is the exact statement that clears those rows.
             let source = registry.source_path().display().to_string();
-            let current = cfg.registry_path().display().to_string();
+            let current = registry.path().display().to_string();
+            let ids = unknown
+                .keys()
+                .map(|id| format!("'{id}'"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delete = format!(
+                "sqlite3 {current} \"DELETE FROM assignment WHERE profile_id IN ({ids})\""
+            );
             let where_to_edit = if source == current {
-                format!("remove those entries from {current}")
+                format!("remove those entries from {current} (`{delete}`)")
             } else {
                 format!(
-                    "remove those entries from {current} (they were read from {source}, which is \
-                     left intact for a rollback; editing that file alone will not help, because \
-                     {current} is what the daemon reads from here on)"
+                    "remove those entries from {current} (`{delete}`; they were imported from \
+                     {source}, which is kept for a rollback; editing that file will not help, \
+                     because {current} is what the daemon reads from here on)"
                 )
             };
             anyhow::bail!(
@@ -1053,15 +1061,11 @@ pub async fn boot(
                 loaded_torrents = loaded,
                 resume_dir = %dirs_of(&cfg, &profile).0.display(),
                 torrent_dir = %dirs_of(&cfg, &profile).1.display(),
-                // Both files, as the refusal above names both. On the
-                // migration boot `source_path()` is the pre-rename
-                // `slot_assignments.json` — the file `docs/running.md` tells
-                // the operator explicitly not to edit — so naming it alone
-                // pointed at the wrong one. Its own justification for being
-                // the name to quote, that the current file is "by
-                // construction not on disk", stopped holding when the
-                // migration began writing that file unconditionally.
-                registry_path = %cfg.registry_path().display(),
+                // Both, as the refusal above names both. On the import boot
+                // `source_path()` is the JSON file under its `.imported` name
+                // — the file `docs/running.md` tells the operator explicitly
+                // not to edit — so naming it alone pointed at the wrong one.
+                registry_path = %registry.path().display(),
                 registry_read_from = %registry.source_path().display(),
                 "the assignment registry claims more torrents for this profile than the scans \
                  loaded; the files are probably still at the pre-profiles root — point this \
@@ -1097,7 +1101,7 @@ pub async fn boot(
     }
 
     // Two artefacts persist a torrent→profile mapping, and nothing reconciled
-    // them: `profile_assignments.json`, which the resume scan above writes and
+    // them: the assignment registry, which the resume scan above writes and
     // every load is gated on, and the pool index's `torrent.profile` column,
     // which `pool scan` writes and an operator may never run. The registry is
     // the authority and the column is a cache of it — said so in both module
