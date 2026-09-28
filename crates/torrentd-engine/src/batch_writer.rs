@@ -23,10 +23,14 @@
 //!
 //! A queued write stays visible to [`BatchWriter::pending`] until it is on
 //! disk, so a reader never sees a torrent's file missing between the queue and
-//! the rename. Synchronous operations — [`BatchWriter::write_now`] and
-//! [`BatchWriter::delete_now`] — take the same I/O lock as a batch and drop any
-//! queued write for their path first, so a queued write can never land after
-//! (and resurrect) a delete that followed it.
+//! the rename. A write's rename happens under the queue's lock and only while
+//! the write is still the newest queued for its path, and
+//! [`BatchWriter::delete_now`] drops the queued write and unlinks under that
+//! same lock, so a queued write can never land after (and resurrect) a delete
+//! that followed it — without the delete, which the alert loop calls when a
+//! torrent is removed, waiting out a batch's flushes. [`BatchWriter::write_now`]
+//! takes the I/O lock a batch holds instead: it is the API's synchronous path,
+//! and flushes of its own.
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -157,10 +161,10 @@ impl BatchWriter {
     }
 
     /// Delete `path` now, dropping anything queued for it. A missing file is
-    /// not an error.
+    /// not an error. Never waits for a batch: see the module docs.
     pub fn delete_now(&self, path: &Path) -> io::Result<()> {
-        let _io = self.shared.io.lock();
-        self.shared.pending.lock().by_path.remove(path);
+        let mut p = self.shared.pending.lock();
+        p.by_path.remove(path);
         remove_if_present(path)
     }
 
@@ -292,12 +296,26 @@ fn run_batch(shared: &Shared) {
         dir_ok.insert(dir.clone(), r.map_err(|e| e.kind()));
     }
 
-    // 3. Renames, then 4. one fsync per directory.
+    // 3. Renames, then 4. one fsync per directory. Each rename happens under
+    //    the queue's lock and only while this write is still the one queued:
+    //    one deleted or superseded since the batch was taken is dropped, so it
+    //    cannot land over the delete or the newer write.
     for (path, q) in written {
         let dir = path.parent().unwrap_or(Path::new("."));
-        let r = match dir_ok.get(dir) {
-            Some(Err(kind)) => Err(io::Error::from(*kind)),
-            _ => fs::rename(tmp_for(path), path),
+        let r = {
+            let p = shared.pending.lock();
+            let current = p
+                .by_path
+                .get(path)
+                .is_some_and(|now| now.generation == q.generation);
+            if !current {
+                let _ = fs::remove_file(tmp_for(path));
+                continue;
+            }
+            match dir_ok.get(dir) {
+                Some(Err(kind)) => Err(io::Error::from(*kind)),
+                _ => fs::rename(tmp_for(path), path),
+            }
         };
         if let Err(e) = r {
             let _ = fs::remove_file(tmp_for(path));
