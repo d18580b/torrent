@@ -24,8 +24,24 @@
 //! route via the tunnel in a table of its own, and a rule sending traffic from
 //! the tunnel address to that table. The profile's sockets are bound to that
 //! address and device, so that is all they need, and nothing else on the host
-//! is rerouted. The rules are removed at `bring_down`, before the process that
-//! owns the link is signalled, since the table is derived from the live link.
+//! is rerouted.
+//!
+//! The table is `TABLE_BASE + ifindex`, and the routes in it go with the link,
+//! so the routing holds only as long as the tun device openvpn created at
+//! bring-up does. `--persist-tun` is passed for that reason: a `ping-restart`
+//! or `SIGUSR1` reconnect then keeps the device — its ifindex, its table and
+//! its routes — instead of recreating it bare, which the health monitor would
+//! read as a route mismatch and fence on every reconnect. A reconnect that
+//! recreates the device anyway (the server pushed different options) is
+//! fenced, deliberately: nothing re-installs routing behind the monitor's
+//! back.
+//!
+//! The table a bring-up routed through is recorded next to the pid file, as
+//! `openvpn-<iface>.table`, before any rule is added. Teardown removes the
+//! rules pointing at that recorded table whether or not an openvpn is still
+//! running, and — when one is — those pointing at the live link's table too,
+//! before the process is signalled. So a device recreated with a new ifindex,
+//! or an openvpn that died on its own, does not leave rules behind.
 //!
 //! This assumes a routed (`tun`) device: a default route with no gateway is
 //! what a point-to-point link takes. A bridged `tap` profile would need the
@@ -89,17 +105,20 @@ fn openvpn_args<'a>(config: &'a str, iface: &'a str, pid_file: &'a str) -> Vec<&
         "--pull-filter",
         "ignore",
         "redirect-gateway",
+        // Keep the device across a reconnect: the routing below lives in a
+        // table keyed on its ifindex (see the module docs).
+        "--persist-tun",
     ]
 }
 
-/// The per-source routing an OpenVPN tunnel gets: everything, via the tunnel,
-/// for traffic from the tunnel's own address.
-fn route_tunnel(iface: &str, ip: IpAddr) -> std::io::Result<()> {
-    let default = match ip {
-        IpAddr::V4(_) => "0.0.0.0/0",
-        IpAddr::V6(_) => "::/0",
-    };
-    route::install(iface, &[ip.to_string()], &[default.to_string()])
+/// The tables whose rules teardown removes: the one recorded at bring-up,
+/// and the live link's, each once.
+fn tables_to_clear(recorded: Option<u32>, live: Option<u32>) -> Vec<u32> {
+    let mut tables: Vec<u32> = recorded.into_iter().collect();
+    if let Some(t) = live.filter(|t| !tables.contains(t)) {
+        tables.push(t);
+    }
+    tables
 }
 
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -124,6 +143,50 @@ impl OpenvpnManager {
 
     fn pid_file(&self, iface: &str) -> PathBuf {
         self.run_dir.join(format!("openvpn-{iface}.pid"))
+    }
+
+    /// Where the routing table a bring-up used for `iface` is recorded.
+    fn table_file(&self, iface: &str) -> PathBuf {
+        self.run_dir.join(format!("openvpn-{iface}.table"))
+    }
+
+    fn recorded_table(&self, iface: &str) -> Option<u32> {
+        std::fs::read_to_string(self.table_file(iface))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    /// The per-source routing an OpenVPN tunnel gets: everything, via the
+    /// tunnel, for traffic from the tunnel's own address.
+    ///
+    /// The table is recorded before the first rule goes in, so a partial
+    /// install is still found by teardown. A table left recorded by an
+    /// earlier run that never tore down has its rules removed first.
+    fn route_tunnel(&self, iface: &str, ip: IpAddr) -> std::io::Result<()> {
+        let table = route::table_for(iface)?;
+        if let Some(old) = self.recorded_table(iface).filter(|t| *t != table) {
+            route::remove(old);
+        }
+        std::fs::write(self.table_file(iface), format!("{table}\n"))?;
+        let default = match ip {
+            IpAddr::V4(_) => "0.0.0.0/0",
+            IpAddr::V6(_) => "::/0",
+        };
+        route::install(iface, &[ip.to_string()], &[default.to_string()])
+    }
+
+    /// Remove the source-address rules this manager installed for `iface`:
+    /// those pointing at the recorded table always, and — only while `pid`
+    /// is a live openvpn on `iface`, whose link is ours — those pointing at
+    /// the live link's table. Then forget the record.
+    fn unroute(&self, iface: &str, pid: Option<u32>) {
+        let live = pid.and_then(|_| route::table_for(iface).ok());
+        for table in tables_to_clear(self.recorded_table(iface), live) {
+            route::remove(table);
+        }
+        let _ = std::fs::remove_file(self.table_file(iface));
     }
 
     /// The pid recorded for `iface`, if it is still an openvpn process running
@@ -240,7 +303,7 @@ impl VpnManager for OpenvpnManager {
             match super::ip_lookup::first_ipv4(&profile.interface) {
                 Ok(ip) => {
                     let addr = IpAddr::V4(ip);
-                    if let Err(e) = route_tunnel(&profile.interface, addr) {
+                    if let Err(e) = self.route_tunnel(&profile.interface, addr) {
                         // Without its rule the tunnel address routes by the
                         // main table: a profile bound to it would send out of
                         // the physical interface. What this call started is
@@ -313,24 +376,24 @@ impl OpenvpnManager {
     /// tunnel whose routing could not be installed.
     ///
     /// The source-address rules go first, while the link still stands: the
-    /// table they point at is derived from the link's ifindex, and once
-    /// openvpn has exited there is no link to derive it from and the rules
-    /// would outlive it.
+    /// live link's table is derived from its ifindex, and once openvpn has
+    /// exited there is no link to derive it from. The recorded table's rules
+    /// go even when no openvpn is left to signal — one that died on its own
+    /// leaves them otherwise.
     fn stop(&self, iface: &str) {
-        let Some(pid) = self.live_pid(iface) else {
+        let pid = self.live_pid(iface);
+        self.unroute(iface, pid);
+        let Some(pid) = pid else {
             // No pid file, or it does not describe a live openvpn on this
             // interface. Either the tunnel is already down or it was started
             // by something else; in both cases signalling is not ours to do.
             warn!(
                 target: "torrentd::vpn::openvpn",
                 vpn_iface = %iface,
-                "no live openvpn pid recorded for this interface; nothing to tear down",
+                "no live openvpn pid recorded for this interface; nothing to signal",
             );
             return;
         };
-        if let Ok(table) = route::table_for(iface) {
-            route::remove(table);
-        }
         info!(
             target: "torrentd::vpn::openvpn",
             vpn_iface = %iface,
@@ -396,6 +459,50 @@ mod tests {
         assert!(
             args.windows(2).any(|w| w == ["--dev", "tun-a"]),
             "the interface is still pinned: {args:?}"
+        );
+    }
+
+    /// A reconnect keeps the device, and with it the ifindex-keyed table and
+    /// its routes. Without `--persist-tun` a `ping-restart` recreates the tun
+    /// bare and the monitor fences the profile on every reconnect.
+    #[test]
+    fn a_reconnect_keeps_the_device_its_routing_lives_on() {
+        let args = openvpn_args("/etc/openvpn/a.conf", "tun-a", "/var/lib/torrentd/p.pid");
+        assert!(args.contains(&"--persist-tun"), "{args:?}");
+    }
+
+    /// Teardown clears the table recorded at bring-up and the live link's,
+    /// once each. A device recreated with a new ifindex makes the two differ,
+    /// and the recorded one is what still holds the bring-up's rules.
+    #[test]
+    fn teardown_clears_the_recorded_table_and_the_live_one() {
+        assert_eq!(tables_to_clear(Some(7), Some(9)), vec![7, 9]);
+        assert_eq!(tables_to_clear(Some(7), Some(7)), vec![7]);
+        assert_eq!(
+            tables_to_clear(Some(7), None),
+            vec![7],
+            "no live openvpn: the recorded table still goes",
+        );
+        assert_eq!(tables_to_clear(None, Some(9)), vec![9]);
+        assert!(tables_to_clear(None, None).is_empty());
+    }
+
+    /// An openvpn that died on its own leaves no pid to signal, and its
+    /// recorded table is still consumed: the rules pointing at it are
+    /// removed and the record forgotten, where at the head this replaces
+    /// teardown returned before touching routing at all.
+    #[test]
+    fn teardown_with_no_live_openvpn_still_unroutes_the_recorded_table() {
+        let (_d, m) = mgr();
+        // An ifindex no host has, so the `ip rule del` this runs matches
+        // nothing whatever the privilege.
+        let table = route::TABLE_BASE.wrapping_add(0xFFFE);
+        std::fs::write(m.table_file("tun0"), format!("{table}\n")).unwrap();
+        assert_eq!(m.recorded_table("tun0"), Some(table));
+        m.bring_down("tun0");
+        assert!(
+            !m.table_file("tun0").exists(),
+            "the recorded table was cleared even with nothing to signal",
         );
     }
 

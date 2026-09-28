@@ -138,13 +138,20 @@ while it is running:
   there is never a stale one to clear after a crash. Delete the file while the
   daemon runs and the next start no longer sees it.
 
-A deployment with no `vpn` profile has neither of the next two:
+A deployment with no `vpn` profile has none of the next three:
 
 - **`openvpn-<iface>.pid`** — the pid `openvpn --writepid` recorded for an
   OpenVPN profile. It is the only handle the teardown has on that process, and it
   is verified against `/proc/<pid>/cmdline` before anything is signalled, so a
   recycled pid is not signalled. Delete it while the daemon is running and the
   tunnel survives the next shutdown.
+- **`openvpn-<iface>.table`** — the routing table an OpenVPN profile's
+  source-address rules point at (§11.6), written before the first rule is
+  added. Teardown removes the rules pointing at it even when the openvpn
+  process has already died, then deletes the file; the next bring-up clears a
+  table left recorded by a run that never tore down. Delete it while the
+  daemon is running and a tunnel whose openvpn dies on its own leaves its
+  `ip rule` entries behind.
 - **`wireguard-<iface>.raised`** — a note that *this boot of this host* raised
   the link now standing under that name. It is what lets a restart after an
   unclean shutdown adopt the tunnel still standing instead of leaving the
@@ -1246,6 +1253,12 @@ On a scratch pool, not your real one.
    ignore redirect-gateway`, so it installs no routes and never takes the
    host's default route, and the daemon routes the tunnel (a routed `tun`
    device; a bridged `tap` profile is not supported) once it has its address.
+   It also runs with `--persist-tun`, because the table is keyed on the
+   device's ifindex and its routes go with the device: a `ping-restart` or
+   `SIGUSR1` reconnect keeps the device and its routing. A reconnect that
+   recreates the device anyway — the server pushed different options — is
+   fenced as a route mismatch or an address change, and routing is not
+   re-installed behind the monitor's back.
 
    The ruleset is installed as **one `nft -f` transaction** that replaces
    whatever `torrentd_ks` table is standing, so there is no instant between
