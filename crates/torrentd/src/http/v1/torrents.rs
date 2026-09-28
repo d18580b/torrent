@@ -40,6 +40,7 @@ use crate::http::page::PageRequest;
 use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::security::Write;
+use crate::http::v1::common::blocking;
 use crate::http::v1::common::engine_for;
 use crate::http::v1::common::from_profile_problem;
 use crate::http::v1::common::internal;
@@ -416,23 +417,27 @@ pub async fn get_torrent(
         .registry
         .lookup(&ih)
         .ok_or(GetTorrentError::TorrentNotFound)?;
-    let details = s
-        .state
-        .get(&ih)
-        .and_then(|st| details_of(&s, &profile, &st));
+    let details = match s.state.get(&ih) {
+        Some(st) => details_of(&s, &profile, st.handle).await,
+        None => None,
+    };
     Ok(Json(Torrent::build(&s, &ih, &profile, details)))
 }
 
 /// The session's details for a loaded torrent, or `None` if it cannot be
 /// asked. A torrent is still worth reporting without them.
-fn details_of(s: &AppState, profile: &ProfileId, st: &TorrentState) -> Option<TorrentDetails> {
+async fn details_of(
+    s: &AppState,
+    profile: &ProfileId,
+    handle: torrentd_engine::TorrentHandle,
+) -> Option<TorrentDetails> {
     let engine = s.source.engine_for(profile)?;
-    engine
-        .torrent_details(st.handle)
+    blocking(move || engine.torrent_details(handle))
+        .await
         .inspect_err(|e| {
             warn!(
                 target: "torrentd::http",
-                infohash = %st.handle.infohash,
+                infohash = %handle.infohash,
                 error.cause = %e,
                 "could not read a torrent's details from its session",
             );
@@ -763,7 +768,8 @@ pub async fn add_torrent(
             Some(bytes),
         ),
     };
-    let handle = match engine.add_torrent(params) {
+    let adder = Arc::clone(&engine);
+    let handle = match blocking(move || adder.add_torrent(params)).await {
         Ok(handle) => handle,
         Err(e) => {
             // Release the claim so the add can be retried. A release that
@@ -802,8 +808,8 @@ pub async fn add_torrent(
 
     // The state map learns of the torrent only with its `AddTorrent` alert,
     // so the details come from the handle the session just returned.
-    let details = engine
-        .torrent_details(handle)
+    let details = blocking(move || engine.torrent_details(handle))
+        .await
         .inspect_err(|e| {
             warn!(
                 target: "torrentd::http",
@@ -966,8 +972,8 @@ pub async fn delete_torrent(
     // until the alert lands, so the delete is refused as a conflict to retry.
     match s.state.get(&ih) {
         Some(st) => {
-            engine
-                .remove_torrent(st.handle, delete_files)
+            blocking(move || engine.remove_torrent(st.handle, delete_files))
+                .await
                 .map_err(|e| DeleteTorrentError::Internal {
                     detail: internal("removing the torrent from its session", e),
                 })?;
@@ -1224,8 +1230,8 @@ pub async fn pause_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<NoContent, PauseTorrentError> {
     let (st, engine) = loaded(&s, p.infohash.get())?;
-    engine
-        .pause_torrent(st.handle)
+    blocking(move || engine.pause_torrent(st.handle))
+        .await
         .map_err(|e| PauseTorrentError::Internal {
             detail: internal("pausing the torrent", e),
         })?;
@@ -1268,8 +1274,8 @@ pub async fn resume_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<NoContent, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    engine
-        .resume_torrent(st.handle)
+    blocking(move || engine.resume_torrent(st.handle))
+        .await
         .map_err(|e| UnfencedControlError::Internal {
             detail: internal("resuming the torrent", e),
         })?;
@@ -1290,8 +1296,8 @@ pub async fn recheck_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Accepted<()>, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    engine
-        .force_recheck(st.handle)
+    blocking(move || engine.force_recheck(st.handle))
+        .await
         .map_err(|e| UnfencedControlError::Internal {
             detail: internal("rechecking the torrent", e),
         })?;
@@ -1311,8 +1317,8 @@ pub async fn reannounce_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Accepted<()>, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    engine
-        .force_reannounce(st.handle)
+    blocking(move || engine.force_reannounce(st.handle))
+        .await
         .map_err(|e| UnfencedControlError::Internal {
             detail: internal("reannouncing the torrent", e),
         })?;
@@ -1360,8 +1366,8 @@ pub async fn set_upload_limit(
     let (st, engine) = loaded(&s, p.infohash.get())?;
     // Validated into `1..=i32::MAX` above; libtorrent's 0 is "unlimited".
     let rate = body.bytes_per_sec.map_or(0, |r| r as i32);
-    engine
-        .set_upload_limit(st.handle, rate)
+    blocking(move || engine.set_upload_limit(st.handle, rate))
+        .await
         .map_err(|e| SetUploadLimitError::Internal {
             detail: internal("setting the torrent's upload limit", e),
         })?;
@@ -1596,7 +1602,8 @@ pub async fn set_file_priority(
         .ok()
         .filter(|_| (p.index as usize) < count)
         .ok_or(SetFilePriorityError::FileNotFound)?;
-    match engine.set_file_priority(st.handle, index, body.priority) {
+    let priority = body.priority;
+    match blocking(move || engine.set_file_priority(st.handle, index, priority)).await {
         Ok(()) => Ok(NoContent),
         // Removed between the count and the set.
         Err(e) if is_gone(&e) => Err(SetFilePriorityError::TorrentNotFound),
@@ -1885,7 +1892,7 @@ pub async fn list_torrent_trackers(
     Path(p): Path<TorrentPath>,
 ) -> Result<Json<TrackerList>, ListTrackersError> {
     let (st, engine) = loaded(&s, p.infohash.get())?;
-    let trackers = match engine.torrent_trackers(st.handle) {
+    let trackers = match blocking(move || engine.torrent_trackers(st.handle)).await {
         Ok(trackers) => trackers,
         Err(e) if is_gone(&e) => return Err(ListTrackersError::TorrentNotFound),
         Err(e) => {

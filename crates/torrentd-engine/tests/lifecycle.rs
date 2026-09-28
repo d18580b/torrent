@@ -298,6 +298,39 @@ fn full_check_verifies_and_rejects_corrupt_payload() {
     }
 }
 
+/// A bounded drain returns at most its bound and leaves the rest queued, so
+/// the engine can release the session lock between batches without losing an
+/// alert.
+#[test]
+#[ignore = "real libtorrent; run with --ignored"]
+fn a_bounded_drain_leaves_the_rest_queued() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Session::new(&support::local_seed_settings()).unwrap();
+    for i in 0..20u8 {
+        s.add_torrent(AddParams::Magnet {
+            uri: format!("magnet:?xt=urn:btih:{}", hex::encode([i + 1; 20])),
+            save_path: dir.path().to_str().unwrap().to_string(),
+            flags: TorrentFlags::PAUSED | TorrentFlags::UPLOAD_MODE,
+        })
+        .unwrap();
+    }
+    let first = s.drain_alerts_up_to(5);
+    assert_eq!(first.len(), 5);
+    let mut added = first
+        .iter()
+        .filter(|a| matches!(a, Alert::AddTorrent { .. }))
+        .count();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while added < 20 && std::time::Instant::now() < deadline {
+        added += s
+            .drain_alerts_up_to(5)
+            .iter()
+            .filter(|a| matches!(a, Alert::AddTorrent { .. }))
+            .count();
+    }
+    assert_eq!(added, 20, "every add_torrent_alert arrives across batches");
+}
+
 #[test]
 #[ignore = "real libtorrent; run with --ignored"]
 fn alert_queue_overflow_surfaces_drop_and_keeps_draining() {

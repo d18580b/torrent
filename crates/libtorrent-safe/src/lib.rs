@@ -33,6 +33,7 @@ pub use session::info_hash_from_torrent;
 pub use session::session_stats_metric_index;
 pub use session::torrent_tracker_host_matches;
 pub use session::AddParams;
+pub use session::RawFileList;
 pub use session::Session;
 pub use settings::MoveFlags;
 pub use settings::ResumeFlags;
