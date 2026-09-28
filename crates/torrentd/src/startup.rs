@@ -694,13 +694,23 @@ pub async fn boot(
     // rejections (profile_assignment_registry_errors_total).
     let metrics = Arc::new(PromSink::new());
 
+    // Empty until the alert loop sees each torrent added. Created before the
+    // stores, because a resume write that fails on the batch writer has to
+    // mark its torrent for a fresh save; and before the port-forward monitor
+    // below, which reannounces whatever it holds by the time a port changes.
+    let state = Arc::new(StateMap::new());
+
     // Resume store — rooted at the top-level `resume_dir` and partitioned by
     // profile id, except where a `[[profile]]` names its own directory. Those keys
     // were validated for uniqueness and then ignored, so files landed under
     // the derived path and only matched the configured one by coincidence.
     //
     // The alert loop's writes are batched onto the store's own thread, and a
-    // write that fails there is counted as the handler used to count it.
+    // write that fails there is counted as the handler used to count it. The
+    // handler has already cleared the torrent's `needs_save_resume` by then,
+    // and libtorrent its modified bit, so the hook also marks the file stale:
+    // otherwise no `ONLY_IF_MODIFIED` save, the shutdown drain's included,
+    // would ever rewrite it.
     let resume_store: Arc<dyn ResumeStore> = Arc::new(
         cfg.profile
             .iter()
@@ -713,14 +723,16 @@ pub async fn boot(
             )
             .with_batched_writes(Some({
                 let metrics = metrics.clone();
+                let state = Arc::clone(&state);
                 Arc::new(
                     move |profile: &ProfileId,
-                          _: &libtorrent_safe::InfoHash,
+                          ih: &libtorrent_safe::InfoHash,
                           _: &std::io::Error| {
                         metrics.inc_counter(
                             "resume_write_errors_total",
                             &[("profile_id", profile.as_str())],
                         );
+                        state.note_resume_write_failed(ih);
                     },
                 ) as torrentd_engine::WriteErrorHook
             })),
@@ -872,11 +884,6 @@ pub async fn boot(
     let profile_registry =
         Arc::new(ProfileRegistry::new(profile_entries).with_failed(failed_profiles));
     let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(source_entries));
-    // Empty until the alert loop sees each torrent added; created here so the
-    // port-forward monitor below can reannounce whatever it holds by the time
-    // a port changes.
-    let state = Arc::new(StateMap::new());
-
     // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
     // live session if the forwarded port changes, and reannounces. Started
     // here, the moment every profile is built, rather than from

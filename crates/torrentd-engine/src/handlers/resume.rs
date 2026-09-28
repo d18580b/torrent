@@ -26,7 +26,10 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             // 100K-torrent drain outlast its deadline. The shutdown drain
             // flushes the store before it returns, and a failure the writer
             // meets later is counted by the store's error hook under
-            // `resume_write_errors_total`, as one here is.
+            // `resume_write_errors_total`, as one here is. That hook also
+            // calls `StateMap::note_resume_write_failed`, because the
+            // `needs_save_resume` cleared below and libtorrent's modified bit
+            // are both gone by then, and nothing else would rewrite the file.
             match ctx
                 .resume
                 .write_batched(&ctx.profile_id, &ih, data.as_bytes())
@@ -44,6 +47,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     );
                     ctx.state.update(&ih, |st| {
                         st.needs_save_resume = false;
+                        st.resume_write_failed = false;
                     });
                 }
                 Err(e) => {

@@ -130,6 +130,15 @@ pub struct TorrentState {
     /// libtorrent's own "needs save resume" flag, last we saw it in a
     /// state_update_alert. Read by the resume scheduler.
     pub needs_save_resume: bool,
+    /// The last resume data accepted for this torrent failed to reach the
+    /// disk on the batch writer, so its file on disk is stale.
+    ///
+    /// libtorrent cleared its modified bit when it produced that data, so an
+    /// `ONLY_IF_MODIFIED` save would answer "not modified" and leave the stale
+    /// file for good. Set, this makes the periodic sweep pick the torrent up
+    /// and every save of it ask unconditionally, until a later answer is
+    /// accepted for writing.
+    pub resume_write_failed: bool,
     pub upload_rate: i64,
     pub download_rate: i64,
     /// Cumulative bytes uploaded this session, including protocol overhead.
@@ -176,6 +185,7 @@ impl TorrentState {
             last_alert: now,
             retry: None,
             needs_save_resume: false,
+            resume_write_failed: false,
             upload_rate: 0,
             download_rate: 0,
             total_uploaded: 0,
@@ -361,13 +371,25 @@ impl StateMap {
         self.retry_heap.lock().len()
     }
 
-    /// Snapshot every torrent flagged with `needs_save_resume`.
+    /// Snapshot every torrent flagged with `needs_save_resume`, or whose last
+    /// resume write failed.
     pub fn needing_resume_save(&self) -> Vec<TorrentHandle> {
         self.inner
             .iter()
-            .filter(|e| e.value().needs_save_resume)
+            .filter(|e| e.value().needs_save_resume || e.value().resume_write_failed)
             .map(|e| e.value().handle)
             .collect()
+    }
+
+    /// A resume write for `ih` that its handler accepted failed later, on the
+    /// batch writer. Mark the torrent's file stale, for the next periodic
+    /// sweep or the shutdown drain to save it unconditionally.
+    ///
+    /// Not re-asked for at once: a disk that refuses every write would turn
+    /// that into a loop of whole-torrent saves failing as fast as the writer
+    /// can take them.
+    pub fn note_resume_write_failed(&self, ih: &InfoHash) {
+        self.update(ih, |st| st.resume_write_failed = true);
     }
 
     // --- resume saves ---------------------------------------------------------

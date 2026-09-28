@@ -732,6 +732,13 @@ fn dispatch_saves(
             state.note_resume_settled(&ih);
             continue;
         };
+        // A file left stale by a failed write: libtorrent's modified bit went
+        // with the data that failed, so only an unconditional save rewrites it.
+        let flags = if st.resume_write_failed {
+            flags - ResumeFlags::ONLY_IF_MODIFIED
+        } else {
+            flags
+        };
         if let Err(e) = engine.save_resume_data(st.handle, flags) {
             // Failed before reaching libtorrent, so no alert will settle it.
             state.note_resume_settled(&ih);
@@ -1555,6 +1562,93 @@ mod tests {
             .collect();
         assert_eq!(flags.len(), 3);
         assert!(flags.iter().all(|f| *f == ResumeFlags::ONLY_IF_MODIFIED));
+    }
+
+    /// The flags of every `save_resume_data` `engine` was asked for.
+    fn save_flags(engine: &MockEngine) -> Vec<ResumeFlags> {
+        engine
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                crate::mock::RecordedCall::SaveResumeData { flags, .. } => Some(*flags),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stale_resume_file_is_saved_unconditionally_even_by_the_drain() {
+        // libtorrent's modified bit went with the data whose write failed, so
+        // the drain's `ONLY_IF_MODIFIED` would be answered "not modified".
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        let state = loaded(&engine, 1);
+        let ih = state.handles()[0].infohash;
+        state.update(&ih, |st| st.resume_write_failed = true);
+        drain(Arc::clone(&engine), &state);
+        assert_eq!(save_flags(&engine), vec![ResumeFlags::empty()]);
+        assert!(
+            !state.get(&ih).unwrap().resume_write_failed,
+            "cleared once fresh data is accepted for writing",
+        );
+    }
+
+    #[test]
+    fn a_resume_write_that_fails_on_the_writer_is_saved_again_and_lands() {
+        // The handler accepts the data and clears `needs_save_resume`; the
+        // write fails only later, on the batch writer. Its hook marks the
+        // torrent, and the next save rewrites the file.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("resume");
+        std::fs::create_dir_all(&base).unwrap();
+        // A file where the profile's directory goes: every write fails.
+        let blocker = base.join("p");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        let state = loaded(&engine, 1);
+        let ih = state.handles()[0].infohash;
+        let resume: Arc<dyn ResumeStore> = Arc::new(
+            crate::resume_store::FsResumeStore::new(&base).with_batched_writes(Some({
+                let state = Arc::clone(&state);
+                Arc::new(move |_: &ProfileId, ih: &InfoHash, _: &std::io::Error| {
+                    state.note_resume_write_failed(ih)
+                }) as crate::WriteErrorHook
+            })),
+        );
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        let run = || {
+            run_shutdown(
+                ShutdownReason::Test,
+                DEFAULT_SHUTDOWN_DEADLINE,
+                &source,
+                &state,
+                &resume,
+                &torrents,
+                &metrics,
+                &clock,
+            )
+        };
+
+        assert_eq!(run(), 0, "the answer was accepted, so nothing is pending");
+        assert!(state.get(&ih).unwrap().resume_write_failed);
+        assert!(
+            state.needing_resume_save().iter().any(|h| h.infohash == ih),
+            "the periodic sweep picks it up",
+        );
+
+        std::fs::remove_file(&blocker).unwrap();
+        assert_eq!(run(), 0);
+        let flags = save_flags(&engine);
+        assert_eq!(
+            flags.last(),
+            Some(&ResumeFlags::empty()),
+            "asked unconditionally: {flags:?}",
+        );
+        assert!(!state.get(&ih).unwrap().resume_write_failed);
+        assert!(blocker.join(format!("{}.resume", ih.to_hex())).exists());
     }
 
     #[test]
