@@ -325,6 +325,7 @@ mod tests {
     use torrentd_engine::ProfileId;
 
     use super::*;
+    use crate::config::LogLevel;
 
     /// A host profile taking the top-level `upload_rate_limit` when
     /// `upload_rate_limit` is `None`, or overriding it when it is set.
@@ -550,6 +551,61 @@ mod tests {
             std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             "the running config keeps the address the daemon bound",
         );
+    }
+
+    #[test]
+    fn every_applied_settings_key_advances_including_a_withheld_one() {
+        // The property: each of the five settings keys, once applied, is what
+        // the daemon runs, so the next reload of the same file is empty. Each
+        // key gets a value no other key has, so copying the wrong field of
+        // `next` into `running` leaves a difference the second diff reports.
+        let (first, second, running) = reload_twice(|c| {
+            c.connections_limit = Some(20_000);
+            c.upload_rate_limit = Some(2_000);
+            c.max_concurrent_http_announces = Some(75);
+            c.aio_threads = Some(7);
+            c.enable_lsd = Some(true);
+        });
+        assert_eq!(first.reloadable_changes.len(), 5, "{first:?}");
+        // Decision 7: a key withheld from some profile still advances. Both
+        // withholdings apply to this edit, and neither is re-reported.
+        assert_eq!(withheld_reloadable_keys(&first, &vpn()), vec!["enable_lsd"]);
+        assert_eq!(
+            withheld_reloadable_keys(&first, &host(Some(5000))),
+            vec!["upload_rate_limit"],
+        );
+        assert!(
+            second.is_empty(),
+            "every applied key must advance: {second:?}"
+        );
+        assert_eq!(running.connections_limit, Some(20_000));
+        assert_eq!(running.upload_rate_limit, Some(2_000));
+        assert_eq!(running.max_concurrent_http_announces, Some(75));
+        assert_eq!(running.aio_threads, Some(7));
+        assert_eq!(running.enable_lsd, Some(true));
+    }
+
+    #[test]
+    fn an_applied_log_level_advances() {
+        let (first, second, running) = reload_twice(|c| c.log_level = LogLevel::Debug);
+        assert_eq!(first.log_level, Some(LogLevel::Debug));
+        assert_eq!(running.log_level, LogLevel::Debug);
+        assert!(second.is_empty(), "{second:?}");
+    }
+
+    #[test]
+    fn a_log_level_that_failed_to_apply_is_retried_on_the_next_reload() {
+        // `set_level` failed, so the daemon still logs at the booted level
+        // and the next reload has to try again.
+        let dir = tempfile::tempdir().unwrap();
+        let boot = Config::minimal_for_tests(dir.path(), true);
+        let mut file = Config::minimal_for_tests(dir.path(), true);
+        file.log_level = LogLevel::Debug;
+        let first = Config::diff(&boot, &file);
+        let running = running_config(&boot, &file, &first, true, false);
+        assert_eq!(running.log_level, LogLevel::Info);
+        let second = Config::diff(&running, &file);
+        assert_eq!(second.log_level, Some(LogLevel::Debug));
     }
 
     #[test]
