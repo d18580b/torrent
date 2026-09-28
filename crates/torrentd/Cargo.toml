@@ -61,6 +61,8 @@ fault-injection = []
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `test-util` for the paused clock the port-forward monitor's pacing tests run on.
+tokio = { workspace = true, features = ["test-util"] }
 kynos = { workspace = true, features = ["test-util"] }
 
 [lints]

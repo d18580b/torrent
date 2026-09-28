@@ -172,6 +172,7 @@ pub async fn run(
             metrics.clone() as Arc<dyn MetricsSink>,
             Arc::new(forwarder.clone()),
             id,
+            REANNOUNCE_PACE,
             stop_rx.clone(),
         ));
     }
@@ -211,12 +212,15 @@ pub async fn run(
 /// after each success or [`RETRY_INTERVAL`] after each failure, until `stop`
 /// fires. A port change's paced reannounce runs beside the loop, so it never
 /// delays a renewal; a later port change replaces it, and `stop` ends it.
+/// `pace` is the reannounce's pause between batches, [`REANNOUNCE_PACE`]
+/// outside tests.
 async fn renew_profile(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
     metrics: Arc<dyn MetricsSink>,
     forwarder: Arc<dyn PortForwarder>,
     id: ProfileId,
+    pace: Duration,
     mut stop: watch::Receiver<bool>,
 ) {
     let mut delay = Duration::ZERO;
@@ -244,7 +248,7 @@ async fn renew_profile(
                 metrics.clone(),
                 id.clone(),
                 detected,
-                REANNOUNCE_PACE,
+                pace,
                 stop.clone(),
             )));
         }
@@ -846,6 +850,91 @@ mod tests {
         );
         task.await.unwrap();
         assert_eq!(reannounced(&engine), handles, "and then the rest");
+    }
+
+    /// `2 * REANNOUNCE_BATCH` torrents in `acct_a`, so a reannounce is two
+    /// batches a pace apart, and the renewal loop driving them.
+    fn two_batch_profile(
+        fwd: &MockForwarder,
+        pace: Duration,
+    ) -> (
+        Arc<MockEngine>,
+        Arc<RecordingSink>,
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (entry, engine) = natpmp_entry("acct_a", 6881);
+        let state = Arc::new(StateMap::new());
+        for i in 0..(2 * REANNOUNCE_BATCH) {
+            let h = engine.register_handle(InfoHash([i as u8; 20]));
+            state.insert(
+                h.infohash,
+                TorrentState::newly_added(h, ProfileId::new("acct_a"), Instant::now()),
+            );
+        }
+        let sink = Arc::new(RecordingSink::new());
+        let (stop_tx, stop) = watch::channel(false);
+        let task = tokio::spawn(renew_profile(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            state,
+            sink.clone() as Arc<dyn MetricsSink>,
+            forwarder(fwd),
+            ProfileId::new("acct_a"),
+            pace,
+            stop,
+        ));
+        (engine, sink, stop_tx, task)
+    }
+
+    /// A second port change aborts the first one's reannounce: the batches it
+    /// had left would advertise a port the profile no longer holds.
+    ///
+    /// On the paused clock: at 0s the renewal moves to 40001 and reannounce A
+    /// sends its first batch; at 2s (half the 4s lease) it moves to 40002, A
+    /// is aborted in its pace, and B sends its first batch; B's second goes
+    /// at 12s. Were A not aborted its second batch would go at 10s and it
+    /// would record a second reannounce.
+    #[tokio::test(start_paused = true)]
+    async fn a_later_port_change_aborts_the_running_reannounce() {
+        let fwd = MockForwarder::new();
+        fwd.push_ok_lifetime(40001, 4);
+        fwd.push_ok(40002);
+        let (engine, sink, stop_tx, task) = two_batch_profile(&fwd, Duration::from_secs(10));
+
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        assert_eq!(fwd.call_count(), 2, "two renewals, each a port change");
+        assert_eq!(
+            reannounced(&engine).len(),
+            3 * REANNOUNCE_BATCH,
+            "A's first batch and all of B; A's second never went",
+        );
+        assert_eq!(
+            histograms(&sink, "profile_port_change_reannounce_seconds"),
+            1,
+            "only the second reannounce finished",
+        );
+        stop_tx.send(true).unwrap();
+        task.await.unwrap();
+    }
+
+    /// Stopping the monitor ends a reannounce still in its pace.
+    #[tokio::test(start_paused = true)]
+    async fn stop_ends_a_running_reannounce() {
+        let fwd = MockForwarder::with_ports([40001]);
+        let (engine, sink, stop_tx, task) = two_batch_profile(&fwd, Duration::from_secs(10));
+
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(reannounced(&engine).len(), REANNOUNCE_BATCH, "the first batch");
+        stop_tx.send(true).unwrap();
+        task.await.unwrap();
+
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(
+            reannounced(&engine).len(),
+            REANNOUNCE_BATCH,
+            "nothing after the stop",
+        );
+        assert_eq!(histograms(&sink, "profile_port_change_reannounce_seconds"), 0);
     }
 
     /// Profile Safety Rule 8, for the ports a gateway assigns: a renewal that
