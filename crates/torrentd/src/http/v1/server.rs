@@ -16,6 +16,7 @@ use tracing::info;
 
 use crate::app_state::AppState;
 use crate::http::security::Bearer;
+use crate::http::security::Caller;
 use crate::http::security::Read;
 use crate::http::security::Write;
 use crate::http::v1::Server;
@@ -220,17 +221,31 @@ const RETRY_MILLIS: u64 = 5_000;
 /// that is only `tick`, sent when anything a client renders may have changed
 /// and at least every ten seconds. A comment line keeps the connection alive
 /// every fifteen seconds through proxies that drop idle ones. The stream ends
-/// when the daemon shuts down; reconnect after the `retry` the first event
-/// carries.
+/// when the daemon shuts down, and within a second of the session token it was
+/// opened with expiring or being revoked; reconnect after the `retry` the
+/// first event carries, with a live credential.
 #[kynos::get("/events", tag = Server)]
 pub async fn stream_events(
-    _caller: Scoped<Bearer, Read>,
+    caller: Scoped<Bearer, Read>,
     Inject(s): Inject<Arc<AppState>>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event<ServerEvent>, std::convert::Infallible>>> {
     let mut shutdown = s.shutdown.subscribe();
+    // The credential is checked once, when the request arrives; a stream
+    // outlives that check by as long as the client keeps it open. A session
+    // token is the one credential that can stop being valid while the daemon
+    // runs — it expires, or `DELETE /v1/sessions/current` revokes it — so it
+    // is re-checked on every tick. A static token lasts until the daemon
+    // restarts, and a restart ends the stream anyway.
+    let session = match caller.into_inner() {
+        Caller::Session { token, .. } => Some(token),
+        Caller::Anonymous | Caller::Token { .. } => None,
+    };
     let stream = async_stream::stream! {
         let mut last_fingerprint = u64::MAX;
-        let mut last_emit = std::time::Instant::now() - IDLE_TICK;
+        // The first tick is due at once. `checked_sub` because an `Instant`
+        // cannot go back further than the clock it reads, which on a host
+        // up for less than `IDLE_TICK` panics `Instant - Duration`.
+        let mut last_emit = std::time::Instant::now().checked_sub(IDLE_TICK);
         let mut first = true;
 
         loop {
@@ -241,15 +256,29 @@ pub async fn stream_events(
                 _ = shutdown.recv() => break,
             }
 
+            if let Some(token) = session.as_deref() {
+                let live = s
+                    .auth
+                    .as_ref()
+                    .is_some_and(|auth| auth.sessions.expiry(token).is_some());
+                if !live {
+                    info!(
+                        target: "torrentd::auth",
+                        "event stream closed: its session expired or was revoked",
+                    );
+                    break;
+                }
+            }
+
             // Comparing a cheap summary avoids waking every client once a
             // second for a daemon that is not doing anything.
             let fp = fingerprint(&s);
-            let idle_due = last_emit.elapsed() >= IDLE_TICK;
+            let idle_due = last_emit.is_none_or(|at| at.elapsed() >= IDLE_TICK);
             if fp == last_fingerprint && !idle_due {
                 continue;
             }
             last_fingerprint = fp;
-            last_emit = std::time::Instant::now();
+            last_emit = Some(std::time::Instant::now());
 
             let mut event = Event::new(ServerEvent::Tick {
                 fingerprint: format!("{fp:016x}"),
