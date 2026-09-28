@@ -1390,12 +1390,16 @@ void fill_tracker_entry(lt_tracker_entry& out, const lt::announce_entry& ae) {
     const lt::announce_infohash* any_error = nullptr;
     std::uint32_t max_fails = 0;
     bool updating = false;
+    bool working = false;
     for (auto const& ep : ae.endpoints) {
         if (!ep.enabled) continue;
         for (auto const v : {lt::protocol_version::V1, lt::protocol_version::V2}) {
             auto const& ih = ep.info_hashes[v];
             updating = updating || ih.updating;
             max_fails = std::max<std::uint32_t>(max_fails, ih.fails);
+            // start_sent is set only once the tracker acknowledged the
+            // `started` announce; a pair never announced has fails == 0 too.
+            working = working || (ih.fails == 0 && !ih.last_error && ih.start_sent);
             if (!ih.message.empty()) any_message = &ih;
             if (ih.last_error) any_error = &ih;
             if (!best || ih.min_announce > best->min_announce) best = &ih;
@@ -1403,11 +1407,13 @@ void fill_tracker_entry(lt_tracker_entry& out, const lt::announce_entry& ae) {
     }
     out.updating = updating ? 1 : 0;
     out.fails = max_fails;
+    out.working = working ? 1 : 0;
     if (!best) return;
 
     auto const* msg_src = !best->message.empty() ? best : any_message;
     if (msg_src) copy_utf8_truncated(out.message, LT_MSG_MAX, msg_src->message);
-    auto const* err_src = best->last_error ? best : any_error;
+    // Another pair's error is not the tracker's while one pair works.
+    auto const* err_src = working ? nullptr : best->last_error ? best : any_error;
     if (err_src) copy_utf8_truncated(out.last_error, LT_MSG_MAX, err_src->last_error.message());
     out.next_announce = lt_time_to_unix(best->next_announce);
     out.scrape_complete = best->scrape_complete;

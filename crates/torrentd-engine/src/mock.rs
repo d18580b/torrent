@@ -676,6 +676,7 @@ mod tests {
             tier: 0,
             verified: true,
             updating: false,
+            working: true,
             fails: 0,
             message: None,
             last_error: None,

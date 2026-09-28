@@ -405,7 +405,13 @@ void        lt_torrent_file_list_free(struct lt_torrent_file_list* l);
  * `message`, `last_error`, `next_announce` and the scrape counts come from the
  * endpoint/protocol pair with the most recent announce activity (the latest
  * min_announce, i.e. the latest tracker response or failure), falling back to
- * any pair with a non-empty message / error for those two strings. */
+ * any pair with a non-empty message for `message`.
+ *
+ * `working` is set when any pair's last announce succeeded (no failures since,
+ * no error, and its `started` event was acknowledged). A tracker reached over
+ * one endpoint and failing over another works: it is announcing the torrent.
+ * `last_error` then carries nothing, since the error of another pair is not
+ * the tracker's; with no working pair it falls back to any pair's error. */
 struct lt_tracker_entry {
     char     url[LT_PATH_MAX];
     char     message[LT_MSG_MAX];     /* tracker's last message; "" when none */
@@ -417,7 +423,7 @@ struct lt_tracker_entry {
     uint8_t  tier;
     uint8_t  verified;
     uint8_t  updating;
-    uint8_t  _pad[1];
+    uint8_t  working;
 };
 
 /* A torrent's tracker list, in libtorrent's order (tier-sorted). `entries` is

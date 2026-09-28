@@ -596,7 +596,7 @@ fn trackers_fold_a_failed_announce_into_fails_error_and_next_announce() {
                 c_buf(&e.url),
                 c_buf(&e.last_error),
                 e.next_announce,
-                e.updating,
+                e.working,
             )
         });
         unsafe { lt_tracker_list_free(&mut list) };
@@ -610,9 +610,10 @@ fn trackers_fold_a_failed_announce_into_fails_error_and_next_announce() {
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    let (url, last_error, next_announce, _updating) =
+    let (url, last_error, next_announce, working) =
         failed.expect("an announce to a closed port should fail within 30s");
     assert!(TRACKERS.contains(&url.as_str()), "unexpected url {url}");
+    assert_eq!(working, 0, "no endpoint of a refused tracker works");
     assert!(
         !last_error.is_empty(),
         "a failed announce carries its error"

@@ -1786,10 +1786,12 @@ fn host_matches_domain(host: &str, domain: &str) -> bool {
 
 /// Where a tracker stands.
 ///
-/// Derived in this order: `error` when the last announce failed (an error
-/// text is present, or announces have failed and none has ever succeeded);
-/// otherwise `updating` while an announce is in flight; otherwise `working`
-/// once the tracker has answered an announce; otherwise `not_contacted`.
+/// Derived in this order: `working` when the last announce over any of the
+/// daemon's listen endpoints succeeded, whatever the others report; otherwise
+/// `error` when the last announce failed (an error text is present, or
+/// announces have failed and none has ever succeeded); otherwise `updating`
+/// while an announce is in flight; otherwise `working` once the tracker has
+/// answered an announce; otherwise `not_contacted`.
 #[derive(Clone, Copy, Debug, Schema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackerStatus {
@@ -1805,7 +1807,12 @@ pub enum TrackerStatus {
 
 impl TrackerStatus {
     fn of(t: &torrentd_engine::TrackerEntry) -> Self {
-        if t.last_error.is_some() || (t.fails > 0 && !t.verified) {
+        // One endpoint announcing successfully is the tracker working, even
+        // while another fails: the torrent is announced. `fails` is the worst
+        // endpoint's count, so it cannot say otherwise.
+        if t.working {
+            Self::Working
+        } else if t.last_error.is_some() || (t.fails > 0 && !t.verified) {
             Self::Error
         } else if t.updating {
             Self::Updating
@@ -1987,11 +1994,22 @@ mod tests {
     }
 
     fn tracker(verified: bool, updating: bool, fails: u32, err: Option<&str>) -> TrackerStatus {
+        tracker_with(false, verified, updating, fails, err)
+    }
+
+    fn tracker_with(
+        working: bool,
+        verified: bool,
+        updating: bool,
+        fails: u32,
+        err: Option<&str>,
+    ) -> TrackerStatus {
         TrackerStatus::of(&torrentd_engine::TrackerEntry {
             url: "http://t/a".into(),
             tier: 0,
             verified,
             updating,
+            working,
             fails,
             message: None,
             last_error: err.map(str::to_owned),
@@ -2015,6 +2033,25 @@ mod tests {
         // Failures without an error text: an error only if it never worked.
         assert_eq!(tracker(false, false, 2, None), TrackerStatus::Error);
         assert_eq!(tracker(true, false, 2, None), TrackerStatus::Working);
+    }
+
+    /// One endpoint announcing and another failing is a working tracker. The
+    /// failing endpoint's count is the `fails` the entry carries, and its
+    /// error the text, so without `working` this read as `error`.
+    #[test]
+    fn a_tracker_with_one_working_and_one_failing_endpoint_is_working() {
+        assert_eq!(
+            tracker_with(true, true, false, 3, Some("refused")),
+            TrackerStatus::Working
+        );
+        assert_eq!(
+            tracker_with(true, false, true, 3, None),
+            TrackerStatus::Working
+        );
+        assert_eq!(
+            tracker_with(false, true, false, 3, Some("refused")),
+            TrackerStatus::Error
+        );
     }
 
     #[test]

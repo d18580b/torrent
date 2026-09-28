@@ -985,6 +985,7 @@ async fn trackers(h: &Harness, e: &Engines) {
         tier,
         verified: false,
         updating: false,
+        working: false,
         fails: 0,
         message: None,
         last_error: None,
