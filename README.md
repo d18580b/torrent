@@ -463,6 +463,8 @@ build, and the `convco` check over a pull request's commit range.
 ```bash
 mise run check           # fmt + clippy, warnings denied
 mise run test            # unit + in-memory; no libtorrent, no network
+mise run test-fault-injection  # the same, in the alert drill's fault-injection build
+mise run deny            # cargo-deny: advisories, licenses, bans, sources
 mise run test-shim       # Layer 2: the C ABI boundary
 mise run test-lifecycle  # Layer 3: real libtorrent against real disk
 mise run test-daemon     # Layer 3: spawns the binary, drives it over HTTP
