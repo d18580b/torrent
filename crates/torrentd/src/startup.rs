@@ -2780,6 +2780,79 @@ mod tests {
         );
     }
 
+    /// `boot` hands one `ListenEvents` to both the port-forward monitor and
+    /// the alert loop.
+    ///
+    /// A rebind is confirmed only against outcomes the alert loop publishes.
+    /// If the monitor waited on a different stream, or the loop were built
+    /// without `.listen_events(...)`, no stream the monitor reads would ever
+    /// be attached, and every port change would be deferred as
+    /// `RebindFailure::Unobserved` forever. Every unit test builds the stream
+    /// itself, so none of them would notice. `boot` needs live tunnels to
+    /// run, so this reads its shipped source instead: exactly one stream
+    /// is created there, bound once, cloned into the monitor, and then moved
+    /// into the alert loop.
+    #[test]
+    fn boot_shares_one_listen_stream_between_the_monitor_and_the_alert_loop() {
+        let sources = shipped_crate_sources();
+        let startup = &sources
+            .iter()
+            .find(|(p, _)| p == "startup.rs")
+            .expect("this module")
+            .1;
+        let start = startup
+            .find("pub async fn boot(")
+            .expect("`boot` is defined in this module");
+        let len = startup[start..]
+            .find("\n}\n")
+            .expect("`boot` has a closing brace at column 0");
+        let body = &startup[start..start + len];
+
+        let created = concat!("ListenEvents", "::new()");
+        assert_eq!(
+            body.matches(created).count(),
+            1,
+            "`boot` creates exactly one listen stream",
+        );
+        assert_eq!(
+            body.matches("let listen_events =").count(),
+            1,
+            "the stream is bound once, so both hand-offs name the same one",
+        );
+        assert!(
+            body.contains(&format!(
+                "let listen_events = Arc::new(torrentd_engine::port_forward::{created});"
+            )),
+            "the one binding holds the one stream `boot` creates",
+        );
+
+        let monitor = body
+            .find("crate::port_forward_monitor::run(")
+            .expect("`boot` starts the port-forward monitor");
+        let monitor_args = &body[monitor..monitor + body[monitor..].find(");").expect("call ends")];
+        assert!(
+            monitor_args.contains("listen_events.clone(),"),
+            "the monitor gets a clone of the shared stream; its arguments \
+             were {monitor_args:?}",
+        );
+
+        let handed = body
+            .find(".listen_events(listen_events)")
+            .expect("the alert loop is built with the shared stream");
+        let builder = body
+            .find("AlertLoopBuilder::new(")
+            .expect("`boot` builds the alert loop");
+        let spawned = builder
+            + body[builder..]
+                .find(".spawn();")
+                .expect("the loop is spawned");
+        assert!(
+            builder < handed && handed < spawned && monitor < handed,
+            "the stream is cloned into the monitor first, then moved into \
+             the alert loop's builder before it spawns",
+        );
+    }
+
     /// Every `.rs` under this crate's `src/` with its `#[cfg(test)]` regions
     /// removed — the code that actually ships.
     ///
