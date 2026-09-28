@@ -245,11 +245,15 @@ second copy beside a running service to get a log.
 
 The daemon redacts tracker credentials from its own JSON log before writing
 it, at every level. A URL carrying userinfo (`user:pass@`), a `passkey`,
-`apikey`, `api_key`, `authkey`, `torrent_pass` or `token` query parameter, or
-a path segment of 32 or more letters and digits (a passkey in the path), or
-holding such a URL nested unencoded inside it, is logged as its scheme and
-host plus a marker, e.g.
-`https://tracker.example/[redacted:1a2b3c4d]`. The marker is a short hash of
+`apikey`, `api_key`, `authkey`, `torrent_pass`, `token`, `pid`, `uid`,
+`rsskey` or `pass` query parameter (compared after percent-decoding), or a
+path segment of 32 or more letters and digits (a passkey in the path), or
+holding such a URL nested inside it, unencoded or percent-encoded, is logged
+as its scheme and host plus a marker, e.g.
+`https://tracker.example/[redacted:1a2b3c4d]`. A URL percent-encoded on its
+own (`https%3A%2F%2F…`) is judged by what it decodes to. In libtorrent's own
+log messages, which quote tracker URLs verbatim, every URL is cut at its host
+unless it is a bare `scheme://host/announce`. The marker is a short hash of
 the full URL, stable across runs, so two announce URLs on one host stay
 distinguishable. What remains yours to check before pasting:
 
