@@ -1521,13 +1521,36 @@ fn profile_checks(
     //    an answer the round trip passed. So the route to the probe's own
     //    destination is asserted first, and the round trip is a pass only
     //    over a route that leaves by the tunnel.
+    //
+    //    A destination of the other address family is said to be one before
+    //    anything is asked of `ip`: `ip route get <v6> from <v4>` fails, and
+    //    that failure read as a missing or outranked tunnel rule.
     if let Some(dest) = egress {
-        let route = tunnel_ip.map(|src| host.route_probe(iface, src, dest.ip()));
-        let route_check = judge_route("egress_route", iface, tunnel_ip, dest.ip(), route);
+        let mismatch = tunnel_ip.filter(|src| src.is_ipv4() != dest.ip().is_ipv4());
+        let route_check = match mismatch {
+            Some(src) => Check::fail(
+                "egress_route",
+                format!(
+                    "{dest} is not of the address family of {iface}'s address {src}, so no \
+                     socket bound to the tunnel address can reach it; give --egress a \
+                     destination of {src}'s family"
+                ),
+            ),
+            None => {
+                let route = tunnel_ip.map(|src| host.route_probe(iface, src, dest.ip()));
+                judge_route("egress_route", iface, tunnel_ip, dest.ip(), route)
+            }
+        };
         let routed = route_check.verdict == Verdict::Pass;
         checks.push(route_check);
         checks.push(match tunnel_ip {
             Some(src) if routed => egress_probe(src, dest),
+            Some(src) if mismatch.is_some() => Check::skip(
+                "egress",
+                format!(
+                    "{dest} was not probed: it cannot be reached from {src} (see egress_route)"
+                ),
+            ),
             Some(_) => Check::skip(
                 "egress",
                 format!(
@@ -4103,5 +4126,34 @@ user_agent           = "Transmission/4.0.5"
             "the route is asked for the probe's own destination: {:?}",
             host.events(),
         );
+    }
+
+    /// An IPv6 `--egress` destination from an IPv4 tunnel address is a family
+    /// mismatch, and is reported as one. `ip route get <v6> from <v4>` fails,
+    /// and that failure was reported as a missing or outranked tunnel rule.
+    #[test]
+    fn an_egress_destination_of_the_other_family_is_reported_as_such() {
+        let cfg = cfg_with_profile("");
+        let dest: SocketAddr = "[2001:db8::53]:53".parse().unwrap();
+        let host = FakeHost::new()
+            .with_route(Ok(vpn::route::RouteProbe::Elsewhere(
+                "RTNETLINK answers: Invalid argument".to_string(),
+            )))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, Some(dest), &host);
+        let route = find(&r.checks, "egress_route").expect("the egress route line");
+        assert_eq!(route.verdict, Verdict::Fail, "detail: {}", route.detail);
+        assert!(
+            route.detail.contains("address family") && !route.detail.contains("outranked"),
+            "detail: {}",
+            route.detail,
+        );
+        assert!(
+            !host.events().iter().any(|e| e.ends_with("2001:db8::53")),
+            "no route is asked across families: {:?}",
+            host.events(),
+        );
+        let egress = find(&r.checks, "egress").expect("the egress line");
+        assert_eq!(egress.verdict, Verdict::Skip, "detail: {}", egress.detail);
     }
 }

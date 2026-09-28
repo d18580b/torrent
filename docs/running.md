@@ -1038,6 +1038,8 @@ port to read, and the line says which exemption it had to leave out.
 `--egress` asserts that the route to its destination leaves by the tunnel
 (`egress_route`) before it trusts a reply: a round trip that went out of the
 physical interface proves nothing about the tunnel, so it is not attempted.
+The tunnel address is IPv4, so an IPv6 destination fails `egress_route` as an
+address-family mismatch; give it an IPv4 one.
 
 **Run it as the daemon's user** where you can, so the `wg` probes describe the
 process that will actually run them. The kill-switch pair is the one place
