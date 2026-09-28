@@ -647,9 +647,8 @@ pub async fn boot(
                 .map(|id| format!("'{id}'"))
                 .collect::<Vec<_>>()
                 .join(", ");
-            let delete = format!(
-                "sqlite3 {current} \"DELETE FROM assignment WHERE profile_id IN ({ids})\""
-            );
+            let delete =
+                format!("sqlite3 {current} \"DELETE FROM assignment WHERE profile_id IN ({ids})\"");
             let where_to_edit = if source == current {
                 format!("remove those entries from {current} (`{delete}`)")
             } else {

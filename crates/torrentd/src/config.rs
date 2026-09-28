@@ -217,7 +217,8 @@ const INSTANCE_LOCK_FILE: &str = "torrentd.lock";
 
 /// Whether a configured `registry_path` names a pre-SQLite JSON registry.
 fn is_json(p: &Path) -> bool {
-    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("json"))
+    p.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("json"))
 }
 
 /// How a fingerprint error names the top-level key, which shares its name
@@ -3292,7 +3293,11 @@ upload_rate_limit = 0"#,
         let state = cfg.state_dir();
         assert_eq!(state, dir.path());
         assert_eq!(cfg.registry_path(), state.join("registry.db"));
-        assert_eq!(cfg.registry_import(), None, "nothing on disk, nothing to import");
+        assert_eq!(
+            cfg.registry_import(),
+            None,
+            "nothing on disk, nothing to import"
+        );
 
         fs::write(state.join("slot_assignments.json"), "{}").unwrap();
         assert_eq!(

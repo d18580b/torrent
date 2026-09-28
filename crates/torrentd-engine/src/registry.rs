@@ -222,7 +222,10 @@ impl AssignmentRegistry {
     /// The JSON file is read and validated before the database is touched, so
     /// a file that fails to parse or names an unusable id leaves nothing
     /// created and nothing renamed.
-    pub fn open(path: impl Into<PathBuf>, import: Option<JsonImport>) -> Result<Self, RegistryError> {
+    pub fn open(
+        path: impl Into<PathBuf>,
+        import: Option<JsonImport>,
+    ) -> Result<Self, RegistryError> {
         let path = path.into();
         let parsed = match &import {
             Some(i) => Some(Self::read_json(i, &path)?),
@@ -530,7 +533,6 @@ impl AssignmentRegistry {
             visit(ih, profile);
         }
     }
-
 }
 
 /// Open the database, creating it and its schema where absent.
@@ -546,7 +548,8 @@ fn open_db(path: &Path) -> Result<Connection, RegistryError> {
     // WAL: a commit appends to the log rather than rewriting pages in place,
     // so a process killed mid-write leaves the last committed state intact and
     // readable, and the next open replays or discards the tail.
-    conn.pragma_update(None, "journal_mode", "WAL").map_err(db)?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(db)?;
     // NORMAL, not FULL. Under WAL a commit that has returned survives the
     // process being killed at any instant — the log is in the OS page cache
     // and the next open replays it — which is the failure a daemon under
@@ -824,7 +827,11 @@ mod tests {
         assert_eq!(r.len(), 1);
         assert!(!file.exists());
         assert!(
-            imported(&file).exists() && dir.path().join("profile_assignments.json.imported.1").exists(),
+            imported(&file).exists()
+                && dir
+                    .path()
+                    .join("profile_assignments.json.imported.1")
+                    .exists(),
             "the earlier copy is not overwritten",
         );
     }
@@ -850,7 +857,10 @@ mod tests {
                 if in_db.as_str() == "live" && in_file.as_str() == "stale"),
             "{err:?}",
         );
-        assert!(file.exists(), "a refused import leaves the file where it was");
+        assert!(
+            file.exists(),
+            "a refused import leaves the file where it was"
+        );
         let r = AssignmentRegistry::open(&db, None).unwrap();
         assert_eq!(r.len(), 1, "and imports none of it");
     }
@@ -913,7 +923,10 @@ mod tests {
             !current.exists(),
             "nothing is created until the old file loads",
         );
-        assert!(legacy.exists(), "and the file to edit is still where it was");
+        assert!(
+            legacy.exists(),
+            "and the file to edit is still where it was"
+        );
     }
 
     #[test]
@@ -1008,7 +1021,11 @@ mod tests {
 
         let fresh = InfoHash([0x02; 20]);
         assert!(r.assign(fresh, ProfileId::new("a")).is_err());
-        assert_eq!(r.lookup(&fresh), None, "an assign that failed claims nothing");
+        assert_eq!(
+            r.lookup(&fresh),
+            None,
+            "an assign that failed claims nothing"
+        );
 
         assert!(r.remove(&kept).is_err());
         assert_eq!(
@@ -1051,7 +1068,10 @@ mod tests {
             .map(|h| h.join().unwrap())
             .filter(|won| *won)
             .count();
-        assert_eq!(winners, 1, "one claim on an infohash wins, the rest conflict");
+        assert_eq!(
+            winners, 1,
+            "one claim on an infohash wins, the rest conflict"
+        );
         let total = (THREADS * PER) as usize + 1;
         assert_eq!(r.len(), total);
         drop(r);
@@ -1238,8 +1258,8 @@ mod tests {
         )
         .unwrap();
 
-        let r = AssignmentRegistry::open(dir.path().join("registry.db"), json(&legacy, true))
-            .unwrap();
+        let r =
+            AssignmentRegistry::open(dir.path().join("registry.db"), json(&legacy, true)).unwrap();
 
         let configured: HashSet<ProfileId> = [ProfileId::new("public")].into_iter().collect();
         assert_eq!(r.unknown_profiles(&configured).get("default"), Some(&1));
