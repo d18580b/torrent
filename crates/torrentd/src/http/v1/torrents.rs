@@ -780,43 +780,24 @@ pub async fn add_torrent(
             Some(bytes),
         ),
     };
-    let adder = Arc::clone(&engine);
-    let handle = match blocking(move || adder.add_torrent(params)).await {
-        Ok(handle) => handle,
-        Err(e) => {
-            // Release the claim so the add can be retried. A release that
-            // fails to persist comes back from the file at the next restart as
-            // a claim on a torrent no session holds.
-            if let Err(re) = s.registry.remove(&infohash) {
-                warn!(
-                    infohash = %infohash,
-                    error.cause = %re,
-                    "could not release the claim of a torrent whose add failed",
-                );
-                s.metrics
-                    .inc_counter("store_write_errors_total", &[("store", "registry")]);
-            }
-            return Err(AddTorrentError::Internal {
-                detail: internal("adding the torrent to its session", e),
-            });
-        }
-    };
-
-    // Persist the .torrent so the startup inventory scan can recover it if
-    // resume data is ever lost.
-    if let Some(bytes) = torrent_bytes {
-        if let Err(e) = s.torrents.write(&profile_id, &infohash, &bytes) {
-            warn!(
-                infohash = %infohash,
-                error.cause = %e,
-                "failed to persist .torrent file",
-            );
-            s.metrics.inc_counter(
-                "torrent_file_persist_errors_total",
-                &[("profile_id", profile_id.as_str()), ("source", "api")],
-            );
-        }
-    }
+    // The await is a cancellation point: a client that disconnects drops this
+    // handler while the blocking task runs on. What must follow the engine
+    // call therefore runs inside that task, not after the await.
+    let (adder, settler, owner) = (Arc::clone(&engine), Arc::clone(&s), profile_id.clone());
+    let handle = blocking(move || {
+        add_and_settle(
+            &settler,
+            adder.as_ref(),
+            params,
+            infohash,
+            &owner,
+            torrent_bytes,
+        )
+    })
+    .await
+    .map_err(|e| AddTorrentError::Internal {
+        detail: internal("adding the torrent to its session", e),
+    })?;
 
     // The state map learns of the torrent only with its `AddTorrent` alert,
     // so the details come from the handle the session just returned.
@@ -843,6 +824,57 @@ pub async fn add_torrent(
         ),
         Json(torrent),
     ))
+}
+
+/// Hand `params` to the session, then settle the claim on `infohash` either
+/// way: release it when the add failed, persist the `.torrent` when it
+/// succeeded.
+///
+/// Blocking, and called from inside the blocking task so that it completes
+/// when the request that started it is dropped mid-add.
+fn add_and_settle(
+    s: &AppState,
+    engine: &dyn TorrentEngine,
+    params: AddParams,
+    infohash: InfoHash,
+    profile_id: &ProfileId,
+    torrent_bytes: Option<Vec<u8>>,
+) -> Result<torrentd_engine::TorrentHandle, EngineError> {
+    let handle = match engine.add_torrent(params) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // Release the claim so the add can be retried. A release that
+            // fails to persist comes back from the file at the next restart as
+            // a claim on a torrent no session holds.
+            if let Err(re) = s.registry.remove(&infohash) {
+                warn!(
+                    infohash = %infohash,
+                    error.cause = %re,
+                    "could not release the claim of a torrent whose add failed",
+                );
+                s.metrics
+                    .inc_counter("store_write_errors_total", &[("store", "registry")]);
+            }
+            return Err(e);
+        }
+    };
+
+    // Persist the .torrent so the startup inventory scan can recover it if
+    // resume data is ever lost.
+    if let Some(bytes) = torrent_bytes {
+        if let Err(e) = s.torrents.write(profile_id, &infohash, &bytes) {
+            warn!(
+                infohash = %infohash,
+                error.cause = %e,
+                "failed to persist .torrent file",
+            );
+            s.metrics.inc_counter(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile_id.as_str()), ("source", "api")],
+            );
+        }
+    }
+    Ok(handle)
 }
 
 /// Read a `.torrent` the caller named by path on the daemon's own filesystem.
@@ -984,11 +1016,21 @@ pub async fn delete_torrent(
     // until the alert lands, so the delete is refused as a conflict to retry.
     match s.state.get(&ih) {
         Some(st) => {
-            blocking(move || engine.remove_torrent(st.handle, delete_files))
-                .await
-                .map_err(|e| DeleteTorrentError::Internal {
-                    detail: internal("removing the torrent from its session", e),
-                })?;
+            // The await is a cancellation point: a client that disconnects
+            // drops this handler while the blocking task runs on. A removal
+            // whose assignment clear ran after the await would leave the
+            // infohash assigned to a torrent no session holds, and every later
+            // delete a `409 torrent-adding`, so the clear runs in the task.
+            let settler = Arc::clone(&s);
+            blocking(move || {
+                engine
+                    .remove_torrent(st.handle, delete_files)
+                    .map_err(|e| DeleteTorrentError::Internal {
+                        detail: internal("removing the torrent from its session", e),
+                    })?;
+                clear_assignment(&settler, &ih)
+            })
+            .await?;
         }
         None if s.unloaded_at_boot.lock().contains(&ih) => {
             warn!(
@@ -998,9 +1040,15 @@ pub async fn delete_torrent(
                 "no session holds an info-hash the registry still assigns; the startup \
                  scans did not load it, so clearing the assignment alone",
             );
+            clear_assignment(&s, &ih)?;
         }
         None => return Err(DeleteTorrentError::TorrentAdding),
     }
+    Ok(NoContent)
+}
+
+/// Clear `ih`'s assignment once no session holds it.
+fn clear_assignment(s: &AppState, ih: &InfoHash) -> Result<(), DeleteTorrentError> {
     // Report a persist failure rather than discarding it. On a full or
     // read-only state directory the payload is gone and the assignment write
     // fails, and a 204 here would say the delete succeeded — so the claim
@@ -1009,7 +1057,7 @@ pub async fn delete_torrent(
     // the session has already happened, which the detail says, so a retry is
     // about the assignment alone.
     s.registry
-        .remove(&ih)
+        .remove(ih)
         .map_err(|e| DeleteTorrentError::Internal {
             detail: format!(
                 "{} The torrent was removed from its session; retry the delete to clear the \
@@ -1019,8 +1067,8 @@ pub async fn delete_torrent(
         })?;
     // Cleared, so a later add of the same info-hash is this process's own
     // and must not be mistaken for one the boot left unloaded.
-    s.unloaded_at_boot.lock().remove(&ih);
-    Ok(NoContent)
+    s.unloaded_at_boot.lock().remove(ih);
+    Ok(())
 }
 
 /// Remove a torrent whose profile has no live session.

@@ -3,6 +3,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::Instant;
 
 use base64::engine::general_purpose::STANDARD;
@@ -13,6 +14,7 @@ use serde_json::json;
 use serde_json::Value;
 use torrentd_engine::AssignmentRegistry;
 use torrentd_engine::EngineError;
+use torrentd_engine::HeldCall;
 use torrentd_engine::InfoHash;
 use torrentd_engine::MockEngine;
 use torrentd_engine::ProfileId;
@@ -1247,6 +1249,77 @@ async fn a_delete_that_cannot_clear_the_assignment_says_so_rather_than_answering
         .calls()
         .iter()
         .any(|c| matches!(c, RecordedCall::RemoveTorrent { .. })));
+}
+
+/// Wait, up to ten seconds, for `cond` to hold.
+async fn eventually(what: &str, cond: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !cond() {
+        assert!(Instant::now() < deadline, "never happened: {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Start `req`, wait until `held` is reached, then drop `req` as a client
+/// that disconnects would, and let the held engine call go on.
+async fn drop_mid_call(req: impl std::future::Future<Output = TestResponse>, held: HeldCall) {
+    let entered = tokio::task::spawn_blocking(move || {
+        held.wait_entered();
+        held
+    });
+    let held = tokio::select! {
+        _ = req => panic!("the request answered while its engine call was held"),
+        held = entered => held.unwrap(),
+    };
+    held.release();
+}
+
+#[tokio::test]
+async fn an_add_dropped_mid_call_still_releases_the_claim_when_the_add_fails() {
+    // The claim is taken before the engine call; a handler dropped at the
+    // await would never reach the release, and the infohash would read as
+    // `torrent-exists` until a restart.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p)
+    });
+    let engine = engine.unwrap();
+    let ih = InfoHash([1; 20]); // MAGNET's btih
+    engine.inject_error("add_torrent", injected("add_torrent"));
+    let held = engine.hold_next("add_torrent");
+    drop_mid_call(h.write_json("POST", "/v1/torrents", magnet("p")), held).await;
+    eventually("the failed add's claim is released", || {
+        h.state.registry.lookup(&ih).is_none()
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn a_delete_dropped_mid_call_still_clears_the_assignment() {
+    // The torrent leaves its session whatever happens to the request; were
+    // the assignment cleared only after the await, it would stay on a torrent
+    // no session holds, and every later delete answer `409 torrent-adding`.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p)
+    });
+    let engine = engine.unwrap();
+    let held = engine.hold_next("remove_torrent");
+    drop_mid_call(
+        h.write("DELETE", &format!("/v1/torrents/{}", hex(LOADED))),
+        held,
+    )
+    .await;
+    eventually("the removed torrent's assignment is cleared", || {
+        h.state.registry.lookup(&LOADED).is_none()
+    })
+    .await;
+    let resp = h
+        .write("DELETE", &format!("/v1/torrents/{}", hex(LOADED)))
+        .await;
+    assert_problem(&resp, 404, "torrent-not-found");
 }
 
 #[tokio::test]

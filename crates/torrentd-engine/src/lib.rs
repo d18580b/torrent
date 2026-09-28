@@ -58,6 +58,7 @@ pub use libtorrent_safe::TrackerEntry;
 pub use metrics::MetricsSink;
 pub use metrics::NoopSink;
 pub use metrics::RecordingSink;
+pub use mock::HeldCall;
 pub use mock::MockEngine;
 pub use mock::RecordedCall;
 pub use policy::discovery_guards;

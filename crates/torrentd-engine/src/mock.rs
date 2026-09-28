@@ -15,6 +15,8 @@
 //!   - Fault injection beyond errors: `inject_panic(op)` makes the next call
 //!     to that op panic, and `stall_next_pop(d)` makes the next `pop_alerts`
 //!     block for `d`, which wedges whatever loop is draining it.
+//!   - In-flight calls: `hold_next(op)` parks the next call to that op until
+//!     the test releases it, so a test can act while the call runs.
 //!
 //! The daemon's `fault-injection` build layers one of these over each real
 //! session so an alert drill can queue libtorrent alerts, stall the alert
@@ -26,6 +28,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -186,6 +189,27 @@ impl From<&AddParams> for AddParamsSummary {
     }
 }
 
+/// A call [`MockEngine::hold_next`] parked. Dropping it releases the call.
+#[derive(Debug)]
+pub struct HeldCall {
+    entered: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+}
+
+impl HeldCall {
+    /// Block until the held call has been reached.
+    pub fn wait_entered(&self) {
+        self.entered
+            .recv()
+            .expect("the engine was dropped before the held call was reached");
+    }
+
+    /// Let the held call go on.
+    pub fn release(&self) {
+        let _ = self.release.send(());
+    }
+}
+
 #[derive(Debug)]
 pub struct MockEngine {
     alerts: Mutex<VecDeque<Alert>>,
@@ -197,6 +221,9 @@ pub struct MockEngine {
     panic_inject: DashMap<&'static str, ()>,
     /// How long the next `pop_alerts` blocks before draining.
     stall: Mutex<Option<Duration>>,
+    /// Ops whose next call signals it was reached, then parks until the
+    /// [`HeldCall`] releases it or is dropped.
+    holds: DashMap<&'static str, (mpsc::Sender<()>, Mutex<mpsc::Receiver<()>>)>,
     /// When clear, `calls()` stays empty. On by default.
     recording: AtomicBool,
     /// infohash → handle, so add/remove are consistent across calls.
@@ -233,6 +260,7 @@ impl MockEngine {
             error_inject: DashMap::new(),
             panic_inject: DashMap::new(),
             stall: Mutex::new(None),
+            holds: DashMap::new(),
             recording: AtomicBool::new(true),
             handles: DashMap::new(),
             auto_save_resume: AtomicBool::new(false),
@@ -305,6 +333,19 @@ impl MockEngine {
         *self.stall.lock() = Some(d);
     }
 
+    /// Park the next call to `op` until the returned [`HeldCall`] releases
+    /// it (or is dropped). Takes the same op names as `inject_error`, and is
+    /// taken before them, so a held call can still fail once released.
+    pub fn hold_next(&self, op: &'static str) -> HeldCall {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        self.holds.insert(op, (entered_tx, Mutex::new(release_rx)));
+        HeldCall {
+            entered: entered_rx,
+            release: release_tx,
+        }
+    }
+
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.calls.lock().clone()
     }
@@ -362,6 +403,11 @@ impl MockEngine {
     }
 
     fn check_error(&self, op: &'static str) -> Result<(), EngineError> {
+        if let Some((_, (entered, release))) = self.holds.remove(op) {
+            let _ = entered.send(());
+            // Returns on a release and on a dropped `HeldCall` alike.
+            let _ = release.lock().recv();
+        }
         if self.panic_inject.remove(op).is_some() {
             panic!("mock injected panic on `{op}`");
         }
