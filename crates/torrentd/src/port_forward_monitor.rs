@@ -68,7 +68,8 @@ pub const LEASE_SECS: u32 = 60;
 /// client's ~7.75s retransmit budget), the retry [`RETRY_INTERVAL`] later
 /// finishes by ~51s, and only a second consecutive failure loses the
 /// mapping. At the 45s this used to be, a single failure did. A gateway that
-/// grants a different lease gets half of *that*.
+/// grants a shorter lease gets half of *that*; a longer one does not slow
+/// renewal past this.
 #[cfg(test)]
 const RENEW_INTERVAL: Duration = Duration::from_secs(LEASE_SECS as u64 / 2);
 
@@ -372,7 +373,7 @@ async fn renew_once(
                 "invalid port_forward_gateway; skipping renewal",
             );
             return Next {
-                delay: renew_after(LEASE_SECS),
+                delay: renew_after(LEASE_SECS, LEASE_SECS),
                 rebound_at: None,
             };
         }
@@ -409,7 +410,7 @@ async fn renew_once(
             };
             if record_outcome(e, metrics, o) {
                 Next {
-                    delay: renew_after(lease.unwrap_or(LEASE_SECS)),
+                    delay: renew_after(lease.unwrap_or(LEASE_SECS), LEASE_SECS),
                     rebound_at,
                 }
             } else {
@@ -755,6 +756,17 @@ mod tests {
         )
         .await;
         assert_eq!(next.delay, Duration::from_secs(20));
+
+        // Longer than asked for: still half the requested lease.
+        fwd.push_ok_lifetime(6881, 3600);
+        let next = renew_once(
+            &entry,
+            &RecordingSink::new(),
+            &forwarder(&fwd),
+            BTreeSet::new(),
+        )
+        .await;
+        assert_eq!(next.delay, RENEW_INTERVAL);
     }
 
     #[tokio::test]

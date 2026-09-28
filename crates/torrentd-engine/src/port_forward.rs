@@ -124,13 +124,20 @@ pub struct MapResult {
     pub lifetime_secs: u32,
 }
 
-/// When the next renewal of a lease granted for `lifetime_secs` is due: half
-/// the lease (RFC 6886 §3.3's recommendation), so a renewal that fails still
-/// leaves room for retries before it lapses. Never sooner than
-/// [`MIN_RENEW_AFTER`], so a gateway granting a lease of a second or two
-/// cannot turn the renewal loop into a busy loop.
-pub fn renew_after(lifetime_secs: u32) -> Duration {
-    Duration::from_secs(u64::from(lifetime_secs / 2)).max(MIN_RENEW_AFTER)
+/// When the next renewal of a lease granted for `granted_secs`, having asked
+/// for `requested_secs`, is due: half the lease (RFC 6886 §3.3's
+/// recommendation), so a renewal that fails still leaves room for retries
+/// before it lapses.
+///
+/// Never sooner than [`MIN_RENEW_AFTER`], so a gateway granting a lease of a
+/// second or two cannot turn the renewal loop into a busy loop. Never later
+/// than half the *requested* lease either: the renewal is also how a gateway
+/// reboot (its epoch reset) or a mapping it dropped is noticed, and a
+/// gateway granting an hour would otherwise leave either unseen for half
+/// of one.
+pub fn renew_after(granted_secs: u32, requested_secs: u32) -> Duration {
+    let lease = granted_secs.min(requested_secs);
+    Duration::from_secs(u64::from(lease / 2)).max(MIN_RENEW_AFTER)
 }
 
 /// The floor [`renew_after`] applies.
@@ -597,10 +604,19 @@ mod tests {
     /// a lapse on a gateway granting 40.
     #[test]
     fn a_renewal_is_due_at_half_the_granted_lease() {
-        assert_eq!(renew_after(60), Duration::from_secs(30));
-        assert_eq!(renew_after(40), Duration::from_secs(20));
-        assert_eq!(renew_after(7200), Duration::from_secs(3600));
-        assert_eq!(renew_after(1), MIN_RENEW_AFTER);
+        assert_eq!(renew_after(60, 60), Duration::from_secs(30));
+        assert_eq!(renew_after(40, 60), Duration::from_secs(20));
+        assert_eq!(renew_after(1, 60), MIN_RENEW_AFTER);
+    }
+
+    /// A lease longer than the one requested does not stretch the renewal
+    /// past half the *requested* one. Uncapped, a gateway granting 3600s
+    /// moved renewal from every 30s to every 30min, and a gateway reboot
+    /// (its epoch reset) or a lapsed mapping went unnoticed that long.
+    #[test]
+    fn a_longer_lease_than_requested_does_not_slow_the_renewal() {
+        assert_eq!(renew_after(3600, 60), Duration::from_secs(30));
+        assert_eq!(renew_after(7200, 60), Duration::from_secs(30));
     }
 
     #[test]
