@@ -367,6 +367,7 @@ impl Config {
             .context("[[profile]] validation failed")?;
         self.validate_effective_store_dirs()
             .context("[[profile]] validation failed")?;
+        self.validate_http_listen_port()?;
 
         // Parsed at startup so a malformed CIDR is a config error rather than
         // a proxy that silently stops being trusted. Not gated on
@@ -1112,6 +1113,38 @@ impl Config {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse an `http_listen` port a profile's session also listens on.
+    ///
+    /// libtorrent binds its TCP listen socket before the HTTP listener binds,
+    /// so the collision surfaces as the HTTP bind failing and the daemon
+    /// exiting 70 after it has already brought up every session — or, where
+    /// the addresses happen not to overlap today, as a config that breaks the
+    /// day one of them changes. `--check-config` printed `config OK` for it.
+    ///
+    /// Compared on the port alone, as `ProfileConfig::validate_set` compares
+    /// two profiles' ports and for its reason: a `listen_interfaces` address
+    /// need not be a literal, `0.0.0.0` overlaps every address, and a vpn
+    /// profile binds whatever address its tunnel is given at runtime.
+    /// Refusing a pair that would have bound on disjoint addresses costs one
+    /// port number; accepting a colliding one costs the daemon.
+    fn validate_http_listen_port(&self) -> anyhow::Result<()> {
+        let port = self.http_listen.port();
+        if let Some(p) = self
+            .profile
+            .iter()
+            .find(|p| p.configured_listen_ports().contains(&port))
+        {
+            anyhow::bail!(
+                "http_listen = {} uses port {port}, which [[profile]] id = \"{}\" also \
+                 listens on. The session binds it first and the HTTP API then fails to \
+                 start. Give http_listen a port no profile uses.",
+                self.http_listen,
+                p.id.as_str(),
+            );
         }
         Ok(())
     }
@@ -3553,6 +3586,48 @@ library_dir = "{d}/library"
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("upload_rate_limit"), "got: {msg}");
         assert!(msg.contains("out of range"), "got: {msg}");
+    }
+
+    #[test]
+    fn an_http_listen_port_a_profile_listens_on_is_refused() {
+        let dir = tempdir().unwrap();
+        // A host profile's `listen_interfaces`, on another address.
+        let host = single_session().replace("0.0.0.0:6881", "0.0.0.0:6881,[::]:8080");
+        let msg = format!(
+            "{:#}",
+            Config::load(&write_cfg(dir.path(), &host)).unwrap_err()
+        );
+        assert!(
+            msg.contains("http_listen") && msg.contains("8080"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("\"public\""), "names the profile: {msg}");
+
+        // A vpn profile's static `listen_port`.
+        let mut c = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        c.profile[0] = ProfileConfig {
+            id: torrentd_engine::ProfileId::new("acct_a"),
+            network: torrentd_engine::ProfileNetwork::Vpn {
+                vpn_type: torrentd_engine::VpnType::Wireguard,
+                vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
+                vpn_interface: "wg0".into(),
+                listen_port: Some(8080),
+                port_forward: Default::default(),
+                port_forward_gateway: None,
+            },
+            peer_fingerprint: Some("-AA1000-".into()),
+            user_agent: Some("qB/5.0".into()),
+            resume_dir: None,
+            torrent_dir: None,
+            allowed_tracker_domains: vec![],
+            upload_rate_limit: None,
+        };
+        let msg = format!("{:#}", c.validate_http_listen_port().unwrap_err());
+        assert!(msg.contains("\"acct_a\""), "got: {msg}");
+
+        // Distinct ports are fine.
+        Config::load(&write_cfg(dir.path(), &single_session()))
+            .expect("8080 and 6881 do not collide");
     }
 
     #[test]
