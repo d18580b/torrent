@@ -763,6 +763,22 @@ fn a_config_that_fails_to_load_exits_ex_config() {
 
     let (code, out) = run_to_exit(&p.join("missing.toml"), false, None);
     assert_eq!(code, 78, "a config file that is not there: {out}");
+
+    // An operator subcommand is not the daemon: `vpn check` documents only
+    // 0/1/2, and a config it cannot load is its 1.
+    let status = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["vpn", "check"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn torrentd vpn check");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "vpn check on a config that fails to load"
+    );
 }
 
 /// `--check-config`'s host probe (`nft` present under

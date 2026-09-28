@@ -337,7 +337,15 @@ fn main() -> anyhow::Result<()> {
         eprintln!("error: --config <PATH> is required");
         std::process::exit(2);
     };
-    let cfg = load_config(&cli).unwrap_or_else(|e| refuse_config(&e));
+    // 78 is for the daemon and its pre-flight, the two a unit's
+    // `RestartPreventExitStatus=78` can see. An operator subcommand keeps
+    // exiting 1 for a config it cannot load: its exit statuses are its own
+    // contract (`vpn check` documents 0/1/2), and nothing restarts it.
+    let cfg = match load_config(&cli) {
+        Ok(cfg) => cfg,
+        Err(e) if cli.command.is_some() => return Err(e),
+        Err(e) => refuse_config(&e),
+    };
 
     if cli.check_config {
         if let Err(e) = check_config(&cfg) {

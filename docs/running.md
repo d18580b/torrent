@@ -833,7 +833,9 @@ stalled rather than one that is merely large. The watchdog ping is withheld if
 the alert loop stops advancing, so a wedged daemon gets restarted rather than
 reported healthy.
 
-A refused configuration exits `78` (`EX_CONFIG`), and the unit's
+A configuration the daemon or `--check-config` refuses exits `78`
+(`EX_CONFIG`); an operator subcommand such as `vpn check` keeps its own exit
+statuses and exits `1` for a config it cannot load. The unit's
 `RestartPreventExitStatus=78` leaves it stopped with the reason as the last
 journal line rather than restarting it every five seconds. That directive reads
 only the main process's exit status, so the unit has no `ExecStartPre`
