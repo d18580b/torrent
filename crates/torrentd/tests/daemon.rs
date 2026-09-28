@@ -453,10 +453,12 @@ fn daemon_graceful_shutdown_under_load() {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn a_sigterm_with_a_stream_and_a_stuck_request_open_exits_zero_within_the_bound() {
-    const HTTP: &str = "127.0.0.1:18094";
+    // Ports of its own: the reconciliation test's daemon holds 18094, and a
+    // client that reached it instead held nothing across this one's stop.
+    const HTTP: &str = "127.0.0.1:18101";
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let mut child = spawn_daemon(p, 16894, HTTP);
+    let mut child = spawn_daemon(p, 16901, HTTP);
     wait_healthy(HTTP);
 
     // The events stream, read until its first tick so it is established.
