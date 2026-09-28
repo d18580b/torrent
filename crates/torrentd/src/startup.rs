@@ -178,6 +178,11 @@ struct BootCleanup {
     /// `wg-quick` or `kill`; production always passes `vpn::for_type`.
     vpn_for: VpnFactory,
     tunnels: Vec<(torrentd_engine::VpnType, String)>,
+    /// Every session boot built, closed before any tunnel goes. Dropping
+    /// `boot`'s own handles does not destroy them once the port-forward
+    /// monitor holds the registry, and a session outliving its tunnel is
+    /// sockets bound to an address whose route is about to disappear.
+    sessions: Vec<Arc<dyn TorrentEngine>>,
     kill_switch: bool,
     armed: bool,
 }
@@ -194,6 +199,7 @@ impl std::fmt::Debug for BootCleanup {
         f.debug_struct("BootCleanup")
             .field("run_dir", &self.run_dir)
             .field("tunnels", &self.tunnels)
+            .field("sessions", &self.sessions.len())
             .field("kill_switch", &self.kill_switch)
             .field("armed", &self.armed)
             .finish_non_exhaustive()
@@ -210,6 +216,7 @@ impl BootCleanup {
             run_dir,
             vpn_for,
             tunnels: Vec::new(),
+            sessions: Vec::new(),
             kill_switch: false,
             armed: true,
         }
@@ -225,6 +232,12 @@ impl BootCleanup {
 
     fn note_kill_switch(&mut self) {
         self.kill_switch = true;
+    }
+
+    /// Record the sessions boot built, for the drop guard to close before it
+    /// takes any tunnel down.
+    fn note_sessions(&mut self, sessions: impl IntoIterator<Item = Arc<dyn TorrentEngine>>) {
+        self.sessions.extend(sessions);
     }
 
     /// Bring one tunnel down and stop tracking it — for a profile that failed
@@ -381,10 +394,16 @@ impl Drop for BootCleanup {
         if !self.armed {
             return;
         }
-        // Tunnels before the kill switch, as on a clean shutdown
-        // (`teardown_network`): the switch is what confines the uid to the
-        // tunnels while they go, and removing it first opened the host's own
-        // interface to anything still bound for one.
+        // Sessions, then tunnels, then the kill switch, as on a clean
+        // shutdown (`teardown_network`). The sessions go first because a
+        // session left open while its tunnel goes keeps sockets bound to an
+        // address whose route is disappearing; the switch goes last because
+        // it is what confines the uid to the tunnels while they go, and
+        // removing it first opened the host's own interface to anything
+        // still bound for one.
+        for session in std::mem::take(&mut self.sessions) {
+            session.close();
+        }
         for (t, iface) in std::mem::take(&mut self.tunnels) {
             warn!(vpn_iface = %iface, "boot failed: bringing tunnel down");
             (self.vpn_for)(t, &self.run_dir).bring_down(&iface);
@@ -881,6 +900,10 @@ pub async fn boot(
         .iter()
         .map(|e| (e.config.id.clone(), e.engine.clone()))
         .collect();
+    // From here on something outside `boot` (the port-forward monitor below)
+    // holds the sessions, so a failed boot has to close them itself before
+    // its tunnels go.
+    cleanup.note_sessions(source_entries.iter().map(|(_, e)| Arc::clone(e)));
     let profile_registry =
         Arc::new(ProfileRegistry::new(profile_entries).with_failed(failed_profiles));
     let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(source_entries));
@@ -3674,6 +3697,52 @@ mod tests {
             tunnels < switch,
             "tunnels must come down before the kill switch goes"
         );
+    }
+
+    /// A failed boot closes the sessions it built before any tunnel goes,
+    /// as `teardown_network` does: past the port-forward monitor's start,
+    /// dropping `boot`'s own handles no longer destroys them.
+    #[test]
+    fn a_failed_boot_closes_its_sessions_before_its_tunnels() {
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let engines: Vec<Arc<torrentd_engine::MockEngine>> = (0..2)
+            .map(|_| Arc::new(torrentd_engine::MockEngine::new()))
+            .collect();
+        let vpn = RecordingVpn {
+            log: Arc::clone(&log),
+            engines: engines.clone(),
+        };
+        let mut cleanup = BootCleanup::with_vpn_factory(
+            PathBuf::from("/var/lib/torrentd"),
+            Arc::new(move |_t, _dir| Arc::new(vpn.clone()) as Arc<dyn torrentd_engine::VpnManager>),
+        );
+        cleanup.note_tunnel(VpnType::Wireguard, "wg-a");
+        cleanup.note_sessions(
+            engines
+                .iter()
+                .map(|e| Arc::clone(e) as Arc<dyn TorrentEngine>),
+        );
+
+        drop(cleanup);
+
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec!["tunnel wg-a down (every session closed: true)".to_string()],
+        );
+    }
+
+    /// A disarmed guard closes nothing: the sessions are the shutdown path's.
+    #[test]
+    fn a_disarmed_boot_cleanup_leaves_its_sessions_open() {
+        let engine = Arc::new(torrentd_engine::MockEngine::new());
+        let mut cleanup = cleanup_with(MockVpn::default());
+        cleanup.note_sessions([Arc::clone(&engine) as Arc<dyn TorrentEngine>]);
+        cleanup.disarm();
+        drop(cleanup);
+        assert!(!engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::Close)));
     }
 
     /// And a teardown that panics is warned past rather than taking the rest
