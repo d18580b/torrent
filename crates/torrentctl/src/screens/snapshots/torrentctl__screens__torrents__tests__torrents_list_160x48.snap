@@ -1,0 +1,52 @@
+---
+source: crates/torrentctl/src/screens/torrents.rs
+expression: screen
+---
+╭ torrents ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│29 shown · 29 loaded · more pages   profile all  phase all                                                                                                    │
+│  state        infohash                                 profile                                     done       ↑ rate       ↓ rate peers   uploaded    payload│
+│  ● seeding    01a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%    1.5 MiB/s            —     3    5.0 GiB    4.7 GiB│
+│  ‖ paused     02a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —     6   10.0 GiB    9.3 GiB│
+│› ◐ checking   03a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_b                         ████░░░░░░    42%            —            —     9   15.0 GiB   14.0 GiB│
+│  ✖ errored    04a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    12   20.0 GiB   18.6 GiB│
+│  ✖ disk_error 05a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    15   25.0 GiB   23.3 GiB│
+│  · idle       06a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_b                         ██████████   100%            —            —    18   30.0 GiB   27.9 GiB│
+│  ● seeding    07a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%   10.5 MiB/s            —    21   35.0 GiB   32.6 GiB│
+│  ● seeding    08a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%   12.0 MiB/s            —    24   40.0 GiB   37.3 GiB│
+│  ‖ paused     09a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_b                         ██████████   100%            —            —    27   45.0 GiB   41.9 GiB│
+│  ◐ checking   0aa1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ████░░░░░░    42%            —            —    30   50.0 GiB   46.6 GiB│
+│  ✖ errored    0ba1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    33   55.0 GiB   51.2 GiB│
+│  ✖ disk_error 0ca1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_b                         ██████████   100%            —            —    36   60.0 GiB   55.9 GiB│
+│  · idle       0da1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    39   65.0 GiB   60.5 GiB│
+│  ● seeding    0ea1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%   21.0 MiB/s            —    42   70.0 GiB   65.2 GiB│
+│  ● seeding    0fa1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_b                         ██████████   100%   22.5 MiB/s            —    45   75.0 GiB   69.8 GiB│
+│  ‖ paused     10a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    48   80.0 GiB   74.5 GiB│
+│  ◐ checking   11a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ████░░░░░░    42%            —            —    51   85.0 GiB   79.2 GiB│
+│  ✖ errored    12a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_b                         ██████████   100%            —            —    54   90.0 GiB   83.8 GiB│
+│  ✖ disk_error 13a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    57   95.0 GiB   88.5 GiB│
+│  · idle       14a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    60  100.0 GiB   93.1 GiB│
+│  ● seeding    15a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_b                         ██████████   100%   31.5 MiB/s            —    63  105.0 GiB   97.8 GiB│
+│  ● seeding    16a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%   33.0 MiB/s            —    66  110.0 GiB  102.4 GiB│
+│  ‖ paused     17a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    69  115.0 GiB  107.1 GiB│
+│  ◐ checking   18a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_b                         ████░░░░░░    42%            —            —    72  120.0 GiB  111.8 GiB│
+│  ✖ errored    19a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    75  125.0 GiB  116.4 GiB│
+│  ✖ disk_error 1aa1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%            —            —    78  130.0 GiB  121.1 GiB│
+│  · idle       1ba1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_b                         ██████████   100%            —            —    81  135.0 GiB  125.7 GiB│
+│  ● seeding    1ca1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%   42.0 MiB/s            —    84  140.0 GiB  130.4 GiB│
+│  ● seeding    1da1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4 acct_a                         ██████████   100%   43.5 MiB/s            —    87  145.0 GiB  135.0 GiB│
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

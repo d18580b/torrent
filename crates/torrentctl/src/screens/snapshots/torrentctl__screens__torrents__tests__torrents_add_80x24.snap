@@ -1,0 +1,28 @@
+---
+source: crates/torrentctl/src/screens/torrents.rs
+expression: screen
+---
+╭ torrents ────────────────────────────────────────────────────────────────────╮
+│7 shown · 7 loaded · all loaded   profile all  phase all                      │
+│  state        infohash     profile         done       ↑ rate peers   uploaded│
+│› ● seeding    01a1b2c3d4e5 acct_a          100%    1.5 MiB/s     3    5.0 GiB│
+│  ‖ paused     02a1b2c3d4e5 acct_a          100%            —     6   10.0 GiB│
+│ ╭ Add a torrent ───────────────────────────────────────────────────────────╮B│
+│ │  source      ○ magnet │ ◉ path on server │ ○ local .torrent              │B│
+│ │                                                                          │B│
+│ │▸ server path › /home/op/x.torrent                                        │B│
+│ │              ✖ Refused: the server_path must be inside the daemon's      │B│
+│ │              torrent directory                                           │ │
+│ │  profile     ‹ choose ›  active only: 2 of them                          │ │
+│ │  save path   › /srv/seed/acct_a                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │                                                                          │ │
+│ │↑/↓ field  ←/→ choose  Enter add  Esc cancel                              │ │
+│ ╰──────────────────────────────────────────────────────────────────────────╯ │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

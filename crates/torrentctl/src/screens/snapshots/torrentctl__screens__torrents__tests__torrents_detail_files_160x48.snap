@@ -1,0 +1,52 @@
+---
+source: crates/torrentctl/src/screens/torrents.rs
+expression: screen
+---
+╭ debian-13.1.0-amd64-netinst.iso · 01a1b2c3d4e5 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│ Overview │ Files │ Trackers │ Actions                                                                                                                        │
+│                                                                                                                                                              │
+│3 files loaded                                                                                                                                                │
+│      # path                                                                                                                            size    have priority │
+│      0 debian/debian-13.1.0-amd64-netinst.iso                                                                                     756.0 MiB  100.0% 4 normal │
+│›     1 debian/SHA256SUMS                                                                                                            1.0 KiB   50.0% 7 top    │
+│      2 debian/README.txt                                                                                                                0 B  100.0% 0 skip   │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+╰ ←/→ tab  Esc back  +/- priority  0 skip  = set 0-7 ──────────────────────────────────────────────────────────────────────────────────────────────────────────╯

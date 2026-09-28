@@ -1,0 +1,34 @@
+---
+source: crates/torrentctl/src/screens/login.rs
+expression: screen
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                   ╭ torrentd ──────────────────────────────────────────────╮
+                                                   │                   http://127.0.0.1:9                   │
+                                                   │                                                        │
+                                                   │password › •••••••                                      │
+                                                   │                                                        │
+                                                   │                                                        │
+                                                   │                 Enter sign in  Esc quit                │
+                                                   │                                                        │
+                                                   │                                                        │
+                                                   │                                                        │
+                                                   ╰────────────────────────────────────────────────────────╯

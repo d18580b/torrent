@@ -1,0 +1,28 @@
+---
+source: crates/torrentctl/src/screens/torrents.rs
+expression: screen
+---
+╭ debian-13.1.0-amd64-netinst.iso · 01a1b2c3d4e5 ──────────────────────────────╮
+│ Overview │ Files │ Trackers │ Actions                                        │
+│                                                                              │
+│        infohash  01a1b2c3d4e5a1b2c3d4e5a1b2c3d4e5a1b2c3d4                    │
+│         profile  acct_a                                                      │
+│           phase  ● seeding                                                   │
+│        progress  100.0%                                                      │
+│     upload rate  1.5 MiB/s                                                   │
+│   down╭ Remove torrent and delete files ─────────────────────────────╮       │
+│       │Remove debian-13.1.0-amd64-netinst.iso (01a1b2c3d4e5) and     │       │
+│payload│DELETE its payload from disk? This cannot be undone.          │       │
+│       │                                                              │       │
+│       │Type delete to confirm:                                       │       │
+│       │› del                                                         │       │
+│       │Enter confirm  Esc cancel                                     │       │
+│       │                                                              │       │
+│       ╰──────────────────────────────────────────────────────────────╯       │
+│            size  756.0 MiB                                                   │
+│       save path  /srv/seed/acct_a                                            │
+│    upload limit  2.0 MiB/s                                                   │
+│           added  2026-09-01 08:30 UTC (20d 5h ago)                           │
+│                                                                              │
+│                                                                              │
+╰ ←/→ tab  Esc back  p/r pause/resume  l limit ────────────────────────────────╯

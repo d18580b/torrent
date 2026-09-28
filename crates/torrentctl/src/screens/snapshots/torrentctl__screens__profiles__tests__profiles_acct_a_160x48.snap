@@ -1,0 +1,52 @@
+---
+source: crates/torrentctl/src/screens/profiles.rs
+expression: screen
+---
+╭ profiles (4) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│    profile              status     torrents tunnel          listen forward        user agent                                                                 │
+│▶   acct_a               ● active        900 10.2.0.2             — natpmp :51413  qBittorrent/4.6.2                                                          │
+│  ! acct_b               ✖ vpn_down      334 10.3.0.2         51414 static         default                                                                    │
+│    host                 ● active          1 host              6881 static         default                                                                    │
+│  ! acct_c               ✖ failed         12 —                    — natpmp —       default                                                                    │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ acct_a ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│● active — session up                                                                                                                                         │
+│                                                                                                                                                              │
+│         status  ● active                       allowed trackers                                                                                              │
+│       torrents  900                            · tracker.example.org                                                                                         │
+│      tunnel ip  10.2.0.2                       · announce.example.net                                                                                        │
+│  vpn interface  wg-a                                                                                                                                         │
+│    listen port  —                              actions                                                                                                       │
+│   port forward  natpmp :51413                  p     pause all 900 torrents                                                                                  │
+│ forward health  ● ok                           r     resume all 900 torrents                                                                                 │
+│ paused for vpn  0                              Enter show its torrents                                                                                       │
+│     user agent  qBittorrent/4.6.2                                                                                                                            │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -1,0 +1,52 @@
+---
+source: crates/torrentctl/src/screens/pool/tests.rs
+expression: screen
+---
+ Overview   Tree   Library  [Plans]                                                                                               [ ] views  ● mutations allowed
+╭ plan #8 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│         plan  #8  delete_orphans  ✖ failed  3 steps                                                                                                          │
+│      created  2026-09-27 10:00 UTC   applied —                                                                                                               │
+│confirm token  7f3a-9c21  deletes data: applying asks for this, typed back                                                                                    │
+│   last apply  ✖ failed · 1 done · 1 failed · 0 skipped                                                                                                       │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ steps ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│  seq   op            status         path                                                                                                                     │
+│›     1 delete_file   ● done         stray/old.mkv                                                                                                            │
+│      2 delete_file   ✖ failed       stray/sample.mkv                                                                                                         │
+│                                     ✖ permission denied                                                                                                      │
+│      3 delete_file   ‖ pending      stray/extras/cover.jpg                                                                                                   │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+╰ Esc back  c create  x apply  X discard ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

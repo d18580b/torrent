@@ -1,0 +1,52 @@
+---
+source: crates/torrentctl/src/ui/mod.rs
+expression: screen
+---
+ 1 Dashboard │ 2 Torrents │ 3 Profiles │ 4 Pool                                                                       ● live  token operator  http://127.0.0.1:9
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                           ⠋ loading…
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+R reload config  ? help  q quit

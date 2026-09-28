@@ -1,0 +1,34 @@
+---
+source: crates/torrentctl/src/ui/mod.rs
+expression: screen
+---
+ 1 Dashboard │ 2 Torrents │ 3 Profiles                                        ● live  token operator
+
+                                        ╭──────────────────────────────────────────────────────────╮
+                                        │✖ reloading config: Conflict: a reload is already queued  │
+                                        │(request 01234567)                                        │
+                                        ╰──────────────────────────────────────────────────────────╯
+                                        ╭──────────────────────────────────────────────────────────╮
+                                        │✔ reload queued                                           │
+                                        ╰──────────────────────────────────────────────────────────╯
+
+                    ╭ Dashboard — keys ────────────────────────────────────────╮
+                    │           R  reload config                               │
+                    │                                                          │
+                    │   1-3 / Tab  switch screen                               │
+                    │           :  command                                     │
+                    │           ?  help                                        │
+                    │      Ctrl-r  refresh                                     │
+                    │           q  quit                                        │
+                    │                                                          │
+                    │                     any key to close                     │
+                    ╰──────────────────────────────────────────────────────────╯
+
+
+
+
+
+
+
+
+R reload config  ? help  q quit

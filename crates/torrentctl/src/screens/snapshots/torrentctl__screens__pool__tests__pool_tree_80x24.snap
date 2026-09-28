@@ -1,0 +1,28 @@
+---
+source: crates/torrentctl/src/screens/pool/tests.rs
+expression: screen
+---
+ Overview  [Tree]  Library   Plans                [ ] views  ● mutations allowed
+╭ #1 /srv/pool/a ──────────────────────────────────────────────────────────────╮
+│  name                             total     orphan  claimed by               │
+│› ▸ movies/                    120.0 GiB   10.0 GiB  ● adopted ◐ matched      │
+│  ▸ series/                    120.0 GiB   10.0 GiB  ● adopted ◐ partial ✖ dri│
+│  ▸ stray/                     120.0 GiB  120.0 GiB                           │
+│    readme.nfo                 120.0 GiB   10.0 GiB  ✖ overlap                │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+╰ Enter open  h/⌫ up  o orphans  A adopt this directory ───────────────────────╯

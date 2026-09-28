@@ -202,6 +202,7 @@ jobs:
       # Layer 3: real daemon + libtorrent, driven over HTTP.
       - run: mise run test-lifecycle
       - run: mise run test-daemon
+      - run: mise run test-torrentctl
 
   container:
     name: container image builds

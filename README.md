@@ -33,12 +33,12 @@ which torrents point at data that moved or vanished.
       only from the proxies you name
 - [x] **A `/v1` HTTP API whose OpenAPI 3.2 document is derived from the code**
       that serves it, so the two cannot drift; JSON logs; Prometheus metrics
+- [x] **`torrentctl`, a terminal operator client** on a client generated from
+      the API document: torrents, profiles, the pool and its plans, updated live
 - [ ] **Downloading torrents.** Deliberately absent today; every piece of the
       machinery exists except the policy, and enabling it is a decision about
       what this daemon is, not a missing feature
-- [ ] **An operator client.** A terminal UI on a generated client is in
-      progress ([#68](https://github.com/d18580b/torrent/issues/68)); a web
-      client is deferred ([#40](https://github.com/d18580b/torrent/issues/40))
+- [ ] **A web client.** Deferred ([#40](https://github.com/d18580b/torrent/issues/40))
 - [ ] **Grafana dashboard and alert rules** shipped in `deploy/`
 - [ ] **Sequential streaming, RSS, torrent creation, auto-discovery,
       multi-instance coordination.** Not planned. You tell it what to load.
@@ -172,6 +172,48 @@ substitute for reading `status`, since the first entry is an `active` profile
 only when at least one came up. A client choosing a profile to act on filters
 on `status == "active"` — a failed profile has no session, and every operation
 that needs one answers `409 profile-unavailable` naming the failure reason.
+
+## Operator client
+
+`torrentctl` is a terminal UI for everything an operator does over the API:
+
+- **Torrents.** Browse every torrent, cursor-paged and filterable by profile
+  and phase. Pause, resume, recheck, reannounce or remove one, pause or resume
+  them all, and open one for its files (with priorities), trackers and upload
+  limit.
+- **Adding.** Add a torrent from a magnet, a path on the server, or a local
+  `.torrent` file.
+- **Profiles.** See each profile's tunnel and port-forward health, with a
+  fenced profile distinguished from one that never came up.
+- **The pool.** Browse and scan it, check for drift, verify, adopt with a
+  dry-run preview, and create, review and apply plans.
+
+It refreshes on the daemon's change stream and polls while that stream is
+down.
+
+```bash
+cargo run --release -p torrentctl -- --url http://127.0.0.1:8080
+```
+
+**Authentication.** It takes a static token from `--token-file`, which must
+be mode `0600`, or from `TORRENTCTL_TOKEN`. With neither, it asks for the
+operator password and holds the session token it gets in memory, revoking it
+on quit. The URL and the token file can also go in
+`$XDG_CONFIG_HOME/torrentctl/config.toml` as `url` and `token_file`. It logs
+to `$XDG_STATE_HOME/torrentctl/torrentctl.log`, never to the terminal.
+
+**Keys.** `?` lists the keys on every screen, `1`–`4` switch screens, and `:`
+opens a command line.
+
+**Colour.** Truecolor terminals get the full palette, others 256 colours, and
+`NO_COLOR` none. Every state also carries a symbol, so nothing is carried by
+colour alone.
+
+**The API client is generated, not written.** It talks to the daemon only
+through a client [spargen](https://github.com/getkono/spargen) generates at
+build time from `docs/api/openapi.json`. It is therefore also a second,
+independent consumer of that document: `mise run test-torrentctl` drives the
+generated client against a real daemon.
 
 ## Profiles
 
@@ -424,6 +466,7 @@ mise run test            # unit + in-memory; no libtorrent, no network
 mise run test-shim       # Layer 2: the C ABI boundary
 mise run test-lifecycle  # Layer 3: real libtorrent against real disk
 mise run test-daemon     # Layer 3: spawns the binary, drives it over HTTP
+mise run test-torrentctl # Layer 3: torrentctl's generated client against the daemon
 mise run openapi         # regenerate docs/api/openapi.json after an API change
 mise run openapi-check   # fail if the committed document is stale
 mise run test-all        # all of the above

@@ -7,7 +7,7 @@
 #   mise install         # provision the tools below
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|lint|test|check
-#   mise run test-shim|test-lifecycle|test-daemon|test-all|test-alerts
+#   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-all|test-alerts
 #   mise run openapi|openapi-check|check-fault-injection
 #   mise run bench -- <subcommand>
 
@@ -62,6 +62,16 @@ run = "cargo test -p torrentd-engine --test lifecycle -- --ignored"
 description = "Layer 3: spawns the built binary and drives it over HTTP"
 run = "cargo test -p torrentd --test daemon -- --ignored"
 
+# The spargen-generated client torrentctl is built on, against a real daemon:
+# the other half of the contract, a second tool's reading of the document held
+# to the handlers. It spawns target/debug/torrentd, so builds it first.
+[tasks.test-torrentctl]
+description = "Layer 3: torrentctl's generated client against a spawned daemon"
+run = [
+  "cargo build -p torrentd",
+  "cargo test -p torrentctl --test e2e -- --ignored",
+]
+
 [tasks.test-alerts]
 description = "promtool: check deploy/prometheus's alert rules and run their fixtures (needs podman or docker)"
 # In a container rather than as a [tools] entry: promtool ships only inside the
@@ -95,6 +105,7 @@ run = [
   "mise run test-shim",
   "mise run test-lifecycle",
   "mise run test-daemon",
+  "mise run test-torrentctl",
   "mise run test-alerts",
 ]
 

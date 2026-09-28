@@ -1,0 +1,28 @@
+---
+source: crates/torrentctl/src/screens/torrents.rs
+expression: screen
+---
+╭ torrents ────────────────────────────────────────────────────────────────────╮
+│29 shown · 29 loaded · more pages   profile all  phase all                    │
+│  state        infohash     profile         done       ↑ rate peers   uploaded│
+│  ● seeding    01a1b2c3d4e5 acct_a          100%    1.5 MiB/s     3    5.0 GiB│
+│  ‖ paused     02a1b2c3d4e5 acct_a          100%            —     6   10.0 GiB│
+│› ◐ checking   03a1b2c3d4e5 acct_b           42%            —     9   15.0 GiB│
+│  ✖ errored    04a1b2c3d4e5 acct_a          100%            —    12   20.0 GiB│
+│  ✖ disk_error 05a1b2c3d4e5 acct_a          100%            —    15   25.0 GiB│
+│  · idle       06a1b2c3d4e5 acct_b          100%            —    18   30.0 GiB│
+│  ● seeding    07a1b2c3d4e5 acct_a          100%   10.5 MiB/s    21   35.0 GiB│
+│  ● seeding    08a1b2c3d4e5 acct_a          100%   12.0 MiB/s    24   40.0 GiB│
+│  ‖ paused     09a1b2c3d4e5 acct_b          100%            —    27   45.0 GiB│
+│  ◐ checking   0aa1b2c3d4e5 acct_a           42%            —    30   50.0 GiB│
+│  ✖ errored    0ba1b2c3d4e5 acct_a          100%            —    33   55.0 GiB│
+│  ✖ disk_error 0ca1b2c3d4e5 acct_b          100%            —    36   60.0 GiB│
+│  · idle       0da1b2c3d4e5 acct_a          100%            —    39   65.0 GiB│
+│  ● seeding    0ea1b2c3d4e5 acct_a          100%   21.0 MiB/s    42   70.0 GiB│
+│  ● seeding    0fa1b2c3d4e5 acct_b          100%   22.5 MiB/s    45   75.0 GiB│
+│  ‖ paused     10a1b2c3d4e5 acct_a          100%            —    48   80.0 GiB│
+│  ◐ checking   11a1b2c3d4e5 acct_a           42%            —    51   85.0 GiB│
+│  ✖ errored    12a1b2c3d4e5 acct_b          100%            —    54   90.0 GiB│
+│  ✖ disk_error 13a1b2c3d4e5 acct_a          100%            —    57   95.0 GiB│
+│  · idle       14a1b2c3d4e5 acct_a          100%            —    60  100.0 GiB│
+╰──────────────────────────────────────────────────────────────────────────────╯
