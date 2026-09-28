@@ -25,14 +25,31 @@ use crate::profile::ProfileConfig;
 ///
 /// `upload_mode` is what actually holds — "the torrent will not make any piece
 /// requests" — and libtorrent only takes a torrent out of it on its own when
-/// the torrent is `auto_managed`, which this daemon never sets (the shim's
-/// `build_torrent_flags` starts from `update_subscribe | duplicate_is_error`).
+/// the torrent is `auto_managed`. This daemon never sets that bit, but resume
+/// data can carry it: a `.fastresume` written by qBittorrent or Deluge has
+/// `auto_managed=1`, and libtorrent then lifts upload mode after
+/// `optimistic_disk_retry`. So [`forbidden`] is cleared on every path that
+/// starts from resume data, and the shim clears it, and sets `UPLOAD_MODE`,
+/// on every add whatever the caller passes.
 ///
 /// Magnet *metadata* is not a piece request, so metadata still arrives: the
 /// daemon can still learn what a magnet describes, which is the one thing it
 /// has always claimed to fetch.
 fn no_download() -> TorrentFlags {
     TorrentFlags::UPLOAD_MODE
+}
+
+/// Flags no torrent this daemon adds may carry: each can take a torrent out of
+/// upload mode (`AUTO_MANAGED`), request pieces by design (`SHARE_MODE`), or
+/// is a downloading client's knob with no meaning for a torrent that never
+/// leaves upload mode. The shim enforces the same set on every add; stating it
+/// here keeps each add path's intent readable and testable without libtorrent.
+pub fn forbidden() -> TorrentFlags {
+    TorrentFlags::AUTO_MANAGED
+        | TorrentFlags::SHARE_MODE
+        | TorrentFlags::SUPER_SEEDING
+        | TorrentFlags::SEQUENTIAL_DOWNLOAD
+        | TorrentFlags::STOP_WHEN_READY
 }
 
 /// Per-torrent discovery guards for a torrent living in `profile`.
@@ -77,6 +94,14 @@ pub fn verify_flags(profile: &ProfileConfig) -> TorrentFlags {
 /// without it.
 pub fn resume_flags_set(profile: &ProfileConfig) -> TorrentFlags {
     no_download() | discovery_guards(profile)
+}
+
+/// Flags cleared when loading resume data: everything [`forbidden`], which
+/// resume data written by another client (or by this one, before the guard)
+/// may carry. A caller adds what it clears for its own reasons, such as
+/// `PAUSED`.
+pub fn resume_flags_clear() -> TorrentFlags {
+    forbidden()
 }
 
 #[cfg(test)]
@@ -135,6 +160,21 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn no_path_sets_a_forbidden_flag_and_resume_clears_them_all() {
+        for p in [host(), vpn()] {
+            for flags in [seed_flags(&p), verify_flags(&p), resume_flags_set(&p)] {
+                assert!(
+                    !flags.intersects(forbidden()),
+                    "{flags:?} sets a forbidden flag"
+                );
+            }
+        }
+        assert!(resume_flags_clear().contains(forbidden()));
+        assert!(forbidden().contains(TorrentFlags::AUTO_MANAGED));
+        assert!(!forbidden().contains(TorrentFlags::UPLOAD_MODE));
     }
 
     #[test]

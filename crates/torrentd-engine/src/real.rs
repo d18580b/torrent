@@ -27,6 +27,15 @@ use tracing::instrument;
 use crate::engine::EngineError;
 use crate::engine::TorrentEngine;
 
+/// The most alerts one `pop_alerts` converts while holding the session lock.
+///
+/// Every engine call takes that lock, the HTTP handlers' included, so an
+/// uncapped drain — up to the whole `alert_queue_size` of 10000, each alert a
+/// ~3 KiB union to convert — stalls every one of them behind it. The alert
+/// loop drains again at once while a pop comes back non-empty, so a cap costs
+/// no throughput; it only lets other callers in between batches.
+pub const MAX_ALERTS_PER_POP: usize = 512;
+
 pub struct RealEngine {
     session: Mutex<Session>,
 }
@@ -121,7 +130,7 @@ impl TorrentEngine for RealEngine {
     }
 
     fn pop_alerts(&self) -> Vec<Alert> {
-        self.session.lock().drain_alerts()
+        self.session.lock().drain_alerts_up_to(MAX_ALERTS_PER_POP)
     }
 
     fn post_updates(&self) {
@@ -147,7 +156,10 @@ impl TorrentEngine for RealEngine {
 
     #[instrument(skip_all, fields(op = "torrent_files", infohash = %h.infohash))]
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
-        Ok(self.session.lock().torrent_files(h)?)
+        // The session lock covers the shim call only. Converting the list
+        // copies every path, up to 250k of them, and needs no session.
+        let raw = self.session.lock().torrent_files_raw(h)?;
+        Ok(raw.into_files())
     }
 
     #[instrument(skip_all, fields(op = "torrent_trackers", infohash = %h.infohash))]

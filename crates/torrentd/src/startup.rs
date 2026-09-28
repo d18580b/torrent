@@ -34,7 +34,6 @@ use torrentd_engine::ShutdownReason;
 use torrentd_engine::StateMap;
 use torrentd_engine::SystemClock;
 use torrentd_engine::TorrentEngine;
-use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentStore;
 use tracing::error;
 use tracing::info;
@@ -894,15 +893,7 @@ pub async fn boot(
             // mistake that ends an account. A pool that comes back paused is
             // visible in `/status` and fixed with `resume-all`; a pool that
             // comes back seeding when it was told not to is not recoverable.
-            let flags_set = torrentd_engine::resume_flags_set(profile_cfg);
-            let flags_clear = TorrentFlags::empty();
-            match engine.add_torrent(AddParams::Resume {
-                bytes: data.into_inner(),
-                torrent,
-                save_path: None,
-                flags_set,
-                flags_clear,
-            }) {
+            match engine.add_torrent(resume_scan_params(profile_cfg, data.into_inner(), torrent)) {
                 Ok(_) => {
                     added_from_resume += 1;
                     loaded.insert(ih);
@@ -965,12 +956,11 @@ pub async fn boot(
                 );
                 continue;
             }
-            let flags = torrentd_engine::seed_flags(profile_cfg);
-            match engine.add_torrent(AddParams::File {
+            match engine.add_torrent(torrent_dir_scan_params(
+                profile_cfg,
                 bytes,
-                save_path: scan_save_path.clone(),
-                flags,
-            }) {
+                scan_save_path.clone(),
+            )) {
                 Ok(_) => {
                     added += 1;
                     loaded.insert(ih);
@@ -1211,6 +1201,56 @@ pub async fn boot(
     })
 }
 
+/// The settings a profile's session is built with: the config's, plus whether
+/// libtorrent posts its log alerts at all.
+///
+/// Those alerts are the bulk of libtorrent's alert traffic and feed only
+/// `handlers::log_msg`'s debug lines, so a session subscribes to them only
+/// when that target is at debug as the daemon starts. Raising the level at
+/// runtime does not subscribe a running session.
+fn session_settings(cfg: &Config) -> torrentd_engine::Settings {
+    let mut s = cfg.libtorrent_settings();
+    s.alert_logs = Some(tracing::enabled!(
+        target: "torrentd_engine::handler::log",
+        tracing::Level::DEBUG
+    ));
+    s
+}
+
+/// What the boot resume scan hands a session for one saved torrent.
+///
+/// Its flags are `torrentd_engine::policy`'s: the no-download guards are
+/// re-asserted, and every flag that could lift upload mode is cleared from
+/// whatever the resume data carried, since it may have been written by another
+/// client.
+fn resume_scan_params(
+    profile: &ProfileConfig,
+    resume: Vec<u8>,
+    torrent: Option<Vec<u8>>,
+) -> AddParams {
+    AddParams::Resume {
+        bytes: resume,
+        torrent,
+        save_path: None,
+        flags_set: torrentd_engine::resume_flags_set(profile),
+        flags_clear: torrentd_engine::resume_flags_clear(),
+    }
+}
+
+/// What the boot torrent-dir scan hands a session for a `.torrent` no resume
+/// data covered.
+fn torrent_dir_scan_params(
+    profile: &ProfileConfig,
+    bytes: Vec<u8>,
+    save_path: String,
+) -> AddParams {
+    AddParams::File {
+        bytes,
+        save_path,
+        flags: torrentd_engine::seed_flags(profile),
+    }
+}
+
 /// The production engine factory for [`build_profiles`]: a real libtorrent
 /// session, restored from `state` where a host profile with DHT kept one.
 fn real_engine(
@@ -1305,7 +1345,7 @@ where
 
         match build_profile(
             p,
-            cfg.libtorrent_settings(),
+            session_settings(cfg),
             &cfg.session_state_path(&p.id),
             cleanup,
             forwarder,
@@ -3719,5 +3759,34 @@ mod profile_construction_tests {
             vpn.bring_up_calls().is_empty(),
             "no tunnel is raised after the shutdown",
         );
+    }
+
+    /// Both boot scans hand the session an add that keeps the torrent in
+    /// upload mode and clears every flag resume data could carry to lift it.
+    #[test]
+    fn both_boot_scans_forbid_downloading() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[host("public", true), vpn("a", "wg-a", 1)]);
+        for p in &cfg.profile {
+            let engine = MockEngine::new();
+            engine
+                .add_torrent(resume_scan_params(p, vec![1; 32], None))
+                .unwrap();
+            engine
+                .add_torrent(torrent_dir_scan_params(p, vec![2; 32], "/data".into()))
+                .unwrap();
+            let adds: Vec<_> = engine
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    torrentd_engine::RecordedCall::AddTorrent(a) => Some(a),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(adds.len(), 2);
+            for a in adds {
+                assert!(a.forbids_downloading(), "{}: {a:?}", p.id);
+            }
+        }
     }
 }

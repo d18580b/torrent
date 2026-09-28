@@ -28,6 +28,15 @@ use crate::profile::ProfileId;
 pub enum TorrentPhase {
     /// libtorrent is hashing pieces; the torrent isn't seeding yet.
     Checking,
+    /// A magnet whose metadata has not arrived (libtorrent's
+    /// `downloading_metadata`). Metadata is not payload, so it still arrives
+    /// under upload mode.
+    AwaitingMetadata,
+    /// Has metadata, and pieces it wants are missing (libtorrent's
+    /// `downloading`). Upload mode keeps it from requesting any, so it stays
+    /// here until the payload is supplied and rechecked: a failed check, or a
+    /// payload that was never there.
+    Incomplete,
     /// Has metadata but no peers yet; rare for a seeder.
     Idle,
     /// Actively seeding (or paused while ready to seed).
@@ -54,6 +63,8 @@ impl TorrentPhase {
     pub fn as_str(self) -> &'static str {
         match self {
             TorrentPhase::Checking => "checking",
+            TorrentPhase::AwaitingMetadata => "awaiting_metadata",
+            TorrentPhase::Incomplete => "incomplete",
             TorrentPhase::Idle => "idle",
             TorrentPhase::Seeding => "seeding",
             TorrentPhase::Paused => "paused",
@@ -155,9 +166,10 @@ pub struct TorrentState {
     ///
     /// This is the only authoritative "verification is over" signal. A torrent
     /// that fails its check does not become `Errored` — libtorrent moves it to
-    /// `downloading`, which the phase mapping deliberately ignores — so
-    /// without this stamp a failed verification is indistinguishable from one
-    /// still in progress, and anything waiting on it waits forever.
+    /// `downloading`, which maps to `Incomplete` — and `Incomplete` is also
+    /// what a torrent reports while a check it started is still settling, so
+    /// without this stamp a failed verification cannot be told from one about
+    /// to report seeding.
     pub checked_at: Option<Instant>,
 }
 

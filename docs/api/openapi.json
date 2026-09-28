@@ -9092,6 +9092,8 @@
         "type": "string",
         "enum": [
           "checking",
+          "awaiting_metadata",
+          "incomplete",
           "idle",
           "seeding",
           "paused",
@@ -9350,7 +9352,7 @@
           "working",
           "error"
         ],
-        "description": "Where a tracker stands.\n\nDerived in this order: `error` when the last announce failed (an error\ntext is present, or announces have failed and none has ever succeeded);\notherwise `updating` while an announce is in flight; otherwise `working`\nonce the tracker has answered an announce; otherwise `not_contacted`."
+        "description": "Where a tracker stands.\n\nDerived in this order: `working` when the last announce over any of the\ndaemon's listen endpoints succeeded, whatever the others report; otherwise\n`error` when the last announce failed (an error text is present, or\nannounces have failed and none has ever succeeded); otherwise `updating`\nwhile an announce is in flight; otherwise `working` once the tracker has\nanswered an announce; otherwise `not_contacted`."
       },
       "Tracker": {
         "properties": {
