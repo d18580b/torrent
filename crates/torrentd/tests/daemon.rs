@@ -496,11 +496,19 @@ fn a_sigterm_with_a_stream_and_a_stuck_request_open_exits_zero_within_the_bound(
         wait_exit(&mut child, Duration::from_secs(45)),
         "daemon did not exit within 45s of SIGTERM with clients holding on"
     );
+    let elapsed = started.elapsed();
     let status = child.wait().unwrap();
     assert!(
         status.success(),
-        "a drain cut short by a client is not a failure: {status:?} after {:?}",
-        started.elapsed(),
+        "a drain cut short by a client is not a failure: {status:?} after {elapsed:?}",
+    );
+    // The stuck request holds the HTTP drain to its 10 s bound
+    // (`HTTP_DRAIN_TIMEOUT`), and the rest of the teardown has nothing to
+    // wait on. Under 20 s rules out kynos's 25 s default; at least 9 s shows
+    // the stuck request really held the drain to its bound.
+    assert!(
+        (Duration::from_secs(9)..Duration::from_secs(20)).contains(&elapsed),
+        "the exit should land near the 10 s HTTP drain bound, took {elapsed:?}",
     );
     drop((stuck, events));
 }
