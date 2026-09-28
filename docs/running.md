@@ -381,12 +381,25 @@ re-add the torrents. Edit `registry.db`, not the `.imported` file: the daemon
 does not read that again.
 
 To roll back to a release that predates the database, stop the daemon and
-rename the `.imported` file back to its original name; assignments made since
-the upgrade exist only in `registry.db`. A `profile_assignments.json` that
+rename the newest imported copy back to its original name. The first import
+leaves `<name>.imported`, and each later one takes the next free
+`<name>.imported.N`, so where numbered copies exist the newest is the one with
+the highest `N`; `<name>.imported` itself is then the oldest. Assignments made
+since the upgrade exist only in `registry.db`. A `profile_assignments.json` that
 reappears beside the database — the rolled-back release wrote it — is imported
 again on the next boot of this one: entries the database lacks are
 added, and one that assigns an info-hash to a different profile than the
 database does refuses the boot, naming both, with nothing imported.
+
+That merge only adds. An assignment the rolled-back release *removed* — a
+torrent it deleted — is still in `registry.db`, which that release never
+opened, so it survives the return to this one: nothing loads for that
+info-hash, and adding it again answers 409 until `DELETE
+/v1/torrents/{infohash}` or the `sqlite3` statement clears the row. Where the
+rolled-back release's file should replace the database rather than merge into
+it, stop the daemon and move `registry.db` (with its `registry.db-wal` and
+`registry.db-shm`, if present) aside before booting this release: with no
+database, the boot imports the JSON file into a new one.
 
 `torrentd pool scan` opens the same registry the same way, performing the
 import itself if the daemon has not yet — so running the scan before the
