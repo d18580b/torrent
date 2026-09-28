@@ -651,6 +651,119 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
     );
 }
 
+/// Run the binary against `cfg` to its exit, with `--check-config` when
+/// `check`, and `PATH` limited to `path` when given. Returns the exit code
+/// and both output streams.
+fn run_to_exit(
+    cfg: &std::path::Path,
+    check: bool,
+    path: Option<&std::path::Path>,
+) -> (i32, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_torrentd"));
+    cmd.arg("--config").arg(cfg);
+    if check {
+        cmd.arg("--check-config");
+    }
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(30)),
+        "a refused config must not start the daemon"
+    );
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut out)
+        .unwrap();
+    let code = child.wait().unwrap().code().expect("exited, not signalled");
+    (code, out)
+}
+
+/// A config that does not load exits 78 (`EX_CONFIG`), from the daemon and
+/// from `--check-config` alike, which is what `RestartPreventExitStatus=78`
+/// reads to leave the unit stopped.
+#[test]
+#[ignore = "spawns the real daemon; run with --ignored"]
+fn a_config_that_fails_to_load_exits_ex_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, 16898, "127.0.0.1:18098");
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    // Out of `shutdown_drain_secs`'s `1..=3600`: parses, then fails validation.
+    std::fs::write(&cfg, format!("shutdown_drain_secs = 0\n{text}")).unwrap();
+
+    for check in [false, true] {
+        let (code, out) = run_to_exit(&cfg, check, None);
+        assert_eq!(code, 78, "--check-config: {check}; output: {out}");
+        assert!(
+            out.contains("shutdown_drain_secs"),
+            "the refusal names the key: {out}"
+        );
+    }
+
+    let (code, out) = run_to_exit(&p.join("missing.toml"), false, None);
+    assert_eq!(code, 78, "a config file that is not there: {out}");
+}
+
+/// `--check-config`'s host probe (`nft` present under
+/// `network_kill_switch = true`) exits 78 when it fails, and so does the
+/// daemon, which makes the same probe itself before it raises anything. `nft`
+/// is made absent by running with a `PATH` holding nothing.
+#[test]
+#[ignore = "spawns the real daemon; run with --ignored"]
+fn a_kill_switch_with_no_nft_exits_ex_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    for sub in ["data", "resume", "torrents", "empty-path"] {
+        std::fs::create_dir_all(p.join(sub)).unwrap();
+    }
+    let cfg = p.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "default_save_path = \"{d}/data\"\n\
+             resume_dir = \"{d}/resume\"\n\
+             torrent_dir = \"{d}/torrents\"\n\
+             http_listen = \"127.0.0.1:18099\"\n\
+             log_level = \"warn\"\n\
+             allow_unauthenticated = true\n\
+             network_kill_switch = true\n\
+             \n\
+             [[profile]]\n\
+             id = \"acct_a\"\n\
+             network = \"vpn\"\n\
+             vpn_type = \"wireguard\"\n\
+             vpn_config = \"{d}/wg0.conf\"\n\
+             vpn_interface = \"wg-nonft\"\n\
+             listen_port = 16899\n\
+             peer_fingerprint = \"-AA1000-\"\n\
+             user_agent = \"ua-a\"\n",
+            d = p.display()
+        ),
+    )
+    .unwrap();
+
+    for check in [true, false] {
+        let (code, out) = run_to_exit(&cfg, check, Some(&p.join("empty-path")));
+        assert_eq!(code, 78, "--check-config: {check}; output: {out}");
+        assert!(out.contains("nft"), "the refusal names `nft`: {out}");
+    }
+}
+
 /// The reconciliation warning on a migration boot names the file to edit, not
 /// only the file the entries came from.
 ///
