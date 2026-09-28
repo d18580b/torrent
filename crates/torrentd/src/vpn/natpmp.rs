@@ -117,6 +117,16 @@ impl NatpmpForwarder {
         self.release_divergent_udp
     }
 
+    /// The renewal client, pointed at a gateway on `gateway_port` instead of
+    /// 5351 — a loopback fake, for a test elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn for_gateway_port(gateway_port: u16) -> Self {
+        Self {
+            gateway_port,
+            ..Self::new()
+        }
+    }
+
     fn with_timeouts_ms(ms: &[u64], release_divergent_udp: bool) -> Self {
         Self {
             gateway_port: NATPMP_PORT,

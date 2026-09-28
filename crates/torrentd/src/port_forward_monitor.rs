@@ -138,7 +138,18 @@ pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
     metrics: Arc<PromSink>,
+    shutdown: broadcast::Receiver<ShutdownReason>,
+) {
+    run_with(profiles, state, metrics, shutdown, NatpmpForwarder::new()).await;
+}
+
+/// [`run`] against `forwarder`, which a test points at a loopback gateway.
+async fn run_with(
+    profiles: Arc<ProfileRegistry>,
+    state: Arc<StateMap>,
+    metrics: Arc<PromSink>,
     mut shutdown: broadcast::Receiver<ShutdownReason>,
+    forwarder: NatpmpForwarder,
 ) {
     let natpmp: Vec<ProfileId> = profiles
         .iter()
@@ -149,8 +160,6 @@ pub async fn run(
     if natpmp.is_empty() {
         return;
     }
-
-    let forwarder = NatpmpForwarder::new();
 
     // Seed gauges from the ports negotiated at startup, and pre-register the
     // counters at 0 so `rate()`/alerting queries resolve on a healthy daemon
@@ -1144,5 +1153,125 @@ mod tests {
             &BTreeSet::new()
         ));
         assert_eq!(fwd.call_count(), 0);
+    }
+
+    /// What a loopback fake gateway saw: a mapping request, or a release
+    /// (lifetime 0, RFC 6886 §3.4).
+    #[derive(Debug, PartialEq)]
+    enum Seen {
+        Map,
+        Release,
+    }
+
+    /// A fake NAT-PMP gateway on loopback. It grants every mapping on 40001,
+    /// and answers each release after `release_delay`, reporting every
+    /// request on `seen`. It exits after the second release or when nothing
+    /// arrives for five seconds.
+    fn fake_gateway(
+        release_delay: Duration,
+        seen: tokio::sync::mpsc::UnboundedSender<Seen>,
+    ) -> (u16, std::thread::JoinHandle<()>) {
+        let gw = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        gw.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let port = gw.local_addr().unwrap().port();
+        let thread = std::thread::spawn(move || {
+            let mut releases = 0;
+            while releases < 2 {
+                let mut req = [0u8; 12];
+                let Ok((_, peer)) = gw.recv_from(&mut req) else {
+                    return;
+                };
+                let release = req[8..12] == [0; 4];
+                let mut resp = [0u8; 16];
+                resp[1] = req[1] | 0x80;
+                resp[4..8].copy_from_slice(&1u32.to_be_bytes());
+                resp[8..10].copy_from_slice(&req[4..6]);
+                if release {
+                    releases += 1;
+                    std::thread::sleep(release_delay);
+                } else {
+                    resp[10..12].copy_from_slice(&40001u16.to_be_bytes());
+                    resp[12..16].copy_from_slice(&LEASE_SECS.to_be_bytes());
+                }
+                gw.send_to(&resp, peer).unwrap();
+                let _ = seen.send(if release { Seen::Release } else { Seen::Map });
+            }
+        });
+        (port, thread)
+    }
+
+    /// Shutdown releases every live mapping, and does it off the runtime's
+    /// workers. The test runs on a single-threaded runtime whose one worker
+    /// also drives a ticker: were the release run inline — as it was before
+    /// D13 moved it onto `spawn_blocking` — the ticker would stand still for
+    /// the whole of the slow gateway's answers.
+    #[tokio::test]
+    async fn shutdown_releases_the_mappings_off_the_runtime_workers() {
+        const RELEASE_DELAY: Duration = Duration::from_millis(200);
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let (gw_port, gateway) = fake_gateway(RELEASE_DELAY, seen_tx);
+
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut config = test_vpn_entry("acct_a", ProfileStatus::Active).config;
+        if let ProfileNetwork::Vpn {
+            listen_port,
+            port_forward,
+            port_forward_gateway,
+            ..
+        } = &mut config.network
+        {
+            *listen_port = None;
+            *port_forward = PortForwardMode::Natpmp;
+            *port_forward_gateway = Some(loopback.to_string());
+        }
+        let entry = ProfileEntry::new(
+            config,
+            Arc::new(MockEngine::new()) as Arc<dyn TorrentEngine>,
+            Some(loopback),
+            Some(40001),
+            0,
+        );
+
+        let (shutdown_tx, shutdown) = broadcast::channel(1);
+        let monitor = tokio::spawn(run_with(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(StateMap::new()),
+            Arc::new(PromSink::new()),
+            shutdown,
+            NatpmpForwarder::for_gateway_port(gw_port),
+        ));
+        // The first renewal runs at once: TCP, then UDP.
+        assert_eq!(seen.recv().await, Some(Seen::Map));
+        assert_eq!(seen.recv().await, Some(Seen::Map));
+
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    ticks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+
+        shutdown_tx.send(ShutdownReason::Test).unwrap();
+        let before = ticks.load(std::sync::atomic::Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(10), monitor)
+            .await
+            .expect("the monitor returns after its releases")
+            .unwrap();
+        let during = ticks.load(std::sync::atomic::Ordering::Relaxed) - before;
+        ticker.abort();
+
+        assert_eq!(seen.recv().await, Some(Seen::Release), "UDP released");
+        assert_eq!(seen.recv().await, Some(Seen::Release), "TCP released");
+        gateway.join().unwrap();
+        // Two answers 200ms apart: some 40 ticks when the worker is free,
+        // one or two when the release holds it.
+        assert!(
+            during >= 10,
+            "the runtime's worker was held by the release: {during} ticks",
+        );
     }
 }
