@@ -1300,7 +1300,8 @@ where
         // Keep the leases already negotiated alive across this bring-up. A
         // failure is the monitor's to retry; it renews first thing.
         for built in &profile_entries {
-            crate::port_forward_monitor::refresh_during_boot(built, forwarder, metrics);
+            let taken = ports_taken_at_boot(cfg, &profile_entries, &built.config.id);
+            crate::port_forward_monitor::refresh_during_boot(built, forwarder, metrics, &taken);
         }
 
         match build_profile(
@@ -1310,6 +1311,7 @@ where
             cleanup,
             forwarder,
             &tunnel_owner,
+            &ports_taken_at_boot(cfg, &profile_entries, &p.id),
             &mut make_engine,
         )
         .await
@@ -1330,6 +1332,22 @@ where
     Ok((profile_entries, failed_profiles))
 }
 
+/// The ports a NAT-PMP port for profile `except` must not collide with while
+/// the profiles are being built: every other configured profile's static
+/// ports — including profiles not built yet — and the ports already held by
+/// the profiles that were (profile Safety Rule 8).
+fn ports_taken_at_boot(
+    cfg: &Config,
+    built: &[ProfileEntry],
+    except: &ProfileId,
+) -> std::collections::BTreeSet<u16> {
+    let mut taken = crate::port_forward_monitor::ports_held_by_others(built, except);
+    for p in cfg.profile.iter().filter(|p| &p.id != except) {
+        taken.extend(p.configured_ports());
+    }
+    taken
+}
+
 /// Build one profile's session, or say why it has none.
 ///
 /// Any tunnel this raised and then failed after is taken down before the
@@ -1344,6 +1362,7 @@ async fn build_profile<F, E>(
     cleanup: &mut BootCleanup,
     forwarder: &dyn PortForwarder,
     tunnel_owner: &std::collections::HashMap<IpAddr, ProfileId>,
+    ports_taken: &std::collections::BTreeSet<u16>,
     make_engine: &mut F,
 ) -> Result<ProfileEntry, FailedProfile>
 where
@@ -1518,6 +1537,19 @@ where
                         lifetime_secs: crate::port_forward_monitor::LEASE_SECS,
                     };
                     match forwarder.map(&req) {
+                        Ok(m) if ports_taken.contains(&m.port) => {
+                            // Two gateways assign ports independently. A
+                            // second profile announcing the same port is
+                            // correlatable with the first by a tracker
+                            // operator, whatever the addresses (Safety Rule
+                            // 8), so this one does not come up on it.
+                            error!(profile_id = %p.id, tunnel_ip = %ip, gateway = %gateway, forwarded_port = m.port, "NAT-PMP assigned a port another profile holds; profile disabled");
+                            tear_down_or_warn!(iface);
+                            fail_profile!(format!(
+                                "NAT-PMP assigned port {}, which another profile already holds",
+                                m.port
+                            ));
+                        }
                         Ok(m) => {
                             info!(profile_id = %p.id, tunnel_ip = %ip, gateway = %gateway, forwarded_port = m.port, gateway_epoch = m.epoch, "NAT-PMP port negotiated");
                             forwarded_port = Some(m.port);
@@ -3524,6 +3556,69 @@ mod profile_construction_tests {
             "every request names the same internal port",
         );
         assert_eq!(out.up[1].health().forwarded_port, Some(40002));
+    }
+
+    /// Two gateways, one port: the second natpmp profile is handed the port
+    /// the first holds, or a port a static profile is configured with. Two
+    /// profiles announcing one port are correlatable by a tracker operator
+    /// (Safety Rule 8), so the second does not come up on it. At a9eb5a1
+    /// nothing checked a gateway-assigned port against anything.
+    #[tokio::test]
+    async fn a_natpmp_port_another_profile_holds_disables_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let second = "[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
+             vpn_config = \"/etc/wireguard/wg-b.conf\"\nvpn_interface = \"wg-b\"\n\
+             port_forward = \"natpmp\"\npeer_fingerprint = \"-BB1001-\"\n\
+             user_agent = \"ua-acct_b\"\n"
+            .to_string();
+        let cfg = cfg_with(
+            dir.path(),
+            &[natpmp("acct_a", "wg-a"), second, vpn("acct_s", "wg-s", 3)],
+        );
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", TUNNEL_IP);
+        vpn.set_ip("wg-b", OTHER_TUNNEL_IP);
+        vpn.set_ip("wg-s", IpAddr::V4(Ipv4Addr::new(10, 9, 0, 9)));
+        let forwarder = MockForwarder::new();
+        forwarder.push_ok(6893); // acct_a: acct_s's static port
+        forwarder.push_ok(40002); // acct_b negotiates
+        forwarder.push_ok(40002); // acct_b renewed before acct_s's bring-up
+
+        let out = build(&cfg, &vpn, &forwarder, None).await;
+
+        assert!(
+            out.failed("acct_a").reason.contains("6893"),
+            "a port a static profile is configured with, even one built later: {:?}",
+            out.failed,
+        );
+        assert_eq!(out.up_ids(), vec!["acct_b", "acct_s"]);
+        assert!(
+            vpn.bring_down_calls().contains(&"wg-a".to_string()),
+            "its tunnel is taken down with it",
+        );
+
+        // And a port an already-built profile holds.
+        let dir = tempfile::tempdir().unwrap();
+        let second = "[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
+             vpn_config = \"/etc/wireguard/wg-b.conf\"\nvpn_interface = \"wg-b\"\n\
+             port_forward = \"natpmp\"\npeer_fingerprint = \"-BB1001-\"\n\
+             user_agent = \"ua-acct_b\"\n"
+            .to_string();
+        let cfg = cfg_with(dir.path(), &[natpmp("acct_a", "wg-a"), second]);
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", TUNNEL_IP);
+        vpn.set_ip("wg-b", OTHER_TUNNEL_IP);
+        let forwarder = MockForwarder::new();
+        forwarder.push_ok(51413); // acct_a negotiates
+        forwarder.push_ok(51413); // acct_a renewed
+        forwarder.push_ok(51413); // acct_b handed the same port
+        let out = build(&cfg, &vpn, &forwarder, None).await;
+        assert_eq!(out.up_ids(), vec!["acct_a"]);
+        assert!(
+            out.failed("acct_b").reason.contains("51413"),
+            "{:?}",
+            out.failed
+        );
     }
 
     #[tokio::test]

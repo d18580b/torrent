@@ -79,8 +79,11 @@
 //!    profiles sharing one would be correlatable by a tracker operator even from
 //!    different IPs. Enforced for every profile that names its own port — a
 //!    `vpn` profile's static `listen_port`, and every port a `host` profile's
-//!    `listen_interfaces` binds. Gateway-assigned NAT-PMP ports are unique by
-//!    construction and are the one case nothing here checks.
+//!    `listen_interfaces` binds. Gateway-assigned NAT-PMP ports are not
+//!    unique by construction — two gateways assign independently — so they
+//!    are checked where they are assigned: a profile whose startup
+//!    negotiation lands on a port another profile holds is disabled, and a
+//!    renewal that moves onto one is not bound (`port_forward::renew_and_rebind`).
 //!
 //! `allowed_tracker_domains` is *not* in this list. It is a misconfiguration
 //! guard against loading one profile's `.torrent` into another, checked at add
@@ -598,6 +601,18 @@ impl ProfileConfig {
         match &self.network {
             ProfileNetwork::Vpn { listen_port, .. } => *listen_port,
             ProfileNetwork::Host { .. } => None,
+        }
+    }
+
+    /// The ports this profile's configuration binds: a `vpn` profile's static
+    /// `listen_port`, or every port a `host` profile's `listen_interfaces`
+    /// names. Empty for a NAT-PMP profile, whose port is assigned at runtime.
+    pub fn configured_ports(&self) -> std::collections::BTreeSet<u16> {
+        match &self.network {
+            ProfileNetwork::Vpn { listen_port, .. } => listen_port.iter().copied().collect(),
+            ProfileNetwork::Host {
+                listen_interfaces, ..
+            } => Self::listen_ports(listen_interfaces),
         }
     }
 
