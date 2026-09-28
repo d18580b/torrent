@@ -101,6 +101,11 @@ enable_lsd = false
 # that keeps its address but has silently stopped handshaking. Default 180.
 # vpn_handshake_max_age_secs = 180
 
+# Shutdown: how long (seconds) a stop waits for every torrent's resume data to
+# be saved before giving up on what is left. Default 60; the shipped unit's
+# TimeoutStopSec=120 is sized to it, so raise both together.
+# shutdown_drain_secs = 60
+
 # Defence-in-depth kill switch. When true, torrentd installs a fail-closed
 # nftables table (`torrentd_ks`) confining the daemon's own egress to loopback
 # and its vpn profiles' tunnel interfaces — so if a tunnel drops, the kernel

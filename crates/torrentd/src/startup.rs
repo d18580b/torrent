@@ -430,6 +430,97 @@ fn boot_shutdown_receivers(
     (tx.subscribe(), tx.subscribe())
 }
 
+/// Marks a boot failure as the configuration's: `main` exits `EX_CONFIG` (78)
+/// for it, which the unit's `RestartPreventExitStatus=78` does not restart,
+/// rather than 70, which it does. Only for what no restart can change — a
+/// tunnel that failed to come up is not one.
+#[derive(Debug)]
+pub struct ConfigRefused;
+
+impl std::fmt::Display for ConfigRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the configuration is refused")
+    }
+}
+
+/// Wrap `e` as a [`ConfigRefused`].
+fn refused(e: anyhow::Error) -> anyhow::Error {
+    e.context(ConfigRefused)
+}
+
+/// Whether a boot failure is a [`ConfigRefused`].
+pub fn is_config_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ConfigRefused>().is_some()
+}
+
+/// The longest boot `EXTEND_TIMEOUT_USEC` keeps alive. Past this a boot is
+/// treated as wedged, and systemd's own start timeout fires from the last
+/// extension.
+const BOOT_EXTEND_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// What the teardown after the resume drain is given: closing the sessions,
+/// the tunnels (up to 7 s an OpenVPN profile, in parallel), the kill switch.
+const TEARDOWN_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Every descriptor the daemon may hold at once, against `RLIMIT_NOFILE`.
+///
+/// Each session may open `connections_limit` peer sockets and keep
+/// `file_pool_size` payload files open, and the API accepts up to kynos's
+/// connection cap. A soft limit below their sum is a daemon that seeds until
+/// the pool grows and then fails `accept` and `open` with `EMFILE` — in
+/// libtorrent's logs, as disk and peer errors, far from the cause. The values
+/// are the effective ones: `Settings::server_seed_overrides` sets both, and
+/// the config's keys override that.
+fn warn_if_descriptors_are_short(cfg: &Config) {
+    let need = descriptors_needed(cfg);
+    match nofile_soft_limit() {
+        Some(limit) if limit < need => warn!(
+            rlimit_nofile = limit,
+            needed = need,
+            "the open-file limit is below what the daemon may hold at once \
+             (connections_limit + file_pool_size per profile, plus the HTTP \
+             connection cap); raise LimitNOFILE or lower those keys, or peers, \
+             payload files and API clients will fail with EMFILE under load",
+        ),
+        Some(_) => {}
+        None => warn!("could not read RLIMIT_NOFILE; the open-file limit is unchecked"),
+    }
+}
+
+/// `connections_limit + file_pool_size` per configured profile, plus the
+/// HTTP connection cap.
+fn descriptors_needed(cfg: &Config) -> u64 {
+    let s = cfg.libtorrent_settings();
+    let per_session = u64::from(s.connections_limit.unwrap_or_default())
+        + u64::from(s.file_pool_size.unwrap_or_default());
+    per_session * cfg.profile.len() as u64 + HTTP_MAX_CONNECTIONS
+}
+
+/// kynos's default cap on accepted API connections, which the daemon does not
+/// change.
+const HTTP_MAX_CONNECTIONS: u64 = 10_000;
+
+/// The soft `RLIMIT_NOFILE`, or `None` if it cannot be read.
+fn nofile_soft_limit() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid, writable `rlimit` for the whole call.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    (rc == 0).then_some(lim.rlim_cur)
+}
+
+/// How many entries a boot scan adds between looks at the shutdown receiver.
+/// Cheap enough to check every time; every 256 keeps it out of profiles.
+const SCAN_SHUTDOWN_CHECK_EVERY: usize = 256;
+
+/// Whether a shutdown has been signalled on `rx`. A lagged or closed channel
+/// counts: either means signals went past this receiver unread.
+fn shutdown_requested(rx: &mut broadcast::Receiver<ShutdownReason>) -> bool {
+    !matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty))
+}
+
 /// [`boot_shutdown_receivers`], and then install the signal listener — the
 /// order being the whole of the property.
 ///
@@ -512,7 +603,7 @@ pub async fn boot(
     // Refusals that are pure functions of the file, before any tunnel is
     // raised: among them a host profile beside `network_kill_switch`, whose
     // egress the ruleset would drop while it reported itself Active.
-    cfg.check_boot_rules()?;
+    cfg.check_boot_rules().map_err(refused)?;
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
@@ -558,6 +649,15 @@ pub async fn boot(
     // adjacent statements here any more.
     let (mut boot_shutdown, shutdown_rx) =
         boot_shutdown_receivers_before(&shutdown_tx, || signals::run(channels.clone())).await;
+
+    // Tunnel bring-up (up to 30 s a profile) and the resume and torrent-dir
+    // scans (minutes at 100K torrents) can outrun any fixed
+    // `TimeoutStartSec`. Ask systemd for more time while boot runs — dropped,
+    // and so stopped, when `boot` returns — capped so a wedged boot still
+    // meets the timeout eventually.
+    let _extend_start = sd_notify::TimeoutExtender::start(BOOT_EXTEND_CAP);
+
+    warn_if_descriptors_are_short(&cfg);
 
     // Discard raised-interface records whose interface is no longer standing,
     // before anything can consult one.
@@ -712,14 +812,16 @@ pub async fn boot(
                      {current} is what the daemon reads from here on)"
                 )
             };
-            anyhow::bail!(
+            // Refused as configuration: no restart changes what the file and
+            // the registry say.
+            return Err(refused(anyhow::anyhow!(
                 "the assignment registry at {source} assigns torrents to profiles that no \
                  [[profile]] table declares: {named}. Configured profiles: {known}. Those \
                  torrents cannot be loaded, re-added or deleted while the mismatch stands. \
                  Either give one of the configured profiles the id the registry names — the \
                  upgrade path from the pre-profiles layout, where every entry says `default` — \
                  or {where_to_edit} and re-add the torrents.",
-            );
+            )));
         }
     }
 
@@ -827,7 +929,7 @@ pub async fn boot(
             // the profiles that actually came up: a config with one vpn
             // profile whose tunnel failed lands here too, and no config check
             // could have known.
-            cfg.check_boot_rules()?;
+            cfg.check_boot_rules().map_err(refused)?;
             anyhow::bail!(
                 "network_kill_switch = true and no configured vpn profile came up, so there is \
                  no tunnel to confine the daemon's egress to. Every profile would keep seeding \
@@ -889,7 +991,14 @@ pub async fn boot(
         let engine = source
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
-        for (ih, data) in entries {
+        for (i, (ih, data)) in entries.into_iter().enumerate() {
+            // A 100K-torrent scan runs for minutes; a SIGTERM during it is
+            // answered now, while `BootCleanup` still owns the tunnels, not
+            // after the scan has added everything only for the drain to save
+            // it all again.
+            if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 && shutdown_requested(&mut boot_shutdown) {
+                anyhow::bail!("shutdown requested during the resume scan");
+            }
             // Cross-check the registry; the spec aborts the profile on
             // mismatch. A resume file under one profile's directory that the
             // registry assigns to another is the operator's to reconcile.
@@ -1012,7 +1121,10 @@ pub async fn boot(
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
         let mut added = 0usize;
-        for (ih, bytes) in entries {
+        for (i, (ih, bytes)) in entries.into_iter().enumerate() {
+            if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 && shutdown_requested(&mut boot_shutdown) {
+                anyhow::bail!("shutdown requested during the torrent-dir scan");
+            }
             // Resume data already loaded this torrent (the registry holds
             // every resume-loaded info-hash after the scan above) — skip.
             if registry.lookup(&ih).is_some() {
@@ -1235,6 +1347,7 @@ pub async fn boot(
     // failure has exactly the same exposure as one configured with one — and
     // keying on the configured count treated that survivor's listen failure as
     // non-fatal, leaving a daemon that is up, healthy and listening on nothing.
+    .shutdown_deadline(std::time::Duration::from_secs(cfg.shutdown_drain_secs))
     .fatal_listen_failure(profile_registry.iter().count() == 1)
     .on_fatal({
         let tx = shutdown_tx.clone();
@@ -1864,6 +1977,15 @@ impl DaemonHandle {
         // Tell systemd we're stopping before the resume drain, which may take
         // its whole deadline — otherwise the watchdog can fire mid-drain.
         sd_notify::stopping();
+        // And ask for the time the rest of the stop may take, which on a
+        // large pool can outrun `TimeoutStopSec`: capped at the sum of the
+        // stages' own bounds, so a stop wedged past all of them is still
+        // killed.
+        let _extend_stop = sd_notify::TimeoutExtender::start(
+            POOL_WORK_DRAIN
+                + std::time::Duration::from_secs(cfg.shutdown_drain_secs)
+                + TEARDOWN_ALLOWANCE,
+        );
 
         // Pool work a drained request left behind, or the boot-time re-drive:
         // stopping the alert loop and closing the sessions under a plan that
@@ -1901,8 +2023,12 @@ impl DaemonHandle {
             exit_code = 70;
         }
         let unsaved_at_shutdown = alert_loop.unsaved_at_shutdown();
-        if let Err(e) = alert_loop.join() {
-            warn!(error.cause = ?e, "alert loop join panicked");
+        // Joined off the runtime's workers: the drain can take its whole
+        // deadline, and the timeout extender above has to keep running.
+        match tokio::task::spawn_blocking(move || alert_loop.join()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(error.cause = ?e, "alert loop join panicked"),
+            Err(e) => warn!(error.cause = %e, "alert loop join task failed"),
         }
         let mut shutdown_report = ShutdownReport {
             unsaved_resumes: unsaved_at_shutdown.load(std::sync::atomic::Ordering::Relaxed),
@@ -2417,6 +2543,50 @@ mod shutdown_report_tests {
 
     fn failed() -> std::io::Result<()> {
         Err(std::io::Error::other("nft: permission denied"))
+    }
+
+    #[test]
+    fn a_config_refusal_is_told_apart_from_other_boot_failures() {
+        let e = refused(anyhow::anyhow!("host profile beside network_kill_switch"));
+        assert!(is_config_refusal(&e));
+        assert!(
+            is_config_refusal(&e.context("boot")),
+            "survives more context"
+        );
+        assert!(format!("{:#}", refused(anyhow::anyhow!("why"))).ends_with(": why"));
+        assert!(!is_config_refusal(&anyhow::anyhow!("no profile came up")));
+    }
+
+    #[test]
+    fn the_descriptor_budget_counts_every_session_and_the_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::minimal_for_tests(dir.path(), false);
+        cfg.connections_limit = Some(1_000);
+        cfg.file_pool_size = Some(100);
+        cfg.profile = vec![
+            crate::profile_registry::test_entry("a", ProfileStatus::Active).config,
+            crate::profile_registry::test_entry("b", ProfileStatus::Active).config,
+        ];
+        assert_eq!(descriptors_needed(&cfg), 2 * 1_100 + HTTP_MAX_CONNECTIONS);
+        // And the shipped unit's LimitNOFILE covers a one-profile default.
+        cfg.connections_limit = None;
+        cfg.file_pool_size = None;
+        cfg.profile.truncate(1);
+        assert!(descriptors_needed(&cfg) <= 65_536);
+        assert!(nofile_soft_limit().is_some_and(|n| n > 0));
+    }
+
+    #[test]
+    fn a_boot_scan_sees_a_shutdown_signalled_while_it_runs() {
+        let (tx, mut rx) = broadcast::channel(8);
+        assert!(!shutdown_requested(&mut rx), "nothing signalled yet");
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        assert!(shutdown_requested(&mut rx));
+        // A receiver that fell behind missed signals: that is a shutdown too.
+        let (tx, mut rx) = broadcast::channel(1);
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        tx.send(ShutdownReason::Sigint).unwrap();
+        assert!(shutdown_requested(&mut rx));
     }
 
     #[test]

@@ -51,6 +51,7 @@ thiserror = { workspace = true }
 # Misc
 parking_lot = { workspace = true }
 hex = { workspace = true }
+libc = { workspace = true }
 sha1 = { workspace = true }
 
 [features]

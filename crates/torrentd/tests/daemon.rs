@@ -564,9 +564,11 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
         exited,
         "the daemon started against a registry it cannot serve; stderr: {err}"
     );
-    assert!(
-        !child.wait().unwrap().success(),
-        "exit status must be a failure; stderr: {err}"
+    assert_eq!(
+        child.wait().unwrap().code(),
+        Some(78),
+        "a refusal no restart can fix exits EX_CONFIG, which the unit does not restart; \
+         stderr: {err}"
     );
 
     // The refusal has to be actionable: it names the id it does not recognise,

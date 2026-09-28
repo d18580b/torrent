@@ -3528,6 +3528,7 @@ dependencies = [
  "hex",
  "jiff",
  "kynos",
+ "libc",
  "libtorrent-safe",
  "parking_lot",
  "prometheus",

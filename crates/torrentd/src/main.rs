@@ -235,6 +235,22 @@ fn is_exempt_operator_tool(command: &Command) -> bool {
 /// made `hash-password` unreachable from the very configs the refusal sends an
 /// operator to it to fix. `vpn check --bring-up` is excluded from that, per
 /// [`is_exempt_operator_tool`].
+/// `EX_CONFIG` (sysexits.h): the configuration is wrong, and starting again
+/// will not change that.
+const EX_CONFIG: i32 = 78;
+
+/// Exit [`EX_CONFIG`] for a configuration the daemon refuses.
+///
+/// Exiting 1 put a refusal in the same class as a crash, and
+/// `Restart=on-failure` restarted it every `RestartSec` forever, burying the
+/// one line that said what to fix under the restarts. The unit sets
+/// `RestartPreventExitStatus=78`, so a refused config stops the unit and
+/// leaves the reason as the last thing in the journal.
+fn refuse_config(e: &anyhow::Error) -> ! {
+    eprintln!("error: {e:#}");
+    std::process::exit(EX_CONFIG);
+}
+
 fn load_config(cli: &Cli) -> anyhow::Result<config::Config> {
     let Some(path) = cli.config.as_deref() else {
         anyhow::bail!("--config <PATH> is required");
@@ -320,10 +336,12 @@ fn main() -> anyhow::Result<()> {
         eprintln!("error: --config <PATH> is required");
         std::process::exit(2);
     };
-    let cfg = load_config(&cli)?;
+    let cfg = load_config(&cli).unwrap_or_else(|e| refuse_config(&e));
 
     if cli.check_config {
-        check_config(&cfg)?;
+        if let Err(e) = check_config(&cfg) {
+            refuse_config(&e);
+        }
         eprintln!("config OK");
         return Ok(());
     }
@@ -386,6 +404,9 @@ fn main() -> anyhow::Result<()> {
                 // log line is the only thing they get. Every `.context(...)`
                 // on the way up is written to be read; this is what prints it.
                 error!(error.cause = %format_args!("{e:#}"), "startup failed");
+                if startup::is_config_refusal(&e) {
+                    std::process::exit(EX_CONFIG);
+                }
                 std::process::exit(70); // EX_SOFTWARE
             }
         }
