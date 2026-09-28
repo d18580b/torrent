@@ -179,7 +179,8 @@ pub async fn create_session(
     // Argon2id costs ~50 ms of CPU on purpose. Unthrottled, an
     // unauthenticated caller can spend the whole machine's CPU on password
     // verification. kynos has already refused any body that is not a
-    // well-formed `CreateSession`, so nothing malformed reaches this.
+    // well-formed `CreateSession`, and any body that took longer than
+    // `REQUEST_DEADLINE` to arrive, so nothing malformed reaches this.
     if let Some(wait) = auth.throttle.retry_after(client.ip) {
         warn!(
             target: "torrentd::auth",
@@ -213,7 +214,23 @@ pub async fn create_session(
         ));
     }
 
-    if !auth.verify_password(&body.password) {
+    // ~50 ms of deliberate CPU per call: run on the blocking pool, not on an
+    // async worker, so a burst of logins cannot stall every other request the
+    // runtime is serving. A join failure (the KDF panicked) never
+    // authenticates.
+    let verifier = auth.clone();
+    let verified = tokio::task::spawn_blocking(move || verifier.verify_password(&body.password))
+        .await
+        .unwrap_or_else(|e| {
+            warn!(
+                target: "torrentd::auth",
+                client_ip,
+                error.cause = %e,
+                "password verification task failed",
+            );
+            false
+        });
+    if !verified {
         auth.throttle.note_failure(client.ip);
         // No detail about which part was wrong, and no username to enumerate.
         warn!(target: "torrentd::auth", client_ip, "failed login attempt");
