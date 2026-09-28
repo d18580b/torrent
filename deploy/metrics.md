@@ -85,7 +85,7 @@ hold.
 | `torrentd_task_up` | gauge | `task`: `vpn_monitor`, `port_forward_monitor`, `reload`, `verify_queue`, `kill_switch_watch` | daemon | from boot: always | 1 while a supervised background task runs; 0 once it has exited or panicked. Only the tasks this configuration starts are present. |
 | `torrentd_auth_login_failures_total` | counter | `reason`: `bad_password`, `throttled`, `verification_budget` | daemon | from boot, at 0 | Refused logins: a wrong password, a client locked out by the throttle, or the daemon-wide verification budget spent. |
 | `torrentd_auth_token_scope_denials_total` | counter | — | daemon | from boot, at 0 | Requests carrying a valid token without the scope the route needs. |
-| `torrentd_config_reload_failures_total` | counter | `stage`: `load`, `log_level`, `apply_settings` | daemon | from boot, at 0 | Reloads (SIGHUP or POST /api/reload) that failed, by the step that failed. |
+| `torrentd_config_reload_failures_total` | counter | `stage`: `load`, `log_level`, `apply_settings` | daemon | from boot, at 0 | Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed. |
 | `torrentd_kill_switch_active` | gauge | — | daemon | from boot: always | 1 while the daemon holds the nftables kill switch installed. |
 | `torrentd_kill_switch_table_present` | gauge | — | daemon | from boot: kill switch on | 1 if the kill switch's nftables table was present at the last check. |
 | `torrentd_kill_switch_probe_errors_total` | counter | — | daemon | from boot, at 0 | Runtime kill-switch checks that could not list the nftables tables. |

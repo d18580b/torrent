@@ -48,7 +48,7 @@
 //! **What it cuts off besides leaks: the HTTP API off loopback.** The chain
 //! hooks `output` and matches the socket's owner, and a reply on a connection
 //! someone else opened is still sent from a socket the daemon's uid owns. So a
-//! request to `http_listen` — the API, the web client, a Prometheus scrape of
+//! request to `http_listen` — the API, a Prometheus scrape of
 //! `/metrics` — that arrives on a physical interface is accepted and its reply
 //! dropped: the client sees a connection that opens and then hangs. Over
 //! loopback, or through a tunnel interface, it works. That is the ruleset

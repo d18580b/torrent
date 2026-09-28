@@ -127,6 +127,7 @@ fn subcommand_name(command: &Command) -> &'static str {
         },
         Command::HashPassword => "hash-password",
         Command::NewToken { .. } => "new-token",
+        Command::Openapi { .. } => "openapi",
     }
 }
 
@@ -216,7 +217,7 @@ fn is_exempt_operator_tool(command: &Command) -> bool {
         },
         // Derive a hash, mint a token, print it. Neither reads nor writes
         // anything outside this process.
-        Command::HashPassword | Command::NewToken { .. } => true,
+        Command::HashPassword | Command::NewToken { .. } | Command::Openapi { .. } => true,
         Command::Vpn { cmd } => match cmd {
             // The one arm that changes host network state. Everything else
             // `vpn check` does is reading interfaces, `wg` state and sysctls.
@@ -235,14 +236,32 @@ fn is_exempt_operator_tool(command: &Command) -> bool {
 /// operator to it to fix. `vpn check --bring-up` is excluded from that, per
 /// [`is_exempt_operator_tool`].
 fn load_config(cli: &Cli) -> anyhow::Result<config::Config> {
+    let Some(path) = cli.config.as_deref() else {
+        anyhow::bail!("--config <PATH> is required");
+    };
     let is_operator_tool =
         cli.command.as_ref().is_some_and(is_exempt_operator_tool) && !cli.check_config;
     let loaded = if is_operator_tool {
-        config::Config::load_for_operator_tool(&cli.config)
+        config::Config::load_for_operator_tool(path)
     } else {
-        config::Config::load(&cli.config)
+        config::Config::load(path)
     };
-    loaded.with_context(|| format!("failed to load config from {}", cli.config.display()))
+    loaded.with_context(|| format!("failed to load config from {}", path.display()))
+}
+
+/// `torrentd openapi`: print or write the API's OpenAPI document.
+fn openapi_cmd(out: Option<&std::path::Path>) -> anyhow::Result<()> {
+    let json = http::document_json()?;
+    match out {
+        Some(path) => std::fs::write(path, json)
+            .with_context(|| format!("write the OpenAPI document to {}", path.display())),
+        None => {
+            use std::io::Write as _;
+            std::io::stdout()
+                .write_all(json.as_bytes())
+                .context("write the OpenAPI document to stdout")
+        }
+    }
 }
 
 /// What `--check-config` establishes beyond the file parsing and validating.
@@ -286,6 +305,21 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
 
+    // The one subcommand that reads no configuration: it describes the API
+    // this binary serves, which no config file changes.
+    if let Some(Command::Openapi { out }) = &cli.command {
+        if cli.check_config {
+            eprintln!("error: --check-config cannot be combined with `openapi`");
+            std::process::exit(2);
+        }
+        return openapi_cmd(out.as_deref());
+    }
+
+    let Some(config_path) = cli.config.clone() else {
+        // A usage error, like the one above.
+        eprintln!("error: --config <PATH> is required");
+        std::process::exit(2);
+    };
     let cfg = load_config(&cli)?;
 
     if cli.check_config {
@@ -324,6 +358,8 @@ fn main() -> anyhow::Result<()> {
             },
             Command::HashPassword => hash_password_cmd(),
             Command::NewToken { name, scopes } => new_token_cmd(&name, &scopes),
+            // Handled before the config is loaded, above.
+            Command::Openapi { out } => openapi_cmd(out.as_deref()),
         };
     }
 
@@ -336,7 +372,7 @@ fn main() -> anyhow::Result<()> {
         .context("build tokio runtime")?;
 
     runtime.block_on(async move {
-        match startup::boot(cfg, cli.config, log_handle).await {
+        match startup::boot(cfg, config_path, log_handle).await {
             Ok(handle) => {
                 let exit_code = handle.run_until_signal().await;
                 std::process::exit(exit_code);

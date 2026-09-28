@@ -2,7 +2,7 @@
 # Alertmanager, and a webhook sink that records what it is sent.
 #
 # Not a deployment, and the daemon here is not a release build: it is built
-# with the fault-injection feature, which adds POST /api/fault. run.sh writes
+# with the fault-injection feature, which adds POST /v1/faults. run.sh writes
 # the daemon's config and faults into $DRILL_DIR, brings this up, injects
 # faults through the daemon's own API, and asserts each matching alert arrives
 # at the sink:
@@ -18,7 +18,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/Containerfile
-      # The fault-injection build: real sessions, plus POST /api/fault for
+      # The fault-injection build: real sessions, plus POST /v1/faults for
       # the faults nothing outside the process can cause. Never a release.
       args:
         CARGO_FEATURES: torrentd/fault-injection

@@ -1,8 +1,8 @@
 //! SQLite-backed pool index.
 //!
 //! A managed root can hold millions of files, which is past what the daemon's
-//! existing JSON-file conventions carry — and the web client needs to sort,
-//! filter and paginate over that set without shipping it all to the browser.
+//! existing JSON-file conventions carry — and an API client needs to sort,
+//! filter and paginate over that set without shipping all of it.
 //! One transactional file serves the file index, the torrent library, adoption
 //! state, and a copy of the torrent→profile mapping that lives in
 //! `profile_assignments.json` (once `slot_assignments.json`).
@@ -1421,7 +1421,7 @@ impl PoolStore {
     /// Atomically take ownership of a plan for applying.
     ///
     /// Returns `true` if this caller now owns it. Two concurrent
-    /// `POST /api/pool/plans/:id/apply` requests otherwise both read the steps
+    /// `POST /v1/pool/plans/{plan_id}/apply` requests otherwise both read the steps
     /// as `pending` and both execute them — the second racing the first over
     /// the same files. A conditional `UPDATE` in one statement makes exactly
     /// one of them win.

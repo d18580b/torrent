@@ -40,11 +40,10 @@ allow_unauthenticated = true
 # proxy, which makes every forwarding header client-controlled.
 #
 # Set this to the address your reverse proxy connects from, and only that:
-# anything listed here can claim to be any client. Three things use it — the
-# login throttle, which becomes per-client instead of one shared bucket; the
-# `Secure` attribute on the session cookie, which is set when the original
-# request was over TLS; and the `client_ip` field on the login log lines,
-# including the one that records a failed attempt.
+# anything listed here can claim to be any client. Two things use it: the
+# throttle on `POST /v1/sessions`, which becomes per-client instead of one
+# shared bucket, and the `client_ip` field on the login log lines, including
+# the one that records a failed attempt.
 #
 # One address, not a range. `deploy/compose.yaml` pins its `proxy` service to
 # 172.28.0.2 on an explicit subnet precisely so a single /32 can be named here;
@@ -141,7 +140,7 @@ enable_lsd = false
 # posture the daemon has, and it should not be what you get by writing
 # nothing.
 #
-# `POST /api/torrents` therefore always requires `profile_id`.
+# `POST /v1/torrents` therefore always requires `profile_id`.
 #
 #   network = "host"  binds the host's own interfaces. Peers and trackers see
 #                     this machine's address. Right for public trackers and DHT
@@ -229,7 +228,7 @@ dht               = true
 # like these don't give you a static forwarded port: it is negotiated at
 # runtime over NAT-PMP against the tunnel gateway, and its ~60s lease is
 # renewed continuously. Set `port_forward = "natpmp"`; `listen_port` is then
-# omitted, and the negotiated port is surfaced via `GET /api/profiles/<id>`
+# omitted, and the negotiated port is surfaced via `GET /v1/profiles/<id>`
 # (`forwarded_port`) plus the `torrentd_profile_forwarded_port` and
 # `torrentd_profile_port_forward_up` metrics.
 #

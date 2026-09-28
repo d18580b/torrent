@@ -77,7 +77,7 @@ services:
   # Get it wrong and the daemon ignores the headers, which is the safe
   # direction rather than a broken one: it falls back to the socket peer,
   # which on this network is this proxy, so the login throttle behaves as one
-  # shared bucket and the session cookie loses its `Secure` attribute.
+  # shared bucket and the login log lines name the proxy, not the client.
   proxy:
     image: caddy:2-alpine
     restart: unless-stopped

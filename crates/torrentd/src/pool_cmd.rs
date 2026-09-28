@@ -186,7 +186,7 @@ pub fn orphans(cfg: &Config, limit: usize) -> anyhow::Result<()> {
 /// before ever starting the new daemon — it is the documented first migration
 /// step — so `slot_assignments.json` is on disk and `profile_assignments.json`
 /// is not, and may never be. Passing the post-rename name folded zero
-/// assignments in, reported success, and left every row in `GET /api/pool`
+/// assignments in, reported success, and left every row in `GET /v1/pool`
 /// with no owning profile, recoverable only by booting the daemon once to
 /// trigger the rename and re-scanning.
 ///
@@ -318,7 +318,7 @@ listen_interfaces = "0.0.0.0:6881"
         // the daemon's first boot, so `slot_assignments.json` is the only
         // assignment file on disk. Naming `registry_path()` here read a file
         // that does not exist, `import_legacy` returned `Ok(())` in silence,
-        // the scan reported success, and every row in `GET /api/pool` came
+        // the scan reported success, and every row in `GET /v1/pool` came
         // back with no owning profile.
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_rooted_at(dir.path());

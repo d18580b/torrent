@@ -3,8 +3,6 @@
 # alone is gigabytes, and none of it is used: the builder stage compiles from
 # source inside the image.
 target/
-web/dist/
-web/node_modules/
 .git/
 *.db
 *.db-wal

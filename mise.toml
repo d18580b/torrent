@@ -8,7 +8,7 @@
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|lint|test|check
 #   mise run test-shim|test-lifecycle|test-daemon|test-all|test-alerts
-#   mise run web|daemon-only
+#   mise run openapi|openapi-check|check-fault-injection
 #   mise run bench -- <subcommand>
 
 [tools]
@@ -102,32 +102,26 @@ run = [
 description = "Layer 4: memory and throughput at scale (manual; minutes, GBs of RAM). --release is hardcoded: an unoptimised build measures the debug build, which is not a number worth having."
 run = "cargo run --release -p torrentd-bench --"
 
-# `npm run build` is `tsc -b`, then the bundler, then the precompressor. `tsc
-# -b` runs in strict mode with noUnusedLocals/noUnusedParameters, so this task
-# is the web client's type gate as well as its build.
-[tasks.web]
-description = "Type-check and bundle the web client"
-dir = "web"
-run = ["npm ci", "npm run build"]
+# The HTTP API's OpenAPI document, derived from the handlers by kynos and
+# committed so a change to the contract shows up in review. `openapi-check` is
+# the CI gate: it regenerates the file and fails if the committed copy differs.
+[tasks.openapi]
+description = "Regenerate docs/api/openapi.json from the handlers"
+run = "cargo run -q -p torrentd -- openapi --out docs/api/openapi.json"
 
-# The headless build. No `--release`: this exists to prove the daemon still
-# compiles with `web-ui` off and no Node on the host, which a debug build
-# proves as well and in a fraction of the time. `docs/running.md` §3 is where
-# an operator is told to add `--release`.
-[tasks.daemon-only]
-description = "Build the daemon without the web client (no Node required)"
-run = "cargo build -p torrentd --no-default-features"
-
-[tasks.screenshot]
-description = "Screenshot the pool browser against a mocked API (docs/img/pool.png)"
-dir = "web"
+[tasks.openapi-check]
+description = "Fail if docs/api/openapi.json is stale against the handlers"
 run = [
-  "npm ci",
-  "npm run build",
-  # Chromium only; the default `npx playwright install` pulls three browsers.
-  "npx --yes playwright install --with-deps chromium",
-  "npm run screenshot",
+  "cargo run -q -p torrentd -- openapi --out docs/api/openapi.json",
+  "git diff --exit-code -- docs/api/openapi.json",
 ]
+
+# The alert drill's build (deploy/drill). Checked rather than built: it proves
+# the fault-injection code compiles, including its tests, without a second
+# full link of the daemon.
+[tasks.check-fault-injection]
+description = "Type-check the fault-injection build and its tests"
+run = "cargo check -p torrentd --features fault-injection --all-targets"
 
 # Live verification against real VPN credentials. Deliberately separate from
 # every `test` task: it needs a real host with real tunnels, it is the one

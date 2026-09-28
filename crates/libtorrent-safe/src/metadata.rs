@@ -145,7 +145,7 @@ pub fn torrent_metadata(bytes: &[u8]) -> Result<TorrentMeta> {
     Ok(meta)
 }
 
-fn fixed_c_str(buf: &[std::os::raw::c_char]) -> String {
+pub(crate) fn fixed_c_str(buf: &[std::os::raw::c_char]) -> String {
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const u8, buf.len()) };
     let cstr = std::ffi::CStr::from_bytes_until_nul(bytes).unwrap_or(c"");
     String::from_utf8_lossy(cstr.to_bytes()).into_owned()

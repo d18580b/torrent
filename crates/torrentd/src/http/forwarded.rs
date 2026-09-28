@@ -1,14 +1,14 @@
 //! Resolving the real client behind a reverse proxy.
 //!
 //! The daemon does not terminate TLS and is expected to sit behind a proxy, so
-//! the socket's peer address is usually the proxy's. Three things need the
-//! real client: the login throttle, the `Secure` attribute on the session
-//! cookie, and the `client_ip` field on the log line that records a failed
-//! attempt.
+//! the socket's peer address is usually the proxy's. Two things need the real
+//! client: the throttle on `POST /v1/sessions`, and the `client_ip` field on
+//! the log lines that record a session being issued or refused. Whether the
+//! client reached the proxy over HTTPS is logged beside it.
 //!
-//! Neither could have it before. `axum::serve` was called without
-//! `into_make_service_with_connect_info`, so no handler could see even the
-//! socket address, and nothing parsed a forwarding header. The login throttle
+//! Neither could have it once. The server was started without connection
+//! info, so no handler could see even the socket address, and nothing parsed
+//! a forwarding header. The login throttle
 //! is global as a direct consequence — its own comment says a per-IP bucket
 //! "keyed on a spoofable header is worse than none", which was true while
 //! every header was spoofable.
@@ -34,8 +34,7 @@
 use std::net::IpAddr;
 use std::net::SocketAddr;
 
-use axum::extract::ConnectInfo;
-use axum::http::Request;
+use kynos::http::HeaderMap;
 
 /// A CIDR block, matched against a peer address.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -268,6 +267,16 @@ pub struct Client {
     /// Whether the *original* request was over TLS: **`https` anywhere in a
     /// readable chain**, under either header name.
     ///
+    /// **What it feeds now.** This once decided the session cookie's
+    /// `Secure` attribute. The API has had no cookies since `/v1` made every
+    /// credential a bearer token, and today this feeds one thing: the
+    /// `via_https` field on the log line that records a session being
+    /// issued. The reasoning below — here and in the comments and tests of
+    /// this module that speak of `Secure` and the session cookie — is kept
+    /// because it is still the reasoning about which value to believe; read
+    /// "the cookie's `Secure`" as "what `via_https` reports". A wrong value
+    /// now misstates a log field rather than exposing a credential.
+    ///
     /// This and `ip` are different questions and they read the chain
     /// differently. `ip` wants the hop the trusted proxy saw, which is the
     /// last element and only the last element. TLS is terminated at the edge,
@@ -357,8 +366,8 @@ struct HeaderRead<'a> {
 /// element of the joined value is the trusted proxy's, whatever it contains,
 /// and where it contains nothing usable the header is unreadable rather than
 /// a licence to read further left.
-fn last_element<'a, B>(req: &'a Request<B>, name: &str) -> HeaderRead<'a> {
-    let values = req.headers().get_all(name);
+fn last_element<'a>(headers: &'a HeaderMap, name: &str) -> HeaderRead<'a> {
+    let values = headers.get_all(name);
     HeaderRead {
         present: values.iter().next().is_some(),
         // The last field line's last element. A non-UTF-8 *final* field line
@@ -550,8 +559,8 @@ fn unquote(v: &str) -> std::borrow::Cow<'_, str> {
 /// that is not UTF-8 contributes nothing, which is why the caller still asks
 /// `last_element` whether the header is readable at all before believing an
 /// answer from here.
-fn elements<'a, B>(req: &'a Request<B>, name: &'a str) -> impl Iterator<Item = &'a str> {
-    req.headers()
+fn elements<'a>(headers: &'a HeaderMap, name: &'a str) -> impl Iterator<Item = &'a str> {
+    headers
         .get_all(name)
         .iter()
         .filter_map(|v| v.to_str().ok())
@@ -592,8 +601,8 @@ fn node_addr(node: &str) -> Option<IpAddr> {
     node.split_once(':')?.0.parse().ok()
 }
 
-/// Resolve the client behind `req`.
-pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
+/// Resolve the client behind a request from `peer` carrying `headers`.
+pub fn resolve(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &TrustedProxies) -> Client {
     // Unmapped **here**, at the top, before the trust test and before either
     // early return. A dual-stack `http_listen` — `[::]:8080`, which
     // `SocketAddr` accepts, the posture check permits and `docs/running.md`
@@ -606,10 +615,7 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     // against one spelling locks, and the client picks which route it takes.
     // Doing it once here also makes the trust decision and the resolved
     // address agree by construction.
-    let peer = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| unmap(ci.0.ip()));
+    let peer = peer.map(|addr| unmap(addr.ip()));
 
     let Some(peer) = peer else {
         return Client {
@@ -629,7 +635,7 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     // The last `Forwarded` element, whose parameters are its own; an earlier
     // element is another hop's, and through a proxy that appends rather than
     // strips, the earliest one is the client's.
-    let forwarded = last_element(req, "forwarded");
+    let forwarded = last_element(headers, "forwarded");
 
     // RFC 7239 is the standardised form, so a proxy that emits only
     // `Forwarded` has to be able to supply the address too — otherwise its
@@ -664,7 +670,7 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     // address, `host:port`, and a bracketed IPv6 literal are read the same on
     // either. Otherwise the *stricter* parser is the one that falls through
     // to the *less* trustworthy source, which is how the asymmetry bit.
-    let xff = last_element(req, "x-forwarded-for");
+    let xff = last_element(headers, "x-forwarded-for");
     let ip = if xff.present {
         xff.last.and_then(node_addr).or(Some(peer))
     } else {
@@ -721,13 +727,13 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
     // client's own earlier `https` now wins wherever a trusted proxy appends
     // rather than overwrites. The two harms are the same bytes and nothing in
     // a request separates them, so the rule follows the smaller harm.
-    let xfp = last_element(req, "x-forwarded-proto");
+    let xfp = last_element(headers, "x-forwarded-proto");
     let secure = if xfp.present {
         xfp.last.is_some()
-            && elements(req, "x-forwarded-proto").any(|p| p.eq_ignore_ascii_case("https"))
+            && elements(headers, "x-forwarded-proto").any(|p| p.eq_ignore_ascii_case("https"))
     } else {
         forwarded.last.is_some()
-            && elements(req, "forwarded")
+            && elements(headers, "forwarded")
                 .filter_map(|e| param(e, "proto"))
                 .any(|p| p.eq_ignore_ascii_case("https"))
     };
@@ -747,17 +753,40 @@ pub fn resolve<B>(req: &Request<B>, trusted: &TrustedProxies) -> Client {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::HeaderValue;
+    use kynos::http::HeaderName;
+    use kynos::http::HeaderValue;
 
     use super::*;
 
-    fn req(peer: &str, headers: &[(&str, &str)]) -> Request<()> {
-        let mut r = Request::new(());
-        r.extensions_mut()
-            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 12345)));
+    /// A request as `resolve` sees it: the socket peer and the head.
+    struct Request {
+        peer: SocketAddr,
+        headers: HeaderMap,
+    }
+
+    impl Request {
+        fn new(peer: &str) -> Self {
+            Self {
+                peer: SocketAddr::new(peer.parse().unwrap(), 12345),
+                headers: HeaderMap::new(),
+            }
+        }
+
+        fn headers_mut(&mut self) -> &mut HeaderMap {
+            &mut self.headers
+        }
+    }
+
+    /// `super::resolve`, over the test's request shape.
+    fn resolve(r: &Request, trusted: &TrustedProxies) -> Client {
+        super::resolve(Some(r.peer), &r.headers, trusted)
+    }
+
+    fn req(peer: &str, headers: &[(&str, &str)]) -> Request {
+        let mut r = Request::new(peer);
         for (k, v) in headers {
             r.headers_mut().insert(
-                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
                 HeaderValue::from_str(v).unwrap(),
             );
         }
@@ -766,13 +795,11 @@ mod tests {
 
     /// Like `req`, but appends each pair, so a repeated name becomes a second
     /// field line rather than replacing the first.
-    fn req_appending(peer: &str, headers: &[(&str, &str)]) -> Request<()> {
-        let mut r = Request::new(());
-        r.extensions_mut()
-            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 12345)));
+    fn req_appending(peer: &str, headers: &[(&str, &str)]) -> Request {
+        let mut r = Request::new(peer);
         for (k, v) in headers {
             r.headers_mut().append(
-                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
                 HeaderValue::from_str(v).unwrap(),
             );
         }
@@ -781,11 +808,9 @@ mod tests {
 
     /// A request whose last field line for `name` is raw bytes that are not
     /// UTF-8, preceded by whatever `before` lines the case needs.
-    fn req_with_raw_last(peer: &str, name: &str, before: &[&str], raw: &[u8]) -> Request<()> {
-        let mut r = Request::new(());
-        r.extensions_mut()
-            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 12345)));
-        let header = axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap();
+    fn req_with_raw_last(peer: &str, name: &str, before: &[&str], raw: &[u8]) -> Request {
+        let mut r = Request::new(peer);
+        let header = HeaderName::from_bytes(name.as_bytes()).unwrap();
         for v in before {
             r.headers_mut()
                 .append(header.clone(), HeaderValue::from_str(v).unwrap());
@@ -1357,11 +1382,7 @@ mod tests {
 
         // Non-UTF-8 is the same case. `to_str` fails, no element survives,
         // and the name was still present.
-        let mut r = Request::new(());
-        r.extensions_mut().insert(ConnectInfo(SocketAddr::new(
-            "10.1.2.3".parse().unwrap(),
-            12345,
-        )));
+        let mut r = Request::new("10.1.2.3");
         r.headers_mut().insert(
             "x-forwarded-for",
             HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
@@ -1655,11 +1676,7 @@ mod tests {
             );
         }
 
-        let mut r = Request::new(());
-        r.extensions_mut().insert(ConnectInfo(SocketAddr::new(
-            "10.1.2.3".parse().unwrap(),
-            12345,
-        )));
+        let mut r = Request::new("10.1.2.3");
         r.headers_mut().insert(
             "x-forwarded-proto",
             HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),

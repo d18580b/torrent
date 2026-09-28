@@ -17,7 +17,10 @@ use libtorrent_safe::MoveFlags;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::Session;
 use libtorrent_safe::Settings;
+use libtorrent_safe::TorrentDetails;
+use libtorrent_safe::TorrentFile;
 use libtorrent_safe::TorrentHandle;
+use libtorrent_safe::TrackerEntry;
 use parking_lot::Mutex;
 use tracing::instrument;
 
@@ -135,5 +138,20 @@ impl TorrentEngine for RealEngine {
 
     fn session_state(&self) -> Result<Vec<u8>, EngineError> {
         Ok(self.session.lock().save_state()?)
+    }
+
+    #[instrument(skip_all, fields(op = "torrent_details", infohash = %h.infohash))]
+    fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError> {
+        Ok(self.session.lock().torrent_details(h)?)
+    }
+
+    #[instrument(skip_all, fields(op = "torrent_files", infohash = %h.infohash))]
+    fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
+        Ok(self.session.lock().torrent_files(h)?)
+    }
+
+    #[instrument(skip_all, fields(op = "torrent_trackers", infohash = %h.infohash))]
+    fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
+        Ok(self.session.lock().torrent_trackers(h)?)
     }
 }

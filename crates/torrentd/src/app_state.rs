@@ -1,4 +1,4 @@
-//! Shared state passed to axum handlers via extractors.
+//! Shared state every HTTP handler reads, through `http::ctx::AppCtx`.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -24,7 +24,7 @@ pub struct AppState {
     pub source: Arc<dyn AlertSource>,
     pub registry: Arc<AssignmentRegistry>,
     /// Every configured profile. Always present: a daemon without at least
-    /// one profile does not start. Drives the `/profiles` endpoints and the
+    /// one profile does not start. Drives the `/v1/profiles` endpoints and the
     /// VPN health monitor.
     pub profiles: Arc<ProfileRegistry>,
     pub state: Arc<StateMap>,
@@ -46,12 +46,12 @@ pub struct AppState {
     /// the operator's reverse proxy.
     pub auth: Option<crate::auth::Auth>,
     /// Managed-pool index + adoption. `None` when no `[pool]` section is set,
-    /// in which case the `/api/pool` routes are not mounted at all.
+    /// in which case every `/v1/pool` operation answers `pool-not-configured`.
     pub pool: Option<Arc<crate::pool_service::PoolService>>,
     /// Alert-loop liveness stamp (Unix millis at its last iteration). Read by
     /// `/healthz` so a wedged loop makes the daemon report unready.
     pub alert_heartbeat: Arc<AtomicU64>,
-    /// Save path used when `POST /torrents` omits `save_path`.
+    /// Save path used when `POST /v1/torrents` omits `save_path`.
     pub default_save_path: PathBuf,
     /// Root of the `.torrent` store on disk. Used to confine a caller-supplied
     /// `torrent_path` to directories the daemon already owns.
@@ -65,12 +65,16 @@ pub struct AppState {
     /// no scan loaded into a session: the only entries known to be held by
     /// no session at all.
     ///
-    /// `DELETE /api/torrents/:hash` on a live profile with no state-map entry
+    /// `DELETE /v1/torrents/{infohash}` on a live profile with no state-map entry
     /// clears the assignment alone only for these. Any other entry without
     /// state was assigned in this process and handed to a session whose
     /// `AddTorrent` alert has not arrived yet, so clearing it would leave the
     /// torrent seeding unassigned and free to be added to a second profile.
     pub unloaded_at_boot: Arc<Mutex<HashSet<InfoHash>>>,
+    /// The daemon-wide shutdown signal. Long-lived responses — the
+    /// `/v1/events` stream — end when it fires, so a graceful shutdown is not
+    /// held open by a client that never disconnects.
+    pub shutdown: tokio::sync::broadcast::Sender<torrentd_engine::ShutdownReason>,
 }
 
 impl AppState {
@@ -191,6 +195,7 @@ pub(crate) fn build_test_state_with_sessions(
         reload_tx: None,
         trusted_proxies: Default::default(),
         unloaded_at_boot: Arc::new(Mutex::new(HashSet::new())),
+        shutdown: tokio::sync::broadcast::channel(4).0,
     }
 }
 

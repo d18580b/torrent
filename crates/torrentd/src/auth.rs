@@ -1,27 +1,29 @@
 //! Authentication for the HTTP control plane.
 //!
-//! The API was designed to be bound to loopback behind a reverse proxy. A web
-//! client changes that: a browser needs a session, and "put a proxy in front of
-//! it" is not a session. So the daemon grows its own.
-//!
-//! Two credential kinds, deliberately hashed differently:
+//! Every credential is an opaque bearer token (`http::security`). Two kinds,
+//! deliberately hashed differently:
 //!
 //! * **The operator password** is chosen by a human, so it is low-entropy and
-//!   needs a memory-hard hash. Argon2id, verified once per login.
-//! * **API tokens** are 256 bits of randomness this daemon generated, so
-//!   brute-forcing the *hash* is not the attack — there is nothing to guess.
+//!   needs a memory-hard hash. Argon2id, verified once per `POST /v1/sessions`,
+//!   which exchanges it for a short-lived **session token** (`tds_…`).
+//! * **API tokens** (`tdp_…`) are 256 bits of randomness this daemon generated,
+//!   so brute-forcing the *hash* is not the attack — there is nothing to guess.
 //!   A fast SHA-256 is correct here, and matters: Argon2 on every Prometheus
 //!   scrape would burn ~50ms of CPU per request by design.
 //!
-//! Sessions are opaque random ids looked up server-side, so the cookie carries
-//! no claims to forge and logout is a real deletion rather than a hope that the
-//! client discards it.
+//! The prefixes exist so a leaked token is recognisable for what it is, by a
+//! human reading a paste and by a secret scanner alike.
+//!
+//! Session tokens are looked up server-side, so they carry no claims to forge
+//! and revoking one is a real deletion rather than a hope that the client
+//! discards it.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::PasswordHasher;
@@ -39,14 +41,18 @@ use serde::Serialize;
 use sha2::Digest;
 use sha2::Sha256;
 
-pub const SESSION_COOKIE: &str = "torrentd_session";
+/// Prefix of a static API token minted by `torrentd new-token`.
+pub const STATIC_TOKEN_PREFIX: &str = "tdp_";
+
+/// Prefix of a session token issued by `POST /v1/sessions`.
+pub const SESSION_TOKEN_PREFIX: &str = "tds_";
 
 /// What a credential is allowed to do.
 ///
 /// Deliberately coarse. A finer model invites the mistake of handing a scrape
 /// token something it did not need; three levels are enough to keep Prometheus
 /// away from the mutation endpoints.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, kynos::Schema)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     /// Read-only API access.
@@ -55,10 +61,10 @@ pub enum Scope {
     ///
     /// This is the authentication scope, and it is not the `[pool]
     /// allow_mutations` switch. Holding `Write` is necessary for
-    /// `POST /api/pool/adopt`, `POST /api/pool/plans` and applying a plan;
+    /// `POST /v1/pool/adoptions`, `POST /v1/pool/plans` and applying a plan;
     /// `allow_mutations` separately gates the plan surface — creating a plan
     /// as well as applying one. Creating one touches nothing on disk, and
-    /// `http::pool::mutations_disabled` gives the reason it is gated anyway:
+    /// `http::v1::pool` gives the reason it is gated anyway:
     /// "a plan that can never be applied is a trap, and refusing at the point
     /// the operator asks is the clearer signal." Adoption is not part of that
     /// surface — it records an existing file's ownership in the index — so it
@@ -69,6 +75,16 @@ pub enum Scope {
 }
 
 impl Scope {
+    /// The scope a wire name spells, as the security scheme declares it.
+    pub fn parse(name: &str) -> Option<Scope> {
+        match name {
+            "read" => Some(Scope::Read),
+            "write" => Some(Scope::Write),
+            "metrics" => Some(Scope::Metrics),
+            _ => None,
+        }
+    }
+
     /// Whether holding `self` satisfies a requirement for `needed`.
     pub fn allows(self, needed: Scope) -> bool {
         match self {
@@ -88,7 +104,8 @@ pub struct AuthConfig {
     /// `torrentd --config … hash-password`.
     pub password_hash: String,
 
-    /// How long a browser session stays valid. Default 12 hours.
+    /// How long a session token from `POST /v1/sessions` stays valid.
+    /// Default 12 hours.
     #[serde(default = "AuthConfig::default_ttl")]
     pub session_ttl_secs: u64,
 
@@ -135,12 +152,15 @@ pub struct TokenConfig {
     pub scopes: Vec<Scope>,
 }
 
-/// Live sessions. In memory only: a restart logs everyone out, which for a
-/// single-operator daemon is a feature — it needs no session store to keep
+/// Live session tokens. In memory only: a restart logs everyone out, which for
+/// a single-operator daemon is a feature — it needs no session store to keep
 /// consistent, and there is nothing on disk to steal.
+///
+/// Keyed by the SHA-256 of the token rather than the token itself, so a heap
+/// dump or a `Debug` slip hands out nothing that authenticates.
 #[derive(Debug, Default)]
 pub struct SessionStore {
-    inner: Mutex<HashMap<String, Instant>>,
+    inner: Mutex<HashMap<[u8; 32], (Instant, SystemTime)>>,
     ttl: Duration,
 }
 
@@ -152,33 +172,49 @@ impl SessionStore {
         }
     }
 
-    pub fn create(&self) -> String {
+    /// Mint a session token, returning it and the wall-clock time it expires.
+    pub fn create(&self) -> (String, SystemTime) {
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
-        let id = hex::encode(bytes);
-        let expiry = Instant::now() + self.ttl;
+        let token = format!("{SESSION_TOKEN_PREFIX}{}", hex::encode(bytes));
+        let now = Instant::now();
+        let expires_at = SystemTime::now() + self.ttl;
         let mut g = self.inner.lock();
         // Opportunistic sweep; sessions are few and this keeps a long-running
         // daemon from accumulating expired entries with no separate task.
-        let now = Instant::now();
-        g.retain(|_, exp| *exp > now);
-        g.insert(id.clone(), expiry);
-        id
+        g.retain(|_, (exp, _)| *exp > now);
+        g.insert(digest(&token), (now + self.ttl, expires_at));
+        (token, expires_at)
     }
 
-    pub fn is_valid(&self, id: &str) -> bool {
+    /// When `token` expires, if it is a live session token.
+    pub fn expiry(&self, token: &str) -> Option<SystemTime> {
+        if !token.starts_with(SESSION_TOKEN_PREFIX) {
+            return None;
+        }
         let g = self.inner.lock();
-        g.get(id).is_some_and(|exp| *exp > Instant::now())
+        g.get(&digest(token))
+            .filter(|(exp, _)| *exp > Instant::now())
+            .map(|(_, wall)| *wall)
     }
 
-    pub fn revoke(&self, id: &str) {
-        self.inner.lock().remove(id);
+    #[cfg(test)]
+    pub fn is_valid(&self, token: &str) -> bool {
+        self.expiry(token).is_some()
+    }
+
+    pub fn revoke(&self, token: &str) {
+        self.inner.lock().remove(&digest(token));
     }
 
     pub fn len(&self) -> usize {
         let now = Instant::now();
-        self.inner.lock().values().filter(|e| **e > now).count()
+        self.inner.lock().values().filter(|(e, _)| *e > now).count()
     }
+}
+
+fn digest(token: &str) -> [u8; 32] {
+    Sha256::digest(token.as_bytes()).into()
 }
 
 /// Everything the middleware needs. `None` config means auth is disabled.
@@ -190,7 +226,7 @@ pub struct Auth {
     pub throttle: Arc<LoginThrottle>,
 }
 
-/// Rate limiter for `POST /api/login`.
+/// Rate limiter for `POST /v1/sessions`.
 ///
 /// Verifying the operator password runs Argon2id, which is *designed* to cost
 /// ~50 ms of CPU. Unauthenticated and unthrottled, that is a free
@@ -687,7 +723,7 @@ pub fn hash_password(password: &str) -> anyhow::Result<String> {
 pub fn generate_token() -> (String, String) {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let token = hex::encode(bytes);
+    let token = format!("{STATIC_TOKEN_PREFIX}{}", hex::encode(bytes));
     let digest = hex::encode(Sha256::digest(token.as_bytes()));
     (token, digest)
 }
@@ -803,23 +839,47 @@ mod tests {
     #[test]
     fn sessions_are_unguessable_and_revocable() {
         let s = SessionStore::new(Duration::from_secs(60));
-        let a = s.create();
-        let b = s.create();
+        let (a, a_expires) = s.create();
+        let (b, _) = s.create();
         assert_ne!(a, b);
-        assert_eq!(a.len(), 64, "256 bits of hex");
-        assert!(s.is_valid(&a));
+        assert!(a.starts_with(SESSION_TOKEN_PREFIX), "{a}");
+        assert_eq!(
+            a.len(),
+            SESSION_TOKEN_PREFIX.len() + 64,
+            "the prefix and 256 bits of hex"
+        );
+        assert_eq!(s.expiry(&a), Some(a_expires));
         s.revoke(&a);
-        assert!(!s.is_valid(&a), "logout must actually invalidate");
+        assert!(!s.is_valid(&a), "revoking must actually invalidate");
         assert!(s.is_valid(&b));
         assert!(!s.is_valid("nonsense"));
     }
 
     #[test]
+    fn a_static_token_is_never_mistaken_for_a_session() {
+        let s = SessionStore::new(Duration::from_secs(60));
+        let (static_token, _) = generate_token();
+        assert!(static_token.starts_with(STATIC_TOKEN_PREFIX));
+        assert_eq!(s.expiry(&static_token), None);
+    }
+
+    #[test]
+    fn the_store_holds_no_token_it_could_hand_back() {
+        let s = SessionStore::new(Duration::from_secs(60));
+        let (token, _) = s.create();
+        let dump = format!("{s:?}");
+        assert!(
+            !dump.contains(token.trim_start_matches(SESSION_TOKEN_PREFIX)),
+            "the store keeps a digest, not the token: {dump}"
+        );
+    }
+
+    #[test]
     fn expired_sessions_stop_being_valid() {
         let s = SessionStore::new(Duration::from_millis(1));
-        let id = s.create();
+        let (token, _) = s.create();
         std::thread::sleep(Duration::from_millis(20));
-        assert!(!s.is_valid(&id));
+        assert!(!s.is_valid(&token));
         assert_eq!(s.len(), 0);
     }
 

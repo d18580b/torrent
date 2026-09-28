@@ -15,18 +15,17 @@ shorter and covers the dev loop.
 
 ```bash
 sudo dnf install -y gcc-c++ make cmake ninja-build pkgconf-pkg-config \
-                    openssl-devel clang-devel nodejs npm git
+                    openssl-devel clang-devel git
 ```
 
 Ubuntu 24.04:
 
 ```bash
 sudo apt-get install -y build-essential cmake ninja-build pkg-config \
-                        libssl-dev libclang-dev nodejs npm git
+                        libssl-dev libclang-dev git
 ```
 
-`libclang` is for `bindgen`, which parses the C shim header. `nodejs`/`npm`
-build the embedded web client — see §3.
+`libclang` is for `bindgen`, which parses the C shim header.
 
 **Runtime host**, if different from the build host. These are shelled out to at
 runtime and are easy to miss because nothing checks for them at startup:
@@ -92,17 +91,6 @@ Every later build reuses it — across cargo profiles, git worktrees and
 `cargo clean` alike — and costs about a second. `mise run native-clean` deletes
 it; `LIBTORRENT_SYS_FORCE_REBUILD=1` rebuilds past it. See CONTRIBUTING.md for
 the full set of knobs.
-
-**Node is a build dependency by default.** The `web-ui` feature is on by
-default and the build script shells out to `npm` to build the embedded client.
-Without npm — and without a prebuilt `web/dist/` — the build **panics**; it does
-not quietly skip the UI. For a headless daemon:
-
-```bash
-cargo build -p torrentd --release --no-default-features
-```
-
-CI covers that configuration as its own job, so it stays working.
 
 ## 4. Service user, binary, directories
 
@@ -228,7 +216,7 @@ rather than producing a daemon that starts and cannot seed.
 no implicit one: every profile states how it reaches the network, because the
 alternative (the host's own interfaces, with DHT on) is the least private
 posture the daemon has and should not be what you get by writing nothing.
-`POST /api/torrents` therefore always requires `profile_id`.
+`POST /v1/torrents` therefore always requires `profile_id`.
 
 Every profile takes `id` plus `network`, and then:
 
@@ -496,7 +484,7 @@ in a per-profile subdirectory, `<resume_dir>/<profile_id>` and
 
 Skipping this does **not** cost you a re-hash — it costs you the library. The
 torrent-directory inventory scan is partitioned exactly like the resume store,
-so it finds nothing either: the daemon comes up healthy, `GET /api/torrents`
+so it finds nothing either: the daemon comes up healthy, `GET /v1/torrents`
 lists every torrent at `phase: "unknown"`, and nothing seeds.
 
 **4. Delete the orphaned `session_state.dat`.** It is not migrated. A DHT
@@ -578,7 +566,7 @@ config tells you to do.
 `trusted_proxies` are read once, at startup: the session store is built, the
 listener bound and the trusted-proxy set parsed before anything is served, and
 none of them can change under a live server. Editing any of them and then
-sending `SIGHUP` or calling `POST /api/reload` logs
+sending `SIGHUP` or calling `POST /v1/config/reload` logs
 
 ```
 SIGHUP: change to non-reloadable field requires daemon restart; ignored
@@ -624,23 +612,45 @@ the only argument. Paste the output into the mounted config and
 
 `hash-password` prompts twice when stdin is a TTY, once when piped. `new-token`
 prints the **token on stdout** and the **config stanza on stderr**, so
-`new-token … > token.txt` captures only the secret.
+`new-token … > token.txt` captures only the secret. A static token starts
+with `tdp_`.
 
 There is no token-only mode: `[auth]` requires `password_hash`. Scopes are
-`read` (safe methods), `write` (anything that mutates) and `metrics`
-(`/metrics` and nothing else). `/healthz` is always unauthenticated.
+`read` (safe methods), `write` (anything that mutates, and implies `read`) and
+`metrics` (`/metrics` and nothing else). `/healthz` is always unauthenticated.
 
-`POST /api/login` returns 409 with an explanation when the daemon is running
-unauthenticated, rather than the 404 that used to look like a missing route.
+**Every API call is bearer-authenticated**: `Authorization: Bearer <token>`.
+There are no cookies. The password is exchanged for a session token, which
+starts with `tds_`, carries `read` and `write` — never `metrics` — and lasts
+until it expires (`expires_at` in the response), is revoked with
+`DELETE /v1/sessions/current`, or the daemon restarts.
+`GET /v1/sessions/current` describes whichever credential you present. The
+examples on this page call it `$TOKEN`; either kind works:
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8080/v1/sessions \
+             -H 'content-type: application/json' \
+             -d '{"password":"…"}' | jq -r .token)
+```
+
+A throttled attempt is refused with `429` and a `Retry-After` header (§6a).
+`POST /v1/sessions` returns 409 `auth-not-configured` when the daemon is
+running unauthenticated, rather than a 404 that would look like a missing
+route. Every failure the API returns is an RFC 9457 problem
+(`application/problem+json`); branch on its `type`, catalogued in
+[`docs/api/problems.md`](api/problems.md). The API's conventions are in
+[`docs/api/README.md`](api/README.md), and its contract is
+[`docs/api/openapi.json`](api/openapi.json), which every daemon also serves at
+`GET /v1/openapi.json`.
 
 ## 6a. Reverse proxy
 
 torrentd does not terminate TLS and will not. An HTTP server's TLS
 configuration is a thing to get wrong, there is no certificate handling here,
 and there is a mature implementation one hop away. What the daemon does
-provide is an origin that behaves correctly behind one: ETags and conditional
-requests on the web client's assets, precompressed `.br`/`.gz` variants, and a
-`Vary: accept-encoding` so a shared cache keys on it.
+provide is an origin that behaves correctly behind one: every response carries
+`Cache-Control: no-store`, so nothing it serves lands in a shared cache, and
+the real client's address is recovered from the proxy's headers as below.
 
 [`deploy/Caddyfile`](../deploy/Caddyfile) and
 [`deploy/compose.yaml`](../deploy/compose.yaml) are a working pair. The
@@ -648,8 +658,8 @@ contract is three headers:
 
 | Header | What torrentd does with it |
 | --- | --- |
-| `X-Forwarded-For` | the client address, for the login throttle and the failed-login log line |
-| `X-Forwarded-Proto` | `https` sets `Secure` on the session cookie |
+| `X-Forwarded-For` | the client address, for the per-client throttle on `POST /v1/sessions` and the `client_ip` on its log lines |
+| `X-Forwarded-Proto` | logged as `via_https` on the `session issued` line, and used for nothing else |
 | `Forwarded` (RFC 7239) | `for=` supplies the client address where `X-Forwarded-For` is absent; `proto=` supplies the scheme where `X-Forwarded-Proto` is absent |
 
 Each header is named here so that the stripping requirement below can be read
@@ -670,18 +680,17 @@ that is the proxy's address for every request, so the login throttle behaves
 as one shared bucket; on a **directly exposed** daemon it is the real client's
 address, so the throttle keys per source IP — which is the better property,
 because one attacker's failures no longer land in the same bucket as yours.
-Either way the cookie loses its `Secure` attribute, and nothing becomes
-forgeable.
+Either way nothing becomes forgeable.
 
 Above the per-client buckets sits one daemon-wide ceiling: at most ten
 password verifications back to back, regaining one every three seconds,
 however many addresses the attempts come from. Without it a caller with many
 source addresses — one routed IPv6 /64 supplies more than enough — would get
 a bucket per address, and the Argon2 work and the guessing rate would scale
-with how many they hold. With it, a login that would exceed the ceiling gets
-`429` without running the KDF.
+with how many they hold. With it, a `POST /v1/sessions` that would exceed the
+ceiling gets `429`, with `Retry-After`, without running the KDF.
 
-It is not a promise that nobody can lock you out of the login form. A caller
+It is not a promise that nobody can lock you out of `POST /v1/sessions`. A caller
 with enough source addresses can keep that ceiling spent, and while they do
 every login — yours included — is refused, exactly as the single shared
 bucket did before. That costs them nothing but requests: the ~50 ms of Argon2
@@ -703,11 +712,12 @@ daemon believes.
 is the part that is easy to skip, because such a proxy never sends
 `Forwarded` and it is tempting to conclude it has nothing to do about it. It
 does: where an `X-` name is **absent**, the client's `Forwarded` is what the
-daemon reads. Send no `X-Forwarded-Proto` and a client's `Forwarded:
-proto=https` sets `Secure` on the session cookie over a plain-HTTP request,
-which the browser will then neither store nor return — so the operator cannot
-log in. Send no `X-Forwarded-For` and a client's `for=` becomes the throttle
-key and the `client_ip` on the failed-login line.
+daemon reads. Send no `X-Forwarded-For` and a client's `for=` becomes the
+throttle key and the `client_ip` on the failed-login line — a client that
+chooses its own bucket, and writes whatever address it likes into your
+security log. Send no `X-Forwarded-Proto` and a client's `Forwarded:
+proto=https` is what `via_https` records; that misstates one log field and
+changes nothing else.
 
 That fallback is deliberate: it is what makes a proxy emitting only the
 standardised `Forwarded` work at all, and that proxy is fully supported. The
@@ -750,10 +760,9 @@ is this" is answered by the nearest hop and by no other; "was the original
 request over TLS" is answered by **any** hop that says `https`, because TLS is
 terminated at the edge and every hop behind it honestly reports plain HTTP. So
 `X-Forwarded-Proto: https, http` — a TLS edge in front of a plain-HTTP inner
-proxy — means the request *was* over TLS and the session cookie gets its
-`Secure` attribute. Reading the last entry there would withhold `Secure` from
-a deployment that really is TLS-fronted, and the browser would then send the
-session cookie in clear to any plain-HTTP origin on the host.
+proxy — means the request *was* over TLS, and the `session issued` line
+records `via_https = true`. Reading the last entry there would log a
+deployment that really is TLS-fronted as plain HTTP.
 
 `Forwarded`'s `proto=` is read under the same rule, so the same deployment
 gets the same answer whichever name your proxies speak: `Forwarded:
@@ -766,16 +775,13 @@ unreadable, and unreadable is `false` however much `https` sits to its left —
 that is the same readability rule the address arm uses, and it is what stops
 an appending proxy's empty contribution promoting a client's earlier entry.
 
-**What this rule gives up, and why.** A client's own earlier `https` does win,
+**What this rule gives up.** A client's own earlier `https` does win,
 wherever your proxy appends rather than overwrites. Nothing in a request
 distinguishes "TLS edge, then plain inner proxy, both honest" from "client's
-forgery, then honest appending proxy" — they are the same bytes — so this is a
-choice between two harms. Withholding `Secure` from a genuine TLS edge sends
-your session cookie in clear; honouring a forged `https` marks the forger's
-**own** cookie `Secure`, which the browser then neither stores nor returns over
-`http://`, so the forger breaks their own login and nobody else's. Stripping
-what the client sent, which this section already requires, removes the second
-case entirely.
+forgery, then honest appending proxy" — they are the same bytes. The scheme
+feeds only that one log field, so a forged `https` misstates the forger's own
+`session issued` line and nothing else. Stripping what the client sent, which
+this section already requires, removes that case entirely.
 
 **The compose stack does not publish the API to the host.** `deploy/compose.yaml`
 publishes only the BitTorrent ports on `torrentd` and 80/443 on `proxy`; the
@@ -784,7 +790,7 @@ That is deliberate — a proxy fronting the daemon is the whole point of this
 section — but it means `localhost:8080` is not an address on that deployment.
 See §9 for what the first-run checks look like there.
 
-One nginx-specific note: `proxy_buffering off` is required on `/api/events`,
+One nginx-specific note: `proxy_buffering off` is required on `/v1/events`,
 or the SSE stream arrives in one lump at timeout. Caddy streams by default.
 
 ## 7. Limits and sysctls
@@ -826,21 +832,23 @@ empty.
 `SIGTERM` drains resume data (30s budget), persists session state, brings
 tunnels down, and exits.
 
-`POST /api/reload` does what `SIGHUP` does, over HTTP, for a caller that has no
-way to signal the process — a container without `kill`, or the web client.
+`POST /v1/config/reload` does what `SIGHUP` does, over HTTP, for a caller that
+has no way to signal the process — a container without `kill`, or a remote
+client.
 
 ```bash
-curl -sS -X POST localhost:8080/api/reload
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" localhost:8080/v1/config/reload
 ```
 
 | Status | Meaning |
 | --- | --- |
 | `202` | Accepted. The reload runs asynchronously; watch the journal for its result. A request made while another reload is running is queued behind it and also gets `202`. |
-| `429` | The reload queue, which `SIGHUP` shares and which holds eight pending requests, is full. Retry once the queued reloads have run. |
-| `503` | The daemon is shutting down, or was built without the reload channel wired up. |
+| `409` | `reload-pending`: the reload queue, which `SIGHUP` shares and which holds eight pending requests, is full. Retry once the queued reloads have run; they read the same file. |
+| `503` | `reload-unavailable`: the daemon is shutting down, or was built without the reload channel wired up. |
 
-It needs a token with the `write` scope (or a logged-in session) where `[auth]`
-is configured; `read` and `metrics` tokens are refused. It reloads exactly what
+It needs a token with the `write` scope — a session token has it — where
+`[auth]` is configured (§6); `read` and `metrics` tokens are refused with 403
+`insufficient-scope`. Under `allow_unauthenticated` the header is not needed. It reloads exactly what
 `SIGHUP` reloads, and reports the same warnings for a `[[profile]]` field that
 changed and cannot be applied without a restart: the Safety Rule 7 warning
 (`profile identity change requires daemon restart`) where the field is an
@@ -863,9 +871,13 @@ publishes the API — the systemd path of §8, and any run bound to loopback.
 
 ```bash
 curl -s localhost:8080/healthz            # {"heartbeat_age_secs":0,"ok":true,"profiles":1,"profiles_failed":0,"profiles_fenced":0}
-curl -s localhost:8080/api/status | jq    # counts by phase, rates, peers
-curl -s localhost:8080/metrics | head     # torrentd_* series
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8080/v1/status | jq   # counts by phase, rates, peers
+curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8080/metrics | head   # torrentd_* series
 ```
+
+With `[auth]` configured, `$TOKEN` is any `read` credential (§6) and
+`$METRICS_TOKEN` a static token with the `metrics` scope — a session token
+never has it. Without `[auth]`, drop the headers.
 
 **On the compose stack there is no `localhost:8080`** — §6a explains why — so
 run the same checks from inside the container, or through the proxy:
@@ -892,13 +904,23 @@ the start is visible in the payload rather than only in the startup log.
 Confirm settings actually applied rather than trusting the config parsed:
 
 ```bash
-curl -s localhost:8080/metrics | grep torrentd_libtorrent_
+curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8080/metrics | grep torrentd_libtorrent_
 ```
 
-(Compose: `docker compose exec torrentd curl -s localhost:8080/metrics | grep
-torrentd_libtorrent_`.)
+(Compose: `docker compose exec torrentd curl -s -H "Authorization: Bearer
+$METRICS_TOKEN" localhost:8080/metrics | grep torrentd_libtorrent_`.)
 
-Then add one torrent and watch it reach `seeding` in `/api/status`.
+Then add one torrent and watch it reach `seeding` in `/v1/status`:
+
+```bash
+curl -s -X POST localhost:8080/v1/torrents \
+     -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+     -d '{"profile_id":"acct_a","save_path":null,"source":{"kind":"magnet","uri":"magnet:?xt=urn:btih:…"}}'
+```
+
+`source` may instead be `{"kind":"server_path","path":"…"}` for a `.torrent`
+on the daemon's host, or `{"kind":"metainfo","data":"<base64 .torrent>"}`;
+`save_path: null` uses `default_save_path`.
 
 ### Monitoring: Prometheus alerts and a Grafana dashboard
 
@@ -1068,19 +1090,21 @@ while the daemon is scanning is refused rather than interleaved. Then adopt,
 always dry-run first:
 
 ```bash
-curl -sX POST localhost:8080/api/pool/adopt \
-     -H 'content-type: application/json' \
-     -d '{"root_id":1,"path":"movies","profile_id":"acct_a","dry_run":true}'
+curl -sX POST localhost:8080/v1/pool/adoptions \
+     -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+     -d '{"profile_id":"acct_a","dry_run":true,"selector":{"kind":"subtree","root_id":1,"path":"movies"}}'
 ```
 
 `profile_id` is required: adoption hands every matched torrent to one
-profile's session, and the daemon will not pick one for you. Drop `dry_run`
-to adopt for real:
+profile's session, and the daemon will not pick one for you. The selector may
+instead name torrents directly, as
+`{"kind":"infohashes","infohashes":["…"]}`. Set `dry_run` to `false` to adopt
+for real:
 
 ```bash
-curl -sX POST localhost:8080/api/pool/adopt \
-     -H 'content-type: application/json' \
-     -d '{"root_id":1,"path":"movies","profile_id":"acct_a"}'
+curl -sX POST localhost:8080/v1/pool/adoptions \
+     -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+     -d '{"profile_id":"acct_a","dry_run":false,"selector":{"kind":"subtree","root_id":1,"path":"movies"}}'
 ```
 
 On the compose stack, prefix this with `docker compose exec torrentd` or send
@@ -1102,8 +1126,8 @@ On a scratch pool, not your real one.
    not placed. This is derived from live session state, so restarting the
    daemon does not clear it — only a rescan does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
-   /api/pool/plans` and `DELETE /api/torrents/:infohash?delete_files=true` both
-   403.
+   /v1/pool/plans` and `DELETE /v1/torrents/{infohash}?delete_files=true` both
+   answer 403 `mutations-disabled`.
 5. **Pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
    profile should pause its torrents, report `vpn_down`, and refuse adds and
    resumes with 409 until you restart the daemon. It must not restart itself.
@@ -1222,8 +1246,7 @@ On a scratch pool, not your real one.
    NAT-PMP gateway and a mock session. Record the result here when it has.
 
    The ruleset also confines the daemon's **replies**: a request to
-   `http_listen` that arrives on a physical interface — the web client, the
-   API, a Prometheus scrape of `/metrics` — connects and then hangs, because
+   `http_listen` that arrives on a physical interface — an API call, a Prometheus scrape of `/metrics` — connects and then hangs, because
    the response leaves from a socket the daemon's uid owns. Over loopback, or
    through a tunnel, it works. With the kill switch on, reach the API through
    a reverse proxy on the same host (§6a) or scrape from inside the tunnel.
@@ -1267,16 +1290,16 @@ The reload applies `log_level` only when it differs from the value the daemon
 last loaded, and the level it applies replaces any `RUST_LOG` the process was
 started with. Where there is no `systemctl` — the container in `deploy/` has no
 unit, and its log is `docker compose logs torrentd` (or `podman logs`) rather
-than the journal — edit the mounted `torrentd.toml` and call `POST /api/reload`
-(§8) instead: it does what `SIGHUP` does. §8's `curl localhost:8080/api/reload`
-does not work from the host here: `compose.yaml` does not publish the API, and
-the stack runs with `[auth]`, so the call needs a `write`-scoped token. Make it
-from inside the container, or through the proxy:
+than the journal — edit the mounted `torrentd.toml` and call `POST /v1/config/reload`
+(§8) instead: it does what `SIGHUP` does. §8's `curl localhost:8080/v1/config/reload`
+does not work from the host here: `compose.yaml` does not publish the API. The
+stack runs with `[auth]`, so the call needs a `write`-scoped token as in §8.
+Make it from inside the container, or through the proxy:
 
 ```bash
 docker compose exec torrentd curl -sS -X POST \
-     -H "Authorization: Bearer $TOKEN" localhost:8080/api/reload
-curl -sS -X POST -H "Authorization: Bearer $TOKEN" https://your.host/api/reload
+     -H "Authorization: Bearer $TOKEN" localhost:8080/v1/config/reload
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" https://your.host/v1/config/reload
 ```
 
 A `202` means the reload was queued; its result is in the log. Edit that file
@@ -1305,16 +1328,15 @@ run it by hand instead, start the service again afterwards:
 | Symptom | Cause |
 | --- | --- |
 | Unit fails instantly, `Failed to set up mount namespacing` | A path in `ReadWritePaths=` does not exist (§4). |
-| Build panics mentioning `npm` | Node missing; install it or use `--no-default-features` (§3). |
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
-| `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `/api/profiles`, which lists both kinds, bring the tunnels back, then restart — fenced profiles do not resume themselves by design. |
+| `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, bring the tunnels back, then restart — fenced profiles do not resume themselves by design. |
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
 | A WireGuard profile fails with "hooks are not run when the daemon raises the link itself" or "Table = … is not supported" | The daemon is not root, so it raises the link with `ip` and `wg` and cannot run `wg-quick`'s hooks or honour a named table (§11.6). Move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
 | Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port`; a link re-raised by hand after the daemon started has a new port. Restart the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it will not `wg-quick down` something it cannot vouch for, because that would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
-| Adds fail with 409 and `vpn_down` | The profile is fenced. An operator restart is required by design. |
+| Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced. An operator restart is required by design. |
 | Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
-| Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `/api/profiles`, then `POST /api/profiles/<id>/resume-all`. |
+| Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `GET /v1/profiles`, then `POST /v1/profiles/<id>/resume-all`. |

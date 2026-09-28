@@ -126,7 +126,7 @@ allowed_tracker_domains = ["tracker-a.example.com"]
 # Second account, on a provider that hands out an ephemeral forwarded port over
 # NAT-PMP instead (ProtonVPN, PIA). `listen_port` is not written for these: the
 # gateway assigns it at runtime and renews the ~60s lease continuously. The
-# negotiated value is reported by `GET /api/profiles/acct_b` as
+# negotiated value is reported by `GET /v1/profiles/acct_b` as
 # `forwarded_port`, and by the `torrentd_profile_forwarded_port` metric.
 [[profile]]
 id                      = "acct_b"

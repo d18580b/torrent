@@ -323,6 +323,115 @@ int         lt_torrent_tracker_host_matches(const uint8_t* data, size_t len,
                                             char* err_out, int err_len);
 
 /* ------------------------------------------------------------------ */
+/* Per-torrent queries (session required)                              */
+/* ------------------------------------------------------------------ */
+
+/* err_out text written by lt_torrent_details / lt_torrent_files /
+ * lt_torrent_trackers when `h` is not (or is no longer) a torrent in the
+ * session: an id the handle map does not know, or a torrent libtorrent removed
+ * between the lookup and the query. Any other LT_ERR from those functions is a
+ * libtorrent failure. The Rust side compares against this to tell "no such
+ * torrent" apart from a real error. */
+#define LT_ERR_UNKNOWN_HANDLE_MSG "unknown torrent handle"
+
+/* Point-in-time details of one torrent in a session.
+ *
+ * Strings are NUL-terminated and truncated to fit (at a UTF-8 character
+ * boundary). `name` is empty when libtorrent has no name yet (a magnet without
+ * `dn=` before its metadata arrives). */
+struct lt_torrent_details {
+    char     name[LT_PATH_MAX];
+    char     save_path[LT_PATH_MAX];
+    uint64_t total_size;          /* 0 when has_metadata == 0 */
+    int64_t  added_time;          /* unix seconds; 0 when unknown */
+    uint32_t upload_limit;        /* bytes/sec; 0 = unlimited */
+    uint8_t  has_metadata;
+    uint8_t  _pad[3];
+};
+
+/* Fill *out with the details of torrent `h`. Returns LT_OK / LT_ERR (err_out
+ * populated; LT_ERR_UNKNOWN_HANDLE_MSG for an unknown handle). Nothing to
+ * free: the struct holds no heap memory. */
+int         lt_torrent_details(lt_session* s, lt_handle h,
+                               struct lt_torrent_details* out,
+                               char* err_out, int err_len);
+
+/* One file of a torrent in a session, in file-index order. */
+struct lt_torrent_file_entry {
+    char     path[LT_PATH_MAX];   /* torrent-relative, '/'-separated */
+    uint64_t size;
+    /* Bytes of this file covered by pieces the torrent has. Piece
+     * granularity: a piece spanning two files counts toward both only once
+     * it is complete, so this is cheap to compute and never overstates. */
+    uint64_t downloaded;
+    uint8_t  priority;            /* libtorrent download_priority_t, 0..7 */
+    uint8_t  _pad[7];
+};
+
+/* A torrent's file list. `files` is heap-allocated; release the whole struct
+ * with lt_torrent_file_list_free(). */
+struct lt_torrent_file_list {
+    struct lt_torrent_file_entry* files;
+    size_t   num_files;
+    uint8_t  has_metadata;        /* 0: metadata not yet received, no files */
+    uint8_t  _pad[7];
+};
+
+/* Fill *out with torrent `h`'s file list. A torrent without metadata (a
+ * magnet still fetching it) is not an error: LT_OK with has_metadata = 0 and
+ * num_files = 0. Refuses (LT_ERR) more than LT_MAX_TORRENT_FILES files, as
+ * lt_torrent_metadata does. On LT_OK the caller MUST call
+ * lt_torrent_file_list_free(out); on LT_ERR nothing was allocated. */
+int         lt_torrent_files(lt_session* s, lt_handle h,
+                             struct lt_torrent_file_list* out,
+                             char* err_out, int err_len);
+
+/* Release the heap file list. Idempotent; safe on a zero-initialized struct. */
+void        lt_torrent_file_list_free(struct lt_torrent_file_list* l);
+
+/* One tracker (announce_entry) of a torrent in a session.
+ *
+ * libtorrent 2.0 keeps announce state per (listen endpoint x protocol
+ * version). This entry folds them into one row: `updating` is set if any is
+ * mid-announce and `fails` is the largest consecutive-failure count, while
+ * `message`, `last_error`, `next_announce` and the scrape counts come from the
+ * endpoint/protocol pair with the most recent announce activity (the latest
+ * min_announce, i.e. the latest tracker response or failure), falling back to
+ * any pair with a non-empty message / error for those two strings. */
+struct lt_tracker_entry {
+    char     url[LT_PATH_MAX];
+    char     message[LT_MSG_MAX];     /* tracker's last message; "" when none */
+    char     last_error[LT_MSG_MAX];  /* last announce error; "" when none */
+    int64_t  next_announce;           /* unix seconds; 0 when unknown */
+    int32_t  scrape_complete;         /* seeds; -1 when unknown */
+    int32_t  scrape_incomplete;       /* leechers; -1 when unknown */
+    uint32_t fails;
+    uint8_t  tier;
+    uint8_t  verified;
+    uint8_t  updating;
+    uint8_t  _pad[1];
+};
+
+/* A torrent's tracker list, in libtorrent's order (tier-sorted). `entries` is
+ * heap-allocated; release the whole struct with lt_tracker_list_free(). */
+struct lt_tracker_list {
+    struct lt_tracker_entry* entries;
+    size_t   num_entries;
+};
+
+/* Fill *out with torrent `h`'s trackers. Returns LT_OK / LT_ERR (err_out
+ * populated; LT_ERR_UNKNOWN_HANDLE_MSG for an unknown handle). On LT_OK the
+ * caller MUST call lt_tracker_list_free(out); on LT_ERR nothing was
+ * allocated. */
+int         lt_torrent_trackers(lt_session* s, lt_handle h,
+                                struct lt_tracker_list* out,
+                                char* err_out, int err_len);
+
+/* Release the heap tracker list. Idempotent; safe on a zero-initialized
+ * struct. */
+void        lt_tracker_list_free(struct lt_tracker_list* l);
+
+/* ------------------------------------------------------------------ */
 /* Status & alerts                                                     */
 /* ------------------------------------------------------------------ */
 

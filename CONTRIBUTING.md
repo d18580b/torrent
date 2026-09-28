@@ -133,10 +133,8 @@ cargo build --workspace          # debug
 cargo build --workspace --release
 ```
 
-Node is a build dependency of the default feature set and the build panics
-without it. Building headless — the `--no-default-features` flag and what it
-costs you — is documented in one place,
-[`docs/running.md` §3](docs/running.md#3-build).
+The build is Rust and the vendored C++ alone; nothing else is needed.
+[`docs/running.md` §3](docs/running.md#3-build) has the details.
 
 ### The shared native prefix
 

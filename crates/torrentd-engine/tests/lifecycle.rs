@@ -496,3 +496,98 @@ fn resume_clears_the_error_a_disk_failure_left_and_keeps_upload_mode() {
         "resume() never clears upload_mode; flags={flags:?}",
     );
 }
+
+/// The HTTP API's per-torrent queries, through `RealEngine` against a real
+/// session: details, files and trackers for a seeded torrent with metadata,
+/// the metadata-less shape of a magnet, and `TorrentNotFound` once removed.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn engine_queries_report_details_files_and_trackers() {
+    use torrentd_engine::EngineError;
+    use torrentd_engine::RealEngine;
+    use torrentd_engine::TorrentEngine;
+
+    let dir = tempfile::tempdir().unwrap();
+    let save = dir.path().to_str().unwrap().to_string();
+    let data = support::payload(7, FILE_LEN);
+    std::fs::write(dir.path().join("query-A"), &data).unwrap();
+    // Prepend an announce URL to the generated torrent: `announce` sorts
+    // before `info`, so the result is still a canonical bencoded dict. The
+    // port is closed; the torrent never needs the tracker to answer.
+    let tracker = "http://127.0.0.1:1/announce";
+    let plain = support::single_file_torrent("query-A", &data, PIECE_LEN);
+    let mut torrent = format!("d8:announce{}:{tracker}", tracker.len()).into_bytes();
+    torrent.extend_from_slice(&plain[1..]);
+
+    let engine = RealEngine::new(&support::local_seed_settings()).unwrap();
+    let h = engine
+        .add_torrent(AddParams::File {
+            bytes: torrent,
+            save_path: save.clone(),
+            flags: TorrentFlags::SEED_MODE,
+        })
+        .unwrap();
+    engine.set_upload_limit(h, 123_456).unwrap();
+
+    let d = engine.torrent_details(h).unwrap();
+    assert_eq!(d.name.as_deref(), Some("query-A"));
+    assert!(d.has_metadata);
+    assert_eq!(d.total_size, Some(FILE_LEN as u64));
+    assert_eq!(d.save_path, save);
+    assert_eq!(d.upload_limit, Some(123_456));
+    assert!(d.added_at.is_some_and(|t| t > 1_600_000_000), "{d:?}");
+
+    let files = engine.torrent_files(h).unwrap().expect("metadata present");
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].index, 0);
+    assert_eq!(files[0].path, "query-A");
+    assert_eq!(files[0].size, FILE_LEN as u64);
+    assert_eq!(files[0].priority, 4, "libtorrent's default priority");
+    // SEED_MODE assumes every piece, so a seed reports the whole file.
+    let mut downloaded = files[0].downloaded;
+    for _ in 0..100 {
+        if downloaded == FILE_LEN as u64 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        downloaded = engine.torrent_files(h).unwrap().unwrap()[0].downloaded;
+    }
+    assert_eq!(downloaded, FILE_LEN as u64);
+
+    let trackers = engine.torrent_trackers(h).unwrap();
+    assert_eq!(trackers.len(), 1);
+    assert_eq!(trackers[0].url, tracker);
+    assert_eq!(trackers[0].tier, 0);
+    assert!(!trackers[0].verified);
+
+    // A magnet has no metadata: details say so and there is no file list.
+    let m = engine
+        .add_torrent(AddParams::Magnet {
+            uri: "magnet:?xt=urn:btih:0505050505050505050505050505050505050505&dn=pending".into(),
+            save_path: save.clone(),
+            flags: TorrentFlags::PAUSED | TorrentFlags::UPLOAD_MODE,
+        })
+        .unwrap();
+    let md = engine.torrent_details(m).unwrap();
+    assert!(!md.has_metadata);
+    assert_eq!(md.total_size, None);
+    assert_eq!(md.name.as_deref(), Some("pending"));
+    assert_eq!(md.upload_limit, None, "unlimited by default");
+    assert_eq!(engine.torrent_files(m).unwrap(), None);
+
+    // Once removed, every query is TorrentNotFound rather than a shim error.
+    engine.remove_torrent(h, false).unwrap();
+    for err in [
+        engine.torrent_details(h).map(|_| ()).unwrap_err(),
+        engine.torrent_files(h).map(|_| ()).unwrap_err(),
+        engine.torrent_trackers(h).map(|_| ()).unwrap_err(),
+    ] {
+        assert!(
+            matches!(
+                err,
+                EngineError::Safe(libtorrent_safe::Error::TorrentNotFound(ih)) if ih == h.infohash
+            ),
+            "{err:?}"
+        );
+    }
+}
