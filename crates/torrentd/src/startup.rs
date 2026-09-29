@@ -730,8 +730,8 @@ pub async fn boot(
     //
     // A rebind is confirmed against the session's listen outcomes, which only
     // the alert loop sees; it publishes them into `listen_events`, handed to
-    // it below. Until it is spawned the monitor defers a port change rather
-    // than report a port nothing has confirmed.
+    // it below. Until it has cleared its boot backlog the monitor defers a
+    // port change rather than report a port nothing has confirmed.
     let listen_events = Arc::new(torrentd_engine::port_forward::ListenEvents::new());
     let pf = crate::port_forward_monitor::run(
         profile_registry.clone(),
