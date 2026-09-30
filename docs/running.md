@@ -643,7 +643,8 @@ the only argument. Paste the output into the mounted config and
 `compose up -d` as usual.
 
 `hash-password` prompts twice, with the terminal's echo off, when stdin is a
-TTY, and reads one line when piped. `new-token`
+TTY, and reads one line when piped. Ctrl-C at a prompt exits without
+switching echo back on; run `stty echo` to restore it. `new-token`
 prints the **token on stdout** and the **config stanza on stderr**, so
 `new-token … > token.txt` captures only the secret. A static token starts
 with `tdp_`.

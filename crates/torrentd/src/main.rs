@@ -53,6 +53,11 @@ use crate::cli::PoolCmd;
 /// the daemon has no terminal dependency, and this is the one prompt that
 /// needs one. Echo is restored on drop, so an error or a panic between the
 /// prompts does not leave the operator's shell silent.
+///
+/// A signal is not an unwind: Ctrl-C (SIGINT) at a prompt kills the process
+/// without running this drop, and the terminal is left with echo off. No
+/// handler is installed for it; the operator runs `stty echo` (or `reset`) to
+/// get it back, as the `hash-password` help and `docs/running.md` §6 say.
 struct NoEcho {
     active: bool,
 }

@@ -54,6 +54,10 @@ pub enum Command {
         cmd: PoolCmd,
     },
     /// Hash a password for the `[auth] password_hash` config key.
+    ///
+    /// On a terminal it prompts twice with echo switched off (via `stty`);
+    /// piped, it reads one line. Ctrl-C at a prompt exits without switching
+    /// echo back on: run `stty echo` to restore it.
     HashPassword,
     /// Verify VPN configuration against the real host, without seeding.
     Vpn {
