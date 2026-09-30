@@ -675,11 +675,18 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
         .await;
     resp.assert_status(StatusCode::CREATED);
 
-    body_framework_rejections(h, "POST", "/v1/torrents").await;
+    body_framework_rejections(
+        h,
+        "POST",
+        "/v1/torrents",
+        crate::http::v1::ADD_REQUEST_DEADLINE,
+    )
+    .await;
 }
 
-/// `400`, `415`, `413` and `408` for an operation with a JSON body.
-async fn body_framework_rejections(h: &Harness, method: &str, path: &str) {
+/// `400`, `415`, `413` and `408` for an operation with a JSON body, the
+/// `408` arriving at the operation's `deadline`.
+async fn body_framework_rejections(h: &Harness, method: &str, path: &str, deadline: Duration) {
     let token = h.tokens.write.clone();
     let resp = h
         .send_with(
@@ -713,8 +720,16 @@ async fn body_framework_rejections(h: &Harness, method: &str, path: &str) {
         .await;
     assert_eq!(resp.status().as_u16(), 413, "{method} {path}");
     // A body that stalls is cut off at the operation's deadline.
-    let (status, _) = h.slow_body(method, path, Some(&token)).await;
+    let (status, waited) = h.slow_body(method, path, Some(&token)).await;
     assert_eq!(status.as_u16(), 408, "{method} {path}: stalled body");
+    assert!(
+        // The server arms its deadline a moment before the clock is paused,
+        // so the paused clock sees a hair less than the whole of it. The
+        // window is narrow enough that the add's 300 s cannot pass for the
+        // 30 s every other body gets, or the reverse.
+        waited + Duration::from_secs(1) > deadline && waited <= deadline + Duration::from_secs(1),
+        "{method} {path}: cut off at {deadline:?}, not before or long after: {waited:?}",
+    );
 }
 
 async fn controls(h: &Harness, e: &Engines) {
@@ -839,7 +854,7 @@ async fn controls(h: &Harness, e: &Engines) {
         .write_json("PUT", &path, json!({"bytes_per_sec": 5}))
         .await;
     assert_problem(&resp, 500, "internal");
-    body_framework_rejections(h, "PUT", &path).await;
+    body_framework_rejections(h, "PUT", &path, crate::http::v1::REQUEST_DEADLINE).await;
 }
 
 fn file(index: u32, path: &str) -> TorrentFile {
@@ -979,7 +994,7 @@ async fn files(h: &Harness, e: &Engines) {
         .write_json("PUT", &priority(0), json!({"priority": 1}))
         .await;
     assert_problem(&resp, 404, "torrent-not-found");
-    body_framework_rejections(h, "PUT", &priority(0)).await;
+    body_framework_rejections(h, "PUT", &priority(0), crate::http::v1::REQUEST_DEADLINE).await;
 }
 
 async fn trackers(h: &Harness, e: &Engines) {
