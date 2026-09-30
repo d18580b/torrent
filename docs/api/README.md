@@ -142,7 +142,11 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
   64 MiB `.torrent`. An operation that takes no body declares no `413`.
 - **Deadlines.** An operation that takes a body must have received it and
   answered within 30 seconds of the request head — 300 seconds for
-  `POST /v1/torrents` — or it is answered `408` and the request is abandoned.
+  `POST /v1/torrents` — or it is answered `408`. A `408` does not undo
+  effects already started: an add may still complete, so a retry can get a
+  `409` [`torrent-exists`](problems.md#torrent-exists) (re-read the torrent
+  rather than adding it again), and a `POST /v1/pool/verifications` may still
+  start its rechecks.
   `POST /v1/pool/plans/{plan_id}/apply`, which waits for every step of a plan,
   has no deadline. The server also closes an HTTP/1 connection whose request
   head takes more than 10 seconds to arrive, closes an HTTP/2 connection that

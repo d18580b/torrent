@@ -42,6 +42,7 @@ says everything there is to say:
 | `401` | No bearer token, or one that is unknown, expired or revoked. `WWW-Authenticate: Bearer` accompanies it. |
 | `404` | No route matches the path. |
 | `405` | The route exists, but not for this method. |
+| `408` | An operation that takes a body did not receive it and answer within its deadline (30 seconds, or 300 for `POST /v1/torrents`). Effects already started are not undone: an add may still complete, and a pool verification's rechecks may still start. |
 | `413` | The request body is over the operation's limit (64 KiB, or 96 MiB for `POST /v1/torrents`). |
 | `415` | A body whose `Content-Type` is not `application/json`. |
 | `422` | A JSON body of the wrong shape: a missing field, an unknown field, or a value of the wrong type. |
