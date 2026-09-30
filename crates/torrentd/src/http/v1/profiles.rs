@@ -364,8 +364,35 @@ fn explain(s: &AppState, profile_id: &ProfileId, problem: ProfileProblem) -> Pro
 struct Reached {
     /// Torrents the engine accepted the call for.
     ok: u32,
-    /// The handles it refused.
+    /// Torrents it refused, all of them.
+    failed_count: u32,
+    /// The refused handles with the smallest infohashes: after
+    /// [`Reached::keep_smallest`], at most [`MAX_REPORTED_FAILURES`] of them in
+    /// infohash order. Only those can be named, so a profile whose session
+    /// refuses tens of thousands of torrents hands back a bounded list rather
+    /// than every one of them to sort on an async worker.
     failed: Vec<torrentd_engine::TorrentHandle>,
+}
+
+impl Reached {
+    /// Count a refused handle, keeping it only while it could be named.
+    ///
+    /// Trims once the list reaches twice the cap, so each trim sorts a
+    /// bounded list and the work stays linear in the failures.
+    fn fail(&mut self, h: torrentd_engine::TorrentHandle) {
+        self.failed_count = self.failed_count.saturating_add(1);
+        self.failed.push(h);
+        if self.failed.len() >= 2 * MAX_REPORTED_FAILURES {
+            self.keep_smallest();
+        }
+    }
+
+    /// Cut `failed` to the [`MAX_REPORTED_FAILURES`] smallest infohashes, in
+    /// infohash order.
+    fn keep_smallest(&mut self) {
+        self.failed.sort_unstable_by_key(|h| h.infohash.0);
+        self.failed.truncate(MAX_REPORTED_FAILURES);
+    }
 }
 
 /// Apply `op` to every torrent `profile_id` holds.
@@ -382,15 +409,17 @@ async fn for_each_torrent(
     blocking(move || {
         let mut reached = Reached {
             ok: 0,
+            failed_count: 0,
             failed: Vec::new(),
         };
         for h in handles {
             if op(engine.as_ref(), h) {
                 reached.ok = reached.ok.saturating_add(1);
             } else {
-                reached.failed.push(h);
+                reached.fail(h);
             }
         }
+        reached.keep_smallest();
         reached
     })
     .await
@@ -400,9 +429,11 @@ async fn for_each_torrent(
 ///
 /// Across profiles the named ones are the smallest infohashes that failed,
 /// so the list is the same whichever order the profiles were visited in.
+/// Each profile's list is already bounded, so this merges at most twice the
+/// cap.
 fn tally(out: &mut BulkOutcome, reached: Reached) {
     out.torrent_count = out.torrent_count.saturating_add(reached.ok);
-    out.failed_count = out.failed_count.saturating_add(count(reached.failed.len()));
+    out.failed_count = out.failed_count.saturating_add(reached.failed_count);
     out.failed_infohashes
         .extend(reached.failed.iter().map(|h| InfoHashHex::new(h.infohash)));
     out.failed_infohashes.sort_by_key(|ih| ih.get().0);
@@ -602,6 +633,7 @@ mod tests {
             &mut out,
             Reached {
                 ok: 3,
+                failed_count: 51,
                 failed: (150..=200).rev().map(handle).collect(),
             },
         );
@@ -609,6 +641,7 @@ mod tests {
             &mut out,
             Reached {
                 ok: 2,
+                failed_count: 60,
                 failed: (1..=60).map(handle).collect(),
             },
         );
@@ -618,5 +651,38 @@ mod tests {
         let want: Vec<u8> = (1..=60).chain(150..=189).collect();
         assert_eq!(named.len(), MAX_REPORTED_FAILURES);
         assert_eq!(named, want);
+    }
+
+    #[test]
+    fn a_profile_keeps_only_the_failures_it_could_name_and_counts_them_all() {
+        use torrentd_engine::InfoHash;
+        use torrentd_engine::TorrentHandle;
+        let handle = |n: u16| {
+            let mut ih = [0u8; 20];
+            ih[..2].copy_from_slice(&n.to_be_bytes());
+            TorrentHandle {
+                id: u64::from(n) + 1,
+                infohash: InfoHash(ih),
+            }
+        };
+        let mut reached = Reached {
+            ok: 0,
+            failed_count: 0,
+            failed: Vec::new(),
+        };
+        // Largest first, so every trim has something smaller to keep.
+        for n in (0..1000u16).rev() {
+            reached.fail(handle(n));
+            assert!(reached.failed.len() < 2 * MAX_REPORTED_FAILURES);
+        }
+        reached.keep_smallest();
+        assert_eq!(reached.failed_count, 1000);
+        let kept: Vec<u16> = reached
+            .failed
+            .iter()
+            .map(|h| u16::from_be_bytes([h.infohash.0[0], h.infohash.0[1]]))
+            .collect();
+        let want: Vec<u16> = (0..100).collect();
+        assert_eq!(kept, want);
     }
 }
