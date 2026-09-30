@@ -9787,6 +9787,7 @@
               "$ref": "#/components/schemas/InfoHashHex"
             },
             "type": "array",
+            "maxItems": 100,
             "description": "Which torrents those were: the 100 smallest infohashes among them, in\ninfohash order. Retry each with its own\n`POST /v1/torrents/{infohash}/pause` or `/resume`; when\n`failed_count` is larger, repeat the bulk operation after those."
           },
           "skipped_profiles": {

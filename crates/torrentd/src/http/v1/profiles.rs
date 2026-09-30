@@ -176,6 +176,7 @@ pub struct BulkOutcome {
     /// infohash order. Retry each with its own
     /// `POST /v1/torrents/{infohash}/pause` or `/resume`; when
     /// `failed_count` is larger, repeat the bulk operation after those.
+    #[schema(max_items = 100)]
     pub failed_infohashes: Vec<InfoHashHex>,
     /// Profiles this request did not act on, each with why. Always empty for
     /// a single profile's operation, which refuses instead.
@@ -184,7 +185,9 @@ pub struct BulkOutcome {
 
 /// How many failed infohashes a bulk operation names. A daemon-wide pause
 /// against a session that refuses everything would otherwise answer with a
-/// hundred thousand of them.
+/// hundred thousand of them. Published as `failed_infohashes`' `maxItems`,
+/// which the derive takes only as a literal: the spec tests hold the two
+/// equal.
 pub const MAX_REPORTED_FAILURES: usize = 100;
 
 /// A profile a bulk operation did not act on.

@@ -177,6 +177,19 @@ fn every_page_limit_publishes_its_bounds() {
 }
 
 #[test]
+fn a_bulk_outcome_publishes_how_many_failures_it_names() {
+    // The handlers cut the list at the cap; a client sizing a buffer or
+    // validating a response learns that only from the document.
+    let doc = doc();
+    let failed = &doc["components"]["schemas"]["BulkOutcome"]["properties"]["failed_infohashes"];
+    assert_eq!(
+        failed["maxItems"].as_u64(),
+        Some(crate::http::v1::profiles::MAX_REPORTED_FAILURES as u64),
+        "{failed}"
+    );
+}
+
+#[test]
 fn only_operations_with_a_body_declare_a_deadline() {
     // `408` comes from the deadline a body-bearing group carries; one on an
     // operation without a body would be a promise nothing can produce, and
