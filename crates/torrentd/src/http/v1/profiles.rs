@@ -631,13 +631,15 @@ mod tests {
             infohash: InfoHash([b; 20]),
         };
         let mut out = BulkOutcome::default();
-        // Two profiles, visited largest-first, together over the cap.
+        // Two profiles, visited largest-first, together over the cap. The
+        // first refused more than it could name, so its count is not its
+        // list's length.
         tally(
             &mut out,
             Reached {
                 ok: 3,
-                failed_count: 51,
-                failed: (150..=200).rev().map(handle).collect(),
+                failed_count: 1000,
+                failed: (101..=200).rev().map(handle).collect(),
             },
         );
         tally(
@@ -649,9 +651,9 @@ mod tests {
             },
         );
         assert_eq!(out.torrent_count, 5);
-        assert_eq!(out.failed_count, 51 + 60);
+        assert_eq!(out.failed_count, 1000 + 60);
         let named: Vec<u8> = out.failed_infohashes.iter().map(|h| h.get().0[0]).collect();
-        let want: Vec<u8> = (1..=60).chain(150..=189).collect();
+        let want: Vec<u8> = (1..=60).chain(101..=140).collect();
         assert_eq!(named.len(), MAX_REPORTED_FAILURES);
         assert_eq!(named, want);
     }
