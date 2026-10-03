@@ -139,10 +139,12 @@ name = "drill"
 sha256 = "$write_sha"
 scopes = ["read", "write"]
 
+# The container's own device rather than 0.0.0.0, which is refused beside a
+# vpn profile: libtorrent would expand it to the tunnel's address too.
 [[profile]]
 id = "drill"
 network = "host"
-listen_interfaces = "0.0.0.0:6881"
+listen_interfaces = "eth0:6881"
 dht = false
 
 # No such tunnel config exists, and the daemon's uid could not raise one if it
@@ -156,6 +158,7 @@ vpn_interface = "wg-drill"
 listen_port = 6891
 peer_fingerprint = "-qB5030-"
 user_agent = "qBittorrent/5.0.3"
+allowed_tracker_domains = ["tracker.example.com"]
 EOF
 # Refuse to start a stack whose daemon would exit on its config: a compose
 # dependency on an exited service can wait indefinitely.

@@ -22,6 +22,7 @@ use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentPhase;
+use torrentd_engine::TrackerRefusal;
 use torrentd_pool::adopt::AdoptPlan;
 use torrentd_pool::AdoptionState;
 use torrentd_pool::PoolStore;
@@ -244,6 +245,9 @@ pub struct PendingVerify {
     pub torrent_path: PathBuf,
     pub save_path: PathBuf,
     pub profile: ProfileId,
+    /// Whether the enqueue wrote `profile` as the pool index's owner, which a
+    /// drop then has to clear.
+    pub owner_recorded: bool,
 }
 
 impl VerifyQueue {
@@ -388,7 +392,7 @@ pub async fn run_verify_queue(
             }
             let Some(engine) = source.engine_for(&item.profile) else {
                 warn!(target: "torrentd::pool", profile_id = %item.profile, "no engine for profile; dropping verify");
-                release_dropped_claim(&registry, &item);
+                release_dropped_claim(&pool, &registry, &item);
                 continue;
             };
             let bytes = match std::fs::read(&item.torrent_path) {
@@ -401,7 +405,7 @@ pub async fn run_verify_queue(
                         "cannot read .torrent; dropping verify",
                     );
                     q.failed.fetch_add(1, Ordering::Relaxed);
-                    release_dropped_claim(&registry, &item);
+                    release_dropped_claim(&pool, &registry, &item);
                     continue;
                 }
             };
@@ -415,14 +419,22 @@ pub async fn run_verify_queue(
                     "verify queue holds an item for a profile that is not live; dropping",
                 );
                 q.failed.fetch_add(1, Ordering::Relaxed);
-                release_dropped_claim(&registry, &item);
+                release_dropped_claim(&pool, &registry, &item);
                 continue;
             };
-            match engine.add_torrent(verify_add_params(
+            let params = verify_add_params(
                 profile_cfg,
                 bytes,
                 item.save_path.to_string_lossy().into_owned(),
-            )) {
+            );
+            // The adopt checked this `.torrent` before queueing it; these are
+            // the bytes read now, which are what the session gets.
+            if verify_guard(metrics.as_ref(), profile_cfg, &item, &params).is_err() {
+                q.failed.fetch_add(1, Ordering::Relaxed);
+                release_dropped_claim(&pool, &registry, &item);
+                continue;
+            }
+            match engine.add_torrent(params) {
                 Ok(_) => {
                     q.in_flight.lock().push(item.infohash.clone());
                     info!(
@@ -435,7 +447,7 @@ pub async fn run_verify_queue(
                 Err(e) => {
                     q.failed.fetch_add(1, Ordering::Relaxed);
                     warn!(target: "torrentd::pool", infohash = %item.infohash, error.cause = %e, "verify add failed");
-                    release_dropped_claim(&registry, &item);
+                    release_dropped_claim(&pool, &registry, &item);
                 }
             }
         }
@@ -454,6 +466,39 @@ pub async fn run_verify_queue(
     }
 }
 
+/// Hold the bytes the verify worker is about to add to the account-isolation
+/// guard.
+///
+/// A refusal is logged, and a `NotAllowed` one is counted in
+/// `profile_assignment_registry_errors_total`, where `POST /v1/torrents`, both
+/// boot scans and the adoption's enqueue count theirs. Bytes whose trackers
+/// cannot be read are a failed verify, not an isolation refusal.
+fn verify_guard(
+    metrics: &dyn MetricsSink,
+    profile: &torrentd_engine::ProfileConfig,
+    item: &PendingVerify,
+    params: &AddParams,
+) -> Result<(), TrackerRefusal> {
+    let refusal = match torrentd_engine::check_trackers(profile, params) {
+        Ok(()) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    warn!(
+        target: "torrentd::pool",
+        profile_id = %item.profile,
+        infohash = %item.infohash,
+        error.cause = %refusal,
+        "verify dropped: refused by the profile's allowed_tracker_domains",
+    );
+    if matches!(refusal, TrackerRefusal::NotAllowed) {
+        metrics.inc_counter(
+            "profile_assignment_registry_errors_total",
+            &[("profile_id", item.profile.as_str())],
+        );
+    }
+    Err(refusal)
+}
+
 /// Release the registry claim of a verify item the worker is dropping.
 ///
 /// `POST /v1/pool/adoptions` claims the info-hash before it queues the item, and
@@ -464,7 +509,24 @@ pub async fn run_verify_queue(
 /// every re-add or re-adopt until a restart. The claim is released only while
 /// it still names the item's profile, so a claim someone else has since taken
 /// is left alone.
-fn release_dropped_claim(registry: &AssignmentRegistry, item: &PendingVerify) {
+///
+/// The pool index's owner record the enqueue wrote goes too, while it still
+/// names the item's profile. Left behind, it made adoption into any other
+/// profile refuse the torrent, and `DELETE` could not clear it: with no
+/// registry entry it answers not found.
+fn release_dropped_claim(pool: &PoolService, registry: &AssignmentRegistry, item: &PendingVerify) {
+    if item.owner_recorded {
+        let cleared = pool.with_store(|s| match s.profile_of(&item.infohash) {
+            Ok(Some(owner)) if owner == item.profile.as_str() => {
+                s.set_profile(&item.infohash, None)
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        });
+        if let Err(e) = cleared {
+            pool.note_store_error("set_profile", &e);
+        }
+    }
     let Some(ih) = libtorrent_safe::InfoHash::from_hex(&item.infohash) else {
         return;
     };
@@ -578,32 +640,88 @@ fn unresolved_profile(
     }
 }
 
+/// Why [`execute_adopt`] did not adopt a torrent.
+#[derive(Debug)]
+pub struct AdoptRefusal {
+    /// What the response's `refused` entry says.
+    pub reason: String,
+    /// Refused by the account-isolation guard because the torrent announces
+    /// outside the profile's `allowed_tracker_domains`
+    /// (`TrackerRefusal::NotAllowed`), which the caller counts in
+    /// `profile_assignment_registry_errors_total` as every add path does. A
+    /// `.torrent` whose trackers cannot be read is not one.
+    pub isolation: bool,
+}
+
+impl From<String> for AdoptRefusal {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            isolation: false,
+        }
+    }
+}
+
+/// The refusal an adoption the account-isolation guard refused carries.
+///
+/// Only `NotAllowed` is an isolation refusal, as on `POST /v1/torrents` and
+/// both boot scans; an unreadable `.torrent` is refused uncounted.
+fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
+    AdoptRefusal {
+        reason: format!("refused by the profile's allowed_tracker_domains: {e}"),
+        isolation: matches!(e, TrackerRefusal::NotAllowed),
+    }
+}
+
 /// Adopt one torrent: execute whatever `torrentd_pool::adopt::plan` decided.
 ///
 /// The fast path adds immediately in seed mode. The verify path only enqueues —
 /// admission is the queue's job, so a bulk adopt returns straight away instead
 /// of blocking an HTTP request for hours.
+///
+/// Either path first holds what it would hand the session to the
+/// account-isolation guard (`torrentd_engine::check_trackers`): the fast path
+/// the resume data with its `.torrent`, whose own `trackers` list is what
+/// libtorrent announces to where it has one; the verify path the `.torrent`.
+/// A torrent outside the profile's `allowed_tracker_domains` is refused, and
+/// never falls back to the other path. `dry_run` runs everything up to the
+/// add or the enqueue, and does neither.
 pub fn execute_adopt(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
     profiles: &crate::profile_registry::ProfileRegistry,
     infohash: &str,
     profile: ProfileId,
-) -> Result<&'static str, String> {
+    dry_run: bool,
+) -> Result<&'static str, AdoptRefusal> {
     let plan = pool
         .with_store(|s| torrentd_pool::adopt::plan(s, infohash, |id| pool.root_path_of(id)))
         .map_err(|e| e.to_string())?;
 
     match plan {
-        AdoptPlan::Refuse { reason } => Err(reason.to_string()),
+        AdoptPlan::Refuse { reason } => Err(reason.to_string().into()),
         AdoptPlan::FastPath {
             resume_path,
             torrent_path,
             save_path,
         } => {
+            let verify = |torrent_path, save_path, profile| {
+                enqueue_verify(
+                    pool,
+                    profiles,
+                    infohash,
+                    torrent_path,
+                    save_path,
+                    profile,
+                    dry_run,
+                )
+            };
             let engine = source
                 .engine_for(&profile)
                 .ok_or_else(|| unresolved_profile(profiles, &profile))?;
+            let Some(profile_cfg) = profiles.config(&profile) else {
+                return Err(format!("profile {profile} is not live").into());
+            };
             let resume = match std::fs::read(&resume_path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -617,22 +735,39 @@ pub fn execute_adopt(
                         error.cause = %e,
                         "resume data unreadable; falling back to verification",
                     );
-                    return enqueue_verify(pool, infohash, torrent_path, save_path, profile);
+                    return verify(torrent_path, save_path, profile);
                 }
             };
             // The .torrent rides along because resume data written without
             // SAVE_INFO_DICT carries no metadata; libtorrent ignores it when
             // the resume data already has an info dict.
             let torrent = std::fs::read(&torrent_path).ok();
-            let Some(profile_cfg) = profiles.config(&profile) else {
-                return Err(format!("profile {profile} is not live"));
-            };
-            if let Err(e) = engine.add_torrent(adoption_resume_params(
+            let params = adoption_resume_params(
                 profile_cfg,
                 resume,
-                torrent.clone(),
+                torrent,
                 save_path.to_string_lossy().into_owned(),
-            )) {
+            );
+            match torrentd_engine::check_trackers(profile_cfg, &params) {
+                Ok(()) => {}
+                Err(e @ TrackerRefusal::NotAllowed) => return Err(tracker_refusal(&e)),
+                Err(TrackerRefusal::Unreadable(e)) => {
+                    // libtorrent would refuse these bytes too, which is the
+                    // fallback below; the verify path holds the `.torrent`
+                    // to the guard on its own.
+                    warn!(
+                        target: "torrentd::pool",
+                        infohash = %infohash,
+                        error.cause = %e,
+                        "resume data unparseable; falling back to verification",
+                    );
+                    return verify(torrent_path, save_path, profile);
+                }
+            }
+            if dry_run {
+                return Ok("fast_path");
+            }
+            if let Err(e) = engine.add_torrent(params) {
                 // Resume data another client wrote can be truncated, from an
                 // incompatible version, or simply not libtorrent's format at
                 // all. None of that is a reason to leave the payload
@@ -644,7 +779,7 @@ pub fn execute_adopt(
                     error.cause = %e,
                     "resume add rejected; falling back to verification",
                 );
-                return enqueue_verify(pool, infohash, torrent_path, save_path, profile);
+                return verify(torrent_path, save_path, profile);
             }
 
             let (adoption, owner) = pool.with_store(|s| {
@@ -671,26 +806,64 @@ pub fn execute_adopt(
         AdoptPlan::Verify {
             torrent_path,
             save_path,
-        } => enqueue_verify(pool, infohash, torrent_path, save_path, profile),
+        } => enqueue_verify(
+            pool,
+            profiles,
+            infohash,
+            torrent_path,
+            save_path,
+            profile,
+            dry_run,
+        ),
     }
 }
 
-/// Queue a torrent for hashing before it is allowed to seed.
+/// Queue a torrent for hashing before it is allowed to seed, once its
+/// `.torrent` has passed the account-isolation guard. The queue's worker
+/// holds the bytes it actually adds to the guard again.
 fn enqueue_verify(
     pool: &PoolService,
+    profiles: &crate::profile_registry::ProfileRegistry,
     infohash: &str,
     torrent_path: PathBuf,
     save_path: PathBuf,
     profile: ProfileId,
-) -> Result<&'static str, String> {
-    if let Err(e) = pool.with_store(|s| s.set_profile(infohash, Some(profile.as_str()))) {
-        pool.note_store_error("set_profile", &e);
+    dry_run: bool,
+) -> Result<&'static str, AdoptRefusal> {
+    let Some(profile_cfg) = profiles.config(&profile) else {
+        return Err(format!("profile {profile} is not live").into());
+    };
+    // A profile with no allow-list has nothing to check, and the worker reads
+    // the file when it admits the item; one with a list cannot pass the guard
+    // without its trackers, so a `.torrent` that cannot be read is refused.
+    if !profile_cfg.allowed_tracker_domains.is_empty() {
+        let bytes = std::fs::read(&torrent_path)
+            .map_err(|e| format!("cannot read the .torrent to check its trackers: {e}"))?;
+        let params =
+            verify_add_params(profile_cfg, bytes, save_path.to_string_lossy().into_owned());
+        torrentd_engine::check_trackers(profile_cfg, &params).map_err(|e| tracker_refusal(&e))?;
     }
+    if dry_run {
+        return Ok("queued_for_verification");
+    }
+    // An owner record that already names this profile is not the enqueue's,
+    // so a drop leaves it; one the enqueue writes goes with the item.
+    let recorded = pool.with_store(|s| match s.profile_of(infohash) {
+        Ok(Some(owner)) if owner == profile.as_str() => Ok(false),
+        _ => s
+            .set_profile(infohash, Some(profile.as_str()))
+            .map(|()| true),
+    });
+    let owner_recorded = recorded.unwrap_or_else(|e| {
+        pool.note_store_error("set_profile", &e);
+        false
+    });
     pool.verify_queue().enqueue(PendingVerify {
         infohash: infohash.to_string(),
         torrent_path,
         save_path,
         profile,
+        owner_recorded,
     });
     Ok("queued_for_verification")
 }
@@ -709,6 +882,7 @@ mod tests {
 
     use torrentd_engine::InfoHash;
     use torrentd_engine::ProfileId;
+    use torrentd_engine::ProfileStatus;
     use torrentd_engine::TorrentHandle;
     use torrentd_engine::TorrentPhase;
     use torrentd_engine::TorrentState;
@@ -853,7 +1027,178 @@ mod tests {
             torrent_path: "/nonexistent.torrent".into(),
             save_path: "/nonexistent".into(),
             profile: ProfileId::new(profile),
+            owner_recorded: false,
         }
+    }
+
+    /// A pool index holding one torrent, `ih`, owned by `owner`.
+    fn pool_with(dir: &std::path::Path, ih: InfoHash, owner: Option<&str>) -> super::PoolService {
+        let cfg = crate::config::Config::minimal_for_tests(dir, false);
+        let pool =
+            std::sync::Arc::into_inner(super::PoolService::open(&cfg).unwrap().unwrap()).unwrap();
+        let hex = ih.to_hex();
+        let row = torrentd_pool::PoolTorrent {
+            infohash: hex.clone(),
+            infohash_v1: None,
+            infohash_v2: None,
+            name: "t".into(),
+            total_size: 1,
+            num_files: 1,
+            source_path: dir.join("t.torrent"),
+            fastresume_path: None,
+            declared_save_path: None,
+            category: None,
+            tags: vec![],
+            profile: None,
+        };
+        pool.with_store(|s| {
+            s.upsert_torrent(&row, 0).unwrap();
+            s.set_profile(&hex, owner).unwrap();
+        });
+        pool
+    }
+
+    fn owner_of(pool: &super::PoolService, ih: InfoHash) -> Option<String> {
+        pool.with_store(|s| s.profile_of(&ih.to_hex()).unwrap())
+    }
+
+    /// The enqueue writes the pool index's owner before the worker runs, so a
+    /// drop has to take it back: left behind, it refused adoption into every
+    /// other profile, and `DELETE` (with no registry entry) answered not
+    /// found.
+    #[test]
+    fn a_dropped_verify_clears_the_index_owner_its_enqueue_recorded() {
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash([0x55; 20]);
+        let pool = pool_with(dir.path(), ih, None);
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        reg.assign(ih, ProfileId::new("p")).unwrap();
+
+        super::enqueue_verify(
+            &pool,
+            &profiles,
+            &ih.to_hex(),
+            dir.path().join("t.torrent"),
+            dir.path().join("payload"),
+            ProfileId::new("p"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        assert!(item.owner_recorded);
+
+        super::release_dropped_claim(&pool, &reg, &item);
+        assert_eq!(owner_of(&pool, ih), None);
+        assert_eq!(reg.lookup(&ih), None);
+    }
+
+    /// An owner record the enqueue did not write, or that names another
+    /// profile by the time of the drop, is not the drop's to clear.
+    #[test]
+    fn a_dropped_verify_leaves_an_index_owner_it_did_not_record() {
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash([0x66; 20]);
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+
+        // Already this profile's before the adopt: the enqueue records nothing.
+        let pool = pool_with(dir.path(), ih, Some("p"));
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        super::enqueue_verify(
+            &pool,
+            &profiles,
+            &ih.to_hex(),
+            dir.path().join("t.torrent"),
+            dir.path().join("payload"),
+            ProfileId::new("p"),
+            false,
+        )
+        .unwrap();
+        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        assert!(!item.owner_recorded);
+        super::release_dropped_claim(&pool, &reg, &item);
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+
+        // Recorded, but another profile's by now.
+        pool.with_store(|s| s.set_profile(&ih.to_hex(), Some("other")).unwrap());
+        let item = super::PendingVerify {
+            owner_recorded: true,
+            ..pending(ih, "p")
+        };
+        super::release_dropped_claim(&pool, &reg, &item);
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("other"));
+    }
+
+    /// The verify worker counts a foreign `.torrent` as an isolation refusal,
+    /// as every add path does, and bytes it cannot read as a failed verify
+    /// only.
+    #[test]
+    fn the_verify_worker_counts_only_a_foreign_torrent_as_an_isolation_refusal() {
+        let mut profile = crate::profile_registry::test_entry("acct", ProfileStatus::Active).config;
+        profile.allowed_tracker_domains = vec!["allowed.example".to_owned()];
+        let metrics = crate::metrics_sink::PromSink::new();
+        let item = pending(InfoHash([0x44; 20]), "acct");
+        let file = |announce: &str| {
+            let mut t = format!(
+                "d8:announce{}:{announce}4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:",
+                announce.len()
+            )
+            .into_bytes();
+            t.extend_from_slice(&[0u8; 20]);
+            t.extend_from_slice(b"ee");
+            super::verify_add_params(&profile, t, "/p".into())
+        };
+        let counted = || {
+            let text = String::from_utf8(metrics.render()).unwrap();
+            text.lines()
+                .find(|l| {
+                    l.contains("profile_assignment_registry_errors_total{profile_id=\"acct\"}")
+                })
+                .map(str::to_owned)
+        };
+
+        super::verify_guard(
+            &metrics,
+            &profile,
+            &item,
+            &file("http://tracker.allowed.example/announce"),
+        )
+        .unwrap();
+        assert!(matches!(
+            super::verify_guard(
+                &metrics,
+                &profile,
+                &item,
+                &super::verify_add_params(&profile, b"not bencode".to_vec(), "/p".into()),
+            ),
+            Err(super::TrackerRefusal::Unreadable(_))
+        ));
+        assert!(
+            counted().is_none_or(|l| l.ends_with(" 0")),
+            "{:?}",
+            counted()
+        );
+        assert!(matches!(
+            super::verify_guard(
+                &metrics,
+                &profile,
+                &item,
+                &file("http://tracker.foreign.example/announce"),
+            ),
+            Err(super::TrackerRefusal::NotAllowed)
+        ));
+        assert!(
+            counted().is_some_and(|l| l.ends_with(" 1")),
+            "{:?}",
+            counted()
+        );
     }
 
     /// A verify item the worker drops never reaches a session, so its claim
@@ -865,7 +1210,8 @@ mod tests {
         let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([0x22; 20]);
         reg.assign(ih, ProfileId::new("p")).unwrap();
-        super::release_dropped_claim(&reg, &pending(ih, "p"));
+        let pool = pool_with(dir.path(), ih, None);
+        super::release_dropped_claim(&pool, &reg, &pending(ih, "p"));
         assert_eq!(reg.lookup(&ih), None);
     }
 
@@ -877,7 +1223,8 @@ mod tests {
         let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([0x33; 20]);
         reg.assign(ih, ProfileId::new("other")).unwrap();
-        super::release_dropped_claim(&reg, &pending(ih, "p"));
+        let pool = pool_with(dir.path(), ih, None);
+        super::release_dropped_claim(&pool, &reg, &pending(ih, "p"));
         assert_eq!(reg.lookup(&ih), Some(ProfileId::new("other")));
     }
 

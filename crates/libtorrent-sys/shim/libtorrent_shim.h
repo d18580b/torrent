@@ -322,13 +322,24 @@ int         lt_torrent_metadata(const uint8_t* data, size_t len,
 /* Release the heap file list. Idempotent; safe on a zero-initialized struct. */
 void        lt_torrent_meta_free(struct lt_torrent_meta* m);
 
-/* Return 1 if any tracker URL host in the .torrent buffer matches (equals or
- * is a subdomain of) one of the comma-separated `domains_csv`, 0 if none
- * match, LT_ERR on parse error. Misconfiguration guard for slot assignment
- *. */
-int         lt_torrent_tracker_host_matches(const uint8_t* data, size_t len,
-                                            const char* domains_csv,
-                                            char* err_out, int err_len);
+/* The account-isolation guard: whether every tracker an add would announce to
+ * is on one of the comma-separated `domains_csv` (the host equals a domain or
+ * is a subdomain of it, case-insensitively).
+ *
+ * The source is read as the matching add reads it: resume data when
+ * `resume_buf` is given (with `torrent_buf` as the metadata it lacks, as
+ * lt_add_torrent_resume_ex attaches it), else the magnet URI, else the
+ * .torrent. The trackers checked are the ones libtorrent assembles from those
+ * params — a resume file's own `trackers` list replaces the metadata's.
+ *
+ * Returns 1 when there is at least one tracker and every one is allowed; 0
+ * when any is outside the list, cannot be parsed, or there is none at all;
+ * LT_ERR when the source cannot be parsed (err_out populated). */
+int         lt_add_trackers_allowed(const char* magnet_uri,
+                                    const uint8_t* torrent_buf, size_t torrent_len,
+                                    const uint8_t* resume_buf, size_t resume_len,
+                                    const char* domains_csv,
+                                    char* err_out, int err_len);
 
 /* ------------------------------------------------------------------ */
 /* Per-torrent queries (session required)                              */

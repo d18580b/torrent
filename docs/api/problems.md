@@ -192,8 +192,12 @@ parsed, or the `.torrent` could not be read.
 ## `tracker-not-allowed`
 
 **422**, from `POST /v1/torrents`. The profile sets `allowed_tracker_domains`,
-and the `.torrent` announces to none of them. This guards against adding one
-account's torrent to another account's profile.
+and the torrent announces to a tracker outside them — a `.torrent`'s announce
+list and a magnet's `tr=` parameters are both read — or to no tracker at all.
+Every tracker must be allowed, not just one. This guards against announcing
+one account's passkey from another account's profile. `POST
+/v1/pool/adoptions` refuses such a torrent the same way, in its `refused`
+list.
 
 ## `plan-refused`
 

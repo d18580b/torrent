@@ -53,6 +53,7 @@
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/magnet_uri.hpp>
+#include <libtorrent/parse_url.hpp>
 #include <libtorrent/error_code.hpp>
 #include <libtorrent/sha1_hash.hpp>
 #include <libtorrent/info_hash.hpp>
@@ -76,6 +77,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -1121,9 +1123,24 @@ extern "C" int lt_magnet_info_hash(const char* uri,
 
 namespace {
 
+// A host or domain in the one spelling they are compared in: ASCII
+// lowercase, without surrounding spaces or a trailing root dot.
+std::string canonical_host(std::string s) {
+    auto const first = s.find_first_not_of(" \t");
+    if (first == std::string::npos) return {};
+    s.erase(0, first);
+    s.erase(s.find_last_not_of(" \t") + 1);
+    while (!s.empty() && s.back() == '.') s.pop_back();
+    for (auto& c : s) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return s;
+}
+
+// Both arguments canonical. `host` is `domain` or a subdomain of it.
 bool host_matches_domain(const std::string& host, const std::string& domain) {
+    if (domain.empty()) return false;
     if (host == domain) return true;
-    // Subdomain: host ends with "." + domain.
     if (host.size() > domain.size() + 1) {
         const std::string suffix = "." + domain;
         if (host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0) return true;
@@ -1131,12 +1148,18 @@ bool host_matches_domain(const std::string& host, const std::string& domain) {
     return false;
 }
 
-std::string url_host(const std::string& url) {
-    auto pos = url.find("://");
-    if (pos == std::string::npos) return {};
-    auto start = pos + 3;
-    auto end = url.find_first_of(":/", start);
-    return url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+// Whether libtorrent, announcing to `url`, connects to a host on one of
+// `domains`. The host is read with libtorrent's own URL parser — the one its
+// tracker connections resolve — so userinfo, a port and IPv6 brackets are
+// read as the announce reads them. A URL it cannot read is never allowed.
+bool tracker_url_allowed(const std::string& url, const std::vector<std::string>& domains) {
+    lt::error_code ec;
+    std::string const host = canonical_host(std::get<2>(lt::parse_url_components(url, ec)));
+    if (ec || host.empty()) return false;
+    for (auto const& d : domains) {
+        if (host_matches_domain(host, d)) return true;
+    }
+    return false;
 }
 
 }  // namespace
@@ -1204,30 +1227,68 @@ extern "C" void lt_torrent_meta_free(struct lt_torrent_meta* m) {
     m->num_files = 0;
 }
 
-extern "C" int lt_torrent_tracker_host_matches(const uint8_t* data, size_t len,
-                                               const char* domains_csv,
-                                               char* err_out, int err_len)
+extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
+                                       const uint8_t* torrent_buf, size_t torrent_len,
+                                       const uint8_t* resume_buf, size_t resume_len,
+                                       const char* domains_csv,
+                                       char* err_out, int err_len)
 {
-    if (!data || !domains_csv) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    if (!domains_csv) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
     LT_SHIM_TRY
-    lt::torrent_info ti(reinterpret_cast<const char*>(data), static_cast<int>(len));
     std::vector<std::string> domains;
     {
         std::string cur;
-        for (const char* p = domains_csv; *p; ++p) {
-            if (*p == ',') { if (!cur.empty()) domains.push_back(cur); cur.clear(); }
-            else cur += *p;
-        }
-        if (!cur.empty()) domains.push_back(cur);
-    }
-    for (auto const& ae : ti.trackers()) {
-        std::string host = url_host(ae.url);
-        if (host.empty()) continue;
-        for (auto const& d : domains) {
-            if (host_matches_domain(host, d)) return 1;
+        for (const char* p = domains_csv;; ++p) {
+            if (*p == ',' || *p == '\0') {
+                std::string d = canonical_host(cur);
+                if (!d.empty()) domains.push_back(std::move(d));
+                cur.clear();
+                if (*p == '\0') break;
+            } else {
+                cur += *p;
+            }
         }
     }
-    return 0;
+
+    // Built exactly as the matching lt_add_torrent_* builds it, so the
+    // trackers read below are the ones the add would hand libtorrent.
+    lt::add_torrent_params atp;
+    lt::error_code ec;
+    if (resume_buf && resume_len > 0) {
+        atp = lt::read_resume_data(
+            lt::span<char const>(reinterpret_cast<const char*>(resume_buf), resume_len), ec);
+        if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
+        if (!atp.ti && torrent_buf && torrent_len > 0) {
+            atp.ti = std::make_shared<lt::torrent_info>(
+                reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+        }
+    } else if (magnet_uri) {
+        atp = lt::parse_magnet_uri(magnet_uri, ec);
+        if (ec) { set_err(err_out, err_len, ec.message()); return LT_ERR; }
+    } else if (torrent_buf && torrent_len > 0) {
+        atp.ti = std::make_shared<lt::torrent_info>(
+            reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+    } else {
+        set_err(err_out, err_len, "no torrent source");
+        return LT_ERR;
+    }
+
+    // The announce list torrent::torrent() assembles: the metadata's trackers
+    // unless the params override them (resume data with a `trackers` list
+    // always does), then every tracker the params carry — a magnet's `tr=`,
+    // or that resume list.
+    std::vector<std::string> urls;
+    if (atp.ti && !(atp.flags & lt::torrent_flags::override_trackers)) {
+        for (auto const& ae : atp.ti->trackers()) urls.push_back(ae.url);
+    }
+    for (auto const& url : atp.trackers) {
+        if (!url.empty()) urls.push_back(url);
+    }
+    if (urls.empty()) return 0;
+    for (auto const& url : urls) {
+        if (!tracker_url_allowed(url, domains)) return 0;
+    }
+    return 1;
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)
 }
 
