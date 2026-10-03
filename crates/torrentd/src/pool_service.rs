@@ -683,12 +683,25 @@ pub fn execute_adopt(
             resume_path,
             torrent_path,
             save_path,
+            files_renamed,
         } => {
             let engine = source
                 .engine_for(&profile)
                 .ok_or_else(|| unresolved_profile(profiles, &profile))?;
+            // Verifying from the `.torrent` is the fallback below, and for a
+            // torrent whose files the previous client renamed it looks for
+            // them at the `.torrent`'s paths, where they are not.
+            let no_fallback = |why: &str| {
+                format!(
+                    "{why}, and the previous client renamed this torrent's files, which only \
+                     its resume data maps for libtorrent"
+                )
+            };
             let resume = match std::fs::read(&resume_path) {
                 Ok(b) => b,
+                Err(e) if files_renamed => {
+                    return Err(no_fallback(&format!("resume data unreadable: {e}")));
+                }
                 Err(e) => {
                     // The sidecar vouched for the payload a moment ago and is
                     // now unreadable. Verifying is slower but always correct,
@@ -721,6 +734,9 @@ pub fn execute_adopt(
                 // all. None of that is a reason to leave the payload
                 // unadopted when the .torrent is right there and verifying
                 // reaches the same place.
+                if files_renamed {
+                    return Err(no_fallback(&format!("resume add rejected: {e}")));
+                }
                 warn!(
                     target: "torrentd::pool",
                     infohash = %infohash,

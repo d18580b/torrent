@@ -202,23 +202,36 @@ pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanSta
             num_files: meta.files.len(),
             source_path: path.clone(),
             fastresume_path,
-            declared_save_path: hints.save_path,
-            category: hints.category,
-            tags: hints.tags,
+            declared_save_path: hints.save_path.clone(),
+            category: hints.category.clone(),
+            tags: hints.tags.clone(),
             // Never inferred here; profile assignment is the daemon's decision and
             // upsert_torrent preserves any existing value.
             profile: None,
         };
         store.upsert_torrent(&torrent, now_secs())?;
 
+        // Where the previous client actually put each file: renamed through
+        // libtorrent's `mapped_files`, or moved by qBittorrent's content
+        // layout. Matching the `.torrent`'s own paths instead reads renamed
+        // payload as missing — and offers it up as orphans to delete.
+        let paths: Vec<String> = meta
+            .files
+            .iter()
+            .map(|f| f.path.replace('\\', "/"))
+            .collect();
+        let paths = hints
+            .relayout(&paths, &meta.name)
+            .map_or(paths, |r| r.paths);
         let rows: Vec<TorrentFileRow> = meta
             .files
             .iter()
+            .zip(paths)
             .enumerate()
-            .map(|(i, f)| TorrentFileRow {
+            .map(|(i, (f, rel_path))| TorrentFileRow {
                 infohash: infohash.clone(),
                 idx: i as i64,
-                rel_path: f.path.replace('\\', "/"),
+                rel_path,
                 size: f.size,
                 pieces_root: f.pieces_root,
                 pad_file: f.pad_file,

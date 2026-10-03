@@ -43,6 +43,10 @@ pub enum AdoptPlan {
         resume_path: PathBuf,
         torrent_path: PathBuf,
         save_path: PathBuf,
+        /// The previous client renamed files, and only the resume data tells
+        /// libtorrent where they are: if that add is rejected, falling back
+        /// to verifying from the `.torrent` would look in the wrong places.
+        files_renamed: bool,
     },
     /// Hand it to libtorrent unverified and let it hash before seeding.
     Verify {
@@ -141,17 +145,57 @@ pub fn plan(
         && torrent.fastresume_path.is_some()
         && fastresume_is_trustworthy(store, infohash)?;
 
+    // The matcher placed the files where the previous client renamed them
+    // to. Adding from the `.torrent` alone, as the verify path does, has
+    // libtorrent look for them at the `.torrent`'s own paths instead.
+    let relayout = relayout_of(&torrent);
+    match (&relayout, can_fast_path) {
+        (Some(r), true) if !r.in_resume_data => {
+            return Ok(AdoptPlan::Refuse {
+                reason: "the previous client's content layout moved these files, and its resume \
+                         data does not tell libtorrent so; adopting would look for them in the \
+                         wrong places",
+            })
+        }
+        (Some(_), false) => {
+            return Ok(AdoptPlan::Refuse {
+                reason: "the previous client renamed these files, which only its resume data maps \
+                         for libtorrent, and that resume data does not mark every piece had",
+            })
+        }
+        _ => {}
+    }
+
     Ok(match (&torrent.fastresume_path, can_fast_path) {
         (Some(resume_path), true) => AdoptPlan::FastPath {
             resume_path: resume_path.clone(),
             torrent_path: torrent.source_path.clone(),
             save_path,
+            files_renamed: relayout.is_some(),
         },
         _ => AdoptPlan::Verify {
             torrent_path: torrent.source_path.clone(),
             save_path,
         },
     })
+}
+
+/// How the previous client laid this torrent's files out differently from
+/// its `.torrent`, re-derived from the two files the scan read it from.
+fn relayout_of(torrent: &crate::model::PoolTorrent) -> Option<crate::fastresume::Relayout> {
+    let fr = torrent.fastresume_path.as_ref()?;
+    let hints = crate::fastresume::read_hints(fr);
+    if hints.mapped_files.iter().all(Option::is_none) && hints.content_layout.is_none() {
+        return None;
+    }
+    let bytes = std::fs::read(&torrent.source_path).ok()?;
+    let meta = libtorrent_safe::torrent_metadata(&bytes).ok()?;
+    let paths: Vec<String> = meta
+        .files
+        .iter()
+        .map(|f| f.path.replace('\\', "/"))
+        .collect();
+    hints.relayout(&paths, &meta.name)
 }
 
 /// Whether the previous client's completion claim can stand in for our own

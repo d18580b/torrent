@@ -535,6 +535,121 @@ fn real_padded_and_hybrid_torrents_match_and_adopt() {
     }
 }
 
+/// A real `.torrent` in a library beside a hand-built `.fastresume` holding
+/// `entries` (already-encoded bencode key/value pairs, in key order).
+fn library_with_sidecar(
+    dir: &Path,
+    fixture: &str,
+    entries: &[(&str, Vec<u8>)],
+) -> (PathBuf, PoolStore, String) {
+    let library = dir.join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture),
+        library.join("t.torrent"),
+    )
+    .unwrap();
+    let mut fr = b"d".to_vec();
+    for (k, v) in entries {
+        fr.extend_from_slice(format!("{}:{k}", k.len()).as_bytes());
+        fr.extend_from_slice(v);
+    }
+    fr.push(b'e');
+    std::fs::write(library.join("t.fastresume"), fr).unwrap();
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library).unwrap();
+    let ih = store.torrents().unwrap().pop().unwrap().infohash;
+    (library, store, ih)
+}
+
+fn bstr_of(s: &str) -> Vec<u8> {
+    format!("{}:{s}", s.len()).into_bytes()
+}
+
+/// The acceptance case for qBittorrent: a file it renamed (`mapped_files`) is
+/// found where it was renamed to — not missed, and not offered as an orphan —
+/// and adopting goes only through the resume data that tells libtorrent so.
+#[test]
+fn qbittorrents_mapped_files_are_honoured() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    // pad_file.torrent: `temp/foo/bar.txt` (45 bytes) and a padding file.
+    write_file(&root, "temp/renamed.txt", 45);
+    for (complete, expect_fast) in [(true, true), (false, false)] {
+        let sub = dir.path().join(format!("c{complete}"));
+        let mut mapped = b"l".to_vec();
+        mapped.extend_from_slice(&bstr_of("temp/renamed.txt"));
+        mapped.extend_from_slice(&bstr_of(""));
+        mapped.push(b'e');
+        let pieces: &[u8] = if complete { &[1] } else { &[0] };
+        let mut p = b"1:".to_vec();
+        p.extend_from_slice(pieces);
+        let (_lib, mut store, ih) = library_with_sidecar(
+            &sub,
+            "pad_file.torrent",
+            &[
+                ("mapped_files", mapped),
+                ("pieces", p),
+                ("qBt-savePath", bstr_of(&root.to_string_lossy())),
+            ],
+        );
+        torrentd_pool::scan_root(&mut store, &root).unwrap();
+        torrentd_pool::match_all(&mut store).unwrap();
+        assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+        let root_id = store.root_id(&root).unwrap();
+        assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+
+        let r = root.clone();
+        let plan = torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| r.clone()))
+            .unwrap();
+        if expect_fast {
+            assert!(
+                matches!(
+                    plan,
+                    torrentd_pool::AdoptPlan::FastPath {
+                        files_renamed: true,
+                        ..
+                    }
+                ),
+                "{plan:?}"
+            );
+        } else {
+            assert!(plan.is_refusal(), "{plan:?}");
+        }
+    }
+}
+
+/// qBittorrent's no-subfolder layout: a multi-file torrent's files sit
+/// straight in the save path, without the torrent's top directory.
+#[test]
+fn qbittorrents_no_subfolder_layout_is_honoured() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    write_file(&root, "dl/foo/bar.txt", 45);
+    let (_lib, mut store, ih) = library_with_sidecar(
+        dir.path(),
+        "pad_file.torrent",
+        &[
+            ("pieces", b"1:\x01".to_vec()),
+            ("qBt-contentLayout", bstr_of("NoSubfolder")),
+            ("qBt-savePath", bstr_of(&root.join("dl").to_string_lossy())),
+        ],
+    );
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+    assert_eq!(store.adoption_base(&ih).unwrap().unwrap().1, "dl");
+
+    // libtorrent cannot be told about a layout only qBittorrent recorded.
+    let root_id = store.root_id(&root).unwrap();
+    let r = root.clone();
+    let plan =
+        torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| r.clone())).unwrap();
+    assert!(plan.is_refusal(), "{plan:?}");
+}
+
 // ---------------------------------------------------------------------------
 // drift
 // ---------------------------------------------------------------------------
@@ -707,7 +822,9 @@ fn write_fastresume(dir: &Path, stem: &str, complete: bool) -> PathBuf {
     let mut b = b"d".to_vec();
     let sp = "/irrelevant";
     b.extend_from_slice(format!("12:qBt-savePath{}:{sp}", sp.len()).as_bytes());
-    b.extend_from_slice(format!("14:qBt-seedStatusi{}e", if complete { 1 } else { 0 }).as_bytes());
+    // Completion is the `pieces` bitfield: every piece had, or one missing.
+    b.extend_from_slice(b"6:pieces3:");
+    b.extend_from_slice(if complete { &[1, 1, 1] } else { &[1, 0, 1] });
     b.push(b'e');
     let p = dir.join(format!("{stem}.fastresume"));
     std::fs::write(&p, b).unwrap();
