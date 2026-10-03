@@ -373,6 +373,61 @@ fn drift_survives_a_rescan_until_a_verify_clears_it() {
     assert_eq!(state_of(&store, "d1"), AdoptionState::Adopted);
 }
 
+/// `drifted` is adoptable, so a drifted torrent whose claim set conflicts
+/// with another's has to read `overlap` like any other — its drift marker
+/// carried — while clean sharing leaves it `drifted`.
+#[test]
+fn a_drifted_torrent_in_a_conflict_is_overlap_and_not_adoptable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_file(&root, "S/data.bin", 512);
+    write_file(&root, "S/extra.bin", 64);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "d1", "S", None, &[("S/data.bin", 512)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let (rid, base) = store.adoption_base("d1").unwrap().unwrap();
+    store
+        .set_adoption(
+            "d1",
+            AdoptionState::Drifted,
+            Some(rid),
+            Some(&base),
+            None,
+            Some(7),
+            None,
+        )
+        .unwrap();
+
+    // Clean sharing: the same single file under another info-hash.
+    add_torrent(&mut store, "s2", "S", None, &[("S/data.bin", 512)]);
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Drifted);
+    assert_eq!(stats.drifted, 1);
+
+    // A conflicting claim set over the same bytes.
+    add_torrent(
+        &mut store,
+        "c3",
+        "S",
+        None,
+        &[("S/data.bin", 512), ("S/extra.bin", 64)],
+    );
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Overlap);
+    assert_eq!(store.drift_at("d1").unwrap(), Some(7));
+    assert_eq!(stats.drifted, 0);
+    let r = root.clone();
+    let plan =
+        torrentd_pool::adopt::plan(&store, "d1", |id| (id == root_id).then(|| r.clone())).unwrap();
+    assert!(
+        matches!(plan, torrentd_pool::AdoptPlan::Refuse { .. }),
+        "{plan:?}"
+    );
+}
+
 /// Many equal-sized files on disk under the anchor's name used to make
 /// candidate building quadratic; the right base must still be found, and a
 /// base that only matches a name's tail is not a candidate.

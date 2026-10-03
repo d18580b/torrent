@@ -189,24 +189,29 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
     // A torrent already `adopted` is left `adopted`: it is loaded and seeding,
     // and a rescan relabelling it would only hide that. Its sharing is still
     // visible to every mutation through `shares_claims`.
+    //
+    // A `drifted` torrent is adoptable — adopting is how it gets the
+    // verification that clears drift — so a conflict has to reach it too:
+    // left `drifted`, it would adopt over bytes another torrent disagrees
+    // about. It keeps `drifted` only when the sharing is clean, and its drift
+    // marker rides along either way.
     for ih in store.overlapping_torrents()? {
         let current = store.adoption_state(&ih)?;
-        if matches!(
-            current,
-            Some(AdoptionState::Adopted) | Some(AdoptionState::Drifted)
-        ) {
+        if current == Some(AdoptionState::Adopted) {
             continue;
         }
         let mine = store.claims_of(&ih)?;
-        let mut shared = current == Some(AdoptionState::Matched);
-        if shared {
-            for other in store.co_claimants(&ih)? {
-                if store.claims_of(&other)? != mine {
-                    shared = false;
-                    break;
-                }
+        let mut same_set = true;
+        for other in store.co_claimants(&ih)? {
+            if store.claims_of(&other)? != mine {
+                same_set = false;
+                break;
             }
         }
+        if current == Some(AdoptionState::Drifted) && same_set {
+            continue;
+        }
+        let shared = same_set && current == Some(AdoptionState::Matched);
         let (state, note) = if shared {
             (
                 AdoptionState::Shared,
@@ -232,6 +237,7 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
         // Counted as matched or partial above; move it.
         match current {
             Some(AdoptionState::Partial) => stats.partial = stats.partial.saturating_sub(1),
+            Some(AdoptionState::Drifted) => stats.drifted = stats.drifted.saturating_sub(1),
             _ => stats.matched = stats.matched.saturating_sub(1),
         }
         if shared {
