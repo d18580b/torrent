@@ -31,6 +31,7 @@ use crate::http::page::PageRequest;
 use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::security::Write;
+use crate::http::v1::common::blocking;
 use crate::http::v1::common::from_profile_problem;
 use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
@@ -305,13 +306,14 @@ pub async fn get_pool(
     _caller: Scoped<Bearer, Read>,
     Inject(s): Inject<Arc<AppState>>,
 ) -> Result<Json<PoolOverview>, PoolFailure> {
-    let pool = s.pool.as_ref().ok_or(PoolFailure::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(PoolFailure::PoolNotConfigured)?;
     let fail = |e: torrentd_pool::PoolError| PoolFailure::Internal {
         detail: internal("reading the pool index", e),
     };
-    let (roots, torrents, files, by_state) = pool
-        .with_store(|st| {
-            let roots = pool
+    let reader = Arc::clone(&pool);
+    let (roots, torrents, files, by_state) = blocking(move || {
+        reader.with_reader(|st| {
+            let roots = reader
                 .roots()
                 .iter()
                 .map(|(id, path)| {
@@ -329,7 +331,9 @@ pub async fn get_pool(
                 st.counts_by_state()?,
             ))
         })
-        .map_err(fail)?;
+    })
+    .await
+    .map_err(fail)?;
     let mut states = AdoptionCounts::default();
     for (state, n) in by_state {
         *states.slot(state.into()) += n;
@@ -580,31 +584,30 @@ fn tree_key(path: &str, is_dir: bool) -> String {
     format!("{}{path}", if is_dir { 'd' } else { 'f' })
 }
 
-/// The immediate children of `path` in `root_id` after the cursor, with each
-/// entry built by `entry` (which drops it by returning `None`), one page of
-/// them.
-fn list_children(
+/// One page of the immediate children of `path` in `root_id` after the
+/// cursor — with `orphans_only`, only those holding bytes no torrent claims —
+/// each with its accounting and, for the tree, the states claiming it.
+///
+/// The page is read from the materialised tree on the read connection, on
+/// the blocking pool: `limit + 1` rows of one directory, whatever the size of
+/// the subtree under it, and never waiting for a scan.
+async fn list_children(
     s: &AppState,
-    listing: &str,
+    listing: &'static str,
     root_id: i64,
     q: TreeQuery,
-    entry: impl Fn(
-        &torrentd_pool::PoolStore,
-        String,
-        bool,
-    ) -> Result<Option<TreeEntry>, torrentd_pool::PoolError>,
+    orphans_only: bool,
 ) -> Result<TreePage, TreeError> {
-    let pool = s.pool.as_ref().ok_or(TreeError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(TreeError::PoolNotConfigured)?;
     let prefix = q.path.as_deref().unwrap_or("").trim_matches('/').to_owned();
     // Scoped to the directory listed, so a cursor from another root or path
     // is refused rather than read as "nothing follows".
     // The path's length goes in first, so no path — `:` and all — can make
     // one directory's listing name a prefix of another's.
     let listing = format!("{listing}:{root_id}:{}:{prefix}", prefix.len());
-    let listing = listing.as_str();
     let mut invalid = Invalid::new();
     let page = PageRequest::parse(
-        listing,
+        &listing,
         q.cursor.as_deref(),
         q.limit.map(PageLimit::get),
         |key| is_child_key(key, &prefix),
@@ -617,37 +620,57 @@ fn list_children(
     let fail = |e: torrentd_pool::PoolError| TreeError::Internal {
         detail: internal("listing the pool index", e),
     };
-    pool.with_store(|st| {
-        // The store answers with every child at once, sorted; the page is cut
-        // from that, and per-entry accounting is computed only for entries
-        // the page could hold.
-        let children = st.children(root_id, &prefix).map_err(fail)?;
-        let mut failure = None;
-        let entries = children
-            .into_iter()
-            .filter(|(path, is_dir)| {
-                page.after
-                    .as_deref()
-                    .is_none_or(|after| tree_key(path, *is_dir).as_str() > after)
-            })
-            .filter_map(|(path, is_dir)| match entry(st, path, is_dir) {
-                Ok(e) => e,
-                Err(e) => {
-                    failure.get_or_insert(e);
-                    None
-                }
-            });
-        let (items, next_cursor) = paginate(
-            listing,
-            entries,
-            |e: &TreeEntry| tree_key(&e.path, e.is_dir),
-            &page,
-        );
-        if let Some(e) = failure {
-            return Err(fail(e));
-        }
-        Ok(TreePage { items, next_cursor })
+    blocking(move || {
+        pool.with_reader(|st| {
+            // `is_child_key` admitted the cursor, so it is `d` or `f` and a
+            // path.
+            let after = page
+                .after
+                .as_deref()
+                .and_then(|k| Some((k.starts_with('d'), k.get(1..)?)));
+            // One more than the page, so `paginate` can tell whether a next
+            // page exists.
+            let children = st
+                .children_page(
+                    root_id,
+                    &prefix,
+                    after,
+                    page.limit.saturating_add(1),
+                    orphans_only,
+                )
+                .map_err(fail)?;
+            let entries = children
+                .into_iter()
+                .map(|(path, is_dir)| {
+                    let rollup = entry_rollup(st, root_id, &path, is_dir)?;
+                    let states = if orphans_only {
+                        Vec::new()
+                    } else {
+                        st.states_under(root_id, &path)?
+                            .into_iter()
+                            .map(AdoptionState::from)
+                            .collect()
+                    };
+                    Ok(TreeEntry {
+                        name: name_of(&path),
+                        path,
+                        is_dir,
+                        rollup: rollup.into(),
+                        states,
+                    })
+                })
+                .collect::<Result<Vec<_>, torrentd_pool::PoolError>>()
+                .map_err(fail)?;
+            let (items, next_cursor) = paginate(
+                &listing,
+                entries,
+                |e: &TreeEntry| tree_key(&e.path, e.is_dir),
+                &page,
+            );
+            Ok(TreePage { items, next_cursor })
+        })
     })
+    .await
 }
 
 fn name_of(path: &str) -> String {
@@ -705,19 +728,9 @@ pub async fn get_pool_tree(
     Path(p): Path<RootPath>,
     Query(q): Query<TreeQuery>,
 ) -> Result<Json<TreePage>, TreeError> {
-    let root_id = p.root_id;
-    list_children(&s, "pool-tree", root_id, q, |st, path, is_dir| {
-        let rollup = entry_rollup(st, root_id, &path, is_dir)?;
-        let states = st.states_under(root_id, &path)?;
-        Ok(Some(TreeEntry {
-            name: name_of(&path),
-            states: states.into_iter().map(AdoptionState::from).collect(),
-            path,
-            is_dir,
-            rollup: rollup.into(),
-        }))
-    })
-    .map(Json)
+    list_children(&s, "pool-tree", p.root_id, q, false)
+        .await
+        .map(Json)
 }
 
 /// List a directory's unclaimed payload.
@@ -732,21 +745,9 @@ pub async fn list_pool_orphans(
     Path(p): Path<RootPath>,
     Query(q): Query<TreeQuery>,
 ) -> Result<Json<TreePage>, TreeError> {
-    let root_id = p.root_id;
-    list_children(&s, "pool-orphans", root_id, q, |st, path, is_dir| {
-        let rollup = entry_rollup(st, root_id, &path, is_dir)?;
-        if rollup.bytes_orphan == 0 {
-            return Ok(None);
-        }
-        Ok(Some(TreeEntry {
-            name: name_of(&path),
-            path,
-            is_dir,
-            rollup: rollup.into(),
-            states: Vec::new(),
-        }))
-    })
-    .map(Json)
+    list_children(&s, "pool-orphans", p.root_id, q, true)
+        .await
+        .map(Json)
 }
 
 // ---------------------------------------------------------------------------
@@ -847,7 +848,7 @@ pub async fn list_pool_torrents(
     Query(q): Query<PoolTorrentQuery>,
 ) -> Result<Json<PoolTorrentPage>, ListError> {
     const LISTING: &str = "pool-torrents";
-    let pool = s.pool.as_ref().ok_or(ListError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(ListError::PoolNotConfigured)?;
     let mut invalid = Invalid::new();
     let page = PageRequest::parse(
         LISTING,
@@ -857,26 +858,26 @@ pub async fn list_pool_torrents(
         &mut invalid,
     )?;
     invalid.finish()?;
-    let want = q.state;
-    pool.with_store(|st| {
-        let db = |e: torrentd_pool::PoolError| internal("listing the pool index", e);
-        // Sorted by infohash, which is the cursor key.
-        let all = st
-            .torrents()
-            .map_err(db)
-            .map_err(|detail| ListError::Internal { detail })?;
-        let view = |t: torrentd_pool::PoolTorrent| -> Result<Option<PoolTorrent>, String> {
-            let state = st
-                .adoption_state(&t.infohash)
-                .map_err(db)?
-                .map(AdoptionState::from);
-            if want.is_some() && state != want {
-                return Ok(None);
-            }
-            Ok(Some(PoolTorrent {
+    let want = q.state.map(torrentd_pool::AdoptionState::from);
+    // One page of the index in SQL, keyed on infohash, on the read
+    // connection: `limit + 1` rows whatever the library's size, and never
+    // waiting for a scan.
+    let (after, limit) = (page.after.clone(), page.limit);
+    let rows = blocking(move || {
+        pool.with_reader(|st| st.torrents_page(after.as_deref(), want, limit.saturating_add(1)))
+    })
+    .await
+    .map_err(|e| ListError::Internal {
+        detail: internal("listing the pool index", e),
+    })?;
+    let items = rows
+        .into_iter()
+        .map(|r| {
+            let t = r.torrent;
+            Ok(PoolTorrent {
                 infohash: hex(&t.infohash)?,
-                base_rel: st.adoption_base(&t.infohash).map_err(db)?.map(|(_, b)| b),
-                state,
+                base_rel: r.base_rel,
+                state: r.state.map(AdoptionState::from),
                 name: t.name,
                 total_size: t.total_size,
                 num_files: count(t.num_files),
@@ -884,34 +885,17 @@ pub async fn list_pool_torrents(
                 category: t.category,
                 tags: t.tags,
                 has_fastresume: t.fastresume_path.is_some(),
-            }))
-        };
-        let mut failure = None;
-        let items = all
-            .into_iter()
-            .filter(|t| {
-                page.after
-                    .as_deref()
-                    .is_none_or(|after| t.infohash.as_str() > after)
             })
-            .filter_map(|t| match view(t) {
-                Ok(v) => v,
-                Err(e) => {
-                    failure.get_or_insert(e);
-                    None
-                }
-            });
-        let (items, next_cursor) = paginate(
-            LISTING,
-            items,
-            |t: &PoolTorrent| t.infohash.to_string(),
-            &page,
-        );
-        if let Some(detail) = failure {
-            return Err(ListError::Internal { detail });
-        }
-        Ok(Json(PoolTorrentPage { items, next_cursor }))
-    })
+        })
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|detail| ListError::Internal { detail })?;
+    let (items, next_cursor) = paginate(
+        LISTING,
+        items,
+        |t: &PoolTorrent| t.infohash.to_string(),
+        &page,
+    );
+    Ok(Json(PoolTorrentPage { items, next_cursor }))
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,7 +1031,7 @@ pub async fn adopt_pool_torrents(
     // moves or deletes payload. Adoption is not part of that surface: it
     // records an existing file's ownership in the index, so it is outside the
     // switch; `write` scope is what it needs.
-    let pool = s.pool.as_ref().ok_or(AdoptError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(AdoptError::PoolNotConfigured)?;
     req.validate()?;
     let profile = ProfileId::new(req.profile_id.as_str());
     // Configured-and-failed is not the same as unknown, and telling an
@@ -1056,6 +1040,20 @@ pub async fn adopt_pool_torrents(
     // paused and make the profile look healthy; same guard as adding one.
     unfenced_engine(&s, &profile)?;
 
+    // On the blocking pool: every target reads and writes the index on the
+    // writer, which a running scan holds, and adds go through a session's
+    // lock. Waiting there holds a blocking thread, not a runtime worker.
+    blocking(move || adopt_each(&s, &pool, &req, &profile).map(Json)).await
+}
+
+/// [`adopt_pool_torrents`] past its up-front checks: resolve the targets and
+/// adopt, or refuse, each in turn.
+fn adopt_each(
+    s: &AppState,
+    pool: &PoolService,
+    req: &AdoptRequest,
+    profile: &ProfileId,
+) -> Result<AdoptionResult, AdoptError> {
     let fail = |e: torrentd_pool::PoolError| AdoptError::Internal {
         detail: internal("reading the pool index", e),
     };
@@ -1152,7 +1150,7 @@ pub async fn adopt_pool_torrents(
                 );
             }
         };
-        if let Err(reason) = check_index_owner(pool, &ih, &profile) {
+        if let Err(reason) = check_index_owner(pool, &ih, profile) {
             isolation_refused();
             refuse(&mut resp, reason);
             continue;
@@ -1177,14 +1175,14 @@ pub async fn adopt_pool_torrents(
         // was free to be adopted into profile B and start announcing from a
         // second account — the permanent-ban case Rule 3 exists for — while the
         // conflict was recorded as a warning after the fact.
-        if let Err(reason) = claim_in_registry(&s, infohash, &profile) {
+        if let Err(reason) = claim_in_registry(s, infohash, profile) {
             refuse(&mut resp, reason);
             continue;
         }
         match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), false) {
             Ok(_) => accept(&mut resp),
             Err(r) => {
-                release_claim(&s, infohash);
+                release_claim(s, infohash);
                 if r.isolation {
                     isolation_refused();
                 }
@@ -1201,7 +1199,7 @@ pub async fn adopt_pool_torrents(
         refused = resp.refused.len(),
         "adopt",
     );
-    Ok(Json(resp))
+    Ok(resp)
 }
 
 /// Which result bucket an adopted torrent belongs in.
@@ -1396,7 +1394,7 @@ pub async fn verify_pool_torrents(
             // failure nor written into the index.
             if let Some(pool) = s.pool.as_ref() {
                 let ih = infohash.to_string();
-                let indexed = pool.with_store(|st| st.torrent(&ih).map(|t| t.is_some()));
+                let indexed = pool.with_reader(|st| st.torrent(&ih).map(|t| t.is_some()));
                 match indexed {
                     Ok(true) => pool.verify_queue().track_recheck(ih),
                     Ok(false) => {}
@@ -1625,14 +1623,24 @@ fn summary_of(p: &torrentd_pool::model::PlanRow) -> Result<PlanSummary, String> 
 /// A plan as the API shows it, or `None` when there is no such plan.
 ///
 /// `Err` is the `detail` of a `500 internal`.
+///
+/// Read on the read connection, in one snapshot, so the steps and the
+/// generation its confirm token binds are the same commit's; a plan written
+/// on the writer is visible once it commits. Blocking: call it on the
+/// blocking pool.
 fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, String> {
     let fail = |e: torrentd_pool::PoolError| internal("reading a plan", e);
-    let Some(row) = pool.with_store(|st| st.plan(id)).map_err(fail)? else {
+    let read = pool
+        .with_reader(|st| -> Result<_, torrentd_pool::PoolError> {
+            let Some(row) = st.plan(id)? else {
+                return Ok(None);
+            };
+            Ok(Some((row, st.plan_steps(id)?, st.index_generation()?)))
+        })
+        .map_err(fail)?;
+    let Some((row, steps, generation)) = read else {
         return Ok(None);
     };
-    let (steps, generation) = pool
-        .with_store(|st| Ok((st.plan_steps(id)?, st.index_generation()?)))
-        .map_err(fail)?;
     let confirm_token = torrentd_pool::plan::is_destructive(&row.kind)
         .then(|| torrentd_pool::plan::confirm_token(id, generation, &steps));
     let summary = summary_of(&row)?;
@@ -1684,7 +1692,7 @@ pub async fn list_plans(
     Query(q): Query<PlanQuery>,
 ) -> Result<Json<PlanPage>, ListError> {
     const LISTING: &str = "pool-plans";
-    let pool = s.pool.as_ref().ok_or(ListError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(ListError::PoolNotConfigured)?;
     let mut invalid = Invalid::new();
     let page = PageRequest::parse(
         LISTING,
@@ -1694,8 +1702,8 @@ pub async fn list_plans(
         &mut invalid,
     )?;
     invalid.finish()?;
-    let mut rows = pool
-        .with_store(|st| st.plans())
+    let mut rows = blocking(move || pool.with_reader(|st| st.plans()))
+        .await
         .map_err(|e| ListError::Internal {
             detail: internal("listing plans", e),
         })?;
@@ -1801,11 +1809,20 @@ pub async fn create_plan(
     Inject(s): Inject<Arc<AppState>>,
     Json(req): Json<CreatePlanRequest>,
 ) -> Result<Created<Json<Plan>>, CreatePlanError> {
-    let pool = s.pool.as_ref().ok_or(CreatePlanError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(CreatePlanError::PoolNotConfigured)?;
     if !pool.allow_mutations() {
         return Err(CreatePlanError::MutationsDisabled);
     }
-    let spec = torrentd_pool::PlanSpec::from(req);
+    // On the blocking pool: the plan is built and written on the writer,
+    // which a running scan holds.
+    blocking(move || create_plan_blocking(&pool, torrentd_pool::PlanSpec::from(req))).await
+}
+
+/// [`create_plan`] past its up-front checks.
+fn create_plan_blocking(
+    pool: &PoolService,
+    spec: torrentd_pool::PlanSpec,
+) -> Result<Created<Json<Plan>>, CreatePlanError> {
     let kind = spec.kind();
     let fail = |e: &dyn fmt::Display| CreatePlanError::Internal {
         detail: internal("creating a plan", e),
@@ -1877,8 +1894,9 @@ pub async fn get_plan(
     Inject(s): Inject<Arc<AppState>>,
     Path(p): Path<PlanPath>,
 ) -> Result<Json<Plan>, GetPlanError> {
-    let pool = s.pool.as_ref().ok_or(GetPlanError::PoolNotConfigured)?;
-    load_plan(pool, p.plan_id)
+    let pool = s.pool.clone().ok_or(GetPlanError::PoolNotConfigured)?;
+    blocking(move || load_plan(&pool, p.plan_id))
+        .await
         .map_err(|detail| GetPlanError::Internal { detail })?
         .map(Json)
         .ok_or(GetPlanError::PlanNotFound)
@@ -1917,19 +1935,25 @@ pub async fn delete_plan(
     Inject(s): Inject<Arc<AppState>>,
     Path(p): Path<PlanPath>,
 ) -> Result<NoContent, DeletePlanError> {
-    let pool = s.pool.as_ref().ok_or(DeletePlanError::PoolNotConfigured)?;
+    let pool = s.pool.clone().ok_or(DeletePlanError::PoolNotConfigured)?;
     let fail = |e: torrentd_pool::PoolError| DeletePlanError::Internal {
         detail: internal("discarding a plan", e),
     };
-    let Some(plan) = pool.with_store(|st| st.plan(p.plan_id)).map_err(fail)? else {
-        return Err(DeletePlanError::PlanNotFound);
-    };
-    if plan.status == torrentd_pool::model::plan_status::APPLYING {
-        return Err(DeletePlanError::PlanApplying);
-    }
-    pool.with_store_mut(|st| st.delete_plan(p.plan_id))
-        .map_err(fail)?;
-    Ok(NoContent)
+    // On the blocking pool, and on the writer for the read as well as the
+    // delete: the status that refuses a plan mid-apply must be the one the
+    // delete acts on.
+    blocking(move || {
+        let Some(plan) = pool.with_store(|st| st.plan(p.plan_id)).map_err(fail)? else {
+            return Err(DeletePlanError::PlanNotFound);
+        };
+        if plan.status == torrentd_pool::model::plan_status::APPLYING {
+            return Err(DeletePlanError::PlanApplying);
+        }
+        pool.with_store_mut(|st| st.delete_plan(p.plan_id))
+            .map_err(fail)?;
+        Ok(NoContent)
+    })
+    .await
 }
 
 /// Consent to apply a plan.
@@ -2026,7 +2050,9 @@ pub async fn apply_plan(
         return Err(ApplyPlanError::MutationsDisabled);
     }
     let id = p.plan_id;
-    let plan = load_plan(&pool, id)
+    let reader = Arc::clone(&pool);
+    let plan = blocking(move || load_plan(&reader, id))
+        .await
         .map_err(|detail| ApplyPlanError::Internal { detail })?
         .ok_or(ApplyPlanError::PlanNotFound)?;
     if !applicable(plan.status) {
@@ -2079,7 +2105,7 @@ pub async fn apply_plan(
         // claiming the plan between the check above and the executor's own
         // claim is told apart by the plan's status now; anything else is the
         // executor refusing or stopping.
-        Err(reason) => match load_plan(&pool, id) {
+        Err(reason) => match blocking(move || load_plan(&pool, id)).await {
             Ok(None) => Err(ApplyPlanError::PlanNotFound),
             Ok(Some(now)) if !applicable(now.status) => Err(ApplyPlanError::PlanNotDraft(reason)),
             _ => Err(ApplyPlanError::ApplyFailed(reason)),

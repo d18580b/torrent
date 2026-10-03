@@ -1146,15 +1146,12 @@ fn a_read_only_connection_sees_the_last_commit_while_a_writer_holds_the_lock() {
             torrentd_pool::scan_root(w, &root)?;
             // Mid-transaction: the reader is not blocked, and reads the index
             // as it stood before the transaction began.
-            let seen = reader.read_snapshot(|r| r.file_count()).unwrap().unwrap();
+            let seen = reader.read_snapshot(|r| r.file_count()).unwrap();
             assert_eq!(seen, 1);
             Ok(())
         })
         .unwrap();
-    assert_eq!(
-        reader.read_snapshot(|r| r.file_count()).unwrap().unwrap(),
-        2
-    );
+    assert_eq!(reader.read_snapshot(|r| r.file_count()).unwrap(), 2);
     assert!(
         reader.upsert_root(&root).is_err(),
         "the reader refuses to write"

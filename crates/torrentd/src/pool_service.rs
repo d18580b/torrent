@@ -53,7 +53,12 @@ const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 const RECHECK_EXPIRY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
 
 pub struct PoolService {
+    /// The writer. A scan holds it for its whole run, which on a large pool
+    /// is an hour.
     store: Mutex<PoolStore>,
+    /// A query-only connection to the same file, which under WAL reads the
+    /// last committed index while the writer is held.
+    reader: Mutex<PoolStore>,
     /// Root id → absolute path, resolved once at startup from config.
     roots: Vec<(i64, PathBuf)>,
     library_dir: PathBuf,
@@ -103,6 +108,10 @@ impl PoolService {
             let id = store.upsert_root(path)?;
             roots.push((id, path.clone()));
         }
+        // Opened after the writer has created and migrated the file, which a
+        // query-only connection must never do.
+        let reader = PoolStore::open_read_only(&db)
+            .with_context(|| format!("open pool index {} for reading", db.display()))?;
         info!(
             target: "torrentd::pool",
             path = %db.display(),
@@ -111,6 +120,7 @@ impl PoolService {
         );
         Ok(Some(Arc::new(Self {
             store: Mutex::new(store),
+            reader: Mutex::new(reader),
             roots,
             library_dir: pool_cfg.library_dir.clone(),
             verify: VerifyQueue::new(pool_cfg.max_concurrent_verify),
@@ -154,12 +164,32 @@ impl PoolService {
         self.count("store_write_errors_total", &[("store", "pool_index")]);
     }
 
+    /// Run `f` against the writer connection.
+    ///
+    /// The writer is held by a scan for its whole run, so this can block for
+    /// an hour. Called on a runtime worker, the wait is handed off with
+    /// [`off_worker`] so it never takes a worker thread from every other
+    /// task; an HTTP handler should still prefer [`PoolService::with_reader`]
+    /// for anything that only reads, or run the whole operation on the
+    /// blocking pool.
     pub fn with_store<T>(&self, f: impl FnOnce(&PoolStore) -> T) -> T {
-        f(&self.store.lock())
+        off_worker(|| f(&self.store.lock()))
     }
 
+    /// [`PoolService::with_store`], mutably.
     pub fn with_store_mut<T>(&self, f: impl FnOnce(&mut PoolStore) -> T) -> T {
-        f(&mut self.store.lock())
+        off_worker(|| f(&mut self.store.lock()))
+    }
+
+    /// Run `f` against the read-only connection, inside one read
+    /// transaction.
+    ///
+    /// Never waits for a scan: it reads the last committed index — the
+    /// previous one in full while a scan is running. Not for anything that
+    /// writes, or that must see a write this request has just made on the
+    /// writer before it commits.
+    pub fn with_reader<T>(&self, f: impl FnOnce(&PoolStore) -> T) -> T {
+        off_worker(|| self.reader.lock().read_snapshot(f))
     }
 
     pub fn roots(&self) -> &[(i64, PathBuf)] {
@@ -231,6 +261,23 @@ impl PoolService {
             summary.drifted = m.drifted;
             Ok(summary)
         })
+    }
+}
+
+/// Run `f`, which may block for a long time, without starving the runtime.
+///
+/// On a multi-threaded runtime's worker thread, `block_in_place` hands that
+/// worker's other tasks to another thread for the duration, so a store call
+/// waiting out an hour-long scan holds one thread and not a share of every
+/// request, the health check and the watchdog ping. Anywhere else — the
+/// blocking pool, a plain thread, a current-thread runtime (where
+/// `block_in_place` is not allowed) — it simply runs `f`.
+pub(crate) fn off_worker<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
     }
 }
 

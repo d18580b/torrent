@@ -365,18 +365,24 @@ impl PoolStore {
     /// Run `f` inside one read transaction, so every query it makes sees the
     /// same committed index: a listing that reads a page and then each row's
     /// accounting must not straddle a scan's commit.
-    pub fn read_snapshot<T>(&self, f: impl FnOnce(&Self) -> T) -> Result<T, PoolError> {
-        if self.tx_depth > 0 || !self.conn.is_autocommit() {
-            // Already inside a transaction, which is a snapshot already.
-            return Ok(f(self));
+    ///
+    /// `BEGIN DEFERRED` takes no lock and reads nothing, so it fails only on
+    /// a connection that is already unusable; `f` then runs without the
+    /// snapshot and its own statements report the failure.
+    pub fn read_snapshot<T>(&self, f: impl FnOnce(&Self) -> T) -> T {
+        if self.tx_depth > 0
+            || !self.conn.is_autocommit()
+            || self.conn.execute_batch("BEGIN DEFERRED").is_err()
+        {
+            // Inside a transaction already, which is a snapshot already.
+            return f(self);
         }
-        self.conn.execute_batch("BEGIN DEFERRED")?;
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         // A read transaction has nothing to keep; ending it releases the
         // snapshot so the WAL can be checkpointed past it.
         let _ = self.conn.execute_batch("ROLLBACK");
         match out {
-            Ok(v) => Ok(v),
+            Ok(v) => v,
             Err(panic) => std::panic::resume_unwind(panic),
         }
     }
@@ -2302,8 +2308,8 @@ impl PoolStore {
     /// the caller already has.
     ///
     /// With `orphans_only`, only children holding bytes no torrent claims: a
-    /// directory whose materialised orphan count is non-zero, or an
-    /// unclaimed file.
+    /// directory whose materialised orphan bytes are non-zero, or an
+    /// unclaimed file that is not empty.
     pub fn children_page(
         &self,
         root_id: i64,
@@ -2326,7 +2332,7 @@ impl PoolStore {
             let mut st = self.conn.prepare_cached(
                 "SELECT path FROM dir
                  WHERE root_id = ?1 AND parent = ?2 AND path > ?3
-                   AND (?4 = 0 OR files_orphan > 0)
+                   AND (?4 = 0 OR bytes_orphan > 0)
                  ORDER BY path LIMIT ?5",
             )?;
             let rows = st.query_map(
@@ -2342,7 +2348,7 @@ impl PoolStore {
             let mut st = self.conn.prepare_cached(
                 "SELECT f.rel_path FROM file f
                  WHERE f.root_id = ?1 AND f.parent = ?2 AND f.rel_path > ?3
-                   AND (?4 = 0 OR NOT EXISTS (
+                   AND (?4 = 0 OR f.size > 0 AND NOT EXISTS (
                      SELECT 1 FROM claim c
                      WHERE c.root_id = f.root_id AND c.rel_path = f.rel_path))
                  ORDER BY f.rel_path LIMIT ?5",
