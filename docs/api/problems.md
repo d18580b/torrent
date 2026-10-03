@@ -258,6 +258,12 @@ run yet. The queued reload will read the same file.
 
 **503**, from `POST /v1/config/reload`. The reload task is not running.
 
+## `too-many-event-streams`
+
+**503**, from `GET /v1/events`. 64 event streams are already open on this
+daemon, and each holds its slot for as long as its client keeps it. Close a
+stream you no longer read, or retry in a few seconds.
+
 ## `internal`
 
 **500.** Something failed inside the daemon, most often the torrent engine or

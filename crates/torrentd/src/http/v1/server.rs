@@ -216,6 +216,125 @@ const IDLE_TICK: Duration = Duration::from_secs(10);
 /// the first event.
 const RETRY_MILLIS: u64 = 5_000;
 
+/// The most `/v1/events` streams open at once.
+///
+/// Each open stream is a connection, a task and a slot in the shared feed for
+/// as long as the client keeps it; past this, a client that reconnects in a
+/// loop — or many dashboards left open — is refused with `503` rather than
+/// left to grow without bound.
+pub const MAX_EVENT_STREAMS: usize = 64;
+
+/// The fingerprint every `/v1/events` stream reads, computed once per tick
+/// for all of them, and the cap on how many are open.
+///
+/// Each stream used to compute [`fingerprint`] itself, every second, and the
+/// fingerprint walks the whole assignment registry: a hundred thousand
+/// torrents times every open client, once a second. One task now computes it
+/// and broadcasts it on a `watch` channel. The task starts with the first
+/// stream and ends at the first tick that finds none left, so an idle daemon
+/// computes nothing.
+#[derive(Debug)]
+pub struct EventFeed {
+    slots: Arc<tokio::sync::Semaphore>,
+    feed: parking_lot::Mutex<Option<Arc<tokio::sync::watch::Sender<u64>>>>,
+}
+
+impl Default for EventFeed {
+    fn default() -> Self {
+        Self::with_capacity(MAX_EVENT_STREAMS)
+    }
+}
+
+impl EventFeed {
+    /// A feed admitting at most `streams` open streams.
+    pub fn with_capacity(streams: usize) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(streams)),
+            feed: parking_lot::Mutex::new(None),
+        }
+    }
+
+    /// A slot for one stream, held for as long as the stream is open; `None`
+    /// when every slot is taken.
+    fn admit(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        Arc::clone(&self.slots).try_acquire_owned().ok()
+    }
+
+    /// Streams open now.
+    #[cfg(test)]
+    pub(crate) fn open_streams(&self, capacity: usize) -> usize {
+        capacity - self.slots.available_permits()
+    }
+
+    /// Whether the shared fingerprint task is running.
+    #[cfg(test)]
+    pub(crate) fn is_running(&self) -> bool {
+        self.feed.lock().is_some()
+    }
+
+    /// A receiver of the shared fingerprint, starting the task that computes
+    /// it if none is running.
+    fn subscribe(s: &Arc<AppState>) -> tokio::sync::watch::Receiver<u64> {
+        let mut feed = s.events.feed.lock();
+        if let Some(tx) = feed.as_ref() {
+            return tx.subscribe();
+        }
+        // Seeded with a real value, so the first tick a stream sends carries
+        // the daemon's state rather than a placeholder.
+        let (tx, rx) = tokio::sync::watch::channel(fingerprint(s));
+        let tx = Arc::new(tx);
+        *feed = Some(Arc::clone(&tx));
+        tokio::spawn(Self::run(Arc::clone(s), tx));
+        rx
+    }
+
+    /// Recompute the fingerprint every [`TICK`] while anything listens.
+    async fn run(s: Arc<AppState>, tx: Arc<tokio::sync::watch::Sender<u64>>) {
+        let mut shutdown = s.shutdown.subscribe();
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(TICK) => {}
+                _ = shutdown.recv() => break,
+            }
+            if s.work.is_cancelled() {
+                break;
+            }
+            {
+                // Under the lock `subscribe` takes, so a stream cannot
+                // subscribe to a feed between this check and its end.
+                let mut feed = s.events.feed.lock();
+                if tx.receiver_count() == 0 {
+                    *feed = None;
+                    return;
+                }
+            }
+            // `send_replace` stores the value whether or not anyone is
+            // waiting; each stream decides for itself whether it changed.
+            tx.send_replace(fingerprint(&s));
+        }
+        // The daemon is going away: every stream ends on the same signal,
+        // and a stream opened later finds no feed and starts one that ends
+        // at once.
+        let mut feed = s.events.feed.lock();
+        if feed.as_ref().is_some_and(|f| Arc::ptr_eq(f, &tx)) {
+            *feed = None;
+        }
+    }
+}
+
+/// Why an event stream was not opened.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum EventsError {
+    /// Every event-stream slot is taken.
+    #[error(
+        "{MAX_EVENT_STREAMS} event streams are already open on this daemon; close one, or \
+         retry in a few seconds"
+    )]
+    #[problem(status = 503, title = "Too many event streams")]
+    TooManyEventStreams,
+}
+
 /// Stream change notifications.
 ///
 /// Server-Sent Events. Each message's `data` is a JSON `ServerEvent`; today
@@ -224,12 +343,19 @@ const RETRY_MILLIS: u64 = 5_000;
 /// every fifteen seconds through proxies that drop idle ones. The stream ends
 /// when the daemon shuts down, and within a second of the session token it was
 /// opened with expiring or being revoked; reconnect after the `retry` the
-/// first event carries, with a live credential.
+/// first event carries, with a live credential. At most 64 streams are open
+/// at once; past that the request is refused with `503
+/// too-many-event-streams`.
 #[kynos::get("/events", tag = Server)]
 pub async fn stream_events(
     caller: Scoped<Bearer, Read>,
     Inject(s): Inject<Arc<AppState>>,
-) -> Sse<impl futures_util::Stream<Item = Result<Event<ServerEvent>, std::convert::Infallible>>> {
+) -> Result<
+    Sse<impl futures_util::Stream<Item = Result<Event<ServerEvent>, std::convert::Infallible>>>,
+    EventsError,
+> {
+    let slot = s.events.admit().ok_or(EventsError::TooManyEventStreams)?;
+    let mut feed = EventFeed::subscribe(&s);
     let mut shutdown = s.shutdown.subscribe();
     // The credential is checked once, when the request arrives; a stream
     // outlives that check by as long as the client keeps it open. A session
@@ -242,6 +368,9 @@ pub async fn stream_events(
         Caller::Anonymous | Caller::Token { .. } => None,
     };
     let stream = async_stream::stream! {
+        // Held for the life of the stream: dropping the stream, when it ends
+        // or its client goes away, frees the slot.
+        let _slot = slot;
         let mut last_fingerprint = u64::MAX;
         // The first tick is due at once. `checked_sub` because an `Instant`
         // cannot go back further than the clock it reads, which on a host
@@ -286,8 +415,9 @@ pub async fn stream_events(
             }
 
             // Comparing a cheap summary avoids waking every client once a
-            // second for a daemon that is not doing anything.
-            let fp = fingerprint(&s);
+            // second for a daemon that is not doing anything. The summary
+            // is the shared feed's latest, not one this stream computes.
+            let fp = *feed.borrow_and_update();
             let idle_due = last_emit.is_none_or(|at| at.elapsed() >= IDLE_TICK);
             if fp == last_fingerprint && !idle_due {
                 continue;
@@ -306,11 +436,11 @@ pub async fn stream_events(
         }
     };
 
-    Sse::new(stream).keep_alive(
+    Ok(Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .comment("keep-alive"),
-    )
+    ))
 }
 
 /// Collapse the state a client renders into one number.

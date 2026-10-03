@@ -18,6 +18,7 @@ use crate::model::PoolFile;
 use crate::model::PoolTorrent;
 use crate::model::TorrentFileRow;
 use crate::store::PoolStore;
+use crate::store::STAGE_BATCH;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScanStats {
@@ -52,10 +53,15 @@ impl ScanStats {
 /// Symlinks are not followed. A pool assembled with symlinks into other roots
 /// would otherwise index the same bytes under two paths and every torrent over
 /// them would be reported as an overlap.
+///
+/// The walk streams into a staging table [`STAGE_BATCH`] rows at a time, and
+/// the root's index is swapped for it only once the walk is done: memory is
+/// one batch whatever the root's size, and the index never holds half a walk.
 pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, PoolError> {
     let root_id = store.upsert_root(root_path)?;
     let mut stats = ScanStats::default();
-    let mut files = Vec::new();
+    store.begin_staging()?;
+    let mut files = Vec::with_capacity(STAGE_BATCH);
 
     for entry in jwalk::WalkDir::new(root_path)
         .follow_links(false)
@@ -108,9 +114,15 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             dev: device(&meta),
             v2_root: None,
         });
+        if files.len() >= STAGE_BATCH {
+            store.stage_files(&files)?;
+            files.clear();
+        }
     }
+    store.stage_files(&files)?;
+    drop(files);
 
-    store.replace_root_files(root_id, &files, now_secs())?;
+    store.swap_staged_root(root_id, now_secs())?;
     info!(
         target: "torrentd_pool::scan",
         root = %root_path.display(),

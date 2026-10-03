@@ -247,6 +247,11 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
         }
     }
 
+    // The orphan figures and per-torrent bytes of the materialised tree are
+    // read off the claim set just rebuilt, inside the same transaction, so a
+    // listing never sees one without the other.
+    store.rebuild_all_rollups()?;
+
     info!(
         target: "torrentd_pool::matcher",
         matched = stats.matched,

@@ -130,6 +130,9 @@ fn fixture(dir: &Path, allow_mutations: bool) -> (Arc<PoolService>, i64) {
             ],
         )
         .unwrap();
+        // What the matcher ends with, since this stands in for it: the
+        // materialised tree is read off the claim set.
+        st.rebuild_all_rollups().unwrap();
     });
     (pool, root_id)
 }
@@ -443,6 +446,175 @@ async fn a_scan_or_drift_check_holds_the_work_gate_after_its_request_is_gone() {
             "{path} released the gate when its task finished",
         );
     }
+}
+
+#[tokio::test]
+async fn every_read_answers_while_a_scan_holds_the_writer() {
+    // A scan holds the writer for its whole run — on a large pool, an hour.
+    // Every read goes through the read connection, which sees the last
+    // committed index meanwhile; before, each waited on the writer's mutex.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), false);
+    let held = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        held.with_store_mut(|st| {
+            st.in_transaction(|_| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                Ok::<(), torrentd_pool::PoolError>(())
+            })
+        })
+        .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    for path in [
+        "/v1/pool".to_owned(),
+        "/v1/pool/torrents".to_owned(),
+        "/v1/pool/torrents?state=matched".to_owned(),
+        format!("/v1/pool/roots/{root_id}/tree"),
+        format!("/v1/pool/roots/{root_id}/tree?path=movies"),
+        format!("/v1/pool/roots/{root_id}/orphans"),
+        "/v1/pool/plans".to_owned(),
+    ] {
+        let resp = tokio::time::timeout(Duration::from_secs(5), h.read(&path))
+            .await
+            .unwrap_or_else(|_| panic!("{path} waited on the writer"));
+        assert_eq!(resp.status(), 200, "{path}");
+    }
+    let t: Value = h.read("/v1/pool/torrents?state=matched").await.json();
+    assert_eq!(
+        field(&t, "infohash"),
+        [IH_A],
+        "the committed index, in full"
+    );
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+}
+
+#[tokio::test]
+async fn a_token_read_before_a_scan_does_not_apply_after_it() {
+    // The plan reads come from the read connection, which shows the index
+    // as it was before a running scan. A confirm token taken from that view
+    // binds the old generation; once the scan commits it must no longer
+    // apply, or the plan deletes files the rescan may since have placed.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    let held = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    let w = h.tokens.write.clone();
+    let plan: Value = h
+        .send(
+            "POST",
+            "/v1/pool/plans",
+            Some(&w),
+            Some(json!({"kind": "delete_orphans", "root_id": root_id, "prefix": "junk"})),
+        )
+        .await
+        .json();
+    let id = plan["id"].as_i64().unwrap();
+    let token = plan["confirm_token"].as_str().unwrap().to_owned();
+
+    // A scan in progress: the writer held, and the generation moved when it
+    // commits.
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        held.with_store_mut(|st| {
+            st.in_transaction(|st| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                torrentd_pool::match_all(st).map(|_| ())
+            })
+        })
+        .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    // The token still reads as current while the scan runs.
+    let during: Value = h.read(&format!("/v1/pool/plans/{id}")).await.json();
+    assert_eq!(during["confirm_token"], token.as_str());
+
+    let apply = format!("/v1/pool/plans/{id}/apply");
+    let (resp, ()) = tokio::join!(
+        h.send(
+            "POST",
+            &apply,
+            Some(&w),
+            Some(json!({"confirm_token": token})),
+        ),
+        async {
+            // Let the apply read the plan from the pre-scan snapshot first.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            release_tx.send(()).unwrap();
+        },
+    );
+    holder.join().unwrap();
+    assert_problem(&resp, 422, "confirm-token-mismatch");
+    assert!(dir.path().join("pool/junk/orphan.bin").exists());
+
+    // The plan re-read against the rescanned index carries a token that
+    // applies.
+    let after: Value = h.read(&format!("/v1/pool/plans/{id}")).await.json();
+    assert_ne!(after["confirm_token"], token.as_str());
+    let resp = h
+        .send(
+            "POST",
+            &apply,
+            Some(&w),
+            Some(json!({"confirm_token": after["confirm_token"]})),
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_store_call_waiting_on_the_writer_does_not_take_a_runtime_worker() {
+    // Handlers outside the pool module, and the verify queue, still call the
+    // writer from async code. Waiting there for a scan used to hold a worker
+    // thread for the scan's whole run; with one worker, that was every task.
+    use std::time::Duration;
+
+    // The holder lets go on its own after `HOLD`, so a stalled runtime shows
+    // up as a late answer rather than a test that never ends: with the one
+    // worker blocked, not even a timer would fire.
+    const HOLD: Duration = Duration::from_secs(5);
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let held = Arc::clone(&pool);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        held.with_store(|_| {
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(HOLD);
+        });
+    });
+    locked_rx.recv().unwrap();
+
+    let waiter = tokio::spawn(async move { pool.with_store(|st| st.torrent_count().unwrap()) });
+    // Let the waiter take the one worker, then ask that worker for something
+    // else.
+    std::thread::sleep(Duration::from_millis(100));
+    let asked = std::time::Instant::now();
+    assert_eq!(tokio::spawn(async { 7 }).await.unwrap(), 7);
+    assert!(
+        asked.elapsed() < HOLD / 2,
+        "the runtime stalled behind a store call for {:?}",
+        asked.elapsed(),
+    );
+
+    let _ = release_tx.send(());
+    assert_eq!(waiter.await.unwrap(), 3);
+    holder.join().unwrap();
 }
 
 fn adopt(profile_id: &str, dry_run: bool, selector: Value) -> Option<Value> {
@@ -1300,8 +1472,9 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     let root_id = pool.roots()[0].0;
     const BAD: &str = "not-an-infohash";
     pool.with_store_mut(|st| {
-        // Two files whose sizes sum past `i64::MAX`: SQLite refuses the
-        // rollup with an integer overflow.
+        // Two files whose sizes sum past `i64::MAX`. The materialised tree
+        // saturates rather than failing the scan over them; the reads fail
+        // on the corrupt rows written below.
         let huge = |rel: &str, ino| PoolFile {
             root_id,
             rel_path: rel.to_owned(),
@@ -1332,6 +1505,16 @@ async fn internal_failures(cov: &Arc<Coverage>) {
         // A plan of a kind this build has no name for.
         st.create_plan("bogus", "{}", 0).unwrap();
     });
+    // Directory rows whose byte total does not read back as a number, as a
+    // corrupt index would hold: the overview and both listings fail to load
+    // the accounting.
+    rusqlite::Connection::open(dir.path().join("pool.db"))
+        .unwrap()
+        .execute(
+            "UPDATE dir SET bytes_total = 'corrupt' WHERE root_id = ?1",
+            [root_id],
+        )
+        .unwrap();
     let bogus_plan = pool
         .with_store(|st| st.plans())
         .unwrap()
