@@ -202,7 +202,7 @@ authentication posture, and at least one `[[profile]]`:
 | `http_listen` | `127.0.0.1:8080`. A non-loopback value requires `[auth]` — §6. |
 | `trusted_proxies` | `[]`, so no forwarding header is read and the socket's peer address is the client — §6a. Read once, at startup. |
 | `log_level` | `info` |
-| `registry_path` | `<resume_dir>/../profile_assignments.json` |
+| `registry_path` | `<resume_dir>/../registry.db`, a SQLite database. A path ending in `.json` names a pre-SQLite registry file: it is imported into a database beside it with a `.db` extension. |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
 | `vpn_handshake_max_age_secs` | `180` |
 | `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN profile**; see §11.6 |
@@ -364,26 +364,49 @@ that had no `[[slot]]` needs one `network = "host"` profile carrying the
   load with that key named.
 
 **2. Give a profile the id your registry already uses, or clear the entries.**
-The assignment registry — which torrent belongs to which account — is migrated
-automatically: `slot_assignments.json` is read once and written straight back
-out as `profile_assignments.json`, on that first boot and before anything else
-reads it, with the old file left intact for a rollback. The migration is
-*verbatim*, so every entry still names the id that deployment used, which on a
-single-session deployment is `default`.
+The assignment registry — which torrent belongs to which account — is the
+SQLite database `registry.db` in the state directory, and it is migrated
+automatically. On the first boot, before anything else reads it, the daemon
+imports `profile_assignments.json` into it in one transaction — or, where that
+file does not exist, the pre-profiles `slot_assignments.json` — and renames the
+file it read to `<name>.imported`, which is kept for a rollback and not read
+again. The import is *verbatim*, so every entry still names the id that
+deployment used, which on a single-session deployment is `default`.
 
 Nothing reconciles those ids with your `[[profile]]` tables, so the daemon
 refuses to start until they agree, listing the ids it does not recognise and
-naming the file it read them from. Either name one of your profiles `default` —
-`default` is a legal profile id — or delete those entries from
-`profile_assignments.json` and re-add the torrents. Edit
-`profile_assignments.json`, not `slot_assignments.json`: the old file is kept
-only so a rollback has something to go back to, and the daemon does not read it
-again.
+naming both the database and the file they were imported from. Either name one
+of your profiles `default` — `default` is a legal profile id — or delete those
+rows from the database, with the `sqlite3` statement the refusal prints, and
+re-add the torrents. Edit `registry.db`, not the `.imported` file: the daemon
+does not read that again.
 
-`torrentd pool scan` reads the same registry, and reads the old file too where
-that is the only one present — so running the scan before the daemon's first
-boot, which is the order this section uses, still folds your assignments into
-the pool index. It prints which file it read and how many entries it took.
+To roll back to a release that predates the database, stop the daemon and
+rename the newest imported copy back to its original name. The first import
+leaves `<name>.imported`, and each later one takes the next free
+`<name>.imported.N`, so where numbered copies exist the newest is the one with
+the highest `N`; `<name>.imported` itself is then the oldest. Assignments made
+since the upgrade exist only in `registry.db`. A `profile_assignments.json` that
+reappears beside the database — the rolled-back release wrote it — is imported
+again on the next boot of this one: entries the database lacks are
+added, and one that assigns an info-hash to a different profile than the
+database does refuses the boot, naming both, with nothing imported.
+
+That merge only adds. An assignment the rolled-back release *removed* — a
+torrent it deleted — is still in `registry.db`, which that release never
+opened, so it survives the return to this one: nothing loads for that
+info-hash, and adding it again answers 409 until `DELETE
+/v1/torrents/{infohash}` or the `sqlite3` statement clears the row. Where the
+rolled-back release's file should replace the database rather than merge into
+it, stop the daemon and move `registry.db` (with its `registry.db-wal` and
+`registry.db-shm`, if present) aside before booting this release: with no
+database, the boot imports the JSON file into a new one.
+
+`torrentd pool scan` opens the same registry the same way, performing the
+import itself if the daemon has not yet — so running the scan before the
+daemon's first boot, which is the order this section uses, still folds your
+assignments into the pool index. It prints where it read them from and how many
+entries it took.
 
 **2a. The pool index migrates one way, and leaves a copy.** If you have a
 `[pool]` section, the first open on this build renames the index's

@@ -15,6 +15,8 @@
 //!   - Fault injection beyond errors: `inject_panic(op)` makes the next call
 //!     to that op panic, and `stall_next_pop(d)` makes the next `pop_alerts`
 //!     block for `d`, which wedges whatever loop is draining it.
+//!   - In-flight calls: `hold_next(op)` parks the next call to that op until
+//!     the test releases it, so a test can act while the call runs.
 //!
 //! The daemon's `fault-injection` build layers one of these over each real
 //! session so an alert drill can queue libtorrent alerts, stall the alert
@@ -30,6 +32,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -44,6 +47,7 @@ use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::Settings;
 use libtorrent_safe::TorrentDetails;
 use libtorrent_safe::TorrentFile;
+use libtorrent_safe::TorrentFlags;
 use libtorrent_safe::TorrentHandle;
 use libtorrent_safe::TrackerEntry;
 use parking_lot::Mutex;
@@ -84,7 +88,7 @@ pub enum RecordedCall {
         new_path: String,
         flags: MoveFlags,
     },
-    /// Boxed: `Settings` is several times the size of every other variant.
+    /// Boxed: `Settings` is several times larger than every other variant.
     ApplySettings(Box<Settings>),
     SessionState,
     TorrentDetails(TorrentHandle),
@@ -111,7 +115,44 @@ pub enum AddParamsSummary {
         /// Whether `.torrent` bytes were supplied to repair missing metadata.
         has_torrent: bool,
         save_path: Option<String>,
+        /// Set on top of the resume data's own flags.
+        flags_set: u32,
+        /// Cleared from them, after `flags_set`.
+        flags_clear: u32,
     },
+}
+
+impl AddParamsSummary {
+    /// The flags the add asserts: `flags` for a `.torrent` or magnet add,
+    /// `flags_set` for a resume add.
+    pub fn flags_set(&self) -> TorrentFlags {
+        TorrentFlags::from_bits_retain(match self {
+            Self::File { flags_bits, .. } | Self::Magnet { flags_bits, .. } => *flags_bits,
+            Self::Resume { flags_set, .. } => *flags_set,
+        })
+    }
+
+    /// The flags the add clears from what it starts from: nothing for a
+    /// `.torrent` or magnet add, which starts from no flags at all.
+    pub fn flags_clear(&self) -> TorrentFlags {
+        match self {
+            Self::File { .. } | Self::Magnet { .. } => TorrentFlags::empty(),
+            Self::Resume { flags_clear, .. } => TorrentFlags::from_bits_retain(*flags_clear),
+        }
+    }
+
+    /// Whether the add, as the caller asked for it, leaves the torrent in
+    /// upload mode with no [`crate::policy::forbidden`] flag in force whatever
+    /// its resume data carried.
+    pub fn forbids_downloading(&self) -> bool {
+        let forbidden = crate::policy::forbidden();
+        self.flags_set().contains(TorrentFlags::UPLOAD_MODE)
+            && !self.flags_set().intersects(forbidden)
+            && match self {
+                Self::Resume { .. } => self.flags_clear().contains(forbidden),
+                Self::File { .. } | Self::Magnet { .. } => true,
+            }
+    }
 }
 
 impl From<&AddParams> for AddParamsSummary {
@@ -139,13 +180,37 @@ impl From<&AddParams> for AddParamsSummary {
                 bytes,
                 torrent,
                 save_path,
-                ..
+                flags_set,
+                flags_clear,
             } => AddParamsSummary::Resume {
                 byte_len: bytes.len(),
                 has_torrent: torrent.as_ref().is_some_and(|t| !t.is_empty()),
                 save_path: save_path.clone(),
+                flags_set: flags_set.bits(),
+                flags_clear: flags_clear.bits(),
             },
         }
+    }
+}
+
+/// A call [`MockEngine::hold_next`] parked. Dropping it releases the call.
+#[derive(Debug)]
+pub struct HeldCall {
+    entered: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+}
+
+impl HeldCall {
+    /// Block until the held call has been reached.
+    pub fn wait_entered(&self) {
+        self.entered
+            .recv()
+            .expect("the engine was dropped before the held call was reached");
+    }
+
+    /// Let the held call go on.
+    pub fn release(&self) {
+        let _ = self.release.send(());
     }
 }
 
@@ -160,6 +225,9 @@ pub struct MockEngine {
     panic_inject: DashMap<&'static str, ()>,
     /// How long the next `pop_alerts` blocks before draining.
     stall: Mutex<Option<Duration>>,
+    /// Ops whose next call signals it was reached, then parks until the
+    /// [`HeldCall`] releases it or is dropped.
+    holds: DashMap<&'static str, (mpsc::Sender<()>, Mutex<mpsc::Receiver<()>>)>,
     /// When clear, `calls()` stays empty. On by default.
     recording: AtomicBool,
     /// infohash → handle, so add/remove are consistent across calls.
@@ -196,6 +264,7 @@ impl MockEngine {
             error_inject: DashMap::new(),
             panic_inject: DashMap::new(),
             stall: Mutex::new(None),
+            holds: DashMap::new(),
             recording: AtomicBool::new(true),
             handles: DashMap::new(),
             auto_save_resume: AtomicBool::new(false),
@@ -268,6 +337,19 @@ impl MockEngine {
         *self.stall.lock() = Some(d);
     }
 
+    /// Park the next call to `op` until the returned [`HeldCall`] releases
+    /// it (or is dropped). Takes the same op names as `inject_error`, and is
+    /// taken before them, so a held call can still fail once released.
+    pub fn hold_next(&self, op: &'static str) -> HeldCall {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        self.holds.insert(op, (entered_tx, Mutex::new(release_rx)));
+        HeldCall {
+            entered: entered_rx,
+            release: release_tx,
+        }
+    }
+
     pub fn calls(&self) -> Vec<RecordedCall> {
         self.calls.lock().clone()
     }
@@ -325,6 +407,11 @@ impl MockEngine {
     }
 
     fn check_error(&self, op: &'static str) -> Result<(), EngineError> {
+        if let Some((_, (entered, release))) = self.holds.remove(op) {
+            let _ = entered.send(());
+            // Returns on a release and on a dropped `HeldCall` alike.
+            let _ = release.lock().recv();
+        }
         if self.panic_inject.remove(op).is_some() {
             panic!("mock injected panic on `{op}`");
         }
@@ -640,6 +727,7 @@ mod tests {
             tier: 0,
             verified: true,
             updating: false,
+            working: true,
             fails: 0,
             message: None,
             last_error: None,

@@ -24,9 +24,12 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 
-# Serialization (for AssignmentRegistry JSON)
+# Serialization (AssignmentRegistry's one-time JSON import)
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+# AssignmentRegistry's database
+rusqlite = { workspace = true }
 
 # Misc
 bytes = { workspace = true }

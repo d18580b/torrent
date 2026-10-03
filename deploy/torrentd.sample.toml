@@ -65,9 +65,10 @@ allow_unauthenticated = true
 # profile at directories from a pre-profiles deployment, where resume files
 # lived directly under the root.
 #
-# Optional. Defaults to <resume_dir>/../profile_assignments.json, which records
-# which profile owns which info-hash.
-# registry_path = "/var/lib/torrentd/profile_assignments.json"
+# Optional. Defaults to <resume_dir>/../registry.db, a SQLite database that
+# records which profile owns which info-hash. A path ending in .json names an
+# older JSON registry, imported once into a .db file beside it.
+# registry_path = "/var/lib/torrentd/registry.db"
 
 # libtorrent settings overrides (applied on top of the high_performance_seed
 # preset). All optional; omit any to use the preset's default.

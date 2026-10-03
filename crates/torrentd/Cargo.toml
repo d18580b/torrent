@@ -63,6 +63,8 @@ fault-injection = ["torrentd-engine/test-support"]
 # The engine's test doubles, for this crate's unit tests only.
 torrentd-engine = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
+# Fault injection into the assignment registry's database.
+rusqlite = { workspace = true }
 kynos = { workspace = true, features = ["test-util"] }
 
 [lints]

@@ -60,10 +60,14 @@ pub use metrics::MetricsSink;
 pub use metrics::NoopSink;
 pub use metrics::RecordingSink;
 #[cfg(any(test, feature = "test-support"))]
+pub use mock::HeldCall;
+#[cfg(any(test, feature = "test-support"))]
 pub use mock::MockEngine;
 #[cfg(any(test, feature = "test-support"))]
 pub use mock::RecordedCall;
 pub use policy::discovery_guards;
+pub use policy::forbidden;
+pub use policy::resume_flags_clear;
 pub use policy::resume_flags_set;
 pub use policy::seed_flags;
 pub use policy::verify_flags;
@@ -84,6 +88,7 @@ pub use profile::ProfileNetwork;
 pub use profile::ProfileStatus;
 pub use real::RealEngine;
 pub use registry::AssignmentRegistry;
+pub use registry::JsonImport;
 pub use registry::RegistryError;
 pub use resume_store::FsResumeStore;
 pub use resume_store::MemoryResumeStore;

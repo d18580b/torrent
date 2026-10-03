@@ -4,12 +4,13 @@
 //! existing JSON-file conventions carry — and an API client needs to sort,
 //! filter and paginate over that set without shipping all of it.
 //! One transactional file serves the file index, the torrent library, adoption
-//! state, and a copy of the torrent→profile mapping that lives in
-//! `profile_assignments.json` (once `slot_assignments.json`).
+//! state, and a copy of the torrent→profile mapping that lives in the
+//! assignment registry, `registry.db` (once `profile_assignments.json`, and
+//! before that `slot_assignments.json`).
 //!
 //! # `torrent.profile` is a cache, not the authority
 //!
-//! `profile_assignments.json` is the authority for which profile owns which
+//! The assignment registry is the authority for which profile owns which
 //! info-hash. It is what the daemon's resume scan writes, what every load is
 //! gated on, and what the daemon refuses to boot against when it disagrees
 //! with the configured profiles. This column is a copy of it, written by
