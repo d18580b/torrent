@@ -765,11 +765,11 @@ impl DeleteGuards {
             self.by_root.clear();
             self.generation = Some(generation);
         }
-        if !self.by_root.contains_key(&root_id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.by_root.entry(root_id) {
             let guard = pool
                 .with_store(|s| torrentd_pool::plan::DeleteGuard::load(s, root_id, root))
                 .map_err(|e| e.to_string())?;
-            self.by_root.insert(root_id, guard);
+            e.insert(guard);
         }
         Ok(self.by_root[&root_id].refusal(rel, size))
     }
