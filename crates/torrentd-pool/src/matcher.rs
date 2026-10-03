@@ -72,6 +72,9 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
     let torrents = store.torrents()?;
     let mut stats = MatchStats::default();
 
+    // Inside the rebuild's transaction, so the generation moves exactly when
+    // the claim set it stands for does.
+    store.bump_index_generation()?;
     store.clear_all_claims()?;
 
     for t in &torrents {
@@ -253,8 +256,13 @@ fn candidate_bases(
 
     // (3) Size anchor. Use the largest file: on a real pool, large sizes are
     //     close to unique, so this returns very few candidates.
-    if let Some(anchor) = files.iter().max_by_key(|f| f.size) {
-        if anchor.size > 0 {
+    //     A padding file is never on disk, so it can never anchor anything.
+    if let Some(anchor) = files
+        .iter()
+        .filter(|f| f.is_on_disk())
+        .max_by_key(|f| f.size)
+    {
+        {
             let anchor_rel = normalize(&anchor.rel_path);
             for candidate_path in store.files_with_size(root_id, anchor.size)? {
                 // The base is whatever prefix remains after removing the
@@ -280,10 +288,11 @@ fn evaluate_base(
     let mut resolved = 0usize;
 
     for f in files {
-        // Zero-length entries (v2 pad files, empty files) carry no bytes to
-        // find; counting them as unresolved would mark healthy torrents
-        // partial forever.
-        if f.size == 0 {
+        // Padding files and empty files carry no bytes to find. A BEP 47
+        // padding entry has a real, non-zero size but libtorrent never writes
+        // it, so it is skipped by its flag, not by its size; counting either
+        // as unresolved would mark a healthy torrent partial forever.
+        if !f.is_on_disk() {
             resolved += 1;
             continue;
         }

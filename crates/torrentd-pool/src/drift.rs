@@ -62,7 +62,7 @@ pub fn detect(
 
         let mut changed = false;
         for f in store.torrent_files(&t.infohash)? {
-            if f.size == 0 {
+            if !f.is_on_disk() {
                 continue;
             }
             let rel = if base_rel.is_empty() {

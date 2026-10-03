@@ -64,6 +64,7 @@ fn file_row(infohash: &str, idx: i64, rel_path: &str, size: u64) -> TorrentFileR
         rel_path: rel_path.to_owned(),
         size,
         pieces_root: None,
+        pad_file: false,
     }
 }
 

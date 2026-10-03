@@ -180,9 +180,9 @@ pub struct PoolFile {
     pub mtime_ns: i64,
     pub ino: u64,
     pub dev: u64,
-    /// v2 merkle root, once known. Populated by matching against a v2 torrent
-    /// rather than by hashing: computing it for an unmatched file would mean
-    /// reading the whole pool.
+    /// v2 merkle root. Nothing populates it: computing it would mean reading
+    /// the whole pool, and the matcher places files by `(path, size)` alone.
+    /// The column is kept so the schema does not change for it.
     pub v2_root: Option<[u8; 32]>,
 }
 
@@ -224,6 +224,17 @@ pub struct TorrentFileRow {
     pub rel_path: String,
     pub size: u64,
     pub pieces_root: Option<[u8; 32]>,
+    /// A BEP 47 padding entry. It has a size but is never written to disk, so
+    /// nothing that looks for this torrent's files there may count it.
+    pub pad_file: bool,
+}
+
+impl TorrentFileRow {
+    /// Whether this entry has bytes that should exist on disk. Padding files
+    /// and empty files have none to find.
+    pub fn is_on_disk(&self) -> bool {
+        !self.pad_file && self.size > 0
+    }
 }
 
 /// Byte accounting for one directory subtree — what makes the pool legible at

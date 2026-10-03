@@ -174,7 +174,7 @@ fn fastresume_is_trustworthy(store: &PoolStore, infohash: &str) -> Result<bool, 
     };
 
     for f in store.torrent_files(infohash)? {
-        if f.size == 0 {
+        if !f.is_on_disk() {
             continue;
         }
         let rel = join_rel(&base_rel, &f.rel_path);

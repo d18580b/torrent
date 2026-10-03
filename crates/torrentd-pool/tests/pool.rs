@@ -55,6 +55,9 @@ fn add_torrent(
             rel_path: p.to_string(),
             size: *s,
             pieces_root: None,
+            // BEP 47 names its padding entries `.pad/<n>`; these tests follow
+            // that convention to mark one.
+            pad_file: p.contains(".pad/"),
         })
         .collect();
     store.replace_torrent_files(infohash, &rows).unwrap();
@@ -255,8 +258,8 @@ fn rematching_does_not_demote_an_adopted_torrent() {
 }
 
 #[test]
-fn zero_length_files_do_not_block_a_match() {
-    // v2 pad files and genuinely empty files have no bytes to locate.
+fn empty_files_do_not_block_a_match() {
+    // A genuinely empty file has no bytes to locate.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_file(root, "P/real.bin", 128);
@@ -268,11 +271,95 @@ fn zero_length_files_do_not_block_a_match() {
         "4d",
         "P",
         None,
-        &[("P/real.bin", 128), ("P/.pad/0", 0)],
+        &[("P/real.bin", 128), ("P/empty", 0)],
     );
 
     torrentd_pool::match_all(&mut store).unwrap();
     assert_eq!(state_of(&store, "4d"), AdoptionState::Matched);
+}
+
+#[test]
+fn padding_files_do_not_block_a_match() {
+    // A BEP 47 padding entry has a real, non-zero size — it pads the previous
+    // file out to a piece boundary — and libtorrent never writes it. This test
+    // used to model one as zero bytes, which is the one shape a padding file
+    // never has, and so passed while every real padded torrent read partial.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "P/a.bin", 100);
+    write_file(root, "P/b.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "4e",
+        "P",
+        None,
+        // The pad is larger than either real file, so it would also have been
+        // chosen as the size anchor.
+        &[("P/a.bin", 100), ("P/.pad/16284", 16284), ("P/b.bin", 128)],
+    );
+
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "4e"), AdoptionState::Matched);
+}
+
+/// Index a real `.torrent` from `tests/fixtures`, lay its payload out on disk
+/// the way libtorrent would — every file but the padding ones, sparse — and
+/// return the store, the root and the torrent's info-hash.
+fn fixture_on_disk(name: &str) -> (tempfile::TempDir, PoolStore, PathBuf, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    std::fs::copy(&src, library.join(name)).unwrap();
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library).unwrap();
+    let t = store.torrents().unwrap().pop().expect("fixture indexed");
+    let files = store.torrent_files(&t.infohash).unwrap();
+    assert!(
+        files.iter().any(|f| f.pad_file && f.size > 0),
+        "{name} must carry a non-empty padding file for this test to mean anything",
+    );
+    for f in files.iter().filter(|f| !f.pad_file) {
+        let p = root.join(&f.rel_path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::File::create(&p).unwrap().set_len(f.size).unwrap();
+    }
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    (dir, store, root, t.infohash)
+}
+
+/// The acceptance case for padding: real torrents libtorrent itself pads —
+/// a legacy `_____padding_file_` one and a v1+v2 hybrid, whose v1 half is
+/// padded to piece boundaries — match and adopt with nothing missing.
+#[test]
+fn real_padded_and_hybrid_torrents_match_and_adopt() {
+    for name in ["pad_file.torrent", "v2_hybrid.torrent"] {
+        let (_dir, mut store, root, ih) = fixture_on_disk(name);
+        torrentd_pool::match_all(&mut store).unwrap();
+        assert_eq!(state_of(&store, &ih), AdoptionState::Matched, "{name}");
+
+        let root_id = store.root_id(&root).unwrap();
+        let plan =
+            torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| root.clone()))
+                .unwrap();
+        assert!(
+            matches!(plan, torrentd_pool::AdoptPlan::Verify { .. }),
+            "{name}: {plan:?}"
+        );
+
+        // And the drift pass does not go looking for the padding on disk.
+        let r = root.clone();
+        let report = torrentd_pool::drift::detect(&mut store, |_| Some(r.clone())).unwrap();
+        assert!(report.drifted.is_empty(), "{name}: {report:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -491,6 +578,9 @@ fn add_torrent_with_sidecar(
             rel_path: p.to_string(),
             size: *s,
             pieces_root: None,
+            // BEP 47 names its padding entries `.pad/<n>`; these tests follow
+            // that convention to mark one.
+            pad_file: p.contains(".pad/"),
         })
         .collect();
     store.replace_torrent_files(infohash, &rows).unwrap();
@@ -1386,8 +1476,8 @@ fn a_b28a778_index_opens_and_keeps_its_journal() {
 
     assert_eq!(
         user_version(&db),
-        3,
-        "the version must now agree with the schema the file already had",
+        4,
+        "the version must now agree with the schema the file already had, plus v4",
     );
     let cols = torrent_columns(&db);
     assert!(
@@ -1489,7 +1579,7 @@ fn a_half_applied_v3_index_gains_the_index_the_lost_statement_would_have_made() 
     let store = PoolStore::open(&db).expect("a half-applied v3 opens");
     drop(store);
 
-    assert_eq!(user_version(&db), 3, "the version agrees with the schema");
+    assert_eq!(user_version(&db), 4, "the version agrees with the schema");
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1547,7 +1637,7 @@ fn a_half_applied_v3_index_loses_the_index_name_the_rename_left_mislabelled() {
 
     PoolStore::open(&db).expect("a half-applied v3 opens");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1599,7 +1689,7 @@ fn a_stamped_v3_index_with_no_index_on_profile_is_still_repaired() {
 
     PoolStore::open(&db).expect("a stamped v3 opens");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1639,7 +1729,7 @@ fn a_stamped_v3_index_still_carrying_torrent_by_slot_is_repaired() {
 
     PoolStore::open(&db).expect("a stamped v3 opens");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1694,7 +1784,11 @@ fn a_complete_v3_schema_left_at_version_0_or_1_is_stamped_rather_than_wedged() {
         let store = PoolStore::open(&db).expect("a complete v3 schema must open at any version");
         drop(store);
 
-        assert_eq!(user_version(&db), 3, "stamped to the version it already is");
+        assert_eq!(
+            user_version(&db),
+            4,
+            "stamped to the v3 it already is, then stepped to v4"
+        );
         let idx = torrent_indexes(&db);
         assert!(
             idx.iter().any(|n| n == "torrent_by_profile")
@@ -1813,7 +1907,7 @@ fn a_file_carrying_both_v3_indexes_loses_torrent_by_slot_at_any_version() {
 
         PoolStore::open(&db).expect("a file with both indexes must open");
 
-        assert_eq!(user_version(&db), 3);
+        assert_eq!(user_version(&db), 4);
         let idx = torrent_indexes(&db);
         assert!(
             idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1855,7 +1949,7 @@ fn an_ordinary_v3_index_is_opened_without_touching_it() {
 
     PoolStore::open(&db).expect("a second open is an ordinary v3 open");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     assert_eq!(torrent_indexes(&db), before, "nothing may be rebuilt here");
     assert!(
         !backup.exists(),
@@ -1876,7 +1970,7 @@ fn a_genuine_v2_index_is_still_migrated_by_the_version_keyed_step() {
 
     PoolStore::open(&db).expect("a genuine v2 index migrates forward");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     let cols = torrent_columns(&db);
     assert!(
         cols.iter().any(|c| c == "profile") && !cols.iter().any(|c| c == "slot"),
@@ -2048,7 +2142,7 @@ fn a_real_backup_already_at_the_path_is_replaced_by_a_fresh_copy_once_the_migrat
 
     PoolStore::open(&db).expect("the migration runs");
 
-    assert_eq!(user_version(&db), 3, "the migration really ran");
+    assert_eq!(user_version(&db), 4, "the migration really ran");
     assert_eq!(
         user_version(&backup),
         2,

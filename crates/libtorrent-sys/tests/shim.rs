@@ -282,6 +282,29 @@ fn metadata_reports_every_file_of_a_multi_file_torrent() {
 }
 
 #[test]
+fn metadata_flags_padding_files() {
+    // pad_file.torrent carries a BEP 47 padding entry with a non-zero size,
+    // which never exists on disk; the pool matcher skips it by this flag.
+    let bytes = vendored_torrent("pad_file.torrent");
+    let mut meta = parse_meta(&bytes);
+    let files = unsafe { std::slice::from_raw_parts(meta.files, meta.num_files) };
+    let pads: Vec<_> = files.iter().filter(|f| f.pad_file == 1).collect();
+    assert!(
+        !pads.is_empty(),
+        "the fixture's padding entry must be flagged"
+    );
+    assert!(
+        pads.iter().all(|f| f.size > 0),
+        "padding files carry a size"
+    );
+    assert!(
+        files.iter().any(|f| f.pad_file == 0),
+        "real files must not be flagged",
+    );
+    unsafe { lt_torrent_meta_free(&mut meta) };
+}
+
+#[test]
 fn metadata_rejects_garbage_without_unwinding() {
     let garbage = b"d4:infoNOT-BENCODE";
     let mut meta: lt_torrent_meta = unsafe { std::mem::zeroed() };

@@ -215,6 +215,7 @@ pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanSta
                 rel_path: f.path.replace('\\', "/"),
                 size: f.size,
                 pieces_root: f.pieces_root,
+                pad_file: f.pad_file,
             })
             .collect();
         store.replace_torrent_files(&infohash, &rows)?;

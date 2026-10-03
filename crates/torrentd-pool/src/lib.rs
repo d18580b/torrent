@@ -23,12 +23,12 @@
 //! 2. **Authoritative verify** — libtorrent re-hashes the payload (v1 SHA-1,
 //!    v2 SHA-256 merkle). Triggered on adopt and on drift. torrentd never
 //!    reimplements piece hashing.
-//! 3. **Content-addressed match** — a v2 torrent carries a per-file merkle
-//!    root, which identifies a file independently of its name and location.
-//!    That is what lets the matcher follow a file that was moved or renamed,
-//!    and what surfaces two torrents claiming the same bytes. v1 torrents have
-//!    no per-file digest — pieces span file boundaries — so they match on
-//!    `(path, size)` and are only confirmed by step 2.
+//!
+//! Matching itself is `(path, size)` for every torrent, v1, v2 and hybrid
+//! alike: see [`matcher`]. A v2 torrent's per-file merkle root is recorded in
+//! the index but no file's root is ever computed from disk — that would mean
+//! reading the whole pool — so it plays no part in placing a file, and a
+//! match is only ever confirmed by step 2.
 
 pub mod adopt;
 pub mod drift;

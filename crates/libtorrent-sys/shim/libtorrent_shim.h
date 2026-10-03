@@ -281,16 +281,21 @@ int         lt_magnet_info_hash(const char* uri,
 /* One entry of a torrent's file list.
  *
  * `pieces_root` is the BitTorrent v2 per-file merkle root (SHA-256 over 16 KiB
- * leaves). It is a content identifier for the file on its own — independent of
- * name and location — which is what lets the pool index recognise a file that
- * moved or was renamed. `has_pieces_root` is 0 for v1-only torrents, where
- * pieces span file boundaries and no per-file digest exists. */
+ * leaves). `has_pieces_root` is 0 for v1-only torrents, where pieces span file
+ * boundaries and no per-file digest exists.
+ *
+ * `pad_file` is 1 for a BEP 47 padding file (`file_flags & pad_file`): an
+ * entry that aligns the next file to a piece boundary, carries a non-zero
+ * size, and is never written to disk. Anything that looks for a torrent's
+ * files on disk has to skip these, or every padded torrent reads as
+ * incomplete. */
 struct lt_torrent_meta_file {
     char     path[LT_PATH_MAX];   /* torrent-relative, '/'-separated */
     uint64_t size;
     uint8_t  pieces_root[32];
     uint8_t  has_pieces_root;
-    uint8_t  _pad[7];
+    uint8_t  pad_file;
+    uint8_t  _pad[6];
 };
 
 /* Parsed .torrent metadata. `files` is heap-allocated; release the whole

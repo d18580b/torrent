@@ -166,7 +166,7 @@ fn build_relocate(
     // different copy of this payload or someone else's data, and both are
     // reasons to stop and let a person look.
     for f in store.torrent_files(infohash)? {
-        if f.size == 0 {
+        if !f.is_on_disk() {
             continue;
         }
         let candidate = dest_dir.join(&f.rel_path);

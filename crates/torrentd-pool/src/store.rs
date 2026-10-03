@@ -41,7 +41,28 @@ use crate::model::TorrentFileRow;
 
 /// Bumped whenever the schema changes; `migrate` walks forward from whatever
 /// the file reports. A file from the future is refused rather than guessed at.
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+/// The version [`PoolStore::migrate`] brings a file to. Everything that
+/// machinery stamps, recognises and repairs is the v3 schema; v4 is one
+/// additive step on top of it, in [`PoolStore::migrate_v4`], so the v3
+/// recognition arms keep describing exactly the files they were written for.
+const V3: i64 = 3;
+
+/// v4 marks padding files and adds the index generation.
+///
+/// `pad_file` defaults to 0, so a torrent indexed before this step keeps
+/// reading its padding entries as payload until the library is scanned again,
+/// which rewrites every torrent's file rows. `pool_meta` holds the index
+/// generation a destructive plan's confirm token is bound to.
+const SCHEMA_V4: &str = r#"
+ALTER TABLE torrent_file ADD COLUMN pad_file INTEGER NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS pool_meta (
+    key   TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+) WITHOUT ROWID;
+"#;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE root (
@@ -243,6 +264,7 @@ impl PoolStore {
         conn.busy_timeout(std::time::Duration::from_millis(0))?;
         let store = Self { conn, tx_depth: 0 };
         store.migrate()?;
+        store.migrate_v4()?;
         Ok(store)
     }
 
@@ -666,12 +688,17 @@ impl PoolStore {
                 expected: SCHEMA_VERSION,
             });
         }
+        // Past v3 already: everything below describes files at or before it,
+        // and its recognition arm would otherwise stamp a v4 file back to 3.
+        if found > V3 {
+            return Ok(());
+        }
         // The files no version-keyed step can reach: v3's columns already, so
         // there is no `slot` to rename, under a version that does not describe
         // them. Stamped rather than stepped — and where the indexes did not
         // come with the columns, brought the rest of the way first.
         //
-        // Checked **before** the `found == SCHEMA_VERSION` return below, and
+        // Checked **before** the `found == V3` return below, and
         // for any version this build can open, not only for 2. That return was
         // what made an incomplete v3 permanent, and this change's own builds
         // produced one: in the `e391b72 … 1195546^` window the arm stamped the
@@ -717,10 +744,7 @@ impl PoolStore {
         // fails on `SCHEMA_V1` and says to rebuild with `pool scan` — which
         // costs nothing here, because the journal it would lose was never
         // created.
-        if found >= 0
-            && self.carries_v3_columns()?
-            && (found == SCHEMA_VERSION || self.has_v2_tables()?)
-        {
+        if found >= 0 && self.carries_v3_columns()? && (found == V3 || self.has_v2_tables()?) {
             let indexed = self.has_torrent_index("torrent_by_profile")?;
             // `torrent_by_slot` surviving is a defect in its own right, not
             // merely a symptom of `torrent_by_profile` being absent. Keying
@@ -738,7 +762,7 @@ impl PoolStore {
             // running it for a stale name is the same statement pair either
             // way.
             let stale = self.has_torrent_index("torrent_by_slot")?;
-            if found == SCHEMA_VERSION && indexed && !stale {
+            if found == V3 && indexed && !stale {
                 // An ordinary v3 open: the version and the schema agree.
                 return Ok(());
             }
@@ -750,8 +774,7 @@ impl PoolStore {
                 if !indexed || stale {
                     self.conn.execute_batch(SCHEMA_V3_INDEXES)?;
                 }
-                self.conn
-                    .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                self.conn.pragma_update(None, "user_version", V3)?;
                 Ok(())
             })();
             if let Err(e) = repaired {
@@ -759,11 +782,11 @@ impl PoolStore {
                 return Err(e);
             }
             self.conn.execute_batch("COMMIT")?;
-            match (found == SCHEMA_VERSION, indexed && !stale) {
+            match (found == V3, indexed && !stale) {
                 (false, true) => warn!(
                     target: "torrentd_pool::store",
                     from_version = found,
-                    to_version = SCHEMA_VERSION,
+                    to_version = V3,
                     indexes_repaired = false,
                     "pool index already carries the v3 schema under a user_version that does not \
                      describe it; stamping the version to match. A superseded build of this \
@@ -775,7 +798,7 @@ impl PoolStore {
                 (false, false) => warn!(
                     target: "torrentd_pool::store",
                     from_version = found,
-                    to_version = SCHEMA_VERSION,
+                    to_version = V3,
                     indexes_repaired = true,
                     "pool index carries the v3 schema under a user_version that does not describe \
                      it, but not v3's indexes; creating torrent_by_profile, dropping \
@@ -786,7 +809,7 @@ impl PoolStore {
                 (true, false) => warn!(
                     target: "torrentd_pool::store",
                     from_version = found,
-                    to_version = SCHEMA_VERSION,
+                    to_version = V3,
                     indexes_repaired = true,
                     "pool index reports user_version = 3 but its indexes are not the set v3 \
                      describes; creating torrent_by_profile if it is missing and dropping \
@@ -800,7 +823,7 @@ impl PoolStore {
             }
             return Ok(());
         }
-        if found == SCHEMA_VERSION {
+        if found == V3 {
             return Ok(());
         }
         // Outside the transaction: VACUUM cannot run inside one. Only for a
@@ -826,8 +849,7 @@ impl PoolStore {
             if found < 3 {
                 self.conn.execute_batch(SCHEMA_V3)?;
             }
-            self.conn
-                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            self.conn.pragma_update(None, "user_version", V3)?;
             Ok(())
         })();
         // Settled whichever way the transaction ends, before any `?` below
@@ -840,7 +862,7 @@ impl PoolStore {
                 info!(
                     target: "torrentd_pool::store",
                     from_version = found,
-                    to_version = SCHEMA_VERSION,
+                    to_version = V3,
                     "pool schema migrated",
                 );
                 Ok(())
@@ -877,11 +899,95 @@ impl PoolStore {
                         .unwrap_or("<in-memory>")
                         .to_string(),
                     from: found,
+                    to: V3,
+                    reason: e.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Step a v3 file to v4: one transaction over the additive DDL and the
+    /// version write, for the reason [`PoolStore::migrate`] gives.
+    ///
+    /// The column is added only where it is absent, so a file that carries it
+    /// under a version that does not say so is stamped rather than failed.
+    fn migrate_v4(&self) -> Result<(), PoolError> {
+        let found: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if found >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        self.conn.execute_batch("BEGIN IMMEDIATE")?;
+        let stepped = (|| -> Result<(), PoolError> {
+            let has_pad: i64 = self.conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('torrent_file') WHERE name = 'pad_file'",
+                [],
+                |r| r.get(0),
+            )?;
+            if has_pad == 0 {
+                self.conn.execute_batch(SCHEMA_V4)?;
+            } else {
+                self.conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS pool_meta (
+                         key TEXT PRIMARY KEY, value INTEGER NOT NULL) WITHOUT ROWID;",
+                )?;
+            }
+            self.conn
+                .pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            Ok(())
+        })();
+        let stepped =
+            stepped.and_then(|()| self.conn.execute_batch("COMMIT").map_err(PoolError::from));
+        match stepped {
+            Ok(()) => {
+                info!(
+                    target: "torrentd_pool::store",
+                    from_version = found,
+                    to_version = SCHEMA_VERSION,
+                    "pool schema migrated",
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(PoolError::MigrationFailed {
+                    path: self
+                        .conn
+                        .path()
+                        .filter(|p| !p.is_empty())
+                        .unwrap_or("<in-memory>")
+                        .to_string(),
+                    from: found,
                     to: SCHEMA_VERSION,
                     reason: e.to_string(),
                 })
             }
         }
+    }
+
+    /// The index generation: bumped by every match, so anything bound to it
+    /// — a destructive plan's confirm token — stops matching once the index
+    /// it was computed from has been rebuilt.
+    pub fn index_generation(&self) -> Result<i64, PoolError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT value FROM pool_meta WHERE key = 'index_generation'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    pub(crate) fn bump_index_generation(&self) -> Result<(), PoolError> {
+        self.conn.execute(
+            "INSERT INTO pool_meta(key, value) VALUES ('index_generation', 1)
+             ON CONFLICT(key) DO UPDATE SET value = value + 1",
+            [],
+        )?;
+        Ok(())
     }
 
     // -- roots -------------------------------------------------------------
@@ -988,36 +1094,6 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// Look a file up by its v2 merkle root — content-addressed, so it finds
-    /// the file wherever it now lives.
-    pub fn file_by_v2_root(
-        &self,
-        root_id: i64,
-        v2_root: &[u8; 32],
-    ) -> Result<Option<String>, PoolError> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT rel_path FROM file WHERE root_id = ?1 AND v2_root = ?2",
-                params![root_id, v2_root.to_vec()],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?)
-    }
-
-    pub fn set_file_v2_root(
-        &self,
-        root_id: i64,
-        rel_path: &str,
-        v2_root: &[u8; 32],
-    ) -> Result<(), PoolError> {
-        self.conn.execute(
-            "UPDATE file SET v2_root = ?3 WHERE root_id = ?1 AND rel_path = ?2",
-            params![root_id, rel_path, v2_root.to_vec()],
-        )?;
-        Ok(())
-    }
-
     // -- torrents ----------------------------------------------------------
 
     pub fn upsert_torrent(&self, t: &PoolTorrent, added_at: i64) -> Result<(), PoolError> {
@@ -1085,8 +1161,8 @@ impl PoolStore {
             params![infohash],
         )?;
         let mut ins = tx.prepare(
-            "INSERT INTO torrent_file(infohash, idx, rel_path, size, pieces_root)
-             VALUES (?1,?2,?3,?4,?5)",
+            "INSERT INTO torrent_file(infohash, idx, rel_path, size, pieces_root, pad_file)
+             VALUES (?1,?2,?3,?4,?5,?6)",
         )?;
         for f in files {
             ins.execute(params![
@@ -1095,6 +1171,7 @@ impl PoolStore {
                 f.rel_path,
                 f.size as i64,
                 f.pieces_root.map(|r| r.to_vec()),
+                f.pad_file,
             ])?;
         }
         Ok(())
@@ -1125,7 +1202,7 @@ impl PoolStore {
 
     pub fn torrent_files(&self, infohash: &str) -> Result<Vec<TorrentFileRow>, PoolError> {
         let mut st = self.conn.prepare(
-            "SELECT infohash, idx, rel_path, size, pieces_root
+            "SELECT infohash, idx, rel_path, size, pieces_root, pad_file
              FROM torrent_file WHERE infohash = ?1 ORDER BY idx",
         )?;
         let rows = st.query_map(params![infohash], |r| {
@@ -1135,6 +1212,7 @@ impl PoolStore {
                 rel_path: r.get(2)?,
                 size: r.get::<_, i64>(3)? as u64,
                 pieces_root: r.get::<_, Option<Vec<u8>>>(4)?.and_then(to_root32),
+                pad_file: r.get(5)?,
             })
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)

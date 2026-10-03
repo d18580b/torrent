@@ -422,6 +422,12 @@ mutation journal, which a rescan does not reconstruct. The migration is applied
 in one transaction, so a failure part way through leaves the index exactly as
 it was.
 
+A further step, schema version 4, adds a column marking BEP 47 padding files
+and a table holding the index generation. It is additive and takes no copy, but
+a build that knows only version 3 refuses the result. Torrents indexed before it
+keep reading their padding entries as payload, and so as `partial`, until the
+library is scanned again: run `torrentd pool scan` once after upgrading.
+
 **If the migration fails, that copy is not the remedy.** It is taken
 immediately before the steps that failed, so it is a copy of the index as it
 stands — same version, same columns, same tables — and restoring it puts you
