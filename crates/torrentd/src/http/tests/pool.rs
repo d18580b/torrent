@@ -671,6 +671,44 @@ async fn verification(cov: &Arc<Coverage>) {
         .await;
     assert_eq!(resp.status().as_u16(), 422);
     h.assert_conformance();
+
+    // A fenced profile's torrents are skipped, as resume-all skips them: a
+    // recheck puts the torrent back on the network once it finishes.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let h = Harness::authed(cov, |s| {
+        profiles(s);
+        s.pool = Some(pool);
+    });
+    for (ih, profile) in [(IH_A, "p"), (IH_C, "down")] {
+        let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
+        h.state.state.insert(
+            hash,
+            torrentd_engine::TorrentState::newly_added(
+                torrentd_engine::TorrentHandle {
+                    id: 1,
+                    infohash: hash,
+                },
+                torrentd_engine::ProfileId::new(profile),
+                std::time::Instant::now(),
+            ),
+        );
+    }
+    let resp = h
+        .send(
+            "POST",
+            "/v1/pool/verifications",
+            Some(&h.tokens.write.clone()),
+            Some(json!({"infohashes": [IH_A, IH_C]})),
+        )
+        .await;
+    resp.assert_status(StatusCode::ACCEPTED);
+    let r: Value = resp.json();
+    assert_eq!(r["started"], json!([IH_A]));
+    assert_eq!(r["skipped"][0]["infohash"], IH_C);
+    let reason = r["skipped"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("vpn_down"), "{reason}");
+    h.assert_conformance();
 }
 
 async fn plans(cov: &Arc<Coverage>) {

@@ -2082,7 +2082,7 @@
             }
           },
           "409": {
-            "description": "The torrent is still being added; The profile is unavailable",
+            "description": "The torrent is still being added; The payload is shared; The profile is unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2102,6 +2102,22 @@
                         }
                       ],
                       "title": "The torrent is still being added"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#payload-shared"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The payload is shared"
                     },
                     {
                       "allOf": [

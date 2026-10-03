@@ -234,6 +234,51 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         h.state.registry.lookup(&STALE).is_some(),
         "the entry stays, to clear with a plain delete"
     );
+    // A cross-seed claims the same file in the pool index: deleting this
+    // torrent's payload would delete that one's, so it is refused, and the
+    // torrent stays loaded.
+    let pool = h.state.pool.as_ref().unwrap();
+    let shared_with = "cd".repeat(20);
+    let add = |ih: &str| -> Result<(), torrentd_pool::PoolError> {
+        pool.with_store_mut(|st| {
+            st.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.to_owned(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "X".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.path().join(format!("{ih}.torrent")),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )?;
+            let root_id = st.upsert_root(&dir.path().join("pool"))?;
+            st.replace_claims(ih, &[(root_id, "X/data.bin".to_owned())])
+        })
+    };
+    add(&hex(LOADED)).unwrap();
+    add(&shared_with).unwrap();
+    let resp = h
+        .write(
+            "DELETE",
+            &format!("/v1/torrents/{}?delete_files=true", hex(LOADED)),
+        )
+        .await;
+    assert_problem(&resp, 409, "payload-shared");
+    assert!(resp.json::<Value>()["detail"]
+        .as_str()
+        .unwrap()
+        .contains(&shared_with));
+    assert!(h.state.registry.lookup(&LOADED).is_some());
+    pool.with_store_mut(|st| st.replace_claims(&shared_with, &[]))
+        .unwrap();
+
     // With mutations allowed, a loaded torrent's payload goes with it.
     let resp = h
         .write(

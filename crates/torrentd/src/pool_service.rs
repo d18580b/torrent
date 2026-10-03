@@ -231,6 +231,11 @@ pub struct ScanSummary {
 pub struct VerifyQueue {
     pending: Mutex<VecDeque<PendingVerify>>,
     in_flight: Mutex<Vec<String>>,
+    /// Loaded torrents `POST /v1/pool/verifications` asked libtorrent to
+    /// re-hash, with when. Their outcome is recorded like an adopt's — which
+    /// is the only way a loaded `drifted` torrent is ever cleared — once a
+    /// check that finished after the request is seen.
+    rechecks: Mutex<Vec<(String, std::time::Instant)>>,
     limit: usize,
     completed: AtomicU64,
     failed: AtomicU64,
@@ -255,6 +260,7 @@ impl VerifyQueue {
         Self {
             pending: Mutex::new(VecDeque::new()),
             in_flight: Mutex::new(Vec::new()),
+            rechecks: Mutex::new(Vec::new()),
             limit: limit.max(1),
             completed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -265,6 +271,15 @@ impl VerifyQueue {
 
     pub fn enqueue(&self, item: PendingVerify) {
         self.pending.lock().push_back(item);
+    }
+
+    /// Record the outcome of a re-hash just requested for a loaded torrent.
+    /// Call before asking for it, so the check it starts finishes after
+    /// `started`.
+    pub fn track_recheck(&self, infohash: String) {
+        let mut r = self.rechecks.lock();
+        r.retain(|(ih, _)| *ih != infohash);
+        r.push((infohash, std::time::Instant::now()));
     }
 
     pub fn depth(&self) -> usize {
@@ -322,39 +337,38 @@ pub async fn run_verify_queue(
                     return false;
                 };
                 let outcome = verify_outcome(state.get(&hash).as_ref(), VERIFY_SETTLE);
-                let (state_to_record, verified_at, drift_at, note) = match outcome {
-                    VerifyOutcome::Waiting => return true,
-                    VerifyOutcome::Verified => {
-                        q.completed.fetch_add(1, Ordering::Relaxed);
-                        info!(target: "torrentd::pool", infohash = %ih, "verified and seeding");
-                        (AdoptionState::Adopted, Some(now_secs()), None, None)
-                    }
-                    VerifyOutcome::Failed(reason) => {
-                        q.failed.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            target: "torrentd::pool",
-                            infohash = %ih,
-                            reason = reason,
-                            "verification did not leave the torrent seeding",
-                        );
-                        (AdoptionState::Drifted, None, Some(now_secs()), Some(reason))
-                    }
-                };
-                let written = pool.with_store(|s| {
-                    let base = s.adoption_base(ih).ok().flatten();
-                    s.set_adoption(
-                        ih,
-                        state_to_record,
-                        base.as_ref().map(|(r, _)| *r),
-                        base.as_ref().map(|(_, b)| b.as_str()),
-                        verified_at,
-                        drift_at,
-                        note,
-                    )
-                });
-                if let Err(e) = written {
-                    pool.note_store_error("set_adoption", &e);
+                if outcome == VerifyOutcome::Waiting {
+                    return true;
                 }
+                record_verify_outcome(&pool, &*source, &state, &hash, ih, outcome);
+                false
+            });
+        }
+        // 1b) Retire re-hashes of loaded torrents, once a check that finished
+        //     after the request is in. One that finished before it is the
+        //     previous check, and says nothing about this one.
+        {
+            let mut rechecks = q.rechecks.lock();
+            rechecks.retain(|(ih, started)| {
+                let Some(hash) = libtorrent_safe::InfoHash::from_hex(ih) else {
+                    return false;
+                };
+                let entry = state.get(&hash);
+                let Some(st) = entry.as_ref() else {
+                    // Removed while checking: nothing left to record.
+                    return false;
+                };
+                if st.checked_at.is_none_or(|t| t <= *started) {
+                    // Not checked since the request. A day is long past any
+                    // re-hash this daemon could be running; past it the
+                    // request was lost, and is forgotten rather than held.
+                    return started.elapsed() < Duration::from_secs(24 * 3600);
+                }
+                let outcome = verify_outcome(entry.as_ref(), VERIFY_SETTLE);
+                if outcome == VerifyOutcome::Waiting {
+                    return true;
+                }
+                record_verify_outcome(&pool, &*source, &state, &hash, ih, outcome);
                 false
             });
         }
@@ -483,6 +497,69 @@ fn release_dropped_claim(registry: &AssignmentRegistry, item: &PendingVerify) {
             error.cause = %e,
             "could not release the registry claim of a dropped verify",
         );
+    }
+}
+
+/// Write a finished verification into the pool index.
+///
+/// `Verified` records `adopted` with no drift — the one thing that clears
+/// drift. `Failed` records `drifted` and **pauses** the torrent: under forced
+/// upload mode it would otherwise sit in its session announcing a payload the
+/// piece hashes just rejected, and an operator reading `drifted` would find it
+/// still on the network.
+fn record_verify_outcome(
+    pool: &PoolService,
+    source: &dyn AlertSource,
+    state: &StateMap,
+    hash: &libtorrent_safe::InfoHash,
+    ih: &str,
+    outcome: VerifyOutcome,
+) {
+    let q = pool.verify_queue();
+    let (state_to_record, verified_at, drift_at, note) = match outcome {
+        VerifyOutcome::Waiting => return,
+        VerifyOutcome::Verified => {
+            q.completed.fetch_add(1, Ordering::Relaxed);
+            info!(target: "torrentd::pool", infohash = %ih, "verified and seeding");
+            (AdoptionState::Adopted, Some(now_secs()), None, None)
+        }
+        VerifyOutcome::Failed(reason) => {
+            q.failed.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target: "torrentd::pool",
+                infohash = %ih,
+                reason = reason,
+                "verification did not leave the torrent seeding; pausing it",
+            );
+            if let Some(st) = state.get(hash) {
+                let paused = source
+                    .engine_for(&st.profile_id)
+                    .map(|e| e.pause_torrent(st.handle));
+                if !matches!(paused, Some(Ok(()))) {
+                    warn!(
+                        target: "torrentd::pool",
+                        infohash = %ih,
+                        "could not pause a torrent whose verification failed",
+                    );
+                }
+            }
+            (AdoptionState::Drifted, None, Some(now_secs()), Some(reason))
+        }
+    };
+    let written = pool.with_store(|s| {
+        let base = s.adoption_base(ih).ok().flatten();
+        s.set_adoption(
+            ih,
+            state_to_record,
+            base.as_ref().map(|(r, _)| *r),
+            base.as_ref().map(|(_, b)| b.as_str()),
+            verified_at,
+            drift_at,
+            note,
+        )
+    });
+    if let Err(e) = written {
+        pool.note_store_error("set_adoption", &e);
     }
 }
 
@@ -892,5 +969,79 @@ mod tests {
             verify_outcome(Some(&s), SETTLE),
             VerifyOutcome::Failed(_),
         ));
+    }
+
+    /// A failed verification records `drifted` and pauses the torrent; a
+    /// passed one is the only thing that clears drift.
+    #[test]
+    fn a_failed_verify_pauses_the_torrent_and_a_passed_one_clears_drift() {
+        use std::sync::Arc;
+
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::StateMap;
+        use torrentd_pool::AdoptionState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let engine = Arc::new(MockEngine::new());
+        let source = torrentd_engine::ProfileSource::new(vec![(
+            ProfileId::new("p"),
+            engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]);
+        let state = StateMap::new();
+        let hash = InfoHash([0x11; 20]);
+        state.insert(hash, st(TorrentPhase::Incomplete, Some(SETTLE)));
+        let ih = hash.to_hex();
+        pool.with_store(|s| {
+            s.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.clone(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "T".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.path().join("t.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )
+        })
+        .unwrap();
+
+        super::record_verify_outcome(
+            &pool,
+            &source,
+            &state,
+            &hash,
+            &ih,
+            VerifyOutcome::Failed("bad"),
+        );
+        assert!(engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+        let (got, drift) = pool
+            .with_store(|s| {
+                Ok::<_, torrentd_pool::PoolError>((s.adoption_state(&ih)?, s.drift_at(&ih)?))
+            })
+            .unwrap();
+        assert_eq!(got, Some(AdoptionState::Drifted));
+        assert!(drift.is_some());
+
+        super::record_verify_outcome(&pool, &source, &state, &hash, &ih, VerifyOutcome::Verified);
+        let (got, drift) = pool
+            .with_store(|s| {
+                Ok::<_, torrentd_pool::PoolError>((s.adoption_state(&ih)?, s.drift_at(&ih)?))
+            })
+            .unwrap();
+        assert_eq!(got, Some(AdoptionState::Adopted));
+        assert_eq!(drift, None);
     }
 }

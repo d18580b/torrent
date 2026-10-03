@@ -1308,10 +1308,26 @@ pub async fn verify_pool_torrents(
                 skip(&mut resp, "not loaded in any session".to_owned());
                 continue;
             };
-            let Some(engine) = s.source.engine_for(&st.profile_id) else {
-                skip(&mut resp, "engine missing".to_owned());
-                continue;
+            // A recheck resumes the torrent's network activity once it ends,
+            // so a fenced profile is skipped as resume-all skips it: its
+            // torrents wait for the operator's restart.
+            let engine = match unfenced_engine(&s, &st.profile_id) {
+                Ok(engine) => engine,
+                Err(crate::http::v1::common::ProfileProblem::Unavailable { detail, .. }) => {
+                    skip(&mut resp, detail);
+                    continue;
+                }
+                Err(crate::http::v1::common::ProfileProblem::NotFound) => {
+                    skip(&mut resp, "engine missing".to_owned());
+                    continue;
+                }
             };
+            // Tracked before it is asked for, so the check it starts finishes
+            // after the mark; the verify queue then records its outcome, which
+            // is what clears a drifted torrent or pauses one that failed.
+            if let Some(pool) = s.pool.as_ref() {
+                pool.verify_queue().track_recheck(infohash.to_string());
+            }
             match engine.force_recheck(st.handle) {
                 Ok(()) => resp.started.push(infohash),
                 Err(e) => skip(&mut resp, e.to_string()),
