@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::pool_service::PoolService;
 use crate::profile_registry::test_entry;
 use crate::profile_registry::test_failed_profile;
+use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
 
 /// Matched under `movies/`, claiming both files there.
@@ -616,6 +617,185 @@ async fn adoption_ignores_allow_mutations() {
     resp.assert_status(StatusCode::OK);
     let r: Value = resp.json();
     assert_eq!(r["queued_for_verification"], json!([IH_A]));
+}
+
+/// A one-file `.torrent` announcing to `announce`.
+fn metainfo(announce: &str) -> Vec<u8> {
+    let mut t = format!(
+        "d8:announce{}:{announce}4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:",
+        announce.len()
+    )
+    .into_bytes();
+    t.extend_from_slice(&[0u8; 20]);
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// A complete torrent's `.fastresume` as libtorrent writes one, with a
+/// `trackers` list naming `tracker` when given.
+fn fastresume(torrent: &[u8], tracker: Option<&str>) -> Vec<u8> {
+    let ih = libtorrent_safe::info_hash_from_torrent(torrent).unwrap();
+    let mut r =
+        b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+    r.extend_from_slice(&ih.0);
+    r.extend_from_slice(b"9:seed_modei1e");
+    if let Some(url) = tracker {
+        r.extend_from_slice(format!("8:trackersll{}:{url}ee", url.len()).as_bytes());
+    }
+    r.extend_from_slice(b"e");
+    r
+}
+
+/// Issue #72's adoption acceptance: a torrent adopted into a profile with
+/// `allowed_tracker_domains` is held to it on both paths, through the
+/// trackers libtorrent would announce to; and the pool index's own owner
+/// refuses another profile.
+#[tokio::test]
+async fn adoption_holds_every_torrent_to_the_profiles_tracker_domains() {
+    const ALLOWED: &str = "http://tracker.allowed.example/announce";
+    const FOREIGN: &str = "http://tracker.foreign.example/announce";
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let source = library.join(format!("{IH_A}.torrent"));
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let mut acct = test_entry("acct", ProfileStatus::Active).config;
+        acct.allowed_tracker_domains = vec!["allowed.example".to_owned()];
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            test_entry("p", ProfileStatus::Active),
+            ProfileEntry::new(
+                acct,
+                Arc::new(torrentd_engine::MockEngine::new()),
+                None,
+                None,
+                0,
+            ),
+        ]));
+        *s = crate::app_state::build_test_state_with_sessions(Some(reg), &["p", "acct"]);
+        s.pool = Some(pool);
+    });
+    let w = h.tokens.write.clone();
+    let post = |dry_run, selector| {
+        let w = w.clone();
+        let h = &h;
+        async move {
+            let resp = h
+                .send(
+                    "POST",
+                    "/v1/pool/adoptions",
+                    Some(&w),
+                    adopt("acct", dry_run, selector),
+                )
+                .await;
+            resp.assert_status(StatusCode::OK);
+            resp.json::<Value>()
+        }
+    };
+    let subtree = json!({"kind": "subtree", "root_id": root_id, "path": ""});
+    let just_a = json!({"kind": "infohashes", "infohashes": [IH_A]});
+    let refused_for = |r: &Value, what: &str| {
+        let refused = r["refused"].as_array().unwrap();
+        assert!(
+            refused
+                .iter()
+                .any(|t| t["infohash"] == IH_A && t["reason"].as_str().unwrap().contains(what)),
+            "{IH_A} should be refused for {what:?}: {r}"
+        );
+        assert!(r["fast_path"].as_array().unwrap().is_empty(), "{r}");
+        assert!(
+            r["queued_for_verification"].as_array().unwrap().is_empty(),
+            "{r}"
+        );
+    };
+
+    // The verify path: a `.torrent` announcing outside the list is refused,
+    // by a dry run as by the adoption, and nothing is claimed.
+    std::fs::write(&source, metainfo(FOREIGN)).unwrap();
+    refused_for(
+        &post(true, subtree.clone()).await,
+        "allowed_tracker_domains",
+    );
+    refused_for(
+        &post(false, just_a.clone()).await,
+        "allowed_tracker_domains",
+    );
+    assert_eq!(h.state.registry.len(), 0);
+    std::fs::write(&source, metainfo(ALLOWED)).unwrap();
+    let r = post(true, subtree.clone()).await;
+    assert_eq!(r["queued_for_verification"], json!([IH_A]), "{r}");
+
+    // The index's own owner: another profile's torrent is refused even with
+    // no session holding it.
+    index.with_store(|st| st.set_profile(IH_A, Some("p")).unwrap());
+    refused_for(
+        &post(false, just_a.clone()).await,
+        "assigns this torrent to profile p",
+    );
+    assert_eq!(h.state.registry.len(), 0);
+    index.with_store(|st| st.set_profile(IH_A, None).unwrap());
+
+    // The fast path: resume data whose own tracker list names a foreign
+    // tracker is refused behind an allowed `.torrent`, and does not fall back
+    // to verifying it.
+    let resume = library.join(format!("{IH_A}.fastresume"));
+    let mut row = torrent(dir.path(), IH_A, 96, 2);
+    row.fastresume_path = Some(resume.clone());
+    index.with_store_mut(|st| st.upsert_torrent(&row, 0).unwrap());
+    let allowed = metainfo(ALLOWED);
+    std::fs::write(&resume, fastresume(&allowed, Some(FOREIGN))).unwrap();
+    refused_for(&post(true, just_a.clone()).await, "allowed_tracker_domains");
+    refused_for(
+        &post(false, just_a.clone()).await,
+        "allowed_tracker_domains",
+    );
+    assert_eq!(h.state.registry.len(), 0);
+
+    // Without it, the `.torrent`'s allowed tracker is what is announced, and
+    // the adoption goes through.
+    std::fs::write(&resume, fastresume(&allowed, None)).unwrap();
+    let r = post(false, just_a).await;
+    assert_eq!(r["fast_path"], json!([IH_A]), "{r}");
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&libtorrent_safe::InfoHash::from_hex(IH_A).unwrap()),
+        Some(torrentd_engine::ProfileId::new("acct"))
+    );
+    assert_eq!(
+        index
+            .with_store(|st| st.profile_of(IH_A).unwrap())
+            .as_deref(),
+        Some("acct")
+    );
+}
+
+#[tokio::test]
+async fn a_delete_clears_the_pool_index_owner_it_set() {
+    // Adoption refuses a torrent the index says another profile owns, so the
+    // record has to go with the torrent, or it refuses every later adoption
+    // into anything else.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    for (ih, owner, kept) in [(IH_A, "p", None), (IH_B, "q", Some("q"))] {
+        let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
+        h.state
+            .registry
+            .assign(hash, torrentd_engine::ProfileId::new("p"))
+            .unwrap();
+        h.state.unloaded_at_boot.lock().insert(hash);
+        index.with_store(|st| st.set_profile(ih, Some(owner)).unwrap());
+        let resp = h.write("DELETE", &format!("/v1/torrents/{ih}")).await;
+        resp.assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            index.with_store(|st| st.profile_of(ih).unwrap()).as_deref(),
+            kept,
+            "a record naming {owner} after deleting p's torrent",
+        );
+    }
 }
 
 async fn verification(cov: &Arc<Coverage>) {

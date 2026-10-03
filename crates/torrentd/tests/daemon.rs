@@ -1057,3 +1057,154 @@ fn a_non_reloadable_change_is_reported_on_the_second_reload_too() {
         "daemon did not exit within 30s of SIGTERM"
     );
 }
+
+/// A one-file `.torrent` named `name`, announcing to `announce`.
+fn metainfo(name: &str, announce: &str) -> Vec<u8> {
+    let mut t = format!(
+        "d8:announce{}:{announce}4:infod6:lengthi1e4:name{}:{name}12:piece lengthi16384e\
+         6:pieces20:",
+        announce.len(),
+        name.len()
+    )
+    .into_bytes();
+    t.extend_from_slice(&[0u8; 20]);
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// libtorrent resume data for `torrent`, with no info dict, and with a
+/// `trackers` list of `trackers` when given — the list that replaces the
+/// `.torrent`'s own on the add.
+fn resume_for(torrent: &[u8], trackers: Option<&str>) -> Vec<u8> {
+    let ih = libtorrent_safe::info_hash_from_torrent(torrent).unwrap();
+    let mut r =
+        b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+    r.extend_from_slice(&ih.0);
+    if let Some(url) = trackers {
+        r.extend_from_slice(format!("8:trackersll{}:{url}ee", url.len()).as_bytes());
+    }
+    r.extend_from_slice(b"e");
+    r
+}
+
+/// Issue #72's daemon acceptance: the startup scans hold every torrent to the
+/// profile's `allowed_tracker_domains`, the way `POST /v1/torrents` does.
+///
+/// Five torrents in the profile's two directories, against a list naming
+/// `tracker.allowed.example`:
+///
+/// - `dir_ok`, a `.torrent` announcing there: loaded by the torrent-dir scan;
+/// - `dir_foreign`, a `.torrent` announcing elsewhere: refused;
+/// - `resume_ok`, resume data without a tracker list beside an allowed
+///   `.torrent`: loaded from resume data;
+/// - `resume_override`, resume data whose own `trackers` list names a foreign
+///   tracker, beside an allowed `.torrent`: the resume data is refused, and
+///   the `.torrent` alone is loaded by the torrent-dir scan, so the foreign
+///   tracker is never announced to;
+/// - `resume_only`, the same foreign resume data with no `.torrent`: refused,
+///   and nothing loads it.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn the_boot_scans_hold_every_torrent_to_the_profiles_tracker_domains() {
+    const ALLOWED: &str = "http://tracker.allowed.example/announce";
+    const FOREIGN: &str = "http://tracker.foreign.example/announce";
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("allowed_tracker_domains = [\"allowed.example\"]\n");
+    std::fs::write(&cfg, text).unwrap();
+    let torrents = p.join("torrents").join(PROFILE);
+    let resumes = p.join("resume").join(PROFILE);
+    std::fs::create_dir_all(&torrents).unwrap();
+    std::fs::create_dir_all(&resumes).unwrap();
+    let hex = |t: &[u8]| libtorrent_safe::info_hash_from_torrent(t).unwrap().to_hex();
+    let put = |d: &std::path::Path, ih: &str, ext: &str, bytes: &[u8]| {
+        std::fs::write(d.join(format!("{ih}.{ext}")), bytes).unwrap();
+    };
+
+    let dir_ok = metainfo("dir_ok", ALLOWED);
+    put(&torrents, &hex(&dir_ok), "torrent", &dir_ok);
+    let dir_foreign = metainfo("dir_foreign", FOREIGN);
+    put(&torrents, &hex(&dir_foreign), "torrent", &dir_foreign);
+    let resume_ok = metainfo("resume_ok", ALLOWED);
+    put(&torrents, &hex(&resume_ok), "torrent", &resume_ok);
+    put(
+        &resumes,
+        &hex(&resume_ok),
+        "resume",
+        &resume_for(&resume_ok, None),
+    );
+    let resume_override = metainfo("resume_override", ALLOWED);
+    put(
+        &torrents,
+        &hex(&resume_override),
+        "torrent",
+        &resume_override,
+    );
+    put(
+        &resumes,
+        &hex(&resume_override),
+        "resume",
+        &resume_for(&resume_override, Some(FOREIGN)),
+    );
+    let resume_only = metainfo("resume_only", ALLOWED);
+    put(
+        &resumes,
+        &hex(&resume_only),
+        "resume",
+        &resume_for(&resume_only, Some(FOREIGN)),
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .expect("spawn daemon");
+    wait_healthy(addr);
+
+    let (code, list) = http(addr, "GET", "/v1/torrents", None);
+    assert_eq!(code, 200, "{list}");
+    for (name, t, loaded) in [
+        ("dir_ok", &dir_ok, true),
+        ("dir_foreign", &dir_foreign, false),
+        ("resume_ok", &resume_ok, true),
+        ("resume_override", &resume_override, true),
+        ("resume_only", &resume_only, false),
+    ] {
+        assert_eq!(
+            list.contains(&hex(t)),
+            loaded,
+            "{name} should be {}: {list}",
+            if loaded { "loaded" } else { "refused" },
+        );
+    }
+    // The torrent whose resume data was refused announces to its `.torrent`'s
+    // tracker only.
+    let (code, trackers) = http(
+        addr,
+        "GET",
+        &format!("/v1/torrents/{}/trackers", hex(&resume_override)),
+        None,
+    );
+    assert_eq!(code, 200, "{trackers}");
+    assert!(trackers.contains("tracker.allowed.example"), "{trackers}");
+    assert!(!trackers.contains("foreign"), "{trackers}");
+
+    // Each refusal is counted where an API refusal is.
+    let (code, metrics) = http(addr, "GET", "/metrics", None);
+    assert_eq!(code, 200);
+    assert!(
+        metrics.lines().any(|l| {
+            l.starts_with("torrentd_profile_assignment_registry_errors_total{")
+                && l.contains(&format!("profile_id=\"{PROFILE}\""))
+                && l.ends_with(" 3")
+        }),
+        "three refusals should be counted:\n{metrics}"
+    );
+
+    sigterm(&child);
+    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+}

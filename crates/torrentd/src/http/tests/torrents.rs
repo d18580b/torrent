@@ -1417,6 +1417,60 @@ async fn a_magnet_whose_trackers_are_all_allowed_is_added() {
 }
 
 #[tokio::test]
+async fn one_foreign_tracker_refuses_a_torrent_whatever_else_it_announces_to() {
+    // All-match: an allowed tracker beside a foreign one still announces the
+    // foreign one, and with it another account's passkey. And a torrent that
+    // announces to nothing names no account of this profile's.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let both = {
+        let (ours, theirs) = (
+            "https://tracker.allowed.example/announce",
+            "https://other.example/announce",
+        );
+        let mut t = format!(
+            "d8:announce{}:{ours}13:announce-listll{}:{ours}el{}:{theirs}ee\
+             4:infod6:lengthi1e4:name1:m12:piece lengthi16384e6:pieces20:",
+            ours.len(),
+            ours.len(),
+            theirs.len(),
+        )
+        .into_bytes();
+        t.extend_from_slice(&[0u8; 20]);
+        t.extend_from_slice(b"ee");
+        t
+    };
+    let resp = h
+        .write_json("POST", "/v1/torrents", metainfo("strict", &both))
+        .await;
+    assert_problem(&resp, 422, "tracker-not-allowed");
+    for uri in [
+        format!(
+            "{MAGNET}&tr=https%3A%2F%2Ftracker.allowed.example%2Fannounce\
+             &tr=https%3A%2F%2Fother.example%2Fannounce"
+        ),
+        MAGNET.to_owned(),
+    ] {
+        let resp = h
+            .write_json(
+                "POST",
+                "/v1/torrents",
+                json!({"profile_id": "strict", "source": {"kind": "magnet", "uri": uri}}),
+            )
+            .await;
+        assert_problem(&resp, 422, "tracker-not-allowed");
+    }
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap()),
+        None
+    );
+}
+
+#[tokio::test]
 async fn a_server_path_that_is_a_symlink_is_refused_even_to_a_real_torrent() {
     // The path is opened once, refusing a symlink at the last component, and
     // everything after is read from that descriptor. A symlink planted in a
