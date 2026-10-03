@@ -1684,6 +1684,19 @@ impl PoolStore {
     /// a deletion candidate solely because nothing in the library references
     /// it, never because it merely looks unused.
     pub fn orphan_files(&self, root_id: i64, prefix: &str) -> Result<Vec<String>, PoolError> {
+        Ok(self
+            .orphan_files_sized(root_id, prefix)?
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect())
+    }
+
+    /// [`PoolStore::orphan_files`], with each file's indexed size.
+    pub fn orphan_files_sized(
+        &self,
+        root_id: i64,
+        prefix: &str,
+    ) -> Result<Vec<(String, u64)>, PoolError> {
         let like = if prefix.is_empty() {
             String::new()
         } else {
@@ -1691,7 +1704,7 @@ impl PoolStore {
         };
         let upper = prefix_upper_bound(&like);
         let mut st = self.conn.prepare(
-            "SELECT f.rel_path FROM file f
+            "SELECT f.rel_path, f.size FROM file f
              WHERE f.root_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3
                AND NOT EXISTS (
                  SELECT 1 FROM claim c
@@ -1699,7 +1712,9 @@ impl PoolStore {
                )
              ORDER BY f.rel_path",
         )?;
-        let rows = st.query_map(params![root_id, like, upper], |r| r.get::<_, String>(0))?;
+        let rows = st.query_map(params![root_id, like, upper], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 

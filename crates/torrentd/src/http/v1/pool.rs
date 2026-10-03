@@ -1333,8 +1333,12 @@ pub async fn verify_pool_torrents(
 pub enum PlanKind {
     /// Move one torrent's payload to another directory under a managed root.
     Relocate,
-    /// Delete every file under a subtree that no torrent claims. Destructive:
-    /// applying it needs the plan's `confirm_token`.
+    /// Delete every file under a subtree that no torrent claims, by moving it
+    /// into `<root>/.torrentd-trash/<plan id>/`. Refused where a torrent the
+    /// matcher could not fully place expects its files, and a file the size
+    /// of one the library is still missing is left out. Destructive: applying
+    /// it needs the plan's `confirm_token`, which changes whenever the pool is
+    /// rescanned.
     DeleteOrphans,
 }
 
@@ -1532,9 +1536,11 @@ fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, String> {
     let Some(row) = pool.with_store(|st| st.plan(id)).map_err(fail)? else {
         return Ok(None);
     };
-    let steps = pool.with_store(|st| st.plan_steps(id)).map_err(fail)?;
+    let (steps, generation) = pool
+        .with_store(|st| Ok((st.plan_steps(id)?, st.index_generation()?)))
+        .map_err(fail)?;
     let confirm_token = torrentd_pool::plan::is_destructive(&row.kind)
-        .then(|| torrentd_pool::plan::confirm_token(id, &steps));
+        .then(|| torrentd_pool::plan::confirm_token(id, generation, &steps));
     let summary = summary_of(&row)?;
     let steps = steps
         .into_iter()

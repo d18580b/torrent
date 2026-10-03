@@ -245,9 +245,14 @@ fn apply_inner(
             ops::MOVE_FILE => move_file(
                 Path::new(&step.src),
                 Path::new(step.dst.as_deref().unwrap_or("")),
-            ),
-            ops::DELETE_FILE => delete_file(pool, Path::new(&step.src)),
-            other => Err(format!("unknown plan operation {other:?}")),
+            )
+            .map_err(StepFailure::Failed),
+            ops::DELETE_FILE => {
+                delete_file(pool, Path::new(&step.src), plan_id).map_err(StepFailure::Failed)
+            }
+            other => Err(StepFailure::Failed(format!(
+                "unknown plan operation {other:?}"
+            ))),
         };
 
         match result {
@@ -259,7 +264,32 @@ fn apply_inner(
                     pool.note_store_error("set_step_status", &e);
                 }
             }
-            Err(e) => {
+            Err(StepFailure::Unknown(e)) => {
+                // Not `failed`: the move may yet land. The step stays
+                // `in_progress` — the journal's own word for "started, verdict
+                // unknown" — so neither a resume nor a retry re-runs it, and
+                // the plan is parked for a human, who can see where the
+                // payload is before deciding.
+                out.failed += 1;
+                error!(
+                    target: "torrentd::pool::apply",
+                    plan_id,
+                    step = step.seq,
+                    op = %step.op,
+                    src = %step.src,
+                    error.cause = %e,
+                    "plan step outcome unknown",
+                );
+                pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
+                if let Err(se) = pool.with_store(|s| {
+                    s.set_step_status(plan_id, step.seq, step_status::IN_PROGRESS, Some(&e))
+                }) {
+                    pool.note_store_error("set_step_status", &se);
+                }
+                out.status = plan_status::FAILED.to_string();
+                break;
+            }
+            Err(StepFailure::Failed(e)) => {
                 out.failed += 1;
                 error!(
                     target: "torrentd::pool::apply",
@@ -299,13 +329,35 @@ fn apply_inner(
     Ok(out)
 }
 
+/// How a step did not succeed.
+enum StepFailure {
+    /// It did not happen, or was undone; the journal says `failed`.
+    Failed(String),
+    /// It was started and its verdict is not known — a storage move libtorrent
+    /// has not reported on by the deadline. Recording that as `failed` invited
+    /// a retry of a move that may still land.
+    Unknown(String),
+}
+
+impl From<String> for StepFailure {
+    fn from(e: String) -> Self {
+        StepFailure::Failed(e)
+    }
+}
+
+impl From<&str> for StepFailure {
+    fn from(e: &str) -> Self {
+        StepFailure::Failed(e.to_owned())
+    }
+}
+
 /// Relocate an adopted torrent by asking libtorrent to move its storage.
 fn move_torrent(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
     state: &StateMap,
     step: &PlanStepRow,
-) -> Result<(), String> {
+) -> Result<(), StepFailure> {
     let dst = step
         .dst
         .as_deref()
@@ -317,7 +369,7 @@ fn move_torrent(
     // either a stale plan or a row edited underneath us — both worth refusing
     // rather than handing to `move_storage`.
     if !under_a_managed_root(pool, Path::new(dst)) {
-        return Err(format!("destination {dst} is outside every managed root",));
+        return Err(format!("destination {dst} is outside every managed root").into());
     }
     // The infohash is recovered from the claim rather than carried in the step,
     // so a resumed apply re-resolves against the current index instead of a
@@ -334,7 +386,9 @@ fn move_torrent(
     let Some(st) = state.get(&hash) else {
         // Not loaded: nothing is serving it, so torrentd can move the files
         // itself. This is the `matched but not adopted` case.
-        return move_directory(Path::new(&step.src), Path::new(dst));
+        move_directory(Path::new(&step.src), Path::new(dst))?;
+        record_new_base(pool, &infohash, Path::new(dst));
+        return Ok(());
     };
     let engine = source
         .engine_for(&st.profile_id)
@@ -359,7 +413,50 @@ fn move_torrent(
     // `move_storage` returns as soon as the move is queued. Treating that as
     // success reported a *failed* move as a completed plan step, and the
     // resume path then never retried it because the step said done.
-    await_storage_move(state, &hash, dst)
+    let moved_to = await_storage_move(state, &hash, dst)?;
+    record_new_base(pool, &infohash, Path::new(&moved_to));
+    Ok(())
+}
+
+/// Point the torrent's adoption at where its payload now is.
+///
+/// The adoption base is what `save_path_of`, a later relocate, drift and
+/// `torrent_at` all resolve against, and left at the old directory every one
+/// of them looked where the payload no longer is until the next rescan. The
+/// claims and the file index still describe the old paths; the rescan that
+/// follows a relocate rebuilds both.
+fn record_new_base(pool: &PoolService, infohash: &str, dir: &Path) {
+    let Some((root_id, rel)) = pool.roots().iter().find_map(|(id, root)| {
+        dir.strip_prefix(root)
+            .ok()
+            .map(|r| (*id, r.to_string_lossy().replace('\\', "/")))
+    }) else {
+        warn!(
+            target: "torrentd::pool::apply",
+            infohash,
+            dir = %dir.display(),
+            "the payload moved outside every managed root; its adoption base is unchanged",
+        );
+        return;
+    };
+    let written = pool.with_store(|s| {
+        let Some(state) = s.adoption_state(infohash)? else {
+            return Ok(());
+        };
+        let drift_at = s.drift_at(infohash)?;
+        s.set_adoption(
+            infohash,
+            state,
+            Some(root_id),
+            Some(rel.trim_matches('/')),
+            None,
+            drift_at,
+            None,
+        )
+    });
+    if let Err(e) = written {
+        pool.note_store_error("set_adoption", &e);
+    }
 }
 
 /// How long to wait for `storage_moved_alert` before giving up on a verdict.
@@ -372,13 +469,22 @@ const STORAGE_MOVE_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 const STORAGE_MOVE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Block until libtorrent reports the move done, failed, or the deadline runs
-/// out.
+/// out. `Ok` carries the save path libtorrent reported.
 fn await_storage_move(
     state: &StateMap,
     hash: &libtorrent_safe::InfoHash,
     dst: &str,
-) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + STORAGE_MOVE_DEADLINE;
+) -> Result<String, StepFailure> {
+    await_storage_move_within(state, hash, dst, STORAGE_MOVE_DEADLINE)
+}
+
+fn await_storage_move_within(
+    state: &StateMap,
+    hash: &libtorrent_safe::InfoHash,
+    dst: &str,
+    within: std::time::Duration,
+) -> Result<String, StepFailure> {
+    let deadline = std::time::Instant::now() + within;
     loop {
         match state.get(hash).and_then(|s| s.storage_move) {
             Some(StorageMove::Moved { path }) => {
@@ -388,21 +494,22 @@ fn await_storage_move(
                     save_path = %path,
                     "storage move confirmed",
                 );
-                return Ok(());
+                return Ok(path);
             }
             Some(StorageMove::Failed { message }) => {
-                return Err(format!(
+                return Err(StepFailure::Failed(format!(
                     "libtorrent could not move the payload to {dst}: {message}"
-                ));
+                )));
             }
             _ => {}
         }
         if std::time::Instant::now() >= deadline {
-            return Err(format!(
-                "libtorrent has not reported the move to {dst} after {}s; the torrent is \
-                 still served from its old location and the step is left unfinished",
-                STORAGE_MOVE_DEADLINE.as_secs(),
-            ));
+            return Err(StepFailure::Unknown(format!(
+                "outcome unknown: libtorrent has not reported the move to {dst} after {}s. \
+                 It may still be copying; check where the payload is before resuming or \
+                 discarding this plan",
+                within.as_secs(),
+            )));
         }
         std::thread::sleep(STORAGE_MOVE_POLL);
     }
@@ -417,7 +524,7 @@ fn move_directory(src: &Path, dst: &Path) -> Result<(), String> {
         return Err(format!("destination {} already exists", dst.display()));
     }
     match std::fs::rename(src, dst) {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parents(&[src, dst]),
         Err(e) if e.raw_os_error() == Some(libc_exdev()) => Err(format!(
             "cross-device directory move is not attempted automatically \
                  ({} → {}); move the data and rescan",
@@ -441,7 +548,7 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
     }
 
     match std::fs::rename(src, dst) {
-        Ok(()) => return Ok(()),
+        Ok(()) => return sync_parents(&[src, dst]),
         Err(e) if e.raw_os_error() != Some(libc_exdev()) => {
             return Err(format!("rename {} → {}: {e}", src.display(), dst.display()));
         }
@@ -495,6 +602,24 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
         }
     }
     std::fs::remove_file(src).map_err(|e| format!("unlink {}: {e}", src.display()))?;
+    sync_parents(&[src])
+}
+
+/// Fsync the directory holding each path, so a rename or unlink in it
+/// survives a crash rather than leaving the journal describing a directory
+/// entry the disk never recorded.
+fn sync_parents(paths: &[&Path]) -> Result<(), String> {
+    let mut done: Vec<&Path> = Vec::new();
+    for p in paths {
+        let Some(parent) = p.parent() else { continue };
+        if done.contains(&parent) {
+            continue;
+        }
+        std::fs::File::open(parent)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| format!("fsync {}: {e}", parent.display()))?;
+        done.push(parent);
+    }
     Ok(())
 }
 
@@ -509,16 +634,31 @@ fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
 ///    apply in [`apply`], since it is a property of the whole plan rather than
 ///    of one file.
 /// 3. The file on disk is still the file that was indexed. A `(size, mtime,
-///    inode)` match is the same evidence `drift` trusts; anything else means
-///    the bytes changed after the scan decided they were expendable.
-fn delete_file(pool: &PoolService, path: &Path) -> Result<(), String> {
-    let Some((root_id, rel)) = pool.roots().iter().find_map(|(id, root)| {
+///    inode, device)` match is the same evidence `drift` trusts; anything
+///    else means the bytes changed after the scan decided they were
+///    expendable.
+///
+/// The path is walked from the root one directory at a time with
+/// `O_NOFOLLOW`, so a directory swapped for a symlink after planning stops the
+/// step instead of carrying it onto another volume, and the file is examined
+/// and moved through that parent's descriptor rather than by name from `/`.
+/// It is moved — `renameat2(RENAME_NOREPLACE)` — into
+/// `<root>/.torrentd-trash/<plan id>/`, never unlinked, and both directories
+/// are fsynced so the move survives a crash.
+fn delete_file(pool: &PoolService, path: &Path, plan_id: i64) -> Result<(), String> {
+    let Some((root_id, root, rel)) = pool.roots().iter().find_map(|(id, root)| {
         path.strip_prefix(root)
             .ok()
-            .map(|r| (*id, r.to_string_lossy().replace('\\', "/")))
+            .map(|r| (*id, root.clone(), r.to_string_lossy().replace('\\', "/")))
     }) else {
         return Err(format!("{} is outside every managed root", path.display(),));
     };
+    // The planner's containment check, re-run now: the plan is a stored
+    // record, and a traversal component or a symlinked ancestor added since
+    // it was built must stop the step here.
+    if !torrentd_pool::plan::contains(&root, path) {
+        return Err(format!("{} is outside every managed root", path.display()));
+    }
 
     let indexed = pool
         .with_store(|s| {
@@ -537,20 +677,148 @@ fn delete_file(pool: &PoolService, path: &Path) -> Result<(), String> {
         return Err(format!("{} is now claimed by a torrent", path.display(),));
     }
 
+    let (dirs, name) = match rel.rsplit_once('/') {
+        Some((d, n)) => (d.split('/').collect::<Vec<_>>(), n),
+        None => (Vec::new(), rel.as_str()),
+    };
+    let root_dir =
+        std::fs::File::open(&root).map_err(|e| format!("open {}: {e}", root.display()))?;
+    let parent = fsat::walk(&root_dir, &dirs, false)
+        .map_err(|e| format!("{}: {e}; refusing to follow it", path.display()))?;
+    let parent = parent.as_ref().unwrap_or(&root_dir);
+
     let md =
-        std::fs::symlink_metadata(path).map_err(|e| format!("stat {}: {e}", path.display()))?;
+        fsat::stat_nofollow(parent, name).map_err(|e| format!("stat {}: {e}", path.display()))?;
     if !md.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
-    if torrentd_pool::file_stamp(&md) != (row.size, row.mtime_ns, row.ino) {
+    if torrentd_pool::file_stamp(&md) != (row.size, row.mtime_ns, row.ino, row.dev) {
         return Err(format!(
             "{} changed since the scan that called it unclaimed; rescan before deleting",
             path.display(),
         ));
     }
 
-    std::fs::remove_file(path).map_err(|e| format!("unlink {}: {e}", path.display()))?;
+    let plan_dir = plan_id.to_string();
+    let mut trash_dirs = vec![torrentd_pool::plan::TRASH_DIR, plan_dir.as_str()];
+    trash_dirs.extend(dirs.iter().copied());
+    let trash = fsat::walk(&root_dir, &trash_dirs, true)
+        .map_err(|e| format!("trash for {}: {e}", path.display()))?
+        .expect("a non-empty walk yields a directory");
+    fsat::rename_noreplace(parent, name, &trash, name).map_err(|e| {
+        format!(
+            "move {} into {}/{}: {e}",
+            path.display(),
+            torrentd_pool::plan::TRASH_DIR,
+            plan_dir,
+        )
+    })?;
+    // Both directory entries changed; without these the rename can be lost
+    // to a crash and the file reappear where the journal says it is gone.
+    fsat::fsync(parent).map_err(|e| format!("fsync {}: {e}", path.display()))?;
+    fsat::fsync(&trash).map_err(|e| format!("fsync trash: {e}"))?;
+    info!(
+        target: "torrentd::pool::apply",
+        plan_id,
+        path = %path.display(),
+        "moved to the trash",
+    );
     Ok(())
+}
+
+/// Directory-relative filesystem calls the delete step is made of.
+mod fsat {
+    use std::ffi::CString;
+    use std::fs::File;
+    use std::io;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+
+    fn cname(name: &str) -> io::Result<CString> {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{name:?} is not a single path component"),
+            ));
+        }
+        CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+    }
+
+    /// Open `components` one directory at a time beneath `start`, each with
+    /// `O_NOFOLLOW`: a symlink anywhere on the way is `ELOOP`, never followed.
+    /// With `create`, a missing directory is made (`0700`) first. `None` for
+    /// an empty walk, which is `start` itself.
+    pub fn walk(start: &File, components: &[&str], create: bool) -> io::Result<Option<File>> {
+        let mut cur: Option<File> = None;
+        for c in components {
+            let name = cname(c)?;
+            let dirfd = cur.as_ref().unwrap_or(start).as_raw_fd();
+            if create {
+                // SAFETY: a valid directory fd and a NUL-terminated name.
+                let rc = unsafe { libc::mkdirat(dirfd, name.as_ptr(), 0o700) };
+                if rc != 0 {
+                    let e = io::Error::last_os_error();
+                    if e.raw_os_error() != Some(libc::EEXIST) {
+                        return Err(e);
+                    }
+                }
+            }
+            // SAFETY: as above; the returned fd is owned by the `File`.
+            let fd = unsafe {
+                libc::openat(
+                    dirfd,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            cur = Some(unsafe { File::from_raw_fd(fd) });
+        }
+        Ok(cur)
+    }
+
+    /// The metadata of `name` in `dir`, without following a symlink there.
+    pub fn stat_nofollow(dir: &File, name: &str) -> io::Result<std::fs::Metadata> {
+        let name = cname(name)?;
+        // SAFETY: `O_PATH | O_NOFOLLOW` opens the entry itself, symlink or
+        // not, for `fstat` only; the fd is owned by the `File`.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe { File::from_raw_fd(fd) }.metadata()
+    }
+
+    /// `renameat2(RENAME_NOREPLACE)`: refuses rather than overwrites.
+    pub fn rename_noreplace(from: &File, a: &str, to: &File, b: &str) -> io::Result<()> {
+        let (a, b) = (cname(a)?, cname(b)?);
+        // SAFETY: valid directory fds and NUL-terminated names.
+        let rc = unsafe {
+            libc::renameat2(
+                from.as_raw_fd(),
+                a.as_ptr(),
+                to.as_raw_fd(),
+                b.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub fn fsync(dir: &File) -> io::Result<()> {
+        dir.sync_all()
+    }
 }
 
 /// Whether `path` lies inside one of the configured managed roots.
@@ -1109,7 +1377,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&f, vec![9u8; 48]).unwrap();
 
-        let e = delete_file(&pool, &f).unwrap_err();
+        let e = delete_file(&pool, &f, 1).unwrap_err();
         assert!(e.contains("changed since the scan"), "got {e}");
         assert!(f.exists());
     }
@@ -1124,14 +1392,119 @@ mod tests {
         pool.scan().unwrap();
 
         let sneaked = write(&root, "after/the/scan.bin", 8);
-        let e = delete_file(&pool, &sneaked).unwrap_err();
+        let e = delete_file(&pool, &sneaked, 1).unwrap_err();
         assert!(e.contains("never sanctioned"), "got {e}");
         assert!(sneaked.exists());
 
         let outside = dir.path().join("elsewhere.bin");
         std::fs::write(&outside, b"x").unwrap();
-        let e = delete_file(&pool, &outside).unwrap_err();
+        let e = delete_file(&pool, &outside, 1).unwrap_err();
         assert!(e.contains("outside every managed root"), "got {e}");
         assert!(outside.exists());
+
+        // A traversal component walks back out of the root once resolved.
+        let escaping = root.join("misc/../../elsewhere.bin");
+        let e = delete_file(&pool, &escaping, 1).unwrap_err();
+        assert!(e.contains("outside every managed root"), "got {e}");
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn a_storage_move_libtorrent_never_reports_on_is_unknown_not_failed() {
+        let state = StateMap::new();
+        let hash = libtorrent_safe::InfoHash([3; 20]);
+        match await_storage_move_within(&state, &hash, "/x", std::time::Duration::ZERO) {
+            Err(StepFailure::Unknown(e)) => assert!(e.contains("outcome unknown"), "{e}"),
+            Err(StepFailure::Failed(e)) => panic!("recorded as failed: {e}"),
+            Ok(p) => panic!("reported moved to {p}"),
+        }
+    }
+
+    #[test]
+    fn a_relocated_torrent_is_based_where_its_payload_now_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let root_id = pool.roots()[0].0;
+        let t = torrentd_pool::PoolTorrent {
+            infohash: "ab".repeat(20),
+            infohash_v1: None,
+            infohash_v2: None,
+            name: "T".into(),
+            total_size: 1,
+            num_files: 1,
+            source_path: dir.path().join("t.torrent"),
+            fastresume_path: None,
+            declared_save_path: None,
+            category: None,
+            tags: vec![],
+            profile: None,
+        };
+        pool.with_store(|s| {
+            s.upsert_torrent(&t, 0)?;
+            s.set_adoption(
+                &t.infohash,
+                AdoptionState::Adopted,
+                Some(root_id),
+                Some("old"),
+                Some(1),
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        record_new_base(&pool, &t.infohash, &root.join("new/place"));
+
+        let base = pool.with_store(|s| s.adoption_base(&t.infohash)).unwrap();
+        assert_eq!(base, Some((root_id, "new/place".to_owned())));
+    }
+
+    #[test]
+    fn deleting_moves_the_file_into_the_trash_and_a_rescan_ignores_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let f = write(&root, "misc/old.bin", 32);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        delete_file(&pool, &f, 42).unwrap();
+
+        assert!(!f.exists());
+        let trashed = root.join(".torrentd-trash/42/misc/old.bin");
+        assert_eq!(std::fs::read(&trashed).unwrap(), vec![7u8; 32]);
+
+        pool.scan().unwrap();
+        let root_id = pool.roots()[0].0;
+        let orphans = pool.with_store(|st| st.orphan_files(root_id, "")).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "the trash is never indexed: {orphans:?}"
+        );
+    }
+
+    #[test]
+    fn deleting_refuses_to_follow_a_directory_swapped_for_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let f = write(&root, "misc/victim.bin", 32);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+
+        // After the scan, `misc` becomes a link to a directory outside the
+        // root holding a file with the same name.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("victim.bin"), vec![7u8; 32]).unwrap();
+        std::fs::rename(root.join("misc"), dir.path().join("moved-away")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("misc")).unwrap();
+
+        assert!(delete_file(&pool, &f, 1).is_err());
+        assert!(outside.join("victim.bin").exists());
     }
 }

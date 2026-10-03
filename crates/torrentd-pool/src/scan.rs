@@ -91,6 +91,11 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             stats.note_error("path");
             continue;
         };
+        // What a delete plan removed. Indexing it would offer it up as an
+        // orphan again, or let a torrent match against it.
+        if rel_str.starts_with(&format!("{}/", crate::plan::TRASH_DIR)) {
+            continue;
+        }
 
         stats.files_indexed += 1;
         stats.bytes_indexed += meta.len();
@@ -239,15 +244,20 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// The `(size, mtime, inode)` triple the index records for a file.
+/// The `(size, mtime, inode, device)` the index records for a file.
 ///
 /// Public because anything comparing live metadata against the index — drift
-/// detection, and the last-moment check before an irreversible delete — has to
-/// compute it the same way the scanner did. Two copies of this encoding that
-/// disagree would either miss a change or reject every unchanged file.
-pub fn file_stamp(m: &std::fs::Metadata) -> (u64, i64, u64) {
+/// detection, and the last-moment check before a delete — has to compute it
+/// the same way the scanner did. Two copies of this encoding that disagree
+/// would either miss a change or reject every unchanged file.
+///
+/// The device is part of it because an inode number is only unique within
+/// one filesystem: a different volume mounted over a directory after the scan
+/// can present a file with the same size, mtime and inode number that is not
+/// the file the scan saw.
+pub fn file_stamp(m: &std::fs::Metadata) -> (u64, i64, u64, u64) {
     use std::os::unix::fs::MetadataExt;
-    (m.len(), mtime_ns(m), m.ino())
+    (m.len(), mtime_ns(m), m.ino(), m.dev())
 }
 
 fn mtime_ns(m: &std::fs::Metadata) -> i64 {

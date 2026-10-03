@@ -1271,6 +1271,87 @@ fn delete_orphans_is_scoped_to_the_named_subtree() {
     );
 }
 
+/// The acceptance case: a partial torrent's missing file may be lying right
+/// there under another name, so nothing where it expects its payload is
+/// offered up for deletion — at its own directory, above it, or inside it.
+#[test]
+fn a_delete_plan_under_a_partial_torrent_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "lib/P/a.bin", 100);
+    write_file(root, "lib/P/b-renamed.bin", 300);
+    write_file(root, "elsewhere/loose.bin", 5);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "p1",
+        "P",
+        Some(&root.join("lib").to_string_lossy()),
+        &[("P/a.bin", 100), ("P/b.bin", 300)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "p1"), AdoptionState::Partial);
+
+    for prefix in ["", "lib", "lib/P"] {
+        let e = build_plan(
+            &store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+        .unwrap_err();
+        assert!(e.contains("p1"), "{prefix:?}: got {e}");
+    }
+    // Somewhere it expects nothing is still fine.
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "elsewhere".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1);
+}
+
+#[test]
+fn an_unclaimed_file_the_size_of_a_missing_one_is_held_back() {
+    // A missing torrent with no recorded location: its file could be anywhere,
+    // and a size match is how the matcher itself would recognise it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "junk/maybe.mkv", 4321);
+    write_file(root, "junk/really-junk.txt", 9);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "m1", "M", None, &[("M/film.mkv", 4321)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "m1"), AdoptionState::Missing);
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "junk".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/really-junk.txt"));
+}
+
 #[test]
 fn is_orphan_refuses_paths_the_index_has_never_seen() {
     // The last-moment check before an irreversible delete. A path outside the
@@ -1313,22 +1394,38 @@ fn the_confirm_token_changes_with_the_plan() {
         error: None,
     }];
     assert_ne!(
-        torrentd_pool::plan::confirm_token(1, &a),
-        torrentd_pool::plan::confirm_token(1, &b),
+        torrentd_pool::plan::confirm_token(1, 7, &a),
+        torrentd_pool::plan::confirm_token(1, 7, &b),
         "different steps must not share a token",
     );
     assert_ne!(
-        torrentd_pool::plan::confirm_token(1, &a),
-        torrentd_pool::plan::confirm_token(2, &a),
+        torrentd_pool::plan::confirm_token(1, 7, &a),
+        torrentd_pool::plan::confirm_token(2, 7, &a),
         "different plan ids must not share a token",
     );
+    assert_ne!(
+        torrentd_pool::plan::confirm_token(1, 7, &a),
+        torrentd_pool::plan::confirm_token(1, 8, &a),
+        "a token read before a rescan must not apply after it",
+    );
     assert_eq!(
-        torrentd_pool::plan::confirm_token(1, &a),
-        torrentd_pool::plan::confirm_token(1, &a),
+        torrentd_pool::plan::confirm_token(1, 7, &a),
+        torrentd_pool::plan::confirm_token(1, 7, &a),
         "the token must be stable for the same plan",
     );
     assert!(torrentd_pool::plan::is_destructive("delete_orphans"));
     assert!(!torrentd_pool::plan::is_destructive("relocate"));
+}
+
+#[test]
+fn every_match_moves_the_index_generation() {
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let before = store.index_generation().unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    let after = store.index_generation().unwrap();
+    assert!(after > before, "{before} -> {after}");
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert!(store.index_generation().unwrap() > after);
 }
 
 #[test]

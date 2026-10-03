@@ -122,12 +122,7 @@ pub fn detect(
 }
 
 fn same_file(indexed: &crate::model::PoolFile, live: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let live_mtime = live
-        .mtime()
-        .saturating_mul(1_000_000_000)
-        .saturating_add(i64::from(live.mtime_nsec() as i32));
-    indexed.size == live.len() && indexed.mtime_ns == live_mtime && indexed.ino == live.ino()
+    crate::scan::file_stamp(live) == (indexed.size, indexed.mtime_ns, indexed.ino, indexed.dev)
 }
 
 fn now_secs() -> i64 {
