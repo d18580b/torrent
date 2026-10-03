@@ -1967,11 +1967,20 @@ impl DaemonHandle {
         // state an operator cannot reason about. Held in the work gate like an
         // API apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
+            // What the boot handed to sessions: the re-drive waits for every
+            // one to reach the state map before acting on what is loaded.
+            let loaded: Vec<_> = registry
+                .entries()
+                .into_iter()
+                .map(|(ih, _)| ih)
+                .filter(|ih| !unloaded_at_boot.contains(ih))
+                .collect();
             crate::pool_apply::spawn_resume_unfinished(
                 pool,
                 source.clone(),
                 state.clone(),
                 Arc::clone(&work),
+                loaded,
             );
         }
 

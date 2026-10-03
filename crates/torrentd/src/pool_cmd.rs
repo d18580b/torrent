@@ -39,6 +39,10 @@ fn scan_inner(
     let mut files = 0u64;
     let mut bytes = 0u64;
     let mut errors = 0u64;
+    let dropped = store.retain_roots(&pool_cfg.roots)?;
+    if dropped > 0 {
+        println!("  dropped {dropped} root(s) no longer configured");
+    }
     for root in &pool_cfg.roots {
         let s = torrentd_pool::scan_root(store, root)
             .with_context(|| format!("scan root {}", root.display()))?;

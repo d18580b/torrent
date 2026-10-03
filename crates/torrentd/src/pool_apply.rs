@@ -945,17 +945,66 @@ fn libc_exdev() -> i32 {
 /// [`resume_unfinished`] on the blocking pool, as boot runs it: `work` is
 /// held by the blocking task for as long as the re-drive runs, so the
 /// teardown waits for it, and its latch is the stop check between steps.
+///
+/// `loaded` is every info-hash the boot handed to a session. The re-drive
+/// waits until each is in the state map: a session holds a torrent from the
+/// moment it is added, but the state map learns of it only when its
+/// `add_torrent_alert` is processed, and until then the re-drive would read
+/// a loaded torrent as unloaded — a delete would find the index accounting
+/// for everything "loaded", and a relocate would rename the directory a
+/// session is serving instead of asking libtorrent to move it.
 pub fn spawn_resume_unfinished(
     pool: Arc<PoolService>,
     source: Arc<dyn AlertSource>,
     state: Arc<StateMap>,
     work: Arc<crate::app_state::WorkGate>,
+    loaded: Vec<libtorrent_safe::InfoHash>,
 ) -> tokio::task::JoinHandle<()> {
     let guard = work.enter();
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
-        resume_unfinished(&pool, &source, &state, &|| work.is_cancelled());
+        let stop = || work.is_cancelled();
+        let unfinished = pool
+            .with_store(|s| s.unfinished_plans())
+            .map(|p| !p.is_empty())
+            .unwrap_or(true);
+        if unfinished && !await_loaded(&state, &loaded, REDRIVE_SETTLE_DEADLINE, &stop) {
+            if !stop() {
+                warn!(
+                    target: "torrentd::pool::apply",
+                    "not every torrent the boot loaded reached the state map in time; \
+                     interrupted plans are left applying for the next boot",
+                );
+            }
+            return;
+        }
+        resume_unfinished(&pool, &source, &state, &stop);
     })
+}
+
+/// How long the boot re-drive waits for the loaded torrents to appear.
+const REDRIVE_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Wait until every one of `loaded` is in `state`. `false` on the deadline
+/// or a stop.
+fn await_loaded(
+    state: &StateMap,
+    loaded: &[libtorrent_safe::InfoHash],
+    within: std::time::Duration,
+    stop: StopCheck<'_>,
+) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    let mut pending: Vec<_> = loaded.to_vec();
+    loop {
+        pending.retain(|ih| !state.contains(ih));
+        if pending.is_empty() {
+            return true;
+        }
+        if stop() || std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 /// Re-drive any plan a crash left mid-apply.
@@ -1273,6 +1322,7 @@ mod tests {
             source,
             Arc::new(state),
             Arc::clone(&work),
+            Vec::new(),
         );
         assert!(
             !work.wait_idle(Duration::from_millis(200)).await,
@@ -1312,6 +1362,7 @@ mod tests {
             Arc::clone(&source),
             Arc::clone(&state),
             Arc::clone(&work),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -1319,10 +1370,60 @@ mod tests {
         assert_eq!(status, plan_status::APPLYING, "a latched gate stops it");
         assert_eq!(steps, vec![step_status::PENDING, step_status::PENDING]);
 
-        spawn_resume_unfinished(Arc::clone(&pool), source, state, Arc::default())
+        spawn_resume_unfinished(Arc::clone(&pool), source, state, Arc::default(), Vec::new())
             .await
             .unwrap();
         assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLIED);
+    }
+
+    #[tokio::test]
+    async fn the_boot_redrive_waits_for_every_loaded_torrent_to_reach_the_state_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a/one.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (source, state) = engine_and_state();
+        // Claimed and left applying, as a crash right after the claim leaves it.
+        pool.with_store(|s| s.claim_plan_for_apply(plan_id, false))
+            .unwrap();
+        let state = Arc::new(state);
+
+        // A torrent the boot handed to a session whose add alert is not in.
+        let pending = libtorrent_safe::InfoHash([9; 20]);
+        let work: Arc<crate::app_state::WorkGate> = Arc::default();
+        let task = spawn_resume_unfinished(
+            Arc::clone(&pool),
+            Arc::clone(&source),
+            Arc::clone(&state),
+            Arc::clone(&work),
+            vec![pending],
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            plan_state(&pool, plan_id).0,
+            plan_status::APPLYING,
+            "nothing is re-driven while a loaded torrent is missing from the state map",
+        );
+        // Shut down: it gives up without touching the plan.
+        work.cancel();
+        task.await.unwrap();
+        assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLYING);
+
+        assert!(await_loaded(
+            &state,
+            &[],
+            std::time::Duration::ZERO,
+            &|| false
+        ));
+        assert!(!await_loaded(
+            &state,
+            &[pending],
+            std::time::Duration::ZERO,
+            &|| false
+        ));
     }
 
     #[test]

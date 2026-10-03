@@ -130,6 +130,7 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
 /// a plain directory of `.torrent` files works the same, minus the hints.
 pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanStats, PoolError> {
     let mut stats = ScanStats::default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !library_dir.exists() {
         warn!(
             target: "torrentd_pool::scan",
@@ -225,6 +226,29 @@ pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanSta
             .collect();
         store.replace_torrent_files(&infohash, &rows)?;
         stats.torrents_indexed += 1;
+        seen.insert(infohash);
+    }
+
+    // A torrent whose `.torrent` is gone from the library leaves the index,
+    // unless a walk or read error means the library was not fully seen: an
+    // unreadable subdirectory would otherwise drop every torrent under it.
+    let unseen = stats.errors_by_kind.get("walk").copied().unwrap_or(0)
+        + stats.errors_by_kind.get("read").copied().unwrap_or(0);
+    if unseen == 0 {
+        let dropped = store.retain_torrents(&seen)?;
+        if dropped > 0 {
+            info!(
+                target: "torrentd_pool::scan",
+                torrent_count = dropped,
+                "torrents no longer in the library dropped from the index",
+            );
+        }
+    } else {
+        warn!(
+            target: "torrentd_pool::scan",
+            error_count = unseen,
+            "the library could not be read in full; torrents missing from it are kept",
+        );
     }
 
     info!(

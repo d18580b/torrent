@@ -1008,6 +1008,85 @@ impl PoolStore {
         Ok(id)
     }
 
+    /// Forget every root not in `keep`: its row, its file index (by cascade)
+    /// and the claims made against it. Returns how many were dropped.
+    ///
+    /// A root removed from the config otherwise stayed in the index for good —
+    /// its files still listed, its claims still "protecting" bytes the daemon
+    /// no longer manages, and every torrent once matched there still placed
+    /// on a root nothing resolves.
+    pub fn retain_roots(&mut self, keep: &[PathBuf]) -> Result<usize, PoolError> {
+        let keep: std::collections::HashSet<String> = keep
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let gone: Vec<(i64, String)> = {
+            let mut st = self.conn.prepare("SELECT id, path FROM root")?;
+            let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<(i64, String)>, _>>()?
+                .into_iter()
+                .filter(|(_, p)| !keep.contains(p))
+                .collect()
+        };
+        if gone.is_empty() {
+            return Ok(0);
+        }
+        let tx = self.conn.savepoint()?;
+        for (id, path) in &gone {
+            tx.execute("DELETE FROM claim WHERE root_id = ?1", params![id])?;
+            tx.execute("DELETE FROM root WHERE id = ?1", params![id])?;
+            info!(
+                target: "torrentd_pool::store",
+                root = %path,
+                "root is no longer configured; dropped from the index",
+            );
+        }
+        tx.commit()?;
+        Ok(gone.len())
+    }
+
+    /// Drop every library torrent not in `seen` and not `adopted`. Returns
+    /// how many went.
+    ///
+    /// A `.torrent` deleted from the library otherwise stayed in the index
+    /// for good, and its claims kept protecting bytes no torrent wants. An
+    /// adopted one is kept: it is loaded and seeding, and its claims are what
+    /// keep a delete plan off its payload.
+    pub fn retain_torrents(
+        &mut self,
+        seen: &std::collections::HashSet<String>,
+    ) -> Result<usize, PoolError> {
+        let gone: Vec<String> = self
+            .torrents()?
+            .into_iter()
+            .map(|t| t.infohash)
+            .filter(|ih| !seen.contains(ih))
+            .collect();
+        let mut dropped = 0;
+        let tx = self.conn.savepoint()?;
+        for ih in gone {
+            let state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM adoption WHERE infohash = ?1",
+                    params![ih],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if state.as_deref() == Some(AdoptionState::Adopted.as_str()) {
+                warn!(
+                    target: "torrentd_pool::store",
+                    infohash = %ih,
+                    "an adopted torrent's .torrent left the library; keeping it in the index",
+                );
+                continue;
+            }
+            tx.execute("DELETE FROM torrent WHERE infohash = ?1", params![ih])?;
+            dropped += 1;
+        }
+        tx.commit()?;
+        Ok(dropped)
+    }
+
     pub fn roots(&self) -> Result<Vec<(i64, PathBuf)>, PoolError> {
         let mut st = self
             .conn

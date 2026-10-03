@@ -182,6 +182,8 @@ impl PoolService {
         let mut store = self.store.lock();
         store.in_transaction(|store| {
             let mut summary = ScanSummary::default();
+            let configured: Vec<_> = self.roots.iter().map(|(_, p)| p.clone()).collect();
+            store.retain_roots(&configured)?;
             for (_, path) in &self.roots {
                 let s = torrentd_pool::scan_root(store, path)
                     .with_context(|| format!("scan root {}", path.display()))?;

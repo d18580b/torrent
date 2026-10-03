@@ -1418,6 +1418,80 @@ fn the_confirm_token_changes_with_the_plan() {
 }
 
 #[test]
+fn a_torrent_gone_from_the_library_leaves_the_index_unless_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    for name in ["pad_file.torrent", "v2_hybrid.torrent"] {
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name),
+            library.join(name),
+        )
+        .unwrap();
+    }
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library).unwrap();
+    let all = store.torrents().unwrap();
+    assert_eq!(all.len(), 2);
+    let pad = all
+        .iter()
+        .find(|t| t.source_path.ends_with("pad_file.torrent"))
+        .unwrap()
+        .infohash
+        .clone();
+    let hybrid = all
+        .iter()
+        .find(|t| t.source_path.ends_with("v2_hybrid.torrent"))
+        .unwrap()
+        .infohash
+        .clone();
+    store
+        .set_adoption(
+            &hybrid,
+            AdoptionState::Adopted,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+    std::fs::remove_file(library.join("pad_file.torrent")).unwrap();
+    std::fs::remove_file(library.join("v2_hybrid.torrent")).unwrap();
+    torrentd_pool::scan_library(&mut store, &library).unwrap();
+
+    assert!(store.torrent(&pad).unwrap().is_none(), "dropped");
+    assert!(store.torrent(&hybrid).unwrap().is_some(), "adopted: kept");
+}
+
+#[test]
+fn a_root_no_longer_configured_leaves_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    write_file(&a, "x.bin", 1);
+    write_file(&b, "y.bin", 1);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, &a).unwrap();
+    torrentd_pool::scan_root(&mut store, &b).unwrap();
+    assert_eq!(store.file_count().unwrap(), 2);
+
+    assert_eq!(store.retain_roots(std::slice::from_ref(&a)).unwrap(), 1);
+    assert_eq!(
+        store
+            .roots()
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect::<Vec<_>>(),
+        vec![a]
+    );
+    assert_eq!(store.file_count().unwrap(), 1);
+}
+
+#[test]
 fn every_match_moves_the_index_generation() {
     let mut store = PoolStore::open_in_memory().unwrap();
     let before = store.index_generation().unwrap();
