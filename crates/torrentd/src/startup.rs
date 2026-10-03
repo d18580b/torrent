@@ -2097,6 +2097,7 @@ impl DaemonHandle {
             unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
             shutdown: shutdown_tx.clone(),
             work: Arc::clone(&work),
+            events: Arc::default(),
         };
 
         // What the daemon decided to believe, in the journal, once. Anything

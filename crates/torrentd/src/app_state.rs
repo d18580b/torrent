@@ -78,6 +78,9 @@ pub struct AppState {
     /// Long-running pool work — scans, drift checks, plan applies — and the
     /// latch that tells it the daemon is going away. See [`WorkGate`].
     pub work: Arc<WorkGate>,
+    /// The fingerprint every `/v1/events` stream shares, and the cap on how
+    /// many are open.
+    pub events: Arc<crate::http::v1::server::EventFeed>,
 }
 
 /// Blocking work a request (or boot) started that must not be cut off
@@ -284,6 +287,7 @@ pub(crate) fn build_test_state_with_sessions(
         unloaded_at_boot: Arc::new(Mutex::new(HashSet::new())),
         shutdown: tokio::sync::broadcast::channel(4).0,
         work: Arc::default(),
+        events: Arc::default(),
     }
 }
 

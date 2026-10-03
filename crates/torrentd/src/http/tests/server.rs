@@ -144,6 +144,70 @@ async fn events(cov: &Arc<Coverage>) {
     assert_eq!(data["kind"], "tick");
     assert_eq!(data["fingerprint"].as_str().unwrap().len(), 16);
     h.assert_conformance();
+
+    // Past the cap, a stream is refused rather than opened.
+    let full = Harness::authed(cov, |s| {
+        s.events = Arc::new(crate::http::v1::server::EventFeed::with_capacity(0));
+    });
+    let refused = full.read("/v1/events").await;
+    assert_problem(&refused, 503, "too-many-event-streams");
+    assert!(
+        !full.state.events.is_running(),
+        "a refused stream starts no feed"
+    );
+    full.assert_conformance();
+}
+
+#[tokio::test]
+async fn event_streams_share_one_feed_that_stops_with_the_last_and_free_their_slots() {
+    use std::time::Duration;
+    const CAP: usize = 2;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        s.events = Arc::new(crate::http::v1::server::EventFeed::with_capacity(CAP));
+    });
+    let auth = h.state.auth.clone().unwrap();
+    let tokens = [auth.sessions.create().0, auth.sessions.create().0];
+    // A backstop: the daemon shutting down ends every stream, so a stream
+    // that does not end fails the test rather than hanging it.
+    let shutdown = h.state.shutdown.clone();
+    let backstop = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let _ = shutdown.send(torrentd_engine::ShutdownReason::Sigterm);
+    });
+
+    let h = Arc::new(h);
+    let streams: Vec<_> = tokens
+        .iter()
+        .map(|t| {
+            let (h, t) = (Arc::clone(&h), t.clone());
+            tokio::spawn(async move { h.send("GET", "/v1/events", Some(&t), None).await })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert_eq!(h.state.events.open_streams(CAP), 2);
+    assert!(h.state.events.is_running(), "one feed serves both");
+    // The cap is reached: a third is refused while both are open.
+    assert_problem(&h.read("/v1/events").await, 503, "too-many-event-streams");
+
+    for t in &tokens {
+        auth.sessions.revoke(t);
+    }
+    for s in streams {
+        let resp = s.await.unwrap();
+        resp.assert_status(kynos::http::StatusCode::OK);
+        assert!(!resp.events().is_empty());
+    }
+    assert_eq!(h.state.events.open_streams(CAP), 0, "every slot is freed");
+    // The feed notices it has no listener on its next tick and stops.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while h.state.events.is_running() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !h.state.events.is_running(),
+        "the feed outlived its last stream"
+    );
+    backstop.abort();
 }
 
 #[tokio::test]
