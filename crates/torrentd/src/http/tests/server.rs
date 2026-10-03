@@ -147,6 +147,21 @@ async fn events(cov: &Arc<Coverage>) {
 }
 
 #[tokio::test]
+async fn an_events_stream_opened_after_the_shutdown_ends_at_once() {
+    // Subscribed after the broadcast went out, the stream never saw it and
+    // held the graceful drain open to its timeout. Nothing sends on the
+    // broadcast here: only the latch can end this stream, and if it does not
+    // the read below never returns.
+    let h = Harness::authed(&Coverage::new(), |_| {});
+    h.state.work.cancel();
+    let resp = tokio::time::timeout(std::time::Duration::from_secs(5), h.read("/v1/events"))
+        .await
+        .expect("the stream must end without waiting for a broadcast");
+    resp.assert_status(kynos::http::StatusCode::OK);
+    assert!(resp.events().is_empty(), "nothing is sent once shut down");
+}
+
+#[tokio::test]
 async fn every_response_carries_the_shared_headers_and_its_own_request_id() {
     let h = Harness::authed(&Coverage::new(), |_| {});
     let mut ids = std::collections::BTreeSet::new();

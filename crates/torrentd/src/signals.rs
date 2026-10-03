@@ -122,7 +122,21 @@ async fn dispatch<T, I, H>(
                     warn!("received SIGHUP while shutting down; ignoring it");
                 } else {
                     info!("received SIGHUP");
-                    let _ = reload_tx.send(()).await;
+                    // Never `send().await`: with the reload queue full — a
+                    // reload in progress and SIGHUPs arriving faster — this
+                    // loop would park on it and stop serving SIGTERM, the one
+                    // signal that must always get through. A full queue
+                    // already holds a reload that will re-read the file, so
+                    // dropping this one loses nothing.
+                    match reload_tx.try_send(()) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(())) => {
+                            info!("a reload is already queued; this SIGHUP joins it");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(())) => {
+                            warn!("received SIGHUP but the reload task is not running");
+                        }
+                    }
                 }
             }
             else => break,
@@ -248,6 +262,30 @@ mod tests {
             "a SIGHUP during the drain does not reconfigure sessions that are \
              being torn down",
         );
+    }
+
+    /// A full reload queue cannot stall SIGTERM.
+    ///
+    /// `send().await` on a full queue parked the dispatcher until the reload
+    /// task drained it — a reload that hangs on a slow config read, or no
+    /// reload task reading at all — and a SIGTERM meanwhile went unanswered.
+    #[tokio::test]
+    async fn a_full_reload_queue_does_not_hold_up_a_sigterm() {
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel(8);
+        // Capacity one and never read: the second SIGHUP finds it full.
+        let (reload_tx, _reload_rx) = mpsc::channel(1);
+        let (term_tx, term) = mpsc::channel(8);
+        let (_int_tx, int_) = mpsc::channel(8);
+        let (hup_tx, hup) = mpsc::channel(8);
+        tokio::spawn(dispatch(shutdown_tx, reload_tx, term, int_, hup));
+
+        hup_tx.send(()).await.unwrap();
+        hup_tx.send(()).await.unwrap();
+        term_tx.send(()).await.unwrap();
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), shutdown_rx.recv())
+            .await
+            .expect("SIGTERM was stuck behind a full reload queue");
+        assert!(matches!(got, Ok(ShutdownReason::Sigterm)));
     }
 
     /// EOF on every stream ends the loop rather than panicking `select!` with

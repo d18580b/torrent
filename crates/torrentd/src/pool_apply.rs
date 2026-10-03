@@ -40,7 +40,13 @@ pub struct ApplyOutcome {
     pub status: String,
 }
 
-/// Apply every pending step of `plan_id`.
+/// Asked between steps: is the daemon shutting down? A plan stopped for it
+/// is left `applying` with its remaining steps `pending`, which is exactly
+/// what `resume_unfinished` re-drives on the next boot.
+pub type StopCheck<'a> = &'a (dyn Fn() -> bool + Send + Sync);
+
+/// Apply every pending step of `plan_id`, stopping between steps once `stop`
+/// says so.
 ///
 /// Already-`done` steps are skipped, which is what makes this safe to call
 /// again on a plan a crash interrupted.
@@ -49,8 +55,9 @@ pub fn apply(
     source: &Arc<dyn AlertSource>,
     state: &StateMap,
     plan_id: i64,
+    stop: StopCheck<'_>,
 ) -> Result<ApplyOutcome, String> {
-    apply_inner(pool, source, state, plan_id, false)
+    apply_inner(pool, source, state, plan_id, false, stop)
 }
 
 /// Whether the index accounts for everything the daemon currently serves.
@@ -75,12 +82,17 @@ fn check_index_accounts_for_live_state(pool: &PoolService, state: &StateMap) -> 
     Ok(())
 }
 
+/// What `apply_inner` answers when a shutdown stops it before the claim. The
+/// boot re-drive tells a stop from a failure by it.
+const SHUTTING_DOWN: &str = "the daemon is shutting down; apply the plan again once it is back";
+
 fn apply_inner(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
     state: &StateMap,
     plan_id: i64,
     resume: bool,
+    stop: StopCheck<'_>,
 ) -> Result<ApplyOutcome, String> {
     let Some(plan) = pool
         .with_store(|s| s.plan(plan_id))
@@ -133,6 +145,12 @@ fn apply_inner(
         check_index_accounts_for_live_state(pool, state)?;
     }
 
+    // Not claimed during a shutdown: the claim would hand the plan to the next
+    // boot to re-drive, which is not what a request made now asked for.
+    if stop() {
+        return Err(SHUTTING_DOWN.into());
+    }
+
     // ---- claim -------------------------------------------------------------
     //
     // One conditional UPDATE. Reading the status and then setting it lets two
@@ -166,6 +184,22 @@ fn apply_inner(
         if step.status == step_status::DONE {
             out.skipped += 1;
             continue;
+        }
+        // Between steps, never inside one: a step is journalled
+        // `in_progress` before it runs, and a process killed inside it leaves
+        // a step whose outcome is unknown and a plan parked for a human. Stop
+        // here instead and the plan stays `applying` with this step still
+        // `pending`, which the next boot re-drives from exactly here.
+        if stop() {
+            warn!(
+                target: "torrentd::pool::apply",
+                plan_id,
+                next_step = step.seq,
+                done = out.done,
+                "stopping between steps for shutdown; the plan resumes at the next boot",
+            );
+            out.status = plan_status::APPLYING.to_string();
+            return Ok(out);
         }
         if deletes && step.op == ops::DELETE_FILE && state.len() != loaded_len {
             if let Err(e) = check_index_accounts_for_live_state(pool, state) {
@@ -632,8 +666,29 @@ fn libc_exdev() -> i32 {
     18
 }
 
+/// [`resume_unfinished`] on the blocking pool, as boot runs it: `work` is
+/// held by the blocking task for as long as the re-drive runs, so the
+/// teardown waits for it, and its latch is the stop check between steps.
+pub fn spawn_resume_unfinished(
+    pool: Arc<PoolService>,
+    source: Arc<dyn AlertSource>,
+    state: Arc<StateMap>,
+    work: Arc<crate::app_state::WorkGate>,
+) -> tokio::task::JoinHandle<()> {
+    let guard = work.enter();
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        resume_unfinished(&pool, &source, &state, &|| work.is_cancelled());
+    })
+}
+
 /// Re-drive any plan a crash left mid-apply.
-pub fn resume_unfinished(pool: &PoolService, source: &Arc<dyn AlertSource>, state: &StateMap) {
+pub fn resume_unfinished(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    stop: StopCheck<'_>,
+) {
     if !pool.allow_mutations() {
         // Mutations were turned off between the interrupted apply and this
         // boot. Re-driving anyway would destroy data the operator has since
@@ -662,9 +717,25 @@ pub fn resume_unfinished(pool: &PoolService, source: &Arc<dyn AlertSource>, stat
         );
         // A plan that ran and stopped at a failed step has already counted
         // that; this counts the re-drive itself being refused or erroring.
-        if let Err(e) = apply_inner(pool, source, state, plan.id, true) {
-            error!(target: "torrentd::pool::apply", plan_id = plan.id, error.cause = %e, "resume failed");
-            pool.count("pool_plan_failures_total", &[("kind", "resume_failed")]);
+        if stop() {
+            return;
+        }
+        match apply_inner(pool, source, state, plan.id, true, stop) {
+            Ok(_) => {}
+            // A stop latched after the check above: the plan was stopped,
+            // not failed, and stays `applying` for the next boot.
+            Err(e) if e == SHUTTING_DOWN => {
+                warn!(
+                    target: "torrentd::pool::apply",
+                    plan_id = plan.id,
+                    "not resuming for shutdown; the plan resumes at the next boot",
+                );
+                return;
+            }
+            Err(e) => {
+                error!(target: "torrentd::pool::apply", plan_id = plan.id, error.cause = %e, "resume failed");
+                pool.count("pool_plan_failures_total", &[("kind", "resume_failed")]);
+            }
         }
     }
 }
@@ -756,7 +827,7 @@ mod tests {
             ),
         );
 
-        let e = apply(&pool, &source, &state, plan_id).unwrap_err();
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
         assert!(e.contains("no claims in the index"), "got {e}");
         assert!(victim.exists(), "payload was deleted against a stale index");
 
@@ -800,7 +871,7 @@ mod tests {
         .unwrap();
 
         let (source, state) = engine_and_state();
-        let e = apply(&pool, &source, &state, plan_id).unwrap_err();
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
         assert!(
             e.contains("interrupted and its outcome is unknown"),
             "got {e}"
@@ -816,6 +887,204 @@ mod tests {
         assert_eq!(status, torrentd_pool::model::plan_status::FAILED);
         pool.with_store_mut(|st| st.delete_plan(plan_id)).unwrap();
         assert!(pool.with_store(|st| st.plan(plan_id)).unwrap().is_none());
+    }
+
+    /// Status and per-step statuses of `plan_id`.
+    fn plan_state(pool: &PoolService, plan_id: i64) -> (String, Vec<String>) {
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        (plan.status, steps.into_iter().map(|s| s.status).collect())
+    }
+
+    #[test]
+    fn a_shutdown_during_an_apply_stops_between_steps_and_the_next_boot_finishes_it() {
+        // SIGTERM mid-apply: the teardown used to run alongside the blocking
+        // apply until `process::exit` killed it — inside a step as often as
+        // not, which parks the plan `failed` for a human. Stopping between
+        // steps leaves it `applying`, the state the next boot re-drives.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = write(&root, "a/one.bin", 16);
+        let b = write(&root, "b/two.bin", 16);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (_, steps) = plan_state(&pool, plan_id);
+        assert_eq!(steps.len(), 2, "one delete per orphan");
+
+        // The shutdown lands once the first step is done: asked before the
+        // claim, before step 0, then before step 1.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 2;
+        let (source, state) = engine_and_state();
+        let out = apply(&pool, &source, &state, plan_id, &stop).unwrap();
+        assert_eq!(out.done, 1);
+        assert_eq!(out.status, plan_status::APPLYING);
+
+        let (status, steps) = plan_state(&pool, plan_id);
+        assert_eq!(status, plan_status::APPLYING, "left for the next boot");
+        assert_eq!(steps, vec![step_status::DONE, step_status::PENDING]);
+        assert_eq!(
+            [a.exists(), b.exists()].iter().filter(|e| **e).count(),
+            1,
+            "exactly one step ran",
+        );
+
+        // Next boot.
+        resume_unfinished(&pool, &source, &state, &|| false);
+        let (status, steps) = plan_state(&pool, plan_id);
+        assert_eq!(status, plan_status::APPLIED);
+        assert_eq!(steps, vec![step_status::DONE, step_status::DONE]);
+        assert!(!a.exists() && !b.exists());
+    }
+
+    #[test]
+    fn an_apply_asked_for_during_a_shutdown_is_refused_unclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let a = write(&root, "a/one.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (source, state) = engine_and_state();
+        let e = apply(&pool, &source, &state, plan_id, &|| true).unwrap_err();
+        assert!(e.contains("shutting down"), "got {e}");
+        assert_eq!(plan_state(&pool, plan_id).0, plan_status::DRAFT);
+        assert!(a.exists());
+    }
+
+    /// Hold the pool store's lock on another thread until the returned sender
+    /// is sent to (or dropped), so work that needs the store blocks there.
+    fn hold_the_store(
+        pool: &Arc<PoolService>,
+    ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let held = Arc::clone(pool);
+        let holder = std::thread::spawn(move || {
+            held.with_store(|_| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+        });
+        locked_rx.recv().unwrap();
+        (release_tx, holder)
+    }
+
+    #[tokio::test]
+    async fn the_boot_redrive_holds_the_work_gate_until_it_finishes() {
+        // The teardown waits on the gate before it stops the alert loop and
+        // closes the sessions a re-driven move goes through. A re-drive that
+        // did not hold it would be torn down around mid-step.
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a/one.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let (source, state) = engine_and_state();
+        let work: Arc<crate::app_state::WorkGate> = Arc::default();
+
+        // The re-drive's first act is reading the store, so it blocks here.
+        let (release, holder) = hold_the_store(&pool);
+        let task = spawn_resume_unfinished(
+            Arc::clone(&pool),
+            source,
+            Arc::new(state),
+            Arc::clone(&work),
+        );
+        assert!(
+            !work.wait_idle(Duration::from_millis(200)).await,
+            "the teardown saw no work while the re-drive was running",
+        );
+        assert_eq!(work.in_flight(), 1);
+
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        task.await.unwrap();
+        assert_eq!(work.in_flight(), 0, "released once the re-drive is done");
+    }
+
+    #[tokio::test]
+    async fn the_boot_redrive_stops_on_the_work_gates_latch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a/one.bin", 16);
+        write(&root, "b/two.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (source, state) = engine_and_state();
+
+        // Left `applying` with nothing done, as a shutdown right after the
+        // claim leaves it.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        apply(&pool, &source, &state, plan_id, &stop).unwrap();
+        let state = Arc::new(state);
+
+        let work: Arc<crate::app_state::WorkGate> = Arc::default();
+        work.cancel();
+        spawn_resume_unfinished(
+            Arc::clone(&pool),
+            Arc::clone(&source),
+            Arc::clone(&state),
+            Arc::clone(&work),
+        )
+        .await
+        .unwrap();
+        let (status, steps) = plan_state(&pool, plan_id);
+        assert_eq!(status, plan_status::APPLYING, "a latched gate stops it");
+        assert_eq!(steps, vec![step_status::PENDING, step_status::PENDING]);
+
+        spawn_resume_unfinished(Arc::clone(&pool), source, state, Arc::default())
+            .await
+            .unwrap();
+        assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLIED);
+    }
+
+    #[test]
+    fn a_stop_latched_inside_the_redrive_is_not_counted_as_a_failure() {
+        // The re-drive checks the stop, then `apply_inner` checks it again
+        // before its claim. A shutdown landing between the two used to come
+        // back as an error and count as `resume_failed`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        write(&root, "a/one.bin", 16);
+        write(&root, "b/two.bin", 16);
+        let pool = service(dir.path(), true);
+        let metrics = Arc::new(crate::metrics_sink::PromSink::new());
+        pool.set_metrics(metrics.clone());
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let (source, state) = engine_and_state();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        apply(&pool, &source, &state, plan_id, &stop).unwrap();
+        assert_eq!(plan_state(&pool, plan_id).0, plan_status::APPLYING);
+
+        // Clear for the re-drive's own check, latched for `apply_inner`'s.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let stop = || asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1;
+        resume_unfinished(&pool, &source, &state, &stop);
+
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let (status, steps) = plan_state(&pool, plan_id);
+        assert_eq!(
+            status,
+            plan_status::APPLYING,
+            "a stopped plan is left for the next boot"
+        );
+        assert_eq!(steps, vec![step_status::PENDING, step_status::PENDING]);
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(!text.contains("kind=\"resume_failed\"} 1"), "{text}");
     }
 
     #[test]

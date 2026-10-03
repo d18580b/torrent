@@ -131,6 +131,14 @@ pub struct Config {
     #[serde(default = "Config::default_handshake_max_age")]
     pub vpn_handshake_max_age_secs: u64,
 
+    /// How long the shutdown drain waits for outstanding resume saves before
+    /// giving up on them, in seconds. Default 60. A pool of 100K torrents
+    /// answers a whole-pool save in batches of `RESUME_SAVES_IN_FLIGHT`, so a
+    /// large pool on slow storage may need more; `deploy/torrentd.service`'s
+    /// `TimeoutStopSec` is sized to the default.
+    #[serde(default = "Config::default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
+
     /// Install a fail-closed nftables kill switch that
     /// confines the daemon's egress to loopback + the profiles' tunnel interfaces.
     /// Off by default; requires `CAP_NET_ADMIN` and that torrentd runs as its own
@@ -237,6 +245,14 @@ impl Config {
     fn default_handshake_max_age() -> u64 {
         180
     }
+
+    fn default_shutdown_drain_secs() -> u64 {
+        60
+    }
+
+    /// The largest `shutdown_drain_secs` accepted. An hour is already far
+    /// past any stop budget a supervisor would grant.
+    pub const MAX_SHUTDOWN_DRAIN_SECS: u64 = 3600;
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let cfg = Self::parse(path)?;
@@ -433,6 +449,14 @@ impl Config {
             }
             Ok(())
         };
+        // Zero would skip the drain outright and lose every unsaved resume.
+        if !(1..=Self::MAX_SHUTDOWN_DRAIN_SECS).contains(&self.shutdown_drain_secs) {
+            anyhow::bail!(
+                "shutdown_drain_secs = {} is out of range (1..={})",
+                self.shutdown_drain_secs,
+                Self::MAX_SHUTDOWN_DRAIN_SECS,
+            );
+        }
         range("connections_limit", self.connections_limit, 1, 1_000_000)?;
         range("file_pool_size", self.file_pool_size, 1, 1_000_000)?;
         range("aio_threads", self.aio_threads, 1, 1024)?;
@@ -607,6 +631,7 @@ impl Config {
             peer_fingerprint: new_peer_fingerprint,
             user_agent: new_user_agent,
             vpn_handshake_max_age_secs: new_vpn_handshake_max_age_secs,
+            shutdown_drain_secs: new_shutdown_drain_secs,
             network_kill_switch: new_network_kill_switch,
             profile: new_profile,
             auth: new_auth,
@@ -747,6 +772,10 @@ impl Config {
         if old.vpn_handshake_max_age_secs != *new_vpn_handshake_max_age_secs {
             d.non_reloadable_changes.push("vpn_handshake_max_age_secs");
         }
+        // Handed to the alert loop once, when it is spawned.
+        if old.shutdown_drain_secs != *new_shutdown_drain_secs {
+            d.non_reloadable_changes.push("shutdown_drain_secs");
+        }
         if old.network_kill_switch != *new_network_kill_switch {
             d.non_reloadable_changes.push("network_kill_switch");
         }
@@ -793,10 +822,9 @@ impl Config {
     ///
     /// `startup::boot` refuses `network_kill_switch = true` with no tunnel to
     /// confine egress to, or with a host profile the ruleset would silently
-    /// cut off, and `--check-config` — which
-    /// `deploy/torrentd.service` runs as its `ExecStartPre`, so that a bad
-    /// configuration fails before `ExecStart` rather than under
-    /// `Restart=on-failure` — did not. The configuration that reaches it, a
+    /// cut off, and `--check-config` — the pre-flight that exists so a bad
+    /// configuration is caught before the daemon is restarted onto it — did
+    /// not. The configuration that reaches it, a
     /// set of profiles with zero tunnels, is new in this change.
     ///
     /// Called from [`Config::validate_inner`], above the authentication
@@ -1611,6 +1639,7 @@ impl Config {
             peer_fingerprint: None,
             user_agent: None,
             vpn_handshake_max_age_secs: Self::default_handshake_max_age(),
+            shutdown_drain_secs: Self::default_shutdown_drain_secs(),
             network_kill_switch: false,
             profile: vec![],
             auth: None,
@@ -3362,9 +3391,8 @@ upload_rate_limit = 0"#,
 
     #[test]
     fn check_config_refuses_a_kill_switch_with_no_tunnel_to_confine_egress_to() {
-        // `deploy/torrentd.service` runs `--check-config` as its
-        // `ExecStartPre` so a bad configuration fails before `ExecStart`
-        // rather than under `Restart=on-failure`. This refusal is a pure
+        // `--check-config` is the pre-flight that catches a bad configuration
+        // before the daemon is restarted onto it. This refusal is a pure
         // function of the file and `boot` makes it anyway, so the pre-flight
         // has no reason not to.
         //
@@ -3676,6 +3704,20 @@ library_dir = "{d}/library"
     }
 
     #[test]
+    fn the_shutdown_drain_defaults_to_a_minute_and_refuses_zero() {
+        let dir = tempdir().unwrap();
+        let base = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        assert_eq!(base.shutdown_drain_secs, 60);
+        // Zero would skip the drain and lose every unsaved resume.
+        let text = format!("shutdown_drain_secs = 0\n{}", single_session());
+        let e = Config::load(&write_cfg(dir.path(), &text)).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("shutdown_drain_secs"),
+            "got {e:#}"
+        );
+    }
+
+    #[test]
     fn an_edit_to_any_non_reloadable_key_is_reported() {
         // The property: a config that differs in exactly one key the daemon
         // cannot apply is not an unchanged config, and the warning names the
@@ -3700,6 +3742,9 @@ library_dir = "{d}/library"
         let mut handshake = base.clone();
         handshake.vpn_handshake_max_age_secs = base.vpn_handshake_max_age_secs + 60;
 
+        let mut drain = base.clone();
+        drain.shutdown_drain_secs = base.shutdown_drain_secs + 30;
+
         let mut kill_switch = base.clone();
         kill_switch.network_kill_switch = !base.network_kill_switch;
 
@@ -3717,6 +3762,7 @@ library_dir = "{d}/library"
             ("default_save_path", &save_path),
             ("registry_path", &registry),
             ("vpn_handshake_max_age_secs", &handshake),
+            ("shutdown_drain_secs", &drain),
             ("network_kill_switch", &kill_switch),
             ("pool", &pool),
         ] {

@@ -59,6 +59,58 @@ pub fn status(text: &str) {
     log_failure("STATUS", notify(&format!("STATUS={text}")));
 }
 
+/// `EXTEND_TIMEOUT_USEC=` — ask for `by` more time from now before systemd's
+/// start or stop timeout fires.
+pub fn extend_timeout(by: Duration) {
+    log_failure("EXTEND_TIMEOUT_USEC", notify(&extend_timeout_message(by)));
+}
+
+fn extend_timeout_message(by: Duration) -> String {
+    format!("EXTEND_TIMEOUT_USEC={}", by.as_micros())
+}
+
+/// How far each `EXTEND_TIMEOUT_USEC` reaches, and how often
+/// [`TimeoutExtender`] re-sends it: each message outlives the next by the
+/// difference, so one lost datagram costs nothing.
+const EXTEND_BY: Duration = Duration::from_secs(30);
+const EXTEND_EVERY: Duration = Duration::from_secs(10);
+
+/// Keeps systemd's start or stop timeout from firing while a phase that is
+/// making progress runs long — a boot loading 100K torrents, a drain saving
+/// them — by re-sending `EXTEND_TIMEOUT_USEC` until dropped or until `cap`
+/// has passed.
+///
+/// The cap is what keeps this from defeating the timeout: a phase that is
+/// wedged rather than slow stops being extended once it has run past every
+/// bound it was given, and systemd's own timeout fires from the last
+/// extension. A no-op outside systemd, like every other notification here.
+#[derive(Debug)]
+pub struct TimeoutExtender(Option<tokio::task::JoinHandle<()>>);
+
+impl TimeoutExtender {
+    /// Start extending, on the current tokio runtime.
+    pub fn start(cap: Duration) -> Self {
+        if std::env::var_os("NOTIFY_SOCKET").is_none() {
+            return Self(None);
+        }
+        Self(Some(tokio::spawn(async move {
+            let until = tokio::time::Instant::now() + cap;
+            while tokio::time::Instant::now() < until {
+                extend_timeout(EXTEND_BY);
+                tokio::time::sleep(EXTEND_EVERY).await;
+            }
+        })))
+    }
+}
+
+impl Drop for TimeoutExtender {
+    fn drop(&mut self) {
+        if let Some(t) = self.0.take() {
+            t.abort();
+        }
+    }
+}
+
 /// How often to send `WATCHDOG=1`, or `None` when the watchdog is disabled.
 ///
 /// systemd sets `WATCHDOG_USEC` to the configured `WatchdogSec=`. The
@@ -190,5 +242,41 @@ mod tests {
         let mut buf = [0u8; 64];
         let n = listener.recv(&mut buf).unwrap();
         assert_eq!(&buf[..n], b"READY=1");
+    }
+
+    #[test]
+    fn the_extender_asks_for_more_time_at_once() {
+        let _lk = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let listener = UnixDatagram::bind(&path).unwrap();
+        let _g = EnvGuard::set(&[("NOTIFY_SOCKET", Some(path.to_str().unwrap()))]);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let extender = TimeoutExtender::start(Duration::from_secs(600));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(extender);
+        });
+
+        listener.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 64];
+        let n = listener.recv(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"EXTEND_TIMEOUT_USEC=30000000");
+        assert!(
+            listener.recv(&mut buf).is_err(),
+            "one message per interval, not a stream of them"
+        );
+    }
+
+    #[test]
+    fn the_extender_is_inert_outside_systemd() {
+        let _lk = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = EnvGuard::set(&[("NOTIFY_SOCKET", None)]);
+        // No runtime here: starting one outside systemd must not spawn.
+        assert!(TimeoutExtender::start(Duration::from_secs(1)).0.is_none());
     }
 }

@@ -6,13 +6,34 @@ Wants=network-online.target
 
 [Service]
 Type=notify
-ExecStartPre=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml --check-config
+# No `ExecStartPre=... --check-config`: the daemon makes every check that flag
+# makes before it starts anything, and exits 78 for the same refusals.
+# RestartPreventExitStatus= reads only the main process's status, so a refusal
+# from an ExecStartPre would be restarted every RestartSec regardless.
 ExecStart=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml
 ExecReload=/bin/kill -HUP $MAINPID
 KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=5s
+# 78 (EX_CONFIG) is a configuration the daemon refuses: a config that does not
+# load, `nft` missing under `network_kill_switch = true`, or a boot refusal no
+# restart can change. Restarting it every RestartSec only buries the reason in
+# the journal.
+RestartPreventExitStatus=78
 WatchdogSec=60s
+
+# Start: tunnel bring-up (up to 30 s a profile) plus the resume and
+# torrent-dir scans, minutes at 100K torrents. The daemon sends
+# EXTEND_TIMEOUT_USEC every 10 s while it boots, for up to 15 minutes, so
+# this bounds a boot that has stopped making progress rather than a large one.
+TimeoutStartSec=90s
+# Stop: the HTTP drain (10 s), pool work finishing its current step (up to
+# 20 s), the resume drain (shutdown_drain_secs, default 60 s), then closing
+# the sessions and tunnels: about 95 s at the defaults. The daemon also sends
+# EXTEND_TIMEOUT_USEC while it drains, capped at those stages' sum, so a larger
+# shutdown_drain_secs is covered; keep this above the defaults' total so a
+# stop is bounded even where the extensions do not arrive.
+TimeoutStopSec=120s
 
 # Resource limits Environment.
 LimitNOFILE=65536
@@ -30,8 +51,25 @@ ProtectControlGroups=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Other users' processes are invisible. The daemon only ever signals its own
+# children (the OpenVPN process it started), which run as its own uid.
+ProtectProc=invisible
+RestrictNamespaces=yes
+# AF_UNIX for sd_notify, AF_INET/AF_INET6 for peers, trackers and the API,
+# AF_NETLINK for `ip`, `wg` and `nft`, which inherit this list when the daemon
+# runs them to manage tunnels and the kill switch.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
-# State + data dirs the daemon may write.
+# State + data dirs the daemon may write. `ProtectSystem=strict` makes every
+# other path read-only, so this must name every directory the daemon writes:
+# the state dir, every `default_save_path`/`save_path` payload lands under,
+# every `[pool] roots` entry and its `library_dir` (a plan moves and deletes
+# payload there), and any `resume_dir`/`torrent_dir` a `[[profile]]` moves
+# elsewhere. A pool root missing here fails every mutation plan with EROFS.
 ReadWritePaths=/var/lib/torrentd /data/torrents
 StateDirectory=torrentd
 StateDirectoryMode=0750

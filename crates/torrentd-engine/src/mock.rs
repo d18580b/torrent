@@ -90,6 +90,7 @@ pub enum RecordedCall {
     TorrentDetails(TorrentHandle),
     TorrentFiles(TorrentHandle),
     TorrentTrackers(TorrentHandle),
+    Close,
 }
 
 /// Stripped-down view of `AddParams` so we can derive Clone/Debug
@@ -213,6 +214,12 @@ impl HeldCall {
 #[derive(Debug)]
 pub struct MockEngine {
     alerts: Mutex<VecDeque<Alert>>,
+    /// When set, the alert queue holds at most this many alerts and drops the
+    /// rest, reporting them on the next `pop_alerts` as one
+    /// `Alert::AlertsDropped` — libtorrent's `alert_queue_size` behaviour.
+    alert_capacity: Mutex<Option<usize>>,
+    /// Types dropped since the last `pop_alerts`, as libtorrent's bitset.
+    dropped_bits: Mutex<[u64; 2]>,
     calls: Mutex<Vec<RecordedCall>>,
     next_handle_id: AtomicU64,
     /// `op_name` → fixed error to return on the next call to that op.
@@ -255,6 +262,8 @@ impl MockEngine {
     pub fn new() -> Self {
         Self {
             alerts: Mutex::new(VecDeque::new()),
+            alert_capacity: Mutex::new(None),
+            dropped_bits: Mutex::new([0; 2]),
             calls: Mutex::new(Vec::new()),
             next_handle_id: AtomicU64::new(1),
             error_inject: DashMap::new(),
@@ -300,9 +309,28 @@ impl MockEngine {
 
     // --- test fixture helpers -----------------------------------------------
 
+    /// Bound the alert queue at `n`, dropping what overflows it the way
+    /// libtorrent does: silently, reported afterwards only as a bitset of the
+    /// alert *types* lost. Saves are the one type mapped to their real bit
+    /// (37/38, `alert_types.hpp`); any other lost type sets bit 0.
+    pub fn with_alert_capacity(self, n: usize) -> Self {
+        *self.alert_capacity.lock() = Some(n);
+        self
+    }
+
     /// Queue an alert that the next `pop_alerts` call will surface.
     pub fn push_alert(&self, a: Alert) {
-        self.alerts.lock().push_back(a);
+        let mut q = self.alerts.lock();
+        if self.alert_capacity.lock().is_some_and(|cap| q.len() >= cap) {
+            let bit = match a.kind() {
+                AlertKind::SaveResumeData => 37,
+                AlertKind::SaveResumeDataFailed => 38,
+                _ => 0,
+            };
+            self.dropped_bits.lock()[0] |= 1u64 << bit;
+            return;
+        }
+        q.push_back(a);
     }
 
     pub fn push_alerts(&self, alerts: impl IntoIterator<Item = Alert>) {
@@ -558,7 +586,20 @@ impl TorrentEngine for MockEngine {
         if let Some(d) = stall {
             std::thread::sleep(d);
         }
-        self.alerts.lock().drain(..).collect()
+        let mut out: Vec<Alert> = self.alerts.lock().drain(..).collect();
+        let bits = std::mem::take(&mut *self.dropped_bits.lock());
+        if bits != [0; 2] {
+            out.push(Alert::AlertsDropped {
+                hdr: AlertHeader {
+                    kind: AlertKind::AlertsDropped,
+                    infohash: None,
+                    handle: None,
+                    timestamp_us: 0,
+                },
+                bits,
+            });
+        }
+        out
     }
 
     fn post_updates(&self) {
@@ -603,6 +644,10 @@ impl TorrentEngine for MockEngine {
             .get(&h.infohash)
             .map(|t| t.clone())
             .unwrap_or_default())
+    }
+
+    fn close(&self) {
+        self.record(RecordedCall::Close);
     }
 }
 

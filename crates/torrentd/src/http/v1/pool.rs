@@ -381,15 +381,22 @@ pub async fn scan_pool(
 ) -> Result<Json<ScanSummary>, PoolFailure> {
     let pool = s.pool.clone().ok_or(PoolFailure::PoolNotConfigured)?;
     // Walking millions of paths is blocking work; keeping it off the async
-    // runtime is what stops a scan from stalling every other request.
-    let summary = tokio::task::spawn_blocking(move || pool.scan())
-        .await
-        .map_err(|e| PoolFailure::Internal {
-            detail: internal("the pool scan", e),
-        })?
-        .map_err(|e| PoolFailure::Internal {
-            detail: internal("the pool scan", format!("{e:#}")),
-        })?;
+    // runtime is what stops a scan from stalling every other request. The
+    // guard moves into the task, so the teardown waits for the scan itself
+    // and not merely for this request: one transaction, which a kill would
+    // roll back whole, but whose rollback is minutes of work thrown away.
+    let guard = s.work.enter();
+    let summary = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        pool.scan()
+    })
+    .await
+    .map_err(|e| PoolFailure::Internal {
+        detail: internal("the pool scan", e),
+    })?
+    .map_err(|e| PoolFailure::Internal {
+        detail: internal("the pool scan", format!("{e:#}")),
+    })?;
     info!(
         target: "torrentd::http::pool",
         files = summary.files,
@@ -424,7 +431,10 @@ pub async fn check_pool_drift(
     Inject(s): Inject<Arc<AppState>>,
 ) -> Result<Json<DriftReport>, PoolFailure> {
     let pool = s.pool.clone().ok_or(PoolFailure::PoolNotConfigured)?;
+    // Held by the task, as for a scan: the teardown waits for it.
+    let guard = s.work.enter();
     let report = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
         let roots: std::collections::HashMap<i64, std::path::PathBuf> =
             pool.roots().iter().cloned().collect();
         pool.with_store_mut(|st| torrentd_pool::drift::detect(st, |id| roots.get(&id).cloned()))
@@ -1920,13 +1930,19 @@ pub async fn apply_plan(
     let state = s.state.clone();
     let worker = Arc::clone(&pool);
     // Moving payload is blocking work and can run long; keep it off the async
-    // runtime so the rest of the API stays responsive.
-    let outcome =
-        tokio::task::spawn_blocking(move || crate::pool_apply::apply(&worker, &source, &state, id))
-            .await
-            .map_err(|e| ApplyPlanError::Internal {
-                detail: internal("applying a plan", e),
-            })?;
+    // runtime so the rest of the API stays responsive. The apply checks the
+    // shutdown latch between steps, and the guard it holds is what the
+    // teardown waits on before it closes the sessions a move goes through.
+    let work = Arc::clone(&s.work);
+    let guard = work.enter();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        crate::pool_apply::apply(&worker, &source, &state, id, &|| work.is_cancelled())
+    })
+    .await
+    .map_err(|e| ApplyPlanError::Internal {
+        detail: internal("applying a plan", e),
+    })?;
 
     match outcome {
         Ok(o) => Ok(Json(ApplyOutcome {

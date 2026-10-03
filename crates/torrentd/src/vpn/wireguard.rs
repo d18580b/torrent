@@ -1382,27 +1382,82 @@ mod native {
         Ok(())
     }
 
-    /// Remove the rules this module added for `iface`, then the link. Routes
-    /// in its table go with the link. Best effort, like `wg-quick down`: the
+    /// Remove the link, then the rules this module added for it. Routes in
+    /// its table go with the link. Best effort, like `wg-quick down`: the
     /// caller decides what a link still standing afterwards means.
     pub(super) fn down(iface: &str) {
-        if let Ok(table) = table_for(iface) {
+        // The table is named from the link's ifindex, so it is read while the
+        // link still exists.
+        let table = table_for(iface).ok();
+        down_with(iface, table, |args| run(args, None));
+    }
+
+    /// [`down`] over a command runner, so the order can be tested.
+    ///
+    /// **The link goes first.** The rules are what steer traffic sourced from
+    /// the tunnel's address into the tunnel's table. Deleting them first left
+    /// a window, as long as the link teardown took, in which a socket still
+    /// bound to that address was routed by the main table — out of the
+    /// host's own interface, carrying the tunnel's source address. With the
+    /// link gone first the address is gone with it, nothing can be sourced
+    /// from it, and the rules left behind match nothing until they are
+    /// removed.
+    pub(super) fn down_with(
+        iface: &str,
+        table: Option<u32>,
+        mut run: impl FnMut(&[&str]) -> Result<(), String>,
+    ) {
+        let _ = run(&["ip", "link", "delete", "dev", iface]);
+        if let Some(table) = table {
             let table = table.to_string();
             for fam in ["-4", "-6"] {
                 for _ in 0..MAX_RULES {
-                    if run(&["ip", fam, "rule", "del", "table", &table], None).is_err() {
+                    if run(&["ip", fam, "rule", "del", "table", &table]).is_err() {
                         break;
                     }
                 }
             }
         }
-        let _ = run(&["ip", "link", "delete", "dev", iface], None);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_teardown_removes_the_link_before_its_rules() {
+        // Rules first left the tunnel's source address routed by the main
+        // table for as long as the link teardown took: a leak out of the
+        // host's own interface.
+        let mut seen: Vec<String> = Vec::new();
+        let mut rules_left = 2;
+        native::down_with("wg-a", Some(51_820), |args| {
+            seen.push(args.join(" "));
+            if args.get(2) == Some(&"rule") {
+                if rules_left == 0 {
+                    return Err("no such rule".into());
+                }
+                rules_left -= 1;
+            }
+            Ok(())
+        });
+        assert_eq!(
+            seen[0], "ip link delete dev wg-a",
+            "the link goes first: {seen:?}"
+        );
+        assert!(
+            seen[1..]
+                .iter()
+                .all(|c| c.contains(" rule del table 51820")),
+            "then only the rules: {seen:?}",
+        );
+        assert_eq!(
+            seen.iter().filter(|c| c.contains(" rule del ")).count(),
+            4,
+            "rules are deleted until none is left, in each family: {seen:?}",
+        );
+    }
 
     #[test]
     fn a_missing_interface_is_a_probe_failure_not_a_missing_handshake() {

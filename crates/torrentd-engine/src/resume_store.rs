@@ -3,14 +3,17 @@
 //! `FsResumeStore` writes one bencoded file per info-hash under
 //! `<base_dir>/<profile_id>/<infohash_hex>.resume`. Writes go via temp file +
 //! `fsync` + `rename` for atomicity: a partial write must leave the
-//! previous resume file intact.
+//! previous resume file intact. With
+//! [`FsResumeStore::with_batched_writes`], `write_batched` queues onto a
+//! [`BatchWriter`] instead, which pays those flushes per batch on its own
+//! thread rather than per file on the alert loop's.
 //!
 //! `MemoryResumeStore` keeps everything in a `DashMap` keyed by
 //! `(profile, infohash)`. Used by Layer 1 unit tests so we don't hit the
 //! filesystem.
 
 use std::fs;
-use std::io::Write;
+use std::path::Path;
 use std::path::PathBuf;
 
 use dashmap::DashMap;
@@ -20,17 +23,40 @@ use thiserror::Error;
 use tracing::debug;
 use tracing::warn;
 
+use crate::batch_writer::remove_if_present;
+use crate::batch_writer::write_atomic;
+use crate::batch_writer::BatchWriter;
+use crate::batch_writer::WriteErrorHook;
 use crate::profile::ProfileId;
 
+/// What a store's scan of one profile's directory found.
+#[derive(Debug, Default)]
+pub struct Scan<T> {
+    /// Every file that read, keyed by the info-hash its name carries.
+    pub entries: Vec<(InfoHash, T)>,
+    /// Files with a well-formed name that could not be read. Each is skipped
+    /// and logged rather than failing the scan: one bad file used to abort
+    /// the whole profile's load, and a profile that loads nothing is a far
+    /// larger outage than one torrent missing.
+    pub unreadable: u64,
+}
+
 pub trait ResumeStore: Send + Sync + std::fmt::Debug {
-    /// Load every resume file owned by `profile`. Implementations skip
-    /// files that don't parse as a 40-char hex info-hash filename.
+    /// Scan every resume file owned by `profile`. Implementations skip
+    /// files that don't parse as a 40-char hex info-hash filename, and count
+    /// the ones that do but cannot be read.
+    fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError>;
+
+    /// [`ResumeStore::scan`]'s entries alone.
     fn load_all(
         &self,
         profile: &ProfileId,
-    ) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError>;
+    ) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError> {
+        self.scan(profile).map(|s| s.entries)
+    }
 
-    /// Atomically replace the resume file for `(profile, ih)` with `data`.
+    /// Atomically replace the resume file for `(profile, ih)` with `data`,
+    /// durably, before returning.
     fn write(
         &self,
         profile: &ProfileId,
@@ -38,9 +64,87 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
         data: &[u8],
     ) -> Result<(), ResumeStoreError>;
 
+    /// Replace the resume file for `(profile, ih)` with `data`, possibly
+    /// later, from another thread. What the alert loop calls: it must not
+    /// wait on the disk. A store with no writer of its own writes at once.
+    /// A failure after this returns is the writer's to report.
+    fn write_batched(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        data: &[u8],
+    ) -> Result<(), ResumeStoreError> {
+        self.write(profile, ih, data)
+    }
+
+    /// Return once every batched write accepted so far is durable.
+    fn flush(&self) {}
+
     /// Delete the resume file for `(profile, ih)`. Missing files are not an
     /// error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError>;
+}
+
+/// Read every `<infohash><suffix>` file in `dir`, skipping — with a warning
+/// — names that are not an info-hash and files that cannot be read. `what`
+/// names the store in the log.
+pub(crate) fn scan_dir(
+    dir: &Path,
+    suffix: &str,
+    profile: &ProfileId,
+    what: &str,
+) -> std::io::Result<Scan<Vec<u8>>> {
+    let mut out = Scan::default();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    for entry in fs::read_dir(dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(
+                    target: "torrentd_engine::store",
+                    profile_id = %profile,
+                    dir = %dir.display(),
+                    error.cause = %e,
+                    "skipping a {what} directory entry that could not be read",
+                );
+                out.unreadable += 1;
+                continue;
+            }
+        };
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let Some(stem) = name.strip_suffix(suffix) else {
+            continue;
+        };
+        let Some(ih) = InfoHash::from_hex(stem) else {
+            warn!(
+                target: "torrentd_engine::store",
+                profile_id = %profile,
+                file = %path.display(),
+                "skipping {what} file with invalid name",
+            );
+            continue;
+        };
+        match fs::read(&path) {
+            Ok(bytes) => out.entries.push((ih, bytes)),
+            Err(e) => {
+                warn!(
+                    target: "torrentd_engine::store",
+                    profile_id = %profile,
+                    infohash = %ih,
+                    file = %path.display(),
+                    error.cause = %e,
+                    "skipping {what} file that could not be read",
+                );
+                out.unreadable += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +170,8 @@ pub struct FsResumeStore {
     /// asked for, and matched only by coincidence when the configured path
     /// happened to equal the derived one.
     overrides: std::collections::HashMap<ProfileId, PathBuf>,
+    /// Where `write_batched` queues, when set; otherwise it writes at once.
+    writer: Option<BatchWriter>,
 }
 
 impl FsResumeStore {
@@ -73,7 +179,15 @@ impl FsResumeStore {
         Self {
             base: base.into(),
             overrides: std::collections::HashMap::new(),
+            writer: None,
         }
+    }
+
+    /// Queue `write_batched` onto a writer thread of the store's own, which
+    /// reports each failure to `on_error`.
+    pub fn with_batched_writes(mut self, on_error: Option<WriteErrorHook>) -> Self {
+        self.writer = Some(BatchWriter::spawn("torrentd-resume-writer", on_error));
+        self
     }
 
     /// Pin `profile` to an explicit directory rather than the derived one.
@@ -100,40 +214,18 @@ impl FsResumeStore {
 }
 
 impl ResumeStore for FsResumeStore {
-    fn load_all(
-        &self,
-        profile: &ProfileId,
-    ) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError> {
-        let dir = self.dir_for(profile);
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(stem) = name.strip_suffix(".resume") else {
-                continue;
-            };
-            match InfoHash::from_hex(stem) {
-                Some(ih) => {
-                    let bytes = fs::read(&path)?;
-                    out.push((ih, ResumeData::new(bytes)));
-                }
-                None => {
-                    warn!(
-                        target: "torrentd_engine::resume_store",
-                        profile_id = %profile,
-                        file = %path.display(),
-                        "skipping resume file with invalid name",
-                    );
-                }
-            }
-        }
-        Ok(out)
+    fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError> {
+        // Whatever is still queued lands first, so the scan reads the newest.
+        self.flush();
+        let raw = scan_dir(&self.dir_for(profile), ".resume", profile, "resume")?;
+        Ok(Scan {
+            entries: raw
+                .entries
+                .into_iter()
+                .map(|(ih, b)| (ih, ResumeData::new(b)))
+                .collect(),
+            unreadable: raw.unreadable,
+        })
     }
 
     fn write(
@@ -142,28 +234,13 @@ impl ResumeStore for FsResumeStore {
         ih: &InfoHash,
         data: &[u8],
     ) -> Result<(), ResumeStoreError> {
-        let dir = self.dir_for(profile);
-        fs::create_dir_all(&dir)?;
-        let final_path = self.file_for(profile, ih);
-        let tmp_path = dir.join(format!("{}.resume.tmp", ih.to_hex()));
-
-        // Atomic write: temp file → fsync(file) → rename. The temp file is
-        // in the same directory so the rename is same-filesystem.
-        {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            f.write_all(data)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp_path, &final_path)?;
-        // fsync the parent directory so the rename hits disk too. Best-effort
-        // — on filesystems that don't support fsync of dirs (rare on Linux),
-        // ignore the failure.
-        if let Ok(d) = fs::File::open(&dir) {
-            let _ = d.sync_all();
+        // Atomic write: temp file → fsync(file) → rename → fsync(dir). The
+        // temp file is in the same directory so the rename is
+        // same-filesystem.
+        let path = self.file_for(profile, ih);
+        match &self.writer {
+            Some(w) => w.write_now(&path, data)?,
+            None => write_atomic(&path, data)?,
         }
         debug!(
             target: "torrentd_engine::resume_store",
@@ -175,13 +252,34 @@ impl ResumeStore for FsResumeStore {
         Ok(())
     }
 
+    fn write_batched(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        data: &[u8],
+    ) -> Result<(), ResumeStoreError> {
+        match &self.writer {
+            Some(w) => {
+                w.enqueue(self.file_for(profile, ih), profile, ih, data);
+                Ok(())
+            }
+            None => self.write(profile, ih, data),
+        }
+    }
+
+    fn flush(&self) {
+        if let Some(w) = &self.writer {
+            w.flush();
+        }
+    }
+
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
         let path = self.file_for(profile, ih);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        match &self.writer {
+            Some(w) => w.delete_now(&path)?,
+            None => remove_if_present(&path)?,
         }
+        Ok(())
     }
 }
 
@@ -217,16 +315,16 @@ impl MemoryResumeStore {
 }
 
 impl ResumeStore for MemoryResumeStore {
-    fn load_all(
-        &self,
-        profile: &ProfileId,
-    ) -> Result<Vec<(InfoHash, ResumeData)>, ResumeStoreError> {
-        Ok(self
-            .inner
-            .iter()
-            .filter(|e| e.key().0 == *profile)
-            .map(|e| (e.key().1, ResumeData::new(e.value().clone())))
-            .collect())
+    fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError> {
+        Ok(Scan {
+            entries: self
+                .inner
+                .iter()
+                .filter(|e| e.key().0 == *profile)
+                .map(|e| (e.key().1, ResumeData::new(e.value().clone())))
+                .collect(),
+            unreadable: 0,
+        })
     }
 
     fn write(
@@ -277,6 +375,45 @@ mod tests {
         assert_eq!(loaded[0].1.as_bytes(), b"hello");
         store.delete(&profile, &ih).unwrap();
         assert_eq!(store.load_all(&profile).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn one_unreadable_resume_file_is_skipped_and_counted_not_fatal() {
+        // `load_all` used to `?` on the first read failure, which aborted the
+        // whole profile's load at boot: one bad file, zero torrents.
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path());
+        let profile = ProfileId::new("p");
+        let good = InfoHash([0x01u8; 20]);
+        store.write(&profile, &good, b"ok").unwrap();
+        // A directory where a resume file should be reads as EISDIR.
+        std::fs::create_dir(
+            dir.path()
+                .join("p")
+                .join(format!("{}.resume", InfoHash([0x02u8; 20]).to_hex())),
+        )
+        .unwrap();
+        let scan = store.scan(&profile).unwrap();
+        assert_eq!(scan.unreadable, 1);
+        assert_eq!(scan.entries.len(), 1);
+        assert_eq!(scan.entries[0].0, good);
+    }
+
+    #[test]
+    fn batched_writes_land_and_a_delete_after_one_sticks() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path()).with_batched_writes(None);
+        let profile = ProfileId::new("p");
+        let kept = InfoHash([0x01u8; 20]);
+        let removed = InfoHash([0x02u8; 20]);
+        store.write_batched(&profile, &kept, b"kept").unwrap();
+        store.write_batched(&profile, &removed, b"gone").unwrap();
+        store.delete(&profile, &removed).unwrap();
+        store.flush();
+        let loaded = store.load_all(&profile).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, kept);
+        assert_eq!(loaded[0].1.as_bytes(), b"kept");
     }
 
     #[test]
