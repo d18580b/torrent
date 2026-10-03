@@ -1283,7 +1283,10 @@ from_invalid!(VerifyError);
 /// Asks libtorrent to check each torrent's payload against its piece hashes
 /// (v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.
 /// `202` means the checks started; each torrent reports `checking` until it
-/// finishes. A torrent not loaded in any session is skipped with the reason.
+/// finishes. A torrent not loaded in any session, or paused (libtorrent does
+/// not hash a paused torrent), is skipped with the reason. Only a torrent in
+/// the pool index has its outcome recorded: a pass marks it `adopted`, a
+/// failure marks it `drifted` and pauses it.
 #[kynos::post("/pool/verifications", tag = Pool)]
 pub async fn verify_pool_torrents(
     _caller: Scoped<Bearer, Write>,
@@ -1322,11 +1325,37 @@ pub async fn verify_pool_torrents(
                     continue;
                 }
             };
+            // libtorrent does not hash a paused torrent: the check waits for a
+            // resume that nothing here issues, so reporting it started would
+            // be false. A torrent paused by a failed verification is the
+            // common case; resuming it is the operator's call, since it puts
+            // the rejected payload back on the network until the check ends.
+            if st.phase == torrentd_engine::TorrentPhase::Paused {
+                skip(
+                    &mut resp,
+                    "paused, and libtorrent does not hash a paused torrent; resume it, then \
+                     verify again"
+                        .to_owned(),
+                );
+                continue;
+            }
             // Tracked before it is asked for, so the check it starts finishes
             // after the mark; the verify queue then records its outcome, which
             // is what clears a drifted torrent or pauses one that failed.
+            // Only a torrent the pool index holds has an adoption to record:
+            // anything else is re-hashed and left alone, neither paused on a
+            // failure nor written into the index.
             if let Some(pool) = s.pool.as_ref() {
-                pool.verify_queue().track_recheck(infohash.to_string());
+                let ih = infohash.to_string();
+                let indexed = pool.with_store(|st| st.torrent(&ih).map(|t| t.is_some()));
+                match indexed {
+                    Ok(true) => pool.verify_queue().track_recheck(ih),
+                    Ok(false) => {}
+                    Err(e) => {
+                        skip(&mut resp, format!("pool index unreadable: {e}"));
+                        continue;
+                    }
+                }
             }
             match engine.force_recheck(st.handle) {
                 Ok(()) => resp.started.push(infohash),

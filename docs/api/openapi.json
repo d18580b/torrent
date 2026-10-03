@@ -8238,7 +8238,7 @@
           "pool"
         ],
         "summary": "Re-hash loaded torrents.",
-        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks started; each torrent reports `checking` until it\nfinishes. A torrent not loaded in any session is skipped with the reason.",
+        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks started; each torrent reports `checking` until it\nfinishes. A torrent not loaded in any session, or paused (libtorrent does\nnot hash a paused torrent), is skipped with the reason. Only a torrent in\nthe pool index has its outcome recorded: a pass marks it `adopted`, a\nfailure marks it `drifted` and pauses it.",
         "operationId": "verify_pool_torrents",
         "requestBody": {
           "content": {
