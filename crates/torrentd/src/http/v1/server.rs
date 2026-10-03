@@ -329,7 +329,7 @@ pub enum EventsError {
     /// Every event-stream slot is taken.
     #[error(
         "{MAX_EVENT_STREAMS} event streams are already open on this daemon; close one, or \
-         reconnect after the stream's retry interval"
+         retry in a few seconds"
     )]
     #[problem(status = 503, title = "Too many event streams")]
     TooManyEventStreams,

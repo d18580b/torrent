@@ -473,6 +473,13 @@ a build that knows only version 3 refuses the result. Torrents indexed before it
 keep reading their padding entries as payload, and so as `partial`, until the
 library is scanned again: run `torrentd pool scan` once after upgrading.
 
+Schema version 5 materialises the directory tree: each file's directory, and
+per directory the byte accounting the tree listing and `GET /v1/pool` show.
+The step derives all of it from the index already on disk, in the same
+transaction as the version write, so it needs no rescan; on an index of
+millions of files it adds seconds to that first start. It is additive and
+takes no copy, but a build that knows only version 4 refuses the result.
+
 **If the migration fails, that copy is not the remedy.** It is taken
 immediately before the steps that failed, so it is a copy of the index as it
 stands — same version, same columns, same tables — and restoring it puts you

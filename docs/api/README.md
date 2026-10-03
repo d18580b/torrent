@@ -207,6 +207,9 @@ described in [`problems.md`](problems.md):
 - The stream ends when the daemon shuts down, and within a second of the
   session token it was opened with expiring or being revoked. Reconnect with
   a live credential, and poll while the stream is down.
+- At most 64 streams are open on a daemon at once. Past that, the request is
+  refused with `503 too-many-event-streams`; retry in a few seconds, and poll
+  meanwhile.
 
 ## Optional surfaces
 

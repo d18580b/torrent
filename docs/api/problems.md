@@ -262,7 +262,7 @@ run yet. The queued reload will read the same file.
 
 **503**, from `GET /v1/events`. 64 event streams are already open on this
 daemon, and each holds its slot for as long as its client keeps it. Close a
-stream you no longer read, or reconnect after the stream's `retry` interval.
+stream you no longer read, or retry in a few seconds.
 
 ## `internal`
 
