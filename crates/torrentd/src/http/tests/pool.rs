@@ -498,6 +498,84 @@ async fn every_read_answers_while_a_scan_holds_the_writer() {
     holder.join().unwrap();
 }
 
+#[tokio::test]
+async fn a_token_read_before_a_scan_does_not_apply_after_it() {
+    // The plan reads come from the read connection, which shows the index
+    // as it was before a running scan. A confirm token taken from that view
+    // binds the old generation; once the scan commits it must no longer
+    // apply, or the plan deletes files the rescan may since have placed.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    let held = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    let w = h.tokens.write.clone();
+    let plan: Value = h
+        .send(
+            "POST",
+            "/v1/pool/plans",
+            Some(&w),
+            Some(json!({"kind": "delete_orphans", "root_id": root_id, "prefix": "junk"})),
+        )
+        .await
+        .json();
+    let id = plan["id"].as_i64().unwrap();
+    let token = plan["confirm_token"].as_str().unwrap().to_owned();
+
+    // A scan in progress: the writer held, and the generation moved when it
+    // commits.
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        held.with_store_mut(|st| {
+            st.in_transaction(|st| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                torrentd_pool::match_all(st).map(|_| ())
+            })
+        })
+        .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    // The token still reads as current while the scan runs.
+    let during: Value = h.read(&format!("/v1/pool/plans/{id}")).await.json();
+    assert_eq!(during["confirm_token"], token.as_str());
+
+    let apply = format!("/v1/pool/plans/{id}/apply");
+    let (resp, ()) = tokio::join!(
+        h.send(
+            "POST",
+            &apply,
+            Some(&w),
+            Some(json!({"confirm_token": token})),
+        ),
+        async {
+            // Let the apply read the plan from the pre-scan snapshot first.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            release_tx.send(()).unwrap();
+        },
+    );
+    holder.join().unwrap();
+    assert_problem(&resp, 422, "confirm-token-mismatch");
+    assert!(dir.path().join("pool/junk/orphan.bin").exists());
+
+    // The plan re-read against the rescanned index carries a token that
+    // applies.
+    let after: Value = h.read(&format!("/v1/pool/plans/{id}")).await.json();
+    assert_ne!(after["confirm_token"], token.as_str());
+    let resp = h
+        .send(
+            "POST",
+            &apply,
+            Some(&w),
+            Some(json!({"confirm_token": after["confirm_token"]})),
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_store_call_waiting_on_the_writer_does_not_take_a_runtime_worker() {
     // Handlers outside the pool module, and the verify queue, still call the

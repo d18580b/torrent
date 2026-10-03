@@ -2065,11 +2065,31 @@ pub async fn apply_plan(
     // Deleting data takes a second, deliberate call carrying a value only the
     // plan could have produced. Not a security control — a guard against
     // applying the wrong plan id.
-    if let Some(expected) = &plan.confirm_token {
-        match req.confirm_token.as_deref() {
-            None => return Err(ApplyPlanError::ConfirmTokenRequired),
-            Some(got) if got != expected => return Err(ApplyPlanError::ConfirmTokenMismatch),
-            Some(_) => {}
+    //
+    // Checked against the writer, not the snapshot `load_plan` read: during
+    // a scan the reader still shows the previous index generation, so a token
+    // read before the rescan would match there and the plan would then run on
+    // the rescanned index. The writer waits for the scan to commit and
+    // answers with the generation the executor will see.
+    if plan.confirm_token.is_some() {
+        let Some(got) = req.confirm_token else {
+            return Err(ApplyPlanError::ConfirmTokenRequired);
+        };
+        let writer = Arc::clone(&pool);
+        let expected = blocking(move || {
+            writer
+                .with_store(|st| -> Result<_, torrentd_pool::PoolError> {
+                    Ok((st.plan_steps(id)?, st.index_generation()?))
+                })
+                .map(|(steps, generation)| {
+                    torrentd_pool::plan::confirm_token(id, generation, &steps)
+                })
+                .map_err(|e| internal("reading a plan", e))
+        })
+        .await
+        .map_err(|detail| ApplyPlanError::Internal { detail })?;
+        if got != expected {
+            return Err(ApplyPlanError::ConfirmTokenMismatch);
         }
     }
 
