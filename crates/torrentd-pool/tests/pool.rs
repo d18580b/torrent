@@ -1534,6 +1534,58 @@ fn a_delete_plan_under_a_partial_torrent_is_refused() {
     assert_eq!(steps.len(), 1);
 }
 
+/// A missing torrent has no base the matcher found, so the save path the
+/// previous client recorded is where its payload is expected.
+#[test]
+fn a_delete_plan_where_a_missing_torrent_was_saved_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "dl/Q/sample.txt", 5);
+    write_file(root, "elsewhere/loose.bin", 6);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "q1",
+        "Q",
+        Some(&root.join("dl").to_string_lossy()),
+        &[("Q/q.bin", 77)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "q1"), AdoptionState::Missing);
+    assert_eq!(store.adoption_base("q1").unwrap(), None);
+
+    for prefix in ["dl", "dl/Q"] {
+        let e = build_plan(
+            &store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("q1") && e.contains("dl/Q"),
+            "{prefix:?}: got {e}"
+        );
+    }
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "elsewhere".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1);
+}
+
 #[test]
 fn an_unclaimed_file_the_size_of_a_missing_one_is_held_back() {
     // A missing torrent with no recorded location: its file could be anywhere,
