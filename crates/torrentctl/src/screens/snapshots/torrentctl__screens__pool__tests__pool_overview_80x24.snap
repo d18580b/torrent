@@ -6,11 +6,12 @@ expression: screen
 ╭ library ─────────────────────────────╮╭ adoption ────────────────────────────╮
 │      library  /srv/library           ││● adopted        800 ██████████······ │
 │     torrents  1,234                  ││◐ matched        300 ███············· │
-│        files  56,789                 ││◐ partial         50 █··············· │
-│        roots  3                      ││○ missing         40 █··············· │
-│    verifying  4 queued · 2 running   ││✖ drifted          3 █··············· │
+│        files  56,789                 ││◐ shared           6 █··············· │
+│        roots  3                      ││◐ partial         50 █··············· │
+│    verifying  4 queued · 2 running   ││○ missing         40 █··············· │
+│                                      ││✖ drifted          3 █··············· │
 │                                      ││✖ overlap         11 █··············· │
-│                                      ││· unmatched       30 █··············· │
+│                                      ││· unmatched       24 █··············· │
 ╰──────────────────────────────────────╯╰──────────────────────────────────────╯
 ╭ roots █ adopted ▓ matched ░ orphan ──────────────────────────────────────────╮
 │  id    path                                  total     orphan  share         │
@@ -18,11 +19,10 @@ expression: screen
 │  #2    /srv/pool/b                         2.0 TiB        0 B  ███████·······│
 │  #3    /mnt/archive/cold-storage         800.0 GiB  650.0 GiB  ▓░░░░░░░░░░░··│
 │                                                                              │
-│                                                                              │
-│                                                                              │
 ╰ Enter browse root  s scan  d drift check ────────────────────────────────────╯
 ╭ last run ────────────────────────────────────────────────────────────────────╮
 │   scan  57,000 files · 6.8 TiB · 1,234 torrents                              │
-│         ◐ matched 300 · ◐ partial 50 · ○ missing 40 · ✖ overlap 11 · 2 errors│
+│         ◐ matched 300 · ◐ partial 50 · ○ missing 40 ·                        │
+│         ✖ overlap 11 · ◐ shared 6 · 2 errors                                 │
 │  drift  ✖ 3 drifted: 090909090909 +2 · 4 files changed · 1 vanished          │
 ╰──────────────────────────────────────────────────────────────────────────────╯

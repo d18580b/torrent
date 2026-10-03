@@ -83,6 +83,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     if st.phase != phase {
                         st.phase = phase;
                     }
+                    st.phase_since_check = true;
                 });
             }
         }
@@ -92,6 +93,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 ctx.state.update(&ih, |st| {
                     st.is_finished = true;
                     st.phase = TorrentPhase::Seeding;
+                    st.phase_since_check = true;
                 });
                 info!(
                     target: "torrentd_engine::handler::state_update",
@@ -207,6 +209,7 @@ mod tests {
         assert_eq!(st.total_payload_uploaded, 90);
         assert_eq!(st.num_peers, 3);
         assert!(st.is_seeding && st.needs_save_resume);
+        assert!(st.phase_since_check);
     }
 
     #[test]
@@ -318,6 +321,63 @@ mod tests {
             dispatch(&update(lt_state), &state, &metrics);
             assert_eq!(phase(&state), sticky);
         }
+    }
+
+    /// `torrent_checked` leaves `phase` as it was before the check and says
+    /// so; the next phase report is the first one a re-hash's verdict can be
+    /// read from.
+    #[test]
+    fn a_check_marks_the_phase_stale_until_the_next_report() {
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        let h = TorrentHandle {
+            id: 3,
+            infohash: ih(0x66),
+        };
+        seed_state(&state, h);
+        state.update(&ih(0x66), |st| {
+            st.phase = TorrentPhase::Seeding;
+            st.phase_since_check = true;
+        });
+        let hdr = |kind| AlertHeader {
+            kind,
+            infohash: Some(ih(0x66)),
+            handle: None,
+            timestamp_us: 0,
+        };
+        let checked = Alert::TorrentChecked {
+            hdr: hdr(AlertKind::TorrentChecked),
+        };
+        {
+            let resume = MemoryResumeStore::new();
+            let torrents = MemoryTorrentStore::new();
+            let clock = MockClock::new();
+            let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+            let mut ctx = HandlerCtx {
+                state: &state,
+                resume: &resume,
+                torrents: &torrents,
+                metrics: &metrics,
+                clock: &clock,
+                engine: &engine,
+                profile_id: ProfileId::new("p"),
+                span: tracing::info_span!("test"),
+            };
+            crate::handlers::storage::handle(&checked, &mut ctx);
+        }
+        let st = state.get(&ih(0x66)).unwrap();
+        assert!(st.checked_at.is_some());
+        assert!(!st.phase_since_check);
+        assert_eq!(st.phase, TorrentPhase::Seeding, "stale, and marked so");
+
+        dispatch(
+            &Alert::TorrentFinished {
+                hdr: hdr(AlertKind::TorrentFinished),
+            },
+            &state,
+            &metrics,
+        );
+        assert!(state.get(&ih(0x66)).unwrap().phase_since_check);
     }
 
     #[test]

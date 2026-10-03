@@ -2082,7 +2082,7 @@
             }
           },
           "409": {
-            "description": "The torrent is still being added; The profile is unavailable",
+            "description": "The torrent is still being added; The payload is shared; The profile is unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2102,6 +2102,22 @@
                         }
                       ],
                       "title": "The torrent is still being added"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#payload-shared"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The payload is shared"
                     },
                     {
                       "allOf": [
@@ -8222,7 +8238,7 @@
           "pool"
         ],
         "summary": "Re-hash loaded torrents.",
-        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks started; each torrent reports `checking` until it\nfinishes. A torrent not loaded in any session is skipped with the reason.",
+        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks started; each torrent reports `checking` until it\nfinishes. A torrent not loaded in any session, or paused (libtorrent does\nnot hash a paused torrent), is skipped with the reason. Only a torrent in\nthe pool index has its outcome recorded: a pass marks it `adopted`, a\nfailure marks it `drifted` and pauses it.",
         "operationId": "verify_pool_torrents",
         "requestBody": {
           "content": {
@@ -9917,7 +9933,13 @@
             "type": "integer",
             "minimum": 0.0,
             "format": "uint64",
-            "description": "Torrents sharing a file with another torrent."
+            "description": "Torrents sharing some files with another torrent that claims a\ndifferent set."
+          },
+          "shared": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Torrents whose files another torrent claims as exactly the same set."
           }
         },
         "type": "object",
@@ -9927,7 +9949,8 @@
           "matched",
           "adopted",
           "drifted",
-          "overlap"
+          "overlap",
+          "shared"
         ],
         "description": "How many library torrents are in each adoption state."
       },
@@ -9995,7 +10018,8 @@
           "matched",
           "adopted",
           "drifted",
-          "overlap"
+          "overlap",
+          "shared"
         ],
         "description": "Where a torrent in the library stands relative to the payload on disk."
       },
@@ -10201,7 +10225,19 @@
             "type": "integer",
             "minimum": 0.0,
             "format": "uint64",
-            "description": "Torrents sharing a file with another torrent."
+            "description": "Torrents sharing some files with another torrent that claims a\ndifferent set."
+          },
+          "shared": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Torrents whose files another torrent claims as exactly the same set."
+          },
+          "drifted": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Complete torrents still carrying drift no verification has cleared."
           },
           "errors": {
             "type": "integer",
@@ -10219,6 +10255,8 @@
           "partial",
           "missing",
           "overlap",
+          "shared",
+          "drifted",
           "errors"
         ],
         "description": "What a full re-index found."

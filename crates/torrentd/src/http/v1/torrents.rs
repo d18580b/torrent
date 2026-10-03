@@ -1057,6 +1057,12 @@ torrent_error! {
         )]
         #[problem(status = 409, title = "The torrent is still being added")]
         TorrentAdding,
+        /// `delete_files=true` for a torrent whose files the pool index has
+        /// another torrent claiming too — a cross-seed, or a conflict.
+        /// Deleting them would take the other torrent's payload with them.
+        #[error("{detail}")]
+        #[problem(status = 409, title = "The payload is shared")]
+        PayloadShared { detail: String },
         /// `delete_files=true` for a torrent whose profile has no running
         /// session: its payload is reachable only through one.
         #[error("{detail}")]
@@ -1103,6 +1109,29 @@ pub async fn delete_torrent(
     // operation wide open on exactly the deployments with the least context.
     if delete_files && s.pool.as_ref().is_none_or(|p| !p.allow_mutations()) {
         return Err(DeleteTorrentError::MutationsDisabled);
+    }
+    // The planner refuses to delete a file two torrents claim, and this is the
+    // same deletion spelled differently: libtorrent removes every file in this
+    // torrent's list, including the ones a cross-seeded torrent is serving.
+    if delete_files {
+        if let Some(pool) = s.pool.as_ref() {
+            let hex = ih.to_hex();
+            let others = pool.with_store(|st| st.co_claimants(&hex)).map_err(|e| {
+                DeleteTorrentError::Internal {
+                    detail: internal("reading the pool index", e),
+                }
+            })?;
+            if let Some(first) = others.first() {
+                return Err(DeleteTorrentError::PayloadShared {
+                    detail: format!(
+                        "{} other torrent(s) claim files of this one in the pool index — the \
+                         first is {first} — so deleting its payload would delete theirs; \
+                         retry without `delete_files`",
+                        others.len(),
+                    ),
+                });
+            }
+        }
     }
     let profile = s
         .registry

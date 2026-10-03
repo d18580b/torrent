@@ -13,11 +13,14 @@
 //!   not resolved.
 //! * **Orphans must be provably unclaimed.** Deletion only ever targets files
 //!   with no claim from any torrent in the library, and only inside the
-//!   subtree the operator named.
+//!   subtree the operator named. Not where a torrent the matcher could not
+//!   fully place expects its files, and never a file the size of one it is
+//!   still missing. A deleted file goes to [`TRASH_DIR`], not away.
 //! * **Every path stays inside its managed root.** Destinations arrive from
 //!   the API as root-relative strings, so a `..` component in one would have
 //!   the daemon write payload wherever the caller pointed it.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -93,7 +96,7 @@ fn build_relocate(
     let state = store.adoption_state(infohash)?;
     match state {
         Some(AdoptionState::Adopted) | Some(AdoptionState::Matched) => {}
-        Some(AdoptionState::Overlap) => {
+        Some(AdoptionState::Overlap) | Some(AdoptionState::Shared) => {
             return Ok(Err(Refused(
                 "another torrent claims the same files; moving them would break it".into(),
             )))
@@ -109,6 +112,14 @@ fn build_relocate(
                 other.map(|s| s.as_str()).unwrap_or("unknown"),
             ))))
         }
+    }
+
+    // An adopted torrent keeps `adopted` across a rescan that finds another
+    // torrent over its files, so the state alone does not rule sharing out.
+    if store.shares_claims(infohash)? {
+        return Ok(Err(Refused(
+            "another torrent claims the same files; moving them would break it".into(),
+        )));
     }
 
     let Some((src_root_id, src_base)) = store.adoption_base(infohash)? else {
@@ -166,7 +177,7 @@ fn build_relocate(
     // different copy of this payload or someone else's data, and both are
     // reasons to stop and let a person look.
     for f in store.torrent_files(infohash)? {
-        if f.size == 0 {
+        if !f.is_on_disk() {
             continue;
         }
         let candidate = dest_dir.join(&f.rel_path);
@@ -201,9 +212,58 @@ fn build_delete_orphans(
     };
     let prefix = prefix.trim_matches('/');
 
-    let orphans = store.orphan_files(root_id, prefix)?;
+    // "Unclaimed" means no torrent placed it — which is not the same as no
+    // torrent wants it. A torrent the matcher could not fully place has files
+    // it is looking for and did not find, and those may be sitting right here
+    // under another name or base. Two guards, because neither alone is
+    // enough:
+    //
+    // * a delete under (or over) the base of a torrent that is not fully
+    //   placed is refused outright — its missing files would be expected
+    //   exactly there;
+    // * anywhere else, an unclaimed file whose size equals one the library is
+    //   still missing is left alone, since a size match is how the matcher
+    //   itself recognises a file that moved.
+    let unresolved = unresolved_payload(store, root_id, &root)?;
+    if let Some((ih, base)) = unresolved
+        .areas
+        .iter()
+        .find(|(_, area)| prefixes_overlap(prefix, area))
+    {
+        return Ok(Err(Refused(format!(
+            "torrent {ih} is not fully present and expects its payload under {:?}; files it \
+             failed to find may be among these. Rescan, or remove it from the library, before \
+             deleting here",
+            if base.is_empty() { "/" } else { base.as_str() },
+        ))));
+    }
+
+    let mut held_back = 0usize;
+    let orphans: Vec<String> = store
+        .orphan_files_sized(root_id, prefix)?
+        .into_iter()
+        .filter_map(|(rel, size)| {
+            // `.torrentd-trash` is where deleted files go; it is never indexed,
+            // but an index from before that rule may still list it.
+            if rel == TRASH_DIR || rel.starts_with(&format!("{TRASH_DIR}/")) {
+                return None;
+            }
+            if unresolved.sizes.contains(&size) {
+                held_back += 1;
+                return None;
+            }
+            Some(rel)
+        })
+        .collect();
     if orphans.is_empty() {
-        return Ok(Err(Refused("no unclaimed files under that path".into())));
+        return Ok(Err(Refused(if held_back > 0 {
+            format!(
+                "every unclaimed file under that path ({held_back}) has the size of a file a \
+                 torrent in the library has not found, so none is provably unwanted"
+            )
+        } else {
+            "no unclaimed files under that path".into()
+        })));
     }
 
     // These come from the index, so they are root-relative by construction —
@@ -221,6 +281,148 @@ fn build_delete_orphans(
         }
     }
     Ok(Ok(steps))
+}
+
+/// Where a delete plan puts the files it removes, relative to their root.
+///
+/// Deleting moves a file here instead of unlinking it, so a plan that was
+/// wrong costs a `mv` back rather than the data. The scanner never indexes
+/// it, so trashed files neither read as orphans again nor match a torrent;
+/// emptying it is the operator's call.
+pub const TRASH_DIR: &str = ".torrentd-trash";
+
+/// The delete planner's two guards for unresolved payload, as of one read of
+/// the index, for the executor to re-run against each file it is about to
+/// trash.
+///
+/// The plan is a stored record and the index moves under it: a rescan
+/// between building and applying can leave a torrent partial or missing
+/// whose files the plan now holds. The confirm token changes with that
+/// rescan, but an operator who re-reads it and applies gets the same steps,
+/// so the guards have to hold at apply time, not only at plan time.
+#[derive(Debug)]
+pub struct DeleteGuard(Unresolved);
+
+impl DeleteGuard {
+    /// Read the guards for `root_id`, whose path is `root`.
+    pub fn load(store: &PoolStore, root_id: i64, root: &Path) -> Result<Self, PoolError> {
+        unresolved_payload(store, root_id, root).map(Self)
+    }
+
+    /// Why the file at `rel` (root-relative), `size` bytes, must not be
+    /// deleted, or `None` when neither guard holds it.
+    pub fn refusal(&self, rel: &str, size: u64) -> Option<String> {
+        if let Some((ih, area)) = self
+            .0
+            .areas
+            .iter()
+            .find(|(_, area)| prefixes_overlap(rel, area))
+        {
+            return Some(format!(
+                "torrent {ih} is not fully present and expects its payload under {:?}, where \
+                 this file is; rescan, or remove it from the library, and rebuild the plan",
+                if area.is_empty() { "/" } else { area.as_str() },
+            ));
+        }
+        if self.0.sizes.contains(&size) {
+            return Some(
+                "it has the size of a file a torrent in the library has not found, so it is \
+                 not provably unwanted; rebuild the plan"
+                    .to_owned(),
+            );
+        }
+        None
+    }
+}
+
+/// What the library is still looking for and has not found.
+#[derive(Debug, Default)]
+struct Unresolved {
+    /// The size of every file a torrent expects and the matcher did not place.
+    sizes: HashSet<u64>,
+    /// `(infohash, root-relative path)` for the content root — the torrent's
+    /// directory, or its single file — of every torrent with an unplaced file
+    /// in this root: where those files are expected to be.
+    areas: Vec<(String, String)>,
+}
+
+/// Collect [`Unresolved`] for `root_id`.
+///
+/// Only `partial`, `missing` and `overlap` torrents can have unplaced files:
+/// `matched`, `shared` and `adopted` are complete by definition, and `drifted`
+/// is complete as of the last rescan.
+fn unresolved_payload(
+    store: &PoolStore,
+    root_id: i64,
+    root: &Path,
+) -> Result<Unresolved, PoolError> {
+    let mut out = Unresolved::default();
+    for t in store.torrents()? {
+        let state = store.adoption_state(&t.infohash)?;
+        if !matches!(
+            state,
+            None | Some(AdoptionState::Partial)
+                | Some(AdoptionState::Missing)
+                | Some(AdoptionState::Overlap)
+        ) {
+            continue;
+        }
+        let claimed: HashSet<(i64, String)> = store.claims_of(&t.infohash)?.into_iter().collect();
+        // Where it is placed, or else where the previous client said it was.
+        let base = match store.adoption_base(&t.infohash)? {
+            Some(b) => Some(b),
+            None => t.declared_save_path.as_deref().and_then(|sp| {
+                Path::new(sp)
+                    .strip_prefix(root)
+                    .ok()
+                    .map(|rel| (root_id, rel.to_string_lossy().trim_matches('/').to_owned()))
+            }),
+        };
+        let mut tops: HashSet<String> = HashSet::new();
+        for f in store.torrent_files(&t.infohash)? {
+            if !f.is_on_disk() {
+                continue;
+            }
+            let placed = base
+                .as_ref()
+                .is_some_and(|(r, b)| claimed.contains(&(*r, join_rel(b, &f.rel_path))));
+            if placed {
+                continue;
+            }
+            out.sizes.insert(f.size);
+            if let Some(top) = f.rel_path.trim_matches('/').split('/').next() {
+                tops.insert(top.to_owned());
+            }
+        }
+        if let Some((r, b)) = &base {
+            if *r == root_id {
+                for top in tops {
+                    out.areas.push((t.infohash.clone(), join_rel(b, &top)));
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Whether deleting under `prefix` can touch anything under `area`, or the
+/// other way round. Both are root-relative; an empty prefix is the whole root.
+fn prefixes_overlap(prefix: &str, area: &str) -> bool {
+    let (p, a) = (prefix.trim_matches('/'), area.trim_matches('/'));
+    p.is_empty()
+        || a.is_empty()
+        || p == a
+        || a.starts_with(&format!("{p}/"))
+        || p.starts_with(&format!("{a}/"))
+}
+
+fn join_rel(base: &str, rel: &str) -> String {
+    let (base, rel) = (base.trim_matches('/'), rel.trim_matches('/'));
+    if base.is_empty() {
+        rel.to_owned()
+    } else {
+        format!("{base}/{rel}")
+    }
 }
 
 /// Resolve a root-relative path, refusing anything that escapes its root.
@@ -278,7 +480,25 @@ fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, Refused> {
 /// on a filesystem that is not mounted yet from being reported as an escape —
 /// a confusing verdict for an unrelated problem. The case this exists to catch
 /// is a symlink *inside* a root, and there the root necessarily exists.
+///
+/// A candidate carrying any component other than a plain name — `..`, or a
+/// leading `.` — is refused outright, before anything is resolved. The
+/// non-existent tail is re-appended *lexically*, so a `..` in it is never
+/// resolved by the filesystem: `root/nx/../../../etc`, with `nx` absent,
+/// canonicalized `root` and re-appended `nx/../../../etc`, which
+/// `starts_with` then read as inside the root. Every caller hands this an
+/// absolute path built from a root and a relative name, so a traversal
+/// component there is never legitimate.
 pub fn contains(root: &Path, candidate: &Path) -> bool {
+    use std::path::Component;
+    if !candidate.components().all(|c| {
+        matches!(
+            c,
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return false;
+    }
     let Ok(root_real) = root.canonicalize() else {
         return candidate.starts_with(root);
     };
@@ -314,7 +534,13 @@ pub fn contains(root: &Path, candidate: &Path) -> bool {
 /// Derived from the plan's own contents, so it changes if the plan changes.
 /// The point is not secrecy — it is that deleting data takes a second,
 /// deliberate call carrying something only the dry-run could have produced.
-pub fn confirm_token(plan_id: i64, steps: &[crate::model::PlanStepRow]) -> String {
+///
+/// `generation` is the index generation ([`PoolStore::index_generation`]) the
+/// caller saw the plan at. A rescan moves it, so a token read before the
+/// index was rebuilt no longer applies: the operator re-reads the plan against
+/// the index as it is now, rather than confirming a list of "unclaimed" files
+/// that a newer scan may since have placed.
+pub fn confirm_token(plan_id: i64, generation: i64, steps: &[crate::model::PlanStepRow]) -> String {
     let mut acc: u64 = 1469598103934665603; // FNV-1a offset basis
     let mut mix = |b: &[u8]| {
         for byte in b {
@@ -323,6 +549,7 @@ pub fn confirm_token(plan_id: i64, steps: &[crate::model::PlanStepRow]) -> Strin
         }
     };
     mix(&plan_id.to_le_bytes());
+    mix(&generation.to_le_bytes());
     for s in steps {
         mix(s.op.as_bytes());
         mix(s.src.as_bytes());
@@ -419,6 +646,32 @@ mod tests {
             resolve_under(&root(), "/etc/cron.d").unwrap(),
             Path::new("/data/pool/etc/cron.d"),
         );
+    }
+
+    /// The escape the lexical re-append allowed: a non-existent directory
+    /// followed by enough `..` to walk out of the root. Nothing past `nx`
+    /// exists, so the tail was appended without being resolved.
+    #[test]
+    fn contains_refuses_a_traversal_through_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("torrents");
+        std::fs::create_dir(&root).unwrap();
+
+        for bad in [
+            root.join("nx/../../../etc"),
+            root.join("nx/../.."),
+            root.join(".."),
+            root.join("a/b/../../../outside"),
+            PathBuf::from("./relative"),
+        ] {
+            assert!(!super::contains(&root, &bad), "{bad:?} should be refused");
+        }
+        // A missing root takes the lexical branch, which is refused the same way.
+        let gone = dir.path().join("not-mounted");
+        assert!(!super::contains(&gone, &gone.join("nx/../../etc")));
+
+        assert!(super::contains(&root, &root.join("nx/deeper")));
+        assert!(super::contains(&root, &root.join("..hidden/x")));
     }
 
     #[test]

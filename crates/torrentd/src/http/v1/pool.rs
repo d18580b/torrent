@@ -62,16 +62,23 @@ pub enum AdoptionState {
     /// partial torrent advertises pieces the daemon cannot serve.
     Partial,
     /// Every file resolved at a consistent base, but the torrent is not yet
-    /// loaded into a session. The only adoptable state.
+    /// loaded into a session. Adoptable.
     Matched,
     /// Loaded into a session and seeding.
     Adopted,
     /// Was matched or adopted, but a covering file's stats moved since the
-    /// last verification. Needs a recheck before it can be trusted.
+    /// last verification. Stays so across rescans until a verification
+    /// clears it; adopting one always re-hashes it.
     Drifted,
-    /// At least one file is claimed by another torrent too. Reported on every
-    /// torrent involved, and blocks any mutation touching those files.
+    /// At least one file is claimed by another torrent too, and the two do
+    /// not claim the same set. Blocks adoption and any mutation touching
+    /// those files.
     Overlap,
+    /// Complete, and every other torrent claiming any of these files claims
+    /// exactly the same set — one payload under several info-hashes, as
+    /// cross-seeding produces. Adoptable, each torrent into the profile the
+    /// request names; never moved or deleted for one of them.
+    Shared,
 }
 
 impl From<torrentd_pool::AdoptionState> for AdoptionState {
@@ -84,6 +91,7 @@ impl From<torrentd_pool::AdoptionState> for AdoptionState {
             D::Adopted => Self::Adopted,
             D::Drifted => Self::Drifted,
             D::Overlap => Self::Overlap,
+            D::Shared => Self::Shared,
         }
     }
 }
@@ -98,6 +106,7 @@ impl From<AdoptionState> for torrentd_pool::AdoptionState {
             AdoptionState::Adopted => D::Adopted,
             AdoptionState::Drifted => D::Drifted,
             AdoptionState::Overlap => D::Overlap,
+            AdoptionState::Shared => D::Shared,
         }
     }
 }
@@ -246,8 +255,11 @@ pub struct AdoptionCounts {
     pub adopted: u64,
     /// Torrents whose payload changed since it was last verified.
     pub drifted: u64,
-    /// Torrents sharing a file with another torrent.
+    /// Torrents sharing some files with another torrent that claims a
+    /// different set.
     pub overlap: u64,
+    /// Torrents whose files another torrent claims as exactly the same set.
+    pub shared: u64,
 }
 
 impl AdoptionCounts {
@@ -259,6 +271,7 @@ impl AdoptionCounts {
             AdoptionState::Adopted => &mut self.adopted,
             AdoptionState::Drifted => &mut self.drifted,
             AdoptionState::Overlap => &mut self.overlap,
+            AdoptionState::Shared => &mut self.shared,
         }
     }
 }
@@ -347,8 +360,13 @@ pub struct ScanSummary {
     pub partial: u64,
     /// Torrents with none of their payload present.
     pub missing: u64,
-    /// Torrents sharing a file with another torrent.
+    /// Torrents sharing some files with another torrent that claims a
+    /// different set.
     pub overlap: u64,
+    /// Torrents whose files another torrent claims as exactly the same set.
+    pub shared: u64,
+    /// Complete torrents still carrying drift no verification has cleared.
+    pub drifted: u64,
     /// Entries skipped because they could not be read; the daemon's log names
     /// each, and `pool_scan_errors_total` counts them by kind.
     pub errors: u64,
@@ -364,6 +382,8 @@ impl From<crate::pool_service::ScanSummary> for ScanSummary {
             partial: s.partial,
             missing: s.missing,
             overlap: s.overlap,
+            shared: s.shared,
+            drifted: s.drifted,
             errors: s.errors,
         }
     }
@@ -1312,7 +1332,10 @@ from_invalid!(VerifyError);
 /// Asks libtorrent to check each torrent's payload against its piece hashes
 /// (v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.
 /// `202` means the checks started; each torrent reports `checking` until it
-/// finishes. A torrent not loaded in any session is skipped with the reason.
+/// finishes. A torrent not loaded in any session, or paused (libtorrent does
+/// not hash a paused torrent), is skipped with the reason. Only a torrent in
+/// the pool index has its outcome recorded: a pass marks it `adopted`, a
+/// failure marks it `drifted` and pauses it.
 #[kynos::post("/pool/verifications", tag = Pool)]
 pub async fn verify_pool_torrents(
     _caller: Scoped<Bearer, Write>,
@@ -1337,10 +1360,52 @@ pub async fn verify_pool_torrents(
                 skip(&mut resp, "not loaded in any session".to_owned());
                 continue;
             };
-            let Some(engine) = s.source.engine_for(&st.profile_id) else {
-                skip(&mut resp, "engine missing".to_owned());
-                continue;
+            // A recheck resumes the torrent's network activity once it ends,
+            // so a fenced profile is skipped as resume-all skips it: its
+            // torrents wait for the operator's restart.
+            let engine = match unfenced_engine(&s, &st.profile_id) {
+                Ok(engine) => engine,
+                Err(crate::http::v1::common::ProfileProblem::Unavailable { detail, .. }) => {
+                    skip(&mut resp, detail);
+                    continue;
+                }
+                Err(crate::http::v1::common::ProfileProblem::NotFound) => {
+                    skip(&mut resp, "engine missing".to_owned());
+                    continue;
+                }
             };
+            // libtorrent does not hash a paused torrent: the check waits for a
+            // resume that nothing here issues, so reporting it started would
+            // be false. A torrent paused by a failed verification is the
+            // common case; resuming it is the operator's call, since it puts
+            // the rejected payload back on the network until the check ends.
+            if st.phase == torrentd_engine::TorrentPhase::Paused {
+                skip(
+                    &mut resp,
+                    "paused, and libtorrent does not hash a paused torrent; resume it, then \
+                     verify again"
+                        .to_owned(),
+                );
+                continue;
+            }
+            // Tracked before it is asked for, so the check it starts finishes
+            // after the mark; the verify queue then records its outcome, which
+            // is what clears a drifted torrent or pauses one that failed.
+            // Only a torrent the pool index holds has an adoption to record:
+            // anything else is re-hashed and left alone, neither paused on a
+            // failure nor written into the index.
+            if let Some(pool) = s.pool.as_ref() {
+                let ih = infohash.to_string();
+                let indexed = pool.with_store(|st| st.torrent(&ih).map(|t| t.is_some()));
+                match indexed {
+                    Ok(true) => pool.verify_queue().track_recheck(ih),
+                    Ok(false) => {}
+                    Err(e) => {
+                        skip(&mut resp, format!("pool index unreadable: {e}"));
+                        continue;
+                    }
+                }
+            }
             match engine.force_recheck(st.handle) {
                 Ok(()) => resp.started.push(infohash),
                 Err(e) => skip(&mut resp, e.to_string()),
@@ -1362,8 +1427,12 @@ pub async fn verify_pool_torrents(
 pub enum PlanKind {
     /// Move one torrent's payload to another directory under a managed root.
     Relocate,
-    /// Delete every file under a subtree that no torrent claims. Destructive:
-    /// applying it needs the plan's `confirm_token`.
+    /// Delete every file under a subtree that no torrent claims, by moving it
+    /// into `<root>/.torrentd-trash/<plan id>/`. Refused where a torrent the
+    /// matcher could not fully place expects its files, and a file the size
+    /// of one the library is still missing is left out. Destructive: applying
+    /// it needs the plan's `confirm_token`, which changes whenever the pool is
+    /// rescanned.
     DeleteOrphans,
 }
 
@@ -1561,9 +1630,11 @@ fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, String> {
     let Some(row) = pool.with_store(|st| st.plan(id)).map_err(fail)? else {
         return Ok(None);
     };
-    let steps = pool.with_store(|st| st.plan_steps(id)).map_err(fail)?;
+    let (steps, generation) = pool
+        .with_store(|st| Ok((st.plan_steps(id)?, st.index_generation()?)))
+        .map_err(fail)?;
     let confirm_token = torrentd_pool::plan::is_destructive(&row.kind)
-        .then(|| torrentd_pool::plan::confirm_token(id, &steps));
+        .then(|| torrentd_pool::plan::confirm_token(id, generation, &steps));
     let summary = summary_of(&row)?;
     let steps = steps
         .into_iter()

@@ -168,6 +168,14 @@ profile.
 **409**, from `DELETE /v1/torrents/{infohash}`. The torrent is still being
 added to its session. Retry once it appears in `GET /v1/torrents`.
 
+## `payload-shared`
+
+**409**, from `DELETE /v1/torrents/{infohash}?delete_files=true`. The pool
+index has another torrent claiming some of this torrent's files — a
+cross-seed of the same payload, or a conflict — so deleting them would delete
+that torrent's payload too. `detail` names the first. Retry without
+`delete_files` to remove the torrent alone.
+
 ## `metadata-pending`
 
 **409.** The torrent was added from a magnet URI and has not received its

@@ -55,6 +55,9 @@ fn add_torrent(
             rel_path: p.to_string(),
             size: *s,
             pieces_root: None,
+            // BEP 47 names its padding entries `.pad/<n>`; these tests follow
+            // that convention to mark one.
+            pad_file: p.contains(".pad/"),
         })
         .collect();
     store.replace_torrent_files(infohash, &rows).unwrap();
@@ -196,9 +199,9 @@ fn no_payload_at_all_is_missing() {
 }
 
 #[test]
-fn two_torrents_over_the_same_file_are_both_flagged_overlap() {
-    // The state that blocks every destructive operation: moving or deleting
-    // for one torrent would silently break the other.
+fn two_torrents_over_the_same_files_are_both_shared() {
+    // Cross-seeding: one payload under two info-hashes. Both adoptable; the
+    // planner still refuses to move or delete those bytes for either.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_file(root, "shared/data.bin", 512);
@@ -220,10 +223,238 @@ fn two_torrents_over_the_same_file_are_both_flagged_overlap() {
         &[("shared/data.bin", 512)],
     );
 
-    torrentd_pool::match_all(&mut store).unwrap();
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "1a"), AdoptionState::Shared);
+    assert_eq!(state_of(&store, "2b"), AdoptionState::Shared);
+    assert!(AdoptionState::Shared.is_adoptable());
+    assert_eq!((stats.shared, stats.matched, stats.overlap), (2, 0, 0));
+    assert!(store.shares_claims("1a").unwrap());
+}
+
+#[test]
+fn two_torrents_over_different_sets_of_the_same_bytes_are_both_flagged_overlap() {
+    // The conflict: the claim sets differ, so at least one torrent's view of
+    // these bytes is wrong. Blocks adoption and every destructive operation.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "shared/data.bin", 512);
+    write_file(root, "shared/extra.bin", 64);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "1a",
+        "shared",
+        None,
+        &[("shared/data.bin", 512)],
+    );
+    add_torrent(
+        &mut store,
+        "2b",
+        "shared",
+        None,
+        &[("shared/data.bin", 512), ("shared/extra.bin", 64)],
+    );
+
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
     assert_eq!(state_of(&store, "1a"), AdoptionState::Overlap);
     assert_eq!(state_of(&store, "2b"), AdoptionState::Overlap);
     assert!(!AdoptionState::Overlap.is_adoptable());
+    assert_eq!((stats.overlap, stats.matched), (2, 0));
+}
+
+#[test]
+fn a_rescan_does_not_turn_an_adopted_cross_seed_into_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "X/data.bin", 512);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "aa", "X", None, &[("X/data.bin", 512)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let (r, b) = store.adoption_base("aa").unwrap().unwrap();
+    store
+        .set_adoption(
+            "aa",
+            AdoptionState::Adopted,
+            Some(r),
+            Some(&b),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // A cross-seed of the same payload lands in the library.
+    add_torrent(&mut store, "bb", "X", None, &[("X/data.bin", 512)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    assert_eq!(state_of(&store, "bb"), AdoptionState::Shared);
+}
+
+/// The acceptance case: two cross-seeded torrents adopt, and nothing in the
+/// pool decides the profile — each adopt names its own, so the two land in
+/// different profiles.
+#[test]
+fn two_cross_seeded_torrents_are_each_adoptable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_file(&root, "X/data.bin", 512);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "aa", "X", None, &[("X/data.bin", 512)]);
+    add_torrent(&mut store, "bb", "X", None, &[("X/data.bin", 512)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    for ih in ["aa", "bb"] {
+        let plan =
+            torrentd_pool::adopt::plan(&store, ih, |id| (id == root_id).then(|| root.clone()))
+                .unwrap();
+        assert!(
+            matches!(plan, torrentd_pool::AdoptPlan::Verify { .. }),
+            "{ih}: {plan:?}"
+        );
+    }
+}
+
+#[test]
+fn drift_survives_a_rescan_until_a_verify_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_file(&root, "D/a.bin", 256);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "d1", "D", None, &[("D/a.bin", 256)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::write(root.join("D/a.bin"), vec![b'y'; 256]).unwrap();
+    let r = root.clone();
+    torrentd_pool::drift::detect(&mut store, |_| Some(r.clone())).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Drifted);
+
+    // A rescan sees the same path at the same size — which is exactly what
+    // drift flagged as not enough.
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Drifted);
+    assert_eq!((stats.drifted, stats.matched), (1, 0));
+
+    // Adopting it is how it gets verified, and never by trusting resume data.
+    let plan =
+        torrentd_pool::adopt::plan(&store, "d1", |id| (id == root_id).then(|| r.clone())).unwrap();
+    assert!(
+        matches!(plan, torrentd_pool::AdoptPlan::Verify { .. }),
+        "{plan:?}"
+    );
+
+    // A verification that passed records `adopted` with no drift, and the
+    // next rescan leaves it there.
+    let (rid, base) = store.adoption_base("d1").unwrap().unwrap();
+    store
+        .set_adoption(
+            "d1",
+            AdoptionState::Adopted,
+            Some(rid),
+            Some(&base),
+            Some(2),
+            None,
+            None,
+        )
+        .unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Adopted);
+}
+
+/// `drifted` is adoptable, so a drifted torrent whose claim set conflicts
+/// with another's has to read `overlap` like any other — its drift marker
+/// carried — while clean sharing leaves it `drifted`.
+#[test]
+fn a_drifted_torrent_in_a_conflict_is_overlap_and_not_adoptable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_file(&root, "S/data.bin", 512);
+    write_file(&root, "S/extra.bin", 64);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "d1", "S", None, &[("S/data.bin", 512)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let (rid, base) = store.adoption_base("d1").unwrap().unwrap();
+    store
+        .set_adoption(
+            "d1",
+            AdoptionState::Drifted,
+            Some(rid),
+            Some(&base),
+            None,
+            Some(7),
+            None,
+        )
+        .unwrap();
+
+    // Clean sharing: the same single file under another info-hash.
+    add_torrent(&mut store, "s2", "S", None, &[("S/data.bin", 512)]);
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Drifted);
+    assert_eq!(stats.drifted, 1);
+
+    // A conflicting claim set over the same bytes.
+    add_torrent(
+        &mut store,
+        "c3",
+        "S",
+        None,
+        &[("S/data.bin", 512), ("S/extra.bin", 64)],
+    );
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Overlap);
+    assert_eq!(store.drift_at("d1").unwrap(), Some(7));
+    assert_eq!(stats.drifted, 0);
+    let r = root.clone();
+    let plan =
+        torrentd_pool::adopt::plan(&store, "d1", |id| (id == root_id).then(|| r.clone())).unwrap();
+    assert!(
+        matches!(plan, torrentd_pool::AdoptPlan::Refuse { .. }),
+        "{plan:?}"
+    );
+}
+
+/// Many equal-sized files on disk under the anchor's name used to make
+/// candidate building quadratic; the right base must still be found, and a
+/// base that only matches a name's tail is not a candidate.
+#[test]
+fn many_equal_sized_lookalikes_do_not_misplace_a_torrent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for i in 0..300 {
+        write_file(root, &format!("copies/{i}/T/big.bin"), 4096);
+    }
+    write_file(root, "real/T/big.bin", 4096);
+    write_file(root, "real/T/small.bin", 7);
+    // `xbig.bin` ends with `big.bin` but is not that file.
+    write_file(root, "decoy/T/xbig.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "eq",
+        "T",
+        None,
+        &[("T/big.bin", 4096), ("T/small.bin", 7)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "eq"), AdoptionState::Matched);
+    assert_eq!(store.adoption_base("eq").unwrap().unwrap().1, "real");
 }
 
 #[test]
@@ -255,8 +486,8 @@ fn rematching_does_not_demote_an_adopted_torrent() {
 }
 
 #[test]
-fn zero_length_files_do_not_block_a_match() {
-    // v2 pad files and genuinely empty files have no bytes to locate.
+fn empty_files_do_not_block_a_match() {
+    // A genuinely empty file has no bytes to locate.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_file(root, "P/real.bin", 128);
@@ -268,11 +499,250 @@ fn zero_length_files_do_not_block_a_match() {
         "4d",
         "P",
         None,
-        &[("P/real.bin", 128), ("P/.pad/0", 0)],
+        &[("P/real.bin", 128), ("P/empty", 0)],
     );
 
     torrentd_pool::match_all(&mut store).unwrap();
     assert_eq!(state_of(&store, "4d"), AdoptionState::Matched);
+}
+
+#[test]
+fn padding_files_do_not_block_a_match() {
+    // A BEP 47 padding entry has a real, non-zero size — it pads the previous
+    // file out to a piece boundary — and libtorrent never writes it. This test
+    // used to model one as zero bytes, which is the one shape a padding file
+    // never has, and so passed while every real padded torrent read partial.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "P/a.bin", 100);
+    write_file(root, "P/b.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "4e",
+        "P",
+        None,
+        // The pad is larger than either real file, so it would also have been
+        // chosen as the size anchor.
+        &[("P/a.bin", 100), ("P/.pad/16284", 16284), ("P/b.bin", 128)],
+    );
+
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "4e"), AdoptionState::Matched);
+}
+
+/// Index a real `.torrent` from `tests/fixtures`, lay its payload out on disk
+/// the way libtorrent would — every file but the padding ones, sparse — and
+/// return the store, the root and the torrent's info-hash.
+fn fixture_on_disk(name: &str) -> (tempfile::TempDir, PoolStore, PathBuf, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let src = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    std::fs::copy(&src, library.join(name)).unwrap();
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    let t = store.torrents().unwrap().pop().expect("fixture indexed");
+    let files = store.torrent_files(&t.infohash).unwrap();
+    assert!(
+        files.iter().any(|f| f.pad_file && f.size > 0),
+        "{name} must carry a non-empty padding file for this test to mean anything",
+    );
+    for f in files.iter().filter(|f| !f.pad_file) {
+        let p = root.join(&f.rel_path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::File::create(&p).unwrap().set_len(f.size).unwrap();
+    }
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    (dir, store, root, t.infohash)
+}
+
+/// The acceptance case for padding: real torrents libtorrent itself pads —
+/// a legacy `_____padding_file_` one and a v1+v2 hybrid, whose v1 half is
+/// padded to piece boundaries — match and adopt with nothing missing.
+#[test]
+fn real_padded_and_hybrid_torrents_match_and_adopt() {
+    for name in ["pad_file.torrent", "v2_hybrid.torrent"] {
+        let (_dir, mut store, root, ih) = fixture_on_disk(name);
+        torrentd_pool::match_all(&mut store).unwrap();
+        assert_eq!(state_of(&store, &ih), AdoptionState::Matched, "{name}");
+
+        let root_id = store.root_id(&root).unwrap();
+        let plan =
+            torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| root.clone()))
+                .unwrap();
+        assert!(
+            matches!(plan, torrentd_pool::AdoptPlan::Verify { .. }),
+            "{name}: {plan:?}"
+        );
+
+        // And the drift pass does not go looking for the padding on disk.
+        let r = root.clone();
+        let report = torrentd_pool::drift::detect(&mut store, |_| Some(r.clone())).unwrap();
+        assert!(report.drifted.is_empty(), "{name}: {report:?}");
+    }
+}
+
+/// A real `.torrent` in a library beside a hand-built `.fastresume` holding
+/// `entries` (already-encoded bencode key/value pairs, in key order).
+fn library_with_sidecar(
+    dir: &Path,
+    fixture: &str,
+    entries: &[(&str, Vec<u8>)],
+) -> (PathBuf, PoolStore, String) {
+    let library = dir.join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(fixture),
+        library.join("t.torrent"),
+    )
+    .unwrap();
+    let mut fr = b"d".to_vec();
+    for (k, v) in entries {
+        fr.extend_from_slice(format!("{}:{k}", k.len()).as_bytes());
+        fr.extend_from_slice(v);
+    }
+    fr.push(b'e');
+    std::fs::write(library.join("t.fastresume"), fr).unwrap();
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    let ih = store.torrents().unwrap().pop().unwrap().infohash;
+    (library, store, ih)
+}
+
+fn bstr_of(s: &str) -> Vec<u8> {
+    format!("{}:{s}", s.len()).into_bytes()
+}
+
+/// The acceptance case for qBittorrent: a file it renamed (`mapped_files`) is
+/// found where it was renamed to — not missed, and not offered as an orphan —
+/// and adopting goes only through the resume data that tells libtorrent so.
+#[test]
+fn qbittorrents_mapped_files_are_honoured() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    // pad_file.torrent: `temp/foo/bar.txt` (45 bytes) and a padding file.
+    write_file(&root, "temp/renamed.txt", 45);
+    for (complete, expect_fast) in [(true, true), (false, false)] {
+        let sub = dir.path().join(format!("c{complete}"));
+        let mut mapped = b"l".to_vec();
+        mapped.extend_from_slice(&bstr_of("temp/renamed.txt"));
+        mapped.extend_from_slice(&bstr_of(""));
+        mapped.push(b'e');
+        let pieces: &[u8] = if complete { &[1] } else { &[0] };
+        let mut p = b"1:".to_vec();
+        p.extend_from_slice(pieces);
+        let (_lib, mut store, ih) = library_with_sidecar(
+            &sub,
+            "pad_file.torrent",
+            &[
+                ("mapped_files", mapped),
+                ("pieces", p),
+                ("qBt-savePath", bstr_of(&root.to_string_lossy())),
+            ],
+        );
+        torrentd_pool::scan_root(&mut store, &root).unwrap();
+        torrentd_pool::match_all(&mut store).unwrap();
+        assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+        let root_id = store.root_id(&root).unwrap();
+        assert!(store.orphan_files(root_id, "").unwrap().is_empty());
+
+        let r = root.clone();
+        let plan = torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| r.clone()))
+            .unwrap();
+        if expect_fast {
+            assert!(
+                matches!(
+                    plan,
+                    torrentd_pool::AdoptPlan::FastPath {
+                        files_renamed: true,
+                        ..
+                    }
+                ),
+                "{plan:?}"
+            );
+        } else {
+            assert!(plan.is_refusal(), "{plan:?}");
+        }
+    }
+}
+
+/// A `mapped_files` entry the reader refuses leaves the index at the
+/// `.torrent`'s path while libtorrent, handed the same resume data, would
+/// follow the mapping. Even complete resume data does not take the fast path
+/// then; nothing adopts it.
+#[test]
+fn a_refused_mapped_file_blocks_adoption() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    // Where the `.torrent` says, so the matcher places it there.
+    write_file(&root, "temp/foo/bar.txt", 45);
+    for target in [
+        bstr_of("../../outside.txt"),
+        bstr_of("/etc/outside.txt"),
+        b"4:\xff\xfe\xfd\xfc".to_vec(),
+    ] {
+        let sub = tempfile::tempdir().unwrap();
+        let mut mapped = b"l".to_vec();
+        mapped.extend_from_slice(&target);
+        mapped.extend_from_slice(&bstr_of(""));
+        mapped.push(b'e');
+        let (_lib, mut store, ih) = library_with_sidecar(
+            sub.path(),
+            "pad_file.torrent",
+            &[
+                ("mapped_files", mapped),
+                ("pieces", b"1:\x01".to_vec()),
+                ("qBt-savePath", bstr_of(&root.to_string_lossy())),
+            ],
+        );
+        torrentd_pool::scan_root(&mut store, &root).unwrap();
+        torrentd_pool::match_all(&mut store).unwrap();
+        assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+        let root_id = store.root_id(&root).unwrap();
+        let r = root.clone();
+        let plan = torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| r.clone()))
+            .unwrap();
+        assert!(plan.is_refusal(), "{plan:?}");
+    }
+}
+
+/// qBittorrent's no-subfolder layout: a multi-file torrent's files sit
+/// straight in the save path, without the torrent's top directory.
+#[test]
+fn qbittorrents_no_subfolder_layout_is_honoured() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    write_file(&root, "dl/foo/bar.txt", 45);
+    let (_lib, mut store, ih) = library_with_sidecar(
+        dir.path(),
+        "pad_file.torrent",
+        &[
+            ("pieces", b"1:\x01".to_vec()),
+            ("qBt-contentLayout", bstr_of("NoSubfolder")),
+            ("qBt-savePath", bstr_of(&root.join("dl").to_string_lossy())),
+        ],
+    );
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+    assert_eq!(store.adoption_base(&ih).unwrap().unwrap().1, "dl");
+
+    // libtorrent cannot be told about a layout only qBittorrent recorded.
+    let root_id = store.root_id(&root).unwrap();
+    let r = root.clone();
+    let plan =
+        torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| r.clone())).unwrap();
+    assert!(plan.is_refusal(), "{plan:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +917,9 @@ fn write_fastresume(dir: &Path, stem: &str, complete: bool) -> PathBuf {
     let mut b = b"d".to_vec();
     let sp = "/irrelevant";
     b.extend_from_slice(format!("12:qBt-savePath{}:{sp}", sp.len()).as_bytes());
-    b.extend_from_slice(format!("14:qBt-seedStatusi{}e", if complete { 1 } else { 0 }).as_bytes());
+    // Completion is the `pieces` bitfield: every piece had, or one missing.
+    b.extend_from_slice(b"6:pieces3:");
+    b.extend_from_slice(if complete { &[1, 1, 1] } else { &[1, 0, 1] });
     b.push(b'e');
     let p = dir.join(format!("{stem}.fastresume"));
     std::fs::write(&p, b).unwrap();
@@ -491,6 +963,9 @@ fn add_torrent_with_sidecar(
             rel_path: p.to_string(),
             size: *s,
             pieces_root: None,
+            // BEP 47 names its padding entries `.pad/<n>`; these tests follow
+            // that convention to mark one.
+            pad_file: p.contains(".pad/"),
         })
         .collect();
     store.replace_torrent_files(infohash, &rows).unwrap();
@@ -596,7 +1071,9 @@ fn partial_overlap_and_missing_are_all_refused() {
         &[("P/a.bin", 100), ("P/b.bin", 300)],
         Some(true),
     );
-    // overlap: two torrents over the same file
+    // overlap: two torrents over the same file, claiming different sets
+    write_file(&root, "S/more.bin", 50);
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
     add_torrent_with_sidecar(
         &mut store,
         &lib,
@@ -610,7 +1087,7 @@ fn partial_overlap_and_missing_are_all_refused() {
         &lib,
         "o2",
         "S",
-        &[("S/shared.bin", 200)],
+        &[("S/shared.bin", 200), ("S/more.bin", 50)],
         Some(true),
     );
     // missing
@@ -1006,6 +1483,139 @@ fn delete_orphans_is_scoped_to_the_named_subtree() {
     );
 }
 
+/// The acceptance case: a partial torrent's missing file may be lying right
+/// there under another name, so nothing where it expects its payload is
+/// offered up for deletion — at its own directory, above it, or inside it.
+#[test]
+fn a_delete_plan_under_a_partial_torrent_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "lib/P/a.bin", 100);
+    write_file(root, "lib/P/b-renamed.bin", 300);
+    write_file(root, "elsewhere/loose.bin", 5);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "p1",
+        "P",
+        Some(&root.join("lib").to_string_lossy()),
+        &[("P/a.bin", 100), ("P/b.bin", 300)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "p1"), AdoptionState::Partial);
+
+    for prefix in ["", "lib", "lib/P"] {
+        let e = build_plan(
+            &store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+        .unwrap_err();
+        assert!(e.contains("p1"), "{prefix:?}: got {e}");
+    }
+    // Somewhere it expects nothing is still fine.
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "elsewhere".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1);
+}
+
+/// A missing torrent has no base the matcher found, so the save path the
+/// previous client recorded is where its payload is expected.
+#[test]
+fn a_delete_plan_where_a_missing_torrent_was_saved_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "dl/Q/sample.txt", 5);
+    write_file(root, "elsewhere/loose.bin", 6);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "q1",
+        "Q",
+        Some(&root.join("dl").to_string_lossy()),
+        &[("Q/q.bin", 77)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "q1"), AdoptionState::Missing);
+    assert_eq!(store.adoption_base("q1").unwrap(), None);
+
+    for prefix in ["dl", "dl/Q"] {
+        let e = build_plan(
+            &store,
+            &PlanSpec::DeleteOrphans {
+                root_id,
+                prefix: prefix.into(),
+            },
+            root_id,
+            root,
+        )
+        .unwrap_err();
+        assert!(
+            e.contains("q1") && e.contains("dl/Q"),
+            "{prefix:?}: got {e}"
+        );
+    }
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "elsewhere".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1);
+}
+
+#[test]
+fn an_unclaimed_file_the_size_of_a_missing_one_is_held_back() {
+    // A missing torrent with no recorded location: its file could be anywhere,
+    // and a size match is how the matcher itself would recognise it.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "junk/maybe.mkv", 4321);
+    write_file(root, "junk/really-junk.txt", 9);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "m1", "M", None, &[("M/film.mkv", 4321)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "m1"), AdoptionState::Missing);
+
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "junk".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("junk/really-junk.txt"));
+}
+
 #[test]
 fn is_orphan_refuses_paths_the_index_has_never_seen() {
     // The last-moment check before an irreversible delete. A path outside the
@@ -1048,22 +1658,220 @@ fn the_confirm_token_changes_with_the_plan() {
         error: None,
     }];
     assert_ne!(
-        torrentd_pool::plan::confirm_token(1, &a),
-        torrentd_pool::plan::confirm_token(1, &b),
+        torrentd_pool::plan::confirm_token(1, 7, &a),
+        torrentd_pool::plan::confirm_token(1, 7, &b),
         "different steps must not share a token",
     );
     assert_ne!(
-        torrentd_pool::plan::confirm_token(1, &a),
-        torrentd_pool::plan::confirm_token(2, &a),
+        torrentd_pool::plan::confirm_token(1, 7, &a),
+        torrentd_pool::plan::confirm_token(2, 7, &a),
         "different plan ids must not share a token",
     );
+    assert_ne!(
+        torrentd_pool::plan::confirm_token(1, 7, &a),
+        torrentd_pool::plan::confirm_token(1, 8, &a),
+        "a token read before a rescan must not apply after it",
+    );
     assert_eq!(
-        torrentd_pool::plan::confirm_token(1, &a),
-        torrentd_pool::plan::confirm_token(1, &a),
+        torrentd_pool::plan::confirm_token(1, 7, &a),
+        torrentd_pool::plan::confirm_token(1, 7, &a),
         "the token must be stable for the same plan",
     );
     assert!(torrentd_pool::plan::is_destructive("delete_orphans"));
     assert!(!torrentd_pool::plan::is_destructive("relocate"));
+}
+
+#[test]
+fn a_torrent_gone_from_the_library_leaves_the_index_unless_adopted() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    for name in ["pad_file.torrent", "v2_hybrid.torrent"] {
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name),
+            library.join(name),
+        )
+        .unwrap();
+    }
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    let all = store.torrents().unwrap();
+    assert_eq!(all.len(), 2);
+    let pad = all
+        .iter()
+        .find(|t| t.source_path.ends_with("pad_file.torrent"))
+        .unwrap()
+        .infohash
+        .clone();
+    let hybrid = all
+        .iter()
+        .find(|t| t.source_path.ends_with("v2_hybrid.torrent"))
+        .unwrap()
+        .infohash
+        .clone();
+    store
+        .set_adoption(
+            &hybrid,
+            AdoptionState::Adopted,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+    std::fs::remove_file(library.join("pad_file.torrent")).unwrap();
+    std::fs::remove_file(library.join("v2_hybrid.torrent")).unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+
+    assert!(store.torrent(&pad).unwrap().is_none(), "dropped");
+    assert!(store.torrent(&hybrid).unwrap().is_some(), "adopted: kept");
+}
+
+/// Copy library fixtures into a fresh library and index them, returning the
+/// info-hash of each in order.
+fn indexed_library(names: &[&str]) -> (tempfile::TempDir, PathBuf, PoolStore, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    for name in names {
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name),
+            library.join(name),
+        )
+        .unwrap();
+    }
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    let all = store.torrents().unwrap();
+    let ihs = names
+        .iter()
+        .map(|n| {
+            all.iter()
+                .find(|t| t.source_path.ends_with(n))
+                .unwrap()
+                .infohash
+                .clone()
+        })
+        .collect();
+    (dir, library, store, ihs)
+}
+
+/// A torrent a session serves stays in the index whatever its state: a
+/// loaded torrent with no claims makes every delete plan refuse to apply,
+/// and its payload reads as orphans. `drifted` is kept even when the caller
+/// cannot say what is loaded, as `adopted` is.
+#[test]
+fn a_loaded_or_drifted_torrent_gone_from_the_library_stays_in_the_index() {
+    let (_dir, library, mut store, ihs) =
+        indexed_library(&["pad_file.torrent", "v2_hybrid.torrent"]);
+    let (partial_loaded, drifted) = (&ihs[0], &ihs[1]);
+    store
+        .set_adoption(
+            partial_loaded,
+            AdoptionState::Partial,
+            None,
+            None,
+            None,
+            Some(3),
+            None,
+        )
+        .unwrap();
+    store
+        .set_adoption(
+            drifted,
+            AdoptionState::Drifted,
+            None,
+            None,
+            None,
+            Some(3),
+            None,
+        )
+        .unwrap();
+    std::fs::remove_file(library.join("pad_file.torrent")).unwrap();
+    std::fs::remove_file(library.join("v2_hybrid.torrent")).unwrap();
+
+    let loaded = std::collections::HashSet::from([partial_loaded.clone()]);
+    torrentd_pool::scan_library(&mut store, &library, &loaded).unwrap();
+    assert!(store.torrent(partial_loaded).unwrap().is_some(), "loaded");
+    assert!(store.torrent(drifted).unwrap().is_some(), "drifted");
+
+    // Once nothing serves it, the partial one goes.
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert!(store.torrent(partial_loaded).unwrap().is_none());
+    assert!(store.torrent(drifted).unwrap().is_some());
+}
+
+/// The prune runs only over a library seen in full. A `.torrent` that is
+/// present but does not parse names no info-hash, so one corrupted in place
+/// would otherwise have its torrent dropped with its claims.
+#[test]
+fn nothing_is_pruned_from_a_library_that_was_not_read_in_full() {
+    let (_dir, library, mut store, ihs) = indexed_library(&["pad_file.torrent"]);
+    // Corrupted in place: still there, no longer a torrent.
+    std::fs::write(library.join("pad_file.torrent"), b"truncated").unwrap();
+    let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert_eq!(stats.errors_by_kind.get("parse"), Some(&1));
+    assert!(store.torrent(&ihs[0]).unwrap().is_some(), "kept");
+
+    // Unreadable: the same. Skipped where permissions do not bind (root).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = library.join("pad_file.torrent");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&p).is_err() {
+            let stats =
+                torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+            assert_eq!(stats.errors_by_kind.get("read"), Some(&1));
+            assert!(store.torrent(&ihs[0]).unwrap().is_some(), "kept");
+        }
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // Once the library reads cleanly again, the prune resumes.
+    std::fs::remove_file(library.join("pad_file.torrent")).unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert!(store.torrent(&ihs[0]).unwrap().is_none());
+}
+
+#[test]
+fn a_root_no_longer_configured_leaves_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+    write_file(&a, "x.bin", 1);
+    write_file(&b, "y.bin", 1);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, &a).unwrap();
+    torrentd_pool::scan_root(&mut store, &b).unwrap();
+    assert_eq!(store.file_count().unwrap(), 2);
+
+    assert_eq!(store.retain_roots(std::slice::from_ref(&a)).unwrap(), 1);
+    assert_eq!(
+        store
+            .roots()
+            .unwrap()
+            .into_iter()
+            .map(|(_, p)| p)
+            .collect::<Vec<_>>(),
+        vec![a]
+    );
+    assert_eq!(store.file_count().unwrap(), 1);
+}
+
+#[test]
+fn every_match_moves_the_index_generation() {
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let before = store.index_generation().unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    let after = store.index_generation().unwrap();
+    assert!(after > before, "{before} -> {after}");
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert!(store.index_generation().unwrap() > after);
 }
 
 #[test]
@@ -1386,8 +2194,8 @@ fn a_b28a778_index_opens_and_keeps_its_journal() {
 
     assert_eq!(
         user_version(&db),
-        3,
-        "the version must now agree with the schema the file already had",
+        4,
+        "the version must now agree with the schema the file already had, plus v4",
     );
     let cols = torrent_columns(&db);
     assert!(
@@ -1489,7 +2297,7 @@ fn a_half_applied_v3_index_gains_the_index_the_lost_statement_would_have_made() 
     let store = PoolStore::open(&db).expect("a half-applied v3 opens");
     drop(store);
 
-    assert_eq!(user_version(&db), 3, "the version agrees with the schema");
+    assert_eq!(user_version(&db), 4, "the version agrees with the schema");
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1547,7 +2355,7 @@ fn a_half_applied_v3_index_loses_the_index_name_the_rename_left_mislabelled() {
 
     PoolStore::open(&db).expect("a half-applied v3 opens");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1599,7 +2407,7 @@ fn a_stamped_v3_index_with_no_index_on_profile_is_still_repaired() {
 
     PoolStore::open(&db).expect("a stamped v3 opens");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1639,7 +2447,7 @@ fn a_stamped_v3_index_still_carrying_torrent_by_slot_is_repaired() {
 
     PoolStore::open(&db).expect("a stamped v3 opens");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1694,7 +2502,11 @@ fn a_complete_v3_schema_left_at_version_0_or_1_is_stamped_rather_than_wedged() {
         let store = PoolStore::open(&db).expect("a complete v3 schema must open at any version");
         drop(store);
 
-        assert_eq!(user_version(&db), 3, "stamped to the version it already is");
+        assert_eq!(
+            user_version(&db),
+            4,
+            "stamped to the v3 it already is, then stepped to v4"
+        );
         let idx = torrent_indexes(&db);
         assert!(
             idx.iter().any(|n| n == "torrent_by_profile")
@@ -1813,7 +2625,7 @@ fn a_file_carrying_both_v3_indexes_loses_torrent_by_slot_at_any_version() {
 
         PoolStore::open(&db).expect("a file with both indexes must open");
 
-        assert_eq!(user_version(&db), 3);
+        assert_eq!(user_version(&db), 4);
         let idx = torrent_indexes(&db);
         assert!(
             idx.iter().any(|n| n == "torrent_by_profile"),
@@ -1855,7 +2667,7 @@ fn an_ordinary_v3_index_is_opened_without_touching_it() {
 
     PoolStore::open(&db).expect("a second open is an ordinary v3 open");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     assert_eq!(torrent_indexes(&db), before, "nothing may be rebuilt here");
     assert!(
         !backup.exists(),
@@ -1876,7 +2688,7 @@ fn a_genuine_v2_index_is_still_migrated_by_the_version_keyed_step() {
 
     PoolStore::open(&db).expect("a genuine v2 index migrates forward");
 
-    assert_eq!(user_version(&db), 3);
+    assert_eq!(user_version(&db), 4);
     let cols = torrent_columns(&db);
     assert!(
         cols.iter().any(|c| c == "profile") && !cols.iter().any(|c| c == "slot"),
@@ -2048,7 +2860,7 @@ fn a_real_backup_already_at_the_path_is_replaced_by_a_fresh_copy_once_the_migrat
 
     PoolStore::open(&db).expect("the migration runs");
 
-    assert_eq!(user_version(&db), 3, "the migration really ran");
+    assert_eq!(user_version(&db), 4, "the migration really ran");
     assert_eq!(
         user_version(&backup),
         2,

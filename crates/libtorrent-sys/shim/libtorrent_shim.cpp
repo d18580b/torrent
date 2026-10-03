@@ -1204,6 +1204,7 @@ extern "C" int lt_torrent_metadata(const uint8_t* data, size_t len,
             // path, which is what the pool matcher joins onto a candidate base.
             copy_str_truncated(arr[i].path, LT_PATH_MAX, fs.file_path(idx));
             arr[i].size = static_cast<std::uint64_t>(fs.file_size(idx));
+            arr[i].pad_file = fs.pad_file_at(idx) ? 1 : 0;
             // v2 merkle root per file. root_ptr() is null for v1-only torrents
             // and for v2 padding files, which have no root of their own.
             if (ih.has_v2()) {

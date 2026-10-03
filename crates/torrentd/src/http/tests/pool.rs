@@ -65,6 +65,7 @@ fn file_row(infohash: &str, idx: i64, rel_path: &str, size: u64) -> TorrentFileR
         rel_path: rel_path.to_owned(),
         size,
         pieces_root: None,
+        pad_file: false,
     }
 }
 
@@ -228,7 +229,8 @@ async fn reads(cov: &Arc<Coverage>) {
     assert_eq!(o["files"], 4);
     assert_eq!(
         o["states"],
-        json!({"missing": 0, "partial": 1, "matched": 1, "adopted": 0, "drifted": 0, "overlap": 0})
+        json!({"missing": 0, "partial": 1, "matched": 1, "adopted": 0, "drifted": 0, "overlap": 0,
+               "shared": 0})
     );
     assert_eq!(o["verify_queue_depth"], 0);
 
@@ -638,6 +640,9 @@ fn fastresume(torrent: &[u8], tracker: Option<&str>) -> Vec<u8> {
     let mut r =
         b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
     r.extend_from_slice(&ih.0);
+    // Completion is the `pieces` bitfield with every piece had: `metainfo`
+    // has one piece.
+    r.extend_from_slice(b"6:pieces1:\x01");
     r.extend_from_slice(b"9:seed_modei1e");
     if let Some(url) = tracker {
         r.extend_from_slice(format!("8:trackersll{}:{url}ee", url.len()).as_bytes());
@@ -813,31 +818,48 @@ async fn a_delete_clears_the_pool_index_owner_it_set() {
 async fn verification(cov: &Arc<Coverage>) {
     let dir = tempfile::tempdir().unwrap();
     let (pool, _) = fixture(dir.path(), false);
+    let watched = Arc::clone(&pool);
     let h = Harness::authed(cov, |s| s.pool = Some(pool));
-    let a = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
-    h.state.state.insert(
-        a,
-        torrentd_engine::TorrentState::newly_added(
-            torrentd_engine::TorrentHandle { id: 1, infohash: a },
+    let loaded = |ih: &str, id: u64, phase: torrentd_engine::TorrentPhase| {
+        let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
+        let mut st = torrentd_engine::TorrentState::newly_added(
+            torrentd_engine::TorrentHandle { id, infohash: hash },
             torrentd_engine::ProfileId::new("p"),
             std::time::Instant::now(),
-        ),
-    );
+        );
+        st.phase = phase;
+        h.state.state.insert(hash, st);
+    };
+    loaded(IH_A, 1, torrentd_engine::TorrentPhase::Seeding);
+    // Loaded, but not a torrent the pool index holds.
+    const IH_OUTSIDE: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    loaded(IH_OUTSIDE, 4, torrentd_engine::TorrentPhase::Seeding);
+    // Paused, as a failed verification leaves it.
+    loaded(IH_B, 2, torrentd_engine::TorrentPhase::Paused);
     let w = h.tokens.write.clone();
     let resp = h
         .send(
             "POST",
             "/v1/pool/verifications",
             Some(&w),
-            Some(json!({"infohashes": [IH_A, IH_C]})),
+            Some(json!({"infohashes": [IH_A, IH_C, IH_OUTSIDE, IH_B]})),
         )
         .await;
     resp.assert_status(StatusCode::ACCEPTED);
     let r: Value = resp.json();
-    assert_eq!(r["requested"], 2);
-    assert_eq!(r["started"], json!([IH_A]));
+    assert_eq!(r["requested"], 4);
+    assert_eq!(r["started"], json!([IH_A, IH_OUTSIDE]));
     assert_eq!(r["skipped"][0]["infohash"], IH_C);
     assert_eq!(r["skipped"][0]["reason"], "not loaded in any session");
+    assert_eq!(r["skipped"][1]["infohash"], IH_B);
+    let reason = r["skipped"][1]["reason"].as_str().unwrap();
+    assert!(reason.contains("paused"), "{reason}");
+    // Only the pool's own torrent has an outcome to record: the other is
+    // re-hashed, and neither paused on a failure nor written to the index.
+    let q = watched.verify_queue();
+    assert!(q.tracks_recheck(IH_A));
+    assert!(!q.tracks_recheck(IH_OUTSIDE));
+    assert!(!q.tracks_recheck(IH_B));
 
     let resp = h
         .send(
@@ -860,6 +882,44 @@ async fn verification(cov: &Arc<Coverage>) {
         )
         .await;
     assert_eq!(resp.status().as_u16(), 422);
+    h.assert_conformance();
+
+    // A fenced profile's torrents are skipped, as resume-all skips them: a
+    // recheck puts the torrent back on the network once it finishes.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let h = Harness::authed(cov, |s| {
+        profiles(s);
+        s.pool = Some(pool);
+    });
+    for (ih, profile) in [(IH_A, "p"), (IH_C, "down")] {
+        let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
+        h.state.state.insert(
+            hash,
+            torrentd_engine::TorrentState::newly_added(
+                torrentd_engine::TorrentHandle {
+                    id: 1,
+                    infohash: hash,
+                },
+                torrentd_engine::ProfileId::new(profile),
+                std::time::Instant::now(),
+            ),
+        );
+    }
+    let resp = h
+        .send(
+            "POST",
+            "/v1/pool/verifications",
+            Some(&h.tokens.write.clone()),
+            Some(json!({"infohashes": [IH_A, IH_C]})),
+        )
+        .await;
+    resp.assert_status(StatusCode::ACCEPTED);
+    let r: Value = resp.json();
+    assert_eq!(r["started"], json!([IH_A]));
+    assert_eq!(r["skipped"][0]["infohash"], IH_C);
+    let reason = r["skipped"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("vpn_down"), "{reason}");
     h.assert_conformance();
 }
 

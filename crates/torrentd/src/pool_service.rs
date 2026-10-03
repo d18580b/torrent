@@ -45,6 +45,13 @@ const ADMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// verification deadline, which would have to be derived from payload size.
 const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a re-hash of a loaded torrent is held without a verdict.
+///
+/// A day is long past any re-hash this daemon could be running. Past it the
+/// request, or the phase report its verdict waits for, was lost, and the entry
+/// is forgotten rather than held for the life of the process.
+const RECHECK_EXPIRY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 pub struct PoolService {
     store: Mutex<PoolStore>,
     /// Root id → absolute path, resolved once at startup from config.
@@ -56,6 +63,10 @@ pub struct PoolService {
     /// Set once by the daemon after opening; absent for `torrentd pool …`,
     /// which is a one-shot CLI with nothing to scrape it.
     metrics: std::sync::OnceLock<Arc<dyn MetricsSink>>,
+    /// What the sessions serve. Set once by the daemon; absent for
+    /// `torrentd pool …`, which runs no session. A scan keeps every torrent
+    /// in it in the index even after its `.torrent` leaves the library.
+    loaded: std::sync::OnceLock<Arc<StateMap>>,
 }
 
 impl std::fmt::Debug for PoolService {
@@ -105,7 +116,14 @@ impl PoolService {
             verify: VerifyQueue::new(pool_cfg.max_concurrent_verify),
             allow_mutations: pool_cfg.allow_mutations,
             metrics: std::sync::OnceLock::new(),
+            loaded: std::sync::OnceLock::new(),
         })))
+    }
+
+    /// The sessions' state map, so a scan knows what is loaded. The daemon
+    /// sets this once after opening; a second call is ignored.
+    pub fn set_state(&self, state: Arc<StateMap>) {
+        let _ = self.loaded.set(state);
     }
 
     /// Where the pool's failures are counted. The daemon sets this once after
@@ -183,6 +201,8 @@ impl PoolService {
         let mut store = self.store.lock();
         store.in_transaction(|store| {
             let mut summary = ScanSummary::default();
+            let configured: Vec<_> = self.roots.iter().map(|(_, p)| p.clone()).collect();
+            store.retain_roots(&configured)?;
             for (_, path) in &self.roots {
                 let s = torrentd_pool::scan_root(store, path)
                     .with_context(|| format!("scan root {}", path.display()))?;
@@ -191,7 +211,12 @@ impl PoolService {
                 summary.errors += s.errors;
                 count(&s);
             }
-            let lib = torrentd_pool::scan_library(store, &self.library_dir)
+            let loaded: std::collections::HashSet<String> = self
+                .loaded
+                .get()
+                .map(|s| s.infohashes().iter().map(|ih| ih.to_hex()).collect())
+                .unwrap_or_default();
+            let lib = torrentd_pool::scan_library(store, &self.library_dir, &loaded)
                 .with_context(|| format!("scan library {}", self.library_dir.display()))?;
             summary.torrents = lib.torrents_indexed;
             summary.errors += lib.errors;
@@ -202,6 +227,8 @@ impl PoolService {
             summary.partial = m.partial;
             summary.missing = m.missing;
             summary.overlap = m.overlap;
+            summary.shared = m.shared;
+            summary.drifted = m.drifted;
             Ok(summary)
         })
     }
@@ -216,6 +243,8 @@ pub struct ScanSummary {
     pub partial: u64,
     pub missing: u64,
     pub overlap: u64,
+    pub shared: u64,
+    pub drifted: u64,
     pub errors: u64,
 }
 
@@ -228,6 +257,11 @@ pub struct ScanSummary {
 pub struct VerifyQueue {
     pending: Mutex<VecDeque<PendingVerify>>,
     in_flight: Mutex<Vec<String>>,
+    /// Loaded torrents `POST /v1/pool/verifications` asked libtorrent to
+    /// re-hash, with when. Their outcome is recorded like an adopt's — which
+    /// is the only way a loaded `drifted` torrent is ever cleared — once a
+    /// check that finished after the request is seen.
+    rechecks: Mutex<Vec<(String, std::time::Instant)>>,
     limit: usize,
     completed: AtomicU64,
     failed: AtomicU64,
@@ -255,6 +289,7 @@ impl VerifyQueue {
         Self {
             pending: Mutex::new(VecDeque::new()),
             in_flight: Mutex::new(Vec::new()),
+            rechecks: Mutex::new(Vec::new()),
             limit: limit.max(1),
             completed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -265,6 +300,21 @@ impl VerifyQueue {
 
     pub fn enqueue(&self, item: PendingVerify) {
         self.pending.lock().push_back(item);
+    }
+
+    /// Record the outcome of a re-hash just requested for a loaded torrent.
+    /// Call before asking for it, so the check it starts finishes after
+    /// `started`.
+    pub fn track_recheck(&self, infohash: String) {
+        let mut r = self.rechecks.lock();
+        r.retain(|(ih, _)| *ih != infohash);
+        r.push((infohash, std::time::Instant::now()));
+    }
+
+    /// Whether a re-hash of `infohash` is waiting for its outcome.
+    #[cfg(test)]
+    pub fn tracks_recheck(&self, infohash: &str) -> bool {
+        self.rechecks.lock().iter().any(|(ih, _)| ih == infohash)
     }
 
     pub fn depth(&self) -> usize {
@@ -322,40 +372,38 @@ pub async fn run_verify_queue(
                     return false;
                 };
                 let outcome = verify_outcome(state.get(&hash).as_ref(), VERIFY_SETTLE);
-                let (state_to_record, verified_at, drift_at, note) = match outcome {
-                    VerifyOutcome::Waiting => return true,
-                    VerifyOutcome::Verified => {
-                        q.completed.fetch_add(1, Ordering::Relaxed);
-                        info!(target: "torrentd::pool", infohash = %ih, "verified and seeding");
-                        (AdoptionState::Adopted, Some(now_secs()), None, None)
-                    }
-                    VerifyOutcome::Failed(reason) => {
-                        q.failed.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            target: "torrentd::pool",
-                            infohash = %ih,
-                            reason = reason,
-                            "verification did not leave the torrent seeding",
-                        );
-                        (AdoptionState::Drifted, None, Some(now_secs()), Some(reason))
-                    }
-                };
-                let written = pool.with_store(|s| {
-                    let base = s.adoption_base(ih).ok().flatten();
-                    s.set_adoption(
-                        ih,
-                        state_to_record,
-                        base.as_ref().map(|(r, _)| *r),
-                        base.as_ref().map(|(_, b)| b.as_str()),
-                        verified_at,
-                        drift_at,
-                        note,
-                    )
-                });
-                if let Err(e) = written {
-                    pool.note_store_error("set_adoption", &e);
+                if outcome == VerifyOutcome::Waiting {
+                    return true;
                 }
+                record_verify_outcome(&pool, &*source, &state, &hash, ih, outcome);
                 false
+            });
+        }
+        // 1b) Retire re-hashes of loaded torrents, once a check that finished
+        //     after the request is in. One that finished before it is the
+        //     previous check, and says nothing about this one.
+        {
+            let mut rechecks = q.rechecks.lock();
+            rechecks.retain(|(ih, started)| {
+                let Some(hash) = libtorrent_safe::InfoHash::from_hex(ih) else {
+                    return false;
+                };
+                let entry = state.get(&hash);
+                let Some(st) = entry.as_ref() else {
+                    // Removed while checking: nothing left to record.
+                    return false;
+                };
+                match recheck_step(
+                    recheck_outcome(st, *started, VERIFY_SETTLE),
+                    started.elapsed(),
+                ) {
+                    RecheckStep::Hold => true,
+                    RecheckStep::Forget => false,
+                    RecheckStep::Record(outcome) => {
+                        record_verify_outcome(&pool, &*source, &state, &hash, ih, outcome);
+                        false
+                    }
+                }
             });
         }
 
@@ -544,6 +592,69 @@ fn release_dropped_claim(pool: &PoolService, registry: &AssignmentRegistry, item
     }
 }
 
+/// Write a finished verification into the pool index.
+///
+/// `Verified` records `adopted` with no drift — the one thing that clears
+/// drift. `Failed` records `drifted` and **pauses** the torrent: under forced
+/// upload mode it would otherwise sit in its session announcing a payload the
+/// piece hashes just rejected, and an operator reading `drifted` would find it
+/// still on the network.
+fn record_verify_outcome(
+    pool: &PoolService,
+    source: &dyn AlertSource,
+    state: &StateMap,
+    hash: &libtorrent_safe::InfoHash,
+    ih: &str,
+    outcome: VerifyOutcome,
+) {
+    let q = pool.verify_queue();
+    let (state_to_record, verified_at, drift_at, note) = match outcome {
+        VerifyOutcome::Waiting => return,
+        VerifyOutcome::Verified => {
+            q.completed.fetch_add(1, Ordering::Relaxed);
+            info!(target: "torrentd::pool", infohash = %ih, "verified and seeding");
+            (AdoptionState::Adopted, Some(now_secs()), None, None)
+        }
+        VerifyOutcome::Failed(reason) => {
+            q.failed.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target: "torrentd::pool",
+                infohash = %ih,
+                reason = reason,
+                "verification did not leave the torrent seeding; pausing it",
+            );
+            if let Some(st) = state.get(hash) {
+                let paused = source
+                    .engine_for(&st.profile_id)
+                    .map(|e| e.pause_torrent(st.handle));
+                if !matches!(paused, Some(Ok(()))) {
+                    warn!(
+                        target: "torrentd::pool",
+                        infohash = %ih,
+                        "could not pause a torrent whose verification failed",
+                    );
+                }
+            }
+            (AdoptionState::Drifted, None, Some(now_secs()), Some(reason))
+        }
+    };
+    let written = pool.with_store(|s| {
+        let base = s.adoption_base(ih).ok().flatten();
+        s.set_adoption(
+            ih,
+            state_to_record,
+            base.as_ref().map(|(r, _)| *r),
+            base.as_ref().map(|(_, b)| b.as_str()),
+            verified_at,
+            drift_at,
+            note,
+        )
+    });
+    if let Err(e) = written {
+        pool.note_store_error("set_adoption", &e);
+    }
+}
+
 /// What the verify queue should do with one in-flight torrent.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum VerifyOutcome {
@@ -618,6 +729,56 @@ fn verify_outcome(
             VerifyOutcome::Failed("payload failed verification against the piece hashes")
         }
         _ => VerifyOutcome::Waiting,
+    }
+}
+
+/// Decide a re-hash of a loaded torrent requested at `started`, or `None`
+/// while no check has finished since the request.
+///
+/// Stricter than [`verify_outcome`] in one way: the torrent was loaded, and
+/// usually `Seeding`, before the re-hash, and `torrent_checked_alert` only
+/// stamps `checked_at` — the phase carrying the check's verdict lands with
+/// the next state update, up to an update interval later. Until a phase
+/// report has landed since the check, `phase` is the one from before it, and
+/// reading its `Seeding` as a pass would record `adopted`, clear drift and
+/// leave seeding a payload that just failed. So nothing is decided until a
+/// phase report has been seen since the check.
+fn recheck_outcome(
+    st: &torrentd_engine::TorrentState,
+    started: std::time::Instant,
+    settle: Duration,
+) -> Option<VerifyOutcome> {
+    if st.checked_at.is_none_or(|t| t <= started) {
+        return None;
+    }
+    if !st.phase_since_check {
+        return Some(VerifyOutcome::Waiting);
+    }
+    Some(verify_outcome(Some(st), settle))
+}
+
+/// What the verify queue does with one re-hash entry on a tick.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum RecheckStep {
+    /// No verdict yet, and still inside [`RECHECK_EXPIRY`].
+    Hold,
+    /// No verdict past [`RECHECK_EXPIRY`]: dropped without recording one.
+    Forget,
+    /// A verdict to record.
+    Record(VerifyOutcome),
+}
+
+/// Decide a re-hash entry from its [`recheck_outcome`] and its age.
+///
+/// Both undecided cases share the expiry: no check since the request
+/// (`None`), and a check whose phase report has not landed (`Waiting`). A
+/// phase report that never arrives would otherwise hold the entry for the
+/// life of the process.
+fn recheck_step(outcome: Option<VerifyOutcome>, age: Duration) -> RecheckStep {
+    match outcome {
+        None | Some(VerifyOutcome::Waiting) if age < RECHECK_EXPIRY => RecheckStep::Hold,
+        None | Some(VerifyOutcome::Waiting) => RecheckStep::Forget,
+        Some(outcome) => RecheckStep::Record(outcome),
     }
 }
 
@@ -704,6 +865,7 @@ pub fn execute_adopt(
             resume_path,
             torrent_path,
             save_path,
+            files_renamed,
         } => {
             let verify = |torrent_path, save_path, profile| {
                 enqueue_verify(
@@ -722,8 +884,21 @@ pub fn execute_adopt(
             let Some(profile_cfg) = profiles.config(&profile) else {
                 return Err(format!("profile {profile} is not live").into());
             };
+            // Verifying from the `.torrent` is the fallback below, and for a
+            // torrent whose files the previous client renamed it looks for
+            // them at the `.torrent`'s paths, where they are not.
+            let no_fallback = |why: &str| -> AdoptRefusal {
+                format!(
+                    "{why}, and the previous client renamed this torrent's files, which only \
+                     its resume data maps for libtorrent"
+                )
+                .into()
+            };
             let resume = match std::fs::read(&resume_path) {
                 Ok(b) => b,
+                Err(e) if files_renamed => {
+                    return Err(no_fallback(&format!("resume data unreadable: {e}")));
+                }
                 Err(e) => {
                     // The sidecar vouched for the payload a moment ago and is
                     // now unreadable. Verifying is slower but always correct,
@@ -751,6 +926,9 @@ pub fn execute_adopt(
             match torrentd_engine::check_trackers(profile_cfg, &params) {
                 Ok(()) => {}
                 Err(e @ TrackerRefusal::NotAllowed) => return Err(tracker_refusal(&e)),
+                Err(TrackerRefusal::Unreadable(e)) if files_renamed => {
+                    return Err(no_fallback(&format!("resume data unparseable: {e}")));
+                }
                 Err(TrackerRefusal::Unreadable(e)) => {
                     // libtorrent would refuse these bytes too, which is the
                     // fallback below; the verify path holds the `.torrent`
@@ -773,6 +951,9 @@ pub fn execute_adopt(
                 // all. None of that is a reason to leave the payload
                 // unadopted when the .torrent is right there and verifying
                 // reaches the same place.
+                if files_renamed {
+                    return Err(no_fallback(&format!("resume add rejected: {e}")));
+                }
                 warn!(
                     target: "torrentd::pool",
                     infohash = %infohash,
@@ -1001,6 +1182,64 @@ mod tests {
         assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Waiting);
     }
 
+    /// A re-hash of a torrent that was seeding: `torrent_checked` stamps
+    /// `checked_at`, and the `Seeding` still in `phase` is from before the
+    /// check. Read as the verdict, it records a payload that just failed as
+    /// verified.
+    #[test]
+    fn a_recheck_does_not_take_the_phase_from_before_the_check_as_its_verdict() {
+        let started = Instant::now() - Duration::from_secs(120);
+        let mut s = st(TorrentPhase::Seeding, Some(Duration::from_secs(60)));
+        s.phase_since_check = false;
+        assert_eq!(
+            super::recheck_outcome(&s, started, SETTLE),
+            Some(VerifyOutcome::Waiting),
+        );
+        // The report carrying the verdict lands.
+        s.phase = TorrentPhase::Incomplete;
+        s.phase_since_check = true;
+        assert_eq!(
+            super::recheck_outcome(&s, started, SETTLE),
+            Some(VerifyOutcome::Failed(
+                "payload failed verification against the piece hashes"
+            )),
+        );
+        s.phase = TorrentPhase::Seeding;
+        assert_eq!(
+            super::recheck_outcome(&s, started, SETTLE),
+            Some(VerifyOutcome::Verified),
+        );
+    }
+
+    /// A check that finished before the request is the previous one.
+    #[test]
+    fn a_recheck_ignores_a_check_from_before_the_request() {
+        let mut s = st(TorrentPhase::Seeding, Some(Duration::from_secs(60)));
+        s.phase_since_check = true;
+        let started = Instant::now() - Duration::from_secs(30);
+        assert_eq!(super::recheck_outcome(&s, started, SETTLE), None);
+    }
+
+    /// A re-hash whose phase report never lands falls to the same expiry as
+    /// one that was never checked, instead of being held forever.
+    #[test]
+    fn an_undecided_recheck_is_forgotten_after_the_expiry() {
+        use super::recheck_step;
+        use super::RecheckStep;
+        use super::RECHECK_EXPIRY;
+
+        let young = RECHECK_EXPIRY - Duration::from_secs(1);
+        for undecided in [None, Some(VerifyOutcome::Waiting)] {
+            assert_eq!(recheck_step(undecided, young), RecheckStep::Hold);
+            assert_eq!(recheck_step(undecided, RECHECK_EXPIRY), RecheckStep::Forget);
+        }
+        // A verdict is recorded whatever its age.
+        assert_eq!(
+            recheck_step(Some(VerifyOutcome::Verified), RECHECK_EXPIRY),
+            RecheckStep::Record(VerifyOutcome::Verified),
+        );
+    }
+
     #[test]
     fn a_scan_counts_its_errors_by_kind() {
         let dir = tempfile::tempdir().unwrap();
@@ -1019,6 +1258,49 @@ mod tests {
             text.contains("torrentd_pool_scan_errors_total{kind=\"parse\"} 1"),
             "{text}"
         );
+    }
+
+    /// The daemon's scan keeps a torrent its sessions serve in the index after
+    /// its `.torrent` leaves the library, whatever its adoption state.
+    #[test]
+    fn a_scan_keeps_a_loaded_torrent_gone_from_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../torrentd-pool/tests/fixtures/pad_file.torrent"),
+            library.join("pad_file.torrent"),
+        )
+        .unwrap();
+        pool.scan().unwrap();
+        let ih = pool.with_store(|s| s.torrents().unwrap())[0]
+            .infohash
+            .clone();
+
+        let state = std::sync::Arc::new(torrentd_engine::StateMap::new());
+        let hash = InfoHash::from_hex(&ih).unwrap();
+        state.insert(
+            hash,
+            TorrentState::newly_added(
+                TorrentHandle {
+                    id: 1,
+                    infohash: hash,
+                },
+                ProfileId::new("p"),
+                Instant::now(),
+            ),
+        );
+        pool.set_state(state.clone());
+        std::fs::remove_file(library.join("pad_file.torrent")).unwrap();
+        pool.scan().unwrap();
+        assert!(pool.with_store(|s| s.torrent(&ih).unwrap()).is_some());
+
+        state.remove(&hash);
+        pool.scan().unwrap();
+        assert!(pool.with_store(|s| s.torrent(&ih).unwrap()).is_none());
     }
 
     fn pending(ih: InfoHash, profile: &str) -> super::PendingVerify {
@@ -1235,5 +1517,79 @@ mod tests {
             verify_outcome(Some(&s), SETTLE),
             VerifyOutcome::Failed(_),
         ));
+    }
+
+    /// A failed verification records `drifted` and pauses the torrent; a
+    /// passed one is the only thing that clears drift.
+    #[test]
+    fn a_failed_verify_pauses_the_torrent_and_a_passed_one_clears_drift() {
+        use std::sync::Arc;
+
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::StateMap;
+        use torrentd_pool::AdoptionState;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let engine = Arc::new(MockEngine::new());
+        let source = torrentd_engine::ProfileSource::new(vec![(
+            ProfileId::new("p"),
+            engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]);
+        let state = StateMap::new();
+        let hash = InfoHash([0x11; 20]);
+        state.insert(hash, st(TorrentPhase::Incomplete, Some(SETTLE)));
+        let ih = hash.to_hex();
+        pool.with_store(|s| {
+            s.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.clone(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "T".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.path().join("t.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )
+        })
+        .unwrap();
+
+        super::record_verify_outcome(
+            &pool,
+            &source,
+            &state,
+            &hash,
+            &ih,
+            VerifyOutcome::Failed("bad"),
+        );
+        assert!(engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+        let (got, drift) = pool
+            .with_store(|s| {
+                Ok::<_, torrentd_pool::PoolError>((s.adoption_state(&ih)?, s.drift_at(&ih)?))
+            })
+            .unwrap();
+        assert_eq!(got, Some(AdoptionState::Drifted));
+        assert!(drift.is_some());
+
+        super::record_verify_outcome(&pool, &source, &state, &hash, &ih, VerifyOutcome::Verified);
+        let (got, drift) = pool
+            .with_store(|s| {
+                Ok::<_, torrentd_pool::PoolError>((s.adoption_state(&ih)?, s.drift_at(&ih)?))
+            })
+            .unwrap();
+        assert_eq!(got, Some(AdoptionState::Adopted));
+        assert_eq!(drift, None);
     }
 }
