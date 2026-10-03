@@ -150,6 +150,17 @@ pub fn plan(
     // libtorrent look for them at the `.torrent`'s own paths instead.
     let relayout = relayout_of(&torrent);
     match (&relayout, can_fast_path) {
+        // The index placed a file the resume data maps somewhere this
+        // reader refused at the `.torrent`'s own path, and libtorrent, handed
+        // that resume data, would look for it at the mapped one. Neither path
+        // agrees with the other, so nothing here can be adopted.
+        (Some(r), _) if r.rejected > 0 => {
+            return Ok(AdoptPlan::Refuse {
+                reason: "the previous client's resume data maps a file outside the torrent's \
+                         directory, or to a name that is not UTF-8; where libtorrent would look \
+                         for it is not where the pool found it",
+            })
+        }
         (Some(r), true) if !r.in_resume_data => {
             return Ok(AdoptPlan::Refuse {
                 reason: "the previous client's content layout moved these files, and its resume \
@@ -185,7 +196,10 @@ pub fn plan(
 fn relayout_of(torrent: &crate::model::PoolTorrent) -> Option<crate::fastresume::Relayout> {
     let fr = torrent.fastresume_path.as_ref()?;
     let hints = crate::fastresume::read_hints(fr);
-    if hints.mapped_files.iter().all(Option::is_none) && hints.content_layout.is_none() {
+    if hints.mapped_files.iter().all(Option::is_none)
+        && hints.mapped_files_unreadable == 0
+        && hints.content_layout.is_none()
+    {
         return None;
     }
     let bytes = std::fs::read(&torrent.source_path).ok()?;

@@ -676,6 +676,46 @@ fn qbittorrents_mapped_files_are_honoured() {
     }
 }
 
+/// A `mapped_files` entry the reader refuses leaves the index at the
+/// `.torrent`'s path while libtorrent, handed the same resume data, would
+/// follow the mapping. Even complete resume data does not take the fast path
+/// then; nothing adopts it.
+#[test]
+fn a_refused_mapped_file_blocks_adoption() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    // Where the `.torrent` says, so the matcher places it there.
+    write_file(&root, "temp/foo/bar.txt", 45);
+    for target in [
+        bstr_of("../../outside.txt"),
+        bstr_of("/etc/outside.txt"),
+        b"4:\xff\xfe\xfd\xfc".to_vec(),
+    ] {
+        let sub = tempfile::tempdir().unwrap();
+        let mut mapped = b"l".to_vec();
+        mapped.extend_from_slice(&target);
+        mapped.extend_from_slice(&bstr_of(""));
+        mapped.push(b'e');
+        let (_lib, mut store, ih) = library_with_sidecar(
+            sub.path(),
+            "pad_file.torrent",
+            &[
+                ("mapped_files", mapped),
+                ("pieces", b"1:\x01".to_vec()),
+                ("qBt-savePath", bstr_of(&root.to_string_lossy())),
+            ],
+        );
+        torrentd_pool::scan_root(&mut store, &root).unwrap();
+        torrentd_pool::match_all(&mut store).unwrap();
+        assert_eq!(state_of(&store, &ih), AdoptionState::Matched);
+        let root_id = store.root_id(&root).unwrap();
+        let r = root.clone();
+        let plan = torrentd_pool::adopt::plan(&store, &ih, |id| (id == root_id).then(|| r.clone()))
+            .unwrap();
+        assert!(plan.is_refusal(), "{plan:?}");
+    }
+}
+
 /// qBittorrent's no-subfolder layout: a multi-file torrent's files sit
 /// straight in the save path, without the torrent's top directory.
 #[test]

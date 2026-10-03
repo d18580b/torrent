@@ -29,6 +29,9 @@ pub struct ResumeHints {
     /// libtorrent's `mapped_files`: a file the previous client renamed, by
     /// index into the torrent's file list. `None` where it kept the name.
     pub mapped_files: Vec<Option<String>>,
+    /// `mapped_files` entries that are not UTF-8, and so are not in
+    /// `mapped_files` although libtorrent would still apply them.
+    pub mapped_files_unreadable: usize,
     /// qBittorrent's `qBt-contentLayout`: `Original`, `Subfolder` or
     /// `NoSubfolder`.
     pub content_layout: Option<String>,
@@ -45,6 +48,11 @@ pub struct Relayout {
     /// records. A torrent added without that resume data looks for its files
     /// at the `.torrent`'s paths.
     pub in_resume_data: bool,
+    /// `mapped_files` entries refused — absolute, walking out of the base, or
+    /// not UTF-8 — whose file `paths` therefore gives at the `.torrent`'s own
+    /// path. libtorrent, handed the same resume data, still applies them, so
+    /// the index and libtorrent disagree about where those files are.
+    pub rejected: usize,
 }
 
 impl ResumeHints {
@@ -57,23 +65,28 @@ impl ResumeHints {
     /// puts a single file inside a directory named after it without its
     /// extension.
     pub fn relayout(&self, paths: &[String], name: &str) -> Option<Relayout> {
-        if self.mapped_files.iter().any(Option::is_some) {
+        if self.mapped_files.iter().any(Option::is_some) || self.mapped_files_unreadable > 0 {
+            let mut rejected = self.mapped_files_unreadable;
             let mapped = paths
                 .iter()
                 .enumerate()
                 .map(|(i, p)| {
-                    self.mapped_files
-                        .get(i)
-                        .cloned()
-                        .flatten()
-                        .map(|m| m.replace('\\', "/").trim_matches('/').to_owned())
-                        .filter(|m| is_relative_and_contained(m))
-                        .unwrap_or_else(|| p.clone())
+                    let Some(m) = self.mapped_files.get(i).cloned().flatten() else {
+                        return p.clone();
+                    };
+                    let m = m.replace('\\', "/");
+                    if is_relative_and_contained(&m) {
+                        m.trim_matches('/').to_owned()
+                    } else {
+                        rejected += 1;
+                        p.clone()
+                    }
                 })
                 .collect();
             return Some(Relayout {
                 paths: mapped,
                 in_resume_data: true,
+                rejected,
             });
         }
         let in_name_dir = |p: &String| p.split_once('/').is_some_and(|(top, _)| top == name);
@@ -85,6 +98,7 @@ impl ResumeHints {
                         .map(|p| p.split_once('/').map_or(p.clone(), |(_, r)| r.to_owned()))
                         .collect(),
                     in_resume_data: false,
+                    rejected: 0,
                 })
             }
             Some("Subfolder") if paths.len() == 1 && !paths[0].contains('/') => {
@@ -96,6 +110,7 @@ impl ResumeHints {
                 Some(Relayout {
                     paths: vec![format!("{stem}/{}", paths[0])],
                     in_resume_data: false,
+                    rejected: 0,
                 })
             }
             _ => None,
@@ -157,10 +172,20 @@ pub fn parse_hints(bytes: &[u8]) -> ResumeHints {
         _ => false,
     };
 
+    // An empty entry is a file the client did not rename. One that is not
+    // UTF-8 is a rename this reader cannot follow, and is counted so the
+    // layout built from these says so.
+    let mut mapped_files_unreadable = 0;
     let mapped_files = match top.get("mapped_files") {
         Some(Value::List(items)) => items
             .iter()
-            .map(|b| String::from_utf8(b.clone()).ok().filter(|s| !s.is_empty()))
+            .map(|b| match String::from_utf8(b.clone()) {
+                Ok(s) => Some(s).filter(|s| !s.is_empty()),
+                Err(_) => {
+                    mapped_files_unreadable += 1;
+                    None
+                }
+            })
             .collect(),
         _ => Vec::new(),
     };
@@ -171,6 +196,7 @@ pub fn parse_hints(bytes: &[u8]) -> ResumeHints {
         tags,
         is_complete,
         mapped_files,
+        mapped_files_unreadable,
         content_layout: get_str("qBt-contentLayout").filter(|s| !s.is_empty()),
     }
 }
@@ -424,6 +450,13 @@ mod tests {
             ["Show/a.mkv", "Show/renamed.mkv", "Show/c.nfo", "Show/d.srt"],
             "a traversal is not a layout and is ignored",
         );
+        assert_eq!(r.rejected, 1, "but it is counted");
+        // An absolute mapping is refused before anything strips its slash.
+        let b = bdict(&[("mapped_files", blist(&["/etc/passwd"]))]);
+        let r = parse_hints(&b)
+            .relayout(&["Show/a.mkv".to_owned()], "Show")
+            .unwrap();
+        assert_eq!((r.paths[0].as_str(), r.rejected), ("Show/a.mkv", 1));
         // A list holding anything but strings is skipped, not misread.
         let b = bdict(&[
             ("mapped_files", b"li1ee".to_vec()),
