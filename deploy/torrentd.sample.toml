@@ -97,9 +97,17 @@ enable_lsd = false
 # `peer_fingerprint` is the peer-id prefix itself: exactly 8 printable ASCII
 # characters, handed to libtorrent as written. A profile's own
 # `peer_fingerprint` below is the same field in the same form and overrides
-# this one. libtorrent's own default, "-LT20C0-", is refused.
-# peer_fingerprint = "-XX1234-"
-# user_agent       = "libtorrent/2.0"
+# this one. libtorrent's own client code is refused: any prefix starting
+# "-LT", such as "-LT20E0-", the default of the libtorrent this daemon is
+# built on.
+#
+# The two must agree with each other wherever they are written. A tracker
+# reads both, and one client's peer-id prefix beside another client's user
+# agent is a client that does not exist. Nothing checks the pairing; take both
+# from the one client a profile presents as, as every example in this file
+# does ("-qB4630-" is qBittorrent 4.6.3's prefix).
+# peer_fingerprint = "-qB4630-"
+# user_agent       = "qBittorrent/4.6.3"
 
 # Liveness: max age (seconds) of a WireGuard tunnel's latest handshake before
 # the health monitor declares the profile down and pauses it. Catches a tunnel
@@ -163,6 +171,11 @@ enable_lsd = false
 #                     are disabled unconditionally — there is no key that turns
 #                     them back on.
 
+# The wildcard addresses are fine while this is the only profile. Beside a
+# `vpn` profile they are refused: libtorrent expands `0.0.0.0` and `[::]` to
+# every interface that is up, the tunnels included, and would announce this
+# profile from them. Uncommenting one of the vpn profiles below therefore
+# means naming the host's own address or device here, such as "eth0:6881".
 [[profile]]
 id                = "public"
 network           = "host"
@@ -182,8 +195,8 @@ dht               = true
 # is fine, since neither store descends into a subdirectory.
 # resume_dir           = "/var/lib/torrentd/resume/public"
 # torrent_dir          = "/var/lib/torrentd/torrents/public"
-# peer_fingerprint     = "-XX0001-"
-# user_agent           = "libtorrent/2.0"
+# peer_fingerprint     = "-TR3000-"
+# user_agent           = "Transmission/3.00"
 # Per-profile upload cap in bytes/sec, overriding the daemon-wide key above.
 # `0` here means *unlimited* for this profile, not "unset": writing it is how
 # you uncap one account while the daemon-wide key caps the rest. Omit the key
@@ -211,9 +224,16 @@ dht               = true
 # The eight rules this is built on, and why each exists, are documented on the
 # `torrentd-engine::profile` module.
 #
-# `allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds —
-# it catches loading one account's torrent into another — not an egress
-# control. It is empty by default, which disables the check entirely.
+# `allowed_tracker_domains` is the account-isolation guard, and a vpn profile
+# must set it: the domains of the trackers this account belongs to. Every
+# torrent the profile takes — added over the API, adopted from the pool, or
+# found at startup in its resume or `.torrent` directory — must announce only
+# to trackers on those domains or their subdomains, and to at least one. One
+# tracker outside the list refuses the torrent, whatever else it announces
+# to; a resume file's own tracker list is what is checked where it has one.
+# It keeps one account's torrent, and its passkey, from being announced from
+# another account's tunnel. It is not an egress control. A host profile may
+# set it too, and is not checked when it does not.
 
 # The port here shares one namespace with the ports `public` binds above, so
 # it is 6891 rather than 6881: an announced port that two profiles share is
@@ -227,7 +247,7 @@ dht               = true
 # vpn_config               = "/etc/wireguard/wg-acct-a.conf"
 # vpn_interface            = "wg-acct-a"
 # listen_port              = 6891
-# peer_fingerprint         = "-XX0002-"
+# peer_fingerprint         = "-qB5030-"
 # user_agent               = "qBittorrent/5.0.3"
 # resume_dir               = "/var/lib/torrentd/resume/account_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/account_a"
@@ -252,7 +272,7 @@ dht               = true
 # vpn_interface            = "proton-a"
 # port_forward             = "natpmp"
 # port_forward_gateway     = "10.2.0.1"   # ProtonVPN WireGuard gateway (default)
-# peer_fingerprint         = "-XX0003-"
+# peer_fingerprint         = "-TR4060-"
 # user_agent               = "Transmission/4.0.6"
 # resume_dir               = "/var/lib/torrentd/resume/proton_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/proton_a"

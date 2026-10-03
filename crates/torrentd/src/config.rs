@@ -1034,7 +1034,11 @@ impl Config {
                 // The key named is the one the operator wrote, as it is for
                 // the duplicate errors below.
                 if ProfileConfig::is_libtorrent_default_fingerprint(fp) {
-                    return Err(ProfileConfigError::DefaultFingerprintForbidden { key });
+                    return Err(ProfileConfigError::DefaultFingerprintForbidden {
+                        key,
+                        value: fp.to_string(),
+                        default: ProfileConfig::LIBTORRENT_DEFAULT_FINGERPRINT,
+                    });
                 }
                 match seen_fp.insert(fp, p.id.as_str()) {
                     Some(prev) if inherited && self.inherits_fingerprint(prev) => {}
@@ -1994,11 +1998,12 @@ vpn_interface        = "wg0"
 listen_port          = 6881
 peer_fingerprint     = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
+allowed_tracker_domains = ["t.example"]
 
 [[profile]]
 id                = "public"
 network           = "host"
-listen_interfaces = "0.0.0.0:6882"
+listen_interfaces = "eth0:6882"
 {host_extra}
 "#
         )
@@ -2053,6 +2058,7 @@ vpn_interface        = "wg0"
 listen_port          = 6881
 peer_fingerprint     = "-AA1000-"
 user_agent           = "ua-a"
+allowed_tracker_domains = ["t.example"]
 
 [[profile]]
 id                   = "acct_b"
@@ -2063,6 +2069,7 @@ vpn_interface        = "wg1"
 listen_port          = 6882
 peer_fingerprint     = "-AA1000-"
 user_agent           = "ua-b"
+allowed_tracker_domains = ["t.example"]
 "#
         );
         let p = write_cfg(dir.path(), &body);
@@ -2121,11 +2128,12 @@ vpn_interface        = "wg0"
 listen_port          = 6881
 peer_fingerprint     = "-AA1000-"
 user_agent           = "qBittorrent/5.0.3"
+allowed_tracker_domains = ["t.example"]
 
 [[profile]]
 id                = "public"
 network           = "host"
-listen_interfaces = "0.0.0.0:6882"
+listen_interfaces = "eth0:6882"
 "#,
         );
         assert!(msg.contains("user_agent"), "got: {msg}");
@@ -2179,7 +2187,7 @@ user_agent = "libtorrent/2.0"
             r#"peer_fingerprint = "-LT20C0-""#,
         ));
         assert!(
-            msg.contains("must not equal libtorrent default"),
+            msg.contains("uses libtorrent's own client code"),
             "got: {msg}"
         );
         assert!(
@@ -2324,7 +2332,7 @@ listen_interfaces = "0.0.0.0:6881"
 [[profile]]
 id                = "public"
 network           = "host"
-listen_interfaces = "0.0.0.0:6882"
+listen_interfaces = "eth0:6882"
 {extra_b}
 "#
         )
@@ -3285,7 +3293,7 @@ upload_rate_limit = 0"#,
             "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
              vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
              vpn_interface = \"wg0\"\nlisten_port = 6891\n\
-             peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\n\
+             peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\nallowed_tracker_domains = [\"t.example\"]\n\
              dht = false\n"
         );
         let p = write_cfg(dir.path(), &body);
@@ -3306,7 +3314,7 @@ upload_rate_limit = 0"#,
             "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
              vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
              vpn_interface = \"wg0\"\nport_forward = \"natpmp\"\nlisten_port = 6891\n\
-             peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\n"
+             peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\nallowed_tracker_domains = [\"t.example\"]\n"
         );
         let p = write_cfg(dir.path(), &body);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
@@ -3324,7 +3332,7 @@ upload_rate_limit = 0"#,
             "{TOP_LEVEL}\n[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\n\
              vpn_type = \"wireguard\"\nvpn_config = \"/etc/wireguard/wg0.conf\"\n\
              vpn_interface = \"wg0\"\nport_forward = \"natpmp\"\n\
-             peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\n"
+             peer_fingerprint = \"-AA1000-\"\nuser_agent = \"ua-a\"\nallowed_tracker_domains = [\"t.example\"]\n"
         );
         let p = write_cfg(dir.path(), &body);
         Config::load(&p).expect("a natpmp profile names no port; that is the point");
@@ -3531,11 +3539,11 @@ upload_rate_limit = 0"#,
         let wg = "[[profile]]\nid = \"acct_a\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
                   vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
                   listen_port = 6891\npeer_fingerprint = \"-AA1000-\"\n\
-                  user_agent = \"ua-a\"\n";
+                  user_agent = \"ua-a\"\nallowed_tracker_domains = [\"t.example\"]\n";
         let ovpn = "[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\nvpn_type = \"openvpn\"\n\
                     vpn_config = \"/etc/openvpn/acct_b.conf\"\nvpn_interface = \"tun-b\"\n\
                     listen_port = 6892\npeer_fingerprint = \"-BB1000-\"\n\
-                    user_agent = \"ua-b\"\n";
+                    user_agent = \"ua-b\"\nallowed_tracker_domains = [\"t.example\"]\n";
 
         let body = format!("{TOP_LEVEL}\nnetwork_kill_switch = true\n\n{wg}\n{ovpn}");
         let msg = format!(
@@ -3560,7 +3568,7 @@ upload_rate_limit = 0"#,
              network = \"vpn\"\nvpn_type = \"wireguard\"\n\
              vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
              listen_port = 6891\npeer_fingerprint = \"-AA1000-\"\n\
-             user_agent = \"ua-a\"\n"
+             user_agent = \"ua-a\"\nallowed_tracker_domains = [\"t.example\"]\n"
         );
         let p = write_cfg(dir.path(), &body);
         Config::load(&p).unwrap().check_boot_rules().unwrap();
@@ -3577,12 +3585,12 @@ upload_rate_limit = 0"#,
         let dir = tempdir().unwrap();
         let body = format!(
             "{TOP_LEVEL}\nnetwork_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
-             network = \"host\"\nlisten_interfaces = \"0.0.0.0:6881\"\n\n\
+             network = \"host\"\nlisten_interfaces = \"eth0:6881\"\n\n\
              [[profile]]\nid = \"acct_a\"\n\
              network = \"vpn\"\nvpn_type = \"wireguard\"\n\
              vpn_config = \"/etc/wireguard/wg0.conf\"\nvpn_interface = \"wg0\"\n\
              listen_port = 6891\npeer_fingerprint = \"-AA1000-\"\n\
-             user_agent = \"ua-a\"\n"
+             user_agent = \"ua-a\"\nallowed_tracker_domains = [\"t.example\"]\n"
         );
         let p = write_cfg(dir.path(), &body);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());

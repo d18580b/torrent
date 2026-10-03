@@ -846,7 +846,8 @@ fn a_kill_switch_with_no_nft_exits_ex_config() {
              vpn_interface = \"wg-nonft\"\n\
              listen_port = 16899\n\
              peer_fingerprint = \"-AA1000-\"\n\
-             user_agent = \"ua-a\"\n",
+             user_agent = \"ua-a\"\n\
+             allowed_tracker_domains = [\"t.example\"]\n",
             d = p.display()
         ),
     )

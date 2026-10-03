@@ -227,7 +227,7 @@ Every profile takes `id` plus `network`, and then:
 
 | `network = "host"` | |
 | --- | --- |
-| `listen_interfaces` | **required**, e.g. `"0.0.0.0:6881,[::]:6881"` |
+| `listen_interfaces` | **required**, e.g. `"eth0:6881"` or `"0.0.0.0:6881,[::]:6881"`. The unspecified address is refused when any `vpn` profile is configured — see [Account isolation](#account-isolation). |
 | `dht` | default `false`. DHT is a public announcement of what this host holds, so it is opt-in. |
 
 | `network = "vpn"` | |
@@ -235,7 +235,8 @@ Every profile takes `id` plus `network`, and then:
 | `vpn_type`, `vpn_config`, `vpn_interface` | **required**. `vpn_interface` must equal `vpn_config`'s file stem — wg-quick derives one from the other in both directions. |
 | `listen_port` | required for `port_forward = "static"` (the default); omitted for `"natpmp"` |
 | `port_forward`, `port_forward_gateway` | default `static`, and `10.2.0.1` |
-| `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters, such as `"-XX0002-"` — in the same form as the top-level key it overrides. |
+| `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client, so the two must name the same client: `"-qB5030-"` with `"qBittorrent/5.0.3"`, not a prefix of one client beside another's user agent. Nothing checks the pairing. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters — in the same form as the top-level key it overrides, and never libtorrent's own `-LT` code. |
+| `allowed_tracker_domains` | **required**, non-empty: the domains of this account's trackers — see [Account isolation](#account-isolation). |
 
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
@@ -318,6 +319,50 @@ Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
 `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
 `peer_fingerprint`, `user_agent`, `resume_dir` and `torrent_dir` must all
 be unique across profiles.
+
+#### Account isolation
+
+Three rules keep one account's identity off another account's traffic, and a
+configuration that breaks one is refused at load and by `--check-config`:
+
+- **`allowed_tracker_domains` is required on every `vpn` profile.** Each entry
+  is a domain, such as `"tracker.example.com"`, matching that host and its
+  subdomains, case-insensitively; an entry that is blank or contains a comma or
+  whitespace is refused on any profile. A profile that sets the list takes a
+  torrent only when **every** tracker it would announce to is on it, and it
+  announces to at least one. One allowed tracker beside a foreign one does not
+  admit the torrent: libtorrent would announce to both. The check runs on all
+  five add paths, against what each hands the session: `POST /v1/torrents` (a
+  `.torrent`'s announce list, a magnet's `tr=` parameters), `POST
+  /v1/pool/adoptions` (the previous client's resume data, whose own `trackers`
+  list replaces the `.torrent`'s where it has one, and the `.torrent` the
+  verify queue adds), and at startup each profile's resume directory and
+  `.torrent` directory. The API answers `422 tracker-not-allowed`, an adoption
+  lists the torrent under `refused`, and a startup scan leaves it unloaded with
+  a warning; each counts it in `profile_assignment_registry_errors_total`. A
+  host profile may set the list too, and is not checked when it does not.
+- **A host profile may not listen on `0.0.0.0` or `[::]` beside a `vpn`
+  profile.** libtorrent expands the unspecified address to every interface
+  that is up, the tunnels included, and announces from each listen socket, so
+  the host profile would announce from the accounts' tunnel addresses too.
+  Name the host's own address (`"192.0.2.10:6881"`) or network device
+  (`"eth0:6881"`) instead. A host profile with no `vpn` profile beside it keeps
+  the wildcard.
+- **No `peer_fingerprint` may start with `-LT`**, top-level or per profile.
+  That is libtorrent's own client code, which every unconfigured libtorrent
+  session announces (`-LT20E0-` in the version this daemon is built on).
+
+Pool adoption also refuses a torrent the pool index assigns to another profile,
+even when no session holds it now; `DELETE /v1/torrents/{infohash}` clears the
+index's record along with the assignment.
+
+**Upgrading.** A configuration that loaded before this release can be refused
+by these rules. Add `allowed_tracker_domains` to each `vpn` profile, replace a
+host profile's wildcard `listen_interfaces` where `vpn` profiles sit beside it,
+and replace an `-LT` fingerprint with the prefix of the client the profile's
+`user_agent` names. Existing torrents are held to the list at the next start:
+one whose trackers fall outside it is left unloaded, with its assignment and
+files in place, and a warning names it.
 
 **`[pool]`** (optional) — `roots` (required, must not nest and must not contain
 the daemon's own state), `library_dir` (required), `db_path`
