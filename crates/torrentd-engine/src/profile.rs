@@ -31,9 +31,13 @@
 //!    the host's public IP. The profile is recorded failed and reported; the
 //!    others proceed.
 //! 2. **No cross-profile announce.** `outgoing_interfaces` is pinned to the
-//!    tunnel IP, so libtorrent binds outgoing connections to it at the socket
-//!    level. If the tunnel drops, subsequent attempts fail at `bind()` rather
-//!    than falling out over the bare interface.
+//!    tunnel device, so libtorrent binds outgoing peer connections to it at
+//!    the socket level (`SO_BINDTODEVICE`). If the tunnel drops, subsequent
+//!    attempts fail at `bind()` rather than falling out over the bare
+//!    interface, and a lost routing rule cannot route them there either.
+//!    Everything else — the listen sockets and what answers on them — is
+//!    bound to the tunnel address, and routed by the tunnel's source rule,
+//!    which the health monitor checks every poll.
 //! 3. **Global info-hash uniqueness.** An add is refused with 409 if the
 //!    info-hash is loaded in *any* profile, not just the target. The same torrent
 //!    seeding under two accounts is visible to the tracker as one info-hash
@@ -77,8 +81,11 @@
 //!    profiles sharing one would be correlatable by a tracker operator even from
 //!    different IPs. Enforced for every profile that names its own port — a
 //!    `vpn` profile's static `listen_port`, and every port a `host` profile's
-//!    `listen_interfaces` binds. Gateway-assigned NAT-PMP ports are unique by
-//!    construction and are the one case nothing here checks.
+//!    `listen_interfaces` binds. Gateway-assigned NAT-PMP ports are not
+//!    unique by construction — two gateways assign independently — so they
+//!    are checked where they are assigned: a profile whose startup
+//!    negotiation lands on a port another profile holds is disabled, and a
+//!    renewal that moves onto one is not bound (`port_forward::renew_and_rebind`).
 //!
 //! `allowed_tracker_domains` is *not* in this list. It is a misconfiguration
 //! guard against loading one profile's `.torrent` into another, checked at add

@@ -1,16 +1,23 @@
 //! VPN tunnel health monitor (multi-profile mode).
 //!
-//! Every 30s, re-reads each profile's tunnel interface IP and — for WireGuard —
-//! the age of its latest handshake. If the interface is down, its IP changed,
-//! or the handshake has gone stale (a tunnel that keeps its address but has
-//! silently died), the monitor immediately pauses every torrent in that profile,
-//! marks the profile `VpnDown`, and emits metrics — but does **not** restart the
-//! session (the spec Safety Rule: automatic restart risks a window where traffic
-//! routes over the bare interface; the operator must intervene).
+//! Every 30s, re-reads each profile's tunnel interface IP, asks the kernel
+//! where a packet from that IP would be routed, and — for WireGuard — reads the
+//! age of its latest handshake. If the interface is down, its IP changed, its
+//! traffic no longer routes by the tunnel device, the handshake has gone stale
+//! (a tunnel that keeps its address but has silently died), or a WireGuard
+//! tunnel has never handshaked within the threshold of coming up, the monitor
+//! immediately pauses every torrent in that profile, marks the profile
+//! `VpnDown`, and emits metrics — but does **not** restart the session (the
+//! spec Safety Rule: automatic restart risks a window where traffic routes over
+//! the bare interface; the operator must intervene).
+//!
+//! [`evaluate`] is the whole judgement and it is shared: `torrentd vpn check`
+//! reports the verdict this monitor would reach on the same observations.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 
 use tokio::sync::broadcast;
 use torrentd_engine::MetricsSink;
@@ -30,38 +37,95 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Why the monitor decided a profile's tunnel is unhealthy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DownReason {
+pub(crate) enum DownReason {
     /// The interface lost its address or the address changed.
     IpLostOrChanged,
+    /// The address is intact but a packet from it would not leave by the
+    /// tunnel device — the source-address rule is gone, or something else now
+    /// wins the lookup.
+    RouteMismatch,
     /// The address is intact but the WireGuard handshake is older than allowed.
     HandshakeStale,
+    /// A WireGuard tunnel that has never handshaked, for longer than the
+    /// handshake threshold while its profile had torrents to carry: wrong key,
+    /// dead endpoint, or a peer that never answered. Its address and route
+    /// look healthy, and the stale-handshake rule cannot fire because there is
+    /// no handshake to age.
+    NoHandshake,
 }
 
 impl DownReason {
-    fn as_str(self) -> &'static str {
+    pub(crate) const ALL: [DownReason; 4] = [
+        DownReason::IpLostOrChanged,
+        DownReason::RouteMismatch,
+        DownReason::HandshakeStale,
+        DownReason::NoHandshake,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             DownReason::IpLostOrChanged => "ip_lost_or_changed",
+            DownReason::RouteMismatch => "route_mismatch",
             DownReason::HandshakeStale => "handshake_stale",
+            DownReason::NoHandshake => "no_handshake",
         }
     }
 }
 
+/// What the WireGuard handshake probe said, as far as the verdict cares.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Handshake {
+    /// Not a WireGuard profile, or the probe could not run: no liveness
+    /// signal, and the verdict rests on the other checks.
+    NoSignal,
+    /// The link is readable and no peer has ever handshaked.
+    Never,
+    /// The most recent handshake was this long ago.
+    Age(Duration),
+}
+
+/// What one poll observed about a profile's tunnel.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct Observation {
+    /// The interface's address now.
+    pub current: Option<IpAddr>,
+    /// The address the profile's session is bound to.
+    pub expected: Option<IpAddr>,
+    /// Where a packet from `current` would be routed; `None` when the probe
+    /// could not run, which (like an unavailable handshake probe) leaves the
+    /// verdict to the other checks.
+    pub route: Option<vpn::route::RouteProbe>,
+    pub handshake: Handshake,
+    /// How long a never-handshaked WireGuard tunnel has had traffic to carry
+    /// and carried none: measured from the first poll that saw it with no
+    /// handshake **and** torrents in its profile, reset when either stops
+    /// being true.
+    ///
+    /// Not time since bring-up. WireGuard handshakes on the first packet sent
+    /// into the tunnel, and a profile with no torrents sends none — a fresh
+    /// deployment's empty profile would be fenced for having nothing to do,
+    /// and fencing, which pauses nothing there, would still need an operator
+    /// to undo.
+    pub unanswered_for: Duration,
+}
+
 /// Decide whether a profile's tunnel is still healthy. Pure (no I/O) so it is
-/// unit-testable. `handshake_age` is `None` when there is no liveness signal
-/// (non-WireGuard, `wg` unavailable, or never handshaked); the verdict then
-/// rests on IP presence alone.
-fn evaluate(
-    current: Option<IpAddr>,
-    expected: Option<IpAddr>,
-    handshake_age: Option<Duration>,
-    max_age: Duration,
-) -> Result<(), DownReason> {
-    match (current, expected) {
+/// unit-testable, and shared with `vpn check` so the pre-flight's verdict is
+/// the monitor's.
+///
+/// Checked in order, and the first failure is the reason: the address, then
+/// the route, then the handshake.
+pub(crate) fn evaluate(obs: &Observation, max_age: Duration) -> Result<(), DownReason> {
+    match (obs.current, obs.expected) {
         (Some(c), Some(x)) if c == x => {}
         _ => return Err(DownReason::IpLostOrChanged),
     }
-    match handshake_age {
-        Some(age) if age > max_age => Err(DownReason::HandshakeStale),
+    if let Some(vpn::route::RouteProbe::Elsewhere(_)) = obs.route {
+        return Err(DownReason::RouteMismatch);
+    }
+    match obs.handshake {
+        Handshake::Age(age) if age > max_age => Err(DownReason::HandshakeStale),
+        Handshake::Never if obs.unanswered_for > max_age => Err(DownReason::NoHandshake),
         _ => Ok(()),
     }
 }
@@ -103,7 +167,10 @@ fn seed_baselines(profiles: &ProfileRegistry, metrics: &PromSink) {
         if e.config.vpn_type() == Some(VpnType::Wireguard) {
             metrics.set_gauge("profile_vpn_handshake_probe_ok", 1.0, &labels);
         }
-        for reason in [DownReason::IpLostOrChanged, DownReason::HandshakeStale] {
+        // The route probe runs for both tunnel types. Same reasoning as the
+        // handshake series: `0` means the probe could not run on this host.
+        metrics.set_gauge("profile_vpn_route_probe_ok", 1.0, &labels);
+        for reason in DownReason::ALL {
             metrics.add_counter(
                 "profile_vpn_fenced_total",
                 0,
@@ -149,6 +216,26 @@ fn seed_baselines(profiles: &ProfileRegistry, metrics: &PromSink) {
     }
 }
 
+/// Advance one profile's no-handshake clock and read it.
+///
+/// Running only while the tunnel has never handshaked **and** the profile has
+/// torrents — traffic that would have made WireGuard handshake — and started
+/// from the first poll that saw both. Anything else stops and resets it.
+fn unanswered_clock(
+    since: &mut std::collections::HashMap<torrentd_engine::ProfileId, Instant>,
+    id: &torrentd_engine::ProfileId,
+    handshake: Handshake,
+    carrying: bool,
+    now: Instant,
+) -> Duration {
+    if handshake == Handshake::Never && carrying {
+        now.saturating_duration_since(*since.entry(id.clone()).or_insert(now))
+    } else {
+        since.remove(id);
+        Duration::ZERO
+    }
+}
+
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -157,6 +244,11 @@ pub async fn run(
     mut shutdown: broadcast::Receiver<ShutdownReason>,
 ) {
     seed_baselines(&profiles, &metrics);
+    // Per profile: when a poll first saw its WireGuard tunnel never
+    // handshaked while it had torrents to carry. See
+    // `Observation::unanswered_for`.
+    let mut unanswered_since: std::collections::HashMap<torrentd_engine::ProfileId, Instant> =
+        std::collections::HashMap::new();
 
     loop {
         tokio::select! {
@@ -176,7 +268,7 @@ pub async fn run(
                 continue;
             }
 
-            // Both probes shell out. Two processes per profile per tick is
+            // The probes shell out. Three processes per profile per tick is
             // cheap, but it is still blocking work and it belongs off the
             // runtime's worker threads.
             // A host profile has no tunnel to watch.
@@ -188,12 +280,18 @@ pub async fn run(
                 let iface = iface.clone();
                 move || {
                     let ip = vpn::first_ipv4(&iface).ok().map(IpAddr::V4);
+                    // Asked from the address the interface holds now: if that
+                    // is not the bound one the address check fences first, and
+                    // with no address there is nothing to ask about.
+                    let route = ip.map(|src| {
+                        vpn::route::probe(&iface, src, IpAddr::V4(vpn::route::PROBE_DEST))
+                    });
                     let hs = is_wg.then(|| vpn::wireguard_handshake_age(&iface));
-                    (ip, hs)
+                    (ip, route, hs)
                 }
             })
             .await;
-            let (current, handshake_probe) = match probe {
+            let (current, route_probe, handshake_probe) = match probe {
                 Ok(v) => v,
                 Err(e) => {
                     error!(
@@ -208,11 +306,29 @@ pub async fn run(
             // Handshake liveness applies to WireGuard only; OpenVPN keeps the
             // IP-presence check (no cheap equivalent probe).
             let labels = [("profile_id", profile_id.as_str())];
+            let route = match route_probe {
+                Some(Ok(r)) => {
+                    metrics.set_gauge("profile_vpn_route_probe_ok", 1.0, &labels);
+                    Some(r)
+                }
+                Some(Err(why)) => {
+                    metrics.set_gauge("profile_vpn_route_probe_ok", 0.0, &labels);
+                    warn!(
+                        target: "torrentd::vpn_monitor",
+                        profile_id = %profile_id,
+                        vpn_iface = %iface,
+                        reason = why.as_str(),
+                        "route probe unavailable; the tunnel's routing is not being checked",
+                    );
+                    None
+                }
+                None => None,
+            };
             let handshake_age = if let Some(probe) = handshake_probe {
                 match probe {
                     Ok(age) => {
                         metrics.set_gauge("profile_vpn_handshake_probe_ok", 1.0, &labels);
-                        age
+                        Some(age)
                     }
                     Err(why) => {
                         // Half the liveness check is not running. It used to
@@ -235,16 +351,35 @@ pub async fn run(
                 None
             };
 
-            if let Some(age) = handshake_age {
-                metrics.set_gauge(
-                    "profile_vpn_handshake_age_seconds",
-                    age.as_secs_f64(),
-                    &labels,
-                );
-            }
+            let handshake = match handshake_age {
+                None => Handshake::NoSignal,
+                Some(None) => Handshake::Never,
+                Some(Some(age)) => {
+                    metrics.set_gauge(
+                        "profile_vpn_handshake_age_seconds",
+                        age.as_secs_f64(),
+                        &labels,
+                    );
+                    Handshake::Age(age)
+                }
+            };
+            let carrying = !state.handles_for_profile(&profile_id).is_empty();
+            let unanswered_for = unanswered_clock(
+                &mut unanswered_since,
+                &profile_id,
+                handshake,
+                carrying,
+                Instant::now(),
+            );
+            let observation = Observation {
+                current,
+                expected: health.tunnel_ip,
+                route: route.clone(),
+                handshake,
+                unanswered_for,
+            };
 
-            let reason = match evaluate(current, health.tunnel_ip, handshake_age, handshake_max_age)
-            {
+            let reason = match evaluate(&observation, handshake_max_age) {
                 Ok(()) => {
                     metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
                     continue;
@@ -299,7 +434,12 @@ pub async fn run(
                 vpn_iface = %iface,
                 tunnel_ip = current.map(|c| c.to_string()).unwrap_or_default(),
                 reason = reason.as_str(),
-                handshake_age_secs = handshake_age.map(|a| a.as_secs()).unwrap_or_default(),
+                route = match &route {
+                    Some(vpn::route::RouteProbe::Elsewhere(why)) => why.as_str(),
+                    Some(vpn::route::RouteProbe::ViaTunnel) => "via_tunnel",
+                    None => "",
+                },
+                handshake_age_secs = handshake_age.flatten().map(|a| a.as_secs()).unwrap_or_default(),
                 torrent_count = paused,
                 "VPN tunnel unhealthy; paused all profile torrents \
                  (no auto-restart — operator must intervene)",
@@ -313,6 +453,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
+    use crate::vpn::route::RouteProbe;
 
     const MAX: Duration = Duration::from_secs(180);
 
@@ -320,47 +461,164 @@ mod tests {
         Some(IpAddr::V4(Ipv4Addr::new(10, 2, 0, a)))
     }
 
+    /// A healthy WireGuard observation, one field at a time away from each
+    /// failure below.
+    fn healthy() -> Observation {
+        Observation {
+            current: ip(2),
+            expected: ip(2),
+            route: Some(RouteProbe::ViaTunnel),
+            handshake: Handshake::Age(Duration::from_secs(20)),
+            unanswered_for: Duration::ZERO,
+        }
+    }
+
     #[test]
-    fn healthy_when_ip_matches_and_handshake_fresh() {
-        assert_eq!(
-            evaluate(ip(2), ip(2), Some(Duration::from_secs(20)), MAX),
-            Ok(())
-        );
+    fn healthy_when_ip_matches_route_is_the_tunnels_and_handshake_fresh() {
+        assert_eq!(evaluate(&healthy(), MAX), Ok(()));
     }
 
     #[test]
     fn healthy_when_no_liveness_signal() {
-        // No handshake age (OpenVPN / never handshaked) → IP check alone.
-        assert_eq!(evaluate(ip(2), ip(2), None, MAX), Ok(()));
+        // OpenVPN, or a probe that could not run → the other checks alone.
+        let obs = Observation {
+            handshake: Handshake::NoSignal,
+            route: None,
+            ..healthy()
+        };
+        assert_eq!(evaluate(&obs, MAX), Ok(()));
     }
 
     #[test]
     fn down_when_ip_lost_or_changed() {
-        assert_eq!(
-            evaluate(None, ip(2), None, MAX),
-            Err(DownReason::IpLostOrChanged)
-        );
-        assert_eq!(
-            evaluate(ip(3), ip(2), Some(Duration::from_secs(1)), MAX),
-            Err(DownReason::IpLostOrChanged)
-        );
+        let lost = Observation {
+            current: None,
+            ..healthy()
+        };
+        assert_eq!(evaluate(&lost, MAX), Err(DownReason::IpLostOrChanged));
+        let changed = Observation {
+            current: ip(3),
+            ..healthy()
+        };
+        assert_eq!(evaluate(&changed, MAX), Err(DownReason::IpLostOrChanged));
     }
 
     #[test]
     fn down_when_handshake_stale_despite_matching_ip() {
-        assert_eq!(
-            evaluate(ip(2), ip(2), Some(Duration::from_secs(181)), MAX),
-            Err(DownReason::HandshakeStale)
-        );
+        let obs = Observation {
+            handshake: Handshake::Age(Duration::from_secs(181)),
+            ..healthy()
+        };
+        assert_eq!(evaluate(&obs, MAX), Err(DownReason::HandshakeStale));
     }
 
     #[test]
     fn ip_change_beats_stale_handshake() {
         // IP mismatch is reported even if the handshake is also stale.
+        let obs = Observation {
+            current: ip(3),
+            handshake: Handshake::Age(Duration::from_secs(999)),
+            ..healthy()
+        };
+        assert_eq!(evaluate(&obs, MAX), Err(DownReason::IpLostOrChanged));
+    }
+
+    /// The acceptance test for the route check: the address and the
+    /// handshake are exactly as healthy as before, and the kernel would send
+    /// the profile's traffic out of the physical interface — what `ip rule
+    /// flush` leaves behind. At a9eb5a1 the monitor did not ask, and this
+    /// profile stayed `Active`.
+    #[test]
+    fn a_route_that_no_longer_leaves_by_the_tunnel_fences() {
+        let obs = Observation {
+            route: Some(RouteProbe::Elsewhere(
+                "leaves by eth0: 1.1.1.1 from 10.2.0.2 via 192.168.1.1 dev eth0".into(),
+            )),
+            ..healthy()
+        };
+        assert_eq!(evaluate(&obs, MAX), Err(DownReason::RouteMismatch));
+        let unavailable = Observation {
+            route: None,
+            ..healthy()
+        };
         assert_eq!(
-            evaluate(ip(3), ip(2), Some(Duration::from_secs(999)), MAX),
-            Err(DownReason::IpLostOrChanged)
+            evaluate(&unavailable, MAX),
+            Ok(()),
+            "a probe that could not run is reported by its own series, not fenced on",
         );
+    }
+
+    /// The acceptance test for the no-handshake rule: a WireGuard link that
+    /// came up with an address and a route and has never handshaked. At
+    /// a9eb5a1 "never" was read as "no liveness signal" and the profile stayed
+    /// `Active` forever.
+    #[test]
+    fn a_wireguard_tunnel_that_never_handshakes_fences_once_the_threshold_passes() {
+        let fresh = Observation {
+            handshake: Handshake::Never,
+            unanswered_for: Duration::from_secs(30),
+            ..healthy()
+        };
+        assert_eq!(
+            evaluate(&fresh, MAX),
+            Ok(()),
+            "a tunnel that has just come up gets the threshold to handshake",
+        );
+        let dark = Observation {
+            unanswered_for: MAX + Duration::from_secs(1),
+            ..fresh
+        };
+        assert_eq!(evaluate(&dark, MAX), Err(DownReason::NoHandshake));
+    }
+
+    /// The clock runs only while there is traffic that should have made the
+    /// tunnel handshake. An empty profile on a fresh deployment sends nothing
+    /// into its tunnel, so WireGuard never handshakes, and fencing it would
+    /// need an operator to undo for a profile that had nothing to do.
+    #[test]
+    fn the_no_handshake_clock_runs_only_while_the_profile_has_torrents() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+        let later = t0 + Duration::from_secs(600);
+
+        assert_eq!(
+            unanswered_clock(&mut since, &id, Handshake::Never, false, t0),
+            Duration::ZERO
+        );
+        assert_eq!(
+            unanswered_clock(&mut since, &id, Handshake::Never, false, later),
+            Duration::ZERO,
+            "no torrents, however long: nothing was sent to answer",
+        );
+
+        assert_eq!(
+            unanswered_clock(&mut since, &id, Handshake::Never, true, later),
+            Duration::ZERO,
+            "starts when the first torrent is there",
+        );
+        let then = later + MAX + Duration::from_secs(1);
+        assert!(unanswered_clock(&mut since, &id, Handshake::Never, true, then) > MAX);
+
+        assert_eq!(
+            unanswered_clock(
+                &mut since,
+                &id,
+                Handshake::Age(Duration::from_secs(1)),
+                true,
+                then
+            ),
+            Duration::ZERO,
+            "a handshake resets it",
+        );
+        assert!(since.is_empty());
+    }
+
+    #[test]
+    fn every_reason_has_a_distinct_label() {
+        let labels: std::collections::BTreeSet<_> =
+            DownReason::ALL.iter().map(|r| r.as_str()).collect();
+        assert_eq!(labels.len(), DownReason::ALL.len());
     }
 
     /// The profile the baseline block used to miss, for exactly the metric it

@@ -13,6 +13,43 @@
 //! * `--writepid <file>` records the daemonised pid where `bring_down` can
 //!   read it.
 //!
+//! # Routing
+//!
+//! `openvpn` runs with `--route-noexec --pull-filter ignore redirect-gateway`:
+//! it installs **no** routes, and a server's pushed `redirect-gateway` — which
+//! would take over the host's default route and move every other process
+//! (and every other profile) into this tunnel — is dropped before it is
+//! applied. Once the tunnel has its address, the daemon installs the same
+//! per-source routing the native WireGuard path uses (`vpn::route`): a default
+//! route via the tunnel in a table of its own, and a rule sending traffic from
+//! the tunnel address to that table. The profile's sockets are bound to that
+//! address and device, so that is all they need, and nothing else on the host
+//! is rerouted.
+//!
+//! The table is `TABLE_BASE + ifindex`, and the routes in it go with the link,
+//! so the routing holds only as long as the tun device openvpn created at
+//! bring-up does. `--persist-tun` is passed for that reason: a `ping-restart`
+//! or `SIGUSR1` reconnect then keeps the device — its ifindex, its table and
+//! its routes — instead of recreating it bare, which the health monitor would
+//! read as a route mismatch and fence on every reconnect. A reconnect that
+//! recreates the device anyway (the server pushed different options) is
+//! fenced, deliberately: nothing re-installs routing behind the monitor's
+//! back.
+//!
+//! The table a bring-up routed through is recorded next to the pid file, as
+//! `openvpn-<iface>.table`, before any rule is added, together with the host's
+//! boot id: a table number is an ifindex, ifindexes restart with the kernel,
+//! and a record from an earlier boot is not believed, since its number may
+//! name a live link's table now (`recorded_table`). Teardown removes the
+//! rules pointing at that recorded table whether or not an openvpn is still
+//! running, and — when one is — those pointing at the live link's table too,
+//! before the process is signalled. So a device recreated with a new ifindex,
+//! or an openvpn that died on its own, does not leave rules behind.
+//!
+//! This assumes a routed (`tun`) device: a default route with no gateway is
+//! what a point-to-point link takes. A bridged `tap` profile would need the
+//! pushed gateway, which `--route-noexec` withholds, and is not supported.
+//!
 //! The pid is verified against `/proc/<pid>/cmdline` before it is signalled, so
 //! a stale pid file whose number has been recycled cannot make the daemon kill
 //! an unrelated process.
@@ -38,7 +75,6 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
-use std::process::Command;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -48,6 +84,45 @@ use torrentd_engine::VpnManager;
 use torrentd_engine::VpnTunnel;
 use tracing::info;
 use tracing::warn;
+
+use super::exec;
+use super::route;
+
+/// The arguments `bring_up` hands to `openvpn`, in order. Split out so the
+/// routing flags are asserted without an `openvpn` binary.
+fn openvpn_args<'a>(config: &'a str, iface: &'a str, pid_file: &'a str) -> Vec<&'a str> {
+    vec![
+        "--daemon",
+        "--config",
+        config,
+        // Authoritative, so the OpenVPN profile file cannot disagree with the
+        // profile config.
+        "--dev",
+        iface,
+        "--writepid",
+        pid_file,
+        // No routes from openvpn at all, and never the server's
+        // default-gateway redirect: routing is the daemon's, per source
+        // address (see the module docs).
+        "--route-noexec",
+        "--pull-filter",
+        "ignore",
+        "redirect-gateway",
+        // Keep the device across a reconnect: the routing below lives in a
+        // table keyed on its ifindex (see the module docs).
+        "--persist-tun",
+    ]
+}
+
+/// The tables whose rules teardown removes: the one recorded at bring-up,
+/// and the live link's, each once.
+fn tables_to_clear(recorded: Option<u32>, live: Option<u32>) -> Vec<u32> {
+    let mut tables: Vec<u32> = recorded.into_iter().collect();
+    if let Some(t) = live.filter(|t| !tables.contains(t)) {
+        tables.push(t);
+    }
+    tables
+}
 
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -62,15 +137,93 @@ const KILL_GRACE: Duration = Duration::from_secs(2);
 #[derive(Debug)]
 pub struct OpenvpnManager {
     run_dir: PathBuf,
+    /// The host's boot id, read at construction: what scopes the
+    /// `openvpn-<iface>.table` record to the boot that wrote it. `None` when
+    /// it could not be read, and then no record is believed.
+    boot_id: Option<String>,
 }
 
 impl OpenvpnManager {
     pub fn new(run_dir: PathBuf) -> Self {
-        Self { run_dir }
+        Self {
+            run_dir,
+            boot_id: super::wireguard::current_boot_id(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_boot_id(run_dir: PathBuf, boot_id: Option<&str>) -> Self {
+        Self {
+            run_dir,
+            boot_id: boot_id.map(str::to_string),
+        }
     }
 
     fn pid_file(&self, iface: &str) -> PathBuf {
         self.run_dir.join(format!("openvpn-{iface}.pid"))
+    }
+
+    /// Where the routing table a bring-up used for `iface` is recorded.
+    fn table_file(&self, iface: &str) -> PathBuf {
+        self.run_dir.join(format!("openvpn-{iface}.table"))
+    }
+
+    /// The table recorded for `iface`, if a bring-up on *this* boot of the
+    /// host recorded it.
+    ///
+    /// The record is `<boot id>\n<table>\n`. A table is `TABLE_BASE +
+    /// ifindex`, and ifindexes restart with the kernel: after a reboot the
+    /// number a dead openvpn's record names is as likely as not the table of
+    /// a live WireGuard link that took the same ifindex, and removing its
+    /// rules would have the monitor fence that healthy profile with
+    /// `route_mismatch`. So a record from another boot — or one this process
+    /// cannot scope, having no boot id — is *detected*, not trusted, as the
+    /// WireGuard `.raised` record and the pid check are. Its rules went with
+    /// the kernel that held them.
+    fn recorded_table(&self, iface: &str) -> Option<u32> {
+        let boot_id = self.boot_id.as_deref()?;
+        let text = std::fs::read_to_string(self.table_file(iface)).ok()?;
+        let mut lines = text.lines();
+        if lines.next()?.trim() != boot_id {
+            return None;
+        }
+        lines.next()?.trim().parse().ok()
+    }
+
+    /// The per-source routing an OpenVPN tunnel gets: everything, via the
+    /// tunnel, for traffic from the tunnel's own address.
+    ///
+    /// The table is recorded before the first rule goes in, so a partial
+    /// install is still found by teardown. A table left recorded by an
+    /// earlier run on this boot that never tore down has its rules removed
+    /// first; one recorded on an earlier boot is not believed
+    /// ([`Self::recorded_table`]) and is overwritten.
+    fn route_tunnel(&self, iface: &str, ip: IpAddr) -> std::io::Result<()> {
+        let table = route::table_for(iface)?;
+        if let Some(old) = self.recorded_table(iface).filter(|t| *t != table) {
+            route::remove(old);
+        }
+        std::fs::write(
+            self.table_file(iface),
+            format!("{}\n{table}\n", self.boot_id.as_deref().unwrap_or_default()),
+        )?;
+        let default = match ip {
+            IpAddr::V4(_) => "0.0.0.0/0",
+            IpAddr::V6(_) => "::/0",
+        };
+        route::install(iface, &[ip.to_string()], &[default.to_string()])
+    }
+
+    /// Remove the source-address rules this manager installed for `iface`:
+    /// those pointing at the recorded table always, and — only while `pid`
+    /// is a live openvpn on `iface`, whose link is ours — those pointing at
+    /// the live link's table. Then forget the record.
+    fn unroute(&self, iface: &str, pid: Option<u32>) {
+        let live = pid.and_then(|_| route::table_for(iface).ok());
+        for table in tables_to_clear(self.recorded_table(iface), live) {
+            route::remove(table);
+        }
+        let _ = std::fs::remove_file(self.table_file(iface));
     }
 
     /// The pid recorded for `iface`, if it is still an openvpn process running
@@ -101,15 +254,18 @@ impl OpenvpnManager {
     /// `kill` rather than libc, matching the kill switch's reason for reading
     /// /proc directly: one fewer dependency for one syscall.
     fn signal(&self, iface: &str, pid: u32, sig: &str) -> bool {
-        match Command::new("kill").arg(sig).arg(pid.to_string()).status() {
-            Ok(st) if st.success() => true,
-            Ok(st) => {
+        let pid_arg = pid.to_string();
+        match exec::run("kill", &[sig, &pid_arg], None, exec::QUICK) {
+            Ok(out) if out.status.success() => true,
+            Ok(out) => {
                 warn!(
                     target: "torrentd::vpn::openvpn",
                     vpn_iface = %iface,
                     pid,
                     signal = sig,
-                    "kill exited with {st}",
+                    "kill exited with {}: {}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr).trim(),
                 );
                 false
             }
@@ -161,20 +317,22 @@ impl VpnManager for OpenvpnManager {
             pid_file = %pid_file.display(),
             "openvpn --daemon",
         );
-        let status = Command::new("openvpn")
-            .arg("--daemon")
-            .arg("--config")
-            .arg(&profile.config_path)
-            // Authoritative, so the OpenVPN profile file cannot disagree with
-            // the profile config.
-            .arg("--dev")
-            .arg(&profile.interface)
-            .arg("--writepid")
-            .arg(&pid_file)
-            .status()
-            .map_err(VpnError::Io)?;
-        if !status.success() {
-            return Err(VpnError::Spawn(format!("openvpn exited with {status}")));
+        let iface = exec::iface(&profile.interface).map_err(VpnError::Io)?;
+        let config = profile.config_path.to_string_lossy();
+        let pid_path = pid_file.to_string_lossy();
+        let out = exec::run(
+            "openvpn",
+            &openvpn_args(&config, iface, &pid_path),
+            None,
+            exec::CHANGE,
+        )
+        .map_err(VpnError::Io)?;
+        if !out.status.success() {
+            return Err(VpnError::Spawn(format!(
+                "openvpn exited with {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim(),
+            )));
         }
 
         let deadline = Instant::now() + BRING_UP_TIMEOUT;
@@ -182,11 +340,30 @@ impl VpnManager for OpenvpnManager {
             match super::ip_lookup::first_ipv4(&profile.interface) {
                 Ok(ip) => {
                     let addr = IpAddr::V4(ip);
+                    if let Err(e) = self.route_tunnel(&profile.interface, addr) {
+                        // Without its rule the tunnel address routes by the
+                        // main table: a profile bound to it would send out of
+                        // the physical interface. What this call started is
+                        // this call's to stop.
+                        warn!(
+                            target: "torrentd::vpn::openvpn",
+                            vpn_iface = %profile.interface,
+                            tunnel_ip = %addr,
+                            error.cause = %e,
+                            "could not install the tunnel's source-address routing; \
+                             taking it down",
+                        );
+                        self.stop(&profile.interface);
+                        return Err(VpnError::RoutingFailed {
+                            iface: profile.interface.clone(),
+                            cause: e.to_string(),
+                        });
+                    }
                     info!(
                         target: "torrentd::vpn::openvpn",
                         vpn_iface = %profile.interface,
                         tunnel_ip = %addr,
-                        "openvpn tunnel up",
+                        "openvpn tunnel up, routed by source address",
                     );
                     return Ok(addr);
                 }
@@ -227,14 +404,30 @@ impl VpnManager for OpenvpnManager {
     /// process that is still running, and the next boot's `live_pid` then
     /// finds nothing — leaving an orphan no code path can ever reach again.
     fn bring_down(&self, iface: &str) {
-        let Some(pid) = self.live_pid(iface) else {
+        self.stop(iface);
+    }
+}
+
+impl OpenvpnManager {
+    /// [`VpnManager::bring_down`]'s body, also used by `bring_up` to undo a
+    /// tunnel whose routing could not be installed.
+    ///
+    /// The source-address rules go first, while the link still stands: the
+    /// live link's table is derived from its ifindex, and once openvpn has
+    /// exited there is no link to derive it from. The recorded table's rules
+    /// go even when no openvpn is left to signal — one that died on its own
+    /// leaves them otherwise.
+    fn stop(&self, iface: &str) {
+        let pid = self.live_pid(iface);
+        self.unroute(iface, pid);
+        let Some(pid) = pid else {
             // No pid file, or it does not describe a live openvpn on this
             // interface. Either the tunnel is already down or it was started
             // by something else; in both cases signalling is not ours to do.
             warn!(
                 target: "torrentd::vpn::openvpn",
                 vpn_iface = %iface,
-                "no live openvpn pid recorded for this interface; nothing to tear down",
+                "no live openvpn pid recorded for this interface; nothing to signal",
             );
             return;
         };
@@ -282,10 +475,97 @@ impl VpnManager for OpenvpnManager {
 mod tests {
     use super::*;
 
+    const BOOT: &str = "boot-a";
+
     fn mgr() -> (tempfile::TempDir, OpenvpnManager) {
         let d = tempfile::tempdir().unwrap();
-        let m = OpenvpnManager::new(d.path().to_path_buf());
+        let m = OpenvpnManager::with_boot_id(d.path().to_path_buf(), Some(BOOT));
         (d, m)
+    }
+
+    /// openvpn installs no routes and never takes the default gateway: at
+    /// a9eb5a1 a server's pushed `redirect-gateway` moved the host's default
+    /// route — every other process and every other profile — into this
+    /// tunnel. Drop either flag and this fails.
+    #[test]
+    fn openvpn_runs_with_no_routes_of_its_own_and_no_gateway_redirect() {
+        let args = openvpn_args("/etc/openvpn/a.conf", "tun-a", "/var/lib/torrentd/p.pid");
+        assert!(args.contains(&"--route-noexec"), "{args:?}");
+        let filter = args
+            .windows(3)
+            .any(|w| w == ["--pull-filter", "ignore", "redirect-gateway"]);
+        assert!(filter, "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w == ["--dev", "tun-a"]),
+            "the interface is still pinned: {args:?}"
+        );
+    }
+
+    /// A reconnect keeps the device, and with it the ifindex-keyed table and
+    /// its routes. Without `--persist-tun` a `ping-restart` recreates the tun
+    /// bare and the monitor fences the profile on every reconnect.
+    #[test]
+    fn a_reconnect_keeps_the_device_its_routing_lives_on() {
+        let args = openvpn_args("/etc/openvpn/a.conf", "tun-a", "/var/lib/torrentd/p.pid");
+        assert!(args.contains(&"--persist-tun"), "{args:?}");
+    }
+
+    /// Teardown clears the table recorded at bring-up and the live link's,
+    /// once each. A device recreated with a new ifindex makes the two differ,
+    /// and the recorded one is what still holds the bring-up's rules.
+    #[test]
+    fn teardown_clears_the_recorded_table_and_the_live_one() {
+        assert_eq!(tables_to_clear(Some(7), Some(9)), vec![7, 9]);
+        assert_eq!(tables_to_clear(Some(7), Some(7)), vec![7]);
+        assert_eq!(
+            tables_to_clear(Some(7), None),
+            vec![7],
+            "no live openvpn: the recorded table still goes",
+        );
+        assert_eq!(tables_to_clear(None, Some(9)), vec![9]);
+        assert!(tables_to_clear(None, None).is_empty());
+    }
+
+    /// An openvpn that died on its own leaves no pid to signal, and its
+    /// recorded table is still consumed: the rules pointing at it are
+    /// removed and the record forgotten, where at the head this replaces
+    /// teardown returned before touching routing at all.
+    #[test]
+    fn teardown_with_no_live_openvpn_still_unroutes_the_recorded_table() {
+        let (_d, m) = mgr();
+        // An ifindex no host has, so the `ip rule del` this runs matches
+        // nothing whatever the privilege.
+        let table = route::TABLE_BASE.wrapping_add(0xFFFE);
+        std::fs::write(m.table_file("tun0"), format!("{BOOT}\n{table}\n")).unwrap();
+        assert_eq!(m.recorded_table("tun0"), Some(table));
+        m.bring_down("tun0");
+        assert!(
+            !m.table_file("tun0").exists(),
+            "the recorded table was cleared even with nothing to signal",
+        );
+    }
+
+    /// A table recorded on an earlier boot of the host is not believed: its
+    /// number is an ifindex, and after a reboot a WireGuard link that took
+    /// the same ifindex owns that table. Believing it had `route_tunnel`
+    /// delete that link's rules and the monitor fence a healthy profile.
+    /// Drop the boot-id comparison from `recorded_table` and this fails.
+    #[test]
+    fn a_table_recorded_on_an_earlier_boot_is_not_believed() {
+        let (_d, m) = mgr();
+        let table = route::TABLE_BASE.wrapping_add(0xFFFE);
+        std::fs::write(m.table_file("tun0"), format!("boot-b\n{table}\n")).unwrap();
+        assert_eq!(m.recorded_table("tun0"), None, "another boot's record");
+
+        // The format this replaces carried the table alone.
+        std::fs::write(m.table_file("tun0"), format!("{table}\n")).unwrap();
+        assert_eq!(m.recorded_table("tun0"), None, "an unscoped record");
+
+        // A process that cannot read the boot id believes no record at all.
+        let blind = OpenvpnManager::with_boot_id(m.run_dir.clone(), None);
+        std::fs::write(m.table_file("tun0"), format!("{BOOT}\n{table}\n")).unwrap();
+        assert_eq!(blind.recorded_table("tun0"), None);
+        assert_eq!(m.recorded_table("tun0"), Some(table), "this boot's record");
     }
 
     #[test]
@@ -355,8 +635,9 @@ mod tests {
     /// The package the operator-facing record names for `kill` is the package
     /// that actually provides the binary [`OpenvpnManager::signal`] spawns.
     ///
-    /// `signal` runs `Command::new("kill")`. `Command` spawns no shell, so the
-    /// shell builtin is unreachable and `/usr/bin/kill` has to be installed as
+    /// `signal` runs `kill` through `exec::run`, which spawns it with
+    /// `std::process::Command`. `Command` spawns no shell, so the shell
+    /// builtin is unreachable and `/usr/bin/kill` has to be installed as
     /// a file. On the image `deploy/Containerfile` itself pins —
     /// `registry.fedoraproject.org/fedora-minimal:43` — `rpm -qf /usr/bin/kill`
     /// prints `util-linux-core`; `procps-ng` ships `pgrep` and `pkill` and no
@@ -418,14 +699,16 @@ mod tests {
     /// substitution yields the empty string, the `&&` chain reaches the final
     /// `cmd sysctl`, that exits 127, and `cmd_up`'s `trap 'del_if; exit' EXIT`
     /// deletes the link it has just created — so a full-tunnel
-    /// `AllowedIPs = 0.0.0.0/0` profile, the shape every commercial provider
-    /// uses, cannot come up in the image at all and the daemon exits because
-    /// no profile came up.
+    /// `AllowedIPs = 0.0.0.0/0` link, the shape every commercial provider
+    /// uses, cannot be raised with `wg-quick` in the image. The daemon no
+    /// longer runs `wg-quick` on any path; the package stays for an operator
+    /// raising a link by hand inside the image, which is the consumer this
+    /// pins.
     ///
     /// **What this does and does not establish.** It pins the install list and
     /// the recorded reason, which is what a `grep` of this repository's own
     /// source for `pkill`/`pgrep` could never have reached — the consumer is a
-    /// third binary in a tool the daemon execs. It does **not** build the
+    /// third binary in a tool outside this repository. It does **not** build the
     /// image or bring a tunnel up in it; nothing in this repository does, and
     /// that gap is what let the regression ship. Remove `procps-ng` from the
     /// install list and this fails.
@@ -441,8 +724,8 @@ mod tests {
             install.contains("procps-ng"),
             "`wg-quick` runs `sysctl` on the IPv4 default-route path under \
              `set -e`, and /usr/sbin/sysctl is procps-ng's; without it no \
-             full-tunnel WireGuard profile can come up in this image; got: \
-             {install}",
+             full-tunnel WireGuard link can be raised by hand in this image; \
+             got: {install}",
         );
         assert!(
             containerfile.contains("sysctl") && containerfile.contains("wg-quick"),
@@ -462,6 +745,10 @@ mod tests {
     /// `pgrep` call site and this fails, which is the signal that
     /// `docs/running.md` §1's prerequisite table needs a row for it — hosts
     /// that run the daemon outside this image get no install list at all.
+    ///
+    /// A call site is any string literal naming the tool, whitespace aside —
+    /// `exec::run`, `exec::run_ok`, `exec::available` and a bare `Command`
+    /// alike, however rustfmt wraps the call ([`names_tool`]).
     #[test]
     fn no_source_invokes_the_binaries_procps_ng_provides() {
         let mut offenders = Vec::new();
@@ -485,8 +772,8 @@ mod tests {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
-                for tool in ["pkill", "pgrep"] {
-                    if text.contains(&format!("Command::new(\"{tool}\")")) {
+                for tool in PROCPS_TOOLS {
+                    if names_tool(&text, tool) {
                         offenders.push(format!("{} invokes {tool}", path.display()));
                     }
                 }
@@ -497,6 +784,36 @@ mod tests {
             "the runtime image carries procps-ng for `wg-quick`'s `sysctl` and \
              not for this repository; these call its binaries, so the host \
              prerequisite table owes them a row: {offenders:?}",
+        );
+    }
+
+    /// The procps-ng binaries the guard above looks for. Split with
+    /// `concat!` so this file's own source never names them as a literal.
+    const PROCPS_TOOLS: [&str; 2] = [concat!("pk", "ill"), concat!("pg", "rep")];
+
+    /// Whether `source` names `tool` as a string literal — the program
+    /// argument of every way this repository spawns a binary.
+    fn names_tool(source: &str, tool: &str) -> bool {
+        source.contains(&format!("\"{tool}\""))
+    }
+
+    /// The guard can fail on the call shapes this repository actually uses.
+    /// At the head this replaces it matched a bare `Command::new` call
+    /// alone, and every tool now runs through `exec::run`.
+    #[test]
+    fn the_procps_guard_sees_every_way_a_tool_is_spawned() {
+        let tool = PROCPS_TOOLS[0];
+        for shape in [
+            format!("exec::run(\n        \"{tool}\",\n        &[\"-f\"],"),
+            format!("exec::run_ok(\"{tool}\", &[], None, exec::QUICK)"),
+            format!("exec::available(\"{tool}\", \"--version\")"),
+            format!("Command::new(\"{tool}\")"),
+        ] {
+            assert!(names_tool(&shape, tool), "missed: {shape}");
+        }
+        assert!(
+            !names_tool("`pkill` in a doc comment", tool),
+            "prose is not a call site",
         );
     }
 }
