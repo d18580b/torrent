@@ -866,6 +866,302 @@ fn children_lists_directories_before_files() {
     );
 }
 
+/// The rollup of `prefix` computed the slow way, file by file, from what the
+/// index says: the definition the materialised tree has to agree with.
+fn rollup_by_walking(
+    store: &PoolStore,
+    root_id: i64,
+    files: &[(&str, u64)],
+    prefix: &str,
+) -> torrentd_pool::DirRollup {
+    let under = |p: &str| prefix.is_empty() || p.starts_with(&format!("{prefix}/"));
+    let mut r = torrentd_pool::DirRollup::default();
+    for (path, size) in files.iter().filter(|(p, _)| under(p)) {
+        r.bytes_total += size;
+        r.files_total += 1;
+        let claimants: Vec<AdoptionState> = store
+            .states_under(root_id, path)
+            .unwrap()
+            .into_iter()
+            .collect();
+        if claimants.is_empty() {
+            r.bytes_orphan += size;
+            r.files_orphan += 1;
+        }
+    }
+    // One claimant per file in this fixture, so the per-state sums are the
+    // files' sizes by their one claimant's state.
+    for (path, size) in files.iter().filter(|(p, _)| under(p)) {
+        let states = store.states_under(root_id, path).unwrap();
+        if states.contains(&AdoptionState::Adopted) {
+            r.bytes_adopted += size;
+        }
+        if states.contains(&AdoptionState::Matched) {
+            r.bytes_matched += size;
+        }
+    }
+    r
+}
+
+#[test]
+fn the_materialised_tree_agrees_with_the_files_and_follows_adoption_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let files: &[(&str, u64)] = &[
+        ("a/x/1.bin", 10),
+        ("a/x/2.bin", 20),
+        ("a/y/3.bin", 40),
+        ("a/4.bin", 80),
+        ("b/5.bin", 160),
+        ("top.bin", 320),
+    ];
+    for (p, s) in files {
+        write_file(root, p, *s as usize);
+    }
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "aa",
+        "x",
+        Some(&format!("{}/a", root.display())),
+        &[("x/1.bin", 10), ("x/2.bin", 20)],
+    );
+    add_torrent(
+        &mut store,
+        "bb",
+        "b",
+        Some(&root.display().to_string()),
+        &[("b/5.bin", 160)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
+
+    for prefix in ["", "a", "a/x", "a/y", "b", "nowhere"] {
+        assert_eq!(
+            store.rollup(root_id, prefix).unwrap(),
+            rollup_by_walking(&store, root_id, files, prefix),
+            "{prefix:?}",
+        );
+    }
+    assert_eq!(store.file_count().unwrap(), files.len() as u64);
+
+    // An adoption moves bytes from matched to adopted with no rebuild: the
+    // per-state figures are joined to the live state, not stored.
+    store
+        .set_adoption("aa", AdoptionState::Adopted, None, None, None, None, None)
+        .unwrap();
+    let a = store.rollup(root_id, "a").unwrap();
+    assert_eq!((a.bytes_adopted, a.bytes_matched), (30, 0));
+    assert_eq!(store.rollup(root_id, "").unwrap().bytes_matched, 160);
+    assert_eq!(
+        store.states_under(root_id, "a").unwrap(),
+        vec![AdoptionState::Adopted]
+    );
+    assert_eq!(
+        store.states_under(root_id, "a/x/1.bin").unwrap(),
+        vec![AdoptionState::Adopted],
+        "a file's own claimants",
+    );
+    assert!(store.states_under(root_id, "a/4.bin").unwrap().is_empty());
+}
+
+#[test]
+fn children_page_resumes_after_a_cursor_and_keeps_only_orphans_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for p in ["d1/f", "d2/f", "d3/f", "f1", "f2", "f3"] {
+        write_file(root, p, 1);
+    }
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "cc",
+        "d2",
+        Some(&root.display().to_string()),
+        &[("d2/f", 1)],
+    );
+    add_torrent(
+        &mut store,
+        "dd",
+        "f2",
+        Some(&root.display().to_string()),
+        &[("f2", 1)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    let page = |after, limit, orphans| {
+        store
+            .children_page(root_id, "", after, limit, orphans)
+            .unwrap()
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(page(None, 2, false), ["d1", "d2"]);
+    assert_eq!(page(Some((true, "d2")), 2, false), ["d3", "f1"]);
+    assert_eq!(page(Some((false, "f1")), 5, false), ["f2", "f3"]);
+    assert_eq!(page(None, 10, true), ["d1", "d3", "f1", "f3"]);
+    assert_eq!(page(Some((true, "d3")), 10, true), ["f1", "f3"]);
+    assert_eq!(
+        store.children_page(root_id, "d1", None, 10, false).unwrap(),
+        [("d1/f".to_owned(), false)],
+    );
+}
+
+#[test]
+fn torrents_page_is_keyset_paged_in_infohash_order_and_filters_by_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "m/a.bin", 5);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    let base = root.display().to_string();
+    add_torrent(&mut store, "03", "m", Some(&base), &[("m/a.bin", 5)]);
+    add_torrent(&mut store, "01", "gone", Some(&base), &[("gone/x", 9)]);
+    add_torrent(&mut store, "02", "gone2", Some(&base), &[("gone2/x", 9)]);
+    // Never matched: no adoption row, listed only without a state filter.
+    torrentd_pool::match_all(&mut store).unwrap();
+    add_torrent(&mut store, "04", "new", None, &[("new/x", 1)]);
+
+    let ids = |rows: Vec<torrentd_pool::store::TorrentListing>| {
+        rows.into_iter()
+            .map(|r| (r.torrent.infohash, r.state))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        ids(store.torrents_page(None, None, 2).unwrap()),
+        [
+            ("01".to_owned(), Some(AdoptionState::Missing)),
+            ("02".to_owned(), Some(AdoptionState::Missing)),
+        ],
+    );
+    assert_eq!(
+        ids(store.torrents_page(Some("02"), None, 10).unwrap()),
+        [
+            ("03".to_owned(), Some(AdoptionState::Matched)),
+            ("04".to_owned(), None),
+        ],
+    );
+    assert_eq!(
+        ids(store
+            .torrents_page(Some("01"), Some(AdoptionState::Missing), 10)
+            .unwrap()),
+        [("02".to_owned(), Some(AdoptionState::Missing))],
+    );
+    let matched = store
+        .torrents_page(None, Some(AdoptionState::Matched), 10)
+        .unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].base_rel.as_deref(), Some(""));
+}
+
+#[test]
+fn a_root_larger_than_one_staging_batch_is_indexed_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let n = torrentd_pool::store::STAGE_BATCH + 7;
+    for i in 0..n {
+        let p = root.join(format!("d{}/f{i}", i % 13));
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, b"").unwrap();
+    }
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    let stats = torrentd_pool::scan_root(&mut store, root).unwrap();
+    assert_eq!(stats.files_indexed, n as u64);
+    assert_eq!(store.file_count().unwrap(), n as u64);
+    assert_eq!(store.children(root_id, "").unwrap().len(), 13);
+
+    // A rescan replaces the root rather than adding to it.
+    std::fs::remove_file(root.join("d0/f0")).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    assert_eq!(store.file_count().unwrap(), n as u64 - 1);
+    assert!(store.file(root_id, "d0/f0").unwrap().is_none());
+}
+
+#[test]
+fn a_v4_index_migrates_to_the_materialised_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    let root = dir.path().join("root");
+    write_file(&root, "a/b/c.bin", 3);
+    write_file(&root, "top.bin", 4);
+    {
+        let mut store = PoolStore::open(&db).unwrap();
+        store.upsert_root(&root).unwrap();
+        torrentd_pool::scan_root(&mut store, &root).unwrap();
+    }
+    // Take the file back to what a v4 build wrote: no `parent`, no tree.
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "DROP INDEX file_by_parent;
+             DROP INDEX adoption_by_state_infohash;
+             ALTER TABLE file DROP COLUMN parent;
+             DROP TABLE dir;
+             DROP TABLE dir_claim;
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    }
+
+    let store = PoolStore::open(&db).unwrap();
+    assert_eq!(user_version(&db), 5);
+    let root_id = store.root_id(&root).unwrap();
+    assert_eq!(
+        store.children(root_id, "").unwrap(),
+        [("a".to_owned(), true), ("top.bin".to_owned(), false)],
+    );
+    assert_eq!(
+        store.children(root_id, "a/b").unwrap(),
+        [("a/b/c.bin".to_owned(), false)],
+        "each file's directory is derived from its path",
+    );
+    let all = store.rollup(root_id, "").unwrap();
+    assert_eq!(
+        (all.files_total, all.bytes_total, all.bytes_orphan),
+        (2, 7, 7)
+    );
+}
+
+#[test]
+fn a_read_only_connection_sees_the_last_commit_while_a_writer_holds_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    let root = dir.path().join("root");
+    write_file(&root, "a.bin", 1);
+    let mut writer = PoolStore::open(&db).unwrap();
+    let root_id = writer.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut writer, &root).unwrap();
+    let reader = PoolStore::open_read_only(&db).unwrap();
+
+    write_file(&root, "b.bin", 1);
+    writer
+        .in_transaction(|w| -> Result<(), torrentd_pool::PoolError> {
+            torrentd_pool::scan_root(w, &root)?;
+            // Mid-transaction: the reader is not blocked, and reads the index
+            // as it stood before the transaction began.
+            let seen = reader.read_snapshot(|r| r.file_count()).unwrap().unwrap();
+            assert_eq!(seen, 1);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        reader.read_snapshot(|r| r.file_count()).unwrap().unwrap(),
+        2
+    );
+    assert!(
+        reader.upsert_root(&root).is_err(),
+        "the reader refuses to write"
+    );
+    assert_eq!(reader.children(root_id, "").unwrap().len(), 2);
+}
+
 // ---------------------------------------------------------------------------
 // registry fold-in
 // ---------------------------------------------------------------------------
@@ -2194,8 +2490,8 @@ fn a_b28a778_index_opens_and_keeps_its_journal() {
 
     assert_eq!(
         user_version(&db),
-        4,
-        "the version must now agree with the schema the file already had, plus v4",
+        5,
+        "the version must now agree with the schema the file already had, plus v4 and v5",
     );
     let cols = torrent_columns(&db);
     assert!(
@@ -2297,7 +2593,7 @@ fn a_half_applied_v3_index_gains_the_index_the_lost_statement_would_have_made() 
     let store = PoolStore::open(&db).expect("a half-applied v3 opens");
     drop(store);
 
-    assert_eq!(user_version(&db), 4, "the version agrees with the schema");
+    assert_eq!(user_version(&db), 5, "the version agrees with the schema");
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -2355,7 +2651,7 @@ fn a_half_applied_v3_index_loses_the_index_name_the_rename_left_mislabelled() {
 
     PoolStore::open(&db).expect("a half-applied v3 opens");
 
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -2407,7 +2703,7 @@ fn a_stamped_v3_index_with_no_index_on_profile_is_still_repaired() {
 
     PoolStore::open(&db).expect("a stamped v3 opens");
 
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -2447,7 +2743,7 @@ fn a_stamped_v3_index_still_carrying_torrent_by_slot_is_repaired() {
 
     PoolStore::open(&db).expect("a stamped v3 opens");
 
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
     let idx = torrent_indexes(&db);
     assert!(
         idx.iter().any(|n| n == "torrent_by_profile"),
@@ -2504,8 +2800,8 @@ fn a_complete_v3_schema_left_at_version_0_or_1_is_stamped_rather_than_wedged() {
 
         assert_eq!(
             user_version(&db),
-            4,
-            "stamped to the v3 it already is, then stepped to v4"
+            5,
+            "stamped to the v3 it already is, then stepped to v4 and v5"
         );
         let idx = torrent_indexes(&db);
         assert!(
@@ -2625,7 +2921,7 @@ fn a_file_carrying_both_v3_indexes_loses_torrent_by_slot_at_any_version() {
 
         PoolStore::open(&db).expect("a file with both indexes must open");
 
-        assert_eq!(user_version(&db), 4);
+        assert_eq!(user_version(&db), 5);
         let idx = torrent_indexes(&db);
         assert!(
             idx.iter().any(|n| n == "torrent_by_profile"),
@@ -2667,7 +2963,7 @@ fn an_ordinary_v3_index_is_opened_without_touching_it() {
 
     PoolStore::open(&db).expect("a second open is an ordinary v3 open");
 
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
     assert_eq!(torrent_indexes(&db), before, "nothing may be rebuilt here");
     assert!(
         !backup.exists(),
@@ -2688,7 +2984,7 @@ fn a_genuine_v2_index_is_still_migrated_by_the_version_keyed_step() {
 
     PoolStore::open(&db).expect("a genuine v2 index migrates forward");
 
-    assert_eq!(user_version(&db), 4);
+    assert_eq!(user_version(&db), 5);
     let cols = torrent_columns(&db);
     assert!(
         cols.iter().any(|c| c == "profile") && !cols.iter().any(|c| c == "slot"),
@@ -2860,7 +3156,7 @@ fn a_real_backup_already_at_the_path_is_replaced_by_a_fresh_copy_once_the_migrat
 
     PoolStore::open(&db).expect("the migration runs");
 
-    assert_eq!(user_version(&db), 4, "the migration really ran");
+    assert_eq!(user_version(&db), 5, "the migration really ran");
     assert_eq!(
         user_version(&backup),
         2,

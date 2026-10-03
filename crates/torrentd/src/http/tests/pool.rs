@@ -130,6 +130,9 @@ fn fixture(dir: &Path, allow_mutations: bool) -> (Arc<PoolService>, i64) {
             ],
         )
         .unwrap();
+        // What the matcher ends with, since this stands in for it: the
+        // materialised tree is read off the claim set.
+        st.rebuild_all_rollups().unwrap();
     });
     (pool, root_id)
 }
@@ -1300,8 +1303,9 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     let root_id = pool.roots()[0].0;
     const BAD: &str = "not-an-infohash";
     pool.with_store_mut(|st| {
-        // Two files whose sizes sum past `i64::MAX`: SQLite refuses the
-        // rollup with an integer overflow.
+        // Two files whose sizes sum past `i64::MAX`. The materialised tree
+        // saturates rather than failing the scan over them; the reads fail
+        // on the corrupt rows written below.
         let huge = |rel: &str, ino| PoolFile {
             root_id,
             rel_path: rel.to_owned(),
@@ -1332,6 +1336,16 @@ async fn internal_failures(cov: &Arc<Coverage>) {
         // A plan of a kind this build has no name for.
         st.create_plan("bogus", "{}", 0).unwrap();
     });
+    // Directory rows whose byte total does not read back as a number, as a
+    // corrupt index would hold: the overview and both listings fail to load
+    // the accounting.
+    rusqlite::Connection::open(dir.path().join("pool.db"))
+        .unwrap()
+        .execute(
+            "UPDATE dir SET bytes_total = 'corrupt' WHERE root_id = ?1",
+            [root_id],
+        )
+        .unwrap();
     let bogus_plan = pool
         .with_store(|st| st.plans())
         .unwrap()
