@@ -48,12 +48,24 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     // shows — the state an operator acts on first — and if
                     // the disk error is still there when it resumes, the
                     // alert fires again.
+                    //
+                    // `downloading_metadata` and `downloading` have phases of
+                    // their own. Folding them into whatever came before left a
+                    // torrent whose check found pieces missing reporting
+                    // `Checking` forever, and the disk-error retry, which waits
+                    // out a check, deferring for as long. A torrent that was
+                    // `DiskError` or `Errored` stays so through them: neither
+                    // says the error cleared.
                     let flags = TorrentFlags::from_bits_truncate(s.flags);
+                    let sticky =
+                        matches!(st.phase, TorrentPhase::DiskError | TorrentPhase::Errored);
                     let phase = if flags.contains(TorrentFlags::PAUSED) {
                         TorrentPhase::Paused
                     } else {
                         match s.state {
-                            1 | 7 => TorrentPhase::Checking,
+                            0 | 1 | 7 => TorrentPhase::Checking,
+                            2 if !sticky => TorrentPhase::AwaitingMetadata,
+                            3 if !sticky => TorrentPhase::Incomplete,
                             4 | 5 => {
                                 if s.is_seeding {
                                     TorrentPhase::Seeding
@@ -61,9 +73,10 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                                     TorrentPhase::Idle
                                 }
                             }
-                            // Preserve the current phase; other states are not
-                            // seeder-relevant. `DiskError` and `Errored` are
-                            // set by the error handler and must survive here.
+                            // Preserve the current phase: `allocating` says
+                            // nothing a seeder acts on, and `DiskError` and
+                            // `Errored` are set by the error handler and must
+                            // survive here.
                             _ => st.phase,
                         }
                     };
@@ -249,6 +262,62 @@ mod tests {
         let st = state.get(&ih(0x66)).unwrap();
         assert!(!st.has_error);
         assert_eq!(st.phase, TorrentPhase::Seeding);
+    }
+
+    /// libtorrent's `downloading_metadata` and `downloading` get phases of
+    /// their own rather than inheriting the one before. A torrent whose check
+    /// found pieces missing used to report `Checking` for good.
+    #[test]
+    fn metadata_and_missing_pieces_have_their_own_phases() {
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        let h = TorrentHandle {
+            id: 4,
+            infohash: ih(0x77),
+        };
+        seed_state(&state, h);
+        let update = |lt_state: u32| Alert::StateUpdate {
+            hdr: AlertHeader {
+                kind: AlertKind::StateUpdate,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            statuses: vec![TorrentStatusView {
+                handle: h,
+                state: lt_state,
+                flags: TorrentFlags::UPLOAD_MODE.bits(),
+                total_uploaded: 0,
+                total_payload_uploaded: 0,
+                upload_rate: 0,
+                download_rate: 0,
+                num_peers: 0,
+                num_seeds: 0,
+                num_connections: 0,
+                progress: 0.5,
+                has_metadata: lt_state != 2,
+                needs_save_resume: false,
+                is_finished: false,
+                is_seeding: false,
+                has_error: false,
+            }],
+        };
+        let phase = |state: &StateMap| state.get(&ih(0x77)).unwrap().phase;
+
+        dispatch(&update(2), &state, &metrics);
+        assert_eq!(phase(&state), TorrentPhase::AwaitingMetadata);
+        dispatch(&update(1), &state, &metrics);
+        assert_eq!(phase(&state), TorrentPhase::Checking);
+        // The check found pieces missing.
+        dispatch(&update(3), &state, &metrics);
+        assert_eq!(phase(&state), TorrentPhase::Incomplete);
+
+        // An error the handlers recorded is not cleared by either.
+        for (sticky, lt_state) in [(TorrentPhase::DiskError, 3), (TorrentPhase::Errored, 2)] {
+            state.update(&ih(0x77), |st| st.phase = sticky);
+            dispatch(&update(lt_state), &state, &metrics);
+            assert_eq!(phase(&state), sticky);
+        }
     }
 
     #[test]

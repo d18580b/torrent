@@ -5,11 +5,9 @@
 //! matcher got it right *before* anything is handed to a session.
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::path::PathBuf;
 
 use anyhow::Context;
-use torrentd_engine::ProfileId;
+use torrentd_engine::AssignmentRegistry;
 use torrentd_pool::model::AdoptionState;
 use torrentd_pool::PoolStore;
 
@@ -65,7 +63,7 @@ fn scan_inner(
     errors += lib.errors;
 
     if pool_cfg.import_legacy_registry {
-        import_legacy(store, &legacy_import_path(cfg))?;
+        import_legacy(store, &open_registry(cfg)?)?;
     }
 
     let m = torrentd_pool::match_all(store)?;
@@ -179,66 +177,50 @@ pub fn orphans(cfg: &Config, limit: usize) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Which assignment file `pool scan` folds into the index.
+/// Open the assignment registry exactly as the daemon's boot does.
 ///
-/// The pre-rename file where that is the only one present, and the current one
-/// otherwise. An operator upgrading a slot-era deployment runs `pool scan`
-/// before ever starting the new daemon — it is the documented first migration
-/// step — so `slot_assignments.json` is on disk and `profile_assignments.json`
-/// is not, and may never be. Passing the post-rename name folded zero
-/// assignments in, reported success, and left every row in `GET /v1/pool`
-/// with no owning profile, recoverable only by booting the daemon once to
-/// trigger the rename and re-scanning.
+/// The same path and the same one-time JSON import, through the same door. An
+/// operator upgrading a slot-era deployment runs `pool scan` before ever
+/// starting the new daemon — it is the documented first migration step — so
+/// `slot_assignments.json` may be the only assignment file on disk. Reading
+/// any one fixed name folded zero assignments in, reported success, and left
+/// every row in `GET /v1/pool` with no owning profile. Opening the registry
+/// finds whichever file the daemon would, and a file the daemon refuses to
+/// boot on (an unusable profile id) fails the scan the same way rather than
+/// writing those ids into the pool index.
 ///
-/// `legacy_registry_path` already encodes the precedence rule
-/// (`legacy.exists() && !registry_path().exists()`); a second, differently
-/// worded copy of it here is the duplication this change removes elsewhere.
-fn legacy_import_path(cfg: &Config) -> PathBuf {
-    cfg.legacy_registry_path()
-        .unwrap_or_else(|| cfg.registry_path())
+/// Opening performs the import the daemon's first boot would, renaming the
+/// JSON file it read; that step is idempotent, so which of the two runs first
+/// does not matter.
+fn open_registry(cfg: &Config) -> anyhow::Result<AssignmentRegistry> {
+    let db = cfg.registry_path();
+    AssignmentRegistry::open(&db, cfg.registry_import())
+        .with_context(|| format!("open the assignment registry at {}", db.display()))
 }
 
-/// Fold an assignment file into the index.
+/// Fold the registry's assignments into the index.
 ///
 /// Says what it did in every case. Returning `Ok(())` in silence when the
-/// file was absent or held nothing is indistinguishable, from the operator's
-/// side, from a successful import — and the case that produces it is an
-/// upgrade where the assignments really are somewhere else.
-fn import_legacy(store: &mut PoolStore, registry_path: &Path) -> anyhow::Result<()> {
-    let Ok(bytes) = std::fs::read(registry_path) else {
-        println!(
-            "  no assignment file at {} — nothing to import",
-            registry_path.display(),
-        );
-        return Ok(());
-    };
-    if bytes.is_empty() {
-        println!("  {} is empty — nothing to import", registry_path.display());
+/// registry held nothing is indistinguishable, from the operator's side, from
+/// a successful import — and the case that produces it is an upgrade where
+/// the assignments really are somewhere else.
+fn import_legacy(store: &mut PoolStore, registry: &AssignmentRegistry) -> anyhow::Result<()> {
+    let from = registry.source_path().display().to_string();
+    if registry.is_empty() {
+        println!("  the assignment registry at {from} is empty — nothing to import");
         return Ok(());
     }
-    // Parse the values through `ProfileId`, exactly as the daemon does.
-    //
-    // Reading them as bare `String` here meant the scan succeeded on a file
-    // `AssignmentRegistry::load_inner` refuses to boot on, so the two commands
-    // disagreed about whether one file was loadable — and the one that said
-    // yes wrote those ids into the pool index. The same door, or it is not a
-    // door.
-    let parsed: HashMap<String, ProfileId> = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse {}", registry_path.display()))?;
-    let raw: HashMap<String, String> = parsed
+    let raw: HashMap<String, String> = registry
+        .entries()
         .into_iter()
-        .map(|(ih, id)| (ih, id.as_str().to_string()))
+        .map(|(ih, id)| (ih.to_hex(), id.as_str().to_string()))
         .collect();
     let n = store.import_legacy_registry(&raw)?;
     if n > 0 {
-        println!(
-            "  imported {n} profile assignments from {}",
-            registry_path.display(),
-        );
+        println!("  imported {n} profile assignments from {from}");
     } else {
         println!(
-            "  {} added no assignments ({} entries, all already in the index)",
-            registry_path.display(),
+            "  {from} added no assignments ({} entries, all already in the index)",
             raw.len(),
         );
     }
@@ -291,6 +273,8 @@ fn human_bytes(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     /// A config whose `state_dir` is `dir`.
@@ -322,38 +306,44 @@ listen_interfaces = "0.0.0.0:6881"
         // back with no owning profile.
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_rooted_at(dir.path());
-        std::fs::write(dir.path().join("slot_assignments.json"), "{}").unwrap();
-
-        assert_eq!(
-            legacy_import_path(&cfg),
+        std::fs::write(
             dir.path().join("slot_assignments.json"),
-        );
+            r#"{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":"public"}"#,
+        )
+        .unwrap();
+
+        let registry = open_registry(&cfg).unwrap();
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.path(), dir.path().join("registry.db"));
     }
 
     #[test]
-    fn a_migrated_deployment_reads_the_current_assignment_file() {
-        // Once the new file exists it is the authority and the old one is
-        // only a rollback copy. `legacy_registry_path`'s own precedence rule
-        // decides this; there is no second copy of that rule here.
+    fn a_migrated_deployment_reads_the_database_it_left_behind() {
+        // The import renamed the JSON file on the run that did it, so a later
+        // scan — or the daemon's boot — reads the database and nothing else.
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_rooted_at(dir.path());
-        std::fs::write(dir.path().join("slot_assignments.json"), "{}").unwrap();
-        std::fs::write(dir.path().join("profile_assignments.json"), "{}").unwrap();
-
-        assert_eq!(
-            legacy_import_path(&cfg),
+        std::fs::write(
             dir.path().join("profile_assignments.json"),
-        );
+            r#"{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":"public"}"#,
+        )
+        .unwrap();
+        drop(open_registry(&cfg).unwrap());
+        assert!(!dir.path().join("profile_assignments.json").exists());
+
+        assert_eq!(open_registry(&cfg).unwrap().len(), 1);
     }
 
     #[test]
-    fn a_deployment_with_no_assignment_file_at_all_names_the_current_one() {
+    fn a_registry_file_the_daemon_refuses_fails_the_scan_too() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_rooted_at(dir.path());
-        assert_eq!(
-            legacy_import_path(&cfg),
+        std::fs::write(
             dir.path().join("profile_assignments.json"),
-        );
+            r#"{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa":"../.."}"#,
+        )
+        .unwrap();
+        assert!(open_registry(&cfg).is_err());
     }
 
     #[test]

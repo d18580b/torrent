@@ -63,14 +63,21 @@ pub enum AddParams {
 }
 
 impl AddParams {
-    /// Re-add from resume data with no overrides — the common restart path.
+    /// Re-add from resume data with no relocation and no `.torrent` — the
+    /// plain restart path. Asserts `UPLOAD_MODE` and clears every flag that
+    /// could lift it, as the shim does on every add anyway: a constructor that
+    /// reads as "no overrides" must not be the one path that says otherwise.
     pub fn resume(bytes: Vec<u8>) -> Self {
         Self::Resume {
             bytes,
             torrent: None,
             save_path: None,
-            flags_set: TorrentFlags::empty(),
-            flags_clear: TorrentFlags::empty(),
+            flags_set: TorrentFlags::UPLOAD_MODE,
+            flags_clear: TorrentFlags::AUTO_MANAGED
+                | TorrentFlags::SHARE_MODE
+                | TorrentFlags::SUPER_SEEDING
+                | TorrentFlags::SEQUENTIAL_DOWNLOAD
+                | TorrentFlags::STOP_WHEN_READY,
         }
     }
 }
@@ -421,6 +428,16 @@ impl Session {
     /// The torrent's files in index order, or `None` while its metadata has
     /// not arrived yet (a magnet still fetching it).
     pub fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>> {
+        self.torrent_files_raw(h).map(RawFileList::into_files)
+    }
+
+    /// The torrent's files as the shim returned them, unconverted.
+    ///
+    /// Converting is a copy of every path, up to `LT_MAX_TORRENT_FILES` of
+    /// them, and needs nothing from the session. A caller that serialises
+    /// session access behind a lock takes this under the lock and calls
+    /// [`RawFileList::into_files`] after releasing it.
+    pub fn torrent_files_raw(&self, h: TorrentHandle) -> Result<RawFileList> {
         let mut list = FileListGuard::new();
         let mut err = ErrBuf::new();
         let rc = unsafe {
@@ -435,15 +452,7 @@ impl Session {
         if rc != ffi::LT_OK as i32 {
             return Err(query_error(h, err));
         }
-        if list.0.has_metadata == 0 {
-            return Ok(None);
-        }
-        Ok(Some(
-            (0u32..)
-                .zip(list.entries())
-                .map(|(i, f)| TorrentFile::from_raw(i, f))
-                .collect(),
-        ))
+        Ok(RawFileList(list))
     }
 
     /// The torrent's trackers, tier by tier, with their announce state.
@@ -501,11 +510,52 @@ impl Session {
     /// Convenience for the engine's poll thread; equivalent to calling
     /// `pop_alert` in a loop until it returns None.
     pub fn drain_alerts(&self) -> Vec<Alert> {
+        self.drain_alerts_up_to(usize::MAX)
+    }
+
+    /// Drain at most `max` queued alerts. Whatever is left stays queued for
+    /// the next call, so a caller holding a lock across this bounds how long
+    /// it holds it.
+    pub fn drain_alerts_up_to(&self, max: usize) -> Vec<Alert> {
         let mut out = Vec::new();
-        while let Some(a) = self.pop_alert() {
-            out.push(a);
+        while out.len() < max {
+            match self.pop_alert() {
+                Some(a) => out.push(a),
+                None => break,
+            }
         }
         out
+    }
+}
+
+/// A torrent's file list as the shim filled it, owned until dropped.
+///
+/// Not `Send`: it owns a buffer the shim allocated, and nothing here needs to
+/// move it across threads.
+pub struct RawFileList(FileListGuard);
+
+impl std::fmt::Debug for RawFileList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawFileList")
+            .field("has_metadata", &(self.0 .0.has_metadata != 0))
+            .field("num_files", &self.0.entries().len())
+            .finish()
+    }
+}
+
+impl RawFileList {
+    /// The files in index order, or `None` while the torrent's metadata has
+    /// not arrived.
+    pub fn into_files(self) -> Option<Vec<TorrentFile>> {
+        if self.0 .0.has_metadata == 0 {
+            return None;
+        }
+        Some(
+            (0u32..)
+                .zip(self.0.entries())
+                .map(|(i, f)| TorrentFile::from_raw(i, f))
+                .collect(),
+        )
     }
 }
 

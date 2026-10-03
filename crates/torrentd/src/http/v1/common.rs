@@ -135,6 +135,27 @@ impl ProfileProblem {
     }
 }
 
+/// Run synchronous engine work on tokio's blocking pool.
+///
+/// Every call into a real session takes that session's lock, and the alert
+/// loop holds it while it drains a batch, so an engine call made on an async
+/// worker parks the worker — and every request queued on it — until the drain
+/// ends. A panic in `f` resumes in the caller, exactly as it would have run
+/// inline.
+pub async fn blocking<T, F>(f: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(v) => v,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // Only a runtime shutting down cancels a blocking task, and then the
+        // request that awaited it is being torn down with it.
+        Err(e) => panic!("engine task did not run: {e}"),
+    }
+}
+
 /// The engine of a live profile, or why there is none.
 ///
 /// A failed profile is `Unavailable`, never `NotFound`: telling an operator

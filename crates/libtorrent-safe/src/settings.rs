@@ -23,6 +23,10 @@ bitflags::bitflags! {
         const PAUSED          = ffi::LT_TF_PAUSED;
         const UPLOAD_MODE     = ffi::LT_TF_UPLOAD_MODE;
         const APPLY_IP_FILTER = ffi::LT_TF_APPLY_IP_FILTER;
+        const SHARE_MODE      = ffi::LT_TF_SHARE_MODE;
+        const SUPER_SEEDING   = ffi::LT_TF_SUPER_SEEDING;
+        const SEQUENTIAL_DOWNLOAD = ffi::LT_TF_SEQUENTIAL_DOWNLOAD;
+        const STOP_WHEN_READY = ffi::LT_TF_STOP_WHEN_READY;
     }
 
     /// Flags for `lt_save_resume_data`.
@@ -99,6 +103,12 @@ pub struct Settings {
     pub aio_threads: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub no_atime_storage: Option<bool>,
+    /// Seconds after which libtorrent takes an *auto-managed* torrent out of
+    /// upload mode to retry its disk. No torrent here is auto-managed (the
+    /// shim clears the flag on every add), so this only matters to a test
+    /// proving that: it shortens the window from the default ten minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub optimistic_disk_retry: Option<u32>,
     /// Shim pseudo-setting (serialized as `_disabled_disk_io`, not a libtorrent
     /// `settings_pack` entry): build the session with libtorrent's no-op disk
     /// backend (`disabled_disk_io_constructor`). All reads return zero-filled
@@ -107,6 +117,15 @@ pub struct Settings {
     /// daemon.
     #[serde(rename = "_disabled_disk_io", skip_serializing_if = "Option::is_none")]
     pub disabled_disk_io: Option<bool>,
+
+    // ---- Alerts ----
+    /// Shim pseudo-setting (serialized as `_alert_logs`): subscribe the
+    /// session to libtorrent's `session_log` and `torrent_log` alert
+    /// categories. Off, or unset at construction, they are not posted at all:
+    /// they are the bulk of all alert traffic and feed nothing but debug log
+    /// lines. Unset on a reload leaves the session's subscription as it was.
+    #[serde(rename = "_alert_logs", skip_serializing_if = "Option::is_none")]
+    pub alert_logs: Option<bool>,
 
     // ---- Discovery toggles ----
     #[serde(skip_serializing_if = "Option::is_none")]

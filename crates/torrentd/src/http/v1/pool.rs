@@ -1271,28 +1271,34 @@ pub async fn verify_pool_torrents(
 ) -> Result<Accepted<Json<VerifyResult>>, VerifyError> {
     s.pool.as_ref().ok_or(VerifyError::PoolNotConfigured)?;
     req.validate()?;
-    let mut resp = VerifyResult {
-        requested: count(req.infohashes.len()),
-        started: Vec::new(),
-        skipped: Vec::new(),
-    };
-    for infohash in req.infohashes {
-        let skip = |resp: &mut VerifyResult, reason: String| {
-            resp.skipped.push(RefusedTorrent { infohash, reason });
+    // On the blocking pool: each recheck takes its session's lock, and a
+    // request may name thousands of torrents.
+    let resp = crate::http::v1::common::blocking(move || {
+        let mut resp = VerifyResult {
+            requested: count(req.infohashes.len()),
+            started: Vec::new(),
+            skipped: Vec::new(),
         };
-        let Some(st) = s.state.get(&infohash.get()) else {
-            skip(&mut resp, "not loaded in any session".to_owned());
-            continue;
-        };
-        let Some(engine) = s.source.engine_for(&st.profile_id) else {
-            skip(&mut resp, "engine missing".to_owned());
-            continue;
-        };
-        match engine.force_recheck(st.handle) {
-            Ok(()) => resp.started.push(infohash),
-            Err(e) => skip(&mut resp, e.to_string()),
+        for infohash in req.infohashes {
+            let skip = |resp: &mut VerifyResult, reason: String| {
+                resp.skipped.push(RefusedTorrent { infohash, reason });
+            };
+            let Some(st) = s.state.get(&infohash.get()) else {
+                skip(&mut resp, "not loaded in any session".to_owned());
+                continue;
+            };
+            let Some(engine) = s.source.engine_for(&st.profile_id) else {
+                skip(&mut resp, "engine missing".to_owned());
+                continue;
+            };
+            match engine.force_recheck(st.handle) {
+                Ok(()) => resp.started.push(infohash),
+                Err(e) => skip(&mut resp, e.to_string()),
+            }
         }
-    }
+        resp
+    })
+    .await;
     Ok(Accepted::new(Json(resp)))
 }
 
