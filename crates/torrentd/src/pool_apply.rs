@@ -623,7 +623,7 @@ fn recheck_relocatable(pool: &PoolService, infohash: &str, src: &Path) -> Result
     pool.with_store(|store| {
         match store.adoption_state(infohash).map_err(|e| e.to_string())? {
             Some(AdoptionState::Adopted) | Some(AdoptionState::Matched) => {}
-            Some(AdoptionState::Overlap) => {
+            Some(AdoptionState::Overlap) | Some(AdoptionState::Shared) => {
                 return Err(
                     "another torrent now claims these files; moving them would break it".into(),
                 )
@@ -637,6 +637,14 @@ fn recheck_relocatable(pool: &PoolService, infohash: &str, src: &Path) -> Result
                     other.map(|s| s.as_str()).unwrap_or("unknown"),
                 ))
             }
+        }
+
+        // `adopted` survives a rescan that finds another torrent over the
+        // same files, so sharing is asked of the claim table directly.
+        if store.shares_claims(infohash).map_err(|e| e.to_string())? {
+            return Err(
+                "another torrent now claims these files; moving them would break it".into(),
+            );
         }
 
         // The source is a directory rename, so it still has to hold this

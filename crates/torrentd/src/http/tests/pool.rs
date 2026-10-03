@@ -228,7 +228,8 @@ async fn reads(cov: &Arc<Coverage>) {
     assert_eq!(o["files"], 4);
     assert_eq!(
         o["states"],
-        json!({"missing": 0, "partial": 1, "matched": 1, "adopted": 0, "drifted": 0, "overlap": 0})
+        json!({"missing": 0, "partial": 1, "matched": 1, "adopted": 0, "drifted": 0, "overlap": 0,
+               "shared": 0})
     );
     assert_eq!(o["verify_queue_depth"], 0);
 

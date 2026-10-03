@@ -9917,7 +9917,13 @@
             "type": "integer",
             "minimum": 0.0,
             "format": "uint64",
-            "description": "Torrents sharing a file with another torrent."
+            "description": "Torrents sharing some files with another torrent that claims a\ndifferent set."
+          },
+          "shared": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Torrents whose files another torrent claims as exactly the same set."
           }
         },
         "type": "object",
@@ -9927,7 +9933,8 @@
           "matched",
           "adopted",
           "drifted",
-          "overlap"
+          "overlap",
+          "shared"
         ],
         "description": "How many library torrents are in each adoption state."
       },
@@ -9995,7 +10002,8 @@
           "matched",
           "adopted",
           "drifted",
-          "overlap"
+          "overlap",
+          "shared"
         ],
         "description": "Where a torrent in the library stands relative to the payload on disk."
       },
@@ -10201,7 +10209,19 @@
             "type": "integer",
             "minimum": 0.0,
             "format": "uint64",
-            "description": "Torrents sharing a file with another torrent."
+            "description": "Torrents sharing some files with another torrent that claims a\ndifferent set."
+          },
+          "shared": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Torrents whose files another torrent claims as exactly the same set."
+          },
+          "drifted": {
+            "type": "integer",
+            "minimum": 0.0,
+            "format": "uint64",
+            "description": "Complete torrents still carrying drift no verification has cleared."
           },
           "errors": {
             "type": "integer",
@@ -10219,6 +10239,8 @@
           "partial",
           "missing",
           "overlap",
+          "shared",
+          "drifted",
           "errors"
         ],
         "description": "What a full re-index found."

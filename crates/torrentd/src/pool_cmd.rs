@@ -74,8 +74,8 @@ fn scan_inner(
         store.torrent_count()?,
     );
     println!(
-        "  matched {}   partial {}   missing {}   overlap {}",
-        m.matched, m.partial, m.missing, m.overlap,
+        "  matched {}   partial {}   missing {}   overlap {}   shared {}   drifted {}",
+        m.matched, m.partial, m.missing, m.overlap, m.shared, m.drifted,
     );
     if errors > 0 {
         // Unreadable directories look exactly like empty ones, so never let
@@ -230,13 +230,14 @@ fn import_legacy(store: &mut PoolStore, registry: &AssignmentRegistry) -> anyhow
 fn print_state_counts(counts: &HashMap<AdoptionState, u64>) {
     let get = |s: AdoptionState| counts.get(&s).copied().unwrap_or(0);
     println!(
-        "  adopted {}   matched {}   partial {}   missing {}   drifted {}   overlap {}",
+        "  adopted {}   matched {}   partial {}   missing {}   drifted {}   overlap {}   shared {}",
         get(AdoptionState::Adopted),
         get(AdoptionState::Matched),
         get(AdoptionState::Partial),
         get(AdoptionState::Missing),
         get(AdoptionState::Drifted),
         get(AdoptionState::Overlap),
+        get(AdoptionState::Shared),
     );
 }
 

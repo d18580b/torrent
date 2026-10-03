@@ -199,9 +199,9 @@ fn no_payload_at_all_is_missing() {
 }
 
 #[test]
-fn two_torrents_over_the_same_file_are_both_flagged_overlap() {
-    // The state that blocks every destructive operation: moving or deleting
-    // for one torrent would silently break the other.
+fn two_torrents_over_the_same_files_are_both_shared() {
+    // Cross-seeding: one payload under two info-hashes. Both adoptable; the
+    // planner still refuses to move or delete those bytes for either.
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     write_file(root, "shared/data.bin", 512);
@@ -223,10 +223,183 @@ fn two_torrents_over_the_same_file_are_both_flagged_overlap() {
         &[("shared/data.bin", 512)],
     );
 
-    torrentd_pool::match_all(&mut store).unwrap();
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "1a"), AdoptionState::Shared);
+    assert_eq!(state_of(&store, "2b"), AdoptionState::Shared);
+    assert!(AdoptionState::Shared.is_adoptable());
+    assert_eq!((stats.shared, stats.matched, stats.overlap), (2, 0, 0));
+    assert!(store.shares_claims("1a").unwrap());
+}
+
+#[test]
+fn two_torrents_over_different_sets_of_the_same_bytes_are_both_flagged_overlap() {
+    // The conflict: the claim sets differ, so at least one torrent's view of
+    // these bytes is wrong. Blocks adoption and every destructive operation.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "shared/data.bin", 512);
+    write_file(root, "shared/extra.bin", 64);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "1a",
+        "shared",
+        None,
+        &[("shared/data.bin", 512)],
+    );
+    add_torrent(
+        &mut store,
+        "2b",
+        "shared",
+        None,
+        &[("shared/data.bin", 512), ("shared/extra.bin", 64)],
+    );
+
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
     assert_eq!(state_of(&store, "1a"), AdoptionState::Overlap);
     assert_eq!(state_of(&store, "2b"), AdoptionState::Overlap);
     assert!(!AdoptionState::Overlap.is_adoptable());
+    assert_eq!((stats.overlap, stats.matched), (2, 0));
+}
+
+#[test]
+fn a_rescan_does_not_turn_an_adopted_cross_seed_into_overlap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "X/data.bin", 512);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "aa", "X", None, &[("X/data.bin", 512)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let (r, b) = store.adoption_base("aa").unwrap().unwrap();
+    store
+        .set_adoption(
+            "aa",
+            AdoptionState::Adopted,
+            Some(r),
+            Some(&b),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // A cross-seed of the same payload lands in the library.
+    add_torrent(&mut store, "bb", "X", None, &[("X/data.bin", 512)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    assert_eq!(state_of(&store, "bb"), AdoptionState::Shared);
+}
+
+/// The acceptance case: two cross-seeded torrents adopt, and nothing in the
+/// pool decides the profile — each adopt names its own, so the two land in
+/// different profiles.
+#[test]
+fn two_cross_seeded_torrents_are_each_adoptable() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_file(&root, "X/data.bin", 512);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "aa", "X", None, &[("X/data.bin", 512)]);
+    add_torrent(&mut store, "bb", "X", None, &[("X/data.bin", 512)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    for ih in ["aa", "bb"] {
+        let plan =
+            torrentd_pool::adopt::plan(&store, ih, |id| (id == root_id).then(|| root.clone()))
+                .unwrap();
+        assert!(
+            matches!(plan, torrentd_pool::AdoptPlan::Verify { .. }),
+            "{ih}: {plan:?}"
+        );
+    }
+}
+
+#[test]
+fn drift_survives_a_rescan_until_a_verify_clears_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    write_file(&root, "D/a.bin", 256);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "d1", "D", None, &[("D/a.bin", 256)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    std::fs::write(root.join("D/a.bin"), vec![b'y'; 256]).unwrap();
+    let r = root.clone();
+    torrentd_pool::drift::detect(&mut store, |_| Some(r.clone())).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Drifted);
+
+    // A rescan sees the same path at the same size — which is exactly what
+    // drift flagged as not enough.
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    let stats = torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Drifted);
+    assert_eq!((stats.drifted, stats.matched), (1, 0));
+
+    // Adopting it is how it gets verified, and never by trusting resume data.
+    let plan =
+        torrentd_pool::adopt::plan(&store, "d1", |id| (id == root_id).then(|| r.clone())).unwrap();
+    assert!(
+        matches!(plan, torrentd_pool::AdoptPlan::Verify { .. }),
+        "{plan:?}"
+    );
+
+    // A verification that passed records `adopted` with no drift, and the
+    // next rescan leaves it there.
+    let (rid, base) = store.adoption_base("d1").unwrap().unwrap();
+    store
+        .set_adoption(
+            "d1",
+            AdoptionState::Adopted,
+            Some(rid),
+            Some(&base),
+            Some(2),
+            None,
+            None,
+        )
+        .unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "d1"), AdoptionState::Adopted);
+}
+
+/// Many equal-sized files on disk under the anchor's name used to make
+/// candidate building quadratic; the right base must still be found, and a
+/// base that only matches a name's tail is not a candidate.
+#[test]
+fn many_equal_sized_lookalikes_do_not_misplace_a_torrent() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for i in 0..300 {
+        write_file(root, &format!("copies/{i}/T/big.bin"), 4096);
+    }
+    write_file(root, "real/T/big.bin", 4096);
+    write_file(root, "real/T/small.bin", 7);
+    // `xbig.bin` ends with `big.bin` but is not that file.
+    write_file(root, "decoy/T/xbig.bin", 4096);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "eq",
+        "T",
+        None,
+        &[("T/big.bin", 4096), ("T/small.bin", 7)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "eq"), AdoptionState::Matched);
+    assert_eq!(store.adoption_base("eq").unwrap().unwrap().1, "real");
 }
 
 #[test]
@@ -686,7 +859,9 @@ fn partial_overlap_and_missing_are_all_refused() {
         &[("P/a.bin", 100), ("P/b.bin", 300)],
         Some(true),
     );
-    // overlap: two torrents over the same file
+    // overlap: two torrents over the same file, claiming different sets
+    write_file(&root, "S/more.bin", 50);
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
     add_torrent_with_sidecar(
         &mut store,
         &lib,
@@ -700,7 +875,7 @@ fn partial_overlap_and_missing_are_all_refused() {
         &lib,
         "o2",
         "S",
-        &[("S/shared.bin", 200)],
+        &[("S/shared.bin", 200), ("S/more.bin", 50)],
         Some(true),
     );
     // missing

@@ -62,16 +62,23 @@ pub enum AdoptionState {
     /// partial torrent advertises pieces the daemon cannot serve.
     Partial,
     /// Every file resolved at a consistent base, but the torrent is not yet
-    /// loaded into a session. The only adoptable state.
+    /// loaded into a session. Adoptable.
     Matched,
     /// Loaded into a session and seeding.
     Adopted,
     /// Was matched or adopted, but a covering file's stats moved since the
-    /// last verification. Needs a recheck before it can be trusted.
+    /// last verification. Stays so across rescans until a verification
+    /// clears it; adopting one always re-hashes it.
     Drifted,
-    /// At least one file is claimed by another torrent too. Reported on every
-    /// torrent involved, and blocks any mutation touching those files.
+    /// At least one file is claimed by another torrent too, and the two do
+    /// not claim the same set. Blocks adoption and any mutation touching
+    /// those files.
     Overlap,
+    /// Complete, and every other torrent claiming any of these files claims
+    /// exactly the same set — one payload under several info-hashes, as
+    /// cross-seeding produces. Adoptable, each torrent into the profile the
+    /// request names; never moved or deleted for one of them.
+    Shared,
 }
 
 impl From<torrentd_pool::AdoptionState> for AdoptionState {
@@ -84,6 +91,7 @@ impl From<torrentd_pool::AdoptionState> for AdoptionState {
             D::Adopted => Self::Adopted,
             D::Drifted => Self::Drifted,
             D::Overlap => Self::Overlap,
+            D::Shared => Self::Shared,
         }
     }
 }
@@ -98,6 +106,7 @@ impl From<AdoptionState> for torrentd_pool::AdoptionState {
             AdoptionState::Adopted => D::Adopted,
             AdoptionState::Drifted => D::Drifted,
             AdoptionState::Overlap => D::Overlap,
+            AdoptionState::Shared => D::Shared,
         }
     }
 }
@@ -246,8 +255,11 @@ pub struct AdoptionCounts {
     pub adopted: u64,
     /// Torrents whose payload changed since it was last verified.
     pub drifted: u64,
-    /// Torrents sharing a file with another torrent.
+    /// Torrents sharing some files with another torrent that claims a
+    /// different set.
     pub overlap: u64,
+    /// Torrents whose files another torrent claims as exactly the same set.
+    pub shared: u64,
 }
 
 impl AdoptionCounts {
@@ -259,6 +271,7 @@ impl AdoptionCounts {
             AdoptionState::Adopted => &mut self.adopted,
             AdoptionState::Drifted => &mut self.drifted,
             AdoptionState::Overlap => &mut self.overlap,
+            AdoptionState::Shared => &mut self.shared,
         }
     }
 }
@@ -347,8 +360,13 @@ pub struct ScanSummary {
     pub partial: u64,
     /// Torrents with none of their payload present.
     pub missing: u64,
-    /// Torrents sharing a file with another torrent.
+    /// Torrents sharing some files with another torrent that claims a
+    /// different set.
     pub overlap: u64,
+    /// Torrents whose files another torrent claims as exactly the same set.
+    pub shared: u64,
+    /// Complete torrents still carrying drift no verification has cleared.
+    pub drifted: u64,
     /// Entries skipped because they could not be read; the daemon's log names
     /// each, and `pool_scan_errors_total` counts them by kind.
     pub errors: u64,
@@ -364,6 +382,8 @@ impl From<crate::pool_service::ScanSummary> for ScanSummary {
             partial: s.partial,
             missing: s.missing,
             overlap: s.overlap,
+            shared: s.shared,
+            drifted: s.drifted,
             errors: s.errors,
         }
     }

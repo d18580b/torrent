@@ -135,9 +135,16 @@ pub enum AdoptionState {
     /// Was matched or adopted, but a covering file's stats moved since the last
     /// verification. Needs a recheck before it can be trusted.
     Drifted,
-    /// At least one file is claimed by another torrent too. Reported on every
-    /// torrent involved, and blocks any mutation touching those files.
+    /// At least one file is claimed by another torrent too, and the two do not
+    /// claim the same set — a conflict. Reported on every torrent involved,
+    /// and blocks adoption and any mutation touching those files.
     Overlap,
+    /// Every file is present, and every other torrent claiming any of them
+    /// claims exactly the same set: one payload under several info-hashes, as
+    /// cross-seeding produces. Adoptable — each torrent into whichever profile
+    /// the operator names — but its bytes are never moved or deleted for one
+    /// of them, since that breaks the others.
+    Shared,
 }
 
 impl AdoptionState {
@@ -149,6 +156,7 @@ impl AdoptionState {
             AdoptionState::Adopted => "adopted",
             AdoptionState::Drifted => "drifted",
             AdoptionState::Overlap => "overlap",
+            AdoptionState::Shared => "shared",
         }
     }
 
@@ -160,13 +168,14 @@ impl AdoptionState {
             "adopted" => AdoptionState::Adopted,
             "drifted" => AdoptionState::Drifted,
             "overlap" => AdoptionState::Overlap,
+            "shared" => AdoptionState::Shared,
             _ => return None,
         })
     }
 
     /// Whether a torrent in this state may be handed to a session.
     pub fn is_adoptable(self) -> bool {
-        matches!(self, AdoptionState::Matched)
+        matches!(self, AdoptionState::Matched | AdoptionState::Shared)
     }
 }
 

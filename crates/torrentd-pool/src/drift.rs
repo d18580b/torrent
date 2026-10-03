@@ -45,7 +45,10 @@ pub fn detect(
         let Some(state) = store.adoption_state(&t.infohash)? else {
             continue;
         };
-        if !matches!(state, AdoptionState::Matched | AdoptionState::Adopted) {
+        if !matches!(
+            state,
+            AdoptionState::Matched | AdoptionState::Adopted | AdoptionState::Shared
+        ) {
             continue;
         }
         let Some((root_id, base_rel)) = store.adoption_base(&t.infohash)? else {

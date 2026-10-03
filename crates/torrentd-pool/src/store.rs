@@ -1402,6 +1402,59 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Every file `infohash` claims, sorted, so two claim sets compare equal
+    /// exactly when they name the same files.
+    pub fn claims_of(&self, infohash: &str) -> Result<Vec<(i64, String)>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT root_id, rel_path FROM claim WHERE infohash = ?1 ORDER BY root_id, rel_path",
+        )?;
+        let rows = st.query_map(params![infohash], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// The other torrents that claim at least one file `infohash` claims.
+    pub fn co_claimants(&self, infohash: &str) -> Result<Vec<String>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT DISTINCT o.infohash FROM claim c
+             JOIN claim o ON o.root_id = c.root_id AND o.rel_path = c.rel_path
+             WHERE c.infohash = ?1 AND o.infohash <> ?1
+             ORDER BY o.infohash",
+        )?;
+        let rows = st.query_map(params![infohash], |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// Whether any file `infohash` claims is claimed by another torrent too —
+    /// shared payload or a conflict, either of which makes moving or deleting
+    /// those bytes for one torrent break the other.
+    ///
+    /// Asked directly rather than read off the adoption state, because an
+    /// adopted torrent keeps `adopted` across a rescan that finds it sharing.
+    pub fn shares_claims(&self, infohash: &str) -> Result<bool, PoolError> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (
+                SELECT 1 FROM claim c JOIN claim o
+                  ON o.root_id = c.root_id AND o.rel_path = c.rel_path
+                WHERE c.infohash = ?1 AND o.infohash <> ?1)",
+            params![infohash],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// When drift was last recorded for `infohash` and not since cleared by a
+    /// verification. Only a verify clears it.
+    pub fn drift_at(&self, infohash: &str) -> Result<Option<i64>, PoolError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT drift_at FROM adoption WHERE infohash = ?1",
+                params![infohash],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
     // -- plans ---------------------------------------------------------------
 
     pub fn create_plan(&self, kind: &str, spec: &str, created_at: i64) -> Result<i64, PoolError> {

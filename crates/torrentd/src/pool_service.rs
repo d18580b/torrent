@@ -201,6 +201,8 @@ impl PoolService {
             summary.partial = m.partial;
             summary.missing = m.missing;
             summary.overlap = m.overlap;
+            summary.shared = m.shared;
+            summary.drifted = m.drifted;
             Ok(summary)
         })
     }
@@ -215,6 +217,8 @@ pub struct ScanSummary {
     pub partial: u64,
     pub missing: u64,
     pub overlap: u64,
+    pub shared: u64,
+    pub drifted: u64,
     pub errors: u64,
 }
 

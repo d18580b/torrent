@@ -18,9 +18,12 @@
 //!   which makes libtorrent hash the payload against the piece hashes (v1
 //!   SHA-1, v2 SHA-256 merkle) before it will seed. torrentd never reimplements
 //!   that check.
-//! * **Refuse** — `partial`, `missing`, `overlap` and `drifted` are not
-//!   adoptable. Seeding a partial torrent advertises pieces the daemon cannot
-//!   serve; acting on an overlap would touch bytes another torrent depends on.
+//! * **Refuse** — `partial`, `missing` and `overlap` are not adoptable.
+//!   Seeding a partial torrent advertises pieces the daemon cannot serve; an
+//!   overlap means two torrents disagree about the same bytes. `shared`
+//!   payload — the same files under another info-hash — adopts like a match,
+//!   and `drifted` adopts only through the verify path, whose outcome is what
+//!   clears the drift.
 //!
 //! The decision is pure so it can be tested without a session, and so the API
 //! can show an operator exactly what a bulk adopt would do before it runs.
@@ -80,8 +83,18 @@ pub fn plan(
         });
     };
     let state = store.adoption_state(infohash)?;
+    // Whether the previous client's completion claim may stand in for a
+    // verification at all. Drifted payload is exactly what it may not.
+    let mut may_fast_path = true;
     match state {
-        Some(AdoptionState::Matched) => {}
+        // Shared payload — the same files under another info-hash — seeds
+        // from each torrent independently, so it adopts like any match, into
+        // whichever profile the request names.
+        Some(AdoptionState::Matched) | Some(AdoptionState::Shared) => {}
+        // Adopting is how a drifted torrent that is not loaded gets the
+        // verification that clears it: always the hashing path, whose outcome
+        // records `adopted` or `drifted` again.
+        Some(AdoptionState::Drifted) => may_fast_path = false,
         Some(AdoptionState::Adopted) => {
             return Ok(AdoptPlan::Refuse {
                 reason: "already adopted",
@@ -95,12 +108,7 @@ pub fn plan(
         }
         Some(AdoptionState::Overlap) => {
             return Ok(AdoptPlan::Refuse {
-                reason: "another torrent claims the same files",
-            })
-        }
-        Some(AdoptionState::Drifted) => {
-            return Ok(AdoptPlan::Refuse {
-                reason: "on-disk data changed since the last scan; rescan and verify first",
+                reason: "another torrent claims some of the same files but not the same set",
             })
         }
         Some(AdoptionState::Missing) | None => {
@@ -129,8 +137,9 @@ pub fn plan(
         root.join(&base_rel)
     };
 
-    let can_fast_path =
-        torrent.fastresume_path.is_some() && fastresume_is_trustworthy(store, infohash)?;
+    let can_fast_path = may_fast_path
+        && torrent.fastresume_path.is_some()
+        && fastresume_is_trustworthy(store, infohash)?;
 
     Ok(match (&torrent.fastresume_path, can_fast_path) {
         (Some(resume_path), true) => AdoptPlan::FastPath {

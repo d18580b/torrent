@@ -93,7 +93,7 @@ fn build_relocate(
     let state = store.adoption_state(infohash)?;
     match state {
         Some(AdoptionState::Adopted) | Some(AdoptionState::Matched) => {}
-        Some(AdoptionState::Overlap) => {
+        Some(AdoptionState::Overlap) | Some(AdoptionState::Shared) => {
             return Ok(Err(Refused(
                 "another torrent claims the same files; moving them would break it".into(),
             )))
@@ -109,6 +109,14 @@ fn build_relocate(
                 other.map(|s| s.as_str()).unwrap_or("unknown"),
             ))))
         }
+    }
+
+    // An adopted torrent keeps `adopted` across a rescan that finds another
+    // torrent over its files, so the state alone does not rule sharing out.
+    if store.shares_claims(infohash)? {
+        return Ok(Err(Refused(
+            "another torrent claims the same files; moving them would break it".into(),
+        )));
     }
 
     let Some((src_root_id, src_base)) = store.adoption_base(infohash)? else {
