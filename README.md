@@ -239,19 +239,26 @@ daemon has, and it should not be what you get by writing nothing. `POST
 [[profile]]
 id                = "public"
 network           = "host"          # binds this machine's interfaces
-listen_interfaces = "0.0.0.0:6881,[::]:6881"
+listen_interfaces = "eth0:6881"     # not 0.0.0.0 beside a vpn profile
 dht               = true            # off unless written
 
 [[profile]]
-id                   = "account_a"
-network              = "vpn"        # binds a tunnel; dht/pex/lsd forced off
-vpn_type             = "wireguard"
-vpn_config           = "/etc/wireguard/wg-acct-a.conf"
-vpn_interface        = "wg-acct-a"
-port_forward         = "natpmp"
-peer_fingerprint     = "-XX0002-"     # 8-char peer-id prefix, as written
-user_agent           = "qBittorrent/5.0.3"
+id                      = "account_a"
+network                 = "vpn"     # binds a tunnel; dht/pex/lsd forced off
+vpn_type                = "wireguard"
+vpn_config              = "/etc/wireguard/wg-acct-a.conf"
+vpn_interface           = "wg-acct-a"
+port_forward            = "natpmp"
+peer_fingerprint        = "-qB5030-"  # 8-char peer-id prefix, as written,
+user_agent              = "qBittorrent/5.0.3"  # of the same client
+allowed_tracker_domains = ["tracker.example.com"]  # required on vpn
 ```
+
+> **Config break.** A `vpn` profile without `allowed_tracker_domains`, a host
+> profile listening on `0.0.0.0` or `[::]` beside a `vpn` profile, and any
+> `peer_fingerprint` starting `-LT` are refused at load. See
+> [docs/running.md](docs/running.md#account-isolation) for what each means
+> and what to write instead.
 
 A `vpn` profile pins every socket to its tunnel address and disables DHT, PEX
 and LSD unconditionally — there is no key that turns them back on. Its
@@ -330,10 +337,14 @@ operational side of each knob, including what the kill switch costs and what
 it needs, is in [`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml),
 which is the file an operator actually edits.
 
-`allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds —
-it catches loading one account's torrent into another — not an egress control,
-and it is empty by default. Public content that wants DHT belongs in a
-`network = "host"` profile.
+`allowed_tracker_domains` is the account-isolation guard, and every `vpn`
+profile must set it. A torrent enters a profile that sets it only when every
+tracker it announces to is on one of those domains, and it announces to at
+least one — on every add path: the API, pool adoption, and the startup reload
+of resume data and `.torrent` files. It keeps one account's torrent, and its
+passkey, from being announced from another account's tunnel; it is not an
+egress control. Public content that wants DHT belongs in a `network = "host"`
+profile.
 
 ## Authentication
 

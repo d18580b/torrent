@@ -1315,7 +1315,7 @@
           "torrents"
         ],
         "summary": "Add a torrent.",
-        "description": "From a magnet URI, a `.torrent` on the daemon's filesystem, or a\n`.torrent` in the request (base64). The infohash is computed before any\nsession sees the torrent, so an infohash already assigned anywhere is\n`409 torrent-exists` and the session never receives a duplicate. A\n`.torrent` must announce to one of the profile's `allowed_tracker_domains`\nwhen it sets any. The response is the torrent as its session first reports\nit; its `phase` is `unknown` until the first state update.",
+        "description": "From a magnet URI, a `.torrent` on the daemon's filesystem, or a\n`.torrent` in the request (base64). The infohash is computed before any\nsession sees the torrent, so an infohash already assigned anywhere is\n`409 torrent-exists` and the session never receives a duplicate. When the\nprofile sets `allowed_tracker_domains`, every tracker the torrent announces\nto — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and\nthere must be at least one. The response is the torrent as its session first reports\nit; its `phase` is `unknown` until the first state update.",
         "operationId": "add_torrent",
         "requestBody": {
           "content": {

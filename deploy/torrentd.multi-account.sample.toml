@@ -92,6 +92,26 @@ network_kill_switch = false
 #     own identity, so such a pair is always two host profiles — which are one
 #     host. (This file sets no top-level identity at all, and the one profile
 #     below that writes neither key is the host profile.)
+#
+#     The two keys must also agree with each other: a tracker reads both, and
+#     a peer-id prefix of one client beside the user agent of another is a
+#     client that does not exist. Each profile below presents as one real
+#     client — `-qB5030-` is qBittorrent 5.0.3's prefix, `-TR4060-`
+#     Transmission 4.0.6's. Nothing checks the pairing; it is on the operator.
+#     What is checked is that no profile writes libtorrent's own `-LT` code.
+#
+# Two account-isolation rules apply to the `vpn` profiles in particular:
+#
+#   * `allowed_tracker_domains` is required on each. Every torrent the profile
+#     takes, on every add path — the API, pool adoption, and the startup scans
+#     of its resume and `.torrent` directories — must announce only to
+#     trackers on those domains (or their subdomains), and to at least one.
+#     A torrent with a single tracker outside the list is refused.
+#   * A host profile beside them may not listen on `0.0.0.0` or `[::]`.
+#     libtorrent expands the unspecified address to every interface that is
+#     up, the tunnels included, and announces from each, so the host profile
+#     would announce from the accounts' tunnel addresses too. Name the host's
+#     own address or network device instead.
 #   * Each profile's resume and `.torrent` directories are its own. By default
 #     they are `<resume_dir>/<id>` and `<torrent_dir>/<id>`; an override must
 #     not equal another profile's. One that *contains* another's is fine: each
@@ -103,11 +123,12 @@ network_kill_switch = false
 
 # The untunnelled profile: public trackers and DHT content. Peers and trackers
 # see this machine's address, so nothing that must not be traced here belongs
-# in it.
+# in it. It binds the host's own network device rather than `0.0.0.0`, which
+# would take in the accounts' tunnels below; `eth0` is a placeholder for yours.
 [[profile]]
 id                = "public"
 network           = "host"
-listen_interfaces = "0.0.0.0:6881,[::]:6881"
+listen_interfaces = "eth0:6881"
 dht               = true
 
 # First private-tracker account. A static forwarded port, which the provider
@@ -119,7 +140,7 @@ vpn_type                = "wireguard"
 vpn_config              = "/etc/wireguard/wg-acct-a.conf"
 vpn_interface           = "wg-acct-a"
 listen_port             = 6891
-peer_fingerprint        = "-XX0002-"
+peer_fingerprint        = "-qB5030-"
 user_agent              = "qBittorrent/5.0.3"
 allowed_tracker_domains = ["tracker-a.example.com"]
 
@@ -136,6 +157,6 @@ vpn_config              = "/etc/wireguard/proton-b.conf"
 vpn_interface           = "proton-b"
 port_forward            = "natpmp"
 port_forward_gateway    = "10.2.0.1"
-peer_fingerprint        = "-XX0003-"
+peer_fingerprint        = "-TR4060-"
 user_agent              = "Transmission/4.0.6"
 allowed_tracker_domains = ["tracker-b.example.com"]

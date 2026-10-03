@@ -69,12 +69,14 @@ pub use mock::HeldCall;
 pub use mock::MockEngine;
 #[cfg(any(test, feature = "test-support"))]
 pub use mock::RecordedCall;
+pub use policy::check_trackers;
 pub use policy::discovery_guards;
 pub use policy::forbidden;
 pub use policy::resume_flags_clear;
 pub use policy::resume_flags_set;
 pub use policy::seed_flags;
 pub use policy::verify_flags;
+pub use policy::TrackerRefusal;
 pub use port_forward::renew_and_rebind;
 pub use port_forward::MapResult;
 #[cfg(any(test, feature = "test-support"))]

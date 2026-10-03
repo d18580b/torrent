@@ -31,6 +31,7 @@ use torrentd_engine::ProfileId;
 use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentState;
+use torrentd_engine::TrackerRefusal;
 use tracing::warn;
 
 use crate::app_state::AppState;
@@ -645,9 +646,12 @@ torrent_error! {
         #[error("{0}")]
         #[problem(status = 422, title = "Invalid metainfo")]
         InvalidMetainfo(String),
-        /// The `.torrent` announces to none of the profile's
-        /// `allowed_tracker_domains`.
-        #[error("the torrent does not announce to the profile's allowed_tracker_domains")]
+        /// The profile sets `allowed_tracker_domains`, and the torrent
+        /// announces to a tracker outside them, or to none.
+        #[error(
+            "the torrent announces to a tracker outside the profile's allowed_tracker_domains, \
+             or to no tracker at all"
+        )]
         #[problem(status = 422, title = "Tracker not allowed")]
         TrackerNotAllowed,
         /// A torrent with this infohash is already assigned, to this profile
@@ -676,9 +680,10 @@ enum AddSource {
 /// From a magnet URI, a `.torrent` on the daemon's filesystem, or a
 /// `.torrent` in the request (base64). The infohash is computed before any
 /// session sees the torrent, so an infohash already assigned anywhere is
-/// `409 torrent-exists` and the session never receives a duplicate. A
-/// `.torrent` must announce to one of the profile's `allowed_tracker_domains`
-/// when it sets any. The response is the torrent as its session first reports
+/// `409 torrent-exists` and the session never receives a duplicate. When the
+/// profile sets `allowed_tracker_domains`, every tracker the torrent announces
+/// to — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and
+/// there must be at least one. The response is the torrent as its session first reports
 /// it; its `phase` is `unknown` until the first state update.
 #[kynos::post("/torrents", tag = Torrents)]
 pub async fn add_torrent(
@@ -779,70 +784,8 @@ pub async fn add_torrent(
         );
     };
 
-    // Misconfiguration guard (multi-profile): a torrent must announce to one
-    // of the profile's allowed tracker domains. Catches adding one account's
-    // torrent — and so its passkey — to another account's profile. Checked
-    // against a configured, non-empty allow-list only.
-    //
-    // A magnet names its trackers in `tr=` up front, and those are what the
-    // session announces to until metadata arrives, so they are held to the
-    // same rule. A magnet with no `tr=` names no tracker to check and is let
-    // through: whatever trackers its metadata brings are the `.torrent`'s.
-    //
-    // One allowed tracker admits the magnet, as one does a `.torrent`: this
-    // guards against the wrong profile, and a torrent announcing to an
-    // allowed tracker belongs to it. A `tr` the daemon cannot read a host
-    // from is refused rather than skipped, since libtorrent may still
-    // announce to it.
-    if let AddSource::Magnet(uri) = &source {
-        let domains = &profile_cfg.allowed_tracker_domains;
-        if !domains.is_empty() {
-            let allowed = match magnet_tracker_hosts(uri) {
-                MagnetTrackers::None => true,
-                MagnetTrackers::Unreadable => false,
-                MagnetTrackers::Hosts(hosts) => hosts
-                    .iter()
-                    .any(|h| domains.iter().any(|d| host_matches_domain(h, d))),
-            };
-            if !allowed {
-                registry_error();
-                return Err(AddTorrentError::TrackerNotAllowed);
-            }
-        }
-    }
-    if let AddSource::File(bytes) = &source {
-        let domains = &profile_cfg.allowed_tracker_domains;
-        if !domains.is_empty() {
-            match libtorrent_safe::torrent_tracker_host_matches(bytes, domains) {
-                Ok(true) => {}
-                Ok(false) => {
-                    registry_error();
-                    return Err(AddTorrentError::TrackerNotAllowed);
-                }
-                Err(e) => {
-                    return Err(AddTorrentError::InvalidMetainfo(format!(
-                        "tracker check: {e}"
-                    )));
-                }
-            }
-        }
-    }
-
-    // Reject duplicates before the session sees the torrent.
-    if s.registry.lookup(&infohash).is_some() {
-        registry_error();
-        return Err(AddTorrentError::TorrentExists(
-            "a torrent with this infohash is already assigned".to_owned(),
-        ));
-    }
-    // Reserve the assignment; assign() re-checks uniqueness to close any race.
-    if let Err(e) = s.registry.assign(infohash, profile_id.clone()) {
-        registry_error();
-        return Err(AddTorrentError::TorrentExists(e.to_string()));
-    }
-
-    // Now build params and hand the torrent to the session. Release the
-    // reservation if the add fails so the info-hash can be retried.
+    // What the session will be handed, built before the guard so the guard
+    // reads exactly that.
     let (params, torrent_bytes) = match source {
         AddSource::Magnet(uri) => (
             AddParams::Magnet {
@@ -861,6 +804,40 @@ pub async fn add_torrent(
             Some(bytes),
         ),
     };
+
+    // The account-isolation guard, the same one every add path runs (see
+    // `torrentd_engine::policy::check_trackers`): on a profile with
+    // `allowed_tracker_domains`, every tracker the torrent announces to — a
+    // `.torrent`'s announce list, a magnet's `tr=` — must be on it.
+    match torrentd_engine::check_trackers(profile_cfg, &params) {
+        Ok(()) => {}
+        Err(TrackerRefusal::NotAllowed) => {
+            registry_error();
+            return Err(AddTorrentError::TrackerNotAllowed);
+        }
+        Err(TrackerRefusal::Unreadable(e)) => {
+            return Err(AddTorrentError::InvalidMetainfo(format!(
+                "tracker check: {e}"
+            )));
+        }
+    }
+
+    // Reject duplicates before the session sees the torrent.
+    if s.registry.lookup(&infohash).is_some() {
+        registry_error();
+        return Err(AddTorrentError::TorrentExists(
+            "a torrent with this infohash is already assigned".to_owned(),
+        ));
+    }
+    // Reserve the assignment; assign() re-checks uniqueness to close any race.
+    if let Err(e) = s.registry.assign(infohash, profile_id.clone()) {
+        registry_error();
+        return Err(AddTorrentError::TorrentExists(e.to_string()));
+    }
+
+    // Now hand the torrent to the session. Release the reservation if the add
+    // fails so the info-hash can be retried.
+    //
     // The await is a cancellation point: a client that disconnects drops this
     // handler while the blocking task runs on. What must follow the engine
     // call therefore runs inside that task, not after the await.
@@ -1193,7 +1170,7 @@ pub async fn delete_torrent(
                     .map_err(|e| DeleteTorrentError::Internal {
                         detail: internal("removing the torrent from its session", e),
                     })?;
-                clear_assignment(&settler, &ih)
+                clear_assignment(&settler, &ih, &profile)
             })
             .await?;
         }
@@ -1205,15 +1182,19 @@ pub async fn delete_torrent(
                 "no session holds an info-hash the registry still assigns; the startup \
                  scans did not load it, so clearing the assignment alone",
             );
-            clear_assignment(&s, &ih)?;
+            clear_assignment(&s, &ih, &profile)?;
         }
         None => return Err(DeleteTorrentError::TorrentAdding),
     }
     Ok(NoContent)
 }
 
-/// Clear `ih`'s assignment once no session holds it.
-fn clear_assignment(s: &AppState, ih: &InfoHash) -> Result<(), DeleteTorrentError> {
+/// Clear `ih`'s assignment to `profile` once no session holds it.
+fn clear_assignment(
+    s: &AppState,
+    ih: &InfoHash,
+    profile: &ProfileId,
+) -> Result<(), DeleteTorrentError> {
     // Report a persist failure rather than discarding it. On a full or
     // read-only state directory the payload is gone and the assignment write
     // fails, and a 204 here would say the delete succeeded — so the claim
@@ -1233,7 +1214,32 @@ fn clear_assignment(s: &AppState, ih: &InfoHash) -> Result<(), DeleteTorrentErro
     // Cleared, so a later add of the same info-hash is this process's own
     // and must not be mistaken for one the boot left unloaded.
     s.unloaded_at_boot.lock().remove(ih);
+    release_index_owner(s, ih, profile);
     Ok(())
+}
+
+/// Forget the pool index's record that `profile` owns `ih`, once the torrent
+/// is gone from it.
+///
+/// Adoption refuses a torrent the index says another profile owns, so a record
+/// left behind after a delete would refuse every later adoption of it into
+/// any other profile, with nothing but the database to clear it from. Only a
+/// record naming `profile` is cleared; one naming anything else was never this
+/// delete's. A failed write is logged and counted by the pool, and leaves
+/// adoption refusing rather than allowing.
+fn release_index_owner(s: &AppState, ih: &InfoHash, profile: &ProfileId) {
+    let Some(pool) = s.pool.as_ref() else {
+        return;
+    };
+    let hex = ih.to_hex();
+    let cleared = pool.with_store(|st| match st.profile_of(&hex) {
+        Ok(Some(owner)) if owner == profile.as_str() => st.set_profile(&hex, None),
+        Ok(_) => Ok(()),
+        Err(e) => Err(e),
+    });
+    if let Err(e) = cleared {
+        pool.note_store_error("set_profile", &e);
+    }
 }
 
 /// Remove a torrent whose profile has no live session.
@@ -1313,6 +1319,7 @@ fn clear_sessionless(
          and .torrent files so the startup scan does not re-assign it",
     );
     s.unloaded_at_boot.lock().remove(ih);
+    release_index_owner(s, ih, profile);
     Ok(NoContent)
 }
 
@@ -1909,90 +1916,6 @@ fn display_message(message: &str) -> String {
     out
 }
 
-/// The trackers a magnet URI names, as libtorrent reads them.
-enum MagnetTrackers {
-    /// No `tr` parameter at all.
-    None,
-    /// The host of every tracker named, lowercased, without its port.
-    Hosts(Vec<String>),
-    /// A tracker the daemon cannot read a host from. libtorrent may still
-    /// announce to it, so it is never waved through as "no trackers".
-    Unreadable,
-}
-
-/// The trackers `uri` names in its `tr` parameters.
-///
-/// Read the way libtorrent reads them, so nothing it will announce to is
-/// missed here: the parameter name is matched case-insensitively and may carry
-/// a `.N` index (`tr.1=`), as `magnet_uri.cpp` accepts.
-fn magnet_tracker_hosts(uri: &str) -> MagnetTrackers {
-    let query = uri.split_once('?').map_or("", |(_, q)| q);
-    let mut hosts = Vec::new();
-    let mut any = false;
-    for pair in query.split('&') {
-        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
-        let base = name.split_once('.').map_or(name, |(base, _)| base);
-        if !base.eq_ignore_ascii_case("tr") {
-            continue;
-        }
-        any = true;
-        let Some(url) = percent_decode(value) else {
-            return MagnetTrackers::Unreadable;
-        };
-        let host = crate::tracing_init::display_announce_url(&url).host;
-        if host.is_empty() {
-            return MagnetTrackers::Unreadable;
-        }
-        let host = match host.strip_prefix('[') {
-            Some(v6) => v6.split(']').next().unwrap_or("").to_owned(),
-            None => host.split(':').next().unwrap_or("").to_owned(),
-        };
-        hosts.push(host.to_ascii_lowercase());
-    }
-    if any {
-        MagnetTrackers::Hosts(hosts)
-    } else {
-        MagnetTrackers::None
-    }
-}
-
-/// `s` with `%XX` escapes (and `+` as a space) decoded; `None` when an escape
-/// is malformed or the result is not UTF-8.
-fn percent_decode(s: &str) -> Option<String> {
-    let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' => {
-                let hex = bytes.get(i + 1..i + 3)?;
-                out.push(u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()?);
-                i += 3;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-/// Whether `host` is `domain` or a subdomain of it, case-insensitively — the
-/// rule the shim applies to a `.torrent`'s trackers.
-fn host_matches_domain(host: &str, domain: &str) -> bool {
-    let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    !domain.is_empty()
-        && (host == domain
-            || host
-                .strip_suffix(&domain)
-                .is_some_and(|rest| rest.ends_with('.')))
-}
-
 // ---------------------------------------------------------------------------
 // Trackers
 // ---------------------------------------------------------------------------
@@ -2300,53 +2223,6 @@ mod tests {
             tracker_with(false, true, false, 3, Some("refused")),
             TrackerStatus::Error
         );
-    }
-
-    #[test]
-    fn a_magnets_trackers_are_read_from_tr_and_matched_by_domain() {
-        let hosts = |uri: &str| match magnet_tracker_hosts(uri) {
-            MagnetTrackers::Hosts(h) => Some(h),
-            MagnetTrackers::None => Some(Vec::new()),
-            MagnetTrackers::Unreadable => None,
-        };
-        let uri = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101\
-                   &tr=https%3A%2F%2FTracker.Example.org%3A443%2Fannounce%3Fpasskey%3Dx\
-                   &dn=x&tr=udp%3A%2F%2F%5B2001%3Adb8%3A%3A1%5D%3A6969%2Fannounce";
-        assert_eq!(hosts(uri).unwrap(), ["tracker.example.org", "2001:db8::1"]);
-        // Every spelling libtorrent accepts is read.
-        for uri in [
-            "magnet:?xt=urn:btih:01&tr.1=https%3A%2F%2Ft.example%2Fannounce",
-            "magnet:?xt=urn:btih:01&TR=https%3A%2F%2Ft.example%2Fannounce",
-            "magnet:?xt=urn:btih:01&Tr.7=udp%3A%2F%2Ft.example%3A1%2Fannounce",
-        ] {
-            assert_eq!(hosts(uri).unwrap(), ["t.example"], "{uri}");
-        }
-        // No tracker named at all.
-        assert!(matches!(
-            magnet_tracker_hosts("magnet:?xt=urn:btih:01&dn=x"),
-            MagnetTrackers::None
-        ));
-        // A tracker whose host cannot be read is never skipped.
-        for uri in [
-            "magnet:?xt=urn:btih:01&tr=not-a-url",
-            "magnet:?xt=urn:btih:01&tr=http%3A%2F%2Fa%20b%2Fannounce",
-            "magnet:?xt=urn:btih:01&tr=%ZZ",
-        ] {
-            assert!(hosts(uri).is_none(), "{uri}");
-        }
-        // A host with `_` is refused rather than read: libtorrent's
-        // `parse_url` rejects it outside an IPv6 literal, so it is never
-        // announced to either, and refusing is the stricter answer.
-        assert!(hosts(
-            "magnet:?xt=urn:btih:01&tr=udp%3A%2F%2Ftracker_x.foreign.example%3A6969%2Fannounce"
-        )
-        .is_none());
-        assert!(host_matches_domain("tracker.example.org", "example.org"));
-        assert!(host_matches_domain("example.org", "Example.org."));
-        assert!(!host_matches_domain("badexample.org", "example.org"));
-        assert!(!host_matches_domain("example.org.evil", "example.org"));
-        assert_eq!(percent_decode("a%2Fb+c"), Some("a/b c".to_owned()));
-        assert_eq!(percent_decode("a%2"), None);
     }
 
     #[test]

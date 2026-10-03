@@ -1106,8 +1106,9 @@ pub async fn boot(
             // Cross-check the registry; the spec aborts the profile on
             // mismatch. A resume file under one profile's directory that the
             // registry assigns to another is the operator's to reconcile.
-            if let Some(existing) = registry.lookup(&ih) {
-                if existing != profile {
+            let existing = registry.lookup(&ih);
+            if let Some(existing) = &existing {
+                if *existing != profile {
                     warn!(
                         profile_id = %profile,
                         infohash = %ih,
@@ -1120,23 +1121,6 @@ pub async fn boot(
                     );
                     continue;
                 }
-            } else if let Err(e) = registry.assign(ih, profile.clone()) {
-                // Rule 4 makes the registry the gate every load passes. An
-                // assignment that failed to persist is one that disappears at
-                // the next restart, after which nothing knows this info-hash
-                // belongs to this profile — so refuse the load rather than seed a
-                // torrent the uniqueness rule can no longer see.
-                warn!(
-                    profile_id = %profile,
-                    infohash = %ih,
-                    error.cause = %e,
-                    "could not record the resume assignment; skipping this torrent",
-                );
-                metrics.inc_counter(
-                    "profile_assignment_registry_errors_total",
-                    &[("profile_id", profile.as_str())],
-                );
-                continue;
             }
             // Re-attach metadata. libtorrent writes the info dict into resume
             // data only when save_resume_data was called with SAVE_INFO_DICT
@@ -1174,7 +1158,43 @@ pub async fn boot(
             // mistake that ends an account. A pool that comes back paused is
             // visible in `/status` and fixed with `resume-all`; a pool that
             // comes back seeding when it was told not to is not recoverable.
-            match engine.add_torrent(resume_scan_params(profile_cfg, data.into_inner(), torrent)) {
+            let params = resume_scan_params(profile_cfg, data.into_inner(), torrent);
+            // The account-isolation guard, on the trackers this resume data
+            // would announce to — its own `trackers` list where it has one.
+            // A file written before the profile's allow-list was set, or
+            // dropped into the directory by hand, is held to it like an API
+            // add. Checked before the registry claim, so a refusal claims
+            // nothing.
+            if let Err(refusal) = boot_scan_guard(&*metrics, profile_cfg, &ih, &params, "resume") {
+                if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
+                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
+                }
+                continue;
+            }
+            // Unless it is already this profile's, claim it.
+            let claimed = match existing {
+                Some(_) => Ok(()),
+                None => registry.assign(ih, profile.clone()),
+            };
+            if let Err(e) = claimed {
+                // Rule 4 makes the registry the gate every load passes. An
+                // assignment that failed to persist is one that disappears at
+                // the next restart, after which nothing knows this info-hash
+                // belongs to this profile — so refuse the load rather than seed a
+                // torrent the uniqueness rule can no longer see.
+                warn!(
+                    profile_id = %profile,
+                    infohash = %ih,
+                    error.cause = %e,
+                    "could not record the resume assignment; skipping this torrent",
+                );
+                metrics.inc_counter(
+                    "profile_assignment_registry_errors_total",
+                    &[("profile_id", profile.as_str())],
+                );
+                continue;
+            }
+            match engine.add_torrent(params) {
                 Ok(_) => {
                     added_from_resume += 1;
                     loaded.insert(ih);
@@ -1226,6 +1246,21 @@ pub async fn boot(
             if registry.lookup(&ih).is_some() {
                 continue;
             }
+            // The account-isolation guard, before the claim: a `.torrent`
+            // dropped into this profile's directory is held to its
+            // allow-list like one posted to the API.
+            let params = torrent_dir_scan_params(profile_cfg, bytes, scan_save_path.clone());
+            if let Err(refusal) =
+                boot_scan_guard(&*metrics, profile_cfg, &ih, &params, "torrent_dir")
+            {
+                if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_dir_add += 1;
+                }
+                continue;
+            }
             // Rule 4 again: claim first, load second. Claiming afterwards
             // left a window in which the session held a torrent the registry
             // had never agreed to, and dropped the claim silently if it could
@@ -1243,11 +1278,7 @@ pub async fn boot(
                 );
                 continue;
             }
-            match engine.add_torrent(torrent_dir_scan_params(
-                profile_cfg,
-                bytes,
-                scan_save_path.clone(),
-            )) {
+            match engine.add_torrent(params) {
                 Ok(_) => {
                     added += 1;
                     loaded.insert(ih);
@@ -1525,6 +1556,41 @@ fn resume_scan_params(
         flags_set: torrentd_engine::resume_flags_set(profile),
         flags_clear: torrentd_engine::resume_flags_clear(),
     }
+}
+
+/// Run the account-isolation guard (`torrentd_engine::check_trackers`) on one
+/// boot-scan add, before anything is claimed or loaded.
+///
+/// A torrent outside the profile's `allowed_tracker_domains` is logged and
+/// counted where an API refusal is, in
+/// `profile_assignment_registry_errors_total`. One whose trackers cannot be
+/// read is logged only: the add would fail on the same bytes, and the caller
+/// counts it as the load failure it is.
+fn boot_scan_guard(
+    metrics: &dyn MetricsSink,
+    profile: &ProfileConfig,
+    ih: &libtorrent_safe::InfoHash,
+    params: &AddParams,
+    scan: &'static str,
+) -> Result<(), torrentd_engine::TrackerRefusal> {
+    let refusal = match torrentd_engine::check_trackers(profile, params) {
+        Ok(()) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    warn!(
+        profile_id = %profile.id,
+        infohash = %ih,
+        scan,
+        error.cause = %refusal,
+        "boot scan: torrent refused by the profile's allowed_tracker_domains; not loaded",
+    );
+    if matches!(refusal, torrentd_engine::TrackerRefusal::NotAllowed) {
+        metrics.inc_counter(
+            "profile_assignment_registry_errors_total",
+            &[("profile_id", profile.id.as_str())],
+        );
+    }
+    Err(refusal)
 }
 
 /// What the boot torrent-dir scan hands a session for a `.torrent` no resume

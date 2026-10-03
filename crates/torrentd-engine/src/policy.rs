@@ -104,6 +104,56 @@ pub fn resume_flags_clear() -> TorrentFlags {
     forbidden()
 }
 
+/// Why [`check_trackers`] refused an add.
+#[derive(Debug, thiserror::Error)]
+pub enum TrackerRefusal {
+    /// The add would announce to a tracker outside the profile's
+    /// `allowed_tracker_domains`, to one whose host cannot be read, or to
+    /// none at all.
+    #[error(
+        "the torrent announces to a tracker outside the profile's allowed_tracker_domains, \
+         or to no tracker at all"
+    )]
+    NotAllowed,
+    /// The source could not be parsed, so its trackers could not be read.
+    /// The add would fail on the same bytes.
+    #[error("the torrent's trackers could not be read: {0}")]
+    Unreadable(libtorrent_safe::Error),
+}
+
+/// The account-isolation guard: whether `profile` may receive `params`.
+///
+/// A profile that sets `allowed_tracker_domains` — every `vpn` profile must —
+/// takes a torrent only when **every** tracker it would announce to is on
+/// that list, and it announces to at least one. This is what keeps one
+/// account's passkey from being announced from another account's session, so
+/// it is checked on all five add paths — `POST /v1/torrents`, pool adoption
+/// (the resume fast path and the verify queue), the startup resume reload and
+/// the startup torrent-dir scan — against the exact params each hands the
+/// session, before that session sees them.
+///
+/// All-match rather than any-match: one allowed tracker beside a foreign one
+/// still announces the foreign one. And the trackers checked are the ones
+/// libtorrent will use, which for resume data is the resume file's own
+/// `trackers` list rather than the `.torrent`'s — so a resume file another
+/// client wrote cannot swap a foreign tracker in behind an allowed `.torrent`.
+///
+/// A profile with no list is not checked.
+pub fn check_trackers(
+    profile: &ProfileConfig,
+    params: &libtorrent_safe::AddParams,
+) -> Result<(), TrackerRefusal> {
+    let domains = &profile.allowed_tracker_domains;
+    if domains.is_empty() {
+        return Ok(());
+    }
+    match libtorrent_safe::add_trackers_allowed(params, domains) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(TrackerRefusal::NotAllowed),
+        Err(e) => Err(TrackerRefusal::Unreadable(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -209,5 +259,180 @@ mod tests {
         let mut p = vpn();
         p.id = ProfileId::new("default");
         assert!(seed_flags(&p).contains(TorrentFlags::DISABLE_PEX));
+    }
+
+    // -- check_trackers --------------------------------------------------
+
+    fn bstr(s: &str) -> String {
+        format!("{}:{s}", s.len())
+    }
+
+    /// A one-file `.torrent` announcing to `trackers`, one tier each.
+    fn torrent(trackers: &[&str]) -> Vec<u8> {
+        let mut t = String::from("d");
+        if let Some(first) = trackers.first() {
+            t += &format!("8:announce{}", bstr(first));
+            t += "13:announce-listl";
+            for url in trackers {
+                t += &format!("l{}e", bstr(url));
+            }
+            t += "e";
+        }
+        let mut t =
+            format!("{t}4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:").into_bytes();
+        t.extend_from_slice(&[0u8; 20]);
+        t.extend_from_slice(b"ee");
+        t
+    }
+
+    /// Resume data for `torrent`, carrying no info dict, and a `trackers`
+    /// list when `trackers` is `Some`.
+    fn resume(torrent: &[u8], trackers: Option<&[&str]>) -> Vec<u8> {
+        let ih = libtorrent_safe::info_hash_from_torrent(torrent).unwrap();
+        let mut r =
+            b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+        r.extend_from_slice(&ih.0);
+        if let Some(trackers) = trackers {
+            r.extend_from_slice(b"8:trackersl");
+            for url in trackers {
+                r.extend_from_slice(format!("l{}e", bstr(url)).as_bytes());
+            }
+            r.extend_from_slice(b"e");
+        }
+        r.extend_from_slice(b"e");
+        r
+    }
+
+    fn guarded() -> ProfileConfig {
+        let mut p = vpn();
+        p.allowed_tracker_domains = vec!["Tracker.Example.".into()];
+        p
+    }
+
+    fn file(bytes: Vec<u8>) -> libtorrent_safe::AddParams {
+        libtorrent_safe::AddParams::File {
+            bytes,
+            save_path: "/data".into(),
+            flags: TorrentFlags::empty(),
+        }
+    }
+
+    fn magnet(tr: &str) -> libtorrent_safe::AddParams {
+        libtorrent_safe::AddParams::Magnet {
+            uri: format!("magnet:?xt=urn:btih:{}{tr}", "01".repeat(20)),
+            save_path: "/data".into(),
+            flags: TorrentFlags::empty(),
+        }
+    }
+
+    fn resumed(bytes: Vec<u8>, torrent: Option<Vec<u8>>) -> libtorrent_safe::AddParams {
+        libtorrent_safe::AddParams::Resume {
+            bytes,
+            torrent,
+            save_path: None,
+            flags_set: TorrentFlags::empty(),
+            flags_clear: TorrentFlags::empty(),
+        }
+    }
+
+    fn allowed(p: &ProfileConfig, params: &libtorrent_safe::AddParams) -> bool {
+        match check_trackers(p, params) {
+            Ok(()) => true,
+            Err(TrackerRefusal::NotAllowed) => false,
+            Err(e) => panic!("unexpected {e}"),
+        }
+    }
+
+    const OURS: &str = "https://tracker.example/announce?passkey=a";
+    const SUB: &str = "udp://ANNOUNCE.tracker.example:6969/announce";
+    const FOREIGN: &str = "https://other.example/announce?passkey=b";
+
+    #[test]
+    fn a_profile_without_a_list_takes_anything() {
+        assert!(allowed(&host(), &file(torrent(&[FOREIGN]))));
+        assert!(allowed(&host(), &file(torrent(&[]))));
+    }
+
+    #[test]
+    fn a_torrent_is_taken_only_when_every_tracker_is_allowed() {
+        let p = guarded();
+        assert!(allowed(&p, &file(torrent(&[OURS, SUB]))));
+        // One allowed tracker beside a foreign one still announces the
+        // foreign one.
+        assert!(!allowed(&p, &file(torrent(&[OURS, FOREIGN]))));
+        assert!(!allowed(&p, &file(torrent(&[FOREIGN]))));
+        // Announcing to nothing names no account this profile holds.
+        assert!(!allowed(&p, &file(torrent(&[]))));
+        // A suffix that is not a label boundary is a different domain.
+        assert!(!allowed(
+            &p,
+            &file(torrent(&["http://eviltracker.example/a"]))
+        ));
+        // The host libtorrent connects to, not whatever precedes an `@`.
+        assert!(!allowed(
+            &p,
+            &file(torrent(&["http://tracker.example:x@other.example/a"]))
+        ));
+    }
+
+    #[test]
+    fn a_magnet_is_held_to_its_tr_parameters() {
+        let p = guarded();
+        let enc = |u: &str| u.replace(':', "%3A").replace('/', "%2F");
+        assert!(allowed(&p, &magnet(&format!("&tr={}", enc(OURS)))));
+        assert!(allowed(
+            &p,
+            &magnet(&format!("&tr={}&tr.1={}", enc(OURS), enc(SUB)))
+        ));
+        assert!(!allowed(
+            &p,
+            &magnet(&format!("&tr={}&TR={}", enc(OURS), enc(FOREIGN)))
+        ));
+        assert!(!allowed(&p, &magnet("")));
+        assert!(!allowed(&p, &magnet("&tr=not-a-url")));
+    }
+
+    #[test]
+    fn resume_data_is_held_to_the_trackers_it_carries() {
+        let p = guarded();
+        let ours = torrent(&[OURS]);
+        // No `trackers` list: the attached `.torrent`'s are announced.
+        assert!(allowed(
+            &p,
+            &resumed(resume(&ours, None), Some(ours.clone()))
+        ));
+        let foreign = torrent(&[FOREIGN]);
+        assert!(!allowed(
+            &p,
+            &resumed(resume(&foreign, None), Some(foreign.clone()))
+        ));
+        // A `trackers` list replaces the `.torrent`'s: a foreign one behind
+        // an allowed `.torrent` is refused ...
+        assert!(!allowed(
+            &p,
+            &resumed(resume(&ours, Some(&[FOREIGN])), Some(ours.clone()))
+        ));
+        // ... and an allowed one in front of a foreign `.torrent` is what
+        // libtorrent announces to.
+        assert!(allowed(
+            &p,
+            &resumed(resume(&foreign, Some(&[OURS])), Some(foreign.clone()))
+        ));
+        // Without metadata, the list is all there is.
+        assert!(allowed(&p, &resumed(resume(&ours, Some(&[SUB])), None)));
+        assert!(!allowed(&p, &resumed(resume(&ours, None), None)));
+    }
+
+    #[test]
+    fn an_unparseable_source_is_unreadable_rather_than_allowed() {
+        let p = guarded();
+        assert!(matches!(
+            check_trackers(&p, &file(b"not bencode".to_vec())),
+            Err(TrackerRefusal::Unreadable(_))
+        ));
+        assert!(matches!(
+            check_trackers(&p, &resumed(b"de".to_vec(), None)),
+            Err(TrackerRefusal::Unreadable(_))
+        ));
     }
 }

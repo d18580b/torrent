@@ -80,9 +80,15 @@
 //!    `listen_interfaces` binds. Gateway-assigned NAT-PMP ports are unique by
 //!    construction and are the one case nothing here checks.
 //!
-//! `allowed_tracker_domains` is *not* in this list. It is a misconfiguration
-//! guard against loading one profile's `.torrent` into another, checked at add
-//! time — not an egress control, and not a security boundary.
+//! `allowed_tracker_domains` is *not* in this list, but it is required on
+//! every `vpn` profile. It is the account-isolation guard: a profile that
+//! sets it takes only a torrent whose every tracker is on it, on every add
+//! path (`policy::check_trackers`), so one account's torrent and its passkey
+//! are never announced from another account's session. It is not an egress
+//! control. Beside it, two load-time rules: a host profile may not listen on
+//! the unspecified address while a `vpn` profile exists, since libtorrent
+//! expands it to the tunnels' addresses too; and no profile may wear
+//! libtorrent's own `-LT` peer-id code.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -695,8 +701,17 @@ pub enum ProfileConfigError {
     /// [`ProfileConfigError::DuplicateFingerprint`] carries one: the same value
     /// reaches a session from a profile's own `peer_fingerprint` and from the
     /// top-level one it inherits.
-    #[error("{key} must not equal libtorrent default (-LT20C0-)")]
-    DefaultFingerprintForbidden { key: &'static str },
+    #[error(
+        "{key} {value:?} uses libtorrent's own client code (\"-LT\"), the prefix every \
+         libtorrent session that configures nothing announces — {default} in the libtorrent \
+         this daemon is built on. Choose the peer-id prefix of the client this profile presents \
+         as, such as \"-qB5030-\" with user_agent \"qBittorrent/5.0.3\""
+    )]
+    DefaultFingerprintForbidden {
+        key: &'static str,
+        value: String,
+        default: &'static str,
+    },
     /// The value is not a peer-id prefix. `key` as above.
     #[error(
         "{key} {value:?} is not a peer-id prefix: it must be exactly 8 printable ASCII \
@@ -715,6 +730,33 @@ pub enum ProfileConfigError {
     MissingIdentity {
         profile: String,
         field: &'static str,
+    },
+    /// A3: a tunnelled profile is an account, and the allow-list is what
+    /// keeps another account's torrent — and its passkey — out of it.
+    #[error(
+        "profile {0:?} is a vpn profile and must set allowed_tracker_domains: the domains of \
+         the trackers this account belongs to, such as [\"tracker.example.com\"]. Every \
+         torrent the profile takes must announce only to those, which is what stops one \
+         account's torrent, and its passkey, from being announced from another"
+    )]
+    MissingTrackerDomains(String),
+    #[error(
+        "profile {profile:?}: allowed_tracker_domains entry {domain:?} is not a domain: an \
+         entry must be non-empty and contain no ',' or whitespace"
+    )]
+    BadTrackerDomain { profile: String, domain: String },
+    /// D12: an unspecified listen address beside a tunnel.
+    #[error(
+        "profile {profile:?}: listen_interfaces {listen_interfaces:?} binds the unspecified \
+         address, and a vpn profile is configured. libtorrent expands 0.0.0.0 and [::] to every \
+         interface that is up — the vpn profile's tunnel included — so this host profile would \
+         also listen, and announce, from the tunnel's address, tying the host to that account. \
+         Name the host's own address or device instead, such as \"192.0.2.10:6881\" or \
+         \"eth0:6881\""
+    )]
+    WildcardListenBesideVpn {
+        profile: String,
+        listen_interfaces: String,
     },
     #[error("profile {0:?} has an empty listen_interfaces")]
     EmptyListenInterfaces(String),
@@ -787,16 +829,25 @@ impl ProfileConfig {
         fp.len() == 8 && fp.bytes().all(|b| b.is_ascii_graphic())
     }
 
-    /// Whether `fp` is libtorrent's own default peer-id prefix.
+    /// libtorrent's own default peer-id prefix in the version this daemon is
+    /// built against (`settings_pack.cpp`: `peer_fingerprint`, `-LT20E0-` for
+    /// 2.0.14). Named in the refusal; the check itself does not depend on it.
+    pub const LIBTORRENT_DEFAULT_FINGERPRINT: &'static str = "-LT20E0-";
+
+    /// Whether `fp` is a libtorrent default peer-id prefix — of any version.
     ///
-    /// `-LT20C0-` is the eight bytes libtorrent puts at the front of a peer id
-    /// nobody configured. Every key that supplies a fingerprint takes it in
-    /// that raw form and nothing decodes it, so there is one spelling to
-    /// refuse; the sixteen-hex spelling the retired `peer_fingerprint_hex`
-    /// key took is refused as a malformed prefix by
+    /// libtorrent puts `-LT` followed by its own version at the front of a
+    /// peer id nobody configured: `-LT20C0-` for 2.0.12, `-LT20E0-` for the
+    /// 2.0.14 vendored here. Comparing against one version's spelling is what
+    /// let the other through, and the version moves with every vendored
+    /// update, so the whole `-LT` client code is refused: it is the client
+    /// every unconfigured libtorrent announces as, which ties a profile to
+    /// all of them. Every key that supplies a fingerprint takes it in that
+    /// raw form and nothing decodes it; the sixteen-hex spelling the retired
+    /// `peer_fingerprint_hex` key took is refused as a malformed prefix by
     /// [`ProfileConfig::is_valid_fingerprint`] before this is asked.
     pub fn is_libtorrent_default_fingerprint(fp: &str) -> bool {
-        fp == "-LT20C0-"
+        fp.starts_with("-LT")
     }
 
     /// The distinct ports a libtorrent `listen_interfaces` string binds.
@@ -1063,7 +1114,32 @@ impl ProfileConfig {
                             field: "user_agent",
                         });
                     }
+                    // A tunnelled profile is an account, and the allow-list
+                    // is the guard every add path runs
+                    // (`policy::check_trackers`) to keep another account's
+                    // torrent out of it. Optional, it was the guard nobody
+                    // had switched on.
+                    if p.allowed_tracker_domains.is_empty() {
+                        return Err(ProfileConfigError::MissingTrackerDomains(
+                            p.id.as_str().to_string(),
+                        ));
+                    }
                 }
+            }
+
+            // Shape, for any profile that sets the list. The list reaches the
+            // shim comma-joined, and an empty entry matches nothing, so
+            // either would silently narrow the list to something other than
+            // what the operator wrote.
+            if let Some(bad) = p
+                .allowed_tracker_domains
+                .iter()
+                .find(|d| d.trim().is_empty() || d.contains(',') || d.contains(char::is_whitespace))
+            {
+                return Err(ProfileConfigError::BadTrackerDomain {
+                    profile: p.id.as_str().to_string(),
+                    domain: bad.clone(),
+                });
             }
 
             // A profile's own limit is range-checked the way the top-level
@@ -1110,11 +1186,57 @@ impl ProfileConfig {
                 if Self::is_libtorrent_default_fingerprint(fp) {
                     return Err(ProfileConfigError::DefaultFingerprintForbidden {
                         key: "peer_fingerprint",
+                        value: fp.to_string(),
+                        default: Self::LIBTORRENT_DEFAULT_FINGERPRINT,
                     });
                 }
             }
         }
+
+        // D12. libtorrent expands an unspecified listen address to one socket
+        // per interface that is up (`expand_unspecified_address` in
+        // session_impl.cpp), a WireGuard tunnel included, and announces over
+        // every listen socket it has. A host profile on `0.0.0.0` beside a
+        // vpn profile therefore listens and announces from the tunnel's
+        // address as well as the host's, which ties the two together. Alone,
+        // a host profile has no tunnel to leak into, and keeps the wildcard.
+        if profiles.iter().any(ProfileConfig::is_vpn) {
+            for p in profiles {
+                if let ProfileNetwork::Host {
+                    listen_interfaces, ..
+                } = &p.network
+                {
+                    if Self::binds_unspecified(listen_interfaces) {
+                        return Err(ProfileConfigError::WildcardListenBesideVpn {
+                            profile: p.id.as_str().to_string(),
+                            listen_interfaces: listen_interfaces.clone(),
+                        });
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Whether any entry of a libtorrent `listen_interfaces` string binds the
+    /// unspecified address (`0.0.0.0`, `[::]`), rather than a literal address
+    /// or a device.
+    ///
+    /// The grammar is [`ProfileConfig::listen_ports`]'s: `<addr>:<port>` with
+    /// optional `s`/`l` flags, the address possibly bracketed. A device name
+    /// does not parse as an address and is not unspecified.
+    fn binds_unspecified(listen_interfaces: &str) -> bool {
+        listen_interfaces.split(',').any(|entry| {
+            let Some((addr, _)) = entry.trim().rsplit_once(':') else {
+                return false;
+            };
+            let addr = addr
+                .strip_prefix('[')
+                .and_then(|a| a.strip_suffix(']'))
+                .unwrap_or(addr);
+            addr.parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_unspecified())
+        })
     }
 }
 
@@ -1165,7 +1287,7 @@ mod tests {
             user_agent: Some(ua.to_string()),
             resume_dir: Some(PathBuf::from(format!("/var/lib/torrentd/resume/{id}"))),
             torrent_dir: Some(PathBuf::from(format!("/var/lib/torrentd/torrents/{id}"))),
-            allowed_tracker_domains: vec![],
+            allowed_tracker_domains: vec!["tracker.example.com".to_string()],
             upload_rate_limit: None,
         }
     }
@@ -1492,7 +1614,8 @@ mod tests {
         assert!(matches!(
             ProfileConfig::validate_set(&[public]),
             Err(ProfileConfigError::DefaultFingerprintForbidden {
-                key: "peer_fingerprint"
+                key: "peer_fingerprint",
+                ..
             })
         ));
     }
@@ -1504,8 +1627,8 @@ mod tests {
         // neither field has to keep validating.
         let profiles = vec![
             cfg("acct_a", 6881, "wg0", "-AA1000-", "qB/5.0"),
-            host("public", "0.0.0.0:6882", false),
-            host("public2", "0.0.0.0:6883", false),
+            host("public", "192.0.2.10:6882", false),
+            host("public2", "eth0:6883", false),
         ];
         ProfileConfig::validate_set(&profiles).unwrap();
     }
@@ -1627,13 +1750,98 @@ mod tests {
 
     #[test]
     fn libtorrent_default_fingerprint_rejected() {
-        let profiles = vec![cfg("a", 6881, "wg0", "-LT20C0-", "ua-a")];
+        // The vendored 2.0.14's own default, the 2.0.12 one the check used to
+        // compare against, and the next version's: the `-LT` client code is
+        // refused whatever version follows it.
+        for fp in [
+            ProfileConfig::LIBTORRENT_DEFAULT_FINGERPRINT,
+            "-LT20C0-",
+            "-LT20F0-",
+        ] {
+            let profiles = vec![cfg("a", 6881, "wg0", fp, "ua-a")];
+            assert!(
+                matches!(
+                    ProfileConfig::validate_set(&profiles),
+                    Err(ProfileConfigError::DefaultFingerprintForbidden {
+                        key: "peer_fingerprint",
+                        ..
+                    })
+                ),
+                "{fp}"
+            );
+        }
+        assert_eq!(ProfileConfig::LIBTORRENT_DEFAULT_FINGERPRINT, "-LT20E0-");
+        // Another client's code is fine, `lt` (rtorrent's libtorrent) included.
+        let profiles = vec![cfg("a", 6881, "wg0", "-lt0D80-", "rtorrent/0.9.8")];
+        assert!(ProfileConfig::validate_set(&profiles).is_ok());
+    }
+
+    #[test]
+    fn a_vpn_profile_must_name_its_tracker_domains() {
+        let mut p = cfg("acct_a", 6881, "wg0", "-qB5030-", "qBittorrent/5.0.3");
+        p.allowed_tracker_domains.clear();
         assert!(matches!(
-            ProfileConfig::validate_set(&profiles),
-            Err(ProfileConfigError::DefaultFingerprintForbidden {
-                key: "peer_fingerprint"
-            })
+            ProfileConfig::validate_set(&[p.clone()]),
+            Err(ProfileConfigError::MissingTrackerDomains(id)) if id == "acct_a"
         ));
+        // A host profile may leave it unset.
+        assert!(ProfileConfig::validate_set(&[host("public", "eth0:6881", true)]).is_ok());
+        // An entry that is blank, or would split in the shim's list, is not
+        // a domain on either posture.
+        for bad in ["", "  ", "a.example,b.example", "a.example b.example"] {
+            p.allowed_tracker_domains = vec!["tracker.example.com".into(), bad.into()];
+            assert!(
+                matches!(
+                    ProfileConfig::validate_set(&[p.clone()]),
+                    Err(ProfileConfigError::BadTrackerDomain { domain, .. }) if domain == bad
+                ),
+                "{bad:?}"
+            );
+            let mut h = host("public", "eth0:6881", true);
+            h.allowed_tracker_domains = vec![bad.into()];
+            assert!(
+                matches!(
+                    ProfileConfig::validate_set(&[h]),
+                    Err(ProfileConfigError::BadTrackerDomain { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wildcard_host_listen_is_refused_only_beside_a_vpn_profile() {
+        let vpn = cfg("acct_a", 6891, "wg0", "-qB5030-", "qBittorrent/5.0.3");
+        for wildcard in [
+            "0.0.0.0:6881",
+            "[::]:6881",
+            "eth0:6882,0.0.0.0:6881s",
+            "[::0]:6881",
+        ] {
+            assert!(
+                matches!(
+                    ProfileConfig::validate_set(&[host("public", wildcard, true), vpn.clone()]),
+                    Err(ProfileConfigError::WildcardListenBesideVpn { profile, .. })
+                        if profile == "public"
+                ),
+                "{wildcard}"
+            );
+            // With no tunnel to expand into, the wildcard is the host's own.
+            assert!(
+                ProfileConfig::validate_set(&[host("public", wildcard, true)]).is_ok(),
+                "{wildcard}"
+            );
+        }
+        for named in [
+            "eth0:6881",
+            "192.0.2.10:6881",
+            "[2001:db8::1]:6881,eth0:6881",
+        ] {
+            assert!(
+                ProfileConfig::validate_set(&[host("public", named, true), vpn.clone()]).is_ok(),
+                "{named}"
+            );
+        }
     }
 
     #[test]
