@@ -140,7 +140,7 @@ pub fn badge(state: &str) -> (&'static str, Tone) {
             ("●", Tone::Good)
         }
         "checking" | "awaiting_metadata" | "updating" | "applying" | "in_progress" | "partial"
-        | "matched" => ("◐", Tone::Warn),
+        | "matched" | "shared" => ("◐", Tone::Warn),
         "paused" | "draft" | "pending" | "skipped" | "not_contacted" => ("‖", Tone::Warn),
         // `incomplete`: pieces are missing and a seeder never fetches them,
         // so it stays there until an operator supplies the payload.
