@@ -45,6 +45,13 @@ const ADMIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// verification deadline, which would have to be derived from payload size.
 const VERIFY_SETTLE: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a re-hash of a loaded torrent is held without a verdict.
+///
+/// A day is long past any re-hash this daemon could be running. Past it the
+/// request, or the phase report its verdict waits for, was lost, and the entry
+/// is forgotten rather than held for the life of the process.
+const RECHECK_EXPIRY: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+
 pub struct PoolService {
     store: Mutex<PoolStore>,
     /// Root id → absolute path, resolved once at startup from config.
@@ -386,13 +393,13 @@ pub async fn run_verify_queue(
                     // Removed while checking: nothing left to record.
                     return false;
                 };
-                match recheck_outcome(st, *started, VERIFY_SETTLE) {
-                    // Not checked since the request. A day is long past any
-                    // re-hash this daemon could be running; past it the
-                    // request was lost, and is forgotten rather than held.
-                    None => started.elapsed() < Duration::from_secs(24 * 3600),
-                    Some(VerifyOutcome::Waiting) => true,
-                    Some(outcome) => {
+                match recheck_step(
+                    recheck_outcome(st, *started, VERIFY_SETTLE),
+                    started.elapsed(),
+                ) {
+                    RecheckStep::Hold => true,
+                    RecheckStep::Forget => false,
+                    RecheckStep::Record(outcome) => {
                         record_verify_outcome(&pool, &*source, &state, &hash, ih, outcome);
                         false
                     }
@@ -748,6 +755,31 @@ fn recheck_outcome(
         return Some(VerifyOutcome::Waiting);
     }
     Some(verify_outcome(Some(st), settle))
+}
+
+/// What the verify queue does with one re-hash entry on a tick.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum RecheckStep {
+    /// No verdict yet, and still inside [`RECHECK_EXPIRY`].
+    Hold,
+    /// No verdict past [`RECHECK_EXPIRY`]: dropped without recording one.
+    Forget,
+    /// A verdict to record.
+    Record(VerifyOutcome),
+}
+
+/// Decide a re-hash entry from its [`recheck_outcome`] and its age.
+///
+/// Both undecided cases share the expiry: no check since the request
+/// (`None`), and a check whose phase report has not landed (`Waiting`). A
+/// phase report that never arrives would otherwise hold the entry for the
+/// life of the process.
+fn recheck_step(outcome: Option<VerifyOutcome>, age: Duration) -> RecheckStep {
+    match outcome {
+        None | Some(VerifyOutcome::Waiting) if age < RECHECK_EXPIRY => RecheckStep::Hold,
+        None | Some(VerifyOutcome::Waiting) => RecheckStep::Forget,
+        Some(outcome) => RecheckStep::Record(outcome),
+    }
 }
 
 /// Why a `profile_id` resolved to no engine.
@@ -1186,6 +1218,26 @@ mod tests {
         s.phase_since_check = true;
         let started = Instant::now() - Duration::from_secs(30);
         assert_eq!(super::recheck_outcome(&s, started, SETTLE), None);
+    }
+
+    /// A re-hash whose phase report never lands falls to the same expiry as
+    /// one that was never checked, instead of being held forever.
+    #[test]
+    fn an_undecided_recheck_is_forgotten_after_the_expiry() {
+        use super::recheck_step;
+        use super::RecheckStep;
+        use super::RECHECK_EXPIRY;
+
+        let young = RECHECK_EXPIRY - Duration::from_secs(1);
+        for undecided in [None, Some(VerifyOutcome::Waiting)] {
+            assert_eq!(recheck_step(undecided, young), RecheckStep::Hold);
+            assert_eq!(recheck_step(undecided, RECHECK_EXPIRY), RecheckStep::Forget);
+        }
+        // A verdict is recorded whatever its age.
+        assert_eq!(
+            recheck_step(Some(VerifyOutcome::Verified), RECHECK_EXPIRY),
+            RecheckStep::Record(VerifyOutcome::Verified),
+        );
     }
 
     #[test]
