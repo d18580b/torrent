@@ -1364,6 +1364,7 @@ pub async fn boot(
     let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
     if let Some(pool) = pool.as_ref() {
         pool.set_metrics(metrics.clone());
+        pool.set_state(Arc::clone(&state));
     }
 
     // Two artefacts persist a torrent→profile mapping, and nothing reconciled

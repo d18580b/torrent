@@ -55,6 +55,10 @@ pub struct PoolService {
     /// Set once by the daemon after opening; absent for `torrentd pool …`,
     /// which is a one-shot CLI with nothing to scrape it.
     metrics: std::sync::OnceLock<Arc<dyn MetricsSink>>,
+    /// What the sessions serve. Set once by the daemon; absent for
+    /// `torrentd pool …`, which runs no session. A scan keeps every torrent
+    /// in it in the index even after its `.torrent` leaves the library.
+    loaded: std::sync::OnceLock<Arc<StateMap>>,
 }
 
 impl std::fmt::Debug for PoolService {
@@ -104,7 +108,14 @@ impl PoolService {
             verify: VerifyQueue::new(pool_cfg.max_concurrent_verify),
             allow_mutations: pool_cfg.allow_mutations,
             metrics: std::sync::OnceLock::new(),
+            loaded: std::sync::OnceLock::new(),
         })))
+    }
+
+    /// The sessions' state map, so a scan knows what is loaded. The daemon
+    /// sets this once after opening; a second call is ignored.
+    pub fn set_state(&self, state: Arc<StateMap>) {
+        let _ = self.loaded.set(state);
     }
 
     /// Where the pool's failures are counted. The daemon sets this once after
@@ -192,7 +203,12 @@ impl PoolService {
                 summary.errors += s.errors;
                 count(&s);
             }
-            let lib = torrentd_pool::scan_library(store, &self.library_dir)
+            let loaded: std::collections::HashSet<String> = self
+                .loaded
+                .get()
+                .map(|s| s.infohashes().iter().map(|ih| ih.to_hex()).collect())
+                .unwrap_or_default();
+            let lib = torrentd_pool::scan_library(store, &self.library_dir, &loaded)
                 .with_context(|| format!("scan library {}", self.library_dir.display()))?;
             summary.torrents = lib.torrents_indexed;
             summary.errors += lib.errors;
@@ -1012,6 +1028,49 @@ mod tests {
             text.contains("torrentd_pool_scan_errors_total{kind=\"parse\"} 1"),
             "{text}"
         );
+    }
+
+    /// The daemon's scan keeps a torrent its sessions serve in the index after
+    /// its `.torrent` leaves the library, whatever its adoption state.
+    #[test]
+    fn a_scan_keeps_a_loaded_torrent_gone_from_the_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let library = dir.path().join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        std::fs::copy(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../torrentd-pool/tests/fixtures/pad_file.torrent"),
+            library.join("pad_file.torrent"),
+        )
+        .unwrap();
+        pool.scan().unwrap();
+        let ih = pool.with_store(|s| s.torrents().unwrap())[0]
+            .infohash
+            .clone();
+
+        let state = std::sync::Arc::new(torrentd_engine::StateMap::new());
+        let hash = InfoHash::from_hex(&ih).unwrap();
+        state.insert(
+            hash,
+            TorrentState::newly_added(
+                TorrentHandle {
+                    id: 1,
+                    infohash: hash,
+                },
+                ProfileId::new("p"),
+                Instant::now(),
+            ),
+        );
+        pool.set_state(state.clone());
+        std::fs::remove_file(library.join("pad_file.torrent")).unwrap();
+        pool.scan().unwrap();
+        assert!(pool.with_store(|s| s.torrent(&ih).unwrap()).is_some());
+
+        state.remove(&hash);
+        pool.scan().unwrap();
+        assert!(pool.with_store(|s| s.torrent(&ih).unwrap()).is_none());
     }
 
     fn pending(ih: InfoHash, profile: &str) -> super::PendingVerify {

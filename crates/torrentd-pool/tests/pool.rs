@@ -548,7 +548,7 @@ fn fixture_on_disk(name: &str) -> (tempfile::TempDir, PoolStore, PathBuf, String
     std::fs::copy(&src, library.join(name)).unwrap();
 
     let mut store = PoolStore::open_in_memory().unwrap();
-    torrentd_pool::scan_library(&mut store, &library).unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
     let t = store.torrents().unwrap().pop().expect("fixture indexed");
     let files = store.torrent_files(&t.infohash).unwrap();
     assert!(
@@ -614,7 +614,7 @@ fn library_with_sidecar(
     fr.push(b'e');
     std::fs::write(library.join("t.fastresume"), fr).unwrap();
     let mut store = PoolStore::open_in_memory().unwrap();
-    torrentd_pool::scan_library(&mut store, &library).unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
     let ih = store.torrents().unwrap().pop().unwrap().infohash;
     (library, store, ih)
 }
@@ -1604,7 +1604,7 @@ fn a_torrent_gone_from_the_library_leaves_the_index_unless_adopted() {
         .unwrap();
     }
     let mut store = PoolStore::open_in_memory().unwrap();
-    torrentd_pool::scan_library(&mut store, &library).unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
     let all = store.torrents().unwrap();
     assert_eq!(all.len(), 2);
     let pad = all
@@ -1633,10 +1633,118 @@ fn a_torrent_gone_from_the_library_leaves_the_index_unless_adopted() {
 
     std::fs::remove_file(library.join("pad_file.torrent")).unwrap();
     std::fs::remove_file(library.join("v2_hybrid.torrent")).unwrap();
-    torrentd_pool::scan_library(&mut store, &library).unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
 
     assert!(store.torrent(&pad).unwrap().is_none(), "dropped");
     assert!(store.torrent(&hybrid).unwrap().is_some(), "adopted: kept");
+}
+
+/// Copy library fixtures into a fresh library and index them, returning the
+/// info-hash of each in order.
+fn indexed_library(names: &[&str]) -> (tempfile::TempDir, PathBuf, PoolStore, Vec<String>) {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    for name in names {
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures")
+                .join(name),
+            library.join(name),
+        )
+        .unwrap();
+    }
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    let all = store.torrents().unwrap();
+    let ihs = names
+        .iter()
+        .map(|n| {
+            all.iter()
+                .find(|t| t.source_path.ends_with(n))
+                .unwrap()
+                .infohash
+                .clone()
+        })
+        .collect();
+    (dir, library, store, ihs)
+}
+
+/// A torrent a session serves stays in the index whatever its state: a
+/// loaded torrent with no claims makes every delete plan refuse to apply,
+/// and its payload reads as orphans. `drifted` is kept even when the caller
+/// cannot say what is loaded, as `adopted` is.
+#[test]
+fn a_loaded_or_drifted_torrent_gone_from_the_library_stays_in_the_index() {
+    let (_dir, library, mut store, ihs) =
+        indexed_library(&["pad_file.torrent", "v2_hybrid.torrent"]);
+    let (partial_loaded, drifted) = (&ihs[0], &ihs[1]);
+    store
+        .set_adoption(
+            partial_loaded,
+            AdoptionState::Partial,
+            None,
+            None,
+            None,
+            Some(3),
+            None,
+        )
+        .unwrap();
+    store
+        .set_adoption(
+            drifted,
+            AdoptionState::Drifted,
+            None,
+            None,
+            None,
+            Some(3),
+            None,
+        )
+        .unwrap();
+    std::fs::remove_file(library.join("pad_file.torrent")).unwrap();
+    std::fs::remove_file(library.join("v2_hybrid.torrent")).unwrap();
+
+    let loaded = std::collections::HashSet::from([partial_loaded.clone()]);
+    torrentd_pool::scan_library(&mut store, &library, &loaded).unwrap();
+    assert!(store.torrent(partial_loaded).unwrap().is_some(), "loaded");
+    assert!(store.torrent(drifted).unwrap().is_some(), "drifted");
+
+    // Once nothing serves it, the partial one goes.
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert!(store.torrent(partial_loaded).unwrap().is_none());
+    assert!(store.torrent(drifted).unwrap().is_some());
+}
+
+/// The prune runs only over a library seen in full. A `.torrent` that is
+/// present but does not parse names no info-hash, so one corrupted in place
+/// would otherwise have its torrent dropped with its claims.
+#[test]
+fn nothing_is_pruned_from_a_library_that_was_not_read_in_full() {
+    let (_dir, library, mut store, ihs) = indexed_library(&["pad_file.torrent"]);
+    // Corrupted in place: still there, no longer a torrent.
+    std::fs::write(library.join("pad_file.torrent"), b"truncated").unwrap();
+    let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert_eq!(stats.errors_by_kind.get("parse"), Some(&1));
+    assert!(store.torrent(&ihs[0]).unwrap().is_some(), "kept");
+
+    // Unreadable: the same. Skipped where permissions do not bind (root).
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let p = library.join("pad_file.torrent");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&p).is_err() {
+            let stats =
+                torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+            assert_eq!(stats.errors_by_kind.get("read"), Some(&1));
+            assert!(store.torrent(&ihs[0]).unwrap().is_some(), "kept");
+        }
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    // Once the library reads cleanly again, the prune resumes.
+    std::fs::remove_file(library.join("pad_file.torrent")).unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    assert!(store.torrent(&ihs[0]).unwrap().is_none());
 }
 
 #[test]

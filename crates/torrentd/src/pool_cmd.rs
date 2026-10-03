@@ -57,7 +57,9 @@ fn scan_inner(
         errors += s.errors;
     }
 
-    let lib = torrentd_pool::scan_library(store, &pool_cfg.library_dir)
+    // No session runs here to say what is loaded; `adopted` and `drifted`
+    // torrents are kept regardless (`PoolStore::retain_torrents`).
+    let lib = torrentd_pool::scan_library(store, &pool_cfg.library_dir, &Default::default())
         .with_context(|| format!("scan library {}", pool_cfg.library_dir.display()))?;
     println!(
         "  library {:<37} {:>10} torrents",

@@ -1045,22 +1045,27 @@ impl PoolStore {
         Ok(gone.len())
     }
 
-    /// Drop every library torrent not in `seen` and not `adopted`. Returns
-    /// how many went.
+    /// Drop every library torrent not in `seen`, unless it is `adopted` or
+    /// `drifted`, or in `loaded`. Returns how many went.
     ///
     /// A `.torrent` deleted from the library otherwise stayed in the index
-    /// for good, and its claims kept protecting bytes no torrent wants. An
-    /// adopted one is kept: it is loaded and seeding, and its claims are what
-    /// keep a delete plan off its payload.
+    /// for good, and its claims kept protecting bytes no torrent wants. A
+    /// torrent a session serves is kept whatever its state: its claims are
+    /// what keep a delete plan off its payload, and a loaded torrent with no
+    /// claims makes every delete plan refuse to apply. `adopted` and
+    /// `drifted` are kept even where the caller cannot say what is loaded,
+    /// because only a torrent that was adopted reaches either. `loaded` is
+    /// hex info-hashes, as the index keys them.
     pub fn retain_torrents(
         &mut self,
         seen: &std::collections::HashSet<String>,
+        loaded: &std::collections::HashSet<String>,
     ) -> Result<usize, PoolError> {
         let gone: Vec<String> = self
             .torrents()?
             .into_iter()
             .map(|t| t.infohash)
-            .filter(|ih| !seen.contains(ih))
+            .filter(|ih| !seen.contains(ih) && !loaded.contains(ih))
             .collect();
         let mut dropped = 0;
         let tx = self.conn.savepoint()?;
@@ -1072,7 +1077,10 @@ impl PoolStore {
                     |r| r.get(0),
                 )
                 .optional()?;
-            if state.as_deref() == Some(AdoptionState::Adopted.as_str()) {
+            if matches!(
+                state.as_deref().and_then(AdoptionState::parse),
+                Some(AdoptionState::Adopted | AdoptionState::Drifted)
+            ) {
                 warn!(
                     target: "torrentd_pool::store",
                     infohash = %ih,

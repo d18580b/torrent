@@ -128,7 +128,15 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
 /// `<hash>.torrent` alongside `<hash>.fastresume`; the sidecar is read for its
 /// save-path, category and tag hints. Nothing here is qBittorrent-specific —
 /// a plain directory of `.torrent` files works the same, minus the hints.
-pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanStats, PoolError> {
+///
+/// A torrent whose `.torrent` is gone leaves the index, except one in
+/// `loaded` (hex info-hashes a session serves) — see
+/// [`PoolStore::retain_torrents`].
+pub fn scan_library(
+    store: &mut PoolStore,
+    library_dir: &Path,
+    loaded: &std::collections::HashSet<String>,
+) -> Result<ScanStats, PoolError> {
     let mut stats = ScanStats::default();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !library_dir.exists() {
@@ -243,12 +251,17 @@ pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanSta
     }
 
     // A torrent whose `.torrent` is gone from the library leaves the index,
-    // unless a walk or read error means the library was not fully seen: an
-    // unreadable subdirectory would otherwise drop every torrent under it.
-    let unseen = stats.errors_by_kind.get("walk").copied().unwrap_or(0)
-        + stats.errors_by_kind.get("read").copied().unwrap_or(0);
+    // unless an error means the library was not fully seen: an unreadable
+    // subdirectory would otherwise drop every torrent under it, and a
+    // `.torrent` that is present but does not parse — truncated by a copy,
+    // or corrupted — names no info-hash, so its torrent would be dropped
+    // with its claims and its payload offered up as orphans.
+    let unseen = ["walk", "read", "parse"]
+        .iter()
+        .map(|k| stats.errors_by_kind.get(k).copied().unwrap_or(0))
+        .sum::<u64>();
     if unseen == 0 {
-        let dropped = store.retain_torrents(&seen)?;
+        let dropped = store.retain_torrents(&seen, loaded)?;
         if dropped > 0 {
             info!(
                 target: "torrentd_pool::scan",
@@ -324,7 +337,7 @@ mod tests {
         std::fs::write(dir.path().join("broken.torrent"), b"not bencode").unwrap();
         let mut store = PoolStore::open_in_memory().unwrap();
 
-        let stats = scan_library(&mut store, dir.path()).unwrap();
+        let stats = scan_library(&mut store, dir.path(), &Default::default()).unwrap();
 
         assert_eq!(stats.errors, 1);
         assert_eq!(
