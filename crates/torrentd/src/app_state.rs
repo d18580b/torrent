@@ -75,6 +75,93 @@ pub struct AppState {
     /// `/v1/events` stream — end when it fires, so a graceful shutdown is not
     /// held open by a client that never disconnects.
     pub shutdown: tokio::sync::broadcast::Sender<torrentd_engine::ShutdownReason>,
+    /// Long-running pool work — scans, drift checks, plan applies — and the
+    /// latch that tells it the daemon is going away. See [`WorkGate`].
+    pub work: Arc<WorkGate>,
+}
+
+/// Blocking work a request (or boot) started that must not be cut off
+/// mid-step, and the shutdown latch it checks.
+///
+/// A pool scan, drift check or plan apply runs on `spawn_blocking`. The
+/// HTTP server's graceful drain waits for the *request*, not the blocking
+/// task under it: a drain that timed out, or a client that went away, left
+/// the task running while the teardown proceeded around it — closing the
+/// sessions it moves storage through — until `process::exit` killed it
+/// mid-step. The teardown now latches [`WorkGate::cancel`], which an apply
+/// checks between steps, and waits (bounded) for [`WorkGate::wait_idle`]
+/// before it stops the alert loop.
+///
+/// Unlike the shutdown broadcast, the latch can be read by something that
+/// starts *after* the shutdown was sent, which is what the `/v1/events`
+/// stream opened during the drain needs.
+#[derive(Debug, Default)]
+pub struct WorkGate {
+    cancelled: std::sync::atomic::AtomicBool,
+    in_flight: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// Holds one unit of work in flight until dropped.
+#[derive(Debug)]
+pub struct WorkGuard(Arc<WorkGate>);
+
+impl Drop for WorkGuard {
+    fn drop(&mut self) {
+        if self
+            .0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl WorkGate {
+    /// Count one unit of work in flight until the guard drops. Move the guard
+    /// into the blocking task, so it is held for as long as the work runs
+    /// rather than as long as the request waits for it.
+    pub fn enter(self: &Arc<Self>) -> WorkGuard {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        WorkGuard(Arc::clone(self))
+    }
+
+    /// Latch the shutdown. Idempotent.
+    pub fn cancel(&self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Units of work in flight.
+    pub fn in_flight(&self) -> usize {
+        self.in_flight.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until no work is in flight, or `bound` passes. Returns whether
+    /// the work finished.
+    pub async fn wait_idle(&self, bound: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            let notified = self.idle.notified();
+            tokio::pin!(notified);
+            // Registered before the count is read, so a guard dropping in
+            // between still wakes this.
+            notified.as_mut().enable();
+            if self.in_flight() == 0 {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return self.in_flight() == 0;
+            }
+        }
+    }
 }
 
 impl AppState {
@@ -196,6 +283,44 @@ pub(crate) fn build_test_state_with_sessions(
         trusted_proxies: Default::default(),
         unloaded_at_boot: Arc::new(Mutex::new(HashSet::new())),
         shutdown: tokio::sync::broadcast::channel(4).0,
+        work: Arc::default(),
+    }
+}
+
+#[cfg(test)]
+mod work_gate_tests {
+    use std::time::Duration;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_idle_returns_when_the_last_guard_drops() {
+        let gate: Arc<WorkGate> = Arc::default();
+        let guard = gate.enter();
+        let waiter = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move { gate.wait_idle(Duration::from_secs(5)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "returned with work still in flight");
+        drop(guard);
+        assert!(waiter.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn wait_idle_gives_up_at_its_bound() {
+        let gate: Arc<WorkGate> = Arc::default();
+        let _guard = gate.enter();
+        let started = std::time::Instant::now();
+        assert!(!gate.wait_idle(Duration::from_millis(100)).await);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn the_latch_is_visible_to_whatever_starts_after_it() {
+        let gate: Arc<WorkGate> = Arc::default();
+        gate.cancel();
+        assert!(gate.is_cancelled());
     }
 }
 

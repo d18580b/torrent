@@ -15,17 +15,24 @@
 //!   - Fault injection beyond errors: `inject_panic(op)` makes the next call
 //!     to that op panic, and `stall_next_pop(d)` makes the next `pop_alerts`
 //!     block for `d`, which wedges whatever loop is draining it.
+//!   - In-flight calls: `hold_next(op)` parks the next call to that op until
+//!     the test releases it, so a test can act while the call runs.
 //!
 //! The daemon's `fault-injection` build layers one of these over each real
 //! session so an alert drill can queue libtorrent alerts, stall the alert
 //! loop, or panic a task. A long-running process calls `pop_alerts` many
 //! times a second, so that build turns the call recorder off with
 //! `without_recording`.
+//!
+//! Compiled only for this crate's tests and under the `test-support` feature,
+//! which `torrentd` enables for its own tests and for `fault-injection`. A
+//! release daemon carries no test double.
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use dashmap::DashMap;
@@ -40,6 +47,7 @@ use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::Settings;
 use libtorrent_safe::TorrentDetails;
 use libtorrent_safe::TorrentFile;
+use libtorrent_safe::TorrentFlags;
 use libtorrent_safe::TorrentHandle;
 use libtorrent_safe::TrackerEntry;
 use parking_lot::Mutex;
@@ -80,11 +88,13 @@ pub enum RecordedCall {
         new_path: String,
         flags: MoveFlags,
     },
-    ApplySettings(Settings),
+    /// Boxed: `Settings` is several times larger than every other variant.
+    ApplySettings(Box<Settings>),
     SessionState,
     TorrentDetails(TorrentHandle),
     TorrentFiles(TorrentHandle),
     TorrentTrackers(TorrentHandle),
+    Close,
 }
 
 /// Stripped-down view of `AddParams` so we can derive Clone/Debug
@@ -106,7 +116,44 @@ pub enum AddParamsSummary {
         /// Whether `.torrent` bytes were supplied to repair missing metadata.
         has_torrent: bool,
         save_path: Option<String>,
+        /// Set on top of the resume data's own flags.
+        flags_set: u32,
+        /// Cleared from them, after `flags_set`.
+        flags_clear: u32,
     },
+}
+
+impl AddParamsSummary {
+    /// The flags the add asserts: `flags` for a `.torrent` or magnet add,
+    /// `flags_set` for a resume add.
+    pub fn flags_set(&self) -> TorrentFlags {
+        TorrentFlags::from_bits_retain(match self {
+            Self::File { flags_bits, .. } | Self::Magnet { flags_bits, .. } => *flags_bits,
+            Self::Resume { flags_set, .. } => *flags_set,
+        })
+    }
+
+    /// The flags the add clears from what it starts from: nothing for a
+    /// `.torrent` or magnet add, which starts from no flags at all.
+    pub fn flags_clear(&self) -> TorrentFlags {
+        match self {
+            Self::File { .. } | Self::Magnet { .. } => TorrentFlags::empty(),
+            Self::Resume { flags_clear, .. } => TorrentFlags::from_bits_retain(*flags_clear),
+        }
+    }
+
+    /// Whether the add, as the caller asked for it, leaves the torrent in
+    /// upload mode with no [`crate::policy::forbidden`] flag in force whatever
+    /// its resume data carried.
+    pub fn forbids_downloading(&self) -> bool {
+        let forbidden = crate::policy::forbidden();
+        self.flags_set().contains(TorrentFlags::UPLOAD_MODE)
+            && !self.flags_set().intersects(forbidden)
+            && match self {
+                Self::Resume { .. } => self.flags_clear().contains(forbidden),
+                Self::File { .. } | Self::Magnet { .. } => true,
+            }
+    }
 }
 
 impl From<&AddParams> for AddParamsSummary {
@@ -134,19 +181,49 @@ impl From<&AddParams> for AddParamsSummary {
                 bytes,
                 torrent,
                 save_path,
-                ..
+                flags_set,
+                flags_clear,
             } => AddParamsSummary::Resume {
                 byte_len: bytes.len(),
                 has_torrent: torrent.as_ref().is_some_and(|t| !t.is_empty()),
                 save_path: save_path.clone(),
+                flags_set: flags_set.bits(),
+                flags_clear: flags_clear.bits(),
             },
         }
+    }
+}
+
+/// A call [`MockEngine::hold_next`] parked. Dropping it releases the call.
+#[derive(Debug)]
+pub struct HeldCall {
+    entered: mpsc::Receiver<()>,
+    release: mpsc::Sender<()>,
+}
+
+impl HeldCall {
+    /// Block until the held call has been reached.
+    pub fn wait_entered(&self) {
+        self.entered
+            .recv()
+            .expect("the engine was dropped before the held call was reached");
+    }
+
+    /// Let the held call go on.
+    pub fn release(&self) {
+        let _ = self.release.send(());
     }
 }
 
 #[derive(Debug)]
 pub struct MockEngine {
     alerts: Mutex<VecDeque<Alert>>,
+    /// When set, the alert queue holds at most this many alerts and drops the
+    /// rest, reporting them on the next `pop_alerts` as one
+    /// `Alert::AlertsDropped` — libtorrent's `alert_queue_size` behaviour.
+    alert_capacity: Mutex<Option<usize>>,
+    /// Types dropped since the last `pop_alerts`, as libtorrent's bitset.
+    dropped_bits: Mutex<[u64; 2]>,
     calls: Mutex<Vec<RecordedCall>>,
     next_handle_id: AtomicU64,
     /// `op_name` → fixed error to return on the next call to that op.
@@ -155,6 +232,9 @@ pub struct MockEngine {
     panic_inject: DashMap<&'static str, ()>,
     /// How long the next `pop_alerts` blocks before draining.
     stall: Mutex<Option<Duration>>,
+    /// Ops whose next call signals it was reached, then parks until the
+    /// [`HeldCall`] releases it or is dropped.
+    holds: DashMap<&'static str, (mpsc::Sender<()>, Mutex<mpsc::Receiver<()>>)>,
     /// When clear, `calls()` stays empty. On by default.
     recording: AtomicBool,
     /// infohash → handle, so add/remove are consistent across calls.
@@ -186,11 +266,14 @@ impl MockEngine {
     pub fn new() -> Self {
         Self {
             alerts: Mutex::new(VecDeque::new()),
+            alert_capacity: Mutex::new(None),
+            dropped_bits: Mutex::new([0; 2]),
             calls: Mutex::new(Vec::new()),
             next_handle_id: AtomicU64::new(1),
             error_inject: DashMap::new(),
             panic_inject: DashMap::new(),
             stall: Mutex::new(None),
+            holds: DashMap::new(),
             recording: AtomicBool::new(true),
             handles: DashMap::new(),
             auto_save_resume: AtomicBool::new(false),
@@ -230,9 +313,28 @@ impl MockEngine {
 
     // --- test fixture helpers -----------------------------------------------
 
+    /// Bound the alert queue at `n`, dropping what overflows it the way
+    /// libtorrent does: silently, reported afterwards only as a bitset of the
+    /// alert *types* lost. Saves are the one type mapped to their real bit
+    /// (37/38, `alert_types.hpp`); any other lost type sets bit 0.
+    pub fn with_alert_capacity(self, n: usize) -> Self {
+        *self.alert_capacity.lock() = Some(n);
+        self
+    }
+
     /// Queue an alert that the next `pop_alerts` call will surface.
     pub fn push_alert(&self, a: Alert) {
-        self.alerts.lock().push_back(a);
+        let mut q = self.alerts.lock();
+        if self.alert_capacity.lock().is_some_and(|cap| q.len() >= cap) {
+            let bit = match a.kind() {
+                AlertKind::SaveResumeData => 37,
+                AlertKind::SaveResumeDataFailed => 38,
+                _ => 0,
+            };
+            self.dropped_bits.lock()[0] |= 1u64 << bit;
+            return;
+        }
+        q.push_back(a);
     }
 
     pub fn push_alerts(&self, alerts: impl IntoIterator<Item = Alert>) {
@@ -261,6 +363,19 @@ impl MockEngine {
     /// A later call replaces an armed stall that has not been taken yet.
     pub fn stall_next_pop(&self, d: Duration) {
         *self.stall.lock() = Some(d);
+    }
+
+    /// Park the next call to `op` until the returned [`HeldCall`] releases
+    /// it (or is dropped). Takes the same op names as `inject_error`, and is
+    /// taken before them, so a held call can still fail once released.
+    pub fn hold_next(&self, op: &'static str) -> HeldCall {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        self.holds.insert(op, (entered_tx, Mutex::new(release_rx)));
+        HeldCall {
+            entered: entered_rx,
+            release: release_tx,
+        }
     }
 
     pub fn calls(&self) -> Vec<RecordedCall> {
@@ -320,6 +435,11 @@ impl MockEngine {
     }
 
     fn check_error(&self, op: &'static str) -> Result<(), EngineError> {
+        if let Some((_, (entered, release))) = self.holds.remove(op) {
+            let _ = entered.send(());
+            // Returns on a release and on a dropped `HeldCall` alike.
+            let _ = release.lock().recv();
+        }
         if self.panic_inject.remove(op).is_some() {
             panic!("mock injected panic on `{op}`");
         }
@@ -470,7 +590,20 @@ impl TorrentEngine for MockEngine {
         if let Some(d) = stall {
             std::thread::sleep(d);
         }
-        self.alerts.lock().drain(..).collect()
+        let mut out: Vec<Alert> = self.alerts.lock().drain(..).collect();
+        let bits = std::mem::take(&mut *self.dropped_bits.lock());
+        if bits != [0; 2] {
+            out.push(Alert::AlertsDropped {
+                hdr: AlertHeader {
+                    kind: AlertKind::AlertsDropped,
+                    infohash: None,
+                    handle: None,
+                    timestamp_us: 0,
+                },
+                bits,
+            });
+        }
+        out
     }
 
     fn post_updates(&self) {
@@ -481,7 +614,7 @@ impl TorrentEngine for MockEngine {
     }
 
     fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError> {
-        self.record(RecordedCall::ApplySettings(settings.clone()));
+        self.record(RecordedCall::ApplySettings(Box::new(settings.clone())));
         self.check_error("apply_settings")
     }
 
@@ -515,6 +648,10 @@ impl TorrentEngine for MockEngine {
             .get(&h.infohash)
             .map(|t| t.clone())
             .unwrap_or_default())
+    }
+
+    fn close(&self) {
+        self.record(RecordedCall::Close);
     }
 }
 
@@ -635,6 +772,7 @@ mod tests {
             tier: 0,
             verified: true,
             updating: false,
+            working: true,
             fails: 0,
             message: None,
             last_error: None,

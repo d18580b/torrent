@@ -183,6 +183,34 @@ tests:
             exp_annotations:
               summary: "The WireGuard handshake probe cannot run for acct_a (wg missing or unprivileged); only IP presence is checked"
 
+  # Handshakes landing late, over and over, without yet crossing the fence.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_vpn_handshake_age_seconds{profile_id="acct_a"}'
+        values: '100x40'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: TorrentdHandshakeAgeRising
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: TorrentdHandshakeAgeRising
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Profile acct_a's WireGuard handshakes have averaged 100s old over 30 minutes; a healthy tunnel re-handshakes every 2 minutes"
+
+  # A healthy tunnel's sawtooth — a handshake every two minutes — is quiet.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_vpn_handshake_age_seconds{profile_id="acct_a"}'
+        values: '0 60 120 0 60 120 0 60 120 0 60 120 0 60 120 0 60 120 0 60 120 0 60 120 0 60 120 0 60 120 0 60 120 0 60 120 0 60 120'
+    alert_rule_test:
+      - eval_time: 38m
+        alertname: TorrentdHandshakeAgeRising
+        exp_alerts: []
+
   - interval: 1m
     input_series:
       - series: 'torrentd_profile_port_forward_up{profile_id="acct_a"}'
@@ -716,6 +744,55 @@ tests:
               severity: warning
             exp_annotations:
               summary: "Adopted torrents failed verification"
+
+  # Work queued, nothing finishing either way: fires only once the counters
+  # hold an hour of history with no completion, and that has lasted the `for:`
+  # period. A fresh deployment's first large adoption is quiet at 30m and
+  # still at 70m (pending since 60m); it fires at 76m.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_verify_queue_depth'
+        values: '3x90'
+      - series: 'torrentd_pool_verify_completed_total'
+        values: '0x90'
+      - series: 'torrentd_pool_verify_failed_total'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TorrentdPoolVerifyStuck
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: TorrentdPoolVerifyStuck
+        exp_alerts: []
+      - eval_time: 76m
+        alertname: TorrentdPoolVerifyStuck
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "3 adoptions are queued for verification and none has finished in an hour; the verify queue is not draining"
+
+  # A queue that is draining, however deep, is quiet; so is an empty one.
+  # Evaluated past the hour of history the rule requires, so these are quiet
+  # on their merits and not because the counters are young.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_pool_verify_queue_depth{instance="a"}'
+        values: '500x90'
+      - series: 'torrentd_pool_verify_completed_total{instance="a"}'
+        values: '0+1x90'
+      - series: 'torrentd_pool_verify_failed_total{instance="a"}'
+        values: '0x90'
+      - series: 'torrentd_pool_verify_queue_depth{instance="b"}'
+        values: '0x90'
+      - series: 'torrentd_pool_verify_completed_total{instance="b"}'
+        values: '0x90'
+      - series: 'torrentd_pool_verify_failed_total{instance="b"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 80m
+        alertname: TorrentdPoolVerifyStuck
+        exp_alerts: []
 
   - interval: 1m
     input_series:

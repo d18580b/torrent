@@ -3,21 +3,26 @@
 //!
 //!   - Drains alerts from the `AlertSource` and dispatches each through
 //!     the `handlers/` modules.
-//!   - 1-second tick: `post_torrent_updates` per profile.
+//!   - 2-second tick: `post_torrent_updates` per profile.
 //!   - 30-second tick: `post_session_stats` per profile.
-//!   - 30-minute tick: scan the state map for torrents flagged
-//!     `needs_save_resume` and call `save_resume_data` with
-//!     `ONLY_IF_MODIFIED`.
+//!   - 30-minute tick: queue a resume save, `ONLY_IF_MODIFIED`, for every
+//!     torrent flagged `needs_save_resume`.
+//!   - Resume saves: every save is queued per info-hash in the state map and
+//!     handed to libtorrent at most [`RESUME_SAVES_IN_FLIGHT`] at a time,
+//!     topped up as their alerts return. A dropped-alerts notice naming the
+//!     resume alerts puts every in-flight save back on the queue.
 //!   - Disk-error retry timer: a `file_error_alert` arms a `RetryState`;
 //!     when `next_attempt <= now` and libtorrent still holds an error on the
 //!     torrent, we call `engine.resume_torrent(handle)` (which clears the
 //!     error and the pause libtorrent put on it) and schedule the next
 //!     attempt with exponential backoff. A torrent with no error left has
 //!     its timer retired instead.
-//!   - Shutdown: on signal, fire `save_resume_data` for every torrent
-//!     concurrently, then loop draining alerts until
-//!     `pending_resume_count == 0` or the global 30-second deadline
-//!     expires.
+//!   - Shutdown: on signal, queue a resume save (`ONLY_IF_MODIFIED`) for
+//!     every torrent, then loop dispatching and draining until
+//!     `pending_resume_count == 0` or the drain deadline (default
+//!     [`DEFAULT_SHUTDOWN_DEADLINE`], set by
+//!     [`AlertLoopBuilder::shutdown_deadline`]) expires, and flush both
+//!     stores' writers.
 //!   - Listen outcomes: every `listen_succeeded` / `listen_failed` alert is
 //!     published into the `ListenEvents` the daemon supplies, which a NAT-PMP
 //!     rebind waits on before it reports and announces a new port.
@@ -40,7 +45,6 @@ use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use libtorrent_safe::Alert;
 use libtorrent_safe::ResumeFlags;
-use libtorrent_safe::TorrentHandle;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -62,11 +66,27 @@ use crate::state::TorrentPhase;
 use crate::torrent_store::TorrentStore;
 
 const POLL_IDLE_INTERVAL: Duration = Duration::from_millis(100);
-const POST_UPDATES_INTERVAL: Duration = Duration::from_secs(1);
+/// How often each session is asked for a `state_update_alert`. Every call
+/// makes libtorrent walk its torrents for changed status; at 100K torrents a
+/// one-second cadence spent a noticeable share of the network thread on
+/// updates nothing reads that fast, and the API's event stream ticks on the
+/// same cadence, so faster cannot surface anything newer.
+pub const POST_UPDATES_INTERVAL: Duration = Duration::from_secs(2);
 const POST_STATS_INTERVAL: Duration = Duration::from_secs(30);
 const RESUME_SAVE_INTERVAL: Duration = Duration::from_secs(30 * 60);
 const SHUTDOWN_DRAIN_INTERVAL: Duration = Duration::from_millis(50);
-const SHUTDOWN_DEFAULT_DEADLINE: Duration = Duration::from_secs(30);
+/// The resume-save drain's deadline when the daemon sets none.
+pub const DEFAULT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(30);
+/// Most resume saves handed to libtorrent and not yet answered.
+///
+/// Every request is answered by an alert, and libtorrent's alert queue is
+/// bounded: requesting a save for 100K torrents at once overflows it, and the
+/// overflow drops exactly the answers the shutdown drain is waiting for. Half
+/// the 10 000 alerts the shim sizes that queue to, so the answers share it
+/// with every other alert a busy session posts. The queue in the state map
+/// holds the rest, and each loop iteration tops the in-flight set back up as
+/// answers arrive.
+pub const RESUME_SAVES_IN_FLIGHT: usize = 5_000;
 
 /// Why the alert loop is shutting down. Surfaced in logs and tests.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -95,6 +115,7 @@ pub struct AlertLoopBuilder {
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
     listen_events: Option<Arc<ListenEvents>>,
+    shutdown_deadline: Duration,
 }
 
 /// Invoked once, from the loop thread, when a fatal condition is detected —
@@ -134,6 +155,7 @@ impl AlertLoopBuilder {
             on_fatal: None,
             profile_fenced: None,
             listen_events: None,
+            shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
         }
     }
 
@@ -146,6 +168,14 @@ impl AlertLoopBuilder {
     /// rebind's outcome would queue behind it and could outlast the wait.
     pub fn listen_events(mut self, events: Arc<ListenEvents>) -> Self {
         self.listen_events = Some(events);
+        self
+    }
+
+    /// How long the shutdown drain waits for outstanding resume saves before
+    /// giving up on them. The daemon sets it from `shutdown_drain_secs`; a
+    /// pool of 100K torrents needs longer than the default to answer.
+    pub fn shutdown_deadline(mut self, deadline: Duration) -> Self {
+        self.shutdown_deadline = deadline;
         self
     }
 
@@ -211,6 +241,7 @@ impl AlertLoopBuilder {
                 let on_fatal = self.on_fatal.clone();
                 let profile_fenced = self.profile_fenced.clone();
                 let listen_events = self.listen_events.clone();
+                let shutdown_deadline = self.shutdown_deadline;
                 move || {
                     let span = info_span!(parent: parent, "alert_loop");
                     let _enter = span.enter();
@@ -238,6 +269,7 @@ impl AlertLoopBuilder {
                                 profile_fenced,
                                 unsaved_at_shutdown,
                                 listen_events,
+                                shutdown_deadline,
                             },
                         );
                     }));
@@ -375,6 +407,7 @@ struct LoopHooks {
     profile_fenced: Option<ProfileFenced>,
     unsaved_at_shutdown: Arc<AtomicU64>,
     listen_events: Option<Arc<ListenEvents>>,
+    shutdown_deadline: Duration,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,7 +435,7 @@ fn run(
             info!(target: "torrentd_engine::alert_loop", reason = ?reason, "shutdown signaled");
             let unsaved = run_shutdown(
                 reason,
-                SHUTDOWN_DEFAULT_DEADLINE,
+                hooks.shutdown_deadline,
                 &source,
                 &state,
                 &resume,
@@ -465,7 +498,7 @@ fn run(
             }
             let unsaved = run_shutdown(
                 ShutdownReason::ListenFailed,
-                SHUTDOWN_DEFAULT_DEADLINE,
+                hooks.shutdown_deadline,
                 &source,
                 &state,
                 &resume,
@@ -502,9 +535,12 @@ fn run(
             last_post_stats = now;
         }
         if now.saturating_duration_since(last_resume_save) >= RESUME_SAVE_INTERVAL {
-            schedule_periodic_resume_saves(&source, &state, &metrics);
+            schedule_periodic_resume_saves(&state);
             last_resume_save = now;
         }
+        // Top the in-flight saves back up from the queue: the sweep above,
+        // and saves re-queued after an alert overflow.
+        dispatch_saves(&source, &state, &metrics);
 
         // 4) Retry timer.
         execute_due_retries(
@@ -595,11 +631,7 @@ fn dispatch_alert(
     }
 }
 
-fn schedule_periodic_resume_saves(
-    source: &Arc<dyn AlertSource>,
-    state: &Arc<StateMap>,
-    metrics: &Arc<dyn MetricsSink>,
-) {
+fn schedule_periodic_resume_saves(state: &Arc<StateMap>) {
     let handles = state.needing_resume_save();
     if handles.is_empty() {
         return;
@@ -610,7 +642,7 @@ fn schedule_periodic_resume_saves(
         "periodic resume save sweep",
     );
     for h in handles {
-        request_save(source, state, metrics, h, ResumeFlags::ONLY_IF_MODIFIED);
+        state.queue_resume_save(h.infohash, ResumeFlags::ONLY_IF_MODIFIED);
     }
 }
 
@@ -634,6 +666,11 @@ fn execute_due_retries(
         // down and refuses to restart it without an operator. Resuming one on
         // the disk-error retry timer would un-quarantine it individually,
         // which is the thing fencing exists to prevent.
+        //
+        // `retries_due` popped this torrent's deadline, so a skip has to
+        // schedule another look itself, or a torrent whose fence later lifts
+        // is never retried again. Look again after the initial delay, attempt
+        // count unchanged: skipping is not an attempt.
         if profile_fenced.is_some_and(|f| f(&st.profile_id)) {
             debug!(
                 target: "torrentd_engine::alert_loop",
@@ -641,6 +678,7 @@ fn execute_due_retries(
                 infohash = %handle.infohash,
                 "retry skipped: profile is fenced",
             );
+            defer_retry(state, clock, &handle.infohash);
             continue;
         }
         // What a `file_error_alert` leaves behind under this daemon's flags
@@ -692,7 +730,10 @@ fn execute_due_retries(
             state.update(&handle.infohash, |s| s.retry = None);
             continue;
         }
+        // No session for the profile right now: look again later, as for a
+        // fenced profile.
         let Some(engine) = source.engine_for(&st.profile_id) else {
+            defer_retry(state, clock, &handle.infohash);
             continue;
         };
         match engine.resume_torrent(handle) {
@@ -724,40 +765,67 @@ fn execute_due_retries(
                     "disk_error_retry_errors_total",
                     &[("profile_id", st.profile_id.as_str())],
                 );
+                // A failed resume is still an attempt: back off and schedule
+                // the next one, or the popped deadline was the last.
+                state.update(&handle.infohash, |s| {
+                    let attempts = s.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
+                    s.retry = Some(crate::state::RetryState::next(clock.now(), attempts));
+                });
             }
         }
     }
 }
 
-fn request_save(
+/// Schedule another look at a due retry that was skipped without an attempt,
+/// [`RetryState::INITIAL_DELAY`](crate::state::RetryState::INITIAL_DELAY)
+/// from now, keeping its attempt count.
+fn defer_retry(state: &StateMap, clock: &Arc<dyn Clock>, ih: &libtorrent_safe::InfoHash) {
+    state.update(ih, |s| {
+        if let Some(r) = s.retry.as_mut() {
+            r.next_attempt = clock.now() + crate::state::RetryState::INITIAL_DELAY;
+        }
+    });
+}
+
+/// Hand queued resume saves to libtorrent until [`RESUME_SAVES_IN_FLIGHT`]
+/// are outstanding.
+fn dispatch_saves(
     source: &Arc<dyn AlertSource>,
     state: &Arc<StateMap>,
     metrics: &Arc<dyn MetricsSink>,
-    handle: TorrentHandle,
-    flags: ResumeFlags,
 ) {
-    let Some(st) = state.get(&handle.infohash) else {
-        return;
-    };
-    let Some(engine) = source.engine_for(&st.profile_id) else {
-        return;
-    };
-    state.note_resume_requested();
-    if let Err(e) = engine.save_resume_data(handle, flags) {
-        // Failed before reaching libtorrent — settle immediately or the
-        // counter will leak.
-        state.note_resume_settled();
-        warn!(
-            target: "torrentd_engine::alert_loop",
-            profile_id = %st.profile_id,
-            infohash = %handle.infohash,
-            error.cause = %e,
-            "save_resume_data dispatch failed",
-        );
-        metrics.inc_counter(
-            "resume_save_dispatch_errors_total",
-            &[("profile_id", st.profile_id.as_str())],
-        );
+    for (ih, flags) in state.dispatch_resume_saves(RESUME_SAVES_IN_FLIGHT) {
+        // Removed since it was queued: nothing to save, and no alert coming.
+        let Some(st) = state.get(&ih) else {
+            state.note_resume_settled(&ih);
+            continue;
+        };
+        let Some(engine) = source.engine_for(&st.profile_id) else {
+            state.note_resume_settled(&ih);
+            continue;
+        };
+        // A file left stale by a failed write: libtorrent's modified bit went
+        // with the data that failed, so only an unconditional save rewrites it.
+        let flags = if st.resume_write_failed {
+            flags - ResumeFlags::ONLY_IF_MODIFIED
+        } else {
+            flags
+        };
+        if let Err(e) = engine.save_resume_data(st.handle, flags) {
+            // Failed before reaching libtorrent, so no alert will settle it.
+            state.note_resume_settled(&ih);
+            warn!(
+                target: "torrentd_engine::alert_loop",
+                profile_id = %st.profile_id,
+                infohash = %ih,
+                error.cause = %e,
+                "save_resume_data dispatch failed",
+            );
+            metrics.inc_counter(
+                "resume_save_dispatch_errors_total",
+                &[("profile_id", st.profile_id.as_str())],
+            );
+        }
     }
 }
 
@@ -779,12 +847,24 @@ fn run_shutdown(
     let started = clock.now();
     let started_count = state.len();
 
-    // Drain whatever's pending so the resume queue is in a known state.
-    drain_once(source, state, resume, torrents, metrics, clock);
+    let stop_at = started + deadline;
 
-    // Trigger one save_resume_data per torrent. Tracking via the shared
-    // `pending_resume_count`; the per-handler `note_resume_settled` will
-    // decrement as alerts come back.
+    // Drain whatever's pending so the resume queue is in a known state. A pop
+    // is capped at `MAX_ALERTS_PER_POP`, so one drain may leave a backlog;
+    // keep draining while it comes back non-empty, bounded by the deadline.
+    while drain_once(source, state, resume, torrents, metrics, clock) && clock.now() < stop_at {}
+
+    // Queue one save per torrent; the dispatcher below hands them to
+    // libtorrent a capped number at a time, and the resume handlers settle
+    // each as its alert comes back.
+    //
+    // `ONLY_IF_MODIFIED`: libtorrent answers a torrent whose state has not
+    // changed since its last save with a cheap "not modified" rather than
+    // serialising and writing it again. On a 100K-torrent pool that is
+    // nearly all of them, and forcing every one was most of what made the
+    // drain outlast its deadline. A save whose answer was lost is re-asked
+    // without the flag (see the dropped-alerts handler), because libtorrent
+    // cleared its modified bit when it produced the answer nobody received.
     let handles = state.handles();
     info!(
         target: "torrentd_engine::alert_loop",
@@ -794,19 +874,33 @@ fn run_shutdown(
         "shutdown: requesting resume save for every torrent",
     );
     for h in handles {
-        // Force-save (clear ONLY_IF_MODIFIED) — every torrent must persist
-        // its current state, even if libtorrent thinks it's unchanged.
-        request_save(source, state, metrics, h, ResumeFlags::empty());
+        state.queue_resume_save(h.infohash, ResumeFlags::ONLY_IF_MODIFIED);
     }
 
-    let stop_at = started + deadline;
     while clock.now() < stop_at {
+        dispatch_saves(source, state, metrics);
         if state.pending_resume_count() == 0 {
             break;
         }
-        drain_once(source, state, resume, torrents, metrics, clock);
-        clock.sleep(SHUTDOWN_DRAIN_INTERVAL);
+        let drained = drain_once(source, state, resume, torrents, metrics, clock);
+        if state.pending_resume_count() == 0 {
+            break;
+        }
+        // Sleep only once a drain comes back empty: a pop is capped at
+        // `MAX_ALERTS_PER_POP`, and libtorrent's own queue (10000 alerts)
+        // drops `save_resume_data_alert`s once full, so a large pool's saves
+        // must be drained as fast as they arrive, as the main loop does.
+        if !drained {
+            clock.sleep(SHUTDOWN_DRAIN_INTERVAL);
+        }
     }
+
+    // The answers that did arrive are queued on the stores' writers; they are
+    // not saved until they are on disk. Not bounded by the deadline: dropping
+    // data libtorrent already produced would be the worse outcome, and a
+    // batch is a handful of flushes.
+    resume.flush();
+    torrents.flush();
 
     let outstanding = state.pending_resume_count();
     if outstanding > 0 {
@@ -831,6 +925,7 @@ fn run_shutdown(
     outstanding
 }
 
+/// Dispatch one `source.drain()`; true when it returned any alert.
 fn drain_once(
     source: &Arc<dyn AlertSource>,
     state: &Arc<StateMap>,
@@ -838,13 +933,15 @@ fn drain_once(
     torrents: &Arc<dyn TorrentStore>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
-) {
+) -> bool {
     let alerts = source.drain();
+    let drained = !alerts.is_empty();
     for (profile, alert) in alerts {
         dispatch_alert(
             profile, alert, source, state, resume, torrents, metrics, clock,
         );
     }
+    drained
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +954,7 @@ mod tests {
     use libtorrent_safe::AlertKind;
     use libtorrent_safe::InfoHash;
     use libtorrent_safe::ResumeData;
+    use libtorrent_safe::TorrentHandle;
 
     use super::*;
     use crate::clock::MockClock;
@@ -1035,6 +1133,121 @@ mod tests {
         handle.join().expect("loop thread panicked");
     }
 
+    /// One errored torrent in profile `p` whose retry is due at `now`.
+    fn state_with_a_due_retry(now: Instant) -> (Arc<StateMap>, TorrentHandle) {
+        let state = Arc::new(StateMap::new());
+        let ih = InfoHash([9u8; 20]);
+        let h = TorrentHandle {
+            id: 9,
+            infohash: ih,
+        };
+        let mut st = crate::state::TorrentState::newly_added(h, ProfileId::new("p"), now);
+        st.has_error = true;
+        st.phase = TorrentPhase::Paused;
+        st.retry = Some(crate::state::RetryState {
+            next_attempt: now - Duration::from_secs(1),
+            attempts: 1,
+        });
+        state.insert(ih, st);
+        (state, h)
+    }
+
+    #[test]
+    fn a_fenced_torrent_is_retried_once_its_fence_lifts() {
+        // `retries_due` pops the deadline it returns. A skip that scheduled
+        // nothing left the torrent with no deadline at all, and `file_error`
+        // arms only a torrent with no timer, so it was never retried again.
+        let clock = Arc::new(MockClock::new());
+        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+        let (state, h) = state_with_a_due_retry(clock.now());
+        let fenced = Arc::new(AtomicBool::new(true));
+        let fence: ProfileFenced = {
+            let fenced = Arc::clone(&fenced);
+            Arc::new(move |_: &ProfileId| fenced.load(Ordering::SeqCst))
+        };
+
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            Some(&fence),
+            clock.now(),
+        );
+        assert!(!resumed(&engine), "a fenced torrent was resumed");
+        let retry = state.get(&h.infohash).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 1, "a skip is not an attempt");
+        assert!(
+            retry.next_attempt > clock.now(),
+            "the skip scheduled another look"
+        );
+
+        fenced.store(false, Ordering::SeqCst);
+        clock.advance(crate::state::RetryState::INITIAL_DELAY);
+        execute_due_retries(
+            &source,
+            &state,
+            &metrics,
+            &dyn_clock,
+            Some(&fence),
+            clock.now(),
+        );
+        assert!(
+            resumed(&engine),
+            "the torrent was not retried after its fence lifted"
+        );
+    }
+
+    #[test]
+    fn a_retry_with_no_session_or_a_failed_resume_stays_scheduled() {
+        // The two other paths that popped a deadline and scheduled none.
+        let clock = Arc::new(MockClock::new());
+        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+
+        // No engine for the torrent's profile.
+        let empty: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![]));
+        let (state, h) = state_with_a_due_retry(clock.now());
+        execute_due_retries(&empty, &state, &metrics, &dyn_clock, None, clock.now());
+        let retry = state.get(&h.infohash).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 1);
+        assert!(retry.next_attempt > clock.now());
+        clock.advance(crate::state::RetryState::INITIAL_DELAY);
+        assert_eq!(
+            state.retries_due(clock.now()),
+            vec![h],
+            "the look was scheduled"
+        );
+
+        // `resume_torrent` fails: an attempt, so it backs off.
+        let engine = Arc::new(MockEngine::new());
+        engine.inject_error("resume_torrent", crate::engine::EngineError::Shutdown);
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let (state, h) = state_with_a_due_retry(clock.now());
+        execute_due_retries(&source, &state, &metrics, &dyn_clock, None, clock.now());
+        assert!(resumed(&engine));
+        let retry = state.get(&h.infohash).unwrap().retry.unwrap();
+        assert_eq!(retry.attempts, 2, "a failed resume backs off");
+        clock.advance(crate::state::RetryState::delay_for_attempt(2));
+        execute_due_retries(&source, &state, &metrics, &dyn_clock, None, clock.now());
+        assert_eq!(
+            engine
+                .calls()
+                .iter()
+                .filter(|c| matches!(c, crate::mock::RecordedCall::ResumeTorrent(_)))
+                .count(),
+            2,
+            "the retry after a failed resume never ran",
+        );
+    }
+
     /// Drive one pass of the retry timer against a single mock-engine
     /// torrent whose retry is already due, and return what it did.
     fn run_due_retry(has_error: bool) -> (Arc<MockEngine>, Arc<StateMap>, Arc<RecordingSink>) {
@@ -1146,6 +1359,19 @@ mod tests {
                 MetricCall::IncCounter { name, .. } if name.starts_with("disk_error_retry_")
             )),
             "a deferred timer is not a retry attempt",
+        );
+    }
+
+    #[test]
+    fn a_torrent_whose_check_found_pieces_missing_retires_its_timer() {
+        // The check ended and libtorrent reports `downloading`: pieces are
+        // missing, and there is no error left for a resume to clear. It used
+        // to keep reporting `Checking`, so the timer deferred for as long.
+        let (engine, state, _) = run_due_retry_in(false, TorrentPhase::Incomplete, 5);
+        assert!(!resumed(&engine));
+        assert!(
+            state.get(&InfoHash([9u8; 20])).unwrap().retry.is_none(),
+            "the timer retires once the check is over",
         );
     }
 
@@ -1471,7 +1697,8 @@ mod tests {
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
         // Simulate one outstanding save.
-        state.note_resume_requested();
+        state.queue_resume_save(InfoHash([0xAA; 20]), ResumeFlags::empty());
+        state.dispatch_resume_saves(RESUME_SAVES_IN_FLIGHT);
         // Pre-register the torrent in state so the resume handler can
         // update its needs_save_resume flag.
         state.insert(
@@ -1511,8 +1738,9 @@ mod tests {
         let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
         let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
 
-        state.note_resume_requested();
-        state.note_resume_requested();
+        state.queue_resume_save(InfoHash([0xBB; 20]), ResumeFlags::empty());
+        state.queue_resume_save(InfoHash([0xBC; 20]), ResumeFlags::empty());
+        state.dispatch_resume_saves(RESUME_SAVES_IN_FLIGHT);
 
         dispatch_alert(
             ProfileId::new("p"),
@@ -1575,6 +1803,195 @@ mod tests {
         assert_eq!(saves, 2);
     }
 
+    /// `n` torrents loaded into `engine` and the state map, for the drain
+    /// tests below.
+    fn loaded(engine: &MockEngine, n: u32) -> Arc<StateMap> {
+        let state = Arc::new(StateMap::new());
+        let now = std::time::Instant::now();
+        for i in 0..n {
+            let mut b = [0u8; 20];
+            b[..4].copy_from_slice(&i.to_be_bytes());
+            let h = engine.register_handle(InfoHash(b));
+            state.insert(
+                h.infohash,
+                crate::state::TorrentState::newly_added(h, ProfileId::new("p"), now),
+            );
+        }
+        state
+    }
+
+    /// Run the shutdown drain over `engine`/`state`, returning what it left
+    /// unsaved and how many overflows it saw.
+    fn drain(engine: Arc<MockEngine>, state: &Arc<StateMap>) -> (u64, u64, usize) {
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine));
+        let store = Arc::new(MemoryResumeStore::new());
+        let resume: Arc<dyn ResumeStore> = store.clone();
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = recording.clone();
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        let unsaved = run_shutdown(
+            ShutdownReason::Test,
+            DEFAULT_SHUTDOWN_DEADLINE,
+            &source,
+            state,
+            &resume,
+            &torrents,
+            &metrics,
+            &clock,
+        );
+        (
+            unsaved,
+            recording.count_for("alert_queue_overflows_total"),
+            store.len(),
+        )
+    }
+
+    #[test]
+    fn a_50k_drain_stays_inside_the_alert_queue_and_saves_everything() {
+        // The cap is what keeps a whole-pool save from overflowing
+        // libtorrent's 10 000-alert queue: requesting 50K at once answers
+        // 50K alerts into it and drops 40K of them.
+        let engine = Arc::new(
+            MockEngine::new()
+                .without_recording()
+                .with_auto_save_resume(true)
+                .with_alert_capacity(10_000),
+        );
+        let state = loaded(&engine, 50_000);
+        let (unsaved, overflows, written) = drain(engine, &state);
+        assert_eq!(unsaved, 0);
+        assert_eq!(
+            overflows, 0,
+            "the in-flight cap must keep the queue from overflowing"
+        );
+        assert_eq!(written, 50_000);
+    }
+
+    #[test]
+    fn a_50k_drain_with_dropped_answers_still_drains_the_pending_set() {
+        // A queue smaller than the in-flight cap drops answers on every
+        // round. Before, a dropped answer was a save nothing could settle or
+        // re-request, and the drain sat out its deadline with every one of
+        // them counted unsaved.
+        let engine = Arc::new(
+            MockEngine::new()
+                .without_recording()
+                .with_auto_save_resume(true)
+                .with_alert_capacity(3_000),
+        );
+        let state = loaded(&engine, 50_000);
+        let (unsaved, overflows, written) = drain(engine, &state);
+        assert!(overflows > 0, "the scenario must actually drop answers");
+        assert_eq!(unsaved, 0, "every lost save was asked for again");
+        assert_eq!(state.pending_resume_count(), 0);
+        assert_eq!(written, 50_000);
+    }
+
+    #[test]
+    fn the_shutdown_drain_asks_only_for_modified_resume_data() {
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        let state = loaded(&engine, 3);
+        drain(Arc::clone(&engine), &state);
+        let flags: Vec<ResumeFlags> = engine
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                crate::mock::RecordedCall::SaveResumeData { flags, .. } => Some(*flags),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags.len(), 3);
+        assert!(flags.iter().all(|f| *f == ResumeFlags::ONLY_IF_MODIFIED));
+    }
+
+    /// The flags of every `save_resume_data` `engine` was asked for.
+    fn save_flags(engine: &MockEngine) -> Vec<ResumeFlags> {
+        engine
+            .calls()
+            .iter()
+            .filter_map(|c| match c {
+                crate::mock::RecordedCall::SaveResumeData { flags, .. } => Some(*flags),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_stale_resume_file_is_saved_unconditionally_even_by_the_drain() {
+        // libtorrent's modified bit went with the data whose write failed, so
+        // the drain's `ONLY_IF_MODIFIED` would be answered "not modified".
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        let state = loaded(&engine, 1);
+        let ih = state.handles()[0].infohash;
+        state.update(&ih, |st| st.resume_write_failed = true);
+        drain(Arc::clone(&engine), &state);
+        assert_eq!(save_flags(&engine), vec![ResumeFlags::empty()]);
+        assert!(
+            !state.get(&ih).unwrap().resume_write_failed,
+            "cleared once fresh data is accepted for writing",
+        );
+    }
+
+    #[test]
+    fn a_resume_write_that_fails_on_the_writer_is_saved_again_and_lands() {
+        // The handler accepts the data and clears `needs_save_resume`; the
+        // write fails only later, on the batch writer. Its hook marks the
+        // torrent, and the next save rewrites the file.
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("resume");
+        std::fs::create_dir_all(&base).unwrap();
+        // A file where the profile's directory goes: every write fails.
+        let blocker = base.join("p");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        let state = loaded(&engine, 1);
+        let ih = state.handles()[0].infohash;
+        let resume: Arc<dyn ResumeStore> = Arc::new(
+            crate::resume_store::FsResumeStore::new(&base).with_batched_writes(Some({
+                let state = Arc::clone(&state);
+                Arc::new(move |_: &ProfileId, ih: &InfoHash, _: &std::io::Error| {
+                    state.note_resume_write_failed(ih)
+                }) as crate::WriteErrorHook
+            })),
+        );
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        let run = || {
+            run_shutdown(
+                ShutdownReason::Test,
+                DEFAULT_SHUTDOWN_DEADLINE,
+                &source,
+                &state,
+                &resume,
+                &torrents,
+                &metrics,
+                &clock,
+            )
+        };
+
+        assert_eq!(run(), 0, "the answer was accepted, so nothing is pending");
+        assert!(state.get(&ih).unwrap().resume_write_failed);
+        assert!(
+            state.needing_resume_save().iter().any(|h| h.infohash == ih),
+            "the periodic sweep picks it up",
+        );
+
+        std::fs::remove_file(&blocker).unwrap();
+        assert_eq!(run(), 0);
+        let flags = save_flags(&engine);
+        assert_eq!(
+            flags.last(),
+            Some(&ResumeFlags::empty()),
+            "asked unconditionally: {flags:?}",
+        );
+        assert!(!state.get(&ih).unwrap().resume_write_failed);
+        assert!(blocker.join(format!("{}.resume", ih.to_hex())).exists());
+    }
+
     #[test]
     fn shutdown_survives_one_save_resume_failed() {
         // Engine: first save call fails, second succeeds. Both must
@@ -1606,11 +2023,9 @@ mod tests {
         );
 
         // Both alerts are queued before run_shutdown. The first drain
-        // inside run_shutdown will consume them; both note_resume_settled
-        // calls floor at 0 and don't underflow. After requesting saves we
-        // get +2 counter. The next drain finds the auto-pushed alerts
-        // (engine has auto_save_resume off) — actually NONE, so we rely on
-        // the deadline. To unblock here, switch auto_save_resume on.
+        // inside run_shutdown consumes them before any save is in flight, so
+        // they settle nothing. The saves requested after it are answered by
+        // the engine's auto-echo.
         engine.set_auto_save_resume(true);
 
         run_shutdown(
@@ -1661,6 +2076,115 @@ mod tests {
         assert_eq!(unsaved, 1, "the unsaved count is what the daemon persists");
     }
 
+    /// A source whose every drain surfaces at most one alert, holding the rest
+    /// back: the shape of a capped `pop_alerts` against a deep queue.
+    #[derive(Debug)]
+    struct OneAlertPerDrain {
+        inner: ProfileSource,
+        backlog: parking_lot::Mutex<std::collections::VecDeque<(ProfileId, Alert)>>,
+    }
+
+    impl AlertSource for OneAlertPerDrain {
+        fn drain(&self) -> Vec<(ProfileId, Alert)> {
+            let mut backlog = self.backlog.lock();
+            backlog.extend(self.inner.drain());
+            backlog.pop_front().into_iter().collect()
+        }
+        fn profiles(&self) -> Vec<ProfileId> {
+            self.inner.profiles()
+        }
+        fn engine_for(&self, profile: &ProfileId) -> Option<Arc<dyn TorrentEngine>> {
+            self.inner.engine_for(profile)
+        }
+    }
+
+    #[test]
+    fn a_capped_drain_does_not_sleep_between_non_empty_pops_at_shutdown() {
+        // Four saves settle one alert per drain. A deadline of two drain
+        // intervals leaves room for two sleeps at most, so a coordinator that
+        // slept after every drain would leave saves unsettled.
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        let state = Arc::new(StateMap::new());
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        for byte in 1..=4u8 {
+            let h = engine.register_handle(InfoHash([byte; 20]));
+            state.insert(
+                h.infohash,
+                crate::state::TorrentState::newly_added(h, ProfileId::new("p"), clock.now()),
+            );
+        }
+        let source: Arc<dyn AlertSource> = Arc::new(OneAlertPerDrain {
+            inner: single_profile_source(engine.clone()),
+            backlog: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+
+        let unsaved = run_shutdown(
+            ShutdownReason::Test,
+            SHUTDOWN_DRAIN_INTERVAL * 2,
+            &source,
+            &state,
+            &resume,
+            &torrents,
+            &metrics,
+            &clock,
+        );
+
+        assert_eq!(unsaved, 0, "every save settles inside the deadline");
+        assert_eq!(state.pending_resume_count(), 0);
+    }
+
+    #[test]
+    fn the_shutdown_drains_a_capped_backlog_before_requesting_saves() {
+        // Four torrents' `AddTorrent` alerts are queued behind a source that
+        // surfaces one per drain. The saves are requested for the torrents the
+        // state map knows, so a single pre-save drain would learn of one and
+        // leave the other three unsaved while reporting nothing outstanding.
+        let engine = Arc::new(MockEngine::new().with_auto_save_resume(true));
+        let handles: Vec<TorrentHandle> = (1..=4u8)
+            .map(|byte| engine.register_handle(InfoHash([byte; 20])))
+            .collect();
+        engine.push_alerts(
+            handles
+                .iter()
+                .map(|h| add_torrent_alert(h.infohash.0[0], h.id)),
+        );
+        let state = Arc::new(StateMap::new());
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        let source: Arc<dyn AlertSource> = Arc::new(OneAlertPerDrain {
+            inner: single_profile_source(engine.clone()),
+            backlog: parking_lot::Mutex::new(std::collections::VecDeque::new()),
+        });
+        let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+
+        let unsaved = run_shutdown(
+            ShutdownReason::Test,
+            Duration::from_secs(30),
+            &source,
+            &state,
+            &resume,
+            &torrents,
+            &metrics,
+            &clock,
+        );
+
+        assert_eq!(unsaved, 0);
+        assert_eq!(state.len(), 4, "every queued add reached the state map");
+        for h in &handles {
+            assert!(
+                engine.calls().iter().any(|c| matches!(
+                    c,
+                    crate::mock::RecordedCall::SaveResumeData { handle, .. } if handle == h
+                )),
+                "no save was requested for {h:?}"
+            );
+        }
+    }
+
     #[test]
     fn the_handle_reports_what_the_shutdown_drain_left_unsaved() {
         // Saves are accepted and never settle, so the whole 30 s default
@@ -1688,5 +2212,49 @@ mod tests {
         assert!(handle.signal_shutdown(ShutdownReason::Test));
         handle.join().expect("loop thread");
         assert_eq!(unsaved.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn the_builders_shutdown_deadline_is_the_one_the_drain_waits_out() {
+        // The daemon sets it from `shutdown_drain_secs`. A save that never
+        // settles holds the drain to the deadline, so the time the drain
+        // slept on the mock clock is the deadline the loop actually used:
+        // 600 s here, where the default would stop at 30. Only the drain
+        // sleeps `SHUTDOWN_DRAIN_INTERVAL`; the idle loop before the signal
+        // sleeps `POLL_IDLE_INTERVAL`, so it is not counted.
+        let engine = Arc::new(MockEngine::new());
+        let h = engine.register_handle(InfoHash([0xC2; 20]));
+        let state = Arc::new(StateMap::new());
+        let clock = Arc::new(MockClock::new());
+        state.insert(
+            h.infohash,
+            crate::state::TorrentState::newly_added(h, ProfileId::new("p"), clock.now()),
+        );
+        let deadline = Duration::from_secs(600);
+        assert!(deadline > DEFAULT_SHUTDOWN_DEADLINE * 2);
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine)),
+            state,
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            Arc::new(NoopSink),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        )
+        .shutdown_deadline(deadline)
+        .spawn();
+        let unsaved = handle.unsaved_at_shutdown();
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread");
+        assert_eq!(unsaved.load(Ordering::Relaxed), 1);
+        assert_ne!(POLL_IDLE_INTERVAL, SHUTDOWN_DRAIN_INTERVAL);
+        let waited: Duration = clock
+            .observed_sleeps()
+            .into_iter()
+            .filter(|d| *d == SHUTDOWN_DRAIN_INTERVAL)
+            .sum();
+        assert!(
+            waited + SHUTDOWN_DRAIN_INTERVAL >= deadline && waited <= deadline,
+            "the drain waited {waited:?}, not the configured {deadline:?}",
+        );
     }
 }

@@ -180,7 +180,7 @@ fn main() {
     // Tier B: the shim, ~4 MB. Split out so editing libtorrent_shim.cpp costs
     // seconds instead of a full libtorrent rebuild. Keyed on tier A's identity,
     // so a vendor bump invalidates this too.
-    let shim_key = key_shim(&manifest_dir, &cxx_id, &tier_a_id);
+    let shim_key = key_shim(&manifest_dir, &cxx_id, &tier_a_id, &lt_install);
     let shim_detail = format!("libtorrent-prefix={tier_a_id}\ncxx={cxx_id}");
     let shim_prefix = ensure_prefix(&root, "shim", &shim_key, &shim_detail, |dst| {
         compile_shim(&manifest_dir, &lt_install, &boost_install, dst);
@@ -388,9 +388,17 @@ fn compile_shim(manifest_dir: &Path, lt_install: &Path, boost_install: &Path, ds
         .include(lt_install.join("include"))
         .include(boost_install.join("include"));
 
-    // Match libtorrent's compile flags so layouts agree. Most relevantly,
-    // libtorrent's headers consult TORRENT_USE_OPENSSL via its own config,
-    // which is on by default with `encryption=ON`.
+    // Match libtorrent's compile definitions so layouts agree. Its headers
+    // change what they declare on TORRENT_USE_OPENSSL, TORRENT_SSL_PEERS and
+    // the BOOST_ASIO_* switches, and libtorrent's own CMake build passes those
+    // on the command line, not through a config header, so a consumer that
+    // omits them sees different class layouts than the archive it links. The
+    // installed CMake package is where libtorrent publishes that list for
+    // consumers, so read it from there rather than restate it here.
+    for (name, value) in libtorrent_interface_definitions(lt_install) {
+        build.define(&name, value.as_deref());
+    }
+
     //
     // NOTE on ASan: instrumenting only the shim (`-fsanitize=address`) and
     // letting rustc link it does not work on this toolchain — rustc's lld
@@ -402,6 +410,93 @@ fn compile_shim(manifest_dir: &Path, lt_install: &Path, boost_install: &Path, ds
     // marshalling, exception isolation, null-handle safety, buffer ownership)
     // without ASan; that remains a follow-up.
     build.compile("libtorrent_shim");
+}
+
+/// The CMake export file listing libtorrent's imported target and its
+/// `INTERFACE_*` properties.
+fn libtorrent_targets_file(lt_install: &Path) -> PathBuf {
+    pick_libdir(lt_install)
+        .join("cmake")
+        .join("LibtorrentRasterbar")
+        .join("LibtorrentRasterbarTargets.cmake")
+}
+
+/// libtorrent's PUBLIC compile definitions, as its installed CMake package
+/// exports them in `INTERFACE_COMPILE_DEFINITIONS`, evaluated for the Release
+/// configuration it is built with.
+///
+/// Refuses to guess: a missing export file, a missing property, or a
+/// generator expression this does not evaluate panics, because compiling the
+/// shim without the definitions libtorrent was built with links cleanly and
+/// then disagrees with the archive about struct layouts at runtime.
+fn libtorrent_interface_definitions(lt_install: &Path) -> Vec<(String, Option<String>)> {
+    let path = libtorrent_targets_file(lt_install);
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "libtorrent-sys: cannot read {} ({e}); the shim must be compiled with \
+             libtorrent's exported compile definitions",
+            path.display()
+        )
+    });
+    let raw = text
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("INTERFACE_COMPILE_DEFINITIONS")
+                .map(str::trim)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "libtorrent-sys: {} declares no INTERFACE_COMPILE_DEFINITIONS",
+                path.display()
+            )
+        });
+    let raw = raw
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("libtorrent-sys: unquoted definitions in {}", path.display()))
+        // CMake escapes `$` in the export file so the generator expression
+        // survives until the consumer's generate step.
+        .replace("\\$", "$");
+    parse_interface_definitions(&raw, "Release")
+        .unwrap_or_else(|e| panic!("libtorrent-sys: {}: {e}", path.display()))
+}
+
+/// Evaluate a `;`-separated `INTERFACE_COMPILE_DEFINITIONS` list for `config`.
+///
+/// The one generator expression form libtorrent's export uses is understood:
+/// `$<$<CONFIG:Name>:DEF>`, which contributes `DEF` only when `config` is
+/// `Name` (case-insensitively, as CMake compares it). Anything else is an
+/// error rather than a silently dropped definition.
+fn parse_interface_definitions(
+    list: &str,
+    config: &str,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let mut out = Vec::new();
+    for item in list.split(';').filter(|s| !s.is_empty()) {
+        let def = if let Some(rest) = item.strip_prefix("$<$<CONFIG:") {
+            let (name, tail) = rest
+                .split_once(">:")
+                .ok_or_else(|| format!("unrecognised generator expression {item:?}"))?;
+            let def = tail
+                .strip_suffix('>')
+                .ok_or_else(|| format!("unrecognised generator expression {item:?}"))?;
+            if !name.eq_ignore_ascii_case(config) {
+                continue;
+            }
+            def
+        } else if item.contains("$<") {
+            return Err(format!("unrecognised generator expression {item:?}"));
+        } else {
+            item
+        };
+        let (name, value) = match def.split_once('=') {
+            Some((n, v)) => (n.to_string(), Some(v.to_string())),
+            None => (def.to_string(), None),
+        };
+        out.push((name, value));
+    }
+    Ok(out)
 }
 
 fn run_bindgen(manifest_dir: &Path, out_dir: &Path) {
@@ -871,7 +966,7 @@ fn key_libtorrent(manifest_dir: &Path, workspace: &Path, cxx_id: &str) -> String
 }
 
 /// Key inputs for the shim archive.
-fn key_shim(manifest_dir: &Path, cxx_id: &str, tier_a_id: &str) -> String {
+fn key_shim(manifest_dir: &Path, cxx_id: &str, tier_a_id: &str, lt_install: &Path) -> String {
     let mut key = Key::new();
     key.str("libtorrent-sys/shim/v1");
     key.str(&env::var("TARGET").unwrap_or_default());
@@ -879,6 +974,10 @@ fn key_shim(manifest_dir: &Path, cxx_id: &str, tier_a_id: &str) -> String {
     key_toolchain_env(&mut key);
     // Ties the shim to the exact libtorrent it was compiled against.
     key.str(tier_a_id);
+    // And to the compile definitions it read from that libtorrent's CMake
+    // package: an external prefix is keyed on its version.hpp alone, which a
+    // rebuild with different options leaves unchanged.
+    key.file(&libtorrent_targets_file(lt_install));
     key.file(&manifest_dir.join("build.rs"));
     key.file(&manifest_dir.join("Cargo.toml"));
     for rel in [

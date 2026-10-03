@@ -58,6 +58,9 @@ pub struct TrackerEntry {
     pub verified: bool,
     /// An announce is in flight.
     pub updating: bool,
+    /// Some endpoint's last announce succeeded: the tracker is announcing
+    /// the torrent, whatever the others report. `last_error` is then `None`.
+    pub working: bool,
     /// Consecutive failed announces.
     pub fails: u32,
     /// The tracker's last `warning message` / status text.
@@ -109,6 +112,7 @@ impl TrackerEntry {
             tier: raw.tier,
             verified: raw.verified != 0,
             updating: raw.updating != 0,
+            working: raw.working != 0,
             fails: raw.fails,
             message: non_empty(fixed_c_str(&raw.message)),
             last_error: non_empty(fixed_c_str(&raw.last_error)),
@@ -239,6 +243,7 @@ mod tests {
         raw.updating = 1;
         raw.fails = 3;
         let t = TrackerEntry::from_raw(&raw);
+        assert!(!t.working);
         assert_eq!(t.message.as_deref(), Some("hi"));
         assert_eq!(t.last_error.as_deref(), Some("refused"));
         assert_eq!(t.next_announce, Some(42));
@@ -248,6 +253,8 @@ mod tests {
             (t.tier, t.verified, t.updating, t.fails),
             (2, true, true, 3)
         );
+        raw.working = 1;
+        assert!(TrackerEntry::from_raw(&raw).working);
     }
 
     #[test]

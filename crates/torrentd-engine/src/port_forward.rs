@@ -27,6 +27,7 @@ use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -482,6 +483,7 @@ pub fn renew_and_rebind(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// Test double for `PortForwarder`. Returns a scripted sequence of results and
 /// records every request. When the script is exhausted it repeats the last
 /// result, so a steady-state "always returns port N" needs only one entry.
@@ -490,6 +492,7 @@ pub struct MockForwarder {
     inner: Arc<Mutex<MockForwarderInner>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 struct MockForwarderInner {
     script: VecDeque<Result<MapResult, PortForwardError>>,
@@ -497,6 +500,7 @@ struct MockForwarderInner {
     calls: Vec<PortMapRequest>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MockForwarder {
     pub fn new() -> Self {
         Self::default()
@@ -551,6 +555,7 @@ impl MockForwarder {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PortForwarder for MockForwarder {
     fn map(&self, req: &PortMapRequest) -> Result<MapResult, PortForwardError> {
         let mut g = self.inner.lock();

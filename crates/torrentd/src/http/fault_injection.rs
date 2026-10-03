@@ -191,6 +191,9 @@ impl TorrentEngine for FaultEngine {
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
         self.inner.torrent_trackers(h)
     }
+    fn close(&self) {
+        self.inner.close()
+    }
 }
 
 /// One fault to inject, named by `fault`. The module docs of

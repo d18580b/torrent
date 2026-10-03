@@ -40,6 +40,7 @@ use crate::http::page::PageRequest;
 use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::security::Write;
+use crate::http::v1::common::blocking;
 use crate::http::v1::common::engine_for;
 use crate::http::v1::common::from_profile_problem;
 use crate::http::v1::common::internal;
@@ -87,6 +88,12 @@ macro_rules! torrent_error {
 pub enum TorrentPhase {
     /// libtorrent is hashing pieces; the torrent is not seeding yet.
     Checking,
+    /// A magnet whose metadata has not arrived yet.
+    AwaitingMetadata,
+    /// Pieces are missing from the payload, and the torrent never downloads
+    /// them: its check failed, or the payload was never there. Supply the
+    /// payload and recheck.
+    Incomplete,
     /// Has metadata but no peers yet; rare for a seeder.
     Idle,
     /// Seeding.
@@ -106,8 +113,10 @@ pub enum TorrentPhase {
 }
 
 impl TorrentPhase {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 10] = [
         Self::Checking,
+        Self::AwaitingMetadata,
+        Self::Incomplete,
         Self::Idle,
         Self::Seeding,
         Self::Paused,
@@ -120,6 +129,8 @@ impl TorrentPhase {
     fn as_str(self) -> &'static str {
         match self {
             Self::Checking => "checking",
+            Self::AwaitingMetadata => "awaiting_metadata",
+            Self::Incomplete => "incomplete",
             Self::Idle => "idle",
             Self::Seeding => "seeding",
             Self::Paused => "paused",
@@ -134,6 +145,8 @@ impl TorrentPhase {
         use torrentd_engine::TorrentPhase as P;
         match state.map(|s| s.phase) {
             Some(P::Checking) => Self::Checking,
+            Some(P::AwaitingMetadata) => Self::AwaitingMetadata,
+            Some(P::Incomplete) => Self::Incomplete,
             Some(P::Idle) => Self::Idle,
             Some(P::Seeding) => Self::Seeding,
             Some(P::Paused) => Self::Paused,
@@ -416,23 +429,27 @@ pub async fn get_torrent(
         .registry
         .lookup(&ih)
         .ok_or(GetTorrentError::TorrentNotFound)?;
-    let details = s
-        .state
-        .get(&ih)
-        .and_then(|st| details_of(&s, &profile, &st));
+    let details = match s.state.get(&ih) {
+        Some(st) => details_of(&s, &profile, st.handle).await,
+        None => None,
+    };
     Ok(Json(Torrent::build(&s, &ih, &profile, details)))
 }
 
 /// The session's details for a loaded torrent, or `None` if it cannot be
 /// asked. A torrent is still worth reporting without them.
-fn details_of(s: &AppState, profile: &ProfileId, st: &TorrentState) -> Option<TorrentDetails> {
+async fn details_of(
+    s: &AppState,
+    profile: &ProfileId,
+    handle: torrentd_engine::TorrentHandle,
+) -> Option<TorrentDetails> {
     let engine = s.source.engine_for(profile)?;
-    engine
-        .torrent_details(st.handle)
+    blocking(move || engine.torrent_details(handle))
+        .await
         .inspect_err(|e| {
             warn!(
                 target: "torrentd::http",
-                infohash = %st.handle.infohash,
+                infohash = %handle.infohash,
                 error.cause = %e,
                 "could not read a torrent's details from its session",
             );
@@ -763,47 +780,29 @@ pub async fn add_torrent(
             Some(bytes),
         ),
     };
-    let handle = match engine.add_torrent(params) {
-        Ok(handle) => handle,
-        Err(e) => {
-            // Release the claim so the add can be retried. A release that
-            // fails to persist comes back from the file at the next restart as
-            // a claim on a torrent no session holds.
-            if let Err(re) = s.registry.remove(&infohash) {
-                warn!(
-                    infohash = %infohash,
-                    error.cause = %re,
-                    "could not release the claim of a torrent whose add failed",
-                );
-                s.metrics
-                    .inc_counter("store_write_errors_total", &[("store", "registry")]);
-            }
-            return Err(AddTorrentError::Internal {
-                detail: internal("adding the torrent to its session", e),
-            });
-        }
-    };
-
-    // Persist the .torrent so the startup inventory scan can recover it if
-    // resume data is ever lost.
-    if let Some(bytes) = torrent_bytes {
-        if let Err(e) = s.torrents.write(&profile_id, &infohash, &bytes) {
-            warn!(
-                infohash = %infohash,
-                error.cause = %e,
-                "failed to persist .torrent file",
-            );
-            s.metrics.inc_counter(
-                "torrent_file_persist_errors_total",
-                &[("profile_id", profile_id.as_str()), ("source", "api")],
-            );
-        }
-    }
+    // The await is a cancellation point: a client that disconnects drops this
+    // handler while the blocking task runs on. What must follow the engine
+    // call therefore runs inside that task, not after the await.
+    let (adder, settler, owner) = (Arc::clone(&engine), Arc::clone(&s), profile_id.clone());
+    let handle = blocking(move || {
+        add_and_settle(
+            &settler,
+            adder.as_ref(),
+            params,
+            infohash,
+            &owner,
+            torrent_bytes,
+        )
+    })
+    .await
+    .map_err(|e| AddTorrentError::Internal {
+        detail: internal("adding the torrent to its session", e),
+    })?;
 
     // The state map learns of the torrent only with its `AddTorrent` alert,
     // so the details come from the handle the session just returned.
-    let details = engine
-        .torrent_details(handle)
+    let details = blocking(move || engine.torrent_details(handle))
+        .await
         .inspect_err(|e| {
             warn!(
                 target: "torrentd::http",
@@ -825,6 +824,57 @@ pub async fn add_torrent(
         ),
         Json(torrent),
     ))
+}
+
+/// Hand `params` to the session, then settle the claim on `infohash` either
+/// way: release it when the add failed, persist the `.torrent` when it
+/// succeeded.
+///
+/// Blocking, and called from inside the blocking task so that it completes
+/// when the request that started it is dropped mid-add.
+fn add_and_settle(
+    s: &AppState,
+    engine: &dyn TorrentEngine,
+    params: AddParams,
+    infohash: InfoHash,
+    profile_id: &ProfileId,
+    torrent_bytes: Option<Vec<u8>>,
+) -> Result<torrentd_engine::TorrentHandle, EngineError> {
+    let handle = match engine.add_torrent(params) {
+        Ok(handle) => handle,
+        Err(e) => {
+            // Release the claim so the add can be retried. A release that
+            // fails to persist comes back from the file at the next restart as
+            // a claim on a torrent no session holds.
+            if let Err(re) = s.registry.remove(&infohash) {
+                warn!(
+                    infohash = %infohash,
+                    error.cause = %re,
+                    "could not release the claim of a torrent whose add failed",
+                );
+                s.metrics
+                    .inc_counter("store_write_errors_total", &[("store", "registry")]);
+            }
+            return Err(e);
+        }
+    };
+
+    // Persist the .torrent so the startup inventory scan can recover it if
+    // resume data is ever lost.
+    if let Some(bytes) = torrent_bytes {
+        if let Err(e) = s.torrents.write(profile_id, &infohash, &bytes) {
+            warn!(
+                infohash = %infohash,
+                error.cause = %e,
+                "failed to persist .torrent file",
+            );
+            s.metrics.inc_counter(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile_id.as_str()), ("source", "api")],
+            );
+        }
+    }
+    Ok(handle)
 }
 
 /// Read a `.torrent` the caller named by path on the daemon's own filesystem.
@@ -952,10 +1002,10 @@ pub async fn delete_torrent(
     // may be cleared.
     //
     // An entry the startup scans left unloaded — its resume add failed, or a
-    // delete whose registry write failed left it in the file for the next
+    // delete whose registry write failed left it in the registry for the next
     // boot — is held by no session, so the assignment is all there is to
     // clear. Answering 404 there would leave it uncleared by any means but
-    // hand-editing `profile_assignments.json`.
+    // hand-editing `registry.db`.
     //
     // Any other entry was assigned in this process, by the add or adopt
     // path, and handed to a session whose `AddTorrent` alert has not been
@@ -966,11 +1016,21 @@ pub async fn delete_torrent(
     // until the alert lands, so the delete is refused as a conflict to retry.
     match s.state.get(&ih) {
         Some(st) => {
-            engine
-                .remove_torrent(st.handle, delete_files)
-                .map_err(|e| DeleteTorrentError::Internal {
-                    detail: internal("removing the torrent from its session", e),
-                })?;
+            // The await is a cancellation point: a client that disconnects
+            // drops this handler while the blocking task runs on. A removal
+            // whose assignment clear ran after the await would leave the
+            // infohash assigned to a torrent no session holds, and every later
+            // delete a `409 torrent-adding`, so the clear runs in the task.
+            let settler = Arc::clone(&s);
+            blocking(move || {
+                engine
+                    .remove_torrent(st.handle, delete_files)
+                    .map_err(|e| DeleteTorrentError::Internal {
+                        detail: internal("removing the torrent from its session", e),
+                    })?;
+                clear_assignment(&settler, &ih)
+            })
+            .await?;
         }
         None if s.unloaded_at_boot.lock().contains(&ih) => {
             warn!(
@@ -980,9 +1040,15 @@ pub async fn delete_torrent(
                 "no session holds an info-hash the registry still assigns; the startup \
                  scans did not load it, so clearing the assignment alone",
             );
+            clear_assignment(&s, &ih)?;
         }
         None => return Err(DeleteTorrentError::TorrentAdding),
     }
+    Ok(NoContent)
+}
+
+/// Clear `ih`'s assignment once no session holds it.
+fn clear_assignment(s: &AppState, ih: &InfoHash) -> Result<(), DeleteTorrentError> {
     // Report a persist failure rather than discarding it. On a full or
     // read-only state directory the payload is gone and the assignment write
     // fails, and a 204 here would say the delete succeeded — so the claim
@@ -991,7 +1057,7 @@ pub async fn delete_torrent(
     // the session has already happened, which the detail says, so a retry is
     // about the assignment alone.
     s.registry
-        .remove(&ih)
+        .remove(ih)
         .map_err(|e| DeleteTorrentError::Internal {
             detail: format!(
                 "{} The torrent was removed from its session; retry the delete to clear the \
@@ -1001,8 +1067,8 @@ pub async fn delete_torrent(
         })?;
     // Cleared, so a later add of the same info-hash is this process's own
     // and must not be mistaken for one the boot left unloaded.
-    s.unloaded_at_boot.lock().remove(&ih);
-    Ok(NoContent)
+    s.unloaded_at_boot.lock().remove(ih);
+    Ok(())
 }
 
 /// Remove a torrent whose profile has no live session.
@@ -1012,7 +1078,7 @@ pub async fn delete_torrent(
 /// nothing to remove from one; what is left is the registry entry, and that
 /// entry is what makes `POST /v1/torrents` answer `torrent-exists` for this
 /// infohash. Clearing it is the whole of the work; refusing would leave an
-/// operator no way to clear it but hand-editing `profile_assignments.json`.
+/// operator no way to clear it but hand-editing `registry.db`.
 fn clear_sessionless(
     s: &AppState,
     ih: &InfoHash,
@@ -1224,8 +1290,8 @@ pub async fn pause_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<NoContent, PauseTorrentError> {
     let (st, engine) = loaded(&s, p.infohash.get())?;
-    engine
-        .pause_torrent(st.handle)
+    blocking(move || engine.pause_torrent(st.handle))
+        .await
         .map_err(|e| PauseTorrentError::Internal {
             detail: internal("pausing the torrent", e),
         })?;
@@ -1268,8 +1334,8 @@ pub async fn resume_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<NoContent, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    engine
-        .resume_torrent(st.handle)
+    blocking(move || engine.resume_torrent(st.handle))
+        .await
         .map_err(|e| UnfencedControlError::Internal {
             detail: internal("resuming the torrent", e),
         })?;
@@ -1290,8 +1356,8 @@ pub async fn recheck_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Accepted<()>, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    engine
-        .force_recheck(st.handle)
+    blocking(move || engine.force_recheck(st.handle))
+        .await
         .map_err(|e| UnfencedControlError::Internal {
             detail: internal("rechecking the torrent", e),
         })?;
@@ -1311,8 +1377,8 @@ pub async fn reannounce_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Accepted<()>, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    engine
-        .force_reannounce(st.handle)
+    blocking(move || engine.force_reannounce(st.handle))
+        .await
         .map_err(|e| UnfencedControlError::Internal {
             detail: internal("reannouncing the torrent", e),
         })?;
@@ -1360,8 +1426,8 @@ pub async fn set_upload_limit(
     let (st, engine) = loaded(&s, p.infohash.get())?;
     // Validated into `1..=i32::MAX` above; libtorrent's 0 is "unlimited".
     let rate = body.bytes_per_sec.map_or(0, |r| r as i32);
-    engine
-        .set_upload_limit(st.handle, rate)
+    blocking(move || engine.set_upload_limit(st.handle, rate))
+        .await
         .map_err(|e| SetUploadLimitError::Internal {
             detail: internal("setting the torrent's upload limit", e),
         })?;
@@ -1596,7 +1662,8 @@ pub async fn set_file_priority(
         .ok()
         .filter(|_| (p.index as usize) < count)
         .ok_or(SetFilePriorityError::FileNotFound)?;
-    match engine.set_file_priority(st.handle, index, body.priority) {
+    let priority = body.priority;
+    match blocking(move || engine.set_file_priority(st.handle, index, priority)).await {
         Ok(()) => Ok(NoContent),
         // Removed between the count and the set.
         Err(e) if is_gone(&e) => Err(SetFilePriorityError::TorrentNotFound),
@@ -1767,10 +1834,12 @@ fn host_matches_domain(host: &str, domain: &str) -> bool {
 
 /// Where a tracker stands.
 ///
-/// Derived in this order: `error` when the last announce failed (an error
-/// text is present, or announces have failed and none has ever succeeded);
-/// otherwise `updating` while an announce is in flight; otherwise `working`
-/// once the tracker has answered an announce; otherwise `not_contacted`.
+/// Derived in this order: `working` when the last announce over any of the
+/// daemon's listen endpoints succeeded, whatever the others report; otherwise
+/// `error` when the last announce failed (an error text is present, or
+/// announces have failed and none has ever succeeded); otherwise `updating`
+/// while an announce is in flight; otherwise `working` once the tracker has
+/// answered an announce; otherwise `not_contacted`.
 #[derive(Clone, Copy, Debug, Schema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TrackerStatus {
@@ -1786,7 +1855,12 @@ pub enum TrackerStatus {
 
 impl TrackerStatus {
     fn of(t: &torrentd_engine::TrackerEntry) -> Self {
-        if t.last_error.is_some() || (t.fails > 0 && !t.verified) {
+        // One endpoint announcing successfully is the tracker working, even
+        // while another fails: the torrent is announced. `fails` is the worst
+        // endpoint's count, so it cannot say otherwise.
+        if t.working {
+            Self::Working
+        } else if t.last_error.is_some() || (t.fails > 0 && !t.verified) {
             Self::Error
         } else if t.updating {
             Self::Updating
@@ -1885,7 +1959,7 @@ pub async fn list_torrent_trackers(
     Path(p): Path<TorrentPath>,
 ) -> Result<Json<TrackerList>, ListTrackersError> {
     let (st, engine) = loaded(&s, p.infohash.get())?;
-    let trackers = match engine.torrent_trackers(st.handle) {
+    let trackers = match blocking(move || engine.torrent_trackers(st.handle)).await {
         Ok(trackers) => trackers,
         Err(e) if is_gone(&e) => return Err(ListTrackersError::TorrentNotFound),
         Err(e) => {
@@ -1968,11 +2042,22 @@ mod tests {
     }
 
     fn tracker(verified: bool, updating: bool, fails: u32, err: Option<&str>) -> TrackerStatus {
+        tracker_with(false, verified, updating, fails, err)
+    }
+
+    fn tracker_with(
+        working: bool,
+        verified: bool,
+        updating: bool,
+        fails: u32,
+        err: Option<&str>,
+    ) -> TrackerStatus {
         TrackerStatus::of(&torrentd_engine::TrackerEntry {
             url: "http://t/a".into(),
             tier: 0,
             verified,
             updating,
+            working,
             fails,
             message: None,
             last_error: err.map(str::to_owned),
@@ -1996,6 +2081,25 @@ mod tests {
         // Failures without an error text: an error only if it never worked.
         assert_eq!(tracker(false, false, 2, None), TrackerStatus::Error);
         assert_eq!(tracker(true, false, 2, None), TrackerStatus::Working);
+    }
+
+    /// One endpoint announcing and another failing is a working tracker. The
+    /// failing endpoint's count is the `fails` the entry carries, and its
+    /// error the text, so without `working` this read as `error`.
+    #[test]
+    fn a_tracker_with_one_working_and_one_failing_endpoint_is_working() {
+        assert_eq!(
+            tracker_with(true, true, false, 3, Some("refused")),
+            TrackerStatus::Working
+        );
+        assert_eq!(
+            tracker_with(true, false, true, 3, None),
+            TrackerStatus::Working
+        );
+        assert_eq!(
+            tracker_with(false, true, false, 3, Some("refused")),
+            TrackerStatus::Error
+        );
     }
 
     #[test]

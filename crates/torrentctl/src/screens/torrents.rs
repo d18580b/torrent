@@ -50,8 +50,10 @@ const MAX_PAGE: usize = 1000;
 const PAGE_STEP: usize = 10;
 
 /// The phases `F` cycles through, after "all".
-const PHASES: [types::Phase; 8] = [
+const PHASES: [types::Phase; 10] = [
     types::Phase::Checking,
+    types::Phase::AwaitingMetadata,
+    types::Phase::Incomplete,
     types::Phase::Idle,
     types::Phase::Seeding,
     types::Phase::Paused,

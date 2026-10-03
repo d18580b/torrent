@@ -19,6 +19,7 @@ use crate::app_state::AppState;
 use crate::http::security::Bearer;
 use crate::http::security::Read;
 use crate::http::security::Write;
+use crate::http::v1::common::blocking;
 use crate::http::v1::common::engine_for;
 use crate::http::v1::common::from_profile_problem;
 use crate::http::v1::common::unfenced_engine;
@@ -349,22 +350,29 @@ fn explain(s: &AppState, profile_id: &ProfileId, problem: ProfileProblem) -> Pro
 }
 
 /// Apply `op` to every torrent `profile_id` holds; `(accepted, failed)`.
-fn for_each_torrent(
+///
+/// On the blocking pool: each call takes the session's lock, and a profile can
+/// hold tens of thousands of torrents.
+async fn for_each_torrent(
     s: &AppState,
     profile_id: &ProfileId,
-    engine: &dyn TorrentEngine,
-    op: impl Fn(&dyn TorrentEngine, torrentd_engine::TorrentHandle) -> bool,
+    engine: Arc<dyn TorrentEngine>,
+    op: fn(&dyn TorrentEngine, torrentd_engine::TorrentHandle) -> bool,
 ) -> (u32, u32) {
-    let mut ok = 0u32;
-    let mut failed = 0u32;
-    for h in s.state.handles_for_profile(profile_id) {
-        if op(engine, h) {
-            ok = ok.saturating_add(1);
-        } else {
-            failed = failed.saturating_add(1);
+    let handles = s.state.handles_for_profile(profile_id);
+    blocking(move || {
+        let mut ok = 0u32;
+        let mut failed = 0u32;
+        for h in handles {
+            if op(engine.as_ref(), h) {
+                ok = ok.saturating_add(1);
+            } else {
+                failed = failed.saturating_add(1);
+            }
         }
-    }
-    (ok, failed)
+        (ok, failed)
+    })
+    .await
 }
 
 /// Pause every torrent in one profile.
@@ -382,9 +390,7 @@ pub async fn pause_profile(
     let profile_id = ProfileId::new(path.profile_id);
     let engine = engine_for(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
     let (torrent_count, failed_count) =
-        for_each_torrent(&s, &profile_id, engine.as_ref(), |e, h| {
-            e.pause_torrent(h).is_ok()
-        });
+        for_each_torrent(&s, &profile_id, engine, |e, h| e.pause_torrent(h).is_ok()).await;
     if failed_count > 0 {
         warn!(
             profile_id = %profile_id,
@@ -417,9 +423,7 @@ pub async fn resume_profile(
     let profile_id = ProfileId::new(path.profile_id);
     let engine = unfenced_engine(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
     let (torrent_count, failed_count) =
-        for_each_torrent(&s, &profile_id, engine.as_ref(), |e, h| {
-            e.resume_torrent(h).is_ok()
-        });
+        for_each_torrent(&s, &profile_id, engine, |e, h| e.resume_torrent(h).is_ok()).await;
     if failed_count > 0 {
         warn!(
             profile_id = %profile_id,
@@ -472,9 +476,10 @@ pub async fn pause_all_torrents(
         ..BulkOutcome::default()
     };
     for entry in s.profiles.iter() {
-        let reached = for_each_torrent(&s, entry.id(), entry.engine.as_ref(), |e, h| {
+        let reached = for_each_torrent(&s, entry.id(), Arc::clone(&entry.engine), |e, h| {
             e.pause_torrent(h).is_ok()
-        });
+        })
+        .await;
         tally(&mut out, reached);
     }
     if out.failed_count > 0 {
@@ -518,9 +523,10 @@ pub async fn resume_all_torrents(
             });
             continue;
         }
-        let reached = for_each_torrent(&s, entry.id(), entry.engine.as_ref(), |e, h| {
+        let reached = for_each_torrent(&s, entry.id(), Arc::clone(&entry.engine), |e, h| {
             e.resume_torrent(h).is_ok()
-        });
+        })
+        .await;
         tally(&mut out, reached);
     }
     if out.failed_count > 0 {

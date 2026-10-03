@@ -65,9 +65,10 @@ allow_unauthenticated = true
 # profile at directories from a pre-profiles deployment, where resume files
 # lived directly under the root.
 #
-# Optional. Defaults to <resume_dir>/../profile_assignments.json, which records
-# which profile owns which info-hash.
-# registry_path = "/var/lib/torrentd/profile_assignments.json"
+# Optional. Defaults to <resume_dir>/../registry.db, a SQLite database that
+# records which profile owns which info-hash. A path ending in .json names an
+# older JSON registry, imported once into a .db file beside it.
+# registry_path = "/var/lib/torrentd/registry.db"
 
 # libtorrent settings overrides (applied on top of the high_performance_seed
 # preset). All optional; omit any to use the preset's default.
@@ -76,6 +77,10 @@ file_pool_size                = 1000
 aio_threads                   = 8
 max_concurrent_http_announces = 200
 upload_rate_limit             = 0    # bytes/sec; 0 = unlimited
+# Omitted, each session runs libtorrent's rate-based choker, which unchokes as
+# many peers as the upload rate achieved to them supports. Set it to unchoke a
+# fixed number per session instead. Read at startup; a reload reports it.
+# unchoke_slots_limit         = 500
 
 # Local Service Discovery announces to the local network segment. It is
 # ignored for `network = "vpn"` profiles, which disable it unconditionally.
@@ -100,6 +105,13 @@ enable_lsd = false
 # the health monitor declares the profile down and pauses it. Catches a tunnel
 # that keeps its address but has silently stopped handshaking. Default 180.
 # vpn_handshake_max_age_secs = 180
+
+# Shutdown: how long (seconds) a stop waits for every torrent's resume data to
+# be saved before giving up on what is left. Default 60. The shipped unit's
+# TimeoutStopSec=120 is sized to the default; a larger value is covered by the
+# EXTEND_TIMEOUT_USEC the daemon sends while it stops, so TimeoutStopSec needs
+# raising only for a stop that must fit without those extensions.
+# shutdown_drain_secs = 60
 
 # Defence-in-depth kill switch. When true, torrentd installs a fail-closed
 # nftables table (`torrentd_ks`) confining the daemon's own egress to loopback
