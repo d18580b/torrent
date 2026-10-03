@@ -139,13 +139,13 @@ pub fn badge(state: &str) -> (&'static str, Tone) {
         "seeding" | "active" | "working" | "ready" | "adopted" | "done" | "applied" => {
             ("●", Tone::Good)
         }
-        "checking" | "updating" | "applying" | "in_progress" | "partial" | "matched" => {
-            ("◐", Tone::Warn)
-        }
+        "checking" | "awaiting_metadata" | "updating" | "applying" | "in_progress" | "partial"
+        | "matched" => ("◐", Tone::Warn),
         "paused" | "draft" | "pending" | "skipped" | "not_contacted" => ("‖", Tone::Warn),
-        "disk_error" | "errored" | "error" | "failed" | "vpn_down" | "drifted" | "overlap" => {
-            ("✖", Tone::Bad)
-        }
+        // `incomplete`: pieces are missing and a seeder never fetches them,
+        // so it stays there until an operator supplies the payload.
+        "disk_error" | "errored" | "error" | "failed" | "vpn_down" | "drifted" | "overlap"
+        | "incomplete" => ("✖", Tone::Bad),
         "missing" | "cancelled" | "removed" => ("○", Tone::Muted),
         _ => ("·", Tone::Muted),
     }
@@ -166,7 +166,14 @@ mod tests {
     #[test]
     fn every_bad_state_is_marked_without_colour() {
         let mono = Theme::new(Depth::Mono);
-        for state in ["errored", "disk_error", "failed", "vpn_down", "error"] {
+        for state in [
+            "errored",
+            "disk_error",
+            "failed",
+            "vpn_down",
+            "error",
+            "incomplete",
+        ] {
             let (symbol, tone) = badge(state);
             assert_eq!(tone, Tone::Bad, "{state}");
             assert_eq!(symbol, "✖");

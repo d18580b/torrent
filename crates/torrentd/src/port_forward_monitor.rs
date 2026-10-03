@@ -110,7 +110,7 @@ pub(crate) fn ports_held_by_others<'a>(
         if e.id() == except {
             continue;
         }
-        held.extend(e.config.configured_ports());
+        held.extend(e.config.configured_listen_ports());
         if let Some(p) = e.health().forwarded_port {
             held.insert(p);
         }
@@ -1077,7 +1077,7 @@ mod tests {
         let (a, _) = natpmp_entry("acct_a", 40001);
         let (b, _) = natpmp_entry("acct_b", 40002);
         let c = test_vpn_entry("acct_c", ProfileStatus::Active);
-        let static_ports = c.config.configured_ports();
+        let static_ports = c.config.configured_listen_ports();
         assert!(
             !static_ports.is_empty(),
             "the fixture carries a static port"

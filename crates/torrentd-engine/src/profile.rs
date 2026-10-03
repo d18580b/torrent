@@ -606,15 +606,16 @@ impl ProfileConfig {
         }
     }
 
-    /// The ports this profile's configuration binds: a `vpn` profile's static
-    /// `listen_port`, or every port a `host` profile's `listen_interfaces`
-    /// names. Empty for a NAT-PMP profile, whose port is assigned at runtime.
-    pub fn configured_ports(&self) -> std::collections::BTreeSet<u16> {
+    /// Every port this profile's session is configured to listen on: each
+    /// port a host profile's `listen_interfaces` names, or a vpn profile's
+    /// static `listen_port`. Empty for a NAT-PMP profile, whose port the
+    /// gateway assigns at runtime.
+    pub fn configured_listen_ports(&self) -> std::collections::BTreeSet<u16> {
         match &self.network {
-            ProfileNetwork::Vpn { listen_port, .. } => listen_port.iter().copied().collect(),
             ProfileNetwork::Host {
                 listen_interfaces, ..
             } => Self::listen_ports(listen_interfaces),
+            ProfileNetwork::Vpn { listen_port, .. } => listen_port.iter().copied().collect(),
         }
     }
 

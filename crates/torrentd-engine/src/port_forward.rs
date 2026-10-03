@@ -16,14 +16,17 @@
 //! caller. It is pure with respect to metrics and health state so it can be
 //! driven by `MockForwarder` + `MockEngine` in unit tests.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::VecDeque;
 use std::net::IpAddr;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use libtorrent_safe::Settings;
 use libtorrent_safe::TorrentHandle;
+#[cfg(any(test, feature = "test-support"))]
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
@@ -331,6 +334,7 @@ pub fn renew_and_rebind(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// Test double for `PortForwarder`. Returns a scripted sequence of results and
 /// records every request. When the script is exhausted it repeats the last
 /// result, so a steady-state "always returns port N" needs only one entry.
@@ -339,6 +343,7 @@ pub struct MockForwarder {
     inner: Arc<Mutex<MockForwarderInner>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 struct MockForwarderInner {
     script: VecDeque<Result<MapResult, PortForwardError>>,
@@ -346,6 +351,7 @@ struct MockForwarderInner {
     calls: Vec<PortMapRequest>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MockForwarder {
     pub fn new() -> Self {
         Self::default()
@@ -416,6 +422,7 @@ impl MockForwarder {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl PortForwarder for MockForwarder {
     fn map(&self, req: &PortMapRequest) -> Result<MapResult, PortForwardError> {
         let mut g = self.inner.lock();

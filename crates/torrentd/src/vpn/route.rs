@@ -120,16 +120,21 @@ pub(crate) fn install(iface: &str, addresses: &[String], prefixes: &[String]) ->
 /// read while the link is still up — for OpenVPN, before the process that
 /// owns the link is signalled.
 pub(crate) fn remove(table: u32) {
+    remove_with(table, |args| {
+        exec::run_ok("ip", &args[1..], None, exec::CHANGE)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    });
+}
+
+/// [`remove`] over a command runner, which is handed the whole command line
+/// (`ip` first), so a caller can order it against its other commands and a
+/// test can observe it.
+pub(crate) fn remove_with(table: u32, mut run: impl FnMut(&[&str]) -> Result<(), String>) {
     let table = table.to_string();
     for fam in ["-4", "-6"] {
         for _ in 0..MAX_RULES {
-            let deleted = exec::run_ok(
-                "ip",
-                &[fam, "rule", "del", "table", &table],
-                None,
-                exec::CHANGE,
-            );
-            if deleted.is_err() {
+            if run(&["ip", fam, "rule", "del", "table", &table]).is_err() {
                 break;
             }
         }
