@@ -1,0 +1,55 @@
+# cargo-deny policy for the workspace: `mise run deny`, and the `deny` job in
+# .github/workflows/ci.yml.
+#
+# advisories  every RustSec advisory against a crate in Cargo.lock fails the
+#             check, unsound and unmaintained ones included. An exception is
+#             an `ignore` entry here with its reason, never a silent one.
+# licenses    only the permissive licenses the dependency tree uses today. A
+#             new dependency under anything else fails until someone decides
+#             it here.
+# bans        duplicate versions are reported, not refused: the tree carries
+#             several (windows-sys, hashbrown, thiserror) through crates this
+#             workspace does not control.
+# sources     crates.io only; no git dependencies, no other registries.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+[licenses.private]
+# The workspace's own crates are `publish = false` and Apache-2.0; they are
+# not third-party code this policy is about.
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
