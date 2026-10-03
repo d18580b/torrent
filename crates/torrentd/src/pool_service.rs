@@ -245,6 +245,9 @@ pub struct PendingVerify {
     pub torrent_path: PathBuf,
     pub save_path: PathBuf,
     pub profile: ProfileId,
+    /// Whether the enqueue wrote `profile` as the pool index's owner, which a
+    /// drop then has to clear.
+    pub owner_recorded: bool,
 }
 
 impl VerifyQueue {
@@ -389,7 +392,7 @@ pub async fn run_verify_queue(
             }
             let Some(engine) = source.engine_for(&item.profile) else {
                 warn!(target: "torrentd::pool", profile_id = %item.profile, "no engine for profile; dropping verify");
-                release_dropped_claim(&registry, &item);
+                release_dropped_claim(&pool, &registry, &item);
                 continue;
             };
             let bytes = match std::fs::read(&item.torrent_path) {
@@ -402,7 +405,7 @@ pub async fn run_verify_queue(
                         "cannot read .torrent; dropping verify",
                     );
                     q.failed.fetch_add(1, Ordering::Relaxed);
-                    release_dropped_claim(&registry, &item);
+                    release_dropped_claim(&pool, &registry, &item);
                     continue;
                 }
             };
@@ -416,7 +419,7 @@ pub async fn run_verify_queue(
                     "verify queue holds an item for a profile that is not live; dropping",
                 );
                 q.failed.fetch_add(1, Ordering::Relaxed);
-                release_dropped_claim(&registry, &item);
+                release_dropped_claim(&pool, &registry, &item);
                 continue;
             };
             let params = verify_add_params(
@@ -428,7 +431,7 @@ pub async fn run_verify_queue(
             // the bytes read now, which are what the session gets.
             if verify_guard(metrics.as_ref(), profile_cfg, &item, &params).is_err() {
                 q.failed.fetch_add(1, Ordering::Relaxed);
-                release_dropped_claim(&registry, &item);
+                release_dropped_claim(&pool, &registry, &item);
                 continue;
             }
             match engine.add_torrent(params) {
@@ -444,7 +447,7 @@ pub async fn run_verify_queue(
                 Err(e) => {
                     q.failed.fetch_add(1, Ordering::Relaxed);
                     warn!(target: "torrentd::pool", infohash = %item.infohash, error.cause = %e, "verify add failed");
-                    release_dropped_claim(&registry, &item);
+                    release_dropped_claim(&pool, &registry, &item);
                 }
             }
         }
@@ -506,7 +509,24 @@ fn verify_guard(
 /// every re-add or re-adopt until a restart. The claim is released only while
 /// it still names the item's profile, so a claim someone else has since taken
 /// is left alone.
-fn release_dropped_claim(registry: &AssignmentRegistry, item: &PendingVerify) {
+///
+/// The pool index's owner record the enqueue wrote goes too, while it still
+/// names the item's profile. Left behind, it made adoption into any other
+/// profile refuse the torrent, and `DELETE` could not clear it: with no
+/// registry entry it answers not found.
+fn release_dropped_claim(pool: &PoolService, registry: &AssignmentRegistry, item: &PendingVerify) {
+    if item.owner_recorded {
+        let cleared = pool.with_store(|s| match s.profile_of(&item.infohash) {
+            Ok(Some(owner)) if owner == item.profile.as_str() => {
+                s.set_profile(&item.infohash, None)
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        });
+        if let Err(e) = cleared {
+            pool.note_store_error("set_profile", &e);
+        }
+    }
     let Some(ih) = libtorrent_safe::InfoHash::from_hex(&item.infohash) else {
         return;
     };
@@ -826,14 +846,24 @@ fn enqueue_verify(
     if dry_run {
         return Ok("queued_for_verification");
     }
-    if let Err(e) = pool.with_store(|s| s.set_profile(infohash, Some(profile.as_str()))) {
+    // An owner record that already names this profile is not the enqueue's,
+    // so a drop leaves it; one the enqueue writes goes with the item.
+    let recorded = pool.with_store(|s| match s.profile_of(infohash) {
+        Ok(Some(owner)) if owner == profile.as_str() => Ok(false),
+        _ => s
+            .set_profile(infohash, Some(profile.as_str()))
+            .map(|()| true),
+    });
+    let owner_recorded = recorded.unwrap_or_else(|e| {
         pool.note_store_error("set_profile", &e);
-    }
+        false
+    });
     pool.verify_queue().enqueue(PendingVerify {
         infohash: infohash.to_string(),
         torrent_path,
         save_path,
         profile,
+        owner_recorded,
     });
     Ok("queued_for_verification")
 }
@@ -852,6 +882,7 @@ mod tests {
 
     use torrentd_engine::InfoHash;
     use torrentd_engine::ProfileId;
+    use torrentd_engine::ProfileStatus;
     use torrentd_engine::TorrentHandle;
     use torrentd_engine::TorrentPhase;
     use torrentd_engine::TorrentState;
@@ -996,7 +1027,113 @@ mod tests {
             torrent_path: "/nonexistent.torrent".into(),
             save_path: "/nonexistent".into(),
             profile: ProfileId::new(profile),
+            owner_recorded: false,
         }
+    }
+
+    /// A pool index holding one torrent, `ih`, owned by `owner`.
+    fn pool_with(dir: &std::path::Path, ih: InfoHash, owner: Option<&str>) -> super::PoolService {
+        let cfg = crate::config::Config::minimal_for_tests(dir, false);
+        let pool =
+            std::sync::Arc::into_inner(super::PoolService::open(&cfg).unwrap().unwrap()).unwrap();
+        let hex = ih.to_hex();
+        let row = torrentd_pool::PoolTorrent {
+            infohash: hex.clone(),
+            infohash_v1: None,
+            infohash_v2: None,
+            name: "t".into(),
+            total_size: 1,
+            num_files: 1,
+            source_path: dir.join("t.torrent"),
+            fastresume_path: None,
+            declared_save_path: None,
+            category: None,
+            tags: vec![],
+            profile: None,
+        };
+        pool.with_store(|s| {
+            s.upsert_torrent(&row, 0).unwrap();
+            s.set_profile(&hex, owner).unwrap();
+        });
+        pool
+    }
+
+    fn owner_of(pool: &super::PoolService, ih: InfoHash) -> Option<String> {
+        pool.with_store(|s| s.profile_of(&ih.to_hex()).unwrap())
+    }
+
+    /// The enqueue writes the pool index's owner before the worker runs, so a
+    /// drop has to take it back: left behind, it refused adoption into every
+    /// other profile, and `DELETE` (with no registry entry) answered not
+    /// found.
+    #[test]
+    fn a_dropped_verify_clears_the_index_owner_its_enqueue_recorded() {
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash([0x55; 20]);
+        let pool = pool_with(dir.path(), ih, None);
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        reg.assign(ih, ProfileId::new("p")).unwrap();
+
+        super::enqueue_verify(
+            &pool,
+            &profiles,
+            &ih.to_hex(),
+            dir.path().join("t.torrent"),
+            dir.path().join("payload"),
+            ProfileId::new("p"),
+            false,
+        )
+        .unwrap();
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        assert!(item.owner_recorded);
+
+        super::release_dropped_claim(&pool, &reg, &item);
+        assert_eq!(owner_of(&pool, ih), None);
+        assert_eq!(reg.lookup(&ih), None);
+    }
+
+    /// An owner record the enqueue did not write, or that names another
+    /// profile by the time of the drop, is not the drop's to clear.
+    #[test]
+    fn a_dropped_verify_leaves_an_index_owner_it_did_not_record() {
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash([0x66; 20]);
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+
+        // Already this profile's before the adopt: the enqueue records nothing.
+        let pool = pool_with(dir.path(), ih, Some("p"));
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        super::enqueue_verify(
+            &pool,
+            &profiles,
+            &ih.to_hex(),
+            dir.path().join("t.torrent"),
+            dir.path().join("payload"),
+            ProfileId::new("p"),
+            false,
+        )
+        .unwrap();
+        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        assert!(!item.owner_recorded);
+        super::release_dropped_claim(&pool, &reg, &item);
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("p"));
+
+        // Recorded, but another profile's by now.
+        pool.with_store(|s| s.set_profile(&ih.to_hex(), Some("other")).unwrap());
+        let item = super::PendingVerify {
+            owner_recorded: true,
+            ..pending(ih, "p")
+        };
+        super::release_dropped_claim(&pool, &reg, &item);
+        assert_eq!(owner_of(&pool, ih).as_deref(), Some("other"));
     }
 
     /// The verify worker counts a foreign `.torrent` as an isolation refusal,
@@ -1004,8 +1141,6 @@ mod tests {
     /// only.
     #[test]
     fn the_verify_worker_counts_only_a_foreign_torrent_as_an_isolation_refusal() {
-        use torrentd_engine::ProfileStatus;
-
         let mut profile = crate::profile_registry::test_entry("acct", ProfileStatus::Active).config;
         profile.allowed_tracker_domains = vec!["allowed.example".to_owned()];
         let metrics = crate::metrics_sink::PromSink::new();
@@ -1075,7 +1210,8 @@ mod tests {
         let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([0x22; 20]);
         reg.assign(ih, ProfileId::new("p")).unwrap();
-        super::release_dropped_claim(&reg, &pending(ih, "p"));
+        let pool = pool_with(dir.path(), ih, None);
+        super::release_dropped_claim(&pool, &reg, &pending(ih, "p"));
         assert_eq!(reg.lookup(&ih), None);
     }
 
@@ -1087,7 +1223,8 @@ mod tests {
         let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
         let ih = InfoHash([0x33; 20]);
         reg.assign(ih, ProfileId::new("other")).unwrap();
-        super::release_dropped_claim(&reg, &pending(ih, "p"));
+        let pool = pool_with(dir.path(), ih, None);
+        super::release_dropped_claim(&pool, &reg, &pending(ih, "p"));
         assert_eq!(reg.lookup(&ih), Some(ProfileId::new("other")));
     }
 
