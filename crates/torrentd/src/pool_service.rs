@@ -22,6 +22,7 @@ use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentPhase;
+use torrentd_engine::TrackerRefusal;
 use torrentd_pool::adopt::AdoptPlan;
 use torrentd_pool::AdoptionState;
 use torrentd_pool::PoolStore;
@@ -418,11 +419,26 @@ pub async fn run_verify_queue(
                 release_dropped_claim(&registry, &item);
                 continue;
             };
-            match engine.add_torrent(verify_add_params(
+            let params = verify_add_params(
                 profile_cfg,
                 bytes,
                 item.save_path.to_string_lossy().into_owned(),
-            )) {
+            );
+            // The adopt checked this `.torrent` before queueing it; these are
+            // the bytes read now, which are what the session gets.
+            if let Err(e) = torrentd_engine::check_trackers(profile_cfg, &params) {
+                warn!(
+                    target: "torrentd::pool",
+                    profile_id = %item.profile,
+                    infohash = %item.infohash,
+                    error.cause = %e,
+                    "verify dropped: refused by the profile's allowed_tracker_domains",
+                );
+                q.failed.fetch_add(1, Ordering::Relaxed);
+                release_dropped_claim(&registry, &item);
+                continue;
+            }
+            match engine.add_torrent(params) {
                 Ok(_) => {
                     q.in_flight.lock().push(item.infohash.clone());
                     info!(
@@ -578,17 +594,31 @@ fn unresolved_profile(
     }
 }
 
+/// The reason an adoption the account-isolation guard refused carries.
+fn tracker_refusal(e: &TrackerRefusal) -> String {
+    format!("refused by the profile's allowed_tracker_domains: {e}")
+}
+
 /// Adopt one torrent: execute whatever `torrentd_pool::adopt::plan` decided.
 ///
 /// The fast path adds immediately in seed mode. The verify path only enqueues —
 /// admission is the queue's job, so a bulk adopt returns straight away instead
 /// of blocking an HTTP request for hours.
+///
+/// Either path first holds what it would hand the session to the
+/// account-isolation guard (`torrentd_engine::check_trackers`): the fast path
+/// the resume data with its `.torrent`, whose own `trackers` list is what
+/// libtorrent announces to where it has one; the verify path the `.torrent`.
+/// A torrent outside the profile's `allowed_tracker_domains` is refused, and
+/// never falls back to the other path. `dry_run` runs everything up to the
+/// add or the enqueue, and does neither.
 pub fn execute_adopt(
     pool: &PoolService,
     source: &Arc<dyn AlertSource>,
     profiles: &crate::profile_registry::ProfileRegistry,
     infohash: &str,
     profile: ProfileId,
+    dry_run: bool,
 ) -> Result<&'static str, String> {
     let plan = pool
         .with_store(|s| torrentd_pool::adopt::plan(s, infohash, |id| pool.root_path_of(id)))
@@ -601,9 +631,23 @@ pub fn execute_adopt(
             torrent_path,
             save_path,
         } => {
+            let verify = |torrent_path, save_path, profile| {
+                enqueue_verify(
+                    pool,
+                    profiles,
+                    infohash,
+                    torrent_path,
+                    save_path,
+                    profile,
+                    dry_run,
+                )
+            };
             let engine = source
                 .engine_for(&profile)
                 .ok_or_else(|| unresolved_profile(profiles, &profile))?;
+            let Some(profile_cfg) = profiles.config(&profile) else {
+                return Err(format!("profile {profile} is not live"));
+            };
             let resume = match std::fs::read(&resume_path) {
                 Ok(b) => b,
                 Err(e) => {
@@ -617,22 +661,39 @@ pub fn execute_adopt(
                         error.cause = %e,
                         "resume data unreadable; falling back to verification",
                     );
-                    return enqueue_verify(pool, infohash, torrent_path, save_path, profile);
+                    return verify(torrent_path, save_path, profile);
                 }
             };
             // The .torrent rides along because resume data written without
             // SAVE_INFO_DICT carries no metadata; libtorrent ignores it when
             // the resume data already has an info dict.
             let torrent = std::fs::read(&torrent_path).ok();
-            let Some(profile_cfg) = profiles.config(&profile) else {
-                return Err(format!("profile {profile} is not live"));
-            };
-            if let Err(e) = engine.add_torrent(adoption_resume_params(
+            let params = adoption_resume_params(
                 profile_cfg,
                 resume,
-                torrent.clone(),
+                torrent,
                 save_path.to_string_lossy().into_owned(),
-            )) {
+            );
+            match torrentd_engine::check_trackers(profile_cfg, &params) {
+                Ok(()) => {}
+                Err(e @ TrackerRefusal::NotAllowed) => return Err(tracker_refusal(&e)),
+                Err(TrackerRefusal::Unreadable(e)) => {
+                    // libtorrent would refuse these bytes too, which is the
+                    // fallback below; the verify path holds the `.torrent`
+                    // to the guard on its own.
+                    warn!(
+                        target: "torrentd::pool",
+                        infohash = %infohash,
+                        error.cause = %e,
+                        "resume data unparseable; falling back to verification",
+                    );
+                    return verify(torrent_path, save_path, profile);
+                }
+            }
+            if dry_run {
+                return Ok("fast_path");
+            }
+            if let Err(e) = engine.add_torrent(params) {
                 // Resume data another client wrote can be truncated, from an
                 // incompatible version, or simply not libtorrent's format at
                 // all. None of that is a reason to leave the payload
@@ -644,7 +705,7 @@ pub fn execute_adopt(
                     error.cause = %e,
                     "resume add rejected; falling back to verification",
                 );
-                return enqueue_verify(pool, infohash, torrent_path, save_path, profile);
+                return verify(torrent_path, save_path, profile);
             }
 
             let (adoption, owner) = pool.with_store(|s| {
@@ -671,18 +732,46 @@ pub fn execute_adopt(
         AdoptPlan::Verify {
             torrent_path,
             save_path,
-        } => enqueue_verify(pool, infohash, torrent_path, save_path, profile),
+        } => enqueue_verify(
+            pool,
+            profiles,
+            infohash,
+            torrent_path,
+            save_path,
+            profile,
+            dry_run,
+        ),
     }
 }
 
-/// Queue a torrent for hashing before it is allowed to seed.
+/// Queue a torrent for hashing before it is allowed to seed, once its
+/// `.torrent` has passed the account-isolation guard. The queue's worker
+/// holds the bytes it actually adds to the guard again.
 fn enqueue_verify(
     pool: &PoolService,
+    profiles: &crate::profile_registry::ProfileRegistry,
     infohash: &str,
     torrent_path: PathBuf,
     save_path: PathBuf,
     profile: ProfileId,
+    dry_run: bool,
 ) -> Result<&'static str, String> {
+    let Some(profile_cfg) = profiles.config(&profile) else {
+        return Err(format!("profile {profile} is not live"));
+    };
+    // A profile with no allow-list has nothing to check, and the worker reads
+    // the file when it admits the item; one with a list cannot pass the guard
+    // without its trackers, so a `.torrent` that cannot be read is refused.
+    if !profile_cfg.allowed_tracker_domains.is_empty() {
+        let bytes = std::fs::read(&torrent_path)
+            .map_err(|e| format!("cannot read the .torrent to check its trackers: {e}"))?;
+        let params =
+            verify_add_params(profile_cfg, bytes, save_path.to_string_lossy().into_owned());
+        torrentd_engine::check_trackers(profile_cfg, &params).map_err(|e| tracker_refusal(&e))?;
+    }
+    if dry_run {
+        return Ok("queued_for_verification");
+    }
     if let Err(e) = pool.with_store(|s| s.set_profile(infohash, Some(profile.as_str()))) {
         pool.note_store_error("set_profile", &e);
     }

@@ -1112,13 +1112,26 @@ pub async fn adopt_pool_torrents(
             torrentd_pool::AdoptPlan::Verify { .. } => true,
         };
 
-        if verifies {
-            resp.verify_bytes += pool
-                .with_store(|st| st.torrent(&ih).ok().flatten().map(|t| t.total_size))
-                .unwrap_or(0);
+        // Counted only once it is taken, so a refused torrent's bytes are not.
+        let accept = |resp: &mut AdoptionResult| {
+            if verifies {
+                resp.verify_bytes += pool
+                    .with_store(|st| st.torrent(&ih).ok().flatten().map(|t| t.total_size))
+                    .unwrap_or(0);
+            }
+            bucket(resp, verifies).push(infohash);
+        };
+        if let Err(reason) = check_index_owner(pool, &s, &ih, &profile) {
+            refuse(&mut resp, reason);
+            continue;
         }
         if req.dry_run {
-            bucket(&mut resp, verifies).push(infohash);
+            // Everything up to the add, the account-isolation guard included,
+            // so a dry run refuses what the adoption would.
+            match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), true) {
+                Ok(_) => accept(&mut resp),
+                Err(reason) => refuse(&mut resp, reason),
+            }
             continue;
         }
 
@@ -1136,8 +1149,8 @@ pub async fn adopt_pool_torrents(
             refuse(&mut resp, reason);
             continue;
         }
-        match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone()) {
-            Ok(_) => bucket(&mut resp, verifies).push(infohash),
+        match execute_adopt(pool, &s.source, &s.profiles, &ih, profile.clone(), false) {
+            Ok(_) => accept(&mut resp),
             Err(reason) => {
                 release_claim(&s, infohash);
                 refuse(&mut resp, reason);
@@ -1192,6 +1205,34 @@ fn claim_in_registry(
         );
         format!("{e}")
     })
+}
+
+/// Refuse a torrent the pool index says another profile owns.
+///
+/// The index keeps an owner of its own (`torrent.profile`, which also
+/// absorbed the pre-registry `profile_assignments.json`), and it outlives the
+/// torrent being loaded, so the registry claim alone does not see it: a
+/// torrent no session holds now can still be another account's. Counted where
+/// a registry refusal is. `DELETE /v1/torrents/{infohash}` clears the record,
+/// so it never outlasts the torrent it describes.
+fn check_index_owner(
+    pool: &PoolService,
+    s: &AppState,
+    ih: &str,
+    profile: &ProfileId,
+) -> Result<(), String> {
+    let refusal = match pool.with_store(|st| st.profile_of(ih)) {
+        Ok(Some(owner)) if owner != profile.as_str() => {
+            format!("the pool index assigns this torrent to profile {owner}")
+        }
+        Ok(_) => return Ok(()),
+        Err(e) => internal("reading the pool index's owner of this torrent", e),
+    };
+    s.metrics.inc_counter(
+        "profile_assignment_registry_errors_total",
+        &[("profile_id", profile.as_str())],
+    );
+    Err(refusal)
 }
 
 /// Release a claim whose add then failed, so the info-hash can be retried.

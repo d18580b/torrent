@@ -480,7 +480,16 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
     let before = e.p.calls().len();
     let resp = h.write_json("POST", "/v1/torrents", magnet("p")).await;
     assert_problem(&resp, 409, "torrent-exists");
-    let resp = h.write_json("POST", "/v1/torrents", magnet("strict")).await;
+    // To `strict` by way of a tracker its allow-list admits, so it is the
+    // duplicate that refuses it.
+    let allowed = format!("{MAGNET}&tr=https%3A%2F%2Ftracker.allowed.example%2Fannounce");
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "strict", "source": {"kind": "magnet", "uri": allowed}}),
+        )
+        .await;
     assert_problem(&resp, 409, "torrent-exists");
     assert_eq!(e.p.calls().len(), before);
 
