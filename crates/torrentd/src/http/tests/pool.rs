@@ -722,6 +722,11 @@ async fn adoption_holds_every_torrent_to_the_profiles_tracker_domains() {
         "allowed_tracker_domains",
     );
     assert_eq!(h.state.registry.len(), 0);
+    // A `.torrent` whose trackers cannot be read is refused too, but it is
+    // not an isolation refusal, so the count at the end leaves it out.
+    std::fs::write(&source, b"not bencode").unwrap();
+    refused_for(&post(false, just_a.clone()).await, "could not be read");
+    assert_eq!(h.state.registry.len(), 0);
     std::fs::write(&source, metainfo(ALLOWED)).unwrap();
     let r = post(true, subtree.clone()).await;
     assert_eq!(r["queued_for_verification"], json!([IH_A]), "{r}");

@@ -426,14 +426,7 @@ pub async fn run_verify_queue(
             );
             // The adopt checked this `.torrent` before queueing it; these are
             // the bytes read now, which are what the session gets.
-            if let Err(e) = torrentd_engine::check_trackers(profile_cfg, &params) {
-                warn!(
-                    target: "torrentd::pool",
-                    profile_id = %item.profile,
-                    infohash = %item.infohash,
-                    error.cause = %e,
-                    "verify dropped: refused by the profile's allowed_tracker_domains",
-                );
+            if verify_guard(metrics.as_ref(), profile_cfg, &item, &params).is_err() {
                 q.failed.fetch_add(1, Ordering::Relaxed);
                 release_dropped_claim(&registry, &item);
                 continue;
@@ -468,6 +461,39 @@ pub async fn run_verify_queue(
             metrics.add_counter("pool_verify_failed_total", failed, &[]);
         }
     }
+}
+
+/// Hold the bytes the verify worker is about to add to the account-isolation
+/// guard.
+///
+/// A refusal is logged, and a `NotAllowed` one is counted in
+/// `profile_assignment_registry_errors_total`, where `POST /v1/torrents`, both
+/// boot scans and the adoption's enqueue count theirs. Bytes whose trackers
+/// cannot be read are a failed verify, not an isolation refusal.
+fn verify_guard(
+    metrics: &dyn MetricsSink,
+    profile: &torrentd_engine::ProfileConfig,
+    item: &PendingVerify,
+    params: &AddParams,
+) -> Result<(), TrackerRefusal> {
+    let refusal = match torrentd_engine::check_trackers(profile, params) {
+        Ok(()) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    warn!(
+        target: "torrentd::pool",
+        profile_id = %item.profile,
+        infohash = %item.infohash,
+        error.cause = %refusal,
+        "verify dropped: refused by the profile's allowed_tracker_domains",
+    );
+    if matches!(refusal, TrackerRefusal::NotAllowed) {
+        metrics.inc_counter(
+            "profile_assignment_registry_errors_total",
+            &[("profile_id", item.profile.as_str())],
+        );
+    }
+    Err(refusal)
 }
 
 /// Release the registry claim of a verify item the worker is dropping.
@@ -599,8 +625,11 @@ fn unresolved_profile(
 pub struct AdoptRefusal {
     /// What the response's `refused` entry says.
     pub reason: String,
-    /// Refused by the account-isolation guard, which the caller counts in
-    /// `profile_assignment_registry_errors_total` as every add path does.
+    /// Refused by the account-isolation guard because the torrent announces
+    /// outside the profile's `allowed_tracker_domains`
+    /// (`TrackerRefusal::NotAllowed`), which the caller counts in
+    /// `profile_assignment_registry_errors_total` as every add path does. A
+    /// `.torrent` whose trackers cannot be read is not one.
     pub isolation: bool,
 }
 
@@ -614,10 +643,13 @@ impl From<String> for AdoptRefusal {
 }
 
 /// The refusal an adoption the account-isolation guard refused carries.
+///
+/// Only `NotAllowed` is an isolation refusal, as on `POST /v1/torrents` and
+/// both boot scans; an unreadable `.torrent` is refused uncounted.
 fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
     AdoptRefusal {
         reason: format!("refused by the profile's allowed_tracker_domains: {e}"),
-        isolation: true,
+        isolation: matches!(e, TrackerRefusal::NotAllowed),
     }
 }
 
@@ -965,6 +997,73 @@ mod tests {
             save_path: "/nonexistent".into(),
             profile: ProfileId::new(profile),
         }
+    }
+
+    /// The verify worker counts a foreign `.torrent` as an isolation refusal,
+    /// as every add path does, and bytes it cannot read as a failed verify
+    /// only.
+    #[test]
+    fn the_verify_worker_counts_only_a_foreign_torrent_as_an_isolation_refusal() {
+        use torrentd_engine::ProfileStatus;
+
+        let mut profile = crate::profile_registry::test_entry("acct", ProfileStatus::Active).config;
+        profile.allowed_tracker_domains = vec!["allowed.example".to_owned()];
+        let metrics = crate::metrics_sink::PromSink::new();
+        let item = pending(InfoHash([0x44; 20]), "acct");
+        let file = |announce: &str| {
+            let mut t = format!(
+                "d8:announce{}:{announce}4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:",
+                announce.len()
+            )
+            .into_bytes();
+            t.extend_from_slice(&[0u8; 20]);
+            t.extend_from_slice(b"ee");
+            super::verify_add_params(&profile, t, "/p".into())
+        };
+        let counted = || {
+            let text = String::from_utf8(metrics.render()).unwrap();
+            text.lines()
+                .find(|l| {
+                    l.contains("profile_assignment_registry_errors_total{profile_id=\"acct\"}")
+                })
+                .map(str::to_owned)
+        };
+
+        super::verify_guard(
+            &metrics,
+            &profile,
+            &item,
+            &file("http://tracker.allowed.example/announce"),
+        )
+        .unwrap();
+        assert!(matches!(
+            super::verify_guard(
+                &metrics,
+                &profile,
+                &item,
+                &super::verify_add_params(&profile, b"not bencode".to_vec(), "/p".into()),
+            ),
+            Err(super::TrackerRefusal::Unreadable(_))
+        ));
+        assert!(
+            counted().is_none_or(|l| l.ends_with(" 0")),
+            "{:?}",
+            counted()
+        );
+        assert!(matches!(
+            super::verify_guard(
+                &metrics,
+                &profile,
+                &item,
+                &file("http://tracker.foreign.example/announce"),
+            ),
+            Err(super::TrackerRefusal::NotAllowed)
+        ));
+        assert!(
+            counted().is_some_and(|l| l.ends_with(" 1")),
+            "{:?}",
+            counted()
+        );
     }
 
     /// A verify item the worker drops never reaches a session, so its claim
