@@ -1327,8 +1327,20 @@ On a scratch pool, not your real one.
       `torrentd_profile_port_change_reannounce_seconds` shows how long the
       reannounce took to go out.
    4. Across a slow boot — several profiles, a large resume directory —
-      `torrentd_profile_port_forward_up` should never drop to `0` and
-      `torrentd_profile_port_forward_failures_total` should stay at `0`.
+      `torrentd_profile_port_forward_failures_total` should stay at `0`, and
+      `torrentd_profile_port_forward_up` should not drop to `0`, with one
+      exception. If the gateway hands out a new port before the alert loop
+      has cleared its boot backlog (the alerts the resume and `.torrent`
+      scans queue), the monitor cannot yet confirm a rebind promptly. It
+      leaves the session on the old port, sets
+      `torrentd_profile_port_forward_up` to `0`, logs `NAT-PMP renewed with
+      a new port before the alert loop cleared its boot backlog` at info,
+      and retries every 5 seconds. That drop is not counted as a failure,
+      and it lasts until the alert loop has cleared its boot backlog and the
+      retried rebind is confirmed. Nothing bounds that: on a boot slow
+      enough that more than about 5 minutes pass between an early port
+      change and the backlog clearing, the gauge stays at `0` long enough to
+      fire `TorrentdPortForwardDown`.
 
    This drill has not yet been run against a live Proton gateway from this
    repository: the renewal, rebind and reannounce are tested against a fake
