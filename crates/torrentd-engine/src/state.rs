@@ -188,6 +188,15 @@ pub struct TorrentState {
     /// without this stamp a failed verification cannot be told from one about
     /// to report seeding.
     pub checked_at: Option<Instant>,
+    /// A phase report (`state_update_alert` or `torrent_finished_alert`) has
+    /// landed since the last `torrent_checked_alert`.
+    ///
+    /// `phase` is only as fresh as the last report, and the report carrying a
+    /// check's verdict follows the check by up to a state-update interval. A
+    /// reader that re-hashed an already-seeding torrent would otherwise read
+    /// the `Seeding` from *before* the check as the check's verdict. Cleared
+    /// by `torrent_checked_alert`, set by every phase report after it.
+    pub phase_since_check: bool,
 }
 
 impl TorrentState {
@@ -210,6 +219,7 @@ impl TorrentState {
             is_seeding: false,
             has_error: false,
             checked_at: None,
+            phase_since_check: false,
             storage_move: None,
         }
     }

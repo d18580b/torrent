@@ -284,6 +284,12 @@ impl VerifyQueue {
         r.push((infohash, std::time::Instant::now()));
     }
 
+    /// Whether a re-hash of `infohash` is waiting for its outcome.
+    #[cfg(test)]
+    pub fn tracks_recheck(&self, infohash: &str) -> bool {
+        self.rechecks.lock().iter().any(|(ih, _)| ih == infohash)
+    }
+
     pub fn depth(&self) -> usize {
         self.pending.lock().len()
     }
@@ -360,18 +366,17 @@ pub async fn run_verify_queue(
                     // Removed while checking: nothing left to record.
                     return false;
                 };
-                if st.checked_at.is_none_or(|t| t <= *started) {
+                match recheck_outcome(st, *started, VERIFY_SETTLE) {
                     // Not checked since the request. A day is long past any
                     // re-hash this daemon could be running; past it the
                     // request was lost, and is forgotten rather than held.
-                    return started.elapsed() < Duration::from_secs(24 * 3600);
+                    None => started.elapsed() < Duration::from_secs(24 * 3600),
+                    Some(VerifyOutcome::Waiting) => true,
+                    Some(outcome) => {
+                        record_verify_outcome(&pool, &*source, &state, &hash, ih, outcome);
+                        false
+                    }
                 }
-                let outcome = verify_outcome(entry.as_ref(), VERIFY_SETTLE);
-                if outcome == VerifyOutcome::Waiting {
-                    return true;
-                }
-                record_verify_outcome(&pool, &*source, &state, &hash, ih, outcome);
-                false
             });
         }
 
@@ -640,6 +645,31 @@ fn verify_outcome(
         }
         _ => VerifyOutcome::Waiting,
     }
+}
+
+/// Decide a re-hash of a loaded torrent requested at `started`, or `None`
+/// while no check has finished since the request.
+///
+/// Stricter than [`verify_outcome`] in one way: the torrent was loaded, and
+/// usually `Seeding`, before the re-hash, and `torrent_checked_alert` only
+/// stamps `checked_at` — the phase carrying the check's verdict lands with
+/// the next state update, up to an update interval later. Until a phase
+/// report has landed since the check, `phase` is the one from before it, and
+/// reading its `Seeding` as a pass would record `adopted`, clear drift and
+/// leave seeding a payload that just failed. So nothing is decided until a
+/// phase report has been seen since the check.
+fn recheck_outcome(
+    st: &torrentd_engine::TorrentState,
+    started: std::time::Instant,
+    settle: Duration,
+) -> Option<VerifyOutcome> {
+    if st.checked_at.is_none_or(|t| t <= started) {
+        return None;
+    }
+    if !st.phase_since_check {
+        return Some(VerifyOutcome::Waiting);
+    }
+    Some(verify_outcome(Some(st), settle))
 }
 
 /// Why a `profile_id` resolved to no engine.
@@ -924,6 +954,44 @@ mod tests {
     fn a_just_checked_torrent_is_given_time_to_report_seeding() {
         let s = st(TorrentPhase::Checking, Some(Duration::from_millis(10)));
         assert_eq!(verify_outcome(Some(&s), SETTLE), VerifyOutcome::Waiting);
+    }
+
+    /// A re-hash of a torrent that was seeding: `torrent_checked` stamps
+    /// `checked_at`, and the `Seeding` still in `phase` is from before the
+    /// check. Read as the verdict, it records a payload that just failed as
+    /// verified.
+    #[test]
+    fn a_recheck_does_not_take_the_phase_from_before_the_check_as_its_verdict() {
+        let started = Instant::now() - Duration::from_secs(120);
+        let mut s = st(TorrentPhase::Seeding, Some(Duration::from_secs(60)));
+        s.phase_since_check = false;
+        assert_eq!(
+            super::recheck_outcome(&s, started, SETTLE),
+            Some(VerifyOutcome::Waiting),
+        );
+        // The report carrying the verdict lands.
+        s.phase = TorrentPhase::Incomplete;
+        s.phase_since_check = true;
+        assert_eq!(
+            super::recheck_outcome(&s, started, SETTLE),
+            Some(VerifyOutcome::Failed(
+                "payload failed verification against the piece hashes"
+            )),
+        );
+        s.phase = TorrentPhase::Seeding;
+        assert_eq!(
+            super::recheck_outcome(&s, started, SETTLE),
+            Some(VerifyOutcome::Verified),
+        );
+    }
+
+    /// A check that finished before the request is the previous one.
+    #[test]
+    fn a_recheck_ignores_a_check_from_before_the_request() {
+        let mut s = st(TorrentPhase::Seeding, Some(Duration::from_secs(60)));
+        s.phase_since_check = true;
+        let started = Instant::now() - Duration::from_secs(30);
+        assert_eq!(super::recheck_outcome(&s, started, SETTLE), None);
     }
 
     #[test]

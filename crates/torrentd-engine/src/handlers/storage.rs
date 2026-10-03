@@ -24,8 +24,12 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             // that failed its check never reaches a distinct phase — so a
             // reader that waits for one waits forever. The verify queue keys
             // its retirement off this.
-            ctx.state
-                .update(&ih, |st| st.checked_at = Some(ctx.clock.now()));
+            ctx.state.update(&ih, |st| {
+                st.checked_at = Some(ctx.clock.now());
+                // `phase` still says what the torrent was before this check;
+                // the report with the verdict has not landed yet.
+                st.phase_since_check = false;
+            });
             info!(
                 target: "torrentd_engine::handler::storage",
                 infohash = %ih,
