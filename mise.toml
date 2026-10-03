@@ -22,6 +22,14 @@ hk = "1.48.0"
 # pkl is intentionally omitted: hk parses hk.pkl with its built-in evaluator.
 # Set HK_PKL_BACKEND=pkl and add `pkl` here only if you want the pkl CLI instead.
 
+[settings]
+# Install tools one at a time. Each `cargo:` tool runs cargo in this directory,
+# and the first cargo run makes rustup install the rust-toolchain.toml channel
+# and components. Two `cargo:` tools installed in parallel run two of those
+# rustup installs into the same toolchain directory at once, and the loser
+# fails with "failed to install component ... detected conflict".
+jobs = 1
+
 [env]
 # Nightly is used ONLY for rustfmt: granular import normalization
 # (imports_granularity / group_imports in rustfmt.toml) is an unstable feature.
