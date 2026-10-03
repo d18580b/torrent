@@ -21,9 +21,11 @@
 //! named in [`CREDENTIAL_KEYS`], or a path segment of 32 or more ASCII
 //! alphanumerics (the shape of a passkey embedded in the path), or when a URL
 //! nested unencoded after its host is itself credential-carrying, or when it
-//! nests URLs more than [`MAX_URL_NESTING`] deep. Such a URL is
-//! replaced by its scheme and host plus a marker holding a short hash of the
-//! whole URL:
+//! nests URLs more than [`MAX_URL_NESTING`] deep. Keys are compared after
+//! percent-decoding, and a URL percent-encoded once or twice (`https%3A%2F%2F…`,
+//! alone or nested in another URL) is judged by what it decodes to. Such a URL
+//! is replaced by its scheme and host plus a marker holding a short hash of
+//! the whole URL:
 //!
 //! ```text
 //! https://tracker.example/announce?passkey=0123…  ->  https://tracker.example/[redacted:1a2b3c4d]
@@ -31,8 +33,12 @@
 //!
 //! The hash is stable across runs, so two announce URLs on one host stay
 //! distinguishable in a log without the secret. URLs that carry none of these
-//! pass through unchanged. `CONTRIBUTING.md` § Reporting bugs promises this to
-//! bug reporters; change the two together.
+//! pass through unchanged — except in libtorrent's own log messages, which
+//! quote tracker URLs in every shape a tracker invents: there every URL is cut
+//! at its host unless it is a bare `scheme://host[:port]/announce`-style URL,
+//! the same fail-closed rule the API applies to announce URLs.
+//! `CONTRIBUTING.md` § Reporting bugs promises this to bug reporters; change
+//! the two together.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -57,8 +63,10 @@ use tracing_subscriber::Registry;
 use crate::config::LogLevel;
 
 /// Query parameter names whose value is an account credential. Compared
-/// ASCII-case-insensitively. `key`, which libtorrent adds to every announce, is
-/// a per-session random value and deliberately absent.
+/// ASCII-case-insensitively, after percent-decoding. `key`, which libtorrent
+/// adds to every announce, is a per-session random value and deliberately
+/// absent. `pid` and `uid` are the Gazelle/Luminance account parameters, and
+/// `rsskey` and `pass` the RSS and legacy passkey spellings trackers use.
 const CREDENTIAL_KEYS: &[&str] = &[
     "passkey",
     "apikey",
@@ -66,7 +74,23 @@ const CREDENTIAL_KEYS: &[&str] = &[
     "authkey",
     "torrent_pass",
     "token",
+    "pid",
+    "uid",
+    "rsskey",
+    "pass",
 ];
+
+/// The target libtorrent's own log messages arrive under
+/// (`torrentd_engine::handlers::log_msg`). They quote tracker URLs verbatim,
+/// in whatever shape the tracker uses, so every URL in them is held to the
+/// fail-closed rule the API uses ([`display_announce_url`]) rather than to
+/// the credential shapes [`redact_urls`] recognises.
+const LIBTORRENT_LOG_TARGET: &str = "torrentd_engine::handler::log";
+
+/// Separators that start a URL's authority: `://` literally, and the same
+/// percent-encoded once and twice, which is how a URL nested in another URL's
+/// query (or a tracker's redirect) reaches a log line.
+const SEPARATORS: &[&str] = &["://", "%3a%2f%2f", "%253a%252f%252f"];
 
 /// A path segment at least this long and wholly ASCII-alphanumeric is treated
 /// as an embedded passkey (`/<32 hex>/announce`, `/announce/<32 alnum>`).
@@ -97,14 +121,84 @@ where
     ) -> fmt::Result {
         let mut line = String::new();
         self.0.format_event(ctx, Writer::new(&mut line), event)?;
-        writer.write_str(&redact_urls(&line))
+        let redacted = if event.metadata().target() == LIBTORRENT_LOG_TARGET {
+            redact_urls_host_only(&line)
+        } else {
+            redact_urls(&line)
+        };
+        writer.write_str(&redacted)
     }
+}
+
+/// How much of a URL a line may keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Redact a URL carrying a credential shape [`redact_url`] recognises.
+    Credentials,
+    /// Keep a URL only where [`display_announce_url`] would show it whole;
+    /// cut every other at the host. For text that quotes tracker URLs.
+    HostOnly,
 }
 
 /// Replace every credential-carrying URL in `text` with its redacted form.
 /// Borrows when `text` holds no URL at all, which is most lines.
 pub(crate) fn redact_urls(text: &str) -> Cow<'_, str> {
-    redact_urls_at(text, 0)
+    redact_urls_at(text, 0, Mode::Credentials)
+}
+
+/// Replace every URL in `text` that is not known to be safe with its scheme,
+/// host and a marker: what a line quoting tracker URLs may keep.
+fn redact_urls_host_only(text: &str) -> Cow<'_, str> {
+    redact_urls_at(text, 0, Mode::HostOnly)
+}
+
+/// The first URL separator in `text`: its byte offset and length.
+fn next_separator(text: &str) -> Option<(usize, usize)> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        match bytes[at] {
+            b':' | b'%' => {
+                for sep in SEPARATORS {
+                    let end = at + sep.len();
+                    if end <= bytes.len() && bytes[at..end].eq_ignore_ascii_case(sep.as_bytes()) {
+                        return Some((at, sep.len()));
+                    }
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
+/// `text` with every `%XX` escape decoded; borrowed when there is none.
+/// Invalid escapes are kept as written, and bytes that do not decode to UTF-8
+/// are replaced, which can only make a URL look less like a clean one.
+fn percent_decode(text: &str) -> Cow<'_, str> {
+    if !text.contains('%') {
+        return Cow::Borrowed(text);
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| (b as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    match String::from_utf8_lossy(&out) {
+        Cow::Borrowed(s) if s == text => Cow::Borrowed(text),
+        decoded => Cow::Owned(decoded.into_owned()),
+    }
 }
 
 /// An announce URL as the API may show it, and the host it names.
@@ -221,30 +315,44 @@ fn is_plain_host(host: &str) -> bool {
 }
 
 /// [`redact_urls`] for text nested `depth` URLs deep inside another URL.
-fn redact_urls_at(text: &str, depth: usize) -> Cow<'_, str> {
-    if !text.contains("://") {
+fn redact_urls_at(text: &str, depth: usize, mode: Mode) -> Cow<'_, str> {
+    if next_separator(text).is_none() {
         return Cow::Borrowed(text);
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(sep) = rest.find("://") {
+    while let Some((sep, sep_len)) = next_separator(rest) {
         let before = &rest[..sep];
         let mut start = before.trim_end_matches(is_scheme_char).len();
         // A scheme starts with a letter; skip digits or `+-.` glued before it.
         match before[start..].find(|c: char| c.is_ascii_alphabetic()) {
             Some(skip) => start += skip,
             None => {
-                out.push_str(&rest[..sep + 3]);
-                rest = &rest[sep + 3..];
+                out.push_str(&rest[..sep + sep_len]);
+                rest = &rest[sep + sep_len..];
                 continue;
             }
         }
-        let tail = &rest[sep + 3..];
-        let end = sep + 3 + tail.find(is_url_terminator).unwrap_or(tail.len());
+        let tail = &rest[sep + sep_len..];
+        let end = sep + sep_len + tail.find(is_url_terminator).unwrap_or(tail.len());
         let end = start + trim_trailing_punctuation(&rest[start..end]).len();
         let url = &rest[start..end];
         out.push_str(&rest[..start]);
-        match redact_url(url, sep - start, depth) {
+        let redacted = if sep_len == 3 {
+            redact_url(url, sep - start, depth, mode)
+        } else {
+            // Percent-encoded: judge the URL it decodes to. A redaction is
+            // made from the decoded form, so no escape of the secret survives.
+            let decoded = percent_decode(url);
+            if depth >= MAX_URL_NESTING {
+                Some(marker_url(&decoded, sep - start))
+            } else {
+                redact_urls_at(&decoded, depth + 1, mode)
+                    .ne(&decoded)
+                    .then(|| marker_url(&decoded, sep - start))
+            }
+        };
+        match redacted {
             Some(redacted) => out.push_str(&redacted),
             None => out.push_str(url),
         }
@@ -252,6 +360,23 @@ fn redact_urls_at(text: &str, depth: usize) -> Cow<'_, str> {
     }
     out.push_str(rest);
     Cow::Owned(out)
+}
+
+/// `url` cut at its host: `scheme://host/[redacted:<hash>]`. `scheme_len` is
+/// the byte length of the scheme; the separator after it may be literal or
+/// encoded, and the host is whatever precedes the first `/`, `?` or `#` after
+/// a literal `://`, or the bare marker where there is none.
+fn marker_url(url: &str, scheme_len: usize) -> String {
+    let digest = Sha256::digest(url.as_bytes());
+    let marker = format!("[redacted:{}]", hex::encode(&digest[..4]));
+    match url.get(scheme_len..).and_then(|r| r.strip_prefix("://")) {
+        Some(after) => {
+            let authority = &after[..after.find(['/', '?', '#']).unwrap_or(after.len())];
+            let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+            format!("{}://{host}/{marker}", &url[..scheme_len])
+        }
+        None => marker,
+    }
 }
 
 pub(crate) fn is_scheme_char(c: char) -> bool {
@@ -283,7 +408,11 @@ pub(crate) fn trim_trailing_punctuation(url: &str) -> &str {
 /// The redacted form of `url` if it carries a credential, else `None`.
 /// `scheme_len` is the byte length of the scheme before `://`; `depth` is how
 /// many URLs enclose this one.
-fn redact_url(url: &str, scheme_len: usize, depth: usize) -> Option<String> {
+fn redact_url(url: &str, scheme_len: usize, depth: usize, mode: Mode) -> Option<String> {
+    if mode == Mode::HostOnly {
+        let shown = display_announce_url(url);
+        return (shown.url != url).then_some(shown.url);
+    }
     let scheme = &url[..scheme_len];
     let after = &url[scheme_len + 3..];
     let authority_end = after.find(['/', '?', '#']).unwrap_or(after.len());
@@ -297,8 +426,17 @@ fn redact_url(url: &str, scheme_len: usize, depth: usize) -> Option<String> {
     // swallowed whole by `redact_urls`, so check it here: a credential in it
     // makes this URL credential-carrying too. Past `MAX_URL_NESTING` the
     // nested URL is not inspected and this one is redacted, failing closed.
-    let secret_nested = rest.contains("://")
-        && (depth >= MAX_URL_NESTING || redact_urls_at(rest, depth + 1) != rest);
+    //
+    // The same holds for one nested percent-encoded (`?u=https%3A%2F%2Ft…`),
+    // which is found by decoding the rest once and looking again; a
+    // double-encoded one takes one more level, bounded by the same cap.
+    let nested_secret_in = |r: &str| {
+        next_separator(r).is_some()
+            && (depth >= MAX_URL_NESTING || redact_urls_at(r, depth + 1, mode) != r)
+    };
+    let decoded_rest = percent_decode(rest);
+    let secret_nested =
+        nested_secret_in(rest) || (decoded_rest != rest && nested_secret_in(&decoded_rest));
     let rest = rest.split('#').next().unwrap_or_default();
     let (path, query) = match rest.split_once('?') {
         Some((path, query)) => (path, query),
@@ -308,10 +446,17 @@ fn redact_url(url: &str, scheme_len: usize, depth: usize) -> Option<String> {
     let secret_in_path = path.split('/').any(|seg| {
         seg.len() >= PATH_SECRET_MIN_LEN && seg.bytes().all(|b| b.is_ascii_alphanumeric())
     });
-    let secret_in_query = query.split(['&', ';']).any(|pair| {
-        let key = pair.split('=').next().unwrap_or_default();
-        CREDENTIAL_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
-    });
+    // Keys are compared decoded (`pass%6Bey` is `passkey`), and the query is
+    // also read decoded, so a key hidden behind an encoded `&` or `=` counts.
+    let names_a_credential = |q: &str| {
+        q.split(['&', ';']).any(|pair| {
+            let key = percent_decode(pair.split('=').next().unwrap_or_default());
+            CREDENTIAL_KEYS.iter().any(|k| key.eq_ignore_ascii_case(k))
+        })
+    };
+    let decoded_query = percent_decode(query);
+    let secret_in_query =
+        names_a_credential(query) || (decoded_query != query && names_a_credential(&decoded_query));
     if userinfo.is_none() && !secret_in_path && !secret_in_query && !secret_nested {
         return None;
     }
@@ -632,6 +777,89 @@ mod tests {
             .expect("no stack overflow");
         assert!(out.starts_with("x a://a:/[redacted:"), "{}", &out[..40]);
         assert!(out.ends_with("] y"), "{out}");
+    }
+
+    #[test]
+    fn account_keys_trackers_use_are_credentials() {
+        for key in ["pid", "uid", "rsskey", "pass", "PASS", "RssKey"] {
+            let out = redacted(&format!("http://t.example/announce?{key}=SECRETVALUE&x=1"));
+            assert!(!out.contains("SECRETVALUE"), "{key}: {out}");
+            assert!(out.starts_with("http://t.example/[redacted:"), "{out}");
+        }
+        // A key spelled with escapes is the same key.
+        let out = redacted("http://t.example/announce?pass%6Bey=SECRETVALUE");
+        assert!(!out.contains("SECRETVALUE"), "{out}");
+        // Neither is a prefix match: `passage` and `pidgin` are not keys.
+        for clean in [
+            "http://t.example/a?passage=1",
+            "http://t.example/a?pidgin=1",
+        ] {
+            assert_eq!(redacted(clean), clean);
+        }
+    }
+
+    #[test]
+    fn a_percent_encoded_url_is_judged_by_what_it_decodes_to() {
+        let secret = "SECRETVALUE";
+        for line in [
+            // Alone in a line, encoded once and twice.
+            format!("fetch https%3A%2F%2Ft.example%2Fannounce%3Fpasskey%3D{secret} done"),
+            format!("fetch https%3a%2f%2ft.example%2fannounce%3fpasskey%3d{secret} done"),
+            format!("fetch https%253A%252F%252Ft.example%252Fa%253Fpasskey%253D{secret} done"),
+            // Nested in another URL's query, encoded once and twice.
+            format!("fetch http://proxy/r?u=https%3A%2F%2Ft.example%2Fa%3Fpasskey%3D{secret} done"),
+            format!(
+                "fetch http://proxy/r?u=https%253A%252F%252Ft.example%252Fa%253Ftoken%253D{secret} \
+                 done"
+            ),
+            // A credential key behind an encoded `&`.
+            format!("fetch http://t.example/a?x=1%26passkey%3D{secret} done"),
+        ] {
+            let out = redacted(&line);
+            assert!(!out.contains(secret), "{line} -> {out}");
+            assert!(out.starts_with("fetch "), "{out}");
+            assert!(out.ends_with("] done"), "{line} -> {out}");
+        }
+        // An encoded URL carrying nothing is left alone.
+        let plain = "see https%3A%2F%2Fexample.com%2Fdocs and http://p/r?u=https%3A%2F%2Fe.com%2Fa";
+        assert_eq!(redacted(plain), plain);
+    }
+
+    #[test]
+    fn libtorrent_log_lines_keep_only_the_host_of_a_tracker_url() {
+        // libtorrent quotes announce URLs in whatever shape the tracker uses;
+        // a short key the credential rules do not recognise still stays out.
+        let line = "==> TRACKER_REQUEST [ url: https://t.example/announce/Ab-_x9Qz?x=1 ]";
+        let out = redact_urls_host_only(line);
+        assert!(!out.contains("Ab-_x9Qz"), "{out}");
+        assert!(
+            out.starts_with("==> TRACKER_REQUEST [ url: https://t.example/[redacted:"),
+            "{out}"
+        );
+        // A bare announce URL says nothing about the account.
+        let bare = "==> TRACKER_REQUEST [ url: udp://t.example:6969/announce ]";
+        assert_eq!(redact_urls_host_only(bare), bare);
+        // And so does an encoded one.
+        let encoded = "u=https%3A%2F%2Ft.example%2Fannounce%2FAb-_x9Qz";
+        assert!(!redact_urls_host_only(encoded).contains("Ab-_x9Qz"));
+    }
+
+    #[test]
+    fn the_daemon_layer_holds_libtorrent_messages_to_the_host_only_rule() {
+        let buf = Buf::default();
+        let subscriber = tracing_subscriber::registry().with(fmt_layer(buf.clone()));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::debug!(
+                target: "torrentd_engine::handler::log",
+                "==> TRACKER_REQUEST [ url: https://t.example/announce?uk=abc123 ]"
+            );
+            tracing::info!(target: "torrentd::other", "see https://t.example/docs?page=2");
+        });
+        let out = String::from_utf8(buf.0.lock().expect("buffer lock").clone()).expect("utf8");
+        assert!(!out.contains("abc123"), "{out}");
+        assert!(out.contains("https://t.example/[redacted:"), "{out}");
+        // Other targets keep the credential rules, and a clean URL whole.
+        assert!(out.contains("https://t.example/docs?page=2"), "{out}");
     }
 
     #[test]

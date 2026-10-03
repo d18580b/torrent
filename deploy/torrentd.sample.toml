@@ -367,6 +367,10 @@ dht               = true
 # (/metrics and nothing else — keeps a scrape credential out of the API).
 # /healthz is never authenticated.
 #
+# session_ttl_secs is how long a session token from POST /v1/sessions lasts:
+# default 43200 (12 hours), and between 60 and 2592000 (30 days) inclusive.
+# The daemon refuses to start with a value outside that range.
+#
 # [auth]
 # password_hash    = "$argon2id$v=19$m=19456,t=2,p=1$...$..."
 # session_ttl_secs = 43200

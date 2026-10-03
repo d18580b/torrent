@@ -147,6 +147,62 @@ async fn events(cov: &Arc<Coverage>) {
 }
 
 #[tokio::test]
+async fn an_event_stream_ends_when_its_session_is_revoked() {
+    // The credential is checked when the stream opens; without a re-check a
+    // stream opened with a session outlived the session's revocation for as
+    // long as the client kept it open.
+    let h = Harness::authed(&Coverage::new(), |_| {});
+    let auth = h.state.auth.clone().unwrap();
+    let (token, _) = auth.sessions.create();
+
+    let revoker = {
+        let (auth, token) = (auth.clone(), token.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            auth.sessions.revoke(&token);
+        })
+    };
+    // A backstop, so a stream that does not end fails the test rather than
+    // hanging it: the daemon shutting down ends every stream.
+    let shutdown = h.state.shutdown.clone();
+    let backstop = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+        let _ = shutdown.send(torrentd_engine::ShutdownReason::Sigterm);
+    });
+
+    let started = std::time::Instant::now();
+    let resp = h.send("GET", "/v1/events", Some(&token), None).await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "the stream ended with its session, not with the daemon: {:?}",
+        started.elapsed(),
+    );
+    assert!(
+        !resp.events().is_empty(),
+        "it streamed while the session lived"
+    );
+    revoker.await.unwrap();
+    backstop.abort();
+}
+
+#[tokio::test]
+async fn an_event_stream_opened_with_a_static_token_is_not_ended_by_the_check() {
+    // Only a session can stop being valid while the daemon runs; a stream
+    // on a static token runs until the daemon stops.
+    let h = Harness::authed(&Coverage::new(), |_| {});
+    let shutdown = h.state.shutdown.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let _ = shutdown.send(torrentd_engine::ShutdownReason::Sigterm);
+    });
+    let started = std::time::Instant::now();
+    let resp = h.read("/v1/events").await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    assert!(started.elapsed() >= std::time::Duration::from_millis(2400));
+}
+
+#[tokio::test]
 async fn an_events_stream_opened_after_the_shutdown_ends_at_once() {
     // Subscribed after the broadcast went out, the stream never saw it and
     // held the graceful drain open to its timeout. Nothing sends on the

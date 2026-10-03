@@ -47,34 +47,98 @@ use crate::cli::Cli;
 use crate::cli::Command;
 use crate::cli::PoolCmd;
 
+/// Terminal echo, switched off for as long as this guard lives.
+///
+/// Through `stty` on the controlling terminal rather than a termios binding:
+/// the daemon has no terminal dependency, and this is the one prompt that
+/// needs one. Echo is restored on drop, so an error or a panic between the
+/// prompts does not leave the operator's shell silent.
+///
+/// A signal is not an unwind: Ctrl-C (SIGINT) at a prompt kills the process
+/// without running this drop, and the terminal is left with echo off. No
+/// handler is installed for it; the operator runs `stty echo` (or `reset`) to
+/// get it back, as the `hash-password` help and `docs/running.md` §6 say.
+struct NoEcho {
+    active: bool,
+}
+
+impl NoEcho {
+    /// Switch echo off on stdin's terminal. Fails closed: a terminal whose
+    /// echo cannot be switched off is refused, because typing the password
+    /// would print it.
+    fn on_stdin() -> anyhow::Result<Self> {
+        let status = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status()
+            .context("run `stty -echo` to hide the password as it is typed")?;
+        if !status.success() {
+            anyhow::bail!(
+                "`stty -echo` failed ({status}); refusing to read a password that would be \
+                 echoed. Pipe it on stdin instead"
+            );
+        }
+        Ok(Self { active: true })
+    }
+}
+
+impl Drop for NoEcho {
+    fn drop(&mut self) {
+        if std::mem::take(&mut self.active) {
+            let _ = std::process::Command::new("stty")
+                .arg("echo")
+                .stdin(std::process::Stdio::inherit())
+                .status();
+        }
+    }
+}
+
+/// One line from stdin, without its line ending.
+fn read_secret_line() -> anyhow::Result<String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line.trim_end_matches(['\n', '\r']).to_string())
+}
+
 /// Read a password twice from the terminal and print its Argon2id hash.
 ///
 /// Read from stdin rather than taken as an argument so the password never
-/// reaches the shell history or the process table.
+/// reaches the shell history or the process table, and with the terminal's
+/// echo off so it never reaches the screen, a recording, or scrollback.
 fn hash_password_cmd() -> anyhow::Result<()> {
-    use std::io::BufRead;
     use std::io::Write;
+
+    // Only prompt twice when a human is typing; a piped password has already
+    // been decided elsewhere and there is nothing to confirm against.
+    let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let no_echo = if interactive {
+        Some(NoEcho::on_stdin()?)
+    } else {
+        None
+    };
 
     eprint!("password: ");
     std::io::stderr().flush()?;
-    let mut first = String::new();
-    std::io::stdin().lock().read_line(&mut first)?;
-    let first = first.trim_end_matches(['\n', '\r']).to_string();
+    let first = read_secret_line()?;
+    if interactive {
+        // The newline the operator typed was not echoed either.
+        eprintln!();
+    }
     if first.is_empty() {
         anyhow::bail!("empty password");
     }
 
-    // Only prompt twice when a human is typing; a piped password has already
-    // been decided elsewhere and there is nothing to confirm against.
-    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+    if interactive {
         eprint!("confirm : ");
         std::io::stderr().flush()?;
-        let mut again = String::new();
-        std::io::stdin().lock().read_line(&mut again)?;
-        if again.trim_end_matches(['\n', '\r']) != first {
+        let again = read_secret_line()?;
+        eprintln!();
+        if again != first {
             anyhow::bail!("passwords do not match");
         }
     }
+    drop(no_echo);
 
     println!("{}", auth::hash_password(&first)?);
     eprintln!("\nAdd to your config:\n\n[auth]\npassword_hash = \"<the line above>\"");

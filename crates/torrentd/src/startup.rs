@@ -60,6 +60,53 @@ use crate::vpn;
 /// healthy is the worst of both answers.
 const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// The most HTTP connections the API holds open at once; the next waits in
+/// the listen backlog until one closes.
+///
+/// Sized against the descriptor limit the daemon shares with libtorrent,
+/// which is what `LimitNOFILE=65536` in `deploy/torrentd.service` is for:
+/// each profile's `connections_limit` (10,000 in the sample config) and
+/// `file_pool_size` draw on the same table. kynos' default of 10,000 would let
+/// the API alone take a sixth of it, and every descriptor the API holds is one
+/// a profile cannot open a peer or a file with. The API's own callers — an
+/// operator or two, `torrentctl`, a Prometheus scrape, a reverse proxy's
+/// pool — need a few dozen; 256 leaves room for a proxy that does not reuse
+/// connections, at under 0.4% of the table.
+const HTTP_MAX_CONNECTIONS: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(256) {
+    Some(n) => n,
+    None => unreachable!(),
+};
+
+/// How long an HTTP/1 client has to send a request head, including the wait
+/// for the next request on a kept-alive connection.
+///
+/// A head is a few hundred bytes. kynos' default of 30 s lets a client that
+/// never finishes one hold a connection — one of [`HTTP_MAX_CONNECTIONS`] —
+/// three times as long for no reason; the body's own deadline is
+/// `http::v1::REQUEST_DEADLINE`.
+const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often an HTTP/2 (h2c) connection is pinged, and how long the peer has
+/// to acknowledge before the connection is closed.
+///
+/// kynos leaves HTTP/2 keep-alive off, and HTTP/2 has no counterpart to
+/// [`HTTP_HEADER_READ_TIMEOUT`]: a peer that sent the preface and then went
+/// silent — crashed, partitioned, or never reading — would hold one of
+/// [`HTTP_MAX_CONNECTIONS`] until the daemon stopped. With pings, such a peer
+/// is dropped within 30 s.
+///
+/// This does not bound a peer that acknowledges pings and sends nothing
+/// else, nor a plaintext connection that sends no byte at all: hyper-util
+/// sniffs the protocol before either driver starts, with no timer, and kynos
+/// exposes neither a first-byte deadline nor an HTTP/2 idle timeout. Both are
+/// recorded in `docs/running.md` §7; a non-loopback `http_listen` belongs
+/// behind a proxy that bounds them.
+const HTTP2_KEEP_ALIVE: kynos::server::protocol::Http2KeepAlive =
+    kynos::server::protocol::Http2KeepAlive {
+        interval: std::time::Duration::from_secs(20),
+        timeout: std::time::Duration::from_secs(10),
+    };
+
 /// How long the HTTP server's graceful shutdown waits for open requests
 /// before cutting them off. A drain that runs out exits 0 with a warning
 /// (`http_exit_code`).
@@ -483,8 +530,8 @@ const TEARDOWN_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(6
 /// Every descriptor the daemon may hold at once, against `RLIMIT_NOFILE`.
 ///
 /// Each session may open `connections_limit` peer sockets and keep
-/// `file_pool_size` payload files open, and the API accepts up to kynos's
-/// connection cap. A soft limit below their sum is a daemon that seeds until
+/// `file_pool_size` payload files open, and the API accepts up to
+/// [`HTTP_MAX_CONNECTIONS`]. A soft limit below their sum is a daemon that seeds until
 /// the pool grows and then fails `accept` and `open` with `EMFILE` — in
 /// libtorrent's logs, as disk and peer errors, far from the cause. The values
 /// are the effective ones: `Settings::server_seed_overrides` sets both, and
@@ -511,12 +558,13 @@ fn descriptors_needed(cfg: &Config) -> u64 {
     let s = cfg.libtorrent_settings();
     let per_session = u64::from(s.connections_limit.unwrap_or_default())
         + u64::from(s.file_pool_size.unwrap_or_default());
-    per_session * cfg.profile.len() as u64 + HTTP_MAX_CONNECTIONS
+    per_session * cfg.profile.len() as u64 + http_connection_cap()
 }
 
-/// kynos's default cap on accepted API connections, which the daemon does not
-/// change.
-const HTTP_MAX_CONNECTIONS: u64 = 10_000;
+/// [`HTTP_MAX_CONNECTIONS`] as a descriptor count.
+fn http_connection_cap() -> u64 {
+    u64::try_from(HTTP_MAX_CONNECTIONS.get()).unwrap_or(u64::MAX)
+}
 
 /// The soft `RLIMIT_NOFILE`, or `None` if it cannot be read.
 fn nofile_soft_limit() -> Option<u64> {
@@ -2261,9 +2309,21 @@ async fn serve_until_shutdown(
 
     // kynos records every connection's peer address, which is what lets the
     // session throttle and the auth failure log see who was calling.
+    //
+    // The limits are set here rather than left to kynos' defaults, which are
+    // sized for a public web service: 10,000 connections and a 30 s header
+    // timeout. This is a single-operator control plane sharing one descriptor
+    // limit (`LimitNOFILE`) with libtorrent, whose peer connections and file
+    // pool are what the limit is for; see `HTTP_MAX_CONNECTIONS`.
     let work = Arc::clone(work);
     let server = kynos::server::Server::new(app)
         .listener(listener)
+        .max_connections(HTTP_MAX_CONNECTIONS)
+        .http1(
+            kynos::server::protocol::Http1Config::default()
+                .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT)),
+        )
+        .http2(kynos::server::protocol::Http2Config::default().keep_alive(Some(HTTP2_KEEP_ALIVE)))
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             let _ = shutdown_rx.recv().await;
             // Latched first, so an apply still running stops at its next step
@@ -2666,7 +2726,7 @@ mod shutdown_report_tests {
             crate::profile_registry::test_entry("a", ProfileStatus::Active).config,
             crate::profile_registry::test_entry("b", ProfileStatus::Active).config,
         ];
-        assert_eq!(descriptors_needed(&cfg), 2 * 1_100 + HTTP_MAX_CONNECTIONS);
+        assert_eq!(descriptors_needed(&cfg), 2 * 1_100 + 256);
         // And the shipped unit's LimitNOFILE covers a one-profile default.
         cfg.connections_limit = None;
         cfg.file_pool_size = None;

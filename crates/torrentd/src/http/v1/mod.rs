@@ -25,8 +25,26 @@ pub const MAX_BODY_BYTES: usize = 64 * 1024;
 /// encoded, with room for the rest of the request.
 pub const MAX_ADD_BODY_BYTES: usize = 96 * 1024 * 1024;
 
-/// How long a request body may take to arrive between chunks.
-pub(crate) const BODY_IDLE: Duration = Duration::from_secs(30);
+/// How long an operation with a body has, from the request head to its
+/// response head: reading the body, and whatever the handler awaits.
+///
+/// This is what bounds a slow body. Nothing else does: kynos' `BodySize`
+/// reads a length-less body frame by frame and passes a declared-length one
+/// through to the extractor, and neither read has a clock of its own. Without
+/// this, an unauthenticated `POST /v1/sessions` that declares a length and
+/// then trickles its body holds a connection for as long as the client
+/// likes, and enough of them fill the server's connection cap — at which
+/// point `/healthz` and `/metrics` stop answering too. A request that runs
+/// past it is answered `408`.
+///
+/// Thirty seconds is minutes more than any body here takes on a working
+/// link: the largest is 64 KiB, and the slowest handler awaits one Argon2id
+/// run on the blocking pool.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
+
+/// [`REQUEST_DEADLINE`] for `POST /v1/torrents`, whose body may be 96 MiB:
+/// enough for that at about 330 KB/s.
+pub const ADD_REQUEST_DEADLINE: Duration = Duration::from_secs(300);
 
 /// The daemon: identity, status, change notifications and reload.
 #[derive(Tag)]
@@ -85,25 +103,37 @@ pub struct Operations;
 )]
 pub struct Testing;
 
-/// A `/v1` group, with the body limit its operations admit.
+/// A `/v1` group, with the body limit its operations admit and the deadline
+/// the body has to arrive by.
 ///
 /// The interceptors every routed response shares — the request id and the API
 /// headers — sit on the router, not here: per group they would give each
-/// group its own id counter and leave the root routes without them. Three groups share the prefix, differing only in what body
-/// they admit:
-/// operations that take no body declare no `413`, so the document does not
-/// promise a failure they cannot produce. A macro rather than a function
-/// because each interceptor changes the group's type.
+/// group its own id counter and leave the root routes without them. Four
+/// groups share the prefix, differing only in what body they admit and how
+/// long it may take: operations that take no body declare no `413` and no
+/// `408`, so the document does not promise a failure they cannot produce. A
+/// macro rather than a function because each interceptor changes the group's
+/// type.
+///
+/// The deadline is kynos' `Timeout`, mounted *before* `BodySize` so that it
+/// wraps the body read as well as the handler — kynos runs interceptors in the
+/// order they are added, outermost first, and a timeout mounted after
+/// `BodySize` would bound the handler alone. It bounds the handler's awaits
+/// too, which is why the one operation that awaits minutes of work,
+/// `POST /v1/pool/plans/{plan_id}/apply`, is mounted with `untimed`: every
+/// other part of it needs `write`, so an unauthenticated slow body never
+/// reaches it.
 macro_rules! v1_group {
     () => {
         kynos::router::group::Group::new(crate::http::v1::PREFIX)
     };
-    ($max_body:expr) => {
+    (untimed $max_body:expr) => {
+        v1_group!().intercept(kynos::middleware::limits::BodySize::new($max_body as u64))
+    };
+    ($max_body:expr, $deadline:expr) => {
         v1_group!()
+            .intercept(kynos::middleware::limits::Timeout::new($deadline))
             .intercept(kynos::middleware::limits::BodySize::new($max_body as u64))
-            .intercept(kynos::middleware::limits::BodyTimeout::idle(
-                crate::http::v1::BODY_IDLE,
-            ))
     };
 }
 
@@ -126,13 +156,17 @@ macro_rules! mount {
         let bodyless = pool::bodyless_routes!(profiles::bodyless_routes!(
             torrents::bodyless_routes!(bodyless)
         ));
-        let body = v1_group!(MAX_BODY_BYTES).mount(kynos::routes![sessions::create_session]);
+        let body = v1_group!(MAX_BODY_BYTES, REQUEST_DEADLINE)
+            .mount(kynos::routes![sessions::create_session]);
         let body = pool::body_routes!(profiles::body_routes!(torrents::body_routes!(body)));
-        // The alert drill's fault injection, in a `fault-injection` build only.
+        let long = pool::long_body_routes!(v1_group!(untimed MAX_BODY_BYTES));
+        // The alert drill's fault injection, in a `fault-injection` build
+        // only. Untimed: it is a test surface, and a deadline would add a
+        // `408` to it that only a drill could exercise.
         #[cfg(feature = "fault-injection")]
-        let body = crate::http::fault_injection::fault_routes!(body);
-        let add = torrents::add_routes!(v1_group!(MAX_ADD_BODY_BYTES));
-        $router.group(bodyless).group(body).group(add)
+        let long = crate::http::fault_injection::fault_routes!(long);
+        let add = torrents::add_routes!(v1_group!(MAX_ADD_BODY_BYTES, ADD_REQUEST_DEADLINE));
+        $router.group(bodyless).group(body).group(long).group(add)
     }};
 }
 pub(crate) use mount;

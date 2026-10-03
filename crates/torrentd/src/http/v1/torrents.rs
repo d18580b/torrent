@@ -36,6 +36,7 @@ use tracing::warn;
 use crate::app_state::AppState;
 use crate::http::page::page;
 use crate::http::page::paginate;
+use crate::http::page::PageLimit;
 use crate::http::page::PageRequest;
 use crate::http::security::Bearer;
 use crate::http::security::Read;
@@ -322,7 +323,7 @@ pub struct ListTorrentsQuery {
     pub cursor: Option<String>,
     /// Torrents per page, 1 to 1000; 100 when absent.
     #[schema(minimum = 1, maximum = 1000)]
-    pub limit: Option<u32>,
+    pub limit: Option<PageLimit>,
 }
 
 torrent_error! {
@@ -366,32 +367,42 @@ pub async fn list_torrents(
     let page = PageRequest::parse(
         TORRENTS_LISTING,
         q.cursor.as_deref(),
-        q.limit,
+        q.limit.map(PageLimit::get),
         crate::http::validate::is_infohash_hex,
         &mut invalid,
     )
     .map_err(|_| ListTorrentsError::InvalidCursor)?;
     invalid.finish()?;
 
-    let mut all = s.registry.entries();
-    if let Some(id) = q.profile_id {
-        let profile_id = ProfileId::new(id);
-        // A failed profile's assignments are listed: this reads the
-        // registry, not an engine.
-        if matches!(
-            s.profiles.resolve(&profile_id),
-            crate::profile_registry::Resolution::Unknown
-        ) {
-            return Err(ListTorrentsError::ProfileNotFound);
+    let profile_id = match q.profile_id {
+        Some(id) => {
+            let profile_id = ProfileId::new(id);
+            // A failed profile's assignments are listed: this reads the
+            // registry, not an engine.
+            if matches!(
+                s.profiles.resolve(&profile_id),
+                crate::profile_registry::Resolution::Unknown
+            ) {
+                return Err(ListTorrentsError::ProfileNotFound);
+            }
+            Some(profile_id)
         }
-        all.retain(|(_, p)| *p == profile_id);
-    }
-    if let Some(phase) = q.phase {
-        all.retain(|(ih, _)| TorrentPhase::of(s.state.get(ih).as_ref()) == phase);
-    }
-    all.sort_by_key(|(ih, _)| ih.0);
+        None => None,
+    };
+    // `is_infohash_hex` admitted the cursor's key, so it decodes.
+    let after = page.after.as_deref().and_then(InfoHash::from_hex);
+    let rows = first_after(
+        s.registry.as_ref(),
+        after,
+        page.limit.saturating_add(1),
+        |ih, p| {
+            profile_id.as_ref().is_none_or(|want| p == want)
+                && q.phase
+                    .is_none_or(|phase| TorrentPhase::of(s.state.get(ih).as_ref()) == phase)
+        },
+    );
 
-    let (rows, next_cursor) = paginate(TORRENTS_LISTING, all, |(ih, _)| ih.to_hex(), &page);
+    let (rows, next_cursor) = paginate(TORRENTS_LISTING, rows, |(ih, _)| ih.to_hex(), &page);
     Ok(Json(TorrentPage {
         items: rows
             .iter()
@@ -399,6 +410,67 @@ pub async fn list_torrents(
             .collect(),
         next_cursor,
     }))
+}
+
+/// The `take` smallest assignments by infohash that sort after `after` and
+/// that `keep` admits, in ascending order.
+///
+/// One pass over the registry holding at most `take` entries, rather than a
+/// copy of all of it sorted for every page: at a hundred thousand torrents
+/// that was a hundred thousand clones and an `n log n` sort to answer a page
+/// of a hundred. The caller asks for one more than a page, so the page
+/// knows whether another follows.
+fn first_after(
+    registry: &torrentd_engine::AssignmentRegistry,
+    after: Option<InfoHash>,
+    take: usize,
+    mut keep: impl FnMut(&InfoHash, &ProfileId) -> bool,
+) -> Vec<(InfoHash, ProfileId)> {
+    use std::collections::BinaryHeap;
+
+    /// Ordered by infohash alone, so the heap's top is the largest kept.
+    struct ByInfohash(InfoHash, ProfileId);
+    impl PartialEq for ByInfohash {
+        fn eq(&self, other: &Self) -> bool {
+            self.0 .0 == other.0 .0
+        }
+    }
+    impl Eq for ByInfohash {}
+    impl PartialOrd for ByInfohash {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for ByInfohash {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            self.0 .0.cmp(&other.0 .0)
+        }
+    }
+
+    if take == 0 {
+        return Vec::new();
+    }
+    let mut kept: BinaryHeap<ByInfohash> = BinaryHeap::with_capacity(take.min(1024) + 1);
+    registry.for_each(|ih, p| {
+        if after.is_some_and(|a| ih.0 <= a.0) {
+            return;
+        }
+        // Already full of smaller ones: this cannot make the page.
+        if kept.len() == take && kept.peek().is_some_and(|top| ih.0 >= top.0 .0) {
+            return;
+        }
+        if !keep(ih, p) {
+            return;
+        }
+        kept.push(ByInfohash(*ih, p.clone()));
+        if kept.len() > take {
+            kept.pop();
+        }
+    });
+    kept.into_sorted_vec()
+        .into_iter()
+        .map(|ByInfohash(ih, p)| (ih, p))
+        .collect()
 }
 
 torrent_error! {
@@ -677,7 +749,16 @@ pub async fn add_torrent(
         }
         Err(TorrentSource::Magnet { uri }) => AddSource::Magnet(uri),
         Err(TorrentSource::ServerPath { path }) => {
-            AddSource::File(read_local_torrent(&s, FsPath::new(&path))?)
+            // Filesystem I/O, up to 64 MiB of it: on the blocking pool, not
+            // on the async worker serving every other request.
+            let state = Arc::clone(&s);
+            let read =
+                tokio::task::spawn_blocking(move || read_local_torrent(&state, FsPath::new(&path)))
+                    .await
+                    .map_err(|e| AddTorrentError::Internal {
+                        detail: internal("reading the server_path .torrent", e),
+                    })?;
+            AddSource::File(read?)
         }
         Err(TorrentSource::Metainfo { .. }) => unreachable!("decoded above"),
     };
@@ -904,15 +985,70 @@ fn read_local_torrent(state: &AppState, path: &FsPath) -> Result<Vec<u8>, AddTor
         ));
     }
 
-    let md = std::fs::symlink_metadata(path).map_err(|_| refused("no such .torrent"))?;
+    // One open, and every check after it made on that descriptor. Checking
+    // the path and then reading it again was two lookups: a symlink or a
+    // larger file swapped in between them was read as if it had passed.
+    // `O_NOFOLLOW` refuses a symlink at the last component, `O_NONBLOCK`
+    // keeps a FIFO from parking a blocking-pool thread in `open`, and the
+    // read is capped whatever the file grows to after `fstat`.
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW | O_NONBLOCK)
+        .open(path)
+        .map_err(|_| refused("no readable .torrent at that path; symlinks are not followed"))?;
+    let md = file
+        .metadata()
+        .map_err(|_| refused("could not read that .torrent"))?;
     if !md.is_file() {
         return Err(refused("the server_path is not a regular file"));
     }
     if md.len() > MAX_TORRENT_FILE_BYTES {
         return Err(refused("`.torrent` file is implausibly large"));
     }
-    std::fs::read(path).map_err(|_| refused("could not read that .torrent"))
+    let mut bytes = Vec::with_capacity(md.len() as usize);
+    file.take(MAX_TORRENT_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| refused("could not read that .torrent"))?;
+    if bytes.len() as u64 > MAX_TORRENT_FILE_BYTES {
+        return Err(refused("`.torrent` file is implausibly large"));
+    }
+    Ok(bytes)
 }
+
+/// `O_NOFOLLOW`, spelled out rather than pulled from a crate for one
+/// constant (as `pool_apply` does `EXDEV`). Linux-only, which the daemon
+/// already is; the value differs by architecture.
+#[cfg(any(
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "m68k",
+    target_arch = "powerpc",
+    target_arch = "powerpc64"
+))]
+const O_NOFOLLOW: i32 = 0x8000;
+#[cfg(not(any(
+    target_arch = "aarch64",
+    target_arch = "arm",
+    target_arch = "m68k",
+    target_arch = "powerpc",
+    target_arch = "powerpc64"
+)))]
+const O_NOFOLLOW: i32 = 0x20000;
+
+/// `O_NONBLOCK`, likewise.
+#[cfg(any(target_arch = "mips", target_arch = "mips64"))]
+const O_NONBLOCK: i32 = 0x80;
+#[cfg(any(target_arch = "sparc", target_arch = "sparc64"))]
+const O_NONBLOCK: i32 = 0x4000;
+#[cfg(not(any(
+    target_arch = "mips",
+    target_arch = "mips64",
+    target_arch = "sparc",
+    target_arch = "sparc64"
+)))]
+const O_NONBLOCK: i32 = 0x800;
 
 // ---------------------------------------------------------------------------
 // Removing
@@ -1479,7 +1615,7 @@ pub struct ListFilesQuery {
     pub cursor: Option<String>,
     /// Files per page, 1 to 1000; 100 when absent.
     #[schema(minimum = 1, maximum = 1000)]
-    pub limit: Option<u32>,
+    pub limit: Option<PageLimit>,
 }
 
 /// The cursor key of file `index`: zero-padded, so the keys sort as the
@@ -1551,7 +1687,7 @@ pub async fn list_torrent_files(
     let page = PageRequest::parse(
         &listing,
         q.cursor.as_deref(),
-        q.limit,
+        q.limit.map(PageLimit::get),
         |key| crate::http::page::is_padded_decimal(key, FILE_KEY_WIDTH),
         &mut invalid,
     )
@@ -2017,6 +2153,41 @@ pub(crate) use add_routes;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_page_is_the_smallest_kept_infohashes_after_the_cursor() {
+        // Against the obvious implementation this replaced: copy, filter,
+        // sort, skip, take.
+        let dir = tempfile::tempdir().unwrap();
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("r.json"));
+        let mut all = Vec::new();
+        for n in 0..60u8 {
+            // Scrambled, so insertion order says nothing about sort order.
+            let ih = InfoHash([n.wrapping_mul(37).wrapping_add(11); 20]);
+            let p = ProfileId::new(if n % 3 == 0 { "a" } else { "b" });
+            reg.assign(ih, p.clone()).unwrap();
+            all.push((ih, p));
+        }
+        all.sort_by_key(|(ih, _)| ih.0);
+        let want_b = ProfileId::new("b");
+        for after in [None, Some(all[0].0), Some(all[29].0), Some(all[59].0)] {
+            for take in [0, 1, 7, 60, 100] {
+                let naive: Vec<_> = all
+                    .iter()
+                    .filter(|(ih, p)| after.is_none_or(|a| ih.0 > a.0) && *p == want_b)
+                    .take(take)
+                    .cloned()
+                    .collect();
+                let got = first_after(&reg, after, take, |_, p| *p == want_b);
+                assert_eq!(
+                    got.iter().map(|(ih, _)| ih.0).collect::<Vec<_>>(),
+                    naive.iter().map(|(ih, _)| ih.0).collect::<Vec<_>>(),
+                    "after {:?}, take {take}",
+                    after.map(|a| a.to_hex()),
+                );
+            }
+        }
+    }
 
     #[test]
     fn the_base64_bound_covers_exactly_a_64_mib_torrent() {

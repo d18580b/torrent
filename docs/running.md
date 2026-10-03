@@ -584,6 +584,15 @@ So there are two safe shapes:
 | loopback | absent, `allow_unauthenticated = true` | access control is the proxy's job |
 | anything | configured | the daemon authenticates itself |
 
+**A proxy in front of an unauthenticated daemon must strip `Authorization`.**
+Without `[auth]` the daemon checks no credential, but it still reads the
+header: one that is not a well-formed `Bearer` credential is answered `401`
+on every operation, because a request carrying a credential nobody checked is
+not an anonymous one. A proxy doing its own HTTP Basic login forwards that
+`Basic` header by default, and every request through it then fails. Drop it
+before forwarding — nginx `proxy_set_header Authorization "";`, Caddy
+`header_up -Authorization`.
+
 And exactly two, so `[auth]` **and** `allow_unauthenticated = true` together is
 refused as well: the flag does nothing once `[auth]` is present, but it is the
 line anyone reads to answer "does this daemon authenticate?", and a stale copy
@@ -640,7 +649,9 @@ already carries `--config /etc/torrentd/torrentd.toml`, so the subcommand is
 the only argument. Paste the output into the mounted config and
 `compose up -d` as usual.
 
-`hash-password` prompts twice when stdin is a TTY, once when piped. `new-token`
+`hash-password` prompts twice, with the terminal's echo off, when stdin is a
+TTY, and reads one line when piped. Ctrl-C at a prompt exits without
+switching echo back on; run `stty echo` to restore it. `new-token`
 prints the **token on stdout** and the **config stanza on stderr**, so
 `new-token … > token.txt` captures only the secret. A static token starts
 with `tdp_`.
@@ -652,8 +663,12 @@ There is no token-only mode: `[auth]` requires `password_hash`. Scopes are
 **Every API call is bearer-authenticated**: `Authorization: Bearer <token>`.
 There are no cookies. The password is exchanged for a session token, which
 starts with `tds_`, carries `read` and `write` — never `metrics` — and lasts
-until it expires (`expires_at` in the response), is revoked with
-`DELETE /v1/sessions/current`, or the daemon restarts.
+until it expires (`expires_at` in the response; `[auth] session_ttl_secs`,
+60 seconds to 30 days, default 12 hours), is revoked with
+`DELETE /v1/sessions/current`, or the daemon restarts. An open
+`GET /v1/events` stream ends within a second of its session doing either.
+Each `[[auth.token]]` needs a name and a token of its own: two entries sharing
+either are refused at startup.
 `GET /v1/sessions/current` describes whichever credential you present. The
 examples on this page call it `$TOKEN`; either kind works:
 
@@ -710,6 +725,8 @@ that is the proxy's address for every request, so the login throttle behaves
 as one shared bucket; on a **directly exposed** daemon it is the real client's
 address, so the throttle keys per source IP — which is the better property,
 because one attacker's failures no longer land in the same bucket as yours.
+An IPv6 client is keyed by its /64, since one host is routinely handed a whole
+/64 and would otherwise hold that many buckets.
 Either way nothing becomes forgeable.
 
 Above the per-client buckets sits one daemon-wide ceiling: at most ten
@@ -832,7 +849,24 @@ The daemon sets none of these itself.
   immediately. The systemd unit sets 65536 and the compose file matches; **a
   bare-metal run outside either gets nothing** and will hit `EMFILE`. The
   daemon warns at boot when the soft limit is below `connections_limit +
-  file_pool_size` per profile plus the API's 10 000-connection cap.
+  file_pool_size` per profile plus the API's 256-connection cap. The
+  HTTP API draws on the same table and holds at most 256 connections; the
+  next waits in the listen backlog. It closes an HTTP/1 connection whose
+  request head takes more than 10 seconds, closes an HTTP/2 connection that
+  stops answering pings for 30 seconds, and answers `408` to a request whose
+  body has not arrived and been answered within 30 seconds (300 for
+  `POST /v1/torrents`). A `408` does not undo what the request already
+  started: an add may still complete (a retry then gets `409`
+  `torrent-exists`; re-read the torrent), and a pool verification's
+  rechecks may still start. **Two idle cases are not bounded:** a connection that
+  sends no byte at all (or stops partway through the HTTP/2 preface), and an
+  HTTP/2 connection that answers pings but sends no request. 256 such sockets
+  hold every API connection, and `/healthz` and `/metrics` stop answering
+  until they close. The default loopback bind keeps them out of reach of
+  anyone who cannot already run code on the host; a non-loopback
+  `http_listen` belongs behind the proxy of §6 with its own client idle
+  timeouts (nginx `client_header_timeout`, Caddy `timeouts.read_header`),
+  which close such a connection before it reaches the daemon.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on
