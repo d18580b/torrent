@@ -769,6 +769,13 @@ async fn adoption_holds_every_torrent_to_the_profiles_tracker_domains() {
             .as_deref(),
         Some("acct")
     );
+    // The three refusals by an adoption are counted with every add path's;
+    // the dry runs, which change nothing, are not.
+    let text = String::from_utf8(h.state.metrics.render()).unwrap();
+    assert!(
+        text.contains("profile_assignment_registry_errors_total{profile_id=\"acct\"} 3"),
+        "{text}"
+    );
 }
 
 #[tokio::test]

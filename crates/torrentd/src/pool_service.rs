@@ -594,9 +594,31 @@ fn unresolved_profile(
     }
 }
 
-/// The reason an adoption the account-isolation guard refused carries.
-fn tracker_refusal(e: &TrackerRefusal) -> String {
-    format!("refused by the profile's allowed_tracker_domains: {e}")
+/// Why [`execute_adopt`] did not adopt a torrent.
+#[derive(Debug)]
+pub struct AdoptRefusal {
+    /// What the response's `refused` entry says.
+    pub reason: String,
+    /// Refused by the account-isolation guard, which the caller counts in
+    /// `profile_assignment_registry_errors_total` as every add path does.
+    pub isolation: bool,
+}
+
+impl From<String> for AdoptRefusal {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            isolation: false,
+        }
+    }
+}
+
+/// The refusal an adoption the account-isolation guard refused carries.
+fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
+    AdoptRefusal {
+        reason: format!("refused by the profile's allowed_tracker_domains: {e}"),
+        isolation: true,
+    }
 }
 
 /// Adopt one torrent: execute whatever `torrentd_pool::adopt::plan` decided.
@@ -619,13 +641,13 @@ pub fn execute_adopt(
     infohash: &str,
     profile: ProfileId,
     dry_run: bool,
-) -> Result<&'static str, String> {
+) -> Result<&'static str, AdoptRefusal> {
     let plan = pool
         .with_store(|s| torrentd_pool::adopt::plan(s, infohash, |id| pool.root_path_of(id)))
         .map_err(|e| e.to_string())?;
 
     match plan {
-        AdoptPlan::Refuse { reason } => Err(reason.to_string()),
+        AdoptPlan::Refuse { reason } => Err(reason.to_string().into()),
         AdoptPlan::FastPath {
             resume_path,
             torrent_path,
@@ -646,7 +668,7 @@ pub fn execute_adopt(
                 .engine_for(&profile)
                 .ok_or_else(|| unresolved_profile(profiles, &profile))?;
             let Some(profile_cfg) = profiles.config(&profile) else {
-                return Err(format!("profile {profile} is not live"));
+                return Err(format!("profile {profile} is not live").into());
             };
             let resume = match std::fs::read(&resume_path) {
                 Ok(b) => b,
@@ -755,9 +777,9 @@ fn enqueue_verify(
     save_path: PathBuf,
     profile: ProfileId,
     dry_run: bool,
-) -> Result<&'static str, String> {
+) -> Result<&'static str, AdoptRefusal> {
     let Some(profile_cfg) = profiles.config(&profile) else {
-        return Err(format!("profile {profile} is not live"));
+        return Err(format!("profile {profile} is not live").into());
     };
     // A profile with no allow-list has nothing to check, and the worker reads
     // the file when it admits the item; one with a list cannot pass the guard
