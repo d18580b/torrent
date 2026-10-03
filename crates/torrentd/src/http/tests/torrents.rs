@@ -542,7 +542,18 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
         .as_str()
         .unwrap()
         .contains("save_path must be inside"));
-    for outside in ["/etc/shadow", "/nonexistent/x.torrent"] {
+    // A missing directory followed by `..`: the non-existent tail used to be
+    // re-appended lexically and read as inside `default_save_path`.
+    let mut body = magnet("p");
+    body["save_path"] = json!(dir.join("nx/../../../etc"));
+    let resp = h.write_json("POST", "/v1/torrents", body).await;
+    assert_problem(&resp, 422, "path-not-confined");
+    let escaping = dir.join("nx/../../../etc/x.torrent");
+    for outside in [
+        "/etc/shadow",
+        "/nonexistent/x.torrent",
+        escaping.to_str().unwrap(),
+    ] {
         let resp = h
             .write_json(
                 "POST",

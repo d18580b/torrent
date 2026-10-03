@@ -278,7 +278,25 @@ fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, Refused> {
 /// on a filesystem that is not mounted yet from being reported as an escape —
 /// a confusing verdict for an unrelated problem. The case this exists to catch
 /// is a symlink *inside* a root, and there the root necessarily exists.
+///
+/// A candidate carrying any component other than a plain name — `..`, or a
+/// leading `.` — is refused outright, before anything is resolved. The
+/// non-existent tail is re-appended *lexically*, so a `..` in it is never
+/// resolved by the filesystem: `root/nx/../../../etc`, with `nx` absent,
+/// canonicalized `root` and re-appended `nx/../../../etc`, which
+/// `starts_with` then read as inside the root. Every caller hands this an
+/// absolute path built from a root and a relative name, so a traversal
+/// component there is never legitimate.
 pub fn contains(root: &Path, candidate: &Path) -> bool {
+    use std::path::Component;
+    if !candidate.components().all(|c| {
+        matches!(
+            c,
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return false;
+    }
     let Ok(root_real) = root.canonicalize() else {
         return candidate.starts_with(root);
     };
@@ -419,6 +437,32 @@ mod tests {
             resolve_under(&root(), "/etc/cron.d").unwrap(),
             Path::new("/data/pool/etc/cron.d"),
         );
+    }
+
+    /// The escape the lexical re-append allowed: a non-existent directory
+    /// followed by enough `..` to walk out of the root. Nothing past `nx`
+    /// exists, so the tail was appended without being resolved.
+    #[test]
+    fn contains_refuses_a_traversal_through_a_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("torrents");
+        std::fs::create_dir(&root).unwrap();
+
+        for bad in [
+            root.join("nx/../../../etc"),
+            root.join("nx/../.."),
+            root.join(".."),
+            root.join("a/b/../../../outside"),
+            PathBuf::from("./relative"),
+        ] {
+            assert!(!super::contains(&root, &bad), "{bad:?} should be refused");
+        }
+        // A missing root takes the lexical branch, which is refused the same way.
+        let gone = dir.path().join("not-mounted");
+        assert!(!super::contains(&gone, &gone.join("nx/../../etc")));
+
+        assert!(super::contains(&root, &root.join("nx/deeper")));
+        assert!(super::contains(&root, &root.join("..hidden/x")));
     }
 
     #[test]
