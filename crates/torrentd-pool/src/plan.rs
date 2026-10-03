@@ -291,6 +291,50 @@ fn build_delete_orphans(
 /// emptying it is the operator's call.
 pub const TRASH_DIR: &str = ".torrentd-trash";
 
+/// The delete planner's two guards for unresolved payload, as of one read of
+/// the index, for the executor to re-run against each file it is about to
+/// trash.
+///
+/// The plan is a stored record and the index moves under it: a rescan
+/// between building and applying can leave a torrent partial or missing
+/// whose files the plan now holds. The confirm token changes with that
+/// rescan, but an operator who re-reads it and applies gets the same steps,
+/// so the guards have to hold at apply time, not only at plan time.
+#[derive(Debug)]
+pub struct DeleteGuard(Unresolved);
+
+impl DeleteGuard {
+    /// Read the guards for `root_id`, whose path is `root`.
+    pub fn load(store: &PoolStore, root_id: i64, root: &Path) -> Result<Self, PoolError> {
+        unresolved_payload(store, root_id, root).map(Self)
+    }
+
+    /// Why the file at `rel` (root-relative), `size` bytes, must not be
+    /// deleted, or `None` when neither guard holds it.
+    pub fn refusal(&self, rel: &str, size: u64) -> Option<String> {
+        if let Some((ih, area)) = self
+            .0
+            .areas
+            .iter()
+            .find(|(_, area)| prefixes_overlap(rel, area))
+        {
+            return Some(format!(
+                "torrent {ih} is not fully present and expects its payload under {:?}, where \
+                 this file is; rescan, or remove it from the library, and rebuild the plan",
+                if area.is_empty() { "/" } else { area.as_str() },
+            ));
+        }
+        if self.0.sizes.contains(&size) {
+            return Some(
+                "it has the size of a file a torrent in the library has not found, so it is \
+                 not provably unwanted; rebuild the plan"
+                    .to_owned(),
+            );
+        }
+        None
+    }
+}
+
 /// What the library is still looking for and has not found.
 #[derive(Debug, Default)]
 struct Unresolved {

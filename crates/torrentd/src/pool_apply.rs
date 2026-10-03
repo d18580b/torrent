@@ -179,6 +179,7 @@ fn apply_inner(
     // precondition is re-established whenever the loaded set changes. `len()`
     // is O(1); the full check only runs when it has actually moved.
     let mut loaded_len = state.len();
+    let mut guards = DeleteGuards::default();
 
     for step in steps {
         if step.status == step_status::DONE {
@@ -247,9 +248,8 @@ fn apply_inner(
                 Path::new(step.dst.as_deref().unwrap_or("")),
             )
             .map_err(StepFailure::Failed),
-            ops::DELETE_FILE => {
-                delete_file(pool, Path::new(&step.src), plan_id).map_err(StepFailure::Failed)
-            }
+            ops::DELETE_FILE => delete_file(pool, Path::new(&step.src), plan_id, &mut guards)
+                .map_err(StepFailure::Failed),
             other => Err(StepFailure::Failed(format!(
                 "unknown plan operation {other:?}"
             ))),
@@ -637,6 +637,11 @@ fn sync_parents(paths: &[&Path]) -> Result<(), String> {
 ///    inode, device)` match is the same evidence `drift` trusts; anything
 ///    else means the bytes changed after the scan decided they were
 ///    expendable.
+/// 4. No torrent the index *now* holds as partial, missing or overlapping
+///    expects its payload where the file is, or is missing a file of its
+///    size — the planner's guards ([`torrentd_pool::plan::DeleteGuard`]),
+///    re-read whenever the index generation moves, since a rescan after the
+///    plan was built can make a torrent partial over these very files.
 ///
 /// The path is walked from the root one directory at a time with
 /// `O_NOFOLLOW`, so a directory swapped for a symlink after planning stops the
@@ -645,7 +650,12 @@ fn sync_parents(paths: &[&Path]) -> Result<(), String> {
 /// It is moved — `renameat2(RENAME_NOREPLACE)` — into
 /// `<root>/.torrentd-trash/<plan id>/`, never unlinked, and both directories
 /// are fsynced so the move survives a crash.
-fn delete_file(pool: &PoolService, path: &Path, plan_id: i64) -> Result<(), String> {
+fn delete_file(
+    pool: &PoolService,
+    path: &Path,
+    plan_id: i64,
+    guards: &mut DeleteGuards,
+) -> Result<(), String> {
     let Some((root_id, root, rel)) = pool.roots().iter().find_map(|(id, root)| {
         path.strip_prefix(root)
             .ok()
@@ -675,6 +685,9 @@ fn delete_file(pool: &PoolService, path: &Path, plan_id: i64) -> Result<(), Stri
     };
     if !still_orphan {
         return Err(format!("{} is now claimed by a torrent", path.display(),));
+    }
+    if let Some(why) = guards.refusal(pool, root_id, &root, &rel, row.size)? {
+        return Err(format!("{}: {why}", path.display()));
     }
 
     let (dirs, name) = match rel.rsplit_once('/') {
@@ -724,6 +737,42 @@ fn delete_file(pool: &PoolService, path: &Path, plan_id: i64) -> Result<(), Stri
         "moved to the trash",
     );
     Ok(())
+}
+
+/// The planner's unresolved-payload guards, per root, as of one index
+/// generation. Read on first use and again whenever a rescan moves the
+/// generation, so a delete plan over many files reads them once per root
+/// rather than once per file.
+#[derive(Default)]
+struct DeleteGuards {
+    generation: Option<i64>,
+    by_root: std::collections::HashMap<i64, torrentd_pool::plan::DeleteGuard>,
+}
+
+impl DeleteGuards {
+    fn refusal(
+        &mut self,
+        pool: &PoolService,
+        root_id: i64,
+        root: &Path,
+        rel: &str,
+        size: u64,
+    ) -> Result<Option<String>, String> {
+        let generation = pool
+            .with_store(|s| s.index_generation())
+            .map_err(|e| e.to_string())?;
+        if self.generation != Some(generation) {
+            self.by_root.clear();
+            self.generation = Some(generation);
+        }
+        if !self.by_root.contains_key(&root_id) {
+            let guard = pool
+                .with_store(|s| torrentd_pool::plan::DeleteGuard::load(s, root_id, root))
+                .map_err(|e| e.to_string())?;
+            self.by_root.insert(root_id, guard);
+        }
+        Ok(self.by_root[&root_id].refusal(rel, size))
+    }
 }
 
 /// Directory-relative filesystem calls the delete step is made of.
@@ -1166,6 +1215,121 @@ mod tests {
         assert_eq!(status, torrentd_pool::model::plan_status::DRAFT);
     }
 
+    /// Index a torrent straight into the pool and re-match, as a rescan that
+    /// found a new `.torrent` in the library would.
+    fn add_and_rematch(
+        pool: &PoolService,
+        ih: &str,
+        name: &str,
+        save_path: Option<&Path>,
+        files: &[(&str, u64)],
+    ) {
+        pool.with_store_mut(|st| {
+            st.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.to_owned(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: name.to_owned(),
+                    total_size: files.iter().map(|(_, s)| s).sum(),
+                    num_files: files.len(),
+                    source_path: format!("/library/{ih}.torrent").into(),
+                    fastresume_path: None,
+                    declared_save_path: save_path.map(|p| p.to_string_lossy().into_owned()),
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )
+            .unwrap();
+            let rows: Vec<_> = files
+                .iter()
+                .enumerate()
+                .map(|(i, (p, s))| torrentd_pool::model::TorrentFileRow {
+                    infohash: ih.to_owned(),
+                    idx: i as i64,
+                    rel_path: (*p).to_owned(),
+                    size: *s,
+                    pieces_root: None,
+                    pad_file: false,
+                })
+                .collect();
+            st.replace_torrent_files(ih, &rows).unwrap();
+            torrentd_pool::match_all(st).unwrap();
+        });
+    }
+
+    /// The planner's unresolved-payload guards hold at apply time too. A
+    /// rescan between building and applying that leaves a torrent partial
+    /// over the plan's files, or missing a file of one's size, stops those
+    /// steps: an operator re-reading the changed confirm token still applies
+    /// the same steps.
+    #[test]
+    fn applying_re_runs_the_unresolved_payload_guards() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        // Ordered first under `junk`, so it is the step the guard meets.
+        let near = write(&root, "junk/T/0.nfo", 7);
+        write(&root, "junk/T/a.bin", 100);
+        let lookalike = write(&root, "loose/maybe.mkv", 4321);
+        write(&root, "loose/really-junk.txt", 9);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let under_junk = delete_plan_under(&pool, "junk");
+        let under_loose = delete_plan_under(&pool, "loose");
+
+        // T is placed under `junk/` with `b.bin` not found: partial, and
+        // expecting its payload under `junk/T`. M is missing a 4321-byte file.
+        add_and_rematch(
+            &pool,
+            "aa",
+            "T",
+            Some(&root.join("junk")),
+            &[("T/a.bin", 100), ("T/b.bin", 300)],
+        );
+        add_and_rematch(&pool, "bb", "M", None, &[("M/film.mkv", 4321)]);
+        assert_eq!(
+            pool.with_store(|st| st.adoption_state("aa")).unwrap(),
+            Some(AdoptionState::Partial),
+        );
+
+        let (source, state) = engine_and_state();
+        for (plan_id, file, expect) in [
+            (under_junk, &near, "torrent aa"),
+            (under_loose, &lookalike, "size"),
+        ] {
+            let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+            assert_eq!((out.done, out.status.as_str()), (0, "failed"), "{out:?}");
+            assert!(file.exists());
+            let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+            assert_eq!(Path::new(&steps[0].src), file.as_path());
+            let why = steps[0].error.clone().unwrap_or_default();
+            assert!(why.contains(expect), "{why}");
+        }
+    }
+
+    /// Build a `delete_orphans` plan under `prefix`.
+    fn delete_plan_under(pool: &PoolService, prefix: &str) -> i64 {
+        let root_id = pool.roots()[0].0;
+        let spec = torrentd_pool::plan::PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: prefix.to_owned(),
+        };
+        let steps = pool
+            .with_store(|st| torrentd_pool::plan::build(st, &spec, |id| pool.root_path_of(id)))
+            .unwrap()
+            .expect("plan builds");
+        let id = pool
+            .with_store(|st| st.create_plan("delete_orphans", "{}", 0))
+            .unwrap();
+        pool.with_store_mut(|st| st.add_plan_steps(id, &steps))
+            .unwrap();
+        id
+    }
+
     #[test]
     fn a_plan_interrupted_mid_step_can_still_be_resumed_and_discarded() {
         // A crash leaves a step `in_progress` and the plan `applying`. The
@@ -1478,7 +1642,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&f, vec![9u8; 48]).unwrap();
 
-        let e = delete_file(&pool, &f, 1).unwrap_err();
+        let e = delete_file(&pool, &f, 1, &mut Default::default()).unwrap_err();
         assert!(e.contains("changed since the scan"), "got {e}");
         assert!(f.exists());
     }
@@ -1493,19 +1657,19 @@ mod tests {
         pool.scan().unwrap();
 
         let sneaked = write(&root, "after/the/scan.bin", 8);
-        let e = delete_file(&pool, &sneaked, 1).unwrap_err();
+        let e = delete_file(&pool, &sneaked, 1, &mut Default::default()).unwrap_err();
         assert!(e.contains("never sanctioned"), "got {e}");
         assert!(sneaked.exists());
 
         let outside = dir.path().join("elsewhere.bin");
         std::fs::write(&outside, b"x").unwrap();
-        let e = delete_file(&pool, &outside, 1).unwrap_err();
+        let e = delete_file(&pool, &outside, 1, &mut Default::default()).unwrap_err();
         assert!(e.contains("outside every managed root"), "got {e}");
         assert!(outside.exists());
 
         // A traversal component walks back out of the root once resolved.
         let escaping = root.join("misc/../../elsewhere.bin");
-        let e = delete_file(&pool, &escaping, 1).unwrap_err();
+        let e = delete_file(&pool, &escaping, 1, &mut Default::default()).unwrap_err();
         assert!(e.contains("outside every managed root"), "got {e}");
         assert!(outside.exists());
     }
@@ -1572,7 +1736,7 @@ mod tests {
 
         let pool = service(dir.path(), true);
         pool.scan().unwrap();
-        delete_file(&pool, &f, 42).unwrap();
+        delete_file(&pool, &f, 42, &mut Default::default()).unwrap();
 
         assert!(!f.exists());
         let trashed = root.join(".torrentd-trash/42/misc/old.bin");
@@ -1605,7 +1769,7 @@ mod tests {
         std::fs::rename(root.join("misc"), dir.path().join("moved-away")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("misc")).unwrap();
 
-        assert!(delete_file(&pool, &f, 1).is_err());
+        assert!(delete_file(&pool, &f, 1, &mut Default::default()).is_err());
         assert!(outside.join("victim.bin").exists());
     }
 }
