@@ -386,6 +386,96 @@
       "targets": [
         { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (profile_id, reason) (increase(torrentd_profile_vpn_fenced_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval]))", "legendFormat": "{{profile_id}} {{reason}}" }
       ]
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Port-forward failures by stage",
+      "description": "NAT-PMP attempts that failed: renew when the gateway did not answer or refused the lease (provider side, TorrentdPortForwardRenewFailed), rebind when it named a new port the session could not be rebound to (local side, TorrentdPortForwardRebindFailed). natpmp profiles only.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 68 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (profile_id, stage) (increase(torrentd_profile_port_forward_failures_total{instance=~\"$instance\", profile_id=~\"$profile_id\"}[$__rate_interval]))", "legendFormat": "{{profile_id}} {{stage}}" }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "Kill switch table",
+      "description": "Installed is the daemon's own record that it holds the nftables kill switch; present is what the last `nft list tables` found. Installed without present is TorrentdKillSwitchGone: egress is no longer confined to the tunnels. Probe errors are checks that could not list the tables at all (TorrentdKillSwitchUnverifiable). Present is exported only with the kill switch on.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_kill_switch_active{instance=~\"$instance\"}", "legendFormat": "{{instance}} installed" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_kill_switch_table_present{instance=~\"$instance\"}", "legendFormat": "{{instance}} table present" },
+        { "refId": "C", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "increase(torrentd_kill_switch_probe_errors_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} probe errors" }
+      ]
+    },
+    {
+      "id": 29,
+      "type": "row",
+      "title": "Pool",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 76 },
+      "panels": []
+    },
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Verify queue",
+      "description": "Adoptions waiting to verify, and verifying now. A queue that holds work while nothing finishes is TorrentdPoolVerifyStuck. Exported only with [pool] configured.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 77 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_pool_verify_queue_depth{instance=~\"$instance\"}", "legendFormat": "{{instance}} queued" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_pool_verify_in_flight{instance=~\"$instance\"}", "legendFormat": "{{instance}} in flight" }
+      ]
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Verifications finished",
+      "description": "Adopted torrents that verified and are seeding, and those whose verification failed or was dropped (TorrentdPoolVerifyFailed).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 77 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "increase(torrentd_pool_verify_completed_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} verified" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "increase(torrentd_pool_verify_failed_total{instance=~\"$instance\"}[$__rate_interval])", "legendFormat": "{{instance}} failed" }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Pool scan errors by kind",
+      "description": "Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or unparseable .torrent files (TorrentdPoolScanErrors).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 85 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (instance, kind) (increase(torrentd_pool_scan_errors_total{instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{instance}} {{kind}}" }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Pool plan failures by kind",
+      "description": "Pool plans that stopped: a step failed, the index stopped accounting for what is loaded, or re-driving an interrupted plan failed (TorrentdPoolPlanFailed).",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 85 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },
+      "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "targets": [
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "sum by (instance, kind) (increase(torrentd_pool_plan_failures_total{instance=~\"$instance\"}[$__rate_interval]))", "legendFormat": "{{instance}} {{kind}}" }
+      ]
     }
   ]
 }

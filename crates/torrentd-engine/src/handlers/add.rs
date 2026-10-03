@@ -56,6 +56,12 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             let _enter = ctx.span.enter();
             if let Some(ih) = hdr.infohash {
                 ctx.state.remove(&ih);
+                // Settle a save that was in flight when the torrent went: its
+                // answer arrives with no info-hash (the shim skips an invalid
+                // handle), so `resume::handle` cannot settle it, and the drain
+                // would wait out its deadline on it while it held a cap slot.
+                // A queued one is dropped at dispatch, which finds no state.
+                ctx.state.note_resume_settled(&ih);
                 // Delete persisted state so a removed torrent doesn't
                 // resurrect from disk on the next startup scan. This fires
                 // after libtorrent has fully removed the torrent, so it can't
@@ -162,5 +168,72 @@ mod tests {
         assert!(!state.contains(&ih));
         assert!(resume.snapshot(&profile).is_empty());
         assert!(torrents.load_all(&profile).unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_torrent_settles_its_in_flight_save() {
+        use libtorrent_safe::ResumeFlags;
+
+        use crate::handlers::resume;
+
+        let ih = InfoHash([0x78; 20]);
+        let profile = ProfileId::new("p");
+        let state = StateMap::new();
+        let resume_store = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = NoopSink;
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let th = TorrentHandle {
+            id: 1,
+            infohash: ih,
+        };
+        state.insert(
+            ih,
+            TorrentState::newly_added(th, profile.clone(), clock.now()),
+        );
+        assert!(state.queue_resume_save(ih, ResumeFlags::empty()));
+        assert_eq!(state.dispatch_resume_saves(8).len(), 1);
+        assert_eq!(state.resume_saves_in_flight(), 1);
+
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume_store,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_id: profile.clone(),
+            span: tracing::info_span!("test"),
+        };
+        handle(
+            &Alert::TorrentRemoved {
+                hdr: AlertHeader {
+                    kind: AlertKind::TorrentRemoved,
+                    infohash: Some(ih),
+                    handle: None,
+                    timestamp_us: 0,
+                },
+            },
+            &mut ctx,
+        );
+        // The save's answer for the removed torrent carries no info-hash.
+        resume::handle(
+            &Alert::SaveResumeDataFailed {
+                hdr: AlertHeader {
+                    kind: AlertKind::SaveResumeDataFailed,
+                    infohash: None,
+                    handle: None,
+                    timestamp_us: 0,
+                },
+                error_code: 0,
+                not_modified: false,
+                message: String::new(),
+            },
+            &mut ctx,
+        );
+
+        assert_eq!(state.resume_saves_in_flight(), 0);
+        assert_eq!(state.pending_resume_count(), 0);
     }
 }

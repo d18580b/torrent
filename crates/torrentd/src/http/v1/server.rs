@@ -202,10 +202,10 @@ pub enum ServerEvent {
     },
 }
 
-/// How often to consider emitting a tick. Matches the alert loop's own
+/// How often to consider emitting a tick. The alert loop's own
 /// `post_torrent_updates` cadence: emitting faster cannot surface anything
 /// newer.
-const TICK: Duration = Duration::from_secs(1);
+const TICK: Duration = torrentd_engine::POST_UPDATES_INTERVAL;
 
 /// Minimum gap between ticks actually sent when nothing is changing, so an idle
 /// daemon costs one message every ten seconds per client rather than a busy
@@ -252,9 +252,23 @@ pub async fn stream_events(
         loop {
             // The stream ends with the daemon, so a client that never
             // disconnects cannot hold a graceful shutdown open.
-            tokio::select! {
-                _ = tokio::time::sleep(TICK) => {}
-                _ = shutdown.recv() => break,
+            //
+            // The broadcast alone does not do that for a stream opened *after*
+            // the shutdown was sent — during the drain, on a kept-alive
+            // connection: `subscribe` starts at the channel's tail, so the
+            // send it missed never arrives, and the stream held the drain to
+            // its timeout. The latch is set once the shutdown is seen and
+            // stays set, so it is checked on every pass, the first included.
+            if s.work.is_cancelled() {
+                break;
+            }
+            // The first tick goes out at once, so a client has a fingerprint
+            // to compare against without waiting out a whole cadence.
+            if !first {
+                tokio::select! {
+                    _ = tokio::time::sleep(TICK) => {}
+                    _ = shutdown.recv() => break,
+                }
             }
 
             if let Some(token) = session.as_deref() {

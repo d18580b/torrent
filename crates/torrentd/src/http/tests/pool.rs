@@ -401,6 +401,47 @@ async fn a_drift_check_marks_a_torrent_whose_payload_vanished() {
     assert_eq!(t["items"][0]["infohash"], IH_A);
 }
 
+#[tokio::test]
+async fn a_scan_or_drift_check_holds_the_work_gate_after_its_request_is_gone() {
+    // The teardown waits on the gate for the blocking task, not the request:
+    // a drain that cut the request off, or a client that went away, used to
+    // leave the task running while the sessions it works through closed.
+    use std::time::Duration;
+
+    for path in ["/v1/pool/scan", "/v1/pool/drift-check"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, _) = fixture(dir.path(), false);
+        let held = Arc::clone(&pool);
+        let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+
+        // Block the task on the store, then abandon its request.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            held.with_store(|_| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            });
+        });
+        locked_rx.recv().unwrap();
+        let abandoned =
+            tokio::time::timeout(Duration::from_millis(300), h.write("POST", path)).await;
+        assert!(abandoned.is_err(), "{path} finished with the store held");
+        assert_eq!(
+            h.state.work.in_flight(),
+            1,
+            "{path}'s blocking task no longer counts once its request is gone",
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(
+            h.state.work.wait_idle(Duration::from_secs(10)).await,
+            "{path} released the gate when its task finished",
+        );
+    }
+}
+
 fn adopt(profile_id: &str, dry_run: bool, selector: Value) -> Option<Value> {
     Some(json!({"profile_id": profile_id, "dry_run": dry_run, "selector": selector}))
 }

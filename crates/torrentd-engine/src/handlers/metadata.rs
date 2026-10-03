@@ -31,7 +31,10 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     torrent.extend_from_slice(info_section);
     torrent.push(b'e');
 
-    match ctx.torrents.write(&ctx.profile_id, &ih, &torrent) {
+    // Batched: this runs on the alert loop, which must not wait on the disk.
+    // A failure the writer meets later is counted by the store's error hook
+    // under the same series.
+    match ctx.torrents.write_batched(&ctx.profile_id, &ih, &torrent) {
         Ok(()) => debug!(
             target: "torrentd_engine::handler::metadata",
             infohash = %ih,

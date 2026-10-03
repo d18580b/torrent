@@ -12,30 +12,57 @@
 //! own. Two profiles' torrents are therefore never co-mingled.
 
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 
 use dashmap::DashMap;
 use libtorrent_safe::InfoHash;
 use thiserror::Error;
 use tracing::debug;
-use tracing::warn;
 
+use crate::batch_writer::remove_if_present;
+use crate::batch_writer::write_atomic;
+use crate::batch_writer::BatchWriter;
+use crate::batch_writer::WriteErrorHook;
 use crate::profile::ProfileId;
+use crate::resume_store::scan_dir;
+use crate::resume_store::Scan;
 
 pub trait TorrentStore: Send + Sync + std::fmt::Debug {
-    /// Load every `.torrent` file owned by `profile`, returning
+    /// Scan every `.torrent` file owned by `profile`, as
     /// `(infohash-from-filename, raw bytes)`. Files whose name isn't a
-    /// 40-char hex info-hash are skipped with a warning.
-    fn load_all(&self, profile: &ProfileId) -> Result<Vec<(InfoHash, Vec<u8>)>, TorrentStoreError>;
+    /// 40-char hex info-hash are skipped with a warning; files that are
+    /// named as one and cannot be read are skipped, logged and counted.
+    fn scan(&self, profile: &ProfileId) -> Result<Scan<Vec<u8>>, TorrentStoreError>;
 
-    /// Atomically replace the `.torrent` file for `(profile, ih)` with `data`.
+    /// [`TorrentStore::scan`]'s entries alone.
+    fn load_all(&self, profile: &ProfileId) -> Result<Vec<(InfoHash, Vec<u8>)>, TorrentStoreError> {
+        self.scan(profile).map(|s| s.entries)
+    }
+
+    /// Atomically replace the `.torrent` file for `(profile, ih)` with `data`,
+    /// durably, before returning.
     fn write(
         &self,
         profile: &ProfileId,
         ih: &InfoHash,
         data: &[u8],
     ) -> Result<(), TorrentStoreError>;
+
+    /// Replace the `.torrent` file for `(profile, ih)` with `data`, possibly
+    /// later, from another thread; what the alert loop calls. A store with no
+    /// writer of its own writes at once. [`TorrentStore::read`] and
+    /// [`TorrentStore::exists`] see the bytes from the moment this returns.
+    fn write_batched(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        data: &[u8],
+    ) -> Result<(), TorrentStoreError> {
+        self.write(profile, ih, data)
+    }
+
+    /// Return once every batched write accepted so far is durable.
+    fn flush(&self) {}
 
     /// Delete the `.torrent` file for `(profile, ih)`. Missing files are not an
     /// error.
@@ -78,6 +105,8 @@ pub struct FsTorrentStore {
     /// asked for, and matched only by coincidence when the configured path
     /// happened to equal the derived one.
     overrides: std::collections::HashMap<ProfileId, PathBuf>,
+    /// Where `write_batched` queues, when set; otherwise it writes at once.
+    writer: Option<BatchWriter>,
 }
 
 impl FsTorrentStore {
@@ -85,7 +114,15 @@ impl FsTorrentStore {
         Self {
             base: base.into(),
             overrides: std::collections::HashMap::new(),
+            writer: None,
         }
+    }
+
+    /// Queue `write_batched` onto a writer thread of the store's own, which
+    /// reports each failure to `on_error`.
+    pub fn with_batched_writes(mut self, on_error: Option<WriteErrorHook>) -> Self {
+        self.writer = Some(BatchWriter::spawn("torrentd-torrent-writer", on_error));
+        self
     }
 
     /// Pin `profile` to an explicit directory rather than the derived one.
@@ -111,32 +148,15 @@ impl FsTorrentStore {
 }
 
 impl TorrentStore for FsTorrentStore {
-    fn load_all(&self, profile: &ProfileId) -> Result<Vec<(InfoHash, Vec<u8>)>, TorrentStoreError> {
-        let dir = self.dir_for(profile);
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut out = Vec::new();
-        for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            let Some(stem) = name.strip_suffix(".torrent") else {
-                continue;
-            };
-            match InfoHash::from_hex(stem) {
-                Some(ih) => out.push((ih, fs::read(&path)?)),
-                None => warn!(
-                    target: "torrentd_engine::torrent_store",
-                    profile_id = %profile,
-                    file = %path.display(),
-                    "skipping torrent file with invalid name",
-                ),
-            }
-        }
-        Ok(out)
+    fn scan(&self, profile: &ProfileId) -> Result<Scan<Vec<u8>>, TorrentStoreError> {
+        // Whatever is still queued lands first, so the scan reads the newest.
+        self.flush();
+        Ok(scan_dir(
+            &self.dir_for(profile),
+            ".torrent",
+            profile,
+            "torrent",
+        )?)
     }
 
     fn write(
@@ -145,25 +165,12 @@ impl TorrentStore for FsTorrentStore {
         ih: &InfoHash,
         data: &[u8],
     ) -> Result<(), TorrentStoreError> {
-        let dir = self.dir_for(profile);
-        fs::create_dir_all(&dir)?;
-        let final_path = self.path_for(profile, ih);
-        let tmp_path = dir.join(format!("{}.torrent.tmp", ih.to_hex()));
-
-        // Atomic write: temp file → fsync(file) → rename, same as the resume
-        // store.
-        {
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .open(&tmp_path)?;
-            f.write_all(data)?;
-            f.sync_all()?;
-        }
-        fs::rename(&tmp_path, &final_path)?;
-        if let Ok(d) = fs::File::open(&dir) {
-            let _ = d.sync_all();
+        // Atomic write: temp file → fsync(file) → rename → fsync(dir), same
+        // as the resume store.
+        let path = self.path_for(profile, ih);
+        match &self.writer {
+            Some(w) => w.write_now(&path, data)?,
+            None => write_atomic(&path, data)?,
         }
         debug!(
             target: "torrentd_engine::torrent_store",
@@ -175,16 +182,42 @@ impl TorrentStore for FsTorrentStore {
         Ok(())
     }
 
-    fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError> {
-        match fs::remove_file(self.path_for(profile, ih)) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+    fn write_batched(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        data: &[u8],
+    ) -> Result<(), TorrentStoreError> {
+        match &self.writer {
+            Some(w) => {
+                w.enqueue(self.path_for(profile, ih), profile, ih, data);
+                Ok(())
+            }
+            None => self.write(profile, ih, data),
         }
     }
 
+    fn flush(&self) {
+        if let Some(w) = &self.writer {
+            w.flush();
+        }
+    }
+
+    fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError> {
+        let path = self.path_for(profile, ih);
+        match &self.writer {
+            Some(w) => w.delete_now(&path)?,
+            None => remove_if_present(&path)?,
+        }
+        Ok(())
+    }
+
     fn exists(&self, profile: &ProfileId, ih: &InfoHash) -> bool {
-        self.path_for(profile, ih).exists()
+        let path = self.path_for(profile, ih);
+        self.writer
+            .as_ref()
+            .is_some_and(|w| w.pending(&path).is_some())
+            || path.exists()
     }
 
     fn read(
@@ -192,7 +225,11 @@ impl TorrentStore for FsTorrentStore {
         profile: &ProfileId,
         ih: &InfoHash,
     ) -> Result<Option<Vec<u8>>, TorrentStoreError> {
-        match fs::read(self.path_for(profile, ih)) {
+        let path = self.path_for(profile, ih);
+        if let Some(queued) = self.writer.as_ref().and_then(|w| w.pending(&path)) {
+            return Ok(Some(queued.to_vec()));
+        }
+        match fs::read(&path) {
             Ok(b) => Ok(Some(b)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
@@ -223,13 +260,16 @@ impl MemoryTorrentStore {
 }
 
 impl TorrentStore for MemoryTorrentStore {
-    fn load_all(&self, profile: &ProfileId) -> Result<Vec<(InfoHash, Vec<u8>)>, TorrentStoreError> {
-        Ok(self
-            .inner
-            .iter()
-            .filter(|e| e.key().0 == *profile)
-            .map(|e| (e.key().1, e.value().clone()))
-            .collect())
+    fn scan(&self, profile: &ProfileId) -> Result<Scan<Vec<u8>>, TorrentStoreError> {
+        Ok(Scan {
+            entries: self
+                .inner
+                .iter()
+                .filter(|e| e.key().0 == *profile)
+                .map(|e| (e.key().1, e.value().clone()))
+                .collect(),
+            unreadable: 0,
+        })
     }
 
     fn write(
@@ -299,6 +339,40 @@ mod tests {
         assert_eq!(
             store.read(&profile, &ih).unwrap().as_deref(),
             Some(&b"payload"[..])
+        );
+    }
+
+    #[test]
+    fn one_unreadable_torrent_file_is_skipped_and_counted_not_fatal() {
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path());
+        let profile = ProfileId::new("p");
+        let good = InfoHash([0x01u8; 20]);
+        store.write(&profile, &good, b"t").unwrap();
+        std::fs::create_dir(store.path_for(&profile, &InfoHash([0x02u8; 20]))).unwrap();
+        let scan = store.scan(&profile).unwrap();
+        assert_eq!(scan.unreadable, 1);
+        assert_eq!(scan.entries, vec![(good, b"t".to_vec())]);
+    }
+
+    #[test]
+    fn a_batched_torrent_is_readable_before_it_lands() {
+        // The resume-add path reads the `.torrent` back to re-attach
+        // metadata; a write still in the queue must not read as missing.
+        let dir = tempdir().unwrap();
+        let store = FsTorrentStore::new(dir.path()).with_batched_writes(None);
+        let profile = ProfileId::new("p");
+        let ih = InfoHash([0x03u8; 20]);
+        store.write_batched(&profile, &ih, b"meta").unwrap();
+        assert!(store.exists(&profile, &ih));
+        assert_eq!(
+            store.read(&profile, &ih).unwrap().as_deref(),
+            Some(&b"meta"[..])
+        );
+        store.flush();
+        assert_eq!(
+            std::fs::read(store.path_for(&profile, &ih)).unwrap(),
+            b"meta"
         );
     }
 

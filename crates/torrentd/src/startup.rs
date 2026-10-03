@@ -107,6 +107,20 @@ const HTTP2_KEEP_ALIVE: kynos::server::protocol::Http2KeepAlive =
         timeout: std::time::Duration::from_secs(10),
     };
 
+/// How long the HTTP server's graceful shutdown waits for open requests
+/// before cutting them off. A drain that runs out exits 0 with a warning
+/// (`http_exit_code`).
+///
+/// One stage of the stop budget `deploy/torrentd.service` sizes
+/// `TimeoutStopSec` to: this, then [`POOL_WORK_DRAIN`], then the resume
+/// drain (`shutdown_drain_secs`), then the network teardown.
+const HTTP_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the teardown waits for pool work — a scan, a drift check, an
+/// apply finishing its current step — before stopping the alert loop around
+/// it. See `WorkGate`.
+const POOL_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// An exclusive `flock` on [`Config::instance_lock_path`], held for the life
 /// of the daemon.
 ///
@@ -210,6 +224,11 @@ struct BootCleanup {
     /// `wg-quick` or `kill`; production always passes `vpn::for_type`.
     vpn_for: VpnFactory,
     tunnels: Vec<(torrentd_engine::VpnType, String)>,
+    /// Every session boot built, closed before any tunnel goes. Dropping
+    /// `boot`'s own handles does not destroy them once the port-forward
+    /// monitor holds the registry, and a session outliving its tunnel is
+    /// sockets bound to an address whose route is about to disappear.
+    sessions: Vec<Arc<dyn TorrentEngine>>,
     kill_switch: bool,
     armed: bool,
 }
@@ -226,6 +245,7 @@ impl std::fmt::Debug for BootCleanup {
         f.debug_struct("BootCleanup")
             .field("run_dir", &self.run_dir)
             .field("tunnels", &self.tunnels)
+            .field("sessions", &self.sessions.len())
             .field("kill_switch", &self.kill_switch)
             .field("armed", &self.armed)
             .finish_non_exhaustive()
@@ -242,6 +262,7 @@ impl BootCleanup {
             run_dir,
             vpn_for,
             tunnels: Vec::new(),
+            sessions: Vec::new(),
             kill_switch: false,
             armed: true,
         }
@@ -257,6 +278,12 @@ impl BootCleanup {
 
     fn note_kill_switch(&mut self) {
         self.kill_switch = true;
+    }
+
+    /// Record the sessions boot built, for the drop guard to close before it
+    /// takes any tunnel down.
+    fn note_sessions(&mut self, sessions: impl IntoIterator<Item = Arc<dyn TorrentEngine>>) {
+        self.sessions.extend(sessions);
     }
 
     /// Bring one tunnel down and stop tracking it — for a profile that failed
@@ -413,12 +440,22 @@ impl Drop for BootCleanup {
         if !self.armed {
             return;
         }
-        if self.kill_switch {
-            finish_boot_kill_switch_removal(&self.run_dir, crate::vpn::killswitch::disable());
+        // Sessions, then tunnels, then the kill switch, as on a clean
+        // shutdown (`teardown_network`). The sessions go first because a
+        // session left open while its tunnel goes keeps sockets bound to an
+        // address whose route is disappearing; the switch goes last because
+        // it is what confines the uid to the tunnels while they go, and
+        // removing it first opened the host's own interface to anything
+        // still bound for one.
+        for session in std::mem::take(&mut self.sessions) {
+            session.close();
         }
         for (t, iface) in std::mem::take(&mut self.tunnels) {
             warn!(vpn_iface = %iface, "boot failed: bringing tunnel down");
             (self.vpn_for)(t, &self.run_dir).bring_down(&iface);
+        }
+        if self.kill_switch {
+            finish_boot_kill_switch_removal(&self.run_dir, crate::vpn::killswitch::disable());
         }
     }
 }
@@ -456,6 +493,131 @@ fn boot_shutdown_receivers(
     broadcast::Receiver<ShutdownReason>,
 ) {
     (tx.subscribe(), tx.subscribe())
+}
+
+/// Marks a boot failure as the configuration's: `main` exits `EX_CONFIG` (78)
+/// for it, which the unit's `RestartPreventExitStatus=78` does not restart,
+/// rather than 70, which it does. Only for what no restart can change — a
+/// tunnel that failed to come up is not one.
+#[derive(Debug)]
+pub struct ConfigRefused;
+
+impl std::fmt::Display for ConfigRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the configuration is refused")
+    }
+}
+
+/// Wrap `e` as a [`ConfigRefused`].
+fn refused(e: anyhow::Error) -> anyhow::Error {
+    e.context(ConfigRefused)
+}
+
+/// Whether a boot failure is a [`ConfigRefused`].
+pub fn is_config_refusal(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ConfigRefused>().is_some()
+}
+
+/// The longest boot `EXTEND_TIMEOUT_USEC` keeps alive. Past this a boot is
+/// treated as wedged, and systemd's own start timeout fires from the last
+/// extension.
+const BOOT_EXTEND_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// What the teardown after the resume drain is given: closing the sessions,
+/// the tunnels (up to 7 s an OpenVPN profile, in parallel), the kill switch.
+const TEARDOWN_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Every descriptor the daemon may hold at once, against `RLIMIT_NOFILE`.
+///
+/// Each session may open `connections_limit` peer sockets and keep
+/// `file_pool_size` payload files open, and the API accepts up to
+/// [`HTTP_MAX_CONNECTIONS`]. A soft limit below their sum is a daemon that seeds until
+/// the pool grows and then fails `accept` and `open` with `EMFILE` — in
+/// libtorrent's logs, as disk and peer errors, far from the cause. The values
+/// are the effective ones: `Settings::server_seed_overrides` sets both, and
+/// the config's keys override that.
+fn warn_if_descriptors_are_short(cfg: &Config) {
+    let need = descriptors_needed(cfg);
+    match nofile_soft_limit() {
+        Some(limit) if limit < need => warn!(
+            rlimit_nofile = limit,
+            needed = need,
+            "the open-file limit is below what the daemon may hold at once \
+             (connections_limit + file_pool_size per profile, plus the HTTP \
+             connection cap); raise LimitNOFILE or lower those keys, or peers, \
+             payload files and API clients will fail with EMFILE under load",
+        ),
+        Some(_) => {}
+        None => warn!("could not read RLIMIT_NOFILE; the open-file limit is unchecked"),
+    }
+}
+
+/// `connections_limit + file_pool_size` per configured profile, plus the
+/// HTTP connection cap.
+fn descriptors_needed(cfg: &Config) -> u64 {
+    let s = cfg.libtorrent_settings();
+    let per_session = u64::from(s.connections_limit.unwrap_or_default())
+        + u64::from(s.file_pool_size.unwrap_or_default());
+    per_session * cfg.profile.len() as u64 + http_connection_cap()
+}
+
+/// [`HTTP_MAX_CONNECTIONS`] as a descriptor count.
+fn http_connection_cap() -> u64 {
+    u64::try_from(HTTP_MAX_CONNECTIONS.get()).unwrap_or(u64::MAX)
+}
+
+/// The soft `RLIMIT_NOFILE`, or `None` if it cannot be read.
+fn nofile_soft_limit() -> Option<u64> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `lim` is a valid, writable `rlimit` for the whole call.
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
+    (rc == 0).then_some(lim.rlim_cur)
+}
+
+/// How many entries a boot scan adds between looks at the shutdown receiver.
+/// Cheap enough to check every time; every 256 keeps it out of profiles.
+const SCAN_SHUTDOWN_CHECK_EVERY: usize = 256;
+
+/// The resume store's batch-writer error hook: count the failure as the
+/// handler used to, and mark the torrent's file stale. The handler has
+/// already cleared `needs_save_resume` by then, and libtorrent its modified
+/// bit, so without the mark no `ONLY_IF_MODIFIED` save, the shutdown drain's
+/// included, would ever rewrite it.
+fn resume_write_error_hook(
+    metrics: Arc<dyn MetricsSink>,
+    state: Arc<StateMap>,
+) -> torrentd_engine::WriteErrorHook {
+    Arc::new(
+        move |profile: &ProfileId, ih: &libtorrent_safe::InfoHash, _: &std::io::Error| {
+            metrics.inc_counter(
+                "resume_write_errors_total",
+                &[("profile_id", profile.as_str())],
+            );
+            state.note_resume_write_failed(ih);
+        },
+    )
+}
+
+/// The torrent store's batch-writer error hook. Its one batched writer is the
+/// magnet-metadata handler, so a failure counts under that source.
+fn torrent_write_error_hook(metrics: Arc<dyn MetricsSink>) -> torrentd_engine::WriteErrorHook {
+    Arc::new(
+        move |profile: &ProfileId, _: &libtorrent_safe::InfoHash, _: &std::io::Error| {
+            metrics.inc_counter(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile.as_str()), ("source", "metadata")],
+            );
+        },
+    )
+}
+
+/// Whether a shutdown has been signalled on `rx`. A lagged or closed channel
+/// counts: either means signals went past this receiver unread.
+fn shutdown_requested(rx: &mut broadcast::Receiver<ShutdownReason>) -> bool {
+    !matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty))
 }
 
 /// [`boot_shutdown_receivers`], and then install the signal listener — the
@@ -540,7 +702,7 @@ pub async fn boot(
     // Refusals that are pure functions of the file, before any tunnel is
     // raised: among them a host profile beside `network_kill_switch`, whose
     // egress the ruleset would drop while it reported itself Active.
-    cfg.check_boot_rules()?;
+    cfg.check_boot_rules().map_err(refused)?;
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
@@ -587,6 +749,15 @@ pub async fn boot(
     let (mut boot_shutdown, shutdown_rx) =
         boot_shutdown_receivers_before(&shutdown_tx, || signals::run(channels.clone())).await;
 
+    // Tunnel bring-up (up to 30 s a profile) and the resume and torrent-dir
+    // scans (minutes at 100K torrents) can outrun any fixed
+    // `TimeoutStartSec`. Ask systemd for more time while boot runs — dropped,
+    // and so stopped, when `boot` returns — capped so a wedged boot still
+    // meets the timeout eventually.
+    let _extend_start = sd_notify::TimeoutExtender::start(BOOT_EXTEND_CAP);
+
+    warn_if_descriptors_are_short(&cfg);
+
     // Discard raised-interface records whose interface is no longer standing,
     // before anything can consult one.
     //
@@ -617,28 +788,60 @@ pub async fn boot(
     // nftables table confining a uid that no longer exists, and no daemon.
     let mut cleanup = BootCleanup::new(run_dir.clone());
 
+    // Metrics sink — created before the stores, whose batched writers count
+    // their failures in it, and the startup scans, which record registry
+    // rejections (profile_assignment_registry_errors_total).
+    let metrics = Arc::new(PromSink::new());
+
+    // Empty until the alert loop sees each torrent added. Created before the
+    // stores, because a resume write that fails on the batch writer has to
+    // mark its torrent for a fresh save; and before the port-forward monitor
+    // below, which reannounces whatever it holds by the time a port changes.
+    let state = Arc::new(StateMap::new());
+
     // Resume store — rooted at the top-level `resume_dir` and partitioned by
     // profile id, except where a `[[profile]]` names its own directory. Those keys
     // were validated for uniqueness and then ignored, so files landed under
     // the derived path and only matched the configured one by coincidence.
-    let resume_store: Arc<dyn ResumeStore> = Arc::new(cfg.profile.iter().fold(
-        FsResumeStore::new(cfg.resume_dir.clone()),
-        |st, profile| match &profile.resume_dir {
-            Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
-            None => st,
-        },
-    ));
+    //
+    // The alert loop's writes are batched onto the store's own thread, and a
+    // write that fails there is counted as the handler used to count it. The
+    // handler has already cleared the torrent's `needs_save_resume` by then,
+    // and libtorrent its modified bit, so the hook also marks the file stale:
+    // otherwise no `ONLY_IF_MODIFIED` save, the shutdown drain's included,
+    // would ever rewrite it.
+    let resume_store: Arc<dyn ResumeStore> = Arc::new(
+        cfg.profile
+            .iter()
+            .fold(
+                FsResumeStore::new(cfg.resume_dir.clone()),
+                |st, profile| match &profile.resume_dir {
+                    Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
+                    None => st,
+                },
+            )
+            .with_batched_writes(Some(resume_write_error_hook(
+                metrics.clone(),
+                Arc::clone(&state),
+            ))),
+    );
 
     // Torrent store — same per-profile partitioning as the resume store; holds
     // the raw .torrent files for the startup inventory scan, magnet-metadata
-    // persistence, and removal cleanup.
-    let torrent_store: Arc<dyn TorrentStore> = Arc::new(cfg.profile.iter().fold(
-        FsTorrentStore::new(cfg.torrent_dir.clone()),
-        |st, profile| match &profile.torrent_dir {
-            Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
-            None => st,
-        },
-    ));
+    // persistence, and removal cleanup. Its one batched writer is the
+    // magnet-metadata handler, whose failures it counts under that source.
+    let torrent_store: Arc<dyn TorrentStore> = Arc::new(
+        cfg.profile
+            .iter()
+            .fold(
+                FsTorrentStore::new(cfg.torrent_dir.clone()),
+                |st, profile| match &profile.torrent_dir {
+                    Some(dir) => st.with_profile_dir(profile.id.clone(), dir.clone()),
+                    None => st,
+                },
+            )
+            .with_batched_writes(Some(torrent_write_error_hook(metrics.clone()))),
+    );
 
     // Assignment registry.
     let registry = Arc::new(
@@ -706,20 +909,18 @@ pub async fn boot(
                      because {current} is what the daemon reads from here on)"
                 )
             };
-            anyhow::bail!(
+            // Refused as configuration: no restart changes what the file and
+            // the registry say.
+            return Err(refused(anyhow::anyhow!(
                 "the assignment registry at {source} assigns torrents to profiles that no \
                  [[profile]] table declares: {named}. Configured profiles: {known}. Those \
                  torrents cannot be loaded, re-added or deleted while the mismatch stands. \
                  Either give one of the configured profiles the id the registry names — the \
                  upgrade path from the pre-profiles layout, where every entry says `default` — \
                  or {where_to_edit} and re-add the torrents.",
-            );
+            )));
         }
     }
-
-    // Metrics sink — created early so the startup scans can record registry
-    // rejections (profile_assignment_registry_errors_total).
-    let metrics = Arc::new(PromSink::new());
 
     // One libtorrent session per configured profile. There is no other shape:
     // a deployment with one profile is this with n = 1, not a mode of its own.
@@ -765,14 +966,13 @@ pub async fn boot(
         .iter()
         .map(|e| (e.config.id.clone(), e.engine.clone()))
         .collect();
+    // From here on something outside `boot` (the port-forward monitor below)
+    // holds the sessions, so a failed boot has to close them itself before
+    // its tunnels go.
+    cleanup.note_sessions(source_entries.iter().map(|(_, e)| Arc::clone(e)));
     let profile_registry =
         Arc::new(ProfileRegistry::new(profile_entries).with_failed(failed_profiles));
     let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(source_entries));
-    // Empty until the alert loop sees each torrent added; created here so the
-    // port-forward monitor below can reannounce whatever it holds by the time
-    // a port changes.
-    let state = Arc::new(StateMap::new());
-
     // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
     // live session if the forwarded port changes, and reannounces. Started
     // here, the moment every profile is built, rather than from
@@ -820,12 +1020,13 @@ pub async fn boot(
             // with a startup log line as the only trace.
             //
             // `--check-config` reproduces the configured-set half of this
-            // (`Config::check_boot_rules`), so a config with no vpn profile
-            // fails the systemd pre-flight. This check stays because it reads
+            // (`Config::check_boot_rules`), so an operator's pre-flight run
+            // refuses a config with no vpn profile, and the daemon refuses it
+            // as it loads the config, exiting 78. This check stays because it reads
             // the profiles that actually came up: a config with one vpn
             // profile whose tunnel failed lands here too, and no config check
             // could have known.
-            cfg.check_boot_rules()?;
+            cfg.check_boot_rules().map_err(refused)?;
             anyhow::bail!(
                 "network_kill_switch = true and no configured vpn profile came up, so there is \
                  no tunnel to confine the daemon's egress to. Every profile would keep seeding \
@@ -859,11 +1060,11 @@ pub async fn boot(
     // of entry `DELETE` may clear without a state-map entry to remove.
     let mut loaded: std::collections::HashSet<libtorrent_safe::InfoHash> =
         std::collections::HashSet::new();
-    // What the scans could not load, per profile, as
-    // `(resume_add, torrent_read, torrent_dir_add)`. Exported as gauges once
-    // both have run: these happen before any scrape can, so a counter would
-    // appear already incremented and `increase()` would never see it move.
-    let mut load_failures: std::collections::HashMap<ProfileId, (u64, u64, u64)> =
+    // What the scans could not load, per profile, by the `source` label of
+    // `boot_torrent_load_failures`. Exported as gauges once both have run:
+    // these happen before any scrape can, so a counter would appear already
+    // incremented and `increase()` would never see it move.
+    let mut load_failures: std::collections::HashMap<ProfileId, BootLoadFailures> =
         std::collections::HashMap::new();
 
     // Resume scan: load every saved resume file per profile. The shim
@@ -873,14 +1074,28 @@ pub async fn boot(
         let Some(profile_cfg) = profile_registry.config(&profile) else {
             continue;
         };
-        let entries = resume_store.load_all(&profile).context("scan resume dir")?;
+        // A file that cannot be read is skipped, logged and counted by the
+        // store; only the directory itself failing to open stops the boot.
+        let scan = resume_store.scan(&profile).context("scan resume dir")?;
+        load_failures
+            .entry(profile.clone())
+            .or_default()
+            .resume_file += scan.unreadable;
+        let entries = scan.entries;
         let count = entries.len();
         let mut missing_metadata = 0usize;
         let mut added_from_resume = 0usize;
         let engine = source
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
-        for (ih, data) in entries {
+        for (i, (ih, data)) in entries.into_iter().enumerate() {
+            // A 100K-torrent scan runs for minutes; a SIGTERM during it is
+            // answered now, while `BootCleanup` still owns the tunnels, not
+            // after the scan has added everything only for the drain to save
+            // it all again.
+            if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 && shutdown_requested(&mut boot_shutdown) {
+                anyhow::bail!("shutdown requested during the resume scan");
+            }
             // Cross-check the registry; the spec aborts the profile on
             // mismatch. A resume file under one profile's directory that the
             // registry assigns to another is the operator's to reconcile.
@@ -929,7 +1144,10 @@ pub async fn boot(
                 Err(e) => {
                     warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
                           "could not read .torrent for resume add; continuing without metadata");
-                    load_failures.entry(profile.clone()).or_default().1 += 1;
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_read += 1;
                     None
                 }
             };
@@ -956,7 +1174,7 @@ pub async fn boot(
                 }
                 Err(e) => {
                     warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed");
-                    load_failures.entry(profile.clone()).or_default().0 += 1;
+                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
                 }
             }
         }
@@ -982,14 +1200,20 @@ pub async fn boot(
         let Some(profile_cfg) = profile_registry.config(&profile) else {
             continue;
         };
-        let entries = torrent_store
-            .load_all(&profile)
-            .context("scan torrent dir")?;
+        let scan = torrent_store.scan(&profile).context("scan torrent dir")?;
+        load_failures
+            .entry(profile.clone())
+            .or_default()
+            .torrent_file += scan.unreadable;
+        let entries = scan.entries;
         let engine = source
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
         let mut added = 0usize;
-        for (ih, bytes) in entries {
+        for (i, (ih, bytes)) in entries.into_iter().enumerate() {
+            if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 && shutdown_requested(&mut boot_shutdown) {
+                anyhow::bail!("shutdown requested during the torrent-dir scan");
+            }
             // Resume data already loaded this torrent (the registry holds
             // every resume-loaded info-hash after the scan above) — skip.
             if registry.lookup(&ih).is_some() {
@@ -1028,7 +1252,10 @@ pub async fn boot(
                         error.cause = %e,
                         "torrent-dir add failed",
                     );
-                    load_failures.entry(profile.clone()).or_default().2 += 1;
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_dir_add += 1;
                     // Release the claim so a later run can retry the add. A
                     // release that fails to persist leaves the claim on disk,
                     // and the next boot skips this torrent as already loaded.
@@ -1055,12 +1282,13 @@ pub async fn boot(
 
     // Every configured profile, so a failed one reads zero rather than absent.
     for profile in cfg.profile.iter().map(|p| &p.id) {
-        let (resume_add, torrent_read, torrent_dir_add) =
-            load_failures.get(profile).copied().unwrap_or_default();
+        let f = load_failures.get(profile).copied().unwrap_or_default();
         for (what, n) in [
-            ("resume_add", resume_add),
-            ("torrent_read", torrent_read),
-            ("torrent_dir_add", torrent_dir_add),
+            ("resume_add", f.resume_add),
+            ("torrent_read", f.torrent_read),
+            ("torrent_dir_add", f.torrent_dir_add),
+            ("resume_file", f.resume_file),
+            ("torrent_file", f.torrent_file),
         ] {
             metrics.set_gauge(
                 "boot_torrent_load_failures",
@@ -1203,6 +1431,7 @@ pub async fn boot(
     // failure has exactly the same exposure as one configured with one — and
     // keying on the configured count treated that survivor's listen failure as
     // non-fatal, leaving a daemon that is up, healthy and listening on nothing.
+    .shutdown_deadline(std::time::Duration::from_secs(cfg.shutdown_drain_secs))
     .fatal_listen_failure(profile_registry.iter().count() == 1)
     .on_fatal({
         let tx = shutdown_tx.clone();
@@ -1729,15 +1958,21 @@ impl DaemonHandle {
             );
         }
 
+        // Long-running pool work and the shutdown latch it checks; the
+        // teardown below waits for it before stopping the alert loop.
+        let work: Arc<crate::app_state::WorkGate> = Arc::default();
+
         // Re-drive any plan a crash or a kill left mid-apply, before the API
         // can accept new ones. A half-applied reorganisation is exactly the
-        // state an operator cannot reason about.
+        // state an operator cannot reason about. Held in the work gate like an
+        // API apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
-            let src = source.clone();
-            let st = state.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::pool_apply::resume_unfinished(&pool, &src, &st)
-            });
+            crate::pool_apply::spawn_resume_unfinished(
+                pool,
+                source.clone(),
+                state.clone(),
+                Arc::clone(&work),
+            );
         }
 
         // Verify queue: admits a bounded number of adopt-time re-hashes so a
@@ -1777,6 +2012,7 @@ impl DaemonHandle {
             trusted_proxies: trusted_proxies.clone(),
             unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
             shutdown: shutdown_tx.clone(),
+            work: Arc::clone(&work),
         };
 
         // What the daemon decided to believe, in the journal, once. Anything
@@ -1860,15 +2096,35 @@ impl DaemonHandle {
                     &shutdown_tx,
                     shutdown_rx,
                     &alert_loop,
+                    &work,
                 )
                 .await
             }
             None => 70,
         };
+        // Already latched when the server saw the shutdown; this covers the
+        // bind failure, which never served.
+        work.cancel();
 
         // Tell systemd we're stopping before the resume drain, which may take
-        // the full 30s deadline — otherwise the watchdog can fire mid-drain.
+        // its whole deadline — otherwise the watchdog can fire mid-drain.
         sd_notify::stopping();
+        // And ask for the time the rest of the stop may take, which on a
+        // large pool can outrun `TimeoutStopSec`: capped at the sum of the
+        // stages' own bounds, so a stop wedged past all of them is still
+        // killed.
+        let _extend_stop = sd_notify::TimeoutExtender::start(
+            POOL_WORK_DRAIN
+                + std::time::Duration::from_secs(cfg.shutdown_drain_secs)
+                + TEARDOWN_ALLOWANCE,
+        );
+
+        // Pool work a drained request left behind, or the boot-time re-drive:
+        // stopping the alert loop and closing the sessions under a plan that
+        // is moving storage through them is the mid-step kill the latch
+        // exists to prevent. Applies stop at their next step boundary; a scan
+        // or drift check runs to its end or to this bound.
+        wait_for_pool_work(&work, POOL_WORK_DRAIN).await;
         sd_notify::status("draining resume data");
 
         // Trigger alert-loop shutdown and join (saves all resume data). If the
@@ -1886,8 +2142,12 @@ impl DaemonHandle {
             exit_code = 70;
         }
         let unsaved_at_shutdown = alert_loop.unsaved_at_shutdown();
-        if let Err(e) = alert_loop.join() {
-            warn!(error.cause = ?e, "alert loop join panicked");
+        // Joined off the runtime's workers: the drain can take its whole
+        // deadline, and the timeout extender above has to keep running.
+        match tokio::task::spawn_blocking(move || alert_loop.join()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(error.cause = ?e, "alert loop join panicked"),
+            Err(e) => warn!(error.cause = %e, "alert loop join task failed"),
         }
         let mut shutdown_report = ShutdownReport {
             unsaved_resumes: unsaved_at_shutdown.load(std::sync::atomic::Ordering::Relaxed),
@@ -1897,7 +2157,7 @@ impl DaemonHandle {
         // Persist DHT routing tables for the next start. Only a host profile
         // with DHT enabled has one; a tunnelled profile runs with DHT off by
         // construction and has nothing to save. The sessions are still alive
-        // here — they are dropped when `source` goes out of scope.
+        // here — `teardown_network` below closes them.
         for p in cfg.profile.iter().filter(|p| p.dht_enabled()) {
             let Some(engine) = source.engine_for(&p.id) else {
                 continue;
@@ -1918,25 +2178,19 @@ impl DaemonHandle {
             }
         }
 
-        // Remove the network kill switch last, once seeding has drained. The
-        // tunnel is still up during a graceful shutdown, so the profiles' sockets
-        // (still source-bound to the tunnel IP) can't leak in this window.
-        if kill_switch_active {
-            finish_kill_switch_removal(
-                crate::vpn::killswitch::disable(),
-                &metrics,
-                &mut shutdown_report,
-            );
-        }
-        write_shutdown_report(&run_dir, &shutdown_report);
-
-        // Then bring the tunnels down, after the sessions are gone. The daemon
-        // brought them up, so it owns tearing them down; leaving them up meant
-        // every restart accumulated interfaces and left an idle tunnel
-        // connected to the provider indefinitely. This runs on every exit from
-        // `run_until_signal`, the HTTP bind failure included — a failure
-        // inside `boot` is torn down by `BootCleanup` instead.
-        let jobs: Vec<_> = profile_registry
+        // Sessions, then tunnels, then the kill switch — see
+        // `teardown_network`. The daemon brought the tunnels up, so it owns
+        // tearing them down; leaving them up meant every restart accumulated
+        // interfaces and left an idle tunnel connected to the provider
+        // indefinitely. This runs on every exit from `run_until_signal`, the
+        // HTTP bind failure included — a failure inside `boot` is torn down
+        // by `BootCleanup` instead.
+        let engines: Vec<Arc<dyn TorrentEngine>> = source
+            .profiles()
+            .iter()
+            .filter_map(|p| source.engine_for(p))
+            .collect();
+        let tunnels: Vec<_> = profile_registry
             .iter()
             .filter_map(|entry| {
                 // A host profile has no tunnel to take down.
@@ -1945,18 +2199,50 @@ impl DaemonHandle {
                 else {
                     return None;
                 };
-                let vpn = crate::vpn::for_type(vpn_type, &run_dir);
-                let iface = iface.to_string();
-                Some((entry.config.id.clone(), iface.clone(), move || {
-                    vpn.bring_down(&iface)
-                }))
+                Some((
+                    entry.config.id.clone(),
+                    iface.to_string(),
+                    crate::vpn::for_type(vpn_type, &run_dir),
+                ))
             })
             .collect();
-        join_teardowns(jobs).await;
+        teardown_network(engines, tunnels, || {
+            if kill_switch_active {
+                finish_kill_switch_removal(
+                    crate::vpn::killswitch::disable(),
+                    &metrics,
+                    &mut shutdown_report,
+                );
+            }
+        })
+        .await;
+        write_shutdown_report(&run_dir, &shutdown_report);
 
         info!("torrentd: clean exit");
         exit_code
     }
+}
+
+/// Wait up to `bound` for pool work still in flight, returning whether none
+/// is left. Past the bound the teardown goes on around the work, warning.
+async fn wait_for_pool_work(work: &crate::app_state::WorkGate, bound: std::time::Duration) -> bool {
+    if work.in_flight() == 0 {
+        return true;
+    }
+    sd_notify::status("waiting for pool work to stop");
+    info!(
+        in_flight = work.in_flight(),
+        bound_secs = bound.as_secs(),
+        "waiting for pool work to stop",
+    );
+    let idle = work.wait_idle(bound).await;
+    if !idle {
+        warn!(
+            in_flight = work.in_flight(),
+            "pool work still running at its bound; tearing down around it",
+        );
+    }
+    idle
 }
 
 /// Serve the API on a bound listener until a shutdown is signalled, returning
@@ -1965,6 +2251,7 @@ impl DaemonHandle {
 /// Split out of `run_until_signal` so that function has no early return
 /// between `boot`'s `disarm` and its teardown: a failure to bind skips this
 /// and nothing else.
+#[allow(clippy::too_many_arguments)]
 async fn serve_until_shutdown(
     listener: tokio::net::TcpListener,
     app: kynos::router::service::Service<http::ctx::AppCtx>,
@@ -1973,6 +2260,7 @@ async fn serve_until_shutdown(
     shutdown_tx: &broadcast::Sender<ShutdownReason>,
     mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
     alert_loop: &torrentd_engine::AlertLoopHandle,
+    work: &Arc<crate::app_state::WorkGate>,
 ) -> i32 {
     info!(addr = %http_listen, "HTTP server listening");
     if let Some(posture) = posture {
@@ -2027,6 +2315,7 @@ async fn serve_until_shutdown(
     // timeout. This is a single-operator control plane sharing one descriptor
     // limit (`LimitNOFILE`) with libtorrent, whose peer connections and file
     // pool are what the limit is for; see `HTTP_MAX_CONNECTIONS`.
+    let work = Arc::clone(work);
     let server = kynos::server::Server::new(app)
         .listener(listener)
         .max_connections(HTTP_MAX_CONNECTIONS)
@@ -2037,16 +2326,91 @@ async fn serve_until_shutdown(
         .http2(kynos::server::protocol::Http2Config::default().keep_alive(Some(HTTP2_KEEP_ALIVE)))
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             let _ = shutdown_rx.recv().await;
+            // Latched first, so an apply still running stops at its next step
+            // and a `/v1/events` stream opened from here on ends at once.
+            work.cancel();
+            sd_notify::stopping();
+            sd_notify::status("draining HTTP requests");
         }))
+        // Explicit rather than kynos's 25 s default: the drain is one stage
+        // of a stop budget (`deploy/torrentd.service` `TimeoutStopSec`) that
+        // the pool-work wait, the resume drain and the teardown share.
+        .shutdown_timeout(HTTP_DRAIN_TIMEOUT)
         .serve();
 
-    match server.await {
+    http_exit_code(server.await)
+}
+
+/// The exit code the HTTP server's outcome implies.
+///
+/// A drain that ran out of time is not a failure of the daemon: a client
+/// holding a request open past the bound — a slow scan, a stream that did not
+/// notice the shutdown — is cut off, and everything after the drain still
+/// runs. Exiting 70 for it made `Restart=on-failure` restart a daemon that was
+/// asked to stop.
+fn http_exit_code(outcome: kynos::Result<()>) -> i32 {
+    match outcome {
         Ok(()) => 0,
+        Err(kynos::Error::Server(kynos::server::error::ServerError::ShutdownTimeout {
+            timeout,
+        })) => {
+            warn!(
+                timeout_secs = timeout.as_secs(),
+                "HTTP drain timed out; the requests still open were cut off",
+            );
+            0
+        }
         Err(e) => {
             error!(error.cause = %e, "HTTP server exited with error");
             70
         }
     }
+}
+
+/// Take the daemon off the network in the one order that leaks nothing:
+///
+/// 1. **Close every session.** Peer and tracker sockets are bound to a
+///    tunnel's address; closing them first means nothing is left to send when
+///    the tunnel goes. Dropping the sessions was left to `source` going out of
+///    scope at the end of `run_until_signal`, after both steps below — and to
+///    every other task holding a clone letting go of it, which nothing waited
+///    for.
+/// 2. **Bring the tunnels down**, link before rules (`wireguard::native`).
+/// 3. **Remove the kill switch last.** It confines the daemon's uid to the
+///    tunnels; removing it before they were down, as the teardown did, opened
+///    the host's own interface to every socket still bound for one.
+///
+/// Each session closes on the blocking pool — libtorrent's destructor waits for
+/// its sockets and disk threads — and all of them at once, then the tunnels
+/// the same way (`join_teardowns`).
+async fn teardown_network<K>(
+    engines: Vec<Arc<dyn TorrentEngine>>,
+    tunnels: Vec<(ProfileId, String, Arc<dyn torrentd_engine::VpnManager>)>,
+    remove_kill_switch: K,
+) where
+    K: FnOnce(),
+{
+    let closing: Vec<_> = engines
+        .into_iter()
+        .map(|e| tokio::task::spawn_blocking(move || e.close()))
+        .collect();
+    for c in closing {
+        if let Err(e) = c.await {
+            warn!(error.cause = %e, "closing a session failed");
+        }
+    }
+    info!("sessions closed");
+    join_teardowns(
+        tunnels
+            .into_iter()
+            .map(|(id, iface, vpn)| {
+                let job_iface = iface.clone();
+                (id, iface, move || vpn.bring_down(&job_iface))
+            })
+            .collect(),
+    )
+    .await;
+    remove_kill_switch();
 }
 
 /// Put every tunnel teardown in flight at once, then join them.
@@ -2057,9 +2421,8 @@ async fn serve_until_shutdown(
 /// `TERM_GRACE + KILL_GRACE` — seven seconds — per OpenVPN profile, serialized,
 /// which is the `7N` this series named as the thing it was avoiding. Each
 /// tunnel is an independent interface and an independent process, so there is
-/// nothing to serialise for, and `deploy/torrentd.service` sets no
-/// `TimeoutStopSec`, which leaves systemd's default as the only bound on the
-/// drain.
+/// nothing to serialise for, and every serialized second comes out of the
+/// stop budget `deploy/torrentd.service`'s `TimeoutStopSec` bounds.
 ///
 /// Spawning happens in one pass and the awaits in a second, so the jobs run
 /// concurrently and the log still reads in profile order. A `JoinError` — the
@@ -2129,6 +2492,22 @@ fn save_session_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
         }
     }
     Ok(())
+}
+
+/// What one profile's boot scans could not load, by the `source` label of
+/// `boot_torrent_load_failures`.
+#[derive(Clone, Copy, Debug, Default)]
+struct BootLoadFailures {
+    /// A resume file that read but libtorrent refused to add.
+    resume_add: u64,
+    /// A `.torrent` that could not be read to re-attach metadata.
+    torrent_read: u64,
+    /// A torrent-dir `.torrent` libtorrent refused to add.
+    torrent_dir_add: u64,
+    /// A resume file the scan could not read at all, skipped.
+    resume_file: u64,
+    /// A torrent-dir `.torrent` the scan could not read at all, skipped.
+    torrent_file: u64,
 }
 
 /// What a run's exit left behind that no scrape of that run could see.
@@ -2323,6 +2702,146 @@ mod shutdown_report_tests {
 
     fn failed() -> std::io::Result<()> {
         Err(std::io::Error::other("nft: permission denied"))
+    }
+
+    #[test]
+    fn a_config_refusal_is_told_apart_from_other_boot_failures() {
+        let e = refused(anyhow::anyhow!("host profile beside network_kill_switch"));
+        assert!(is_config_refusal(&e));
+        assert!(
+            is_config_refusal(&e.context("boot")),
+            "survives more context"
+        );
+        assert!(format!("{:#}", refused(anyhow::anyhow!("why"))).ends_with(": why"));
+        assert!(!is_config_refusal(&anyhow::anyhow!("no profile came up")));
+    }
+
+    #[test]
+    fn the_descriptor_budget_counts_every_session_and_the_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config::minimal_for_tests(dir.path(), false);
+        cfg.connections_limit = Some(1_000);
+        cfg.file_pool_size = Some(100);
+        cfg.profile = vec![
+            crate::profile_registry::test_entry("a", ProfileStatus::Active).config,
+            crate::profile_registry::test_entry("b", ProfileStatus::Active).config,
+        ];
+        assert_eq!(descriptors_needed(&cfg), 2 * 1_100 + 256);
+        // And the shipped unit's LimitNOFILE covers a one-profile default.
+        cfg.connections_limit = None;
+        cfg.file_pool_size = None;
+        cfg.profile.truncate(1);
+        assert!(descriptors_needed(&cfg) <= 65_536);
+        assert!(nofile_soft_limit().is_some_and(|n| n > 0));
+    }
+
+    #[test]
+    fn a_boot_scan_sees_a_shutdown_signalled_while_it_runs() {
+        let (tx, mut rx) = broadcast::channel(8);
+        assert!(!shutdown_requested(&mut rx), "nothing signalled yet");
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        assert!(shutdown_requested(&mut rx));
+        // A receiver that fell behind missed signals: that is a shutdown too.
+        let (tx, mut rx) = broadcast::channel(1);
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        tx.send(ShutdownReason::Sigint).unwrap();
+        assert!(shutdown_requested(&mut rx));
+    }
+
+    /// A store rooted at `dir/store` whose profile `p` cannot be written: a
+    /// file stands where its directory goes.
+    fn refusing_store_root(dir: &std::path::Path) -> std::path::PathBuf {
+        let base = dir.join("store");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("p"), b"x").unwrap();
+        base
+    }
+
+    /// The labels of every `IncCounter` of `name` the sink recorded.
+    fn counted(sink: &torrentd_engine::RecordingSink, name: &str) -> Vec<Vec<(String, String)>> {
+        sink.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                torrentd_engine::metrics::MetricCall::IncCounter { name: n, labels }
+                    if n == name =>
+                {
+                    Some(labels)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The hook boot installs on the torrent store counts a magnet-metadata
+    /// write that fails on the batch writer under `source=metadata`.
+    #[test]
+    fn a_failed_batched_torrent_write_counts_under_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(torrentd_engine::RecordingSink::new());
+        let store = FsTorrentStore::new(refusing_store_root(dir.path()))
+            .with_batched_writes(Some(torrent_write_error_hook(sink.clone())));
+        let p = ProfileId::new("p");
+        store
+            .write_batched(&p, &libtorrent_safe::InfoHash([0x21; 20]), b"d4:infoe")
+            .unwrap();
+        store.flush();
+        assert_eq!(
+            counted(&sink, "torrent_file_persist_errors_total"),
+            vec![vec![
+                ("profile_id".to_string(), "p".to_string()),
+                ("source".to_string(), "metadata".to_string()),
+            ]],
+        );
+    }
+
+    /// The hook boot installs on the resume store counts a write that fails
+    /// on the batch writer and marks the torrent's file stale.
+    #[test]
+    fn a_failed_batched_resume_write_counts_and_marks_the_torrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let sink = Arc::new(torrentd_engine::RecordingSink::new());
+        let state = Arc::new(StateMap::new());
+        let ih = libtorrent_safe::InfoHash([0x22; 20]);
+        let p = ProfileId::new("p");
+        state.insert(
+            ih,
+            torrentd_engine::TorrentState::newly_added(
+                libtorrent_safe::TorrentHandle {
+                    id: 1,
+                    infohash: ih,
+                },
+                p.clone(),
+                std::time::Instant::now(),
+            ),
+        );
+        let store = FsResumeStore::new(refusing_store_root(dir.path())).with_batched_writes(Some(
+            resume_write_error_hook(sink.clone(), Arc::clone(&state)),
+        ));
+        store.write_batched(&p, &ih, b"resume").unwrap();
+        store.flush();
+        assert_eq!(
+            counted(&sink, "resume_write_errors_total"),
+            vec![vec![("profile_id".to_string(), "p".to_string())]],
+        );
+        assert!(state.get(&ih).unwrap().resume_write_failed);
+    }
+
+    #[test]
+    fn an_http_drain_that_times_out_exits_zero() {
+        // A client holding a request past the drain bound is cut off; the
+        // daemon was still asked to stop, and 70 would have had
+        // `Restart=on-failure` start it again.
+        let timed_out = Err(kynos::Error::Server(
+            kynos::server::error::ServerError::ShutdownTimeout {
+                timeout: HTTP_DRAIN_TIMEOUT,
+            },
+        ));
+        assert_eq!(http_exit_code(timed_out), 0);
+        assert_eq!(http_exit_code(Ok(())), 0);
+        let broken = Err(kynos::Error::Server(
+            kynos::server::error::ServerError::NoListeners,
+        ));
+        assert_eq!(http_exit_code(broken), 70, "a real server failure stays 70");
     }
 
     #[test]
@@ -3188,8 +3707,8 @@ mod tests {
     /// thread waits, not how long the daemon takes to stop: awaiting each
     /// job before spawning the next left the wall-clock stop time at up to
     /// seven seconds per OpenVPN profile, serialized, which is the `7N` this
-    /// series named as the thing it was avoiding. `deploy/torrentd.service`
-    /// sets no `TimeoutStopSec`, so systemd's default is the only bound.
+    /// series named as the thing it was avoiding, out of the stop budget
+    /// `deploy/torrentd.service`'s `TimeoutStopSec` bounds.
     ///
     /// The property is overlap, so overlap is what is counted.
     ///
@@ -3243,6 +3762,207 @@ mod tests {
             "at most this many teardowns were ever inside the job at once; \
              a deployment's stop time must not scale with its profile count",
         );
+    }
+
+    /// A `VpnManager` that writes each teardown into a log the whole teardown
+    /// shares, so the order across sessions, tunnels and the kill switch is
+    /// one sequence to assert on.
+    #[derive(Clone, Debug)]
+    struct RecordingVpn {
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        engines: Vec<Arc<torrentd_engine::MockEngine>>,
+    }
+
+    impl torrentd_engine::VpnManager for RecordingVpn {
+        fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, torrentd_engine::VpnError> {
+            Err(torrentd_engine::VpnError::BringUpTimeout {
+                iface: profile.interface.clone(),
+            })
+        }
+
+        fn current_ip(&self, iface: &str) -> Result<IpAddr, torrentd_engine::VpnError> {
+            Err(torrentd_engine::VpnError::NoAddress {
+                iface: iface.to_string(),
+            })
+        }
+
+        fn bring_down(&self, iface: &str) {
+            let closed = self.engines.iter().all(|e| {
+                e.calls()
+                    .iter()
+                    .any(|c| matches!(c, torrentd_engine::RecordedCall::Close))
+            });
+            self.log
+                .lock()
+                .expect("no panics holding this")
+                .push(format!(
+                    "tunnel {iface} down (every session closed: {closed})"
+                ));
+        }
+    }
+
+    /// The teardown's wait for pool work: nothing in flight passes straight
+    /// through, work that finishes inside the bound is waited for, and work
+    /// still running at the bound is torn down around rather than waited on.
+    #[tokio::test]
+    async fn the_teardown_waits_for_pool_work_up_to_its_bound() {
+        use std::time::Duration;
+
+        let work: Arc<crate::app_state::WorkGate> = Arc::default();
+        let started = std::time::Instant::now();
+        assert!(wait_for_pool_work(&work, Duration::from_secs(30)).await);
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "nothing in flight"
+        );
+
+        let guard = work.enter();
+        let finisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(guard);
+        });
+        assert!(
+            wait_for_pool_work(&work, Duration::from_secs(30)).await,
+            "work that finishes inside the bound is waited for",
+        );
+        finisher.await.unwrap();
+        assert_eq!(work.in_flight(), 0);
+
+        let _stuck = work.enter();
+        let started = std::time::Instant::now();
+        assert!(
+            !wait_for_pool_work(&work, Duration::from_millis(100)).await,
+            "work still running at the bound is reported, not waited on",
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(work.in_flight(), 1);
+    }
+
+    /// The teardown order that leaks nothing: every session closed before any
+    /// tunnel goes, and the kill switch removed only after every tunnel has.
+    ///
+    /// The shutdown removed the kill switch first, then brought the tunnels
+    /// down with the sessions still open — they were dropped only when
+    /// `run_until_signal` returned — so for the length of the teardown the
+    /// uid was unconfined and its sockets still bound to tunnel addresses.
+    #[tokio::test]
+    async fn teardown_closes_sessions_then_tunnels_then_the_kill_switch() {
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let engines: Vec<Arc<torrentd_engine::MockEngine>> = (0..2)
+            .map(|_| Arc::new(torrentd_engine::MockEngine::new()))
+            .collect();
+        let vpn = RecordingVpn {
+            log: Arc::clone(&log),
+            engines: engines.clone(),
+        };
+        let tunnels = ["wg-a", "wg-b"]
+            .into_iter()
+            .map(|iface| {
+                (
+                    ProfileId::new(iface),
+                    iface.to_string(),
+                    Arc::new(vpn.clone()) as Arc<dyn torrentd_engine::VpnManager>,
+                )
+            })
+            .collect();
+
+        teardown_network(
+            engines
+                .iter()
+                .map(|e| Arc::clone(e) as Arc<dyn TorrentEngine>)
+                .collect(),
+            tunnels,
+            {
+                let log = Arc::clone(&log);
+                move || log.lock().unwrap().push("kill switch removed".into())
+            },
+        )
+        .await;
+
+        let log = log.lock().unwrap().clone();
+        let mut tunnels_down: Vec<&String> = log[..2].iter().collect();
+        tunnels_down.sort();
+        assert_eq!(
+            tunnels_down,
+            vec![
+                "tunnel wg-a down (every session closed: true)",
+                "tunnel wg-b down (every session closed: true)",
+            ],
+            "each tunnel went down after every session closed: {log:?}",
+        );
+        assert_eq!(
+            log[2], "kill switch removed",
+            "the switch goes last: {log:?}"
+        );
+        assert_eq!(log.len(), 3);
+    }
+
+    /// A failed boot's teardown keeps the same order between the two things
+    /// it owns: tunnels first, then the kill switch.
+    #[test]
+    fn a_failed_boot_takes_its_tunnels_down_before_the_kill_switch() {
+        let text = include_str!("startup.rs");
+        let drop_impl = text
+            .split("impl Drop for BootCleanup")
+            .nth(1)
+            .and_then(|s| s.split("\n}\n").next())
+            .expect("BootCleanup has a Drop impl");
+        let tunnels = drop_impl
+            .find("bring_down")
+            .expect("drop brings tunnels down");
+        let switch = drop_impl
+            .find("killswitch::disable")
+            .expect("drop removes the kill switch");
+        assert!(
+            tunnels < switch,
+            "tunnels must come down before the kill switch goes"
+        );
+    }
+
+    /// A failed boot closes the sessions it built before any tunnel goes,
+    /// as `teardown_network` does: past the port-forward monitor's start,
+    /// dropping `boot`'s own handles no longer destroys them.
+    #[test]
+    fn a_failed_boot_closes_its_sessions_before_its_tunnels() {
+        let log: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let engines: Vec<Arc<torrentd_engine::MockEngine>> = (0..2)
+            .map(|_| Arc::new(torrentd_engine::MockEngine::new()))
+            .collect();
+        let vpn = RecordingVpn {
+            log: Arc::clone(&log),
+            engines: engines.clone(),
+        };
+        let mut cleanup = BootCleanup::with_vpn_factory(
+            PathBuf::from("/var/lib/torrentd"),
+            Arc::new(move |_t, _dir| Arc::new(vpn.clone()) as Arc<dyn torrentd_engine::VpnManager>),
+        );
+        cleanup.note_tunnel(VpnType::Wireguard, "wg-a");
+        cleanup.note_sessions(
+            engines
+                .iter()
+                .map(|e| Arc::clone(e) as Arc<dyn TorrentEngine>),
+        );
+
+        drop(cleanup);
+
+        assert_eq!(
+            log.lock().unwrap().clone(),
+            vec!["tunnel wg-a down (every session closed: true)".to_string()],
+        );
+    }
+
+    /// A disarmed guard closes nothing: the sessions are the shutdown path's.
+    #[test]
+    fn a_disarmed_boot_cleanup_leaves_its_sessions_open() {
+        let engine = Arc::new(torrentd_engine::MockEngine::new());
+        let mut cleanup = cleanup_with(MockVpn::default());
+        cleanup.note_sessions([Arc::clone(&engine) as Arc<dyn TorrentEngine>]);
+        cleanup.disarm();
+        drop(cleanup);
+        assert!(!engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::Close)));
     }
 
     /// And a teardown that panics is warned past rather than taking the rest

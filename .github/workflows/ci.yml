@@ -83,8 +83,24 @@ jobs:
       - run: mise run openapi-check
 
       # The alert drill's build mounts `POST /v1/faults` and wraps every engine
-      # in `FaultEngine`; nothing else compiles that code.
-      - run: mise run check-fault-injection
+      # in `FaultEngine`; nothing else compiles that code, and until this ran
+      # the tests rather than `cargo check`ing them, nothing executed its tests.
+      - run: mise run test-fault-injection
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      # `cargo deny` reads `cargo metadata`, so it needs cargo, not a build.
+      - uses: dtolnay/rust-toolchain@1.90
+      # cargo-binstall lets mise fetch prebuilt convco and cargo-deny binaries.
+      - uses: cargo-bins/cargo-binstall@main
+      - uses: jdx/mise-action@v2
+      # Advisories, licenses, bans and sources, against deny.toml.
+      - run: mise run deny
 
   tracing-lint:
     name: tracing field-name lint

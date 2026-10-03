@@ -68,6 +68,31 @@ fn wait_healthy(addr: &str) {
 /// The profile every torrent in these tests belongs to.
 pub const PROFILE: &str = "test";
 
+/// A loopback port free for both TCP and UDP right now, from the kernel's
+/// ephemeral range.
+///
+/// Every test here used to hard-code its ports, and two pairs collided:
+/// `the_first_scrape_holds_every_series_present_from_boot` served HTTP on
+/// 18096 and listened on 16896, which the single-instance test used for its
+/// second daemon, and the bind-failure and migrated-registry tests shared
+/// 16893. `cargo test` runs tests in parallel, so a collision was a test that
+/// failed for the other one's sake. A session listens on TCP and UDP, so the
+/// port is checked free for both.
+fn free_port() -> u16 {
+    loop {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let port = tcp.local_addr().unwrap().port();
+        if std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok() {
+            return port;
+        }
+    }
+}
+
+/// `127.0.0.1:<free port>`, for `http_listen`.
+fn free_http() -> String {
+    format!("127.0.0.1:{}", free_port())
+}
+
 /// Write a daemon config into `p`, returning its path.
 ///
 /// `resume_dir` is `p/resume`, so the daemon's state dir — where the
@@ -133,26 +158,27 @@ fn wait_exit(child: &mut Child, timeout: Duration) -> bool {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn daemon_end_to_end() {
-    const HTTP: &str = "127.0.0.1:18091";
+    let addr = free_http();
+    let addr = addr.as_str();
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let mut child = spawn_daemon(p, 16891, HTTP);
+    let mut child = spawn_daemon(p, free_port(), addr);
 
-    wait_healthy(HTTP);
+    wait_healthy(addr);
 
     let magnet = "magnet:?xt=urn:btih:0101010101010101010101010101010101010101&dn=itest";
     let payload = add_magnet(magnet);
     let ih = "0101010101010101010101010101010101010101";
 
-    let (code, body) = http(HTTP, "POST", "/v1/torrents", Some(&payload));
+    let (code, body) = http(addr, "POST", "/v1/torrents", Some(&payload));
     assert_eq!(code, 201, "add should be 201: {body}");
     assert!(body.contains(ih), "add response: {body}");
 
-    let (code, body) = http(HTTP, "GET", "/v1/torrents", None);
+    let (code, body) = http(addr, "GET", "/v1/torrents", None);
     assert_eq!(code, 200);
     assert!(body.contains(ih), "list should contain the torrent: {body}");
 
-    let (code, body) = http(HTTP, "POST", "/v1/torrents", Some(&payload));
+    let (code, body) = http(addr, "POST", "/v1/torrents", Some(&payload));
     assert_eq!(code, 409, "duplicate add must be 409");
     assert!(
         body.contains("problems.md#torrent-exists"),
@@ -160,7 +186,7 @@ fn daemon_end_to_end() {
     );
 
     // The document the daemon serves is the one committed beside the code.
-    let (code, doc) = http(HTTP, "GET", "/v1/openapi.json", None);
+    let (code, doc) = http(addr, "GET", "/v1/openapi.json", None);
     assert_eq!(code, 200);
     let committed = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/api/openapi.json"),
@@ -168,7 +194,7 @@ fn daemon_end_to_end() {
     .expect("read docs/api/openapi.json");
     assert_eq!(doc, committed, "the served document is the committed one");
 
-    let (code, metrics) = http(HTTP, "GET", "/metrics", None);
+    let (code, metrics) = http(addr, "GET", "/metrics", None);
     assert_eq!(code, 200);
     assert!(metrics.contains("torrentd_"), "metrics output: {metrics}");
 
@@ -234,13 +260,14 @@ fn listed_values(labels: &str) -> Vec<String> {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn the_first_scrape_holds_every_series_present_from_boot() {
-    const HTTP: &str = "127.0.0.1:18096";
+    let addr = free_http();
+    let addr = addr.as_str();
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let mut child = spawn_daemon(p, 16896, HTTP);
-    wait_healthy(HTTP);
+    let mut child = spawn_daemon(p, free_port(), addr);
+    wait_healthy(addr);
 
-    let (code, metrics) = http(HTTP, "GET", "/metrics", None);
+    let (code, metrics) = http(addr, "GET", "/metrics", None);
     assert_eq!(code, 200);
     let expected = series_present_from_boot();
     assert!(expected.len() > 30, "parsed too few rows: {expected:?}");
@@ -280,11 +307,11 @@ fn the_first_scrape_holds_every_series_present_from_boot() {
     // A reload that cannot parse the file keeps the old settings and says so
     // in a series an alert can read, not only in the journal.
     std::fs::write(p.join("cfg.toml"), "this is = = not toml").unwrap();
-    let (code, body) = http(HTTP, "POST", "/v1/config/reload", None);
+    let (code, body) = http(addr, "POST", "/v1/config/reload", None);
     assert!((200..300).contains(&code), "reload trigger: {code} {body}");
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let (_, metrics) = http(HTTP, "GET", "/metrics", None);
+        let (_, metrics) = http(addr, "GET", "/metrics", None);
         if metrics.contains("torrentd_config_reload_failures_total{stage=\"load\"} 1") {
             break;
         }
@@ -316,11 +343,11 @@ fn the_first_scrape_holds_every_series_present_from_boot() {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn daemon_http_bind_failure_still_drains() {
-    const HTTP: &str = "127.0.0.1:18093";
-    let _occupied = std::net::TcpListener::bind(HTTP).expect("occupy the HTTP port");
+    let occupied = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy an HTTP port");
+    let addr = occupied.local_addr().unwrap().to_string();
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let mut child = spawn_daemon(p, 16893, HTTP);
+    let mut child = spawn_daemon(p, free_port(), &addr);
 
     assert!(
         wait_exit(&mut child, Duration::from_secs(30)),
@@ -345,16 +372,17 @@ fn daemon_http_bind_failure_still_drains() {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn a_second_daemon_on_the_same_state_dir_refuses_and_leaves_the_first_running() {
-    const HTTP: &str = "127.0.0.1:18095";
-    const HTTP_SECOND: &str = "127.0.0.1:18096";
+    let addr = free_http();
+    let addr = addr.as_str();
+    let second_addr = free_http();
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let mut first = spawn_daemon(p, 16895, HTTP);
-    wait_healthy(HTTP);
+    let mut first = spawn_daemon(p, free_port(), addr);
+    wait_healthy(addr);
 
     // Same state directory, different ports. The first daemon has already
     // read `cfg.toml`, so rewriting it for the second changes nothing for it.
-    let cfg = write_config(p, 16896, HTTP_SECOND);
+    let cfg = write_config(p, free_port(), &second_addr);
     let mut second = Command::new(env!("CARGO_BIN_EXE_torrentd"))
         .arg("--config")
         .arg(&cfg)
@@ -391,12 +419,12 @@ fn a_second_daemon_on_the_same_state_dir_refuses_and_leaves_the_first_running() 
         "the refusal names the lock and the running daemon's pid: {out}"
     );
     assert!(
-        TcpStream::connect(HTTP_SECOND).is_err(),
+        TcpStream::connect(&second_addr).is_err(),
         "the second daemon got as far as binding its HTTP port"
     );
 
     // The first is untouched and still serving.
-    assert_eq!(http(HTTP, "GET", "/healthz", None).0, 200);
+    assert_eq!(http(addr, "GET", "/healthz", None).0, 200);
     sigterm(&first);
     assert!(
         wait_exit(&mut first, Duration::from_secs(30)),
@@ -411,23 +439,24 @@ fn a_second_daemon_on_the_same_state_dir_refuses_and_leaves_the_first_running() 
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn daemon_graceful_shutdown_under_load() {
-    const HTTP: &str = "127.0.0.1:18092";
+    let addr = free_http();
+    let addr = addr.as_str();
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let mut child = spawn_daemon(p, 16892, HTTP);
+    let mut child = spawn_daemon(p, free_port(), addr);
 
-    wait_healthy(HTTP);
+    wait_healthy(addr);
 
     // Add 100 distinct magnets (unique infohashes derived from the index).
     let n = 100;
     for i in 1..=n {
         let ih = format!("{i:040x}");
         let payload = add_magnet(&format!("magnet:?xt=urn:btih:{ih}"));
-        let (code, body) = http(HTTP, "POST", "/v1/torrents", Some(&payload));
+        let (code, body) = http(addr, "POST", "/v1/torrents", Some(&payload));
         assert_eq!(code, 201, "add #{i} should be 201: {body}");
     }
 
-    let (code, body) = http(HTTP, "GET", "/v1/status", None);
+    let (code, body) = http(addr, "GET", "/v1/status", None);
     assert_eq!(code, 200, "status: {body}");
 
     // SIGTERM under load: must exit cleanly within the timeout.
@@ -439,6 +468,127 @@ fn daemon_graceful_shutdown_under_load() {
     assert!(
         p.join(format!("session_state-{PROFILE}.dat")).exists(),
         "a dht profile's session state should be written on SIGTERM"
+    );
+}
+
+/// Clients that do not let go cannot turn a SIGTERM into a failure.
+///
+/// An events stream and a request whose body never finishes arriving are both
+/// open when the signal lands. The stream must end with the daemon; the stuck
+/// request holds the HTTP drain to its bound, and a drain that runs out is a
+/// warning, not exit 70 — which `Restart=on-failure` would have answered by
+/// starting the daemon it had just been asked to stop. Against kynos's
+/// default 25 s bound and the old exit code this fails on the status.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_sigterm_with_a_stream_and_a_stuck_request_open_exits_zero_within_the_bound() {
+    // Ports of its own: the reconciliation test's daemon holds 18094, and a
+    // client that reached it instead held nothing across this one's stop.
+    const HTTP: &str = "127.0.0.1:18101";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let mut child = spawn_daemon(p, 16901, HTTP);
+    wait_healthy(HTTP);
+
+    // The events stream, read until its first tick so it is established.
+    let mut events = TcpStream::connect(HTTP).expect("connect");
+    events
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    events
+        .write_all(
+            b"GET /v1/events HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\n\r\n",
+        )
+        .unwrap();
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !String::from_utf8_lossy(&seen).contains("event: tick") {
+        let n = events
+            .read(&mut buf)
+            .expect("the stream sends its first tick");
+        assert!(n > 0, "the stream closed before its first tick");
+        seen.extend_from_slice(&buf[..n]);
+    }
+
+    // A request whose declared body never arrives: in flight until the drain
+    // gives up on it.
+    let mut stuck = TcpStream::connect(HTTP).expect("connect");
+    stuck
+        .write_all(
+            b"POST /v1/torrents HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+              Content-Length: 4096\r\n\r\n{\"profile_id\":",
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+
+    let started = Instant::now();
+    sigterm(&child);
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(45)),
+        "daemon did not exit within 45s of SIGTERM with clients holding on"
+    );
+    let elapsed = started.elapsed();
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "a drain cut short by a client is not a failure: {status:?} after {elapsed:?}",
+    );
+    // The stuck request holds the HTTP drain to its 10 s bound
+    // (`HTTP_DRAIN_TIMEOUT`), and the rest of the teardown has nothing to
+    // wait on. Under 20 s rules out kynos's 25 s default; at least 9 s shows
+    // the stuck request really held the drain to its bound.
+    assert!(
+        (Duration::from_secs(9)..Duration::from_secs(20)).contains(&elapsed),
+        "the exit should land near the 10 s HTTP drain bound, took {elapsed:?}",
+    );
+    drop((stuck, events));
+}
+
+/// A configured `shutdown_drain_secs` is the deadline the alert loop's drain
+/// runs under, read from the loop's own report of the drain it starts.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn the_configured_drain_deadline_reaches_the_alert_loop() {
+    const HTTP: &str = "127.0.0.1:18097";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, 16897, HTTP);
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    // Neither the config default (60) nor the engine's (30).
+    let text = text.replace(
+        "log_level = \"warn\"\n",
+        "log_level = \"info\"\nshutdown_drain_secs = 7\n",
+    );
+    std::fs::write(&cfg, text).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .env_remove("RUST_LOG")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    // Read on its own thread, so a full pipe cannot stall the daemon.
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let reader = std::thread::spawn(move || {
+        let mut out = String::new();
+        stdout.read_to_string(&mut out).unwrap();
+        out
+    });
+    wait_healthy(HTTP);
+
+    sigterm(&child);
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(30)),
+        "daemon did not exit within 30s of SIGTERM"
+    );
+    let out = reader.join().unwrap();
+    let drain = out
+        .lines()
+        .find(|l| l.contains("shutdown: requesting resume save for every torrent"))
+        .unwrap_or_else(|| panic!("the drain did not report its start:\n{out}"));
+    assert!(
+        drain.contains("\"deadline_secs\":7"),
+        "the drain ran under another deadline: {drain}"
     );
 }
 
@@ -461,7 +611,7 @@ fn daemon_graceful_shutdown_under_load() {
 fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let cfg = write_config(p, 16893, "127.0.0.1:18093");
+    let cfg = write_config(p, free_port(), &free_http());
 
     // The pre-profiles registry, under its pre-profiles name. `write_config`
     // puts `resume_dir` at `p/resume`, so the state dir is `p`.
@@ -501,9 +651,11 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
         exited,
         "the daemon started against a registry it cannot serve; stderr: {err}"
     );
-    assert!(
-        !child.wait().unwrap().success(),
-        "exit status must be a failure; stderr: {err}"
+    assert_eq!(
+        child.wait().unwrap().code(),
+        Some(78),
+        "a refusal no restart can fix exits EX_CONFIG, which the unit does not restart; \
+         stderr: {err}"
     );
 
     // The refusal has to be actionable: it names the id it does not recognise,
@@ -534,6 +686,179 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
     );
 }
 
+/// A resume file and a torrent-dir `.torrent` the boot scans cannot read are
+/// skipped, the daemon comes up anyway, and boot exports each under its own
+/// `source` of `boot_torrent_load_failures`. A directory stands where each
+/// file goes, which no uid can read as a file.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn unreadable_scan_files_are_exported_by_source_at_boot() {
+    const HTTP: &str = "127.0.0.1:18100";
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, 16900, HTTP);
+    let ih = "ab".repeat(20);
+    std::fs::create_dir_all(p.join("resume").join(PROFILE).join(format!("{ih}.resume"))).unwrap();
+    std::fs::create_dir_all(
+        p.join("torrents")
+            .join(PROFILE)
+            .join(format!("{ih}.torrent")),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .expect("spawn daemon");
+    wait_healthy(HTTP);
+
+    let (code, metrics) = http(HTTP, "GET", "/metrics", None);
+    assert_eq!(code, 200);
+    for source in ["resume_file", "torrent_file"] {
+        assert!(
+            metrics.lines().any(|l| {
+                l.starts_with("torrentd_boot_torrent_load_failures{")
+                    && l.contains(&format!("profile_id=\"{PROFILE}\""))
+                    && l.contains(&format!("source=\"{source}\""))
+                    && l.ends_with(" 1")
+            }),
+            "boot_torrent_load_failures{{source={source}}} should read 1:\n{metrics}"
+        );
+    }
+
+    sigterm(&child);
+    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+}
+
+/// Run the binary against `cfg` to its exit, with `--check-config` when
+/// `check`, and `PATH` limited to `path` when given. Returns the exit code
+/// and both output streams.
+fn run_to_exit(
+    cfg: &std::path::Path,
+    check: bool,
+    path: Option<&std::path::Path>,
+) -> (i32, String) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_torrentd"));
+    cmd.arg("--config").arg(cfg);
+    if check {
+        cmd.arg("--check-config");
+    }
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
+    let mut child = cmd
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn daemon");
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(30)),
+        "a refused config must not start the daemon"
+    );
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .expect("piped stdout")
+        .read_to_string(&mut out)
+        .unwrap();
+    child
+        .stderr
+        .take()
+        .expect("piped stderr")
+        .read_to_string(&mut out)
+        .unwrap();
+    let code = child.wait().unwrap().code().expect("exited, not signalled");
+    (code, out)
+}
+
+/// A config that does not load exits 78 (`EX_CONFIG`), from the daemon and
+/// from `--check-config` alike, which is what `RestartPreventExitStatus=78`
+/// reads to leave the unit stopped.
+#[test]
+#[ignore = "spawns the real daemon; run with --ignored"]
+fn a_config_that_fails_to_load_exits_ex_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, 16898, "127.0.0.1:18098");
+    let text = std::fs::read_to_string(&cfg).unwrap();
+    // Out of `shutdown_drain_secs`'s `1..=3600`: parses, then fails validation.
+    std::fs::write(&cfg, format!("shutdown_drain_secs = 0\n{text}")).unwrap();
+
+    for check in [false, true] {
+        let (code, out) = run_to_exit(&cfg, check, None);
+        assert_eq!(code, 78, "--check-config: {check}; output: {out}");
+        assert!(
+            out.contains("shutdown_drain_secs"),
+            "the refusal names the key: {out}"
+        );
+    }
+
+    let (code, out) = run_to_exit(&p.join("missing.toml"), false, None);
+    assert_eq!(code, 78, "a config file that is not there: {out}");
+
+    // An operator subcommand is not the daemon: `vpn check` documents only
+    // 0/1/2, and a config it cannot load is its 1.
+    let status = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .args(["vpn", "check"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("spawn torrentd vpn check");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "vpn check on a config that fails to load"
+    );
+}
+
+/// `--check-config`'s host probe (`nft` present under
+/// `network_kill_switch = true`) exits 78 when it fails, and so does the
+/// daemon, which makes the same probe itself before it raises anything. `nft`
+/// is made absent by running with a `PATH` holding nothing.
+#[test]
+#[ignore = "spawns the real daemon; run with --ignored"]
+fn a_kill_switch_with_no_nft_exits_ex_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    for sub in ["data", "resume", "torrents", "empty-path"] {
+        std::fs::create_dir_all(p.join(sub)).unwrap();
+    }
+    let cfg = p.join("cfg.toml");
+    std::fs::write(
+        &cfg,
+        format!(
+            "default_save_path = \"{d}/data\"\n\
+             resume_dir = \"{d}/resume\"\n\
+             torrent_dir = \"{d}/torrents\"\n\
+             http_listen = \"127.0.0.1:18099\"\n\
+             log_level = \"warn\"\n\
+             allow_unauthenticated = true\n\
+             network_kill_switch = true\n\
+             \n\
+             [[profile]]\n\
+             id = \"acct_a\"\n\
+             network = \"vpn\"\n\
+             vpn_type = \"wireguard\"\n\
+             vpn_config = \"{d}/wg0.conf\"\n\
+             vpn_interface = \"wg-nonft\"\n\
+             listen_port = 16899\n\
+             peer_fingerprint = \"-AA1000-\"\n\
+             user_agent = \"ua-a\"\n",
+            d = p.display()
+        ),
+    )
+    .unwrap();
+
+    for check in [true, false] {
+        let (code, out) = run_to_exit(&cfg, check, Some(&p.join("empty-path")));
+        assert_eq!(code, 78, "--check-config: {check}; output: {out}");
+        assert!(out.contains("nft"), "the refusal names `nft`: {out}");
+    }
+}
+
 /// The reconciliation warning on an import boot names the database to edit,
 /// not only the file the entries came from.
 ///
@@ -548,10 +873,11 @@ fn a_migrated_registry_naming_an_unconfigured_profile_refuses_to_start() {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn the_reconciliation_warning_names_both_registry_files() {
-    const HTTP: &str = "127.0.0.1:18094";
+    let addr = free_http();
+    let addr = addr.as_str();
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
-    let cfg = write_config(p, 16894, HTTP);
+    let cfg = write_config(p, free_port(), addr);
 
     // Assignments for the profile that *is* configured, so the boot check
     // passes and the reconciliation below is reached — and no resume file for
@@ -572,7 +898,7 @@ fn the_reconciliation_warning_names_both_registry_files() {
         .spawn()
         .expect("spawn daemon");
 
-    wait_healthy(HTTP);
+    wait_healthy(addr);
     sigterm(&child);
     assert!(
         wait_exit(&mut child, Duration::from_secs(30)),
@@ -612,7 +938,7 @@ fn the_reconciliation_warning_names_both_registry_files() {
         .stdout(std::process::Stdio::piped())
         .spawn()
         .expect("spawn daemon");
-    wait_healthy(HTTP);
+    wait_healthy(addr);
     sigterm(&child);
     assert!(
         wait_exit(&mut child, Duration::from_secs(30)),
@@ -632,5 +958,101 @@ fn the_reconciliation_warning_names_both_registry_files() {
     assert!(
         warning.contains("\"registry_torrents\":2"),
         "both entries survive into the second boot: {warning}",
+    );
+}
+
+/// A non-reloadable edit is reported on every reload until a restart takes
+/// it, not only on the first.
+///
+/// The reload pump used to record the whole new file as the running config
+/// after each reload, so the second reload of the same edit answered
+/// `SIGHUP: config unchanged` about a `file_pool_size` the daemon was still
+/// not running.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_non_reloadable_change_is_reported_on_the_second_reload_too() {
+    const WARNING: &str = "non-reloadable field requires daemon restart";
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), addr);
+    // Killed if an assertion below panics, rather than left running and
+    // holding the test runner's stderr open.
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    // The daemon logs JSON lines to stdout; a reader thread keeps the pipe
+    // drained and hands each line over as it arrives.
+    let (tx, lines) = std::sync::mpsc::channel::<String>();
+    let stdout = child.0.stdout.take().expect("piped stdout");
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    wait_healthy(addr);
+
+    // A top-level key, so it goes above the `[[profile]]` table.
+    let body = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        body.replace(
+            "enable_lsd = false\n",
+            "enable_lsd = false\nfile_pool_size = 2000\n",
+        ),
+    )
+    .unwrap();
+
+    // Wait for the next reload's verdict: the restart warning naming the key,
+    // or `config unchanged`.
+    let verdict = |seen: &mut Vec<String>| -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match lines.recv_timeout(left) {
+                Ok(line) => {
+                    seen.push(line.clone());
+                    if (line.contains(WARNING) && line.contains("file_pool_size"))
+                        || line.contains("SIGHUP: config unchanged")
+                    {
+                        return line;
+                    }
+                }
+                Err(_) => panic!("no reload verdict within 10s; output:\n{}", seen.join("\n")),
+            }
+        }
+    };
+    let mut seen = Vec::new();
+    for reload in ["first", "second"] {
+        let (code, body) = http(addr, "POST", "/v1/config/reload", None);
+        assert!((200..300).contains(&code), "reload trigger: {code} {body}");
+        let line = verdict(&mut seen);
+        assert!(
+            line.contains(WARNING),
+            "the {reload} reload must still report the restart it needs: {line}",
+        );
+    }
+
+    sigterm(&child.0);
+    assert!(
+        wait_exit(&mut child.0, Duration::from_secs(30)),
+        "daemon did not exit within 30s of SIGTERM"
     );
 }

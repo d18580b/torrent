@@ -120,6 +120,14 @@ pub struct Config {
     pub max_concurrent_http_announces: Option<u32>,
     #[serde(default)]
     pub upload_rate_limit: Option<u32>,
+    /// A fixed number of peers to unchoke per session.
+    ///
+    /// Absent, the session runs libtorrent's rate-based choker, which opens
+    /// slots while the upload rate achieved to them supports it (see
+    /// `Settings::server_seed_overrides`). Set, it selects the fixed-slots
+    /// choker with exactly this many. Read at startup.
+    #[serde(default)]
+    pub unchoke_slots_limit: Option<u32>,
     #[serde(default)]
     pub peer_fingerprint: Option<String>,
     #[serde(default)]
@@ -130,6 +138,14 @@ pub struct Config {
     /// keeps its IP but has silently stopped handshaking. Default 180s.
     #[serde(default = "Config::default_handshake_max_age")]
     pub vpn_handshake_max_age_secs: u64,
+
+    /// How long the shutdown drain waits for outstanding resume saves before
+    /// giving up on them, in seconds. Default 60. A pool of 100K torrents
+    /// answers a whole-pool save in batches of `RESUME_SAVES_IN_FLIGHT`, so a
+    /// large pool on slow storage may need more; `deploy/torrentd.service`'s
+    /// `TimeoutStopSec` is sized to the default.
+    #[serde(default = "Config::default_shutdown_drain_secs")]
+    pub shutdown_drain_secs: u64,
 
     /// Install a fail-closed nftables kill switch that
     /// confines the daemon's egress to loopback + the profiles' tunnel interfaces.
@@ -237,6 +253,14 @@ impl Config {
     fn default_handshake_max_age() -> u64 {
         180
     }
+
+    fn default_shutdown_drain_secs() -> u64 {
+        60
+    }
+
+    /// The largest `shutdown_drain_secs` accepted. An hour is already far
+    /// past any stop budget a supervisor would grant.
+    pub const MAX_SHUTDOWN_DRAIN_SECS: u64 = 3600;
 
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let cfg = Self::parse(path)?;
@@ -369,6 +393,7 @@ impl Config {
             .context("[[profile]] validation failed")?;
         self.validate_effective_store_dirs()
             .context("[[profile]] validation failed")?;
+        self.validate_http_listen_port()?;
 
         // Parsed at startup so a malformed CIDR is a config error rather than
         // a proxy that silently stops being trusted. Not gated on
@@ -433,6 +458,14 @@ impl Config {
             }
             Ok(())
         };
+        // Zero would skip the drain outright and lose every unsaved resume.
+        if !(1..=Self::MAX_SHUTDOWN_DRAIN_SECS).contains(&self.shutdown_drain_secs) {
+            anyhow::bail!(
+                "shutdown_drain_secs = {} is out of range (1..={})",
+                self.shutdown_drain_secs,
+                Self::MAX_SHUTDOWN_DRAIN_SECS,
+            );
+        }
         range("connections_limit", self.connections_limit, 1, 1_000_000)?;
         range("file_pool_size", self.file_pool_size, 1, 1_000_000)?;
         range("aio_threads", self.aio_threads, 1, 1024)?;
@@ -451,6 +484,14 @@ impl Config {
             self.upload_rate_limit,
             0,
             i32::MAX as u32,
+        )?;
+        // Zero unchokes nobody, which is a seeder that uploads nothing; the
+        // upper end keeps the value inside libtorrent's int setting.
+        range(
+            "unchoke_slots_limit",
+            self.unchoke_slots_limit,
+            1,
+            1_000_000,
         )?;
 
         if let Some(auth) = &self.auth {
@@ -604,9 +645,11 @@ impl Config {
             aio_threads: new_aio_threads,
             max_concurrent_http_announces: new_max_concurrent_http_announces,
             upload_rate_limit: new_upload_rate_limit,
+            unchoke_slots_limit: new_unchoke_slots_limit,
             peer_fingerprint: new_peer_fingerprint,
             user_agent: new_user_agent,
             vpn_handshake_max_age_secs: new_vpn_handshake_max_age_secs,
+            shutdown_drain_secs: new_shutdown_drain_secs,
             network_kill_switch: new_network_kill_switch,
             profile: new_profile,
             auth: new_auth,
@@ -694,6 +737,12 @@ impl Config {
             // field in this list.
             d.non_reloadable_changes.push("file_pool_size");
         }
+        // Not reloadable: it also chooses the choker, and a reload that
+        // switched algorithms under live peers is not something this daemon
+        // has ever tested.
+        if old.unchoke_slots_limit != *new_unchoke_slots_limit {
+            d.non_reloadable_changes.push("unchoke_slots_limit");
+        }
         if old.peer_fingerprint != *new_peer_fingerprint {
             d.non_reloadable_changes.push("peer_fingerprint");
         }
@@ -747,6 +796,10 @@ impl Config {
         if old.vpn_handshake_max_age_secs != *new_vpn_handshake_max_age_secs {
             d.non_reloadable_changes.push("vpn_handshake_max_age_secs");
         }
+        // Handed to the alert loop once, when it is spawned.
+        if old.shutdown_drain_secs != *new_shutdown_drain_secs {
+            d.non_reloadable_changes.push("shutdown_drain_secs");
+        }
         if old.network_kill_switch != *new_network_kill_switch {
             d.non_reloadable_changes.push("network_kill_switch");
         }
@@ -779,6 +832,11 @@ impl Config {
         if let Some(v) = self.upload_rate_limit {
             s.upload_rate_limit = Some(v);
         }
+        if let Some(v) = self.unchoke_slots_limit {
+            // `validate` holds it to 1..=1_000_000, so it fits the i32.
+            s.choking_algorithm = Some(libtorrent_safe::Settings::FIXED_SLOTS_CHOKER);
+            s.unchoke_slots_limit = Some(i32::try_from(v).unwrap_or(i32::MAX));
+        }
         if let Some(v) = self.peer_fingerprint.as_ref() {
             s.peer_fingerprint = Some(v.clone());
         }
@@ -793,10 +851,9 @@ impl Config {
     ///
     /// `startup::boot` refuses `network_kill_switch = true` with no tunnel to
     /// confine egress to, or with a host profile the ruleset would silently
-    /// cut off, and `--check-config` — which
-    /// `deploy/torrentd.service` runs as its `ExecStartPre`, so that a bad
-    /// configuration fails before `ExecStart` rather than under
-    /// `Restart=on-failure` — did not. The configuration that reaches it, a
+    /// cut off, and `--check-config` — the pre-flight that exists so a bad
+    /// configuration is caught before the daemon is restarted onto it — did
+    /// not. The configuration that reaches it, a
     /// set of profiles with zero tunnels, is new in this change.
     ///
     /// Called from [`Config::validate_inner`], above the authentication
@@ -1094,6 +1151,38 @@ impl Config {
                     }
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse an `http_listen` port a profile's session also listens on.
+    ///
+    /// libtorrent binds its TCP listen socket before the HTTP listener binds,
+    /// so the collision surfaces as the HTTP bind failing and the daemon
+    /// exiting 70 after it has already brought up every session — or, where
+    /// the addresses happen not to overlap today, as a config that breaks the
+    /// day one of them changes. `--check-config` printed `config OK` for it.
+    ///
+    /// Compared on the port alone, as `ProfileConfig::validate_set` compares
+    /// two profiles' ports and for its reason: a `listen_interfaces` address
+    /// need not be a literal, `0.0.0.0` overlaps every address, and a vpn
+    /// profile binds whatever address its tunnel is given at runtime.
+    /// Refusing a pair that would have bound on disjoint addresses costs one
+    /// port number; accepting a colliding one costs the daemon.
+    fn validate_http_listen_port(&self) -> anyhow::Result<()> {
+        let port = self.http_listen.port();
+        if let Some(p) = self
+            .profile
+            .iter()
+            .find(|p| p.configured_listen_ports().contains(&port))
+        {
+            anyhow::bail!(
+                "http_listen = {} uses port {port}, which [[profile]] id = \"{}\" also \
+                 listens on. The session binds it first and the HTTP API then fails to \
+                 start. Give http_listen a port no profile uses.",
+                self.http_listen,
+                p.id.as_str(),
+            );
         }
         Ok(())
     }
@@ -1608,9 +1697,11 @@ impl Config {
             aio_threads: None,
             max_concurrent_http_announces: None,
             upload_rate_limit: None,
+            unchoke_slots_limit: None,
             peer_fingerprint: None,
             user_agent: None,
             vpn_handshake_max_age_secs: Self::default_handshake_max_age(),
+            shutdown_drain_secs: Self::default_shutdown_drain_secs(),
             network_kill_switch: false,
             profile: vec![],
             auth: None,
@@ -3362,9 +3453,8 @@ upload_rate_limit = 0"#,
 
     #[test]
     fn check_config_refuses_a_kill_switch_with_no_tunnel_to_confine_egress_to() {
-        // `deploy/torrentd.service` runs `--check-config` as its
-        // `ExecStartPre` so a bad configuration fails before `ExecStart`
-        // rather than under `Restart=on-failure`. This refusal is a pure
+        // `--check-config` is the pre-flight that catches a bad configuration
+        // before the daemon is restarted onto it. This refusal is a pure
         // function of the file and `boot` makes it anyway, so the pre-flight
         // has no reason not to.
         //
@@ -3645,6 +3735,90 @@ library_dir = "{d}/library"
     }
 
     #[test]
+    fn an_http_listen_port_a_profile_listens_on_is_refused() {
+        let dir = tempdir().unwrap();
+        // A host profile's `listen_interfaces`, on another address.
+        let host = single_session().replace("0.0.0.0:6881", "0.0.0.0:6881,[::]:8080");
+        let msg = format!(
+            "{:#}",
+            Config::load(&write_cfg(dir.path(), &host)).unwrap_err()
+        );
+        assert!(
+            msg.contains("http_listen") && msg.contains("8080"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("\"public\""), "names the profile: {msg}");
+
+        // A vpn profile's static `listen_port`.
+        let mut c = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        c.profile[0] = ProfileConfig {
+            id: torrentd_engine::ProfileId::new("acct_a"),
+            network: torrentd_engine::ProfileNetwork::Vpn {
+                vpn_type: torrentd_engine::VpnType::Wireguard,
+                vpn_config: PathBuf::from("/etc/wireguard/wg0.conf"),
+                vpn_interface: "wg0".into(),
+                listen_port: Some(8080),
+                port_forward: Default::default(),
+                port_forward_gateway: None,
+            },
+            peer_fingerprint: Some("-AA1000-".into()),
+            user_agent: Some("qB/5.0".into()),
+            resume_dir: None,
+            torrent_dir: None,
+            allowed_tracker_domains: vec![],
+            upload_rate_limit: None,
+        };
+        let msg = format!("{:#}", c.validate_http_listen_port().unwrap_err());
+        assert!(msg.contains("\"acct_a\""), "got: {msg}");
+
+        // Distinct ports are fine.
+        Config::load(&write_cfg(dir.path(), &single_session()))
+            .expect("8080 and 6881 do not collide");
+    }
+
+    #[test]
+    fn an_absent_unchoke_slots_limit_leaves_the_rate_based_choker() {
+        let dir = tempdir().unwrap();
+        let c = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        let s = c.libtorrent_settings();
+        assert_eq!(
+            s.choking_algorithm,
+            Some(libtorrent_safe::Settings::RATE_BASED_CHOKER)
+        );
+        assert_eq!(
+            s.unchoke_slots_limit,
+            Some(libtorrent_safe::Settings::DEFAULT_UNCHOKE_SLOTS)
+        );
+    }
+
+    #[test]
+    fn an_unchoke_slots_limit_selects_the_fixed_slots_choker_with_that_many() {
+        let dir = tempdir().unwrap();
+        let body = with_top_level("unchoke_slots_limit = 64");
+        let c = Config::load(&write_cfg(dir.path(), &body)).unwrap();
+        let s = c.libtorrent_settings();
+        assert_eq!(
+            s.choking_algorithm,
+            Some(libtorrent_safe::Settings::FIXED_SLOTS_CHOKER)
+        );
+        assert_eq!(s.unchoke_slots_limit, Some(64));
+
+        let zero = with_top_level("unchoke_slots_limit = 0");
+        let msg = format!(
+            "{:#}",
+            Config::load(&write_cfg(dir.path(), &zero)).unwrap_err()
+        );
+        assert!(msg.contains("unchoke_slots_limit"), "got: {msg}");
+
+        let mut other = c.clone();
+        other.unchoke_slots_limit = Some(128);
+        assert_eq!(
+            Config::diff(&c, &other).non_reloadable_changes,
+            vec!["unchoke_slots_limit"],
+        );
+    }
+
+    #[test]
     fn diff_separates_reloadable_from_non() {
         let dir = tempdir().unwrap();
         let p = write_cfg(dir.path(), &single_session());
@@ -3676,6 +3850,20 @@ library_dir = "{d}/library"
     }
 
     #[test]
+    fn the_shutdown_drain_defaults_to_a_minute_and_refuses_zero() {
+        let dir = tempdir().unwrap();
+        let base = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        assert_eq!(base.shutdown_drain_secs, 60);
+        // Zero would skip the drain and lose every unsaved resume.
+        let text = format!("shutdown_drain_secs = 0\n{}", single_session());
+        let e = Config::load(&write_cfg(dir.path(), &text)).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("shutdown_drain_secs"),
+            "got {e:#}"
+        );
+    }
+
+    #[test]
     fn an_edit_to_any_non_reloadable_key_is_reported() {
         // The property: a config that differs in exactly one key the daemon
         // cannot apply is not an unchanged config, and the warning names the
@@ -3700,6 +3888,9 @@ library_dir = "{d}/library"
         let mut handshake = base.clone();
         handshake.vpn_handshake_max_age_secs = base.vpn_handshake_max_age_secs + 60;
 
+        let mut drain = base.clone();
+        drain.shutdown_drain_secs = base.shutdown_drain_secs + 30;
+
         let mut kill_switch = base.clone();
         kill_switch.network_kill_switch = !base.network_kill_switch;
 
@@ -3717,6 +3908,7 @@ library_dir = "{d}/library"
             ("default_save_path", &save_path),
             ("registry_path", &registry),
             ("vpn_handshake_max_age_secs", &handshake),
+            ("shutdown_drain_secs", &drain),
             ("network_kill_switch", &kill_switch),
             ("pool", &pool),
         ] {

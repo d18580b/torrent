@@ -8,7 +8,7 @@
 #   mise run setup       # install nightly rustfmt + activate the hooks (once)
 #   mise run fmt|lint|test|check
 #   mise run test-shim|test-lifecycle|test-daemon|test-torrentctl|test-all|test-alerts
-#   mise run openapi|openapi-check|check-fault-injection
+#   mise run openapi|openapi-check|test-fault-injection|deny
 #   mise run bench -- <subcommand>
 
 [tools]
@@ -16,8 +16,19 @@ hk = "1.48.0"
 # convco is not in the mise/aqua registry; the cargo backend fetches a prebuilt
 # binary via cargo-binstall when available, else compiles from source.
 "cargo:convco" = "0.6.4"
+# Supply-chain policy (deny.toml): advisories, licenses, bans, sources. The
+# cargo backend fetches the prebuilt binary through cargo-binstall.
+"cargo:cargo-deny" = "0.20.2"
 # pkl is intentionally omitted: hk parses hk.pkl with its built-in evaluator.
 # Set HK_PKL_BACKEND=pkl and add `pkl` here only if you want the pkl CLI instead.
+
+[settings]
+# Install tools one at a time. Each `cargo:` tool runs cargo in this directory,
+# and the first cargo run makes rustup install the rust-toolchain.toml channel
+# and components. Two `cargo:` tools installed in parallel run two of those
+# rustup installs into the same toolchain directory at once, and the loser
+# fails with "failed to install component ... detected conflict".
+jobs = 1
 
 [env]
 # Nightly is used ONLY for rustfmt: granular import normalization
@@ -102,6 +113,7 @@ description = "Every automated test, including the ignored integration layers"
 # spelled out where a reader of the task can see it.
 run = [
   "mise run test",
+  "mise run test-fault-injection",
   "mise run test-shim",
   "mise run test-lifecycle",
   "mise run test-daemon",
@@ -127,12 +139,20 @@ run = [
   "git diff --exit-code -- docs/api/openapi.json",
 ]
 
-# The alert drill's build (deploy/drill). Checked rather than built: it proves
-# the fault-injection code compiles, including its tests, without a second
-# full link of the daemon.
-[tasks.check-fault-injection]
-description = "Type-check the fault-injection build and its tests"
-run = "cargo check -p torrentd --features fault-injection --all-targets"
+# The alert drill's build (deploy/drill), with its tests run. This used to be
+# `cargo check --all-targets`, which proved the fault-injection code and its
+# tests compile and never ran one: `POST /v1/faults`' scenarios and
+# `FaultEngine`'s own tests exist only in this build, so nothing executed them.
+[tasks.test-fault-injection]
+description = "Run torrentd's tests in the fault-injection build"
+run = "cargo test -p torrentd --features fault-injection"
+
+# The dependency policy in deny.toml: RustSec advisories, licenses, duplicate
+# and wildcard bans, and allowed sources. Reads Cargo.lock and the advisory
+# database; builds nothing.
+[tasks.deny]
+description = "cargo-deny: advisories, licenses, bans and sources (deny.toml)"
+run = "cargo deny check"
 
 # Live verification against real VPN credentials. Deliberately separate from
 # every `test` task: it needs a real host with real tunnels, it is the one

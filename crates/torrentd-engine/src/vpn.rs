@@ -5,11 +5,14 @@
 //! shell-out behavior. Here we declare the trait and a `MockVpn` test
 //! double that returns canned IPs.
 
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::PathBuf;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 
+#[cfg(any(test, feature = "test-support"))]
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
@@ -67,6 +70,7 @@ pub trait VpnManager: Send + Sync + std::fmt::Debug {
     fn bring_down(&self, iface: &str);
 }
 
+#[cfg(any(test, feature = "test-support"))]
 /// Test double. Hand-managed map of `iface -> ip`. `set_ip` advances the
 /// IP in-test to simulate a tunnel re-keying or operator change.
 #[derive(Debug, Default, Clone)]
@@ -74,6 +78,7 @@ pub struct MockVpn {
     inner: Arc<Mutex<MockVpnInner>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 struct MockVpnInner {
     ips: HashMap<String, IpAddr>,
@@ -82,6 +87,7 @@ struct MockVpnInner {
     bring_down_calls: Vec<String>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl MockVpn {
     pub fn new() -> Self {
         Self::default()
@@ -108,6 +114,7 @@ impl MockVpn {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 impl VpnManager for MockVpn {
     fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError> {
         let mut g = self.inner.lock();

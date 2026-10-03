@@ -97,6 +97,16 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError>;
     /// The torrent's trackers, tier by tier, with their announce state.
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError>;
+    /// Destroy the session now, closing every peer and tracker socket, and
+    /// answer every later call with [`EngineError::Shutdown`].
+    ///
+    /// The daemon's teardown calls this before it takes a tunnel down.
+    /// Dropping the last `Arc` would destroy the session too, but only once
+    /// every task holding a clone has let go, which a teardown cannot wait
+    /// for or observe; a session outliving its tunnel is sockets bound to an
+    /// address whose route is about to disappear. Idempotent. The default
+    /// does nothing, for engines with no session to close.
+    fn close(&self) {}
 }
 
 // Convenience: any Arc<dyn TorrentEngine> is itself a TorrentEngine.
@@ -159,5 +169,8 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
         (**self).torrent_trackers(h)
+    }
+    fn close(&self) {
+        (**self).close()
     }
 }

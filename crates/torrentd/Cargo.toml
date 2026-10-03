@@ -51,15 +51,18 @@ thiserror = { workspace = true }
 # Misc
 parking_lot = { workspace = true }
 hex = { workspace = true }
+libc = { workspace = true }
 sha1 = { workspace = true }
 
 [features]
 # The alert drill's build (deploy/drill): layers a MockEngine over every
 # session and mounts `POST /v1/faults` to queue alerts, stall the alert loop,
 # or panic a task. Never enable it for a deployment; no release image does.
-fault-injection = []
+fault-injection = ["torrentd-engine/test-support"]
 
 [dev-dependencies]
+# The engine's test doubles, for this crate's unit tests only.
+torrentd-engine = { workspace = true, features = ["test-support"] }
 tempfile = { workspace = true }
 # Fault injection into the assignment registry's database.
 rusqlite = { workspace = true }

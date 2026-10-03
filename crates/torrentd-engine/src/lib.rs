@@ -10,10 +10,12 @@
 #![warn(missing_debug_implementations)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod batch_writer;
 pub mod clock;
 pub mod engine;
 pub mod handlers;
 pub mod metrics;
+#[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 pub mod policy;
 pub mod port_forward;
@@ -36,6 +38,9 @@ pub use alert_loop::AlertLoopHandle;
 pub use alert_loop::FatalCallback;
 pub use alert_loop::ProfileFenced;
 pub use alert_loop::ShutdownReason;
+pub use alert_loop::DEFAULT_SHUTDOWN_DEADLINE;
+pub use alert_loop::POST_UPDATES_INTERVAL;
+pub use batch_writer::WriteErrorHook;
 pub use clock::Clock;
 pub use clock::MockClock;
 pub use clock::SystemClock;
@@ -58,8 +63,11 @@ pub use libtorrent_safe::TrackerEntry;
 pub use metrics::MetricsSink;
 pub use metrics::NoopSink;
 pub use metrics::RecordingSink;
+#[cfg(any(test, feature = "test-support"))]
 pub use mock::HeldCall;
+#[cfg(any(test, feature = "test-support"))]
 pub use mock::MockEngine;
+#[cfg(any(test, feature = "test-support"))]
 pub use mock::RecordedCall;
 pub use policy::discovery_guards;
 pub use policy::forbidden;
@@ -69,6 +77,7 @@ pub use policy::seed_flags;
 pub use policy::verify_flags;
 pub use port_forward::renew_and_rebind;
 pub use port_forward::MapResult;
+#[cfg(any(test, feature = "test-support"))]
 pub use port_forward::MockForwarder;
 pub use port_forward::PortForwardError;
 pub use port_forward::PortForwardMode;
@@ -88,6 +97,7 @@ pub use registry::RegistryError;
 pub use resume_store::FsResumeStore;
 pub use resume_store::MemoryResumeStore;
 pub use resume_store::ResumeStore;
+pub use resume_store::Scan;
 pub use source::AlertSource;
 pub use source::ProfileSource;
 pub use state::RetryState;
@@ -98,6 +108,7 @@ pub use state::TorrentState;
 pub use torrent_store::FsTorrentStore;
 pub use torrent_store::MemoryTorrentStore;
 pub use torrent_store::TorrentStore;
+#[cfg(any(test, feature = "test-support"))]
 pub use vpn::MockVpn;
 pub use vpn::VpnError;
 pub use vpn::VpnManager;

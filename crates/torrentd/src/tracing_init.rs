@@ -503,6 +503,55 @@ pub fn init(level: LogLevel) -> LogReloadHandle {
     LogReloadHandle { inner: handle }
 }
 
+/// `init`'s subscriber, reloadable filter and daemon layer included, writing
+/// to `writer` and installed nowhere, so a test can scope it with
+/// `tracing::subscriber::set_default` and drive a real `LogReloadHandle`.
+#[cfg(test)]
+pub(crate) fn for_tests<W>(
+    level: LogLevel,
+    writer: W,
+) -> (LogReloadHandle, impl Subscriber + Send + Sync)
+where
+    W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let (filter_layer, handle) = reload::Layer::new(level_filter(level));
+    let subscriber = tracing_subscriber::registry()
+        .with(filter_layer)
+        .with(fmt_layer(writer));
+    (LogReloadHandle { inner: handle }, subscriber)
+}
+
+/// An in-memory log a test hands to `fmt_layer` and reads back.
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(test)]
+impl Buf {
+    pub(crate) fn text(&self) -> String {
+        String::from_utf8(self.0.lock().expect("buffer lock").clone()).expect("utf8")
+    }
+}
+
+#[cfg(test)]
+impl std::io::Write for Buf {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("buffer lock").extend_from_slice(b);
+        Ok(b.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl<'w> MakeWriter<'w> for Buf {
+    type Writer = Buf;
+    fn make_writer(&'w self) -> Self::Writer {
+        self.clone()
+    }
+}
+
 /// The JSON formatting layer, redaction included, writing to `writer`.
 fn fmt_layer<S, W>(writer: W) -> impl Layer<S>
 where
@@ -525,10 +574,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io;
-    use std::sync::Arc;
-    use std::sync::Mutex;
-
     use super::*;
 
     const PASSKEY: &str = "0123456789abcdef0123456789abcdef";
@@ -823,26 +868,6 @@ mod tests {
         assert_eq!(redacted(&once), once);
     }
 
-    #[derive(Clone, Default)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
-
-    impl io::Write for Buf {
-        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
-            self.0.lock().expect("buffer lock").extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'w> MakeWriter<'w> for Buf {
-        type Writer = Buf;
-        fn make_writer(&'w self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     #[test]
     fn the_daemon_layer_redacts_message_event_fields_and_span_fields() {
         let buf = Buf::default();
@@ -853,7 +878,7 @@ mod tests {
             let _enter = span.enter();
             tracing::info!(tracker = %url, "==> TRACKER_REQUEST [ url: {url} ]");
         });
-        let out = String::from_utf8(buf.0.lock().expect("buffer lock").clone()).expect("utf8");
+        let out = buf.text();
         assert!(!out.contains(PASSKEY), "{out}");
         let line: serde_json::Value = serde_json::from_str(out.trim()).expect("one JSON line");
         let redacted_url = redacted(&url);
