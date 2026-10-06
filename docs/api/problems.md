@@ -42,6 +42,7 @@ says everything there is to say:
 | `401` | No bearer token, or one that is unknown, expired or revoked. `WWW-Authenticate: Bearer` accompanies it. |
 | `404` | No route matches the path. |
 | `405` | The route exists, but not for this method. |
+| `408` | An operation that takes a body did not receive it and answer within its deadline (30 seconds, or 300 for `POST /v1/torrents`). Effects already started are not undone: an add may still complete, and a pool verification's rechecks may still start. |
 | `413` | The request body is over the operation's limit (64 KiB, or 96 MiB for `POST /v1/torrents`). |
 | `415` | A body whose `Content-Type` is not `application/json`. |
 | `422` | A JSON body of the wrong shape: a missing field, an unknown field, or a value of the wrong type. |
@@ -167,6 +168,14 @@ profile.
 **409**, from `DELETE /v1/torrents/{infohash}`. The torrent is still being
 added to its session. Retry once it appears in `GET /v1/torrents`.
 
+## `payload-shared`
+
+**409**, from `DELETE /v1/torrents/{infohash}?delete_files=true`. The pool
+index has another torrent claiming some of this torrent's files — a
+cross-seed of the same payload, or a conflict — so deleting them would delete
+that torrent's payload too. `detail` names the first. Retry without
+`delete_files` to remove the torrent alone.
+
 ## `metadata-pending`
 
 **409.** The torrent was added from a magnet URI and has not received its
@@ -191,8 +200,12 @@ parsed, or the `.torrent` could not be read.
 ## `tracker-not-allowed`
 
 **422**, from `POST /v1/torrents`. The profile sets `allowed_tracker_domains`,
-and the `.torrent` announces to none of them. This guards against adding one
-account's torrent to another account's profile.
+and the torrent announces to a tracker outside them — a `.torrent`'s announce
+list and a magnet's `tr=` parameters are both read — or to no tracker at all.
+Every tracker must be allowed, not just one. This guards against announcing
+one account's passkey from another account's profile. `POST
+/v1/pool/adoptions` refuses such a torrent the same way, in its `refused`
+list.
 
 ## `plan-refused`
 
@@ -244,6 +257,12 @@ run yet. The queued reload will read the same file.
 ## `reload-unavailable`
 
 **503**, from `POST /v1/config/reload`. The reload task is not running.
+
+## `too-many-event-streams`
+
+**503**, from `GET /v1/events`. 64 event streams are already open on this
+daemon, and each holds its slot for as long as its client keeps it. Close a
+stream you no longer read, or retry in a few seconds.
 
 ## `internal`
 

@@ -237,7 +237,7 @@ Every profile takes `id` plus `network`, and then:
 
 | `network = "host"` | |
 | --- | --- |
-| `listen_interfaces` | **required**, e.g. `"0.0.0.0:6881,[::]:6881"` |
+| `listen_interfaces` | **required**, e.g. `"eth0:6881"` or `"0.0.0.0:6881,[::]:6881"`. The unspecified address is refused when any `vpn` profile is configured — see [Account isolation](#account-isolation). |
 | `dht` | default `false`. DHT is a public announcement of what this host holds, so it is opt-in. |
 
 | `network = "vpn"` | |
@@ -245,7 +245,8 @@ Every profile takes `id` plus `network`, and then:
 | `vpn_type`, `vpn_config`, `vpn_interface` | **required**. `vpn_interface` must equal `vpn_config`'s file stem — wg-quick derives one from the other in both directions. |
 | `listen_port` | required for `port_forward = "static"` (the default); omitted for `"natpmp"` |
 | `port_forward`, `port_forward_gateway` | default `static`, and `10.2.0.1` |
-| `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters, such as `"-XX0002-"` — in the same form as the top-level key it overrides. |
+| `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client, so the two must name the same client: `"-qB5030-"` with `"qBittorrent/5.0.3"`, not a prefix of one client beside another's user agent. Nothing checks the pairing. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters — in the same form as the top-level key it overrides, and never libtorrent's own `-LT` code. |
+| `allowed_tracker_domains` | **required**, non-empty: the domains of this account's trackers — see [Account isolation](#account-isolation). |
 
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
@@ -328,6 +329,50 @@ Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
 `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
 `peer_fingerprint`, `user_agent`, `resume_dir` and `torrent_dir` must all
 be unique across profiles.
+
+#### Account isolation
+
+Three rules keep one account's identity off another account's traffic, and a
+configuration that breaks one is refused at load and by `--check-config`:
+
+- **`allowed_tracker_domains` is required on every `vpn` profile.** Each entry
+  is a domain, such as `"tracker.example.com"`, matching that host and its
+  subdomains, case-insensitively; an entry that is blank or contains a comma or
+  whitespace is refused on any profile. A profile that sets the list takes a
+  torrent only when **every** tracker it would announce to is on it, and it
+  announces to at least one. One allowed tracker beside a foreign one does not
+  admit the torrent: libtorrent would announce to both. The check runs on all
+  five add paths, against what each hands the session: `POST /v1/torrents` (a
+  `.torrent`'s announce list, a magnet's `tr=` parameters), `POST
+  /v1/pool/adoptions` (the previous client's resume data, whose own `trackers`
+  list replaces the `.torrent`'s where it has one, and the `.torrent` the
+  verify queue adds), and at startup each profile's resume directory and
+  `.torrent` directory. The API answers `422 tracker-not-allowed`, an adoption
+  lists the torrent under `refused`, and a startup scan leaves it unloaded with
+  a warning; each counts it in `profile_assignment_registry_errors_total`. A
+  host profile may set the list too, and is not checked when it does not.
+- **A host profile may not listen on `0.0.0.0` or `[::]` beside a `vpn`
+  profile.** libtorrent expands the unspecified address to every interface
+  that is up, the tunnels included, and announces from each listen socket, so
+  the host profile would announce from the accounts' tunnel addresses too.
+  Name the host's own address (`"192.0.2.10:6881"`) or network device
+  (`"eth0:6881"`) instead. A host profile with no `vpn` profile beside it keeps
+  the wildcard.
+- **No `peer_fingerprint` may start with `-LT`**, top-level or per profile.
+  That is libtorrent's own client code, which every unconfigured libtorrent
+  session announces (`-LT20E0-` in the version this daemon is built on).
+
+Pool adoption also refuses a torrent the pool index assigns to another profile,
+even when no session holds it now; `DELETE /v1/torrents/{infohash}` clears the
+index's record along with the assignment.
+
+**Upgrading.** A configuration that loaded before this release can be refused
+by these rules. Add `allowed_tracker_domains` to each `vpn` profile, replace a
+host profile's wildcard `listen_interfaces` where `vpn` profiles sit beside it,
+and replace an `-LT` fingerprint with the prefix of the client the profile's
+`user_agent` names. Existing torrents are held to the list at the next start:
+one whose trackers fall outside it is left unloaded, with its assignment and
+files in place, and a warning names it.
 
 **`[pool]`** (optional) — `roots` (required, must not nest and must not contain
 the daemon's own state), `library_dir` (required), `db_path`
@@ -431,6 +476,19 @@ that predates this change. It is the only copy of the `plan`/`plan_step`
 mutation journal, which a rescan does not reconstruct. The migration is applied
 in one transaction, so a failure part way through leaves the index exactly as
 it was.
+
+A further step, schema version 4, adds a column marking BEP 47 padding files
+and a table holding the index generation. It is additive and takes no copy, but
+a build that knows only version 3 refuses the result. Torrents indexed before it
+keep reading their padding entries as payload, and so as `partial`, until the
+library is scanned again: run `torrentd pool scan` once after upgrading.
+
+Schema version 5 materialises the directory tree: each file's directory, and
+per directory the byte accounting the tree listing and `GET /v1/pool` show.
+The step derives all of it from the index already on disk, in the same
+transaction as the version write, so it needs no rescan; on an index of
+millions of files it adds seconds to that first start. It is additive and
+takes no copy, but a build that knows only version 4 refuses the result.
 
 **If the migration fails, that copy is not the remedy.** It is taken
 immediately before the steps that failed, so it is a copy of the index as it
@@ -594,6 +652,15 @@ So there are two safe shapes:
 | loopback | absent, `allow_unauthenticated = true` | access control is the proxy's job |
 | anything | configured | the daemon authenticates itself |
 
+**A proxy in front of an unauthenticated daemon must strip `Authorization`.**
+Without `[auth]` the daemon checks no credential, but it still reads the
+header: one that is not a well-formed `Bearer` credential is answered `401`
+on every operation, because a request carrying a credential nobody checked is
+not an anonymous one. A proxy doing its own HTTP Basic login forwards that
+`Basic` header by default, and every request through it then fails. Drop it
+before forwarding — nginx `proxy_set_header Authorization "";`, Caddy
+`header_up -Authorization`.
+
 And exactly two, so `[auth]` **and** `allow_unauthenticated = true` together is
 refused as well: the flag does nothing once `[auth]` is present, but it is the
 line anyone reads to answer "does this daemon authenticate?", and a stale copy
@@ -650,7 +717,9 @@ already carries `--config /etc/torrentd/torrentd.toml`, so the subcommand is
 the only argument. Paste the output into the mounted config and
 `compose up -d` as usual.
 
-`hash-password` prompts twice when stdin is a TTY, once when piped. `new-token`
+`hash-password` prompts twice, with the terminal's echo off, when stdin is a
+TTY, and reads one line when piped. Ctrl-C at a prompt exits without
+switching echo back on; run `stty echo` to restore it. `new-token`
 prints the **token on stdout** and the **config stanza on stderr**, so
 `new-token … > token.txt` captures only the secret. A static token starts
 with `tdp_`.
@@ -662,8 +731,12 @@ There is no token-only mode: `[auth]` requires `password_hash`. Scopes are
 **Every API call is bearer-authenticated**: `Authorization: Bearer <token>`.
 There are no cookies. The password is exchanged for a session token, which
 starts with `tds_`, carries `read` and `write` — never `metrics` — and lasts
-until it expires (`expires_at` in the response), is revoked with
-`DELETE /v1/sessions/current`, or the daemon restarts.
+until it expires (`expires_at` in the response; `[auth] session_ttl_secs`,
+60 seconds to 30 days, default 12 hours), is revoked with
+`DELETE /v1/sessions/current`, or the daemon restarts. An open
+`GET /v1/events` stream ends within a second of its session doing either.
+Each `[[auth.token]]` needs a name and a token of its own: two entries sharing
+either are refused at startup.
 `GET /v1/sessions/current` describes whichever credential you present. The
 examples on this page call it `$TOKEN`; either kind works:
 
@@ -720,6 +793,8 @@ that is the proxy's address for every request, so the login throttle behaves
 as one shared bucket; on a **directly exposed** daemon it is the real client's
 address, so the throttle keys per source IP — which is the better property,
 because one attacker's failures no longer land in the same bucket as yours.
+An IPv6 client is keyed by its /64, since one host is routinely handed a whole
+/64 and would otherwise hold that many buckets.
 Either way nothing becomes forgeable.
 
 Above the per-client buckets sits one daemon-wide ceiling: at most ten
@@ -842,7 +917,24 @@ The daemon sets none of these itself.
   immediately. The systemd unit sets 65536 and the compose file matches; **a
   bare-metal run outside either gets nothing** and will hit `EMFILE`. The
   daemon warns at boot when the soft limit is below `connections_limit +
-  file_pool_size` per profile plus the API's 10 000-connection cap.
+  file_pool_size` per profile plus the API's 256-connection cap. The
+  HTTP API draws on the same table and holds at most 256 connections; the
+  next waits in the listen backlog. It closes an HTTP/1 connection whose
+  request head takes more than 10 seconds, closes an HTTP/2 connection that
+  stops answering pings for 30 seconds, and answers `408` to a request whose
+  body has not arrived and been answered within 30 seconds (300 for
+  `POST /v1/torrents`). A `408` does not undo what the request already
+  started: an add may still complete (a retry then gets `409`
+  `torrent-exists`; re-read the torrent), and a pool verification's
+  rechecks may still start. **Two idle cases are not bounded:** a connection that
+  sends no byte at all (or stops partway through the HTTP/2 preface), and an
+  HTTP/2 connection that answers pings but sends no request. 256 such sockets
+  hold every API connection, and `/healthz` and `/metrics` stop answering
+  until they close. The default loopback bind keeps them out of reach of
+  anyone who cannot already run code on the host; a non-loopback
+  `http_listen` belongs behind the proxy of §6 with its own client idle
+  timeouts (nginx `client_header_timeout`, Caddy `timeouts.read_header`),
+  which close such a connection before it reaches the daemon.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on
@@ -1358,8 +1450,20 @@ On a scratch pool, not your real one.
       is that time. Within 60 seconds of it the tracker should show the new
       port.
    4. Across a slow boot — several profiles, a large resume directory —
-      `torrentd_profile_port_forward_up` should never drop to `0` and
-      `torrentd_profile_port_forward_failures_total` should stay at `0`.
+      `torrentd_profile_port_forward_failures_total` should stay at `0`, and
+      `torrentd_profile_port_forward_up` should not drop to `0`, with one
+      exception. If the gateway hands out a new port before the alert loop
+      has cleared its boot backlog (the alerts the resume and `.torrent`
+      scans queue), the monitor cannot yet confirm a rebind promptly. It
+      leaves the session on the old port, sets
+      `torrentd_profile_port_forward_up` to `0`, logs `NAT-PMP renewed with
+      a new port before the alert loop cleared its boot backlog` at info,
+      and retries every 5 seconds. That drop is not counted as a failure,
+      and it lasts until the alert loop has cleared its boot backlog and the
+      retried rebind is confirmed. Nothing bounds that: on a boot slow
+      enough that more than about 5 minutes pass between an early port
+      change and the backlog clearing, the gauge stays at `0` long enough to
+      fire `TorrentdPortForwardDown`.
 
    This drill has not yet been run against a live Proton gateway from this
    repository: the renewal, rebind and reannounce are tested against a fake

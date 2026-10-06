@@ -281,16 +281,21 @@ int         lt_magnet_info_hash(const char* uri,
 /* One entry of a torrent's file list.
  *
  * `pieces_root` is the BitTorrent v2 per-file merkle root (SHA-256 over 16 KiB
- * leaves). It is a content identifier for the file on its own — independent of
- * name and location — which is what lets the pool index recognise a file that
- * moved or was renamed. `has_pieces_root` is 0 for v1-only torrents, where
- * pieces span file boundaries and no per-file digest exists. */
+ * leaves). `has_pieces_root` is 0 for v1-only torrents, where pieces span file
+ * boundaries and no per-file digest exists.
+ *
+ * `pad_file` is 1 for a BEP 47 padding file (`file_flags & pad_file`): an
+ * entry that aligns the next file to a piece boundary, carries a non-zero
+ * size, and is never written to disk. Anything that looks for a torrent's
+ * files on disk has to skip these, or every padded torrent reads as
+ * incomplete. */
 struct lt_torrent_meta_file {
     char     path[LT_PATH_MAX];   /* torrent-relative, '/'-separated */
     uint64_t size;
     uint8_t  pieces_root[32];
     uint8_t  has_pieces_root;
-    uint8_t  _pad[7];
+    uint8_t  pad_file;
+    uint8_t  _pad[6];
 };
 
 /* Parsed .torrent metadata. `files` is heap-allocated; release the whole
@@ -322,13 +327,24 @@ int         lt_torrent_metadata(const uint8_t* data, size_t len,
 /* Release the heap file list. Idempotent; safe on a zero-initialized struct. */
 void        lt_torrent_meta_free(struct lt_torrent_meta* m);
 
-/* Return 1 if any tracker URL host in the .torrent buffer matches (equals or
- * is a subdomain of) one of the comma-separated `domains_csv`, 0 if none
- * match, LT_ERR on parse error. Misconfiguration guard for slot assignment
- *. */
-int         lt_torrent_tracker_host_matches(const uint8_t* data, size_t len,
-                                            const char* domains_csv,
-                                            char* err_out, int err_len);
+/* The account-isolation guard: whether every tracker an add would announce to
+ * is on one of the comma-separated `domains_csv` (the host equals a domain or
+ * is a subdomain of it, case-insensitively).
+ *
+ * The source is read as the matching add reads it: resume data when
+ * `resume_buf` is given (with `torrent_buf` as the metadata it lacks, as
+ * lt_add_torrent_resume_ex attaches it), else the magnet URI, else the
+ * .torrent. The trackers checked are the ones libtorrent assembles from those
+ * params — a resume file's own `trackers` list replaces the metadata's.
+ *
+ * Returns 1 when there is at least one tracker and every one is allowed; 0
+ * when any is outside the list, cannot be parsed, or there is none at all;
+ * LT_ERR when the source cannot be parsed (err_out populated). */
+int         lt_add_trackers_allowed(const char* magnet_uri,
+                                    const uint8_t* torrent_buf, size_t torrent_len,
+                                    const uint8_t* resume_buf, size_t resume_len,
+                                    const char* domains_csv,
+                                    char* err_out, int err_len);
 
 /* ------------------------------------------------------------------ */
 /* Per-torrent queries (session required)                              */

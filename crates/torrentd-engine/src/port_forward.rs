@@ -11,14 +11,24 @@
 //! The `renew_and_rebind` helper is the testable core of the renewal loop: it
 //! renews a mapping and, if the port changed, rebinds the live libtorrent
 //! session via `TorrentEngine::apply_settings` (which reopens the listen
-//! sockets). The torrents are then reannounced in paced batches
-//! ([`reannounce_batch`], [`REANNOUNCE_BATCH`], [`REANNOUNCE_PACE`]) by the
-//! caller. It is pure with respect to metrics and health state so it can be
-//! driven by `MockForwarder` + `MockEngine` in unit tests.
+//! sockets) and waits for the session to report a listen socket on the new
+//! port. Only a confirmed rebind is reported as one, and the caller then
+//! reannounces the torrents in paced batches ([`reannounce_batch`],
+//! [`REANNOUNCE_BATCH`], [`REANNOUNCE_PACE`]). It is pure with respect to
+//! metrics and health state so it can be driven by `MockForwarder` +
+//! `MockEngine` in unit tests.
+//!
+//! `apply_settings` returning `Ok` only means the new `listen_interfaces`
+//! was handed to the session: libtorrent reopens the sockets on its network
+//! thread and reports the result as a `listen_succeeded_alert` or a
+//! `listen_failed_alert`. Those alerts reach only the alert loop, which
+//! publishes each one into a [`ListenEvents`] the renewal waits on.
 
-#[cfg(any(test, feature = "test-support"))]
 use std::collections::VecDeque;
 use std::net::IpAddr;
+use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,13 +36,14 @@ use std::time::Instant;
 
 use libtorrent_safe::Settings;
 use libtorrent_safe::TorrentHandle;
-#[cfg(any(test, feature = "test-support"))]
+use parking_lot::Condvar;
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
 
 use crate::engine::TorrentEngine;
+use crate::profile::ProfileId;
 
 /// How a profile's listening port is determined.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -219,9 +230,14 @@ pub enum RenewOutcome {
         lifetime_secs: u32,
         detected: Instant,
     },
-    /// Renewed with a new port but re-applying the listen interface failed; the
-    /// session is still bound to the old port.
-    RebindFailed { previous: u16, new: u16 },
+    /// Renewed with a new port but the session was not confirmed listening
+    /// on it. The listen interface is put back on the old port wherever it
+    /// was changed, and nothing is to be reannounced.
+    RebindFailed {
+        previous: u16,
+        new: u16,
+        reason: RebindFailure,
+    },
     /// Renewed onto a port that another profile already listens on. When
     /// `new` differs from `previous` the session was **not** rebound to it:
     /// two profiles announcing one port are correlatable by a tracker
@@ -232,6 +248,183 @@ pub enum RenewOutcome {
     PortTaken { previous: u16, new: u16 },
     /// The renewal request itself failed; the previous mapping is kept.
     RenewFailed(PortForwardError),
+}
+
+/// Why a rebind to a new port did not take.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RebindFailure {
+    /// Nothing publishes the session's listen outcomes promptly yet (the
+    /// alert loop has not cleared its boot backlog), so a rebind could not
+    /// be confirmed. The session was left alone.
+    Unobserved,
+    /// The session refused the new `listen_interfaces`.
+    Apply,
+    /// The session reported a `listen_failed_alert` for the new endpoint;
+    /// the message is libtorrent's.
+    ListenFailed(String),
+    /// No listen outcome for the new endpoint arrived within the bound.
+    TimedOut,
+}
+
+impl std::fmt::Display for RebindFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RebindFailure::Unobserved => f.write_str("no listen outcome observer is running yet"),
+            RebindFailure::Apply => f.write_str("the session refused the new listen interface"),
+            RebindFailure::ListenFailed(msg) => write!(f, "listen failed: {msg}"),
+            RebindFailure::TimedOut => f.write_str("no listen outcome for the new port in time"),
+        }
+    }
+}
+
+/// How long a rebind waits for the session to report a listen outcome on
+/// the new port; a lapse is treated as a failed rebind.
+///
+/// Reopening a socket takes milliseconds on the session's network thread.
+/// What the wait covers is the alert loop reaching the outcome: it sleeps
+/// 100ms when idle and otherwise drains back to back, dispatching each
+/// batch before popping the next, so an outcome waits behind whatever was
+/// queued ahead of it. A rebind is not attempted until the loop has
+/// cleared its boot backlog ([`ListenEvents::attach`]), so the wait is
+/// against steady-state drain latency, for which 5s is generous. It is not
+/// a guarantee: a burst queued ahead of the outcome, such as the periodic
+/// resume-save walking every torrent, can still delay it past the bound.
+/// That fails safe: the rebind is reverted, counted, and retried.
+pub const LISTEN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How many listen outcomes [`ListenEvents`] keeps. A waiter that falls
+/// further behind than this misses its outcome and times out, which fails
+/// safe: the rebind is retried rather than reported.
+const LISTEN_EVENTS_KEPT: usize = 64;
+
+/// What the session said about one listen socket.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ListenConfirmation {
+    Succeeded,
+    Failed(String),
+    TimedOut,
+}
+
+#[derive(Debug)]
+struct ListenEvent {
+    seq: u64,
+    profile: ProfileId,
+    endpoint: Option<SocketAddr>,
+    failure: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ListenLog {
+    next_seq: u64,
+    recent: VecDeque<ListenEvent>,
+}
+
+/// Every profile's listen outcomes, published by the alert loop (the only
+/// consumer of `listen_succeeded_alert` and `listen_failed_alert`) and waited
+/// on, bounded, by a rebind. Shared between the two as an `Arc`.
+#[derive(Debug, Default)]
+pub struct ListenEvents {
+    attached: AtomicBool,
+    log: Mutex<ListenLog>,
+    published: Condvar,
+}
+
+impl ListenEvents {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mark a publisher as running. The alert loop calls this once a drain
+    /// first comes back empty, i.e. once its boot backlog is cleared; before
+    /// then an outcome could queue behind thousands of alerts and a waiter
+    /// would likely time out, so a rebind is deferred instead of attempted.
+    pub fn attach(&self) {
+        self.attached.store(true, Ordering::Release);
+    }
+
+    /// Whether a publisher is running and has cleared its boot backlog.
+    pub fn is_attached(&self) -> bool {
+        self.attached.load(Ordering::Acquire)
+    }
+
+    /// Record a listen outcome for `profile`. `endpoint` is the alert's
+    /// `address:port` text; `failure` is `None` for a success and the
+    /// libtorrent message for a failure.
+    pub fn publish(&self, profile: &ProfileId, endpoint: &str, failure: Option<String>) {
+        let mut log = self.log.lock();
+        let seq = log.next_seq;
+        log.next_seq += 1;
+        if log.recent.len() == LISTEN_EVENTS_KEPT {
+            log.recent.pop_front();
+        }
+        log.recent.push_back(ListenEvent {
+            seq,
+            profile: profile.clone(),
+            endpoint: parse_listen_endpoint(endpoint),
+            failure,
+        });
+        drop(log);
+        self.published.notify_all();
+    }
+
+    /// A position in the stream: [`ListenEvents::wait_for`] considers only
+    /// outcomes published after it. Taken before the change it confirms.
+    pub fn cursor(&self) -> u64 {
+        self.log.lock().next_seq
+    }
+
+    /// Block until an outcome for `profile` on `endpoint` published after
+    /// `after` arrives, or `timeout` elapses. The first such outcome
+    /// decides: libtorrent posts a socket's failures while it sets the
+    /// listener up and its successes only once every socket is set up, so a
+    /// failure on either the TCP or the uTP socket arrives first.
+    pub fn wait_for(
+        &self,
+        profile: &ProfileId,
+        after: u64,
+        endpoint: SocketAddr,
+        timeout: Duration,
+    ) -> ListenConfirmation {
+        let deadline = Instant::now() + timeout;
+        let mut log = self.log.lock();
+        loop {
+            let hit = log
+                .recent
+                .iter()
+                .find(|e| e.seq >= after && &e.profile == profile && e.endpoint == Some(endpoint));
+            if let Some(e) = hit {
+                return match &e.failure {
+                    None => ListenConfirmation::Succeeded,
+                    Some(msg) => ListenConfirmation::Failed(msg.clone()),
+                };
+            }
+            if self.published.wait_until(&mut log, deadline).timed_out() {
+                return ListenConfirmation::TimedOut;
+            }
+        }
+    }
+}
+
+/// Parse a listen alert's endpoint, which the shim formats as
+/// `address:port` with no brackets around an IPv6 address.
+fn parse_listen_endpoint(s: &str) -> Option<SocketAddr> {
+    let (host, port) = s.rsplit_once(':')?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    Some(SocketAddr::new(host.parse().ok()?, port.parse().ok()?))
+}
+
+/// What a rebind needs besides the engine: where to bind, and where to learn
+/// whether the bind took.
+#[derive(Clone, Copy, Debug)]
+pub struct RebindTarget<'a> {
+    /// The profile's VPN tunnel address, which the session listens on.
+    pub tunnel_ip: IpAddr,
+    /// The profile whose listen outcomes to wait for.
+    pub profile: &'a ProfileId,
+    pub listen: &'a ListenEvents,
+    /// Bound on the wait for a listen outcome; [`LISTEN_CONFIRM_TIMEOUT`]
+    /// outside tests.
+    pub timeout: Duration,
 }
 
 /// What the reannounce after a rebind did.
@@ -249,18 +442,29 @@ pub struct Reannounce {
 
 /// Renew a profile's NAT-PMP mapping and, if the negotiated port changed, rebind
 /// the live libtorrent session by re-applying `listen_interfaces`
-/// (`apply_settings` triggers libtorrent's `reopen_listen_sockets`). Pure with
+/// (`apply_settings` triggers libtorrent's `reopen_listen_sockets`), then wait
+/// for the session to confirm a listen socket on `tunnel_ip:new`. Pure with
 /// respect to metrics/health so it is unit-testable with mocks.
 ///
-/// The caller then reannounces the profile's torrents, which is what makes the
-/// new port reach trackers promptly: `reopen_listen_sockets` re-enables the
-/// trackers but announces nothing, so without it a private tracker keeps
-/// handing out the dead port until each torrent's next scheduled announce,
-/// commonly 30–60 minutes away. The reannounce is posted after this rebind to
-/// the session's network thread, so it goes out after the sockets are reopened
-/// on the new port. It is not done here because it is paced
+/// On [`RenewOutcome::Rebound`] the caller reannounces the profile's torrents,
+/// which is what makes the new port reach trackers promptly:
+/// `reopen_listen_sockets` re-enables the trackers but announces nothing, so
+/// without it a private tracker keeps handing out the dead port until each
+/// torrent's next scheduled announce, commonly 30–60 minutes away. `Rebound`
+/// is returned only once the session reports `listen_succeeded` for the new
+/// endpoint: advertising a port nothing listens on is worse than advertising
+/// none. The reannounce is not done here because it is paced
 /// ([`REANNOUNCE_BATCH`]), and pacing it here would hold the renewal — and the
 /// lease it is renewing — for as long as the reannounce takes.
+///
+/// A rebind that is not confirmed — a `listen_failed` for the new endpoint,
+/// or no outcome within `target.timeout` — puts `listen_interfaces` back on
+/// `previous_port` and returns [`RenewOutcome::RebindFailed`]. The revert
+/// matters beyond tidiness: libtorrent reopens its sockets only when
+/// `listen_interfaces` changes, so a retry that re-applied the endpoint
+/// already set would never produce an outcome to wait for. A rebind is not
+/// attempted at all while nothing publishes listen outcomes
+/// ([`ListenEvents::is_attached`]).
 ///
 /// `port_taken` says whether another profile already listens on a port; a new
 /// port it claims is not bound ([`RenewOutcome::PortTaken`]). Gateways assign
@@ -280,9 +484,10 @@ pub fn renew_and_rebind(
     req: &PortMapRequest,
     previous_port: u16,
     previous_epoch: u32,
-    tunnel_ip: IpAddr,
+    target: RebindTarget<'_>,
     port_taken: impl Fn(u16) -> bool,
 ) -> RenewOutcome {
+    let tunnel_ip = target.tunnel_ip;
     match forwarder.map(req) {
         Ok(MapResult {
             port,
@@ -310,15 +515,37 @@ pub fn renew_and_rebind(
                     lifetime_secs,
                 };
             }
-            let settings = Settings {
-                listen_interfaces: Some(crate::profile::bind_endpoint(tunnel_ip, port)),
+            let failed = |reason| RenewOutcome::RebindFailed {
+                previous: previous_port,
+                new: port,
+                reason,
+            };
+            if !target.listen.is_attached() {
+                return failed(RebindFailure::Unobserved);
+            }
+            let listen_on = |p: u16| Settings {
+                listen_interfaces: Some(crate::profile::bind_endpoint(tunnel_ip, p)),
                 ..Default::default()
             };
-            if engine.apply_settings(&settings).is_err() {
-                return RenewOutcome::RebindFailed {
-                    previous: previous_port,
-                    new: port,
-                };
+            let cursor = target.listen.cursor();
+            if engine.apply_settings(&listen_on(port)).is_err() {
+                return failed(RebindFailure::Apply);
+            }
+            let reason = match target.listen.wait_for(
+                target.profile,
+                cursor,
+                SocketAddr::new(tunnel_ip, port),
+                target.timeout,
+            ) {
+                ListenConfirmation::Succeeded => None,
+                ListenConfirmation::Failed(msg) => Some(RebindFailure::ListenFailed(msg)),
+                ListenConfirmation::TimedOut => Some(RebindFailure::TimedOut),
+            };
+            if let Some(reason) = reason {
+                // Best effort: were this refused too, the next attempt's
+                // wait would time out and try the revert again.
+                let _ = engine.apply_settings(&listen_on(previous_port));
+                return failed(reason);
             }
             RenewOutcome::Rebound {
                 previous: previous_port,
@@ -468,6 +695,69 @@ mod tests {
         false
     }
 
+    const TUNNEL: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
+
+    /// A listen stream with a publisher attached, as the alert loop leaves it.
+    fn attached() -> Arc<ListenEvents> {
+        let l = Arc::new(ListenEvents::new());
+        l.attach();
+        l
+    }
+
+    fn target<'a>(profile: &'a ProfileId, listen: &'a ListenEvents) -> RebindTarget<'a> {
+        RebindTarget {
+            tunnel_ip: TUNNEL,
+            profile,
+            listen,
+            timeout: Duration::from_secs(5),
+        }
+    }
+
+    /// Stand in for the alert loop: once `eng` is asked to rebind, publish
+    /// the session's answer for `endpoint` (`failure` `None` for a success).
+    fn answer_rebind(
+        eng: &Arc<MockEngine>,
+        listen: &Arc<ListenEvents>,
+        profile: &ProfileId,
+        endpoint: &'static str,
+        failure: Option<&'static str>,
+    ) -> std::thread::JoinHandle<()> {
+        answer_rebind_with(eng, listen, vec![(profile.clone(), endpoint, failure)])
+    }
+
+    /// [`answer_rebind`], publishing each of `answers` in order.
+    fn answer_rebind_with(
+        eng: &Arc<MockEngine>,
+        listen: &Arc<ListenEvents>,
+        answers: Vec<(ProfileId, &'static str, Option<&'static str>)>,
+    ) -> std::thread::JoinHandle<()> {
+        let (eng, listen) = (eng.clone(), listen.clone());
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !eng
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::ApplySettings(_)))
+            {
+                assert!(Instant::now() < deadline, "no rebind was attempted");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            for (profile, endpoint, failure) in answers {
+                listen.publish(&profile, endpoint, failure.map(str::to_string));
+            }
+        })
+    }
+
+    fn applied_binds(eng: &MockEngine) -> Vec<String> {
+        eng.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                RecordedCall::ApplySettings(s) => s.listen_interfaces,
+                _ => None,
+            })
+            .collect()
+    }
+
     fn reannounced(eng: &MockEngine) -> Vec<TorrentHandle> {
         eng.calls()
             .into_iter()
@@ -502,8 +792,8 @@ mod tests {
     fn renew_unchanged_does_not_rebind() {
         let fwd = MockForwarder::with_ports([6881]);
         let eng = MockEngine::new();
-        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel, port_free);
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
         assert!(matches!(
             out,
             RenewOutcome::Unchanged {
@@ -523,9 +813,11 @@ mod tests {
     #[test]
     fn renew_changed_rebinds_the_live_session_and_leaves_the_reannounce_to_the_caller() {
         let fwd = MockForwarder::with_ports([40001]);
-        let eng = MockEngine::new();
-        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel, port_free);
+        let eng = Arc::new(MockEngine::new());
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let session = answer_rebind(&eng, &listen, &p, "10.2.0.2:40001", None);
+        let out = renew_and_rebind(&fwd, &*eng, &req(), 6881, 0, target(&p, &listen), port_free);
+        session.join().unwrap();
         assert!(
             matches!(
                 out,
@@ -538,15 +830,7 @@ mod tests {
             "expected a rebind, got {out:?}"
         );
         // Exactly one apply_settings carrying the new tunnel_ip:port bind.
-        let applied: Vec<_> = eng
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                RecordedCall::ApplySettings(s) => s.listen_interfaces,
-                _ => None,
-            })
-            .collect();
-        assert_eq!(applied, vec!["10.2.0.2:40001".to_string()]);
+        assert_eq!(applied_binds(&eng), vec!["10.2.0.2:40001".to_string()]);
         assert!(
             reannounced(&eng).is_empty(),
             "the reannounce is paced by the caller, after the rebind returns",
@@ -573,17 +857,18 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_rebind_reannounces_nothing() {
+    fn a_refused_rebind_reannounces_nothing() {
         let fwd = MockForwarder::with_ports([40001]);
         let eng = MockEngine::new();
         eng.inject_error("apply_settings", EngineError::Shutdown);
-        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel, port_free);
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
         assert!(matches!(
             out,
             RenewOutcome::RebindFailed {
                 previous: 6881,
-                new: 40001
+                new: 40001,
+                reason: RebindFailure::Apply,
             }
         ));
         assert!(reannounced(&eng).is_empty());
@@ -596,8 +881,10 @@ mod tests {
     fn a_new_port_another_profile_holds_is_not_bound() {
         let fwd = MockForwarder::with_ports([40001]);
         let eng = MockEngine::new();
-        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel, |p| p == 40001);
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), |p| {
+            p == 40001
+        });
         assert!(
             matches!(
                 out,
@@ -622,8 +909,10 @@ mod tests {
     fn an_unchanged_port_another_profile_now_holds_is_reported() {
         let fwd = MockForwarder::with_ports([40001]);
         let eng = MockEngine::new();
-        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 40001, 0, tunnel, |p| p == 40001);
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 40001, 0, target(&p, &listen), |p| {
+            p == 40001
+        });
         assert!(
             matches!(
                 out,
@@ -657,12 +946,112 @@ mod tests {
     }
 
     #[test]
+    fn a_rebind_the_session_fails_to_listen_on_is_reverted_and_not_announced() {
+        let fwd = MockForwarder::with_ports([40001]);
+        let eng = Arc::new(MockEngine::new());
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let session = answer_rebind_with(
+            &eng,
+            &listen,
+            vec![
+                // Another profile's success on the same endpoint, and this
+                // profile's on another port, say nothing about this rebind.
+                (ProfileId::new("other"), "10.2.0.2:40001", None),
+                (p.clone(), "10.2.0.2:40002", None),
+                (p.clone(), "10.2.0.2:40001", Some("address already in use")),
+                (p.clone(), "10.2.0.2:40001", None),
+            ],
+        );
+        let out = renew_and_rebind(&fwd, &*eng, &req(), 6881, 0, target(&p, &listen), port_free);
+        session.join().unwrap();
+        assert!(
+            matches!(
+                &out,
+                RenewOutcome::RebindFailed {
+                    previous: 6881,
+                    new: 40001,
+                    reason: RebindFailure::ListenFailed(msg),
+                } if msg == "address already in use"
+            ),
+            "got {out:?}",
+        );
+        // Put back on the old port, so the retry is a change libtorrent acts on.
+        assert_eq!(
+            applied_binds(&eng),
+            vec!["10.2.0.2:40001".to_string(), "10.2.0.2:6881".to_string()],
+        );
+        assert!(reannounced(&eng).is_empty());
+    }
+
+    #[test]
+    fn a_rebind_with_no_listen_outcome_times_out_and_is_reverted() {
+        let fwd = MockForwarder::with_ports([40001]);
+        let eng = MockEngine::new();
+        let (p, listen) = (ProfileId::new("p"), attached());
+        // An outcome from before the rebind was asked for does not confirm it.
+        listen.publish(&p, "10.2.0.2:40001", None);
+        let out = renew_and_rebind(
+            &fwd,
+            &eng,
+            &req(),
+            6881,
+            0,
+            RebindTarget {
+                timeout: Duration::from_millis(50),
+                ..target(&p, &listen)
+            },
+            port_free,
+        );
+        assert!(matches!(
+            out,
+            RenewOutcome::RebindFailed {
+                reason: RebindFailure::TimedOut,
+                ..
+            }
+        ));
+        assert_eq!(
+            applied_binds(&eng),
+            vec!["10.2.0.2:40001".to_string(), "10.2.0.2:6881".to_string()],
+        );
+    }
+
+    #[test]
+    fn no_rebind_is_attempted_before_listen_outcomes_are_published() {
+        let fwd = MockForwarder::with_ports([40001]);
+        let eng = MockEngine::new();
+        let (p, listen) = (ProfileId::new("p"), ListenEvents::new());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
+        assert!(matches!(
+            out,
+            RenewOutcome::RebindFailed {
+                reason: RebindFailure::Unobserved,
+                ..
+            }
+        ));
+        assert!(applied_binds(&eng).is_empty(), "the session is left alone");
+    }
+
+    #[test]
+    fn listen_endpoints_parse_as_the_shim_formats_them() {
+        assert_eq!(
+            parse_listen_endpoint("10.2.0.2:40001"),
+            Some(SocketAddr::new(TUNNEL, 40001)),
+        );
+        // boost prints a v6 address unbracketed.
+        assert_eq!(
+            parse_listen_endpoint("fd00::2:40001"),
+            Some("[fd00::2]:40001".parse().unwrap()),
+        );
+        assert_eq!(parse_listen_endpoint(":0"), None);
+    }
+
+    #[test]
     fn a_tcp_only_mapping_is_reported() {
         let fwd = MockForwarder::new();
         fwd.push_ok_tcp_only(6881);
         let eng = MockEngine::new();
-        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel, port_free);
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
         assert!(matches!(
             out,
             RenewOutcome::Unchanged {
@@ -677,8 +1066,8 @@ mod tests {
         let fwd = MockForwarder::new();
         fwd.push_err(PortForwardError::Gateway(3));
         let eng = MockEngine::new();
-        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, tunnel, port_free);
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
         assert!(matches!(out, RenewOutcome::RenewFailed(_)));
         // Renewal failure must not rebind and must never pause torrents.
         assert!(eng.calls().iter().all(|c| !matches!(
@@ -700,8 +1089,16 @@ mod tests {
         let fwd = MockForwarder::new();
         fwd.push_ok_epoch(6881, 40);
         let eng = MockEngine::new();
-        let tunnel = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 500, tunnel, port_free);
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(
+            &fwd,
+            &eng,
+            &req(),
+            6881,
+            500,
+            target(&p, &listen),
+            port_free,
+        );
         assert!(matches!(
             out,
             RenewOutcome::Unchanged {

@@ -18,6 +18,7 @@
 //! and nothing destructive may rely on it alone.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
 
 use tracing::info;
@@ -33,7 +34,14 @@ pub struct MatchStats {
     pub partial: u64,
     pub missing: u64,
     pub overlap: u64,
+    /// Complete, and claiming exactly the files other torrents claim.
+    pub shared: u64,
+    /// Complete, but still carrying drift no verification has cleared.
+    pub drifted: u64,
 }
+
+/// What a torrent still marked drifted reads as after a rescan.
+const DRIFT_NOTE: &str = "on-disk stats changed since the last scan; needs verification";
 
 /// One torrent's placement: which root and base directory its files resolve
 /// against, and how completely.
@@ -72,6 +80,9 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
     let torrents = store.torrents()?;
     let mut stats = MatchStats::default();
 
+    // Inside the rebuild's transaction, so the generation moves exactly when
+    // the claim set it stands for does.
+    store.bump_index_generation()?;
     store.clear_all_claims()?;
 
     for t in &torrents {
@@ -98,13 +109,21 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
             &files,
         )?;
 
+        // Drift is cleared by a verification and by nothing else. A rescan
+        // that finds the same sizes at the same paths says nothing about the
+        // bytes — `drift` flagged them precisely because the sizes did not
+        // change — so the marker is carried through every verdict here.
+        let prior = store.adoption_state(&t.infohash)?;
+        let drift_at = store.drift_at(&t.infohash)?;
+
         match best {
             Some(p) if p.is_complete() => {
                 // Preserve an existing `adopted` verdict: matching runs on
                 // every rescan and must not demote a torrent the daemon is
                 // already seeding back to `matched`.
-                let prior = store.adoption_state(&t.infohash)?;
-                let state = if prior == Some(AdoptionState::Adopted) {
+                let state = if drift_at.is_some() {
+                    AdoptionState::Drifted
+                } else if prior == Some(AdoptionState::Adopted) {
                     AdoptionState::Adopted
                 } else {
                     AdoptionState::Matched
@@ -116,10 +135,14 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
                     Some(p.root_id),
                     Some(&p.base_rel),
                     None,
-                    None,
-                    None,
+                    drift_at,
+                    drift_at.map(|_| DRIFT_NOTE),
                 )?;
-                stats.matched += 1;
+                if state == AdoptionState::Drifted {
+                    stats.drifted += 1;
+                } else {
+                    stats.matched += 1;
+                }
             }
             Some(p) => {
                 // Claim what did resolve, so a partially-present torrent still
@@ -132,7 +155,7 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
                     Some(p.root_id),
                     Some(&p.base_rel),
                     None,
-                    None,
+                    drift_at,
                     Some(&format!("{} of {} files present", p.resolved, p.total)),
                 )?;
                 stats.partial += 1;
@@ -144,7 +167,7 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
                     None,
                     None,
                     None,
-                    None,
+                    drift_at,
                     None,
                 )?;
                 stats.missing += 1;
@@ -154,21 +177,80 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
 
     // Overlap is a property of the finished claim set, so it can only be
     // decided once every torrent has been placed.
+    //
+    // Two kinds, told apart here. **Shared**: every torrent over these bytes
+    // claims exactly the same set of files — one payload under several
+    // info-hashes, as cross-seeding produces. Seeding it from each is fine, so
+    // it stays adoptable; moving or deleting it for one is not, and the
+    // planner asks the claim table about that directly. **Conflict**
+    // (`Overlap`): the claim sets differ, so at least one torrent's view of
+    // these bytes is wrong, and it is refused everything.
+    //
+    // A torrent already `adopted` is left `adopted`: it is loaded and seeding,
+    // and a rescan relabelling it would only hide that. Its sharing is still
+    // visible to every mutation through `shares_claims`.
+    //
+    // A `drifted` torrent is adoptable — adopting is how it gets the
+    // verification that clears drift — so a conflict has to reach it too:
+    // left `drifted`, it would adopt over bytes another torrent disagrees
+    // about. It keeps `drifted` only when the sharing is clean, and its drift
+    // marker rides along either way.
     for ih in store.overlapping_torrents()? {
+        let current = store.adoption_state(&ih)?;
+        if current == Some(AdoptionState::Adopted) {
+            continue;
+        }
+        let mine = store.claims_of(&ih)?;
+        let mut same_set = true;
+        for other in store.co_claimants(&ih)? {
+            if store.claims_of(&other)? != mine {
+                same_set = false;
+                break;
+            }
+        }
+        if current == Some(AdoptionState::Drifted) && same_set {
+            continue;
+        }
+        let shared = same_set && current == Some(AdoptionState::Matched);
+        let (state, note) = if shared {
+            (
+                AdoptionState::Shared,
+                "another torrent claims exactly these files",
+            )
+        } else {
+            (
+                AdoptionState::Overlap,
+                "another torrent claims some of the same file(s), but not the same set",
+            )
+        };
         let base = store.adoption_base(&ih)?;
+        let drift_at = store.drift_at(&ih)?;
         store.set_adoption(
             &ih,
-            AdoptionState::Overlap,
+            state,
             base.as_ref().map(|(r, _)| *r),
             base.as_ref().map(|(_, b)| b.as_str()),
             None,
-            None,
-            Some("another torrent claims the same file(s)"),
+            drift_at,
+            Some(note),
         )?;
-        stats.overlap += 1;
-        // An overlapping torrent was counted as matched or partial above.
-        stats.matched = stats.matched.saturating_sub(1);
+        // Counted as matched or partial above; move it.
+        match current {
+            Some(AdoptionState::Partial) => stats.partial = stats.partial.saturating_sub(1),
+            Some(AdoptionState::Drifted) => stats.drifted = stats.drifted.saturating_sub(1),
+            _ => stats.matched = stats.matched.saturating_sub(1),
+        }
+        if shared {
+            stats.shared += 1;
+        } else {
+            stats.overlap += 1;
+        }
     }
+
+    // The orphan figures and per-torrent bytes of the materialised tree are
+    // read off the claim set just rebuilt, inside the same transaction, so a
+    // listing never sees one without the other.
+    store.rebuild_all_rollups()?;
 
     info!(
         target: "torrentd_pool::matcher",
@@ -176,6 +258,8 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
         partial = stats.partial,
         missing = stats.missing,
         overlap = stats.overlap,
+        shared = stats.shared,
+        drifted = stats.drifted,
         "library matched against the file index",
     );
     Ok(stats)
@@ -201,10 +285,10 @@ fn best_placement(
             torrent_name,
             files,
         )? {
-            let p = evaluate_base(store, *root_id, &base, files)?;
-            if p.resolved == 0 {
+            let floor = best.as_ref().map_or(0, |b| b.resolved);
+            let Some(p) = evaluate_base(store, *root_id, &base, files, floor)? else {
                 continue;
-            }
+            };
             let better = match &best {
                 None => true,
                 Some(b) => p.resolved > b.resolved,
@@ -231,9 +315,13 @@ fn candidate_bases(
     torrent_name: &str,
     files: &[TorrentFileRow],
 ) -> Result<Vec<String>, PoolError> {
+    // Ordered for cost, deduplicated through a set: the size anchor below can
+    // yield one candidate per equal-sized file on disk, and a linear
+    // `contains` over those made building the list quadratic.
     let mut out: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     let mut push = |c: String| {
-        if !out.contains(&c) {
+        if seen.insert(c.clone()) {
             out.push(c);
         }
     };
@@ -253,13 +341,20 @@ fn candidate_bases(
 
     // (3) Size anchor. Use the largest file: on a real pool, large sizes are
     //     close to unique, so this returns very few candidates.
-    if let Some(anchor) = files.iter().max_by_key(|f| f.size) {
-        if anchor.size > 0 {
-            let anchor_rel = normalize(&anchor.rel_path);
-            for candidate_path in store.files_with_size(root_id, anchor.size)? {
-                // The base is whatever prefix remains after removing the
-                // torrent-relative path from the on-disk path.
-                if let Some(base) = candidate_path.strip_suffix(&anchor_rel) {
+    //     A padding file is never on disk, so it can never anchor anything.
+    if let Some(anchor) = files
+        .iter()
+        .filter(|f| f.is_on_disk())
+        .max_by_key(|f| f.size)
+    {
+        let anchor_rel = normalize(&anchor.rel_path);
+        for candidate_path in store.files_with_size(root_id, anchor.size)? {
+            // The base is whatever prefix remains after removing the
+            // torrent-relative path from the on-disk path — at a component
+            // boundary, or `x/foo.mkv` would yield the base `x/` for a
+            // torrent file named `oo.mkv`.
+            if let Some(base) = candidate_path.strip_suffix(&anchor_rel) {
+                if base.is_empty() || base.ends_with('/') {
                     push(base.trim_end_matches('/').to_string());
                 }
             }
@@ -270,39 +365,57 @@ fn candidate_bases(
 }
 
 /// How many of a torrent's files resolve under `base`, and which they are.
+///
+/// `None` when no file with bytes resolves — padding and empty files count as
+/// resolved everywhere, so without that every base would "place" a torrent
+/// none of whose payload exists — and as soon as the base can no longer beat
+/// `floor` files, the best placement found so far. That early exit is what
+/// keeps the size anchor linear: many equal-sized files on disk mean many
+/// candidate bases, and every wrong one now costs a lookup or two rather than
+/// one per file of the torrent.
 fn evaluate_base(
     store: &PoolStore,
     root_id: i64,
     base: &str,
     files: &[TorrentFileRow],
-) -> Result<Placement, PoolError> {
+    floor: usize,
+) -> Result<Option<Placement>, PoolError> {
     let mut claims = Vec::with_capacity(files.len());
     let mut resolved = 0usize;
+    let mut unresolved = 0usize;
 
     for f in files {
-        // Zero-length entries (v2 pad files, empty files) carry no bytes to
-        // find; counting them as unresolved would mark healthy torrents
-        // partial forever.
-        if f.size == 0 {
+        if files.len() - unresolved <= floor {
+            return Ok(None);
+        }
+        // Padding files and empty files carry no bytes to find. A BEP 47
+        // padding entry has a real, non-zero size but libtorrent never writes
+        // it, so it is skipped by its flag, not by its size; counting either
+        // as unresolved would mark a healthy torrent partial forever.
+        if !f.is_on_disk() {
             resolved += 1;
             continue;
         }
         let rel = join_rel(base, &f.rel_path);
-        if let Some(on_disk) = store.file(root_id, &rel)? {
-            if on_disk.size == f.size {
+        match store.file(root_id, &rel)? {
+            Some(on_disk) if on_disk.size == f.size => {
                 resolved += 1;
                 claims.push((root_id, rel));
             }
+            _ => unresolved += 1,
         }
     }
 
-    Ok(Placement {
+    if claims.is_empty() || resolved <= floor {
+        return Ok(None);
+    }
+    Ok(Some(Placement {
         root_id,
         base_rel: base.to_string(),
         resolved,
         total: files.len(),
         claims,
-    })
+    }))
 }
 
 fn join_rel(base: &str, rel: &str) -> String {

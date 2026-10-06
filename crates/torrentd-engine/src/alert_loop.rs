@@ -23,6 +23,9 @@
 //!     [`DEFAULT_SHUTDOWN_DEADLINE`], set by
 //!     [`AlertLoopBuilder::shutdown_deadline`]) expires, and flush both
 //!     stores' writers.
+//!   - Listen outcomes: every `listen_succeeded` / `listen_failed` alert is
+//!     published into the `ListenEvents` the daemon supplies, which a NAT-PMP
+//!     rebind waits on before it reports and announces a new port.
 //!   - Liveness: every iteration stamps a wall-clock heartbeat that
 //!     `GET /healthz` reads. A wedged or panicked loop makes the daemon
 //!     report unready instead of quietly serving a stale state map.
@@ -54,6 +57,7 @@ use crate::engine::TorrentEngine;
 use crate::handlers::HandlerCtx;
 use crate::handlers::{self};
 use crate::metrics::MetricsSink;
+use crate::port_forward::ListenEvents;
 use crate::profile::ProfileId;
 use crate::resume_store::ResumeStore;
 use crate::source::AlertSource;
@@ -110,6 +114,7 @@ pub struct AlertLoopBuilder {
     fatal_listen_failure: bool,
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
+    listen_events: Option<Arc<ListenEvents>>,
     shutdown_deadline: Duration,
 }
 
@@ -149,8 +154,21 @@ impl AlertLoopBuilder {
             fatal_listen_failure: false,
             on_fatal: None,
             profile_fenced: None,
+            listen_events: None,
             shutdown_deadline: DEFAULT_SHUTDOWN_DEADLINE,
         }
+    }
+
+    /// Publish every profile's `listen_succeeded` / `listen_failed` outcome
+    /// into `events`, which a NAT-PMP rebind waits on to confirm the session
+    /// listens on its new port. The loop is the only consumer of those
+    /// alerts, so without this nothing else can learn whether a rebind took.
+    /// The loop marks `events` attached after its first drain that returns
+    /// no alerts, not at `spawn`: until the boot backlog is cleared, a
+    /// rebind's outcome would queue behind it and could outlast the wait.
+    pub fn listen_events(mut self, events: Arc<ListenEvents>) -> Self {
+        self.listen_events = Some(events);
+        self
     }
 
     /// How long the shutdown drain waits for outstanding resume saves before
@@ -222,6 +240,7 @@ impl AlertLoopBuilder {
                 let fatal_listen_failure = self.fatal_listen_failure;
                 let on_fatal = self.on_fatal.clone();
                 let profile_fenced = self.profile_fenced.clone();
+                let listen_events = self.listen_events.clone();
                 let shutdown_deadline = self.shutdown_deadline;
                 move || {
                     let span = info_span!(parent: parent, "alert_loop");
@@ -249,6 +268,7 @@ impl AlertLoopBuilder {
                                 on_fatal,
                                 profile_fenced,
                                 unsaved_at_shutdown,
+                                listen_events,
                                 shutdown_deadline,
                             },
                         );
@@ -386,6 +406,7 @@ struct LoopHooks {
     on_fatal: Option<FatalCallback>,
     profile_fenced: Option<ProfileFenced>,
     unsaved_at_shutdown: Arc<AtomicU64>,
+    listen_events: Option<Arc<ListenEvents>>,
     shutdown_deadline: Duration,
 }
 
@@ -451,6 +472,17 @@ fn run(
                     );
                 }
             }
+            if let Some(events) = &hooks.listen_events {
+                match &alert {
+                    Alert::ListenSucceeded { endpoint, .. } => {
+                        events.publish(&profile, endpoint, None)
+                    }
+                    Alert::ListenFailed {
+                        endpoint, message, ..
+                    } => events.publish(&profile, endpoint, Some(message.clone())),
+                    _ => {}
+                }
+            }
             dispatch_alert(
                 profile, alert, &source, &state, &resume, &torrents, &metrics, &clock,
             );
@@ -476,6 +508,20 @@ fn run(
             );
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
+        }
+
+        // 2b) Listen outcomes become waitable once a drain comes back empty.
+        //     Until then the loop is still working through the boot backlog
+        //     (resume data and .torrent scans can queue thousands of alerts),
+        //     and a rebind's outcome would sit behind it for longer than a
+        //     rebind waits. A rebind before this point is deferred and
+        //     retried rather than counted as failed.
+        if was_empty {
+            if let Some(events) = &hooks.listen_events {
+                if !events.is_attached() {
+                    events.attach();
+                }
+            }
         }
 
         // 3) Tickers.
@@ -1464,6 +1510,135 @@ mod tests {
         // Give the loop a chance to process the alert and keep going.
         std::thread::sleep(Duration::from_millis(200));
         assert!(!handle.listen_failed());
+
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread panicked");
+    }
+
+    #[test]
+    fn listen_outcomes_are_published_for_a_rebind_to_wait_on() {
+        use crate::port_forward::ListenConfirmation;
+
+        let engine = Arc::new(MockEngine::new());
+        let events = Arc::new(ListenEvents::new());
+        let cursor = events.cursor();
+        engine.push_alert(listen_failed_alert());
+        engine.push_alert(Alert::ListenSucceeded {
+            hdr: AlertHeader {
+                kind: AlertKind::ListenSucceeded,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            endpoint: "10.2.0.2:40001".into(),
+        });
+        let handle = builder_with(engine).listen_events(events.clone()).spawn();
+
+        let p = ProfileId::new("p");
+        let wait =
+            |ep: &str| events.wait_for(&p, cursor, ep.parse().unwrap(), Duration::from_secs(5));
+        assert_eq!(
+            wait("0.0.0.0:6881"),
+            ListenConfirmation::Failed("address already in use".into()),
+        );
+        assert_eq!(wait("10.2.0.2:40001"), ListenConfirmation::Succeeded);
+        assert!(
+            wait_for(|| events.is_attached()),
+            "the loop attaches once its queue is empty",
+        );
+
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread panicked");
+    }
+
+    /// An alert source that replays scripted batches and notes, at the start
+    /// of every drain, whether the listen stream was already attached. Its
+    /// first drain blocks until `release` fires, so a test can look at the
+    /// stream before the loop has drained anything.
+    #[derive(Debug)]
+    struct BacklogSource {
+        inner: ProfileSource,
+        batches: parking_lot::Mutex<std::collections::VecDeque<Vec<(ProfileId, Alert)>>>,
+        events: Arc<ListenEvents>,
+        release: Receiver<()>,
+        released: AtomicBool,
+        /// `(attached at entry, alerts returned)` per drain.
+        seen: parking_lot::Mutex<Vec<(bool, usize)>>,
+    }
+
+    impl AlertSource for BacklogSource {
+        fn drain(&self) -> Vec<(ProfileId, Alert)> {
+            if !self.released.swap(true, Ordering::Relaxed) {
+                let _ = self.release.recv();
+            }
+            let attached = self.events.is_attached();
+            let batch = self.batches.lock().pop_front().unwrap_or_default();
+            self.seen.lock().push((attached, batch.len()));
+            batch
+        }
+
+        fn profiles(&self) -> Vec<ProfileId> {
+            self.inner.profiles()
+        }
+
+        fn engine_for(&self, profile: &ProfileId) -> Option<Arc<dyn TorrentEngine>> {
+            self.inner.engine_for(profile)
+        }
+    }
+
+    #[test]
+    fn listen_events_attach_only_after_the_backlog_is_drained() {
+        // At boot the loop starts behind a backlog — resume data and .torrent
+        // scans can queue thousands of alerts. A rebind's listen outcome would
+        // wait behind all of it, outlast the confirm timeout and be counted a
+        // failure. So the stream is attached only once a drain comes back
+        // empty; before that a rebind is deferred, uncounted.
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let events = Arc::new(ListenEvents::new());
+        let p = ProfileId::new("p");
+        let (release_tx, release_rx) = bounded::<()>(1);
+        let source = Arc::new(BacklogSource {
+            inner: single_profile_source(engine),
+            batches: parking_lot::Mutex::new(
+                [
+                    vec![(p.clone(), listen_failed_alert()); 3],
+                    vec![(p.clone(), listen_failed_alert()); 2],
+                ]
+                .into(),
+            ),
+            events: Arc::clone(&events),
+            release: release_rx,
+            released: AtomicBool::new(false),
+            seen: parking_lot::Mutex::default(),
+        });
+        let handle = AlertLoopBuilder::new(
+            Arc::clone(&source) as Arc<dyn AlertSource>,
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            Arc::new(NoopSink),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .listen_events(Arc::clone(&events))
+        .spawn();
+
+        assert!(
+            !events.is_attached(),
+            "spawning must not attach before anything is drained",
+        );
+        release_tx.send(()).unwrap();
+        assert!(
+            wait_for(|| source.seen.lock().len() >= 4),
+            "the loop should keep draining",
+        );
+        assert!(events.is_attached());
+
+        let seen = source.seen.lock().clone();
+        assert_eq!(
+            &seen[..4],
+            &[(false, 3), (false, 2), (false, 0), (true, 0)],
+            "attached only after the first empty drain, and not before it",
+        );
 
         assert!(handle.signal_shutdown(ShutdownReason::Test));
         handle.join().expect("loop thread panicked");

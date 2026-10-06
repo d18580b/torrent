@@ -23,6 +23,7 @@ use crate::http::v1::common::blocking;
 use crate::http::v1::common::engine_for;
 use crate::http::v1::common::from_profile_problem;
 use crate::http::v1::common::unfenced_engine;
+use crate::http::v1::common::InfoHashHex;
 use crate::http::v1::common::ProfileProblem;
 use crate::http::v1::common::ProfileUnavailableReason;
 use crate::http::v1::server::count;
@@ -171,10 +172,23 @@ pub struct BulkOutcome {
     /// Torrents whose engine call failed. Nonzero means not everything was
     /// reached.
     pub failed_count: u32,
+    /// Which torrents those were: the 100 smallest infohashes among them, in
+    /// infohash order. Retry each with its own
+    /// `POST /v1/torrents/{infohash}/pause` or `/resume`; when
+    /// `failed_count` is larger, repeat the bulk operation after those.
+    #[schema(max_items = 100)]
+    pub failed_infohashes: Vec<InfoHashHex>,
     /// Profiles this request did not act on, each with why. Always empty for
     /// a single profile's operation, which refuses instead.
     pub skipped_profiles: Vec<SkippedProfile>,
 }
+
+/// How many failed infohashes a bulk operation names. A daemon-wide pause
+/// against a session that refuses everything would otherwise answer with a
+/// hundred thousand of them. Published as `failed_infohashes`' `maxItems`,
+/// which the derive takes only as a literal: the spec tests hold the two
+/// equal.
+pub const MAX_REPORTED_FAILURES: usize = 100;
 
 /// A profile a bulk operation did not act on.
 #[derive(Debug, Schema, Serialize)]
@@ -349,7 +363,42 @@ fn explain(s: &AppState, profile_id: &ProfileId, problem: ProfileProblem) -> Pro
     }
 }
 
-/// Apply `op` to every torrent `profile_id` holds; `(accepted, failed)`.
+/// What one profile's share of a bulk operation reached.
+struct Reached {
+    /// Torrents the engine accepted the call for.
+    ok: u32,
+    /// Torrents it refused, all of them.
+    failed_count: u32,
+    /// The refused handles with the smallest infohashes: after
+    /// [`Reached::keep_smallest`], at most [`MAX_REPORTED_FAILURES`] of them in
+    /// infohash order. Only those can be named, so a profile whose session
+    /// refuses tens of thousands of torrents hands back a bounded list rather
+    /// than every one of them to sort on an async worker.
+    failed: Vec<torrentd_engine::TorrentHandle>,
+}
+
+impl Reached {
+    /// Count a refused handle, keeping it only while it could be named.
+    ///
+    /// Trims once the list reaches twice the cap, so each trim sorts a
+    /// bounded list and the work stays linear in the failures.
+    fn fail(&mut self, h: torrentd_engine::TorrentHandle) {
+        self.failed_count = self.failed_count.saturating_add(1);
+        self.failed.push(h);
+        if self.failed.len() >= 2 * MAX_REPORTED_FAILURES {
+            self.keep_smallest();
+        }
+    }
+
+    /// Cut `failed` to the [`MAX_REPORTED_FAILURES`] smallest infohashes, in
+    /// infohash order.
+    fn keep_smallest(&mut self) {
+        self.failed.sort_unstable_by_key(|h| h.infohash.0);
+        self.failed.truncate(MAX_REPORTED_FAILURES);
+    }
+}
+
+/// Apply `op` to every torrent `profile_id` holds.
 ///
 /// On the blocking pool: each call takes the session's lock, and a profile can
 /// hold tens of thousands of torrents.
@@ -358,21 +407,40 @@ async fn for_each_torrent(
     profile_id: &ProfileId,
     engine: Arc<dyn TorrentEngine>,
     op: fn(&dyn TorrentEngine, torrentd_engine::TorrentHandle) -> bool,
-) -> (u32, u32) {
+) -> Reached {
     let handles = s.state.handles_for_profile(profile_id);
     blocking(move || {
-        let mut ok = 0u32;
-        let mut failed = 0u32;
+        let mut reached = Reached {
+            ok: 0,
+            failed_count: 0,
+            failed: Vec::new(),
+        };
         for h in handles {
             if op(engine.as_ref(), h) {
-                ok = ok.saturating_add(1);
+                reached.ok = reached.ok.saturating_add(1);
             } else {
-                failed = failed.saturating_add(1);
+                reached.fail(h);
             }
         }
-        (ok, failed)
+        reached.keep_smallest();
+        reached
     })
     .await
+}
+
+/// Add one profile's share to `out`, naming its failures while there is room.
+///
+/// Across profiles the named ones are the smallest infohashes that failed,
+/// so the list is the same whichever order the profiles were visited in.
+/// Each profile's list is already bounded, so this merges at most twice the
+/// cap.
+fn tally(out: &mut BulkOutcome, reached: Reached) {
+    out.torrent_count = out.torrent_count.saturating_add(reached.ok);
+    out.failed_count = out.failed_count.saturating_add(reached.failed_count);
+    out.failed_infohashes
+        .extend(reached.failed.iter().map(|h| InfoHashHex::new(h.infohash)));
+    out.failed_infohashes.sort_by_key(|ih| ih.get().0);
+    out.failed_infohashes.truncate(MAX_REPORTED_FAILURES);
 }
 
 /// Pause every torrent in one profile.
@@ -389,22 +457,25 @@ pub async fn pause_profile(
 ) -> Result<Json<BulkOutcome>, ProfileBulkError> {
     let profile_id = ProfileId::new(path.profile_id);
     let engine = engine_for(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
-    let (torrent_count, failed_count) =
-        for_each_torrent(&s, &profile_id, engine, |e, h| e.pause_torrent(h).is_ok()).await;
-    if failed_count > 0 {
+    let mut out = BulkOutcome::default();
+    tally(
+        &mut out,
+        for_each_torrent(&s, &profile_id, engine, |e, h| e.pause_torrent(h).is_ok()).await,
+    );
+    if out.failed_count > 0 {
         warn!(
             profile_id = %profile_id,
-            torrent_count,
-            failed_count,
+            torrent_count = out.torrent_count,
+            failed_count = out.failed_count,
             "pause of a profile did not reach every torrent"
         );
     }
-    info!(profile_id = %profile_id, torrent_count, "paused all torrents in profile");
-    Ok(Json(BulkOutcome {
-        torrent_count,
-        failed_count,
-        skipped_profiles: Vec::new(),
-    }))
+    info!(
+        profile_id = %profile_id,
+        torrent_count = out.torrent_count,
+        "paused all torrents in profile"
+    );
+    Ok(Json(out))
 }
 
 /// Resume every torrent in one profile.
@@ -422,22 +493,25 @@ pub async fn resume_profile(
 ) -> Result<Json<BulkOutcome>, ProfileBulkError> {
     let profile_id = ProfileId::new(path.profile_id);
     let engine = unfenced_engine(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
-    let (torrent_count, failed_count) =
-        for_each_torrent(&s, &profile_id, engine, |e, h| e.resume_torrent(h).is_ok()).await;
-    if failed_count > 0 {
+    let mut out = BulkOutcome::default();
+    tally(
+        &mut out,
+        for_each_torrent(&s, &profile_id, engine, |e, h| e.resume_torrent(h).is_ok()).await,
+    );
+    if out.failed_count > 0 {
         warn!(
             profile_id = %profile_id,
-            torrent_count,
-            failed_count,
+            torrent_count = out.torrent_count,
+            failed_count = out.failed_count,
             "resume of a profile did not reach every torrent"
         );
     }
-    info!(profile_id = %profile_id, torrent_count, "resumed all torrents in profile");
-    Ok(Json(BulkOutcome {
-        torrent_count,
-        failed_count,
-        skipped_profiles: Vec::new(),
-    }))
+    info!(
+        profile_id = %profile_id,
+        torrent_count = out.torrent_count,
+        "resumed all torrents in profile"
+    );
+    Ok(Json(out))
 }
 
 /// The profiles that never got a session: nothing of theirs is loaded, so a
@@ -452,12 +526,6 @@ fn skipped_failed(s: &AppState) -> Vec<SkippedProfile> {
             detail: no_session_detail(&f.reason),
         })
         .collect()
-}
-
-/// Add one profile's `(accepted, failed)` to `out`.
-fn tally(out: &mut BulkOutcome, (ok, failed): (u32, u32)) {
-    out.torrent_count = out.torrent_count.saturating_add(ok);
-    out.failed_count = out.failed_count.saturating_add(failed);
 }
 
 /// Pause every torrent in every profile.
@@ -552,5 +620,74 @@ mod tests {
         let d = no_session_detail("wg-acct_b: no handshake");
         assert!(d.starts_with("profile has no session: wg-acct_b: no handshake."));
         assert!(d.contains("restart the daemon"));
+    }
+
+    #[test]
+    fn failures_are_counted_exactly_and_named_up_to_the_cap_smallest_first() {
+        use torrentd_engine::InfoHash;
+        use torrentd_engine::TorrentHandle;
+        let handle = |b: u8| TorrentHandle {
+            id: u64::from(b),
+            infohash: InfoHash([b; 20]),
+        };
+        let mut out = BulkOutcome::default();
+        // Two profiles, visited largest-first, together over the cap. The
+        // first refused more than it could name, so its count is not its
+        // list's length.
+        tally(
+            &mut out,
+            Reached {
+                ok: 3,
+                failed_count: 1000,
+                failed: (101..=200).rev().map(handle).collect(),
+            },
+        );
+        tally(
+            &mut out,
+            Reached {
+                ok: 2,
+                failed_count: 60,
+                failed: (1..=60).map(handle).collect(),
+            },
+        );
+        assert_eq!(out.torrent_count, 5);
+        assert_eq!(out.failed_count, 1000 + 60);
+        let named: Vec<u8> = out.failed_infohashes.iter().map(|h| h.get().0[0]).collect();
+        let want: Vec<u8> = (1..=60).chain(101..=140).collect();
+        assert_eq!(named.len(), MAX_REPORTED_FAILURES);
+        assert_eq!(named, want);
+    }
+
+    #[test]
+    fn a_profile_keeps_only_the_failures_it_could_name_and_counts_them_all() {
+        use torrentd_engine::InfoHash;
+        use torrentd_engine::TorrentHandle;
+        let handle = |n: u16| {
+            let mut ih = [0u8; 20];
+            ih[..2].copy_from_slice(&n.to_be_bytes());
+            TorrentHandle {
+                id: u64::from(n) + 1,
+                infohash: InfoHash(ih),
+            }
+        };
+        let mut reached = Reached {
+            ok: 0,
+            failed_count: 0,
+            failed: Vec::new(),
+        };
+        // Largest first, so every trim has something smaller to keep.
+        for n in (0..1000u16).rev() {
+            reached.fail(handle(n));
+            assert!(reached.failed.len() < 2 * MAX_REPORTED_FAILURES);
+        }
+        reached.keep_smallest();
+        assert_eq!(reached.failed_count, 1000);
+        let kept: Vec<u16> = reached
+            .failed
+            .iter()
+            .map(|h| u16::from_be_bytes([h.infohash.0[0], h.infohash.0[1]]))
+            .collect();
+        let want: Vec<u16> = (0..100).collect();
+        assert_eq!(kept, want);
     }
 }

@@ -58,9 +58,16 @@ FROM registry.fedoraproject.org/fedora-minimal:43
 # profile the daemon exits. Install `openvpn` here, or run that configuration on
 # a host, if you need it. `ip`, `wg` and `nft` are the whole of what the daemon
 # shells out to in this image: it raises every WireGuard link with `ip` and
-# `wg` itself, as root or not, and never runs `wg-quick`.
+# `wg` itself, as root or not, and never runs `wg-quick`. Add `stty`, which
+# `torrentd hash-password` runs to stop the terminal echoing the password.
 #
 # curl: used by HEALTHCHECK below.
+#
+# coreutils: `stty`, for `torrentd hash-password` run inside the container.
+# `rpm -qf /usr/bin/stty` in this base prints coreutils-9.7-10.fc43, so the
+# install is a no-op today; it is declared so the dependency does not rest on
+# inheritance from the base image. Without it `hash-password` refuses to read
+# a password it cannot hide.
 #
 # `/usr/bin/kill` is the **daemon's** hard runtime dependency for
 # vpn_type = "openvpn": the OpenVPN teardown shells out to `kill` against a pid
@@ -114,6 +121,7 @@ FROM registry.fedoraproject.org/fedora-minimal:43
 # an operator who `podman exec`s in.
 RUN microdnf install -y \
         openssl ca-certificates curl iproute wireguard-tools nftables procps-ng \
+        coreutils \
     && microdnf clean all
 
 COPY --from=builder /src/target/release/torrentd /usr/local/bin/torrentd

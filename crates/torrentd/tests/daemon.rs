@@ -846,7 +846,8 @@ fn a_kill_switch_with_no_nft_exits_ex_config() {
              vpn_interface = \"wg-nonft\"\n\
              listen_port = 16899\n\
              peer_fingerprint = \"-AA1000-\"\n\
-             user_agent = \"ua-a\"\n",
+             user_agent = \"ua-a\"\n\
+             allowed_tracker_domains = [\"t.example\"]\n",
             d = p.display()
         ),
     )
@@ -1055,4 +1056,369 @@ fn a_non_reloadable_change_is_reported_on_the_second_reload_too() {
         wait_exit(&mut child.0, Duration::from_secs(30)),
         "daemon did not exit within 30s of SIGTERM"
     );
+}
+
+/// A one-file `.torrent` named `name`, announcing to `announce`.
+fn metainfo(name: &str, announce: &str) -> Vec<u8> {
+    let mut t = format!(
+        "d8:announce{}:{announce}4:infod6:lengthi1e4:name{}:{name}12:piece lengthi16384e\
+         6:pieces20:",
+        announce.len(),
+        name.len()
+    )
+    .into_bytes();
+    t.extend_from_slice(&[0u8; 20]);
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// libtorrent resume data for `torrent`, with no info dict, and with a
+/// `trackers` list of `trackers` when given — the list that replaces the
+/// `.torrent`'s own on the add.
+fn resume_for(torrent: &[u8], trackers: Option<&str>) -> Vec<u8> {
+    let ih = libtorrent_safe::info_hash_from_torrent(torrent).unwrap();
+    let mut r =
+        b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+    r.extend_from_slice(&ih.0);
+    if let Some(url) = trackers {
+        r.extend_from_slice(format!("8:trackersll{}:{url}ee", url.len()).as_bytes());
+    }
+    r.extend_from_slice(b"e");
+    r
+}
+
+/// Issue #72's daemon acceptance: the startup scans hold every torrent to the
+/// profile's `allowed_tracker_domains`, the way `POST /v1/torrents` does.
+///
+/// Five torrents in the profile's two directories, against a list naming
+/// `tracker.allowed.example`:
+///
+/// - `dir_ok`, a `.torrent` announcing there: loaded by the torrent-dir scan;
+/// - `dir_foreign`, a `.torrent` announcing elsewhere: refused;
+/// - `resume_ok`, resume data without a tracker list beside an allowed
+///   `.torrent`: loaded from resume data;
+/// - `resume_override`, resume data whose own `trackers` list names a foreign
+///   tracker, beside an allowed `.torrent`: the resume data is refused, and
+///   the `.torrent` alone is loaded by the torrent-dir scan, so the foreign
+///   tracker is never announced to;
+/// - `resume_only`, the same foreign resume data with no `.torrent`: refused,
+///   and nothing loads it.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn the_boot_scans_hold_every_torrent_to_the_profiles_tracker_domains() {
+    const ALLOWED: &str = "http://tracker.allowed.example/announce";
+    const FOREIGN: &str = "http://tracker.foreign.example/announce";
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str("allowed_tracker_domains = [\"allowed.example\"]\n");
+    std::fs::write(&cfg, text).unwrap();
+    let torrents = p.join("torrents").join(PROFILE);
+    let resumes = p.join("resume").join(PROFILE);
+    std::fs::create_dir_all(&torrents).unwrap();
+    std::fs::create_dir_all(&resumes).unwrap();
+    let hex = |t: &[u8]| libtorrent_safe::info_hash_from_torrent(t).unwrap().to_hex();
+    let put = |d: &std::path::Path, ih: &str, ext: &str, bytes: &[u8]| {
+        std::fs::write(d.join(format!("{ih}.{ext}")), bytes).unwrap();
+    };
+
+    let dir_ok = metainfo("dir_ok", ALLOWED);
+    put(&torrents, &hex(&dir_ok), "torrent", &dir_ok);
+    let dir_foreign = metainfo("dir_foreign", FOREIGN);
+    put(&torrents, &hex(&dir_foreign), "torrent", &dir_foreign);
+    let resume_ok = metainfo("resume_ok", ALLOWED);
+    put(&torrents, &hex(&resume_ok), "torrent", &resume_ok);
+    put(
+        &resumes,
+        &hex(&resume_ok),
+        "resume",
+        &resume_for(&resume_ok, None),
+    );
+    let resume_override = metainfo("resume_override", ALLOWED);
+    put(
+        &torrents,
+        &hex(&resume_override),
+        "torrent",
+        &resume_override,
+    );
+    put(
+        &resumes,
+        &hex(&resume_override),
+        "resume",
+        &resume_for(&resume_override, Some(FOREIGN)),
+    );
+    let resume_only = metainfo("resume_only", ALLOWED);
+    put(
+        &resumes,
+        &hex(&resume_only),
+        "resume",
+        &resume_for(&resume_only, Some(FOREIGN)),
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .expect("spawn daemon");
+    wait_healthy(addr);
+
+    let (code, list) = http(addr, "GET", "/v1/torrents", None);
+    assert_eq!(code, 200, "{list}");
+    for (name, t, loaded) in [
+        ("dir_ok", &dir_ok, true),
+        ("dir_foreign", &dir_foreign, false),
+        ("resume_ok", &resume_ok, true),
+        ("resume_override", &resume_override, true),
+        ("resume_only", &resume_only, false),
+    ] {
+        assert_eq!(
+            list.contains(&hex(t)),
+            loaded,
+            "{name} should be {}: {list}",
+            if loaded { "loaded" } else { "refused" },
+        );
+    }
+    // The torrent whose resume data was refused announces to its `.torrent`'s
+    // tracker only.
+    let (code, trackers) = http(
+        addr,
+        "GET",
+        &format!("/v1/torrents/{}/trackers", hex(&resume_override)),
+        None,
+    );
+    assert_eq!(code, 200, "{trackers}");
+    assert!(trackers.contains("tracker.allowed.example"), "{trackers}");
+    assert!(!trackers.contains("foreign"), "{trackers}");
+
+    // Each refusal is counted where an API refusal is.
+    let (code, metrics) = http(addr, "GET", "/metrics", None);
+    assert_eq!(code, 200);
+    assert!(
+        metrics.lines().any(|l| {
+            l.starts_with("torrentd_profile_assignment_registry_errors_total{")
+                && l.contains(&format!("profile_id=\"{PROFILE}\""))
+                && l.ends_with(" 3")
+        }),
+        "three refusals should be counted:\n{metrics}"
+    );
+
+    sigterm(&child);
+    assert!(wait_exit(&mut child, Duration::from_secs(30)));
+}
+
+/// [`http`] with a read timeout of `timeout`, for a request that runs long.
+fn http_within(addr: &str, method: &str, path: &str, timeout: Duration) -> (u16, String) {
+    let mut stream = TcpStream::connect(addr).expect("connect");
+    stream.set_read_timeout(Some(timeout)).unwrap();
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+         Content-Length: 0\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).unwrap();
+    let resp = String::from_utf8_lossy(&buf);
+    let status = resp
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let body = resp
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_owned())
+        .unwrap_or_default();
+    (status, body)
+}
+
+/// Issue #76's acceptance: a scan of a million files leaves the daemon
+/// responsive. While it runs, `/healthz` keeps answering 200, the systemd
+/// watchdog keeps being pinged, and every page of `/v1/pool/torrents` answers
+/// in under 200 ms.
+///
+/// Before, every pool read waited on the one index mutex the scan holds for
+/// its whole run, so a page answered only when the scan ended. The library
+/// is indexed by a first scan before the files exist, so the pages read
+/// during the second are a real library's, from the last committed index.
+///
+/// `TORRENTD_SCALE_FILES` sets the file count; a million when unset.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent and writes a million files; run with --ignored"]
+fn a_million_file_scan_leaves_the_daemon_responsive() {
+    const PAGE_BUDGET: Duration = Duration::from_millis(200);
+    const LIBRARY: usize = 2_000;
+    const WATCHDOG_USEC: u64 = 2_000_000;
+    let files: usize = std::env::var("TORRENTD_SCALE_FILES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1_000_000);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let root = p.join("pool");
+    let library = p.join("library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    for i in 0..LIBRARY {
+        std::fs::write(
+            library.join(format!("t{i}.torrent")),
+            metainfo(&format!("payload-{i}"), "http://tracker.example/announce"),
+        )
+        .unwrap();
+    }
+
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\n",
+        root.display(),
+        library.display()
+    ));
+    std::fs::write(&cfg, text).unwrap();
+
+    // systemd's side of the watchdog: a datagram socket the daemon pings,
+    // every `WATCHDOG_USEC / 2`.
+    let sock_path = p.join("notify.sock");
+    let sock = std::os::unix::net::UnixDatagram::bind(&sock_path).unwrap();
+    sock.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    let pings = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<Instant>::new()));
+    let listening = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let listener = {
+        let (pings, listening) = (pings.clone(), listening.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            while listening.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(n) = sock.recv(&mut buf) {
+                    if String::from_utf8_lossy(&buf[..n])
+                        .lines()
+                        .any(|l| l == "WATCHDOG=1")
+                    {
+                        pings.lock().push(Instant::now());
+                    }
+                }
+            }
+        })
+    };
+
+    // Killed if an assertion below panics, before the directory it writes
+    // into is removed, rather than left running.
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .env("NOTIFY_SOCKET", &sock_path)
+            .env("WATCHDOG_USEC", WATCHDOG_USEC.to_string())
+            .env_remove("WATCHDOG_PID")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_healthy(addr);
+
+    // The library alone, so the index the second scan replaces holds it.
+    let (code, body) = http_within(addr, "POST", "/v1/pool/scan", Duration::from_secs(600));
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains(&format!("\"torrents\":{LIBRARY}")), "{body}");
+
+    // A million files, a thousand to a directory.
+    for i in 0..files {
+        let dir = root.join(format!("d{:04}", i / 1000));
+        if i % 1000 == 0 {
+            std::fs::create_dir_all(&dir).unwrap();
+        }
+        std::fs::File::create(dir.join(format!("f{i}"))).unwrap();
+    }
+
+    let scan = {
+        let addr = addr.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let r = http_within(&addr, "POST", "/v1/pool/scan", Duration::from_secs(3600));
+            (r, started.elapsed())
+        })
+    };
+
+    let mut samples = 0usize;
+    let mut slowest = Duration::ZERO;
+    let mut cursor: Option<String> = None;
+    let started = Instant::now();
+    while !scan.is_finished() {
+        // A generous read timeout, so a slow answer fails on its measured
+        // latency rather than on a socket error.
+        let (code, body) = http_within(addr, "GET", "/healthz", Duration::from_secs(60));
+        assert_eq!(code, 200, "/healthz during the scan: {body}");
+
+        let path = match &cursor {
+            Some(c) => format!("/v1/pool/torrents?limit=100&cursor={c}"),
+            None => "/v1/pool/torrents?limit=100".to_owned(),
+        };
+        let asked = Instant::now();
+        let (code, body) = http_within(addr, "GET", &path, Duration::from_secs(60));
+        let took = asked.elapsed();
+        assert_eq!(code, 200, "{path} during the scan: {body}");
+        assert!(
+            took < PAGE_BUDGET,
+            "{path} took {took:?} during the scan, over {PAGE_BUDGET:?}",
+        );
+        let page: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(page["items"].as_array().map(Vec::len), Some(100), "{body}");
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        slowest = slowest.max(took);
+        samples += 1;
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let ((code, body), took) = scan.join().unwrap();
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains(&format!("\"files\":{files}")), "{body}");
+    assert!(
+        samples >= 4,
+        "the scan ended after {took:?}, too soon to have been observed ({samples} samples)",
+    );
+
+    // The watchdog kept being pinged throughout: no gap between pings across
+    // the scan is longer than the interval systemd would kill the unit at.
+    let pings = pings.lock().clone();
+    let during: Vec<Instant> = pings
+        .iter()
+        .copied()
+        .filter(|t| *t >= started && *t <= started + took)
+        .collect();
+    assert!(
+        during.len() >= 2,
+        "{} watchdog pings during a {took:?} scan",
+        during.len()
+    );
+    let mut edges = vec![started];
+    edges.extend(&during);
+    edges.push(started + took);
+    let widest = edges
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .max()
+        .unwrap_or_default();
+    assert!(
+        widest < Duration::from_micros(WATCHDOG_USEC),
+        "the watchdog went {widest:?} without a ping during the scan",
+    );
+    eprintln!(
+        "{files} files scanned in {took:?}; {samples} pages, slowest {slowest:?}; {} pings",
+        during.len()
+    );
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(60)));
+    listening.store(false, std::sync::atomic::Ordering::Relaxed);
+    listener.join().unwrap();
 }

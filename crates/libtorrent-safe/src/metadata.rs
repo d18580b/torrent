@@ -56,11 +56,13 @@ pub struct TorrentMetaFile {
     pub size: u64,
     /// BitTorrent v2 per-file merkle root (SHA-256 over 16 KiB leaves).
     ///
-    /// This identifies the file's *contents* independently of its name and
-    /// location, which is what lets the pool index recognise a file that was
-    /// moved or renamed. `None` for v1-only torrents, where pieces span file
+    /// Recorded by the pool index; nothing places a file by it, since that
+    /// would mean hashing the file on disk. `None` for v1-only torrents, where pieces span file
     /// boundaries and no per-file digest exists, and for v2 padding files.
     pub pieces_root: Option<[u8; 32]>,
+    /// A BEP 47 padding file: it aligns the next file to a piece boundary,
+    /// has a non-zero size, and is never written to disk.
+    pub pad_file: bool,
 }
 
 /// Parsed `.torrent` metadata.
@@ -128,6 +130,7 @@ pub fn torrent_metadata(bytes: &[u8]) -> Result<TorrentMeta> {
                 path: fixed_c_str(&f.path),
                 size: f.size,
                 pieces_root: (f.has_pieces_root != 0).then_some(f.pieces_root),
+                pad_file: f.pad_file != 0,
             })
             .collect()
     };

@@ -60,6 +60,53 @@ use crate::vpn;
 /// healthy is the worst of both answers.
 const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// The most HTTP connections the API holds open at once; the next waits in
+/// the listen backlog until one closes.
+///
+/// Sized against the descriptor limit the daemon shares with libtorrent,
+/// which is what `LimitNOFILE=65536` in `deploy/torrentd.service` is for:
+/// each profile's `connections_limit` (10,000 in the sample config) and
+/// `file_pool_size` draw on the same table. kynos' default of 10,000 would let
+/// the API alone take a sixth of it, and every descriptor the API holds is one
+/// a profile cannot open a peer or a file with. The API's own callers — an
+/// operator or two, `torrentctl`, a Prometheus scrape, a reverse proxy's
+/// pool — need a few dozen; 256 leaves room for a proxy that does not reuse
+/// connections, at under 0.4% of the table.
+const HTTP_MAX_CONNECTIONS: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(256) {
+    Some(n) => n,
+    None => unreachable!(),
+};
+
+/// How long an HTTP/1 client has to send a request head, including the wait
+/// for the next request on a kept-alive connection.
+///
+/// A head is a few hundred bytes. kynos' default of 30 s lets a client that
+/// never finishes one hold a connection — one of [`HTTP_MAX_CONNECTIONS`] —
+/// three times as long for no reason; the body's own deadline is
+/// `http::v1::REQUEST_DEADLINE`.
+const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often an HTTP/2 (h2c) connection is pinged, and how long the peer has
+/// to acknowledge before the connection is closed.
+///
+/// kynos leaves HTTP/2 keep-alive off, and HTTP/2 has no counterpart to
+/// [`HTTP_HEADER_READ_TIMEOUT`]: a peer that sent the preface and then went
+/// silent — crashed, partitioned, or never reading — would hold one of
+/// [`HTTP_MAX_CONNECTIONS`] until the daemon stopped. With pings, such a peer
+/// is dropped within 30 s.
+///
+/// This does not bound a peer that acknowledges pings and sends nothing
+/// else, nor a plaintext connection that sends no byte at all: hyper-util
+/// sniffs the protocol before either driver starts, with no timer, and kynos
+/// exposes neither a first-byte deadline nor an HTTP/2 idle timeout. Both are
+/// recorded in `docs/running.md` §7; a non-loopback `http_listen` belongs
+/// behind a proxy that bounds them.
+const HTTP2_KEEP_ALIVE: kynos::server::protocol::Http2KeepAlive =
+    kynos::server::protocol::Http2KeepAlive {
+        interval: std::time::Duration::from_secs(20),
+        timeout: std::time::Duration::from_secs(10),
+    };
+
 /// How long the HTTP server's graceful shutdown waits for open requests
 /// before cutting them off. A drain that runs out exits 0 with a warning
 /// (`http_exit_code`).
@@ -483,8 +530,8 @@ const TEARDOWN_ALLOWANCE: std::time::Duration = std::time::Duration::from_secs(6
 /// Every descriptor the daemon may hold at once, against `RLIMIT_NOFILE`.
 ///
 /// Each session may open `connections_limit` peer sockets and keep
-/// `file_pool_size` payload files open, and the API accepts up to kynos's
-/// connection cap. A soft limit below their sum is a daemon that seeds until
+/// `file_pool_size` payload files open, and the API accepts up to
+/// [`HTTP_MAX_CONNECTIONS`]. A soft limit below their sum is a daemon that seeds until
 /// the pool grows and then fails `accept` and `open` with `EMFILE` — in
 /// libtorrent's logs, as disk and peer errors, far from the cause. The values
 /// are the effective ones: `Settings::server_seed_overrides` sets both, and
@@ -511,12 +558,13 @@ fn descriptors_needed(cfg: &Config) -> u64 {
     let s = cfg.libtorrent_settings();
     let per_session = u64::from(s.connections_limit.unwrap_or_default())
         + u64::from(s.file_pool_size.unwrap_or_default());
-    per_session * cfg.profile.len() as u64 + HTTP_MAX_CONNECTIONS
+    per_session * cfg.profile.len() as u64 + http_connection_cap()
 }
 
-/// kynos's default cap on accepted API connections, which the daemon does not
-/// change.
-const HTTP_MAX_CONNECTIONS: u64 = 10_000;
+/// [`HTTP_MAX_CONNECTIONS`] as a descriptor count.
+fn http_connection_cap() -> u64 {
+    u64::try_from(HTTP_MAX_CONNECTIONS.get()).unwrap_or(u64::MAX)
+}
 
 /// The soft `RLIMIT_NOFILE`, or `None` if it cannot be read.
 fn nofile_soft_limit() -> Option<u64> {
@@ -934,10 +982,17 @@ pub async fn boot(
     // If boot fails below, the process exits and the task with it.
     // It returns at once when no live profile negotiates a port, which is
     // not a death, so it is supervised only where it has work.
+    //
+    // A rebind is confirmed against the session's listen outcomes, which only
+    // the alert loop sees; it publishes them into `listen_events`, handed to
+    // it below. Until it has cleared its boot backlog the monitor defers a
+    // port change rather than report a port nothing has confirmed.
+    let listen_events = Arc::new(torrentd_engine::port_forward::ListenEvents::new());
     let pf = crate::port_forward_monitor::run(
         profile_registry.clone(),
         state.clone(),
         metrics.clone(),
+        listen_events.clone(),
         shutdown_tx.subscribe(),
     );
     if profile_registry
@@ -1051,8 +1106,9 @@ pub async fn boot(
             // Cross-check the registry; the spec aborts the profile on
             // mismatch. A resume file under one profile's directory that the
             // registry assigns to another is the operator's to reconcile.
-            if let Some(existing) = registry.lookup(&ih) {
-                if existing != profile {
+            let existing = registry.lookup(&ih);
+            if let Some(existing) = &existing {
+                if *existing != profile {
                     warn!(
                         profile_id = %profile,
                         infohash = %ih,
@@ -1065,23 +1121,6 @@ pub async fn boot(
                     );
                     continue;
                 }
-            } else if let Err(e) = registry.assign(ih, profile.clone()) {
-                // Rule 4 makes the registry the gate every load passes. An
-                // assignment that failed to persist is one that disappears at
-                // the next restart, after which nothing knows this info-hash
-                // belongs to this profile — so refuse the load rather than seed a
-                // torrent the uniqueness rule can no longer see.
-                warn!(
-                    profile_id = %profile,
-                    infohash = %ih,
-                    error.cause = %e,
-                    "could not record the resume assignment; skipping this torrent",
-                );
-                metrics.inc_counter(
-                    "profile_assignment_registry_errors_total",
-                    &[("profile_id", profile.as_str())],
-                );
-                continue;
             }
             // Re-attach metadata. libtorrent writes the info dict into resume
             // data only when save_resume_data was called with SAVE_INFO_DICT
@@ -1119,7 +1158,43 @@ pub async fn boot(
             // mistake that ends an account. A pool that comes back paused is
             // visible in `/status` and fixed with `resume-all`; a pool that
             // comes back seeding when it was told not to is not recoverable.
-            match engine.add_torrent(resume_scan_params(profile_cfg, data.into_inner(), torrent)) {
+            let params = resume_scan_params(profile_cfg, data.into_inner(), torrent);
+            // The account-isolation guard, on the trackers this resume data
+            // would announce to — its own `trackers` list where it has one.
+            // A file written before the profile's allow-list was set, or
+            // dropped into the directory by hand, is held to it like an API
+            // add. Checked before the registry claim, so a refusal claims
+            // nothing.
+            if let Err(refusal) = boot_scan_guard(&*metrics, profile_cfg, &ih, &params, "resume") {
+                if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
+                    load_failures.entry(profile.clone()).or_default().resume_add += 1;
+                }
+                continue;
+            }
+            // Unless it is already this profile's, claim it.
+            let claimed = match existing {
+                Some(_) => Ok(()),
+                None => registry.assign(ih, profile.clone()),
+            };
+            if let Err(e) = claimed {
+                // Rule 4 makes the registry the gate every load passes. An
+                // assignment that failed to persist is one that disappears at
+                // the next restart, after which nothing knows this info-hash
+                // belongs to this profile — so refuse the load rather than seed a
+                // torrent the uniqueness rule can no longer see.
+                warn!(
+                    profile_id = %profile,
+                    infohash = %ih,
+                    error.cause = %e,
+                    "could not record the resume assignment; skipping this torrent",
+                );
+                metrics.inc_counter(
+                    "profile_assignment_registry_errors_total",
+                    &[("profile_id", profile.as_str())],
+                );
+                continue;
+            }
+            match engine.add_torrent(params) {
                 Ok(_) => {
                     added_from_resume += 1;
                     loaded.insert(ih);
@@ -1171,6 +1246,21 @@ pub async fn boot(
             if registry.lookup(&ih).is_some() {
                 continue;
             }
+            // The account-isolation guard, before the claim: a `.torrent`
+            // dropped into this profile's directory is held to its
+            // allow-list like one posted to the API.
+            let params = torrent_dir_scan_params(profile_cfg, bytes, scan_save_path.clone());
+            if let Err(refusal) =
+                boot_scan_guard(&*metrics, profile_cfg, &ih, &params, "torrent_dir")
+            {
+                if matches!(refusal, torrentd_engine::TrackerRefusal::Unreadable(_)) {
+                    load_failures
+                        .entry(profile.clone())
+                        .or_default()
+                        .torrent_dir_add += 1;
+                }
+                continue;
+            }
             // Rule 4 again: claim first, load second. Claiming afterwards
             // left a window in which the session held a torrent the registry
             // had never agreed to, and dropped the claim silently if it could
@@ -1188,11 +1278,7 @@ pub async fn boot(
                 );
                 continue;
             }
-            match engine.add_torrent(torrent_dir_scan_params(
-                profile_cfg,
-                bytes,
-                scan_save_path.clone(),
-            )) {
+            match engine.add_torrent(params) {
                 Ok(_) => {
                     added += 1;
                     loaded.insert(ih);
@@ -1316,6 +1402,7 @@ pub async fn boot(
     let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
     if let Some(pool) = pool.as_ref() {
         pool.set_metrics(metrics.clone());
+        pool.set_state(Arc::clone(&state));
     }
 
     // Two artefacts persist a torrent→profile mapping, and nothing reconciled
@@ -1403,6 +1490,7 @@ pub async fn boot(
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })
+    .listen_events(listen_events)
     .spawn();
 
     // Boot succeeded: the shutdown path owns the tunnels and the kill switch
@@ -1468,6 +1556,41 @@ fn resume_scan_params(
         flags_set: torrentd_engine::resume_flags_set(profile),
         flags_clear: torrentd_engine::resume_flags_clear(),
     }
+}
+
+/// Run the account-isolation guard (`torrentd_engine::check_trackers`) on one
+/// boot-scan add, before anything is claimed or loaded.
+///
+/// A torrent outside the profile's `allowed_tracker_domains` is logged and
+/// counted where an API refusal is, in
+/// `profile_assignment_registry_errors_total`. One whose trackers cannot be
+/// read is logged only: the add would fail on the same bytes, and the caller
+/// counts it as the load failure it is.
+fn boot_scan_guard(
+    metrics: &dyn MetricsSink,
+    profile: &ProfileConfig,
+    ih: &libtorrent_safe::InfoHash,
+    params: &AddParams,
+    scan: &'static str,
+) -> Result<(), torrentd_engine::TrackerRefusal> {
+    let refusal = match torrentd_engine::check_trackers(profile, params) {
+        Ok(()) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    warn!(
+        profile_id = %profile.id,
+        infohash = %ih,
+        scan,
+        error.cause = %refusal,
+        "boot scan: torrent refused by the profile's allowed_tracker_domains; not loaded",
+    );
+    if matches!(refusal, torrentd_engine::TrackerRefusal::NotAllowed) {
+        metrics.inc_counter(
+            "profile_assignment_registry_errors_total",
+            &[("profile_id", profile.id.as_str())],
+        );
+    }
+    Err(refusal)
 }
 
 /// What the boot torrent-dir scan hands a session for a `.torrent` no resume
@@ -1974,11 +2097,20 @@ impl DaemonHandle {
         // state an operator cannot reason about. Held in the work gate like an
         // API apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
+            // What the boot handed to sessions: the re-drive waits for every
+            // one to reach the state map before acting on what is loaded.
+            let loaded: Vec<_> = registry
+                .entries()
+                .into_iter()
+                .map(|(ih, _)| ih)
+                .filter(|ih| !unloaded_at_boot.contains(ih))
+                .collect();
             crate::pool_apply::spawn_resume_unfinished(
                 pool,
                 source.clone(),
                 state.clone(),
                 Arc::clone(&work),
+                loaded,
             );
         }
 
@@ -2020,6 +2152,7 @@ impl DaemonHandle {
             unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
             shutdown: shutdown_tx.clone(),
             work: Arc::clone(&work),
+            events: Arc::default(),
         };
 
         // What the daemon decided to believe, in the journal, once. Anything
@@ -2316,9 +2449,21 @@ async fn serve_until_shutdown(
 
     // kynos records every connection's peer address, which is what lets the
     // session throttle and the auth failure log see who was calling.
+    //
+    // The limits are set here rather than left to kynos' defaults, which are
+    // sized for a public web service: 10,000 connections and a 30 s header
+    // timeout. This is a single-operator control plane sharing one descriptor
+    // limit (`LimitNOFILE`) with libtorrent, whose peer connections and file
+    // pool are what the limit is for; see `HTTP_MAX_CONNECTIONS`.
     let work = Arc::clone(work);
     let server = kynos::server::Server::new(app)
         .listener(listener)
+        .max_connections(HTTP_MAX_CONNECTIONS)
+        .http1(
+            kynos::server::protocol::Http1Config::default()
+                .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT)),
+        )
+        .http2(kynos::server::protocol::Http2Config::default().keep_alive(Some(HTTP2_KEEP_ALIVE)))
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             let _ = shutdown_rx.recv().await;
             // Latched first, so an apply still running stops at its next step
@@ -2721,7 +2866,7 @@ mod shutdown_report_tests {
             crate::profile_registry::test_entry("a", ProfileStatus::Active).config,
             crate::profile_registry::test_entry("b", ProfileStatus::Active).config,
         ];
-        assert_eq!(descriptors_needed(&cfg), 2 * 1_100 + HTTP_MAX_CONNECTIONS);
+        assert_eq!(descriptors_needed(&cfg), 2 * 1_100 + 256);
         // And the shipped unit's LimitNOFILE covers a one-profile default.
         cfg.connections_limit = None;
         cfg.file_pool_size = None;
@@ -3413,6 +3558,79 @@ mod tests {
              not it. Found {direct:?} — a new one wants the helper, and a \
              fifth documented site wants this count and its comment moved \
              together",
+        );
+    }
+
+    /// `boot` hands one `ListenEvents` to both the port-forward monitor and
+    /// the alert loop.
+    ///
+    /// A rebind is confirmed only against outcomes the alert loop publishes.
+    /// If the monitor waited on a different stream, or the loop were built
+    /// without `.listen_events(...)`, no stream the monitor reads would ever
+    /// be attached, and every port change would be deferred as
+    /// `RebindFailure::Unobserved` forever. Every unit test builds the stream
+    /// itself, so none of them would notice. `boot` needs live tunnels to
+    /// run, so this reads its shipped source instead: exactly one stream
+    /// is created there, bound once, cloned into the monitor, and then moved
+    /// into the alert loop.
+    #[test]
+    fn boot_shares_one_listen_stream_between_the_monitor_and_the_alert_loop() {
+        let sources = shipped_crate_sources();
+        let startup = &sources
+            .iter()
+            .find(|(p, _)| p == "startup.rs")
+            .expect("this module")
+            .1;
+        let start = startup
+            .find("pub async fn boot(")
+            .expect("`boot` is defined in this module");
+        let len = startup[start..]
+            .find("\n}\n")
+            .expect("`boot` has a closing brace at column 0");
+        let body = &startup[start..start + len];
+
+        let created = concat!("ListenEvents", "::new()");
+        assert_eq!(
+            body.matches(created).count(),
+            1,
+            "`boot` creates exactly one listen stream",
+        );
+        assert_eq!(
+            body.matches("let listen_events =").count(),
+            1,
+            "the stream is bound once, so both hand-offs name the same one",
+        );
+        assert!(
+            body.contains(&format!(
+                "let listen_events = Arc::new(torrentd_engine::port_forward::{created});"
+            )),
+            "the one binding holds the one stream `boot` creates",
+        );
+
+        let monitor = body
+            .find("crate::port_forward_monitor::run(")
+            .expect("`boot` starts the port-forward monitor");
+        let monitor_args = &body[monitor..monitor + body[monitor..].find(");").expect("call ends")];
+        assert!(
+            monitor_args.contains("listen_events.clone(),"),
+            "the monitor gets a clone of the shared stream; its arguments \
+             were {monitor_args:?}",
+        );
+
+        let handed = body
+            .find(".listen_events(listen_events)")
+            .expect("the alert loop is built with the shared stream");
+        let builder = body
+            .find("AlertLoopBuilder::new(")
+            .expect("`boot` builds the alert loop");
+        let spawned = builder
+            + body[builder..]
+                .find(".spawn();")
+                .expect("the loop is spawned");
+        assert!(
+            builder < handed && handed < spawned && monitor < handed,
+            "the stream is cloned into the monitor first, then moved into \
+             the alert loop's builder before it spawns",
         );
     }
 

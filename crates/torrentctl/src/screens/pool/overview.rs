@@ -228,8 +228,9 @@ pub fn view(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
     } else {
         results.len() as u16 + 2
     };
+    // Eight adoption states and the unmatched remainder, inside a border.
     let [top, roots_area, results_area] = Layout::vertical([
-        Constraint::Length(9),
+        Constraint::Length(10),
         Constraint::Fill(1),
         Constraint::Length(results_height),
     ])
@@ -304,10 +305,11 @@ fn kv<'a>(theme: &Theme, key: &'a str, value: Span<'a>) -> Line<'a> {
 /// One bar per adoption state, against the whole library.
 fn draw_states(pool: &types::PoolOverview, theme: &Theme, frame: &mut Frame, area: Rect) {
     let s = &pool.states;
-    let known = s.missing + s.partial + s.matched + s.adopted + s.drifted + s.overlap;
+    let known = s.missing + s.partial + s.matched + s.adopted + s.drifted + s.overlap + s.shared;
     let rows = [
         ("adopted", s.adopted),
         ("matched", s.matched),
+        ("shared", s.shared),
         ("partial", s.partial),
         ("missing", s.missing),
         ("drifted", s.drifted),
@@ -519,8 +521,16 @@ fn result_lines<'a>(state: &State, ctx: &Ctx<'_>, wide: bool) -> Vec<Line<'a>> {
             Span::raw(format!(" {} · ", fmt::count(s.partial))),
             state_span(theme, "missing"),
             Span::raw(format!(" {} · ", fmt::count(s.missing))),
+        ]);
+        if !wide {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            spans.push(label(""));
+        }
+        spans.extend([
             state_span(theme, "overlap"),
             Span::raw(format!(" {} · ", fmt::count(s.overlap))),
+            state_span(theme, "shared"),
+            Span::raw(format!(" {} · ", fmt::count(s.shared))),
             Span::styled(format!("{} errors", fmt::count(s.errors)), theme.fg(errors)),
         ]);
         lines.push(Line::from(spans));

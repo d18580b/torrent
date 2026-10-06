@@ -174,7 +174,7 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     let out: Value = resp.json();
     assert_eq!(
         out,
-        json!({"torrent_count": 1, "failed_count": 0, "skipped_profiles": []})
+        json!({"torrent_count": 1, "failed_count": 0, "failed_infohashes": [], "skipped_profiles": []})
     );
     assert_eq!(
         calls(
@@ -344,6 +344,11 @@ async fn bulk_operations_count_what_the_engine_refused() {
             out["failed_count"], 1,
             "{path}: a torrent left running must not read as reached"
         );
+        assert_eq!(
+            out["failed_infohashes"],
+            json!([InfoHash([1; 20]).to_hex()]),
+            "{path}: and which one it was, so the operator can retry it"
+        );
     }
     h.assert_conformance();
 }
@@ -361,7 +366,7 @@ async fn a_profile_with_nothing_loaded_reports_zero_and_a_natpmp_one_its_negotia
         .json();
     assert_eq!(
         out,
-        json!({"torrent_count": 0, "failed_count": 0, "skipped_profiles": []})
+        json!({"torrent_count": 0, "failed_count": 0, "failed_infohashes": [], "skipped_profiles": []})
     );
 
     let detail: Value = h.read("/v1/profiles/host").await.json();

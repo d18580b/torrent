@@ -928,7 +928,8 @@ mod tests {
 
     fn outcome(torrents: i64, failed: i64) -> types::BulkOutcome {
         testing::from_json(json!({
-            "torrent_count": torrents, "failed_count": failed, "skipped_profiles": [],
+            "torrent_count": torrents, "failed_count": failed, "failed_infohashes": [],
+            "skipped_profiles": [],
         }))
     }
 

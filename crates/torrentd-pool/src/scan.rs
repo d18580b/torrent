@@ -18,6 +18,7 @@ use crate::model::PoolFile;
 use crate::model::PoolTorrent;
 use crate::model::TorrentFileRow;
 use crate::store::PoolStore;
+use crate::store::STAGE_BATCH;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ScanStats {
@@ -52,10 +53,15 @@ impl ScanStats {
 /// Symlinks are not followed. A pool assembled with symlinks into other roots
 /// would otherwise index the same bytes under two paths and every torrent over
 /// them would be reported as an overlap.
+///
+/// The walk streams into a staging table [`STAGE_BATCH`] rows at a time, and
+/// the root's index is swapped for it only once the walk is done: memory is
+/// one batch whatever the root's size, and the index never holds half a walk.
 pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, PoolError> {
     let root_id = store.upsert_root(root_path)?;
     let mut stats = ScanStats::default();
-    let mut files = Vec::new();
+    store.begin_staging()?;
+    let mut files = Vec::with_capacity(STAGE_BATCH);
 
     for entry in jwalk::WalkDir::new(root_path)
         .follow_links(false)
@@ -91,6 +97,11 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             stats.note_error("path");
             continue;
         };
+        // What a delete plan removed. Indexing it would offer it up as an
+        // orphan again, or let a torrent match against it.
+        if rel_str.starts_with(&format!("{}/", crate::plan::TRASH_DIR)) {
+            continue;
+        }
 
         stats.files_indexed += 1;
         stats.bytes_indexed += meta.len();
@@ -103,9 +114,15 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             dev: device(&meta),
             v2_root: None,
         });
+        if files.len() >= STAGE_BATCH {
+            store.stage_files(&files)?;
+            files.clear();
+        }
     }
+    store.stage_files(&files)?;
+    drop(files);
 
-    store.replace_root_files(root_id, &files, now_secs())?;
+    store.swap_staged_root(root_id, now_secs())?;
     info!(
         target: "torrentd_pool::scan",
         root = %root_path.display(),
@@ -123,8 +140,17 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
 /// `<hash>.torrent` alongside `<hash>.fastresume`; the sidecar is read for its
 /// save-path, category and tag hints. Nothing here is qBittorrent-specific —
 /// a plain directory of `.torrent` files works the same, minus the hints.
-pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanStats, PoolError> {
+///
+/// A torrent whose `.torrent` is gone leaves the index, except one in
+/// `loaded` (hex info-hashes a session serves) — see
+/// [`PoolStore::retain_torrents`].
+pub fn scan_library(
+    store: &mut PoolStore,
+    library_dir: &Path,
+    loaded: &std::collections::HashSet<String>,
+) -> Result<ScanStats, PoolError> {
     let mut stats = ScanStats::default();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !library_dir.exists() {
         warn!(
             target: "torrentd_pool::scan",
@@ -196,29 +222,71 @@ pub fn scan_library(store: &mut PoolStore, library_dir: &Path) -> Result<ScanSta
             num_files: meta.files.len(),
             source_path: path.clone(),
             fastresume_path,
-            declared_save_path: hints.save_path,
-            category: hints.category,
-            tags: hints.tags,
+            declared_save_path: hints.save_path.clone(),
+            category: hints.category.clone(),
+            tags: hints.tags.clone(),
             // Never inferred here; profile assignment is the daemon's decision and
             // upsert_torrent preserves any existing value.
             profile: None,
         };
         store.upsert_torrent(&torrent, now_secs())?;
 
+        // Where the previous client actually put each file: renamed through
+        // libtorrent's `mapped_files`, or moved by qBittorrent's content
+        // layout. Matching the `.torrent`'s own paths instead reads renamed
+        // payload as missing — and offers it up as orphans to delete.
+        let paths: Vec<String> = meta
+            .files
+            .iter()
+            .map(|f| f.path.replace('\\', "/"))
+            .collect();
+        let paths = hints
+            .relayout(&paths, &meta.name)
+            .map_or(paths, |r| r.paths);
         let rows: Vec<TorrentFileRow> = meta
             .files
             .iter()
+            .zip(paths)
             .enumerate()
-            .map(|(i, f)| TorrentFileRow {
+            .map(|(i, (f, rel_path))| TorrentFileRow {
                 infohash: infohash.clone(),
                 idx: i as i64,
-                rel_path: f.path.replace('\\', "/"),
+                rel_path,
                 size: f.size,
                 pieces_root: f.pieces_root,
+                pad_file: f.pad_file,
             })
             .collect();
         store.replace_torrent_files(&infohash, &rows)?;
         stats.torrents_indexed += 1;
+        seen.insert(infohash);
+    }
+
+    // A torrent whose `.torrent` is gone from the library leaves the index,
+    // unless an error means the library was not fully seen: an unreadable
+    // subdirectory would otherwise drop every torrent under it, and a
+    // `.torrent` that is present but does not parse — truncated by a copy,
+    // or corrupted — names no info-hash, so its torrent would be dropped
+    // with its claims and its payload offered up as orphans.
+    let unseen = ["walk", "read", "parse"]
+        .iter()
+        .map(|k| stats.errors_by_kind.get(k).copied().unwrap_or(0))
+        .sum::<u64>();
+    if unseen == 0 {
+        let dropped = store.retain_torrents(&seen, loaded)?;
+        if dropped > 0 {
+            info!(
+                target: "torrentd_pool::scan",
+                torrent_count = dropped,
+                "torrents no longer in the library dropped from the index",
+            );
+        }
+    } else {
+        warn!(
+            target: "torrentd_pool::scan",
+            error_count = unseen,
+            "the library could not be read in full; torrents missing from it are kept",
+        );
     }
 
     info!(
@@ -238,15 +306,20 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-/// The `(size, mtime, inode)` triple the index records for a file.
+/// The `(size, mtime, inode, device)` the index records for a file.
 ///
 /// Public because anything comparing live metadata against the index — drift
-/// detection, and the last-moment check before an irreversible delete — has to
-/// compute it the same way the scanner did. Two copies of this encoding that
-/// disagree would either miss a change or reject every unchanged file.
-pub fn file_stamp(m: &std::fs::Metadata) -> (u64, i64, u64) {
+/// detection, and the last-moment check before a delete — has to compute it
+/// the same way the scanner did. Two copies of this encoding that disagree
+/// would either miss a change or reject every unchanged file.
+///
+/// The device is part of it because an inode number is only unique within
+/// one filesystem: a different volume mounted over a directory after the scan
+/// can present a file with the same size, mtime and inode number that is not
+/// the file the scan saw.
+pub fn file_stamp(m: &std::fs::Metadata) -> (u64, i64, u64, u64) {
     use std::os::unix::fs::MetadataExt;
-    (m.len(), mtime_ns(m), m.ino())
+    (m.len(), mtime_ns(m), m.ino(), m.dev())
 }
 
 fn mtime_ns(m: &std::fs::Metadata) -> i64 {
@@ -276,7 +349,7 @@ mod tests {
         std::fs::write(dir.path().join("broken.torrent"), b"not bencode").unwrap();
         let mut store = PoolStore::open_in_memory().unwrap();
 
-        let stats = scan_library(&mut store, dir.path()).unwrap();
+        let stats = scan_library(&mut store, dir.path(), &Default::default()).unwrap();
 
         assert_eq!(stats.errors, 1);
         assert_eq!(

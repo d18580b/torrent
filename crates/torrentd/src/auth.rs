@@ -47,6 +47,12 @@ pub const STATIC_TOKEN_PREFIX: &str = "tdp_";
 /// Prefix of a session token issued by `POST /v1/sessions`.
 pub const SESSION_TOKEN_PREFIX: &str = "tds_";
 
+/// The shortest `[auth] session_ttl_secs` the config accepts.
+pub const MIN_SESSION_TTL_SECS: u64 = 60;
+
+/// The longest `[auth] session_ttl_secs` the config accepts: 30 days.
+pub const MAX_SESSION_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// What a credential is allowed to do.
 ///
 /// Deliberately coarse. A finer model invites the mistake of handing a scrape
@@ -105,7 +111,7 @@ pub struct AuthConfig {
     pub password_hash: String,
 
     /// How long a session token from `POST /v1/sessions` stays valid.
-    /// Default 12 hours.
+    /// Default 12 hours; [`MIN_SESSION_TTL_SECS`] to [`MAX_SESSION_TTL_SECS`].
     #[serde(default = "AuthConfig::default_ttl")]
     pub session_ttl_secs: u64,
 
@@ -126,8 +132,26 @@ impl AuthConfig {
                  generate one with `torrentd --config … hash-password`"
             );
         }
+        // Bounded both ways. Zero would issue tokens that are dead on arrival,
+        // and an unbounded value overflows the clock arithmetic that computes
+        // an expiry — a panic on the login route rather than a config error.
+        if !(MIN_SESSION_TTL_SECS..=MAX_SESSION_TTL_SECS).contains(&self.session_ttl_secs) {
+            anyhow::bail!(
+                "[auth] session_ttl_secs = {} is out of range; it must be between \
+                 {MIN_SESSION_TTL_SECS} and {MAX_SESSION_TTL_SECS} (30 days)",
+                self.session_ttl_secs,
+            );
+        }
+        let mut names = std::collections::HashSet::new();
+        let mut digests = std::collections::HashSet::new();
         for t in &self.token {
-            if t.sha256.len() != 64 || hex::decode(&t.sha256).is_err() {
+            let Ok(digest) = hex::decode(&t.sha256) else {
+                anyhow::bail!(
+                    "[auth] token {:?}: sha256 must be 64 hex characters",
+                    t.name,
+                );
+            };
+            if digest.len() != 32 {
                 anyhow::bail!(
                     "[auth] token {:?}: sha256 must be 64 hex characters",
                     t.name,
@@ -135,6 +159,20 @@ impl AuthConfig {
             }
             if t.scopes.is_empty() {
                 anyhow::bail!("[auth] token {:?}: at least one scope is required", t.name);
+            }
+            // The name is what the log and `GET /v1/sessions/current` report,
+            // so two tokens sharing one make a leak unattributable. Two
+            // entries sharing a hash are one credential, and the first entry
+            // silently decides which scopes it carries.
+            if !names.insert(t.name.as_str()) {
+                anyhow::bail!("[auth] token name {:?} is used more than once", t.name);
+            }
+            if !digests.insert(digest) {
+                anyhow::bail!(
+                    "[auth] token {:?}: its sha256 is already listed under another name; \
+                     each [[auth.token]] must be a distinct token",
+                    t.name,
+                );
             }
         }
         Ok(())
@@ -178,12 +216,22 @@ impl SessionStore {
         rand::thread_rng().fill_bytes(&mut bytes);
         let token = format!("{SESSION_TOKEN_PREFIX}{}", hex::encode(bytes));
         let now = Instant::now();
-        let expires_at = SystemTime::now() + self.ttl;
+        // `AuthConfig::validate` bounds the TTL, but the store must not panic
+        // on the login route whatever it was built with: `Instant + Duration`
+        // and `SystemTime + Duration` both panic on overflow. A TTL too long
+        // to represent is clamped to one that is.
+        let expires = now
+            .checked_add(self.ttl)
+            .or_else(|| now.checked_add(Duration::from_secs(MAX_SESSION_TTL_SECS)))
+            .unwrap_or(now);
+        let lifetime = expires.saturating_duration_since(now);
+        let wall_now = SystemTime::now();
+        let expires_at = wall_now.checked_add(lifetime).unwrap_or(wall_now);
         let mut g = self.inner.lock();
         // Opportunistic sweep; sessions are few and this keeps a long-running
         // daemon from accumulating expired entries with no separate task.
         g.retain(|_, (exp, _)| *exp > now);
-        g.insert(digest(&token), (now + self.ttl, expires_at));
+        g.insert(digest(&token), (expires, expires_at));
         (token, expires_at)
     }
 
@@ -259,9 +307,10 @@ pub struct Auth {
 /// Per-client buckets alone multiply the rate the daemon verifies at by the
 /// number of addresses a caller holds: 1024 tracked clients at five attempts
 /// per thirty seconds each is ~170 Argon2id runs a second, ~8.5 CPU-seconds
-/// every second on the async workers, and a guessing rate ~1000 times the one
-/// the single global bucket allowed. One routed IPv6 /64 supplies those
-/// addresses. So every verification, whichever bucket admitted it, also
+/// on the blocking pool every second, and a guessing rate ~1000 times the one
+/// the single global bucket allowed. IPv6 clients are keyed per /64
+/// ([`throttle_key`]), so one host's /64 is one bucket, but one routed /48
+/// still supplies 65536 of them. So every verification, whichever bucket admitted it, also
 /// spends from one daemon-wide budget ([`KdfBudget`]), and when that is spent
 /// the route answers 429 without running the KDF. The per-client buckets
 /// decide *who* is throttled below that ceiling; the ceiling alone bounds how
@@ -355,6 +404,26 @@ impl KdfBudget {
         } else {
             Err((self.refilled_at + self.refill).saturating_duration_since(now))
         }
+    }
+}
+
+/// The key a client's failures are counted under.
+///
+/// An IPv4 address is its own key. An IPv6 address is keyed by its /64: a
+/// single host is routinely handed a whole /64, so keying per address gave
+/// one machine 2^64 buckets, each with its own burst, and let it fill the
+/// per-client map on its own. An IPv4-mapped IPv6 address is the IPv4 client
+/// it names, so a dual-stack socket and a v4 one agree on the key.
+pub(crate) fn throttle_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let prefix = u128::from(v6) & !((1u128 << 64) - 1);
+                IpAddr::V6(std::net::Ipv6Addr::from(prefix))
+            }
+        },
     }
 }
 
@@ -488,12 +557,12 @@ impl LoginThrottle {
     /// routes an identified client with no bucket of its own to the global
     /// bucket once the map is full, so this consults the global bucket in the
     /// same case. Returning `None` there instead would mean that filling the
-    /// map — 1024 requests from 1024 addresses, which one routed IPv6 /64
+    /// map — 1024 requests from 1024 /64s, which one routed IPv6 /48
     /// supplies — leaves every address after it permanently unthrottled, and
     /// an unthrottled login route is a free CPU-exhaustion lever for an
     /// unauthenticated caller.
     pub fn retry_after(&self, client: Option<IpAddr>) -> Option<Duration> {
-        let Some(ip) = client else {
+        let Some(ip) = client.map(throttle_key) else {
             return self.global.lock().retry_after();
         };
         let mut g = self.per_client.lock();
@@ -509,7 +578,7 @@ impl LoginThrottle {
 
     /// Record a failed attempt, locking out once the burst is spent.
     pub fn note_failure(&self, client: Option<IpAddr>) {
-        let Some(ip) = client else {
+        let Some(ip) = client.map(throttle_key) else {
             self.global
                 .lock()
                 .note_failure(self.max_burst, self.penalty);
@@ -566,7 +635,7 @@ impl LoginThrottle {
     /// another and never trip the lockout, which is a bypass rather than a
     /// repair.
     pub fn note_success(&self, client: Option<IpAddr>) {
-        let Some(ip) = client else {
+        let Some(ip) = client.map(throttle_key) else {
             *self.global.lock() = ThrottleState::default();
             return;
         };
@@ -905,6 +974,97 @@ mod tests {
         c.token[0].sha256 = digest;
         c.token[0].scopes.clear();
         assert!(c.validate().is_err(), "a token with no scopes is useless");
+    }
+
+    #[test]
+    fn config_validation_bounds_the_session_ttl() {
+        let mut c = cfg(hash_password("pw").unwrap());
+        for bad in [
+            0,
+            MIN_SESSION_TTL_SECS - 1,
+            MAX_SESSION_TTL_SECS + 1,
+            u64::MAX,
+        ] {
+            c.session_ttl_secs = bad;
+            assert!(c.validate().is_err(), "ttl {bad} must be refused");
+        }
+        for good in [MIN_SESSION_TTL_SECS, 43_200, MAX_SESSION_TTL_SECS] {
+            c.session_ttl_secs = good;
+            assert!(c.validate().is_ok(), "ttl {good} must be accepted");
+        }
+    }
+
+    #[test]
+    fn a_ttl_too_long_to_represent_never_panics_the_login_route() {
+        // `Instant + Duration` panics on overflow; the store is built from
+        // whatever the config says, so it must clamp rather than panic.
+        let s = SessionStore::new(Duration::from_secs(u64::MAX));
+        let (token, expires_at) = s.create();
+        assert!(s.is_valid(&token));
+        assert!(expires_at > SystemTime::now());
+    }
+
+    #[test]
+    fn config_validation_refuses_duplicate_token_names_and_hashes() {
+        let base = cfg(hash_password("pw").unwrap());
+        let (_, a) = generate_token();
+        let (_, b) = generate_token();
+        let token = |name: &str, sha256: &str| TokenConfig {
+            name: name.into(),
+            sha256: sha256.into(),
+            scopes: vec![Scope::Read],
+        };
+
+        let mut c = base.clone();
+        c.token = vec![token("one", &a), token("two", &b)];
+        assert!(c.validate().is_ok());
+
+        c.token = vec![token("same", &a), token("same", &b)];
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("more than once"), "{e}");
+
+        // The same credential twice, even spelled in another case.
+        c.token = vec![token("one", &a), token("two", &a.to_uppercase())];
+        let e = c.validate().unwrap_err().to_string();
+        assert!(e.contains("already listed"), "{e}");
+    }
+
+    #[test]
+    fn an_ipv6_client_is_throttled_per_64_not_per_address() {
+        // One host is routinely handed a whole /64. Keyed per address, it had
+        // 2^64 buckets of five attempts each.
+        let t = LoginThrottle::new();
+        let addr = |last: u16| {
+            Some(IpAddr::V6(std::net::Ipv6Addr::new(
+                0x2001, 0xdb8, 0, 1, 0, 0, 0, last,
+            )))
+        };
+        for n in 0..5 {
+            t.note_failure(addr(n));
+        }
+        assert!(
+            t.retry_after(addr(999)).is_some(),
+            "another address in the same /64 is the same client",
+        );
+        let neighbour = Some(IpAddr::V6(std::net::Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 2, 0, 0, 0, 1,
+        )));
+        assert!(
+            t.retry_after(neighbour).is_none(),
+            "the next /64 is another client",
+        );
+        assert_eq!(t.per_client.lock().len(), 1);
+    }
+
+    #[test]
+    fn an_ipv4_mapped_client_shares_the_ipv4_bucket() {
+        let t = LoginThrottle::new();
+        let v4 = std::net::Ipv4Addr::new(198, 51, 100, 7);
+        for _ in 0..5 {
+            t.note_failure(Some(IpAddr::V6(v4.to_ipv6_mapped())));
+        }
+        assert!(t.retry_after(Some(IpAddr::V4(v4))).is_some());
+        assert_eq!(throttle_key(IpAddr::V4(v4)), IpAddr::V4(v4));
     }
 
     #[test]

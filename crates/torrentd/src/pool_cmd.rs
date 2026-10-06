@@ -39,6 +39,10 @@ fn scan_inner(
     let mut files = 0u64;
     let mut bytes = 0u64;
     let mut errors = 0u64;
+    let dropped = store.retain_roots(&pool_cfg.roots)?;
+    if dropped > 0 {
+        println!("  dropped {dropped} root(s) no longer configured");
+    }
     for root in &pool_cfg.roots {
         let s = torrentd_pool::scan_root(store, root)
             .with_context(|| format!("scan root {}", root.display()))?;
@@ -53,7 +57,9 @@ fn scan_inner(
         errors += s.errors;
     }
 
-    let lib = torrentd_pool::scan_library(store, &pool_cfg.library_dir)
+    // No session runs here to say what is loaded; `adopted` and `drifted`
+    // torrents are kept regardless (`PoolStore::retain_torrents`).
+    let lib = torrentd_pool::scan_library(store, &pool_cfg.library_dir, &Default::default())
         .with_context(|| format!("scan library {}", pool_cfg.library_dir.display()))?;
     println!(
         "  library {:<37} {:>10} torrents",
@@ -74,8 +80,8 @@ fn scan_inner(
         store.torrent_count()?,
     );
     println!(
-        "  matched {}   partial {}   missing {}   overlap {}",
-        m.matched, m.partial, m.missing, m.overlap,
+        "  matched {}   partial {}   missing {}   overlap {}   shared {}   drifted {}",
+        m.matched, m.partial, m.missing, m.overlap, m.shared, m.drifted,
     );
     if errors > 0 {
         // Unreadable directories look exactly like empty ones, so never let
@@ -230,13 +236,14 @@ fn import_legacy(store: &mut PoolStore, registry: &AssignmentRegistry) -> anyhow
 fn print_state_counts(counts: &HashMap<AdoptionState, u64>) {
     let get = |s: AdoptionState| counts.get(&s).copied().unwrap_or(0);
     println!(
-        "  adopted {}   matched {}   partial {}   missing {}   drifted {}   overlap {}",
+        "  adopted {}   matched {}   partial {}   missing {}   drifted {}   overlap {}   shared {}",
         get(AdoptionState::Adopted),
         get(AdoptionState::Matched),
         get(AdoptionState::Partial),
         get(AdoptionState::Missing),
         get(AdoptionState::Drifted),
         get(AdoptionState::Overlap),
+        get(AdoptionState::Shared),
     );
 }
 

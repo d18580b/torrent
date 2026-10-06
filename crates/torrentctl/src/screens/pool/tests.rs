@@ -20,7 +20,7 @@ fn overview_json() -> serde_json::Value {
     json!({
         "library_dir": "/srv/library", "torrents": 1234, "files": 56789,
         "states": {"missing": 40, "partial": 50, "matched": 300, "adopted": 800,
-                   "drifted": 3, "overlap": 11},
+                   "drifted": 3, "overlap": 11, "shared": 6},
         "verify_queue_depth": 4, "verify_in_flight": 2,
         "roots": [
             {"root_id": 1, "path": "/srv/pool/a", "bytes_total": 4 * TIB,
@@ -354,7 +354,7 @@ fn an_overview_answer_to_an_older_load_is_dropped() {
     let old = state.overview.generation;
     // A scan finishing reloads at once, superseding the refresh.
     let summary = testing::from_json(json!({"files": 1, "bytes": 1, "torrents": 1, "matched": 1,
-        "partial": 0, "missing": 0, "overlap": 0, "errors": 0}));
+        "partial": 0, "missing": 0, "overlap": 0, "shared": 0, "drifted": 0, "errors": 0}));
     assert_eq!(
         send(
             &mut state,
@@ -1292,7 +1292,8 @@ fn the_overview_renders() {
     let mut state = with_overview();
     state.overview.scan = Some(testing::from_json(
         json!({"files": 57000, "bytes": 7_500_000_000_000_i64,
-        "torrents": 1234, "matched": 300, "partial": 50, "missing": 40, "overlap": 11, "errors": 2}),
+        "torrents": 1234, "matched": 300, "partial": 50, "missing": 40, "overlap": 11, "shared": 6,
+        "drifted": 3, "errors": 2}),
     ));
     state.overview.drift = Some(testing::from_json(
         json!({"drifted": [hash(9), hash(10), hash(11)],

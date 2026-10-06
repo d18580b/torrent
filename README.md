@@ -76,8 +76,9 @@ them, and reports per path:
 | `matched` | Every file resolved on disk; not yet loaded. |
 | `partial` | Only some files present. Adoption is refused — seeding it would advertise pieces the daemon cannot serve. |
 | `missing` | No payload found under any root. |
-| `drifted` | A claimed file's size, mtime or inode changed since the last scan. Needs verification. |
-| `overlap` | Two torrents claim the same file. Blocks any mutation touching those bytes. |
+| `drifted` | A claimed file's size, mtime or inode changed since the last scan. Stays so across rescans until a verification clears it. |
+| `overlap` | Two torrents claim some of the same files, but not the same set. Blocks adoption and any mutation touching those bytes. |
+| `shared` | Another torrent claims exactly the same files — a cross-seed. Adoptable, each into its own profile; never moved or deleted for one of them. |
 
 Plus byte rollups per directory, so an unprotected subtree is visible without
 reading a file listing.
@@ -85,12 +86,15 @@ reading a file listing.
 Change detection is tiered because hashing a petabyte is days of I/O: a
 `(size, mtime, inode)` sweep catches essentially every real change cheaply,
 and libtorrent's own piece hashing is the authoritative check, run on adopt
-and on drift. A v2 torrent's per-file merkle root identifies a file wherever
-it moved; v1 torrents have no per-file digest, so they match on `(path, size)`
-and are confirmed only by verification.
+and on drift. Every torrent, v1, v2 or hybrid, matches on `(path, size)`
+against a small set of candidate directories, and a match is confirmed only
+by that verification.
 
-**Migrating from another client is just the first scan** — point
-`library_dir` at its state directory. The details are in
+**Migrating from qBittorrent, or another libtorrent-based client, is just the
+first scan** — point `library_dir` at its state directory (qBittorrent's
+`BT_backup`). Their `.fastresume` sidecars supply the save path, renamed files
+and completion; a client whose state directory is not `.torrent` files beside
+libtorrent resume data gets matching only, and every torrent is verified. The details are in
 [`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml) next to the key
 you set.
 
@@ -235,19 +239,26 @@ daemon has, and it should not be what you get by writing nothing. `POST
 [[profile]]
 id                = "public"
 network           = "host"          # binds this machine's interfaces
-listen_interfaces = "0.0.0.0:6881,[::]:6881"
+listen_interfaces = "eth0:6881"     # not 0.0.0.0 beside a vpn profile
 dht               = true            # off unless written
 
 [[profile]]
-id                   = "account_a"
-network              = "vpn"        # binds a tunnel; dht/pex/lsd forced off
-vpn_type             = "wireguard"
-vpn_config           = "/etc/wireguard/wg-acct-a.conf"
-vpn_interface        = "wg-acct-a"
-port_forward         = "natpmp"
-peer_fingerprint     = "-XX0002-"     # 8-char peer-id prefix, as written
-user_agent           = "qBittorrent/5.0.3"
+id                      = "account_a"
+network                 = "vpn"     # binds a tunnel; dht/pex/lsd forced off
+vpn_type                = "wireguard"
+vpn_config              = "/etc/wireguard/wg-acct-a.conf"
+vpn_interface           = "wg-acct-a"
+port_forward            = "natpmp"
+peer_fingerprint        = "-qB5030-"  # 8-char peer-id prefix, as written,
+user_agent              = "qBittorrent/5.0.3"  # of the same client
+allowed_tracker_domains = ["tracker.example.com"]  # required on vpn
 ```
+
+> **Config break.** A `vpn` profile without `allowed_tracker_domains`, a host
+> profile listening on `0.0.0.0` or `[::]` beside a `vpn` profile, and any
+> `peer_fingerprint` starting `-LT` are refused at load. See
+> [docs/running.md](docs/running.md#account-isolation) for what each means
+> and what to write instead.
 
 A `vpn` profile pins every socket to its tunnel address and disables DHT, PEX
 and LSD unconditionally — there is no key that turns them back on. Its
@@ -326,10 +337,14 @@ operational side of each knob, including what the kill switch costs and what
 it needs, is in [`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml),
 which is the file an operator actually edits.
 
-`allowed_tracker_domains` is a *misconfiguration guard* for `.torrent` adds —
-it catches loading one account's torrent into another — not an egress control,
-and it is empty by default. Public content that wants DHT belongs in a
-`network = "host"` profile.
+`allowed_tracker_domains` is the account-isolation guard, and every `vpn`
+profile must set it. A torrent enters a profile that sets it only when every
+tracker it announces to is on one of those domains, and it announces to at
+least one — on every add path: the API, pool adoption, and the startup reload
+of resume data and `.torrent` files. It keeps one account's torrent, and its
+passkey, from being announced from another account's tunnel; it is not an
+egress control. Public content that wants DHT belongs in a `network = "host"`
+profile.
 
 ## Authentication
 

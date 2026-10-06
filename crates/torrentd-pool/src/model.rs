@@ -135,9 +135,16 @@ pub enum AdoptionState {
     /// Was matched or adopted, but a covering file's stats moved since the last
     /// verification. Needs a recheck before it can be trusted.
     Drifted,
-    /// At least one file is claimed by another torrent too. Reported on every
-    /// torrent involved, and blocks any mutation touching those files.
+    /// At least one file is claimed by another torrent too, and the two do not
+    /// claim the same set — a conflict. Reported on every torrent involved,
+    /// and blocks adoption and any mutation touching those files.
     Overlap,
+    /// Every file is present, and every other torrent claiming any of them
+    /// claims exactly the same set: one payload under several info-hashes, as
+    /// cross-seeding produces. Adoptable — each torrent into whichever profile
+    /// the operator names — but its bytes are never moved or deleted for one
+    /// of them, since that breaks the others.
+    Shared,
 }
 
 impl AdoptionState {
@@ -149,6 +156,7 @@ impl AdoptionState {
             AdoptionState::Adopted => "adopted",
             AdoptionState::Drifted => "drifted",
             AdoptionState::Overlap => "overlap",
+            AdoptionState::Shared => "shared",
         }
     }
 
@@ -160,13 +168,14 @@ impl AdoptionState {
             "adopted" => AdoptionState::Adopted,
             "drifted" => AdoptionState::Drifted,
             "overlap" => AdoptionState::Overlap,
+            "shared" => AdoptionState::Shared,
             _ => return None,
         })
     }
 
     /// Whether a torrent in this state may be handed to a session.
     pub fn is_adoptable(self) -> bool {
-        matches!(self, AdoptionState::Matched)
+        matches!(self, AdoptionState::Matched | AdoptionState::Shared)
     }
 }
 
@@ -180,9 +189,9 @@ pub struct PoolFile {
     pub mtime_ns: i64,
     pub ino: u64,
     pub dev: u64,
-    /// v2 merkle root, once known. Populated by matching against a v2 torrent
-    /// rather than by hashing: computing it for an unmatched file would mean
-    /// reading the whole pool.
+    /// v2 merkle root. Nothing populates it: computing it would mean reading
+    /// the whole pool, and the matcher places files by `(path, size)` alone.
+    /// The column is kept so the schema does not change for it.
     pub v2_root: Option<[u8; 32]>,
 }
 
@@ -224,6 +233,17 @@ pub struct TorrentFileRow {
     pub rel_path: String,
     pub size: u64,
     pub pieces_root: Option<[u8; 32]>,
+    /// A BEP 47 padding entry. It has a size but is never written to disk, so
+    /// nothing that looks for this torrent's files there may count it.
+    pub pad_file: bool,
+}
+
+impl TorrentFileRow {
+    /// Whether this entry has bytes that should exist on disk. Padding files
+    /// and empty files have none to find.
+    pub fn is_on_disk(&self) -> bool {
+        !self.pad_file && self.size > 0
+    }
 }
 
 /// Byte accounting for one directory subtree — what makes the pool legible at

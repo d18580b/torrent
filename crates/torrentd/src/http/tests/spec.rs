@@ -152,6 +152,63 @@ fn every_error_is_a_problem_and_every_problem_type_is_catalogued() {
 }
 
 #[test]
+fn every_page_limit_publishes_its_bounds() {
+    // kynos describes a query parameter by its type alone, so a bound
+    // written on the field never reached the document: `limit` read as
+    // 0 to 4294967295 while the handler refused both ends.
+    let doc = doc();
+    let mut seen = 0;
+    for (method, path, op) in operations(&doc) {
+        for param in op["parameters"].as_array().into_iter().flatten() {
+            if param["name"] != "limit" || param["in"] != "query" {
+                continue;
+            }
+            seen += 1;
+            let schema = &param["schema"];
+            assert_eq!(schema["minimum"].as_f64(), Some(1.0), "{method} {path}");
+            assert_eq!(
+                schema["maximum"].as_f64(),
+                Some(f64::from(crate::http::page::MAX_LIMIT)),
+                "{method} {path}"
+            );
+        }
+    }
+    assert_eq!(seen, 6, "every paged listing takes a `limit`");
+}
+
+#[test]
+fn a_bulk_outcome_publishes_how_many_failures_it_names() {
+    // The handlers cut the list at the cap; a client sizing a buffer or
+    // validating a response learns that only from the document.
+    let doc = doc();
+    let failed = &doc["components"]["schemas"]["BulkOutcome"]["properties"]["failed_infohashes"];
+    assert_eq!(
+        failed["maxItems"].as_u64(),
+        Some(crate::http::v1::profiles::MAX_REPORTED_FAILURES as u64),
+        "{failed}"
+    );
+}
+
+#[test]
+fn only_operations_with_a_body_declare_a_deadline() {
+    // `408` comes from the deadline a body-bearing group carries; one on an
+    // operation without a body would be a promise nothing can produce, and
+    // one missing from a body-bearing operation (bar the plan apply, which
+    // waits for minutes by design) is a slow body nothing bounds.
+    let doc = doc();
+    for (method, path, op) in operations(&doc) {
+        let has_body = op.get("requestBody").is_some();
+        let has_deadline = op["responses"].get("408").is_some();
+        let long = path == "/v1/pool/plans/{plan_id}/apply" || path == "/v1/faults";
+        assert_eq!(
+            has_deadline,
+            has_body && !long,
+            "{method} {path}: body {has_body}, 408 {has_deadline}"
+        );
+    }
+}
+
+#[test]
 fn no_operation_answers_with_a_top_level_array() {
     let doc = doc();
     for (method, path, op) in operations(&doc) {

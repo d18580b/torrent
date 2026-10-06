@@ -225,6 +225,100 @@ impl Harness {
         resp
     }
 
+    /// Send `method path` over a real socket with a body that declares more
+    /// bytes than it sends and then stalls, and return the status the server
+    /// answers with and how long, on the tokio clock, it took to.
+    ///
+    /// The in-process client can only send a body it has in full, so this
+    /// serves a second router over `state` on a loopback listener — the same
+    /// `kynos::server::Server` the daemon runs — and writes the request by
+    /// hand. The clock is paused while it waits, so a deadline of minutes
+    /// elapses as soon as nothing else can run: the result is exact, and the
+    /// test does not wait for it.
+    pub async fn slow_body(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, std::time::Duration) {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+
+        let openapi = OpenApiJson(Arc::new(bytes::Bytes::from(
+            crate::http::document_json().unwrap(),
+        )));
+        let service = crate::http::service((*self.state).clone(), openapi).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(
+            kynos::server::Server::new(service)
+                .listener(listener)
+                .serve(),
+        );
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let auth = token
+            .map(|t| format!("authorization: Bearer {t}\r\n"))
+            .unwrap_or_default();
+        let head = format!(
+            "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+             content-length: 64\r\n{auth}\r\n{{\"pad\": \""
+        );
+        stream.write_all(head.as_bytes()).await.unwrap();
+
+        // A request nothing bounds would otherwise wait forever. The guard is
+        // a thread on the real clock, not a tokio timer: a paused clock jumps
+        // to the earliest tokio timer the moment nothing can run, which may
+        // be before the server has armed its own deadline, and a guard timer
+        // would then be what fires.
+        let (done, done_rx) = std::sync::mpsc::channel::<()>();
+        let (fire, fired) = tokio::sync::oneshot::channel::<()>();
+        std::thread::spawn(move || {
+            if done_rx.recv_timeout(std::time::Duration::from_secs(60))
+                == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            {
+                let _ = fire.send(());
+            }
+        });
+
+        tokio::time::pause();
+        let started = tokio::time::Instant::now();
+        let mut response = Vec::new();
+        let mut buf = [0u8; 1024];
+        let read = async {
+            while !response.windows(2).any(|w| w == b"\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(
+                    n > 0,
+                    "{method} {path}: the connection closed with no response"
+                );
+                response.extend_from_slice(&buf[..n]);
+            }
+        };
+        let answered = tokio::select! {
+            () = read => true,
+            _ = fired => false,
+        };
+        let waited = started.elapsed();
+        drop(done);
+        tokio::time::resume();
+        assert!(
+            answered,
+            "{method} {path}: no response to a stalled body in a minute of real time"
+        );
+        server.abort();
+
+        let line = String::from_utf8_lossy(&response);
+        let status: u16 = line
+            .split(' ')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("{method} {path}: not a status line: {line}"));
+        let status = StatusCode::from_u16(status).unwrap();
+        self.coverage.saw(method, path, status);
+        (status, waited)
+    }
+
     /// Shorthand for a request with the `write` token and no body.
     pub async fn write(&self, method: &str, path: &str) -> TestResponse {
         self.send(method, path, Some(&self.tokens.write.clone()), None)

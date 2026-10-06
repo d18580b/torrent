@@ -5,10 +5,14 @@
 //! own renewal task, which re-requests the mapping half the *granted* lease
 //! after the last success ([`renew_after`]), or [`RETRY_INTERVAL`] after a
 //! failure. When the port changed it rebinds the live libtorrent session
-//! (`apply_settings` → `reopen_listen_sockets`) and reannounces every torrent
-//! in the profile — paced, [`REANNOUNCE_BATCH`] at a time — so trackers learn
-//! the new port within seconds to minutes rather than at their next scheduled
-//! announce, and never all at once. A new port another profile already holds
+//! (`apply_settings` → `reopen_listen_sockets`), waits for the alert loop to
+//! relay the session's `listen_succeeded` for the new endpoint, and only then
+//! records the port and reannounces every torrent in the profile — paced,
+//! [`REANNOUNCE_BATCH`] at a time — so trackers learn the new port within
+//! seconds to minutes rather than at their next scheduled announce, and never
+//! all at once. A `listen_failed` for it, or no outcome within
+//! [`torrentd_engine::port_forward::LISTEN_CONFIRM_TIMEOUT`], is a `rebind`
+//! failure and is retried like one. A new port another profile already holds
 //! is not bound (profile Safety Rule 8).
 //!
 //! The tasks are independent so one unresponsive gateway, which costs a
@@ -35,7 +39,11 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 use torrentd_engine::port_forward::reannounce_batch;
 use torrentd_engine::port_forward::renew_after;
+use torrentd_engine::port_forward::ListenEvents;
 use torrentd_engine::port_forward::Reannounce;
+use torrentd_engine::port_forward::RebindFailure;
+use torrentd_engine::port_forward::RebindTarget;
+use torrentd_engine::port_forward::LISTEN_CONFIRM_TIMEOUT;
 use torrentd_engine::port_forward::REANNOUNCE_BATCH;
 use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::renew_and_rebind;
@@ -134,13 +142,25 @@ fn held_by_others_now(
     move |p| ports_held_by_others(profiles.iter(), &id).contains(&p)
 }
 
+/// `listen` is the stream the alert loop publishes listen outcomes into; a
+/// rebind waits on it, and defers until the loop has cleared its boot
+/// backlog.
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
     metrics: Arc<PromSink>,
+    listen: Arc<ListenEvents>,
     shutdown: broadcast::Receiver<ShutdownReason>,
 ) {
-    run_with(profiles, state, metrics, shutdown, NatpmpForwarder::new()).await;
+    run_with(
+        profiles,
+        state,
+        metrics,
+        listen,
+        shutdown,
+        NatpmpForwarder::new(),
+    )
+    .await;
 }
 
 /// [`run`] against `forwarder`, which a test points at a loopback gateway.
@@ -148,6 +168,7 @@ async fn run_with(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
     metrics: Arc<PromSink>,
+    listen: Arc<ListenEvents>,
     mut shutdown: broadcast::Receiver<ShutdownReason>,
     forwarder: NatpmpForwarder,
 ) {
@@ -197,6 +218,7 @@ async fn run_with(
             state.clone(),
             metrics.clone() as Arc<dyn MetricsSink>,
             Arc::new(forwarder.clone()),
+            listen.clone(),
             id,
             REANNOUNCE_PACE,
             stop_rx.clone(),
@@ -240,11 +262,13 @@ async fn run_with(
 /// delays a renewal; a later port change replaces it, and `stop` ends it.
 /// `pace` is the reannounce's pause between batches, [`REANNOUNCE_PACE`]
 /// outside tests.
+#[allow(clippy::too_many_arguments)]
 async fn renew_profile(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
     metrics: Arc<dyn MetricsSink>,
     forwarder: Arc<dyn PortForwarder>,
+    listen: Arc<ListenEvents>,
     id: ProfileId,
     pace: Duration,
     mut stop: watch::Receiver<bool>,
@@ -260,7 +284,7 @@ async fn renew_profile(
             break;
         };
         let taken = held_by_others_now(profiles.clone(), id.clone());
-        let next = renew_once(e, &*metrics, &forwarder, taken).await;
+        let next = renew_once(e, &*metrics, &forwarder, &listen, taken).await;
         delay = next.delay;
         if let Some(detected) = next.rebound_at {
             // The old port's reannounce has nothing left worth saying.
@@ -375,6 +399,7 @@ async fn renew_once(
     e: &ProfileEntry,
     metrics: &dyn MetricsSink,
     forwarder: &Arc<dyn PortForwarder>,
+    listen: &Arc<ListenEvents>,
     taken: impl Fn(u16) -> bool + Send + 'static,
 ) -> Next {
     let profile_id = e.id().clone();
@@ -410,10 +435,13 @@ async fn renew_once(
     // The NAT-PMP exchange retransmits on an exponential schedule and can
     // take the best part of eight seconds against an unresponsive gateway.
     // Held on a runtime worker, one wedged gateway stalls a thread for that
-    // long on every attempt.
+    // long on every attempt. The wait for a rebind's listen outcome blocks
+    // too, for up to LISTEN_CONFIRM_TIMEOUT more.
     let outcome = {
         let forwarder = forwarder.clone();
         let engine = e.engine.clone();
+        let listen = listen.clone();
+        let id = profile_id.clone();
         tokio::task::spawn_blocking(move || {
             renew_and_rebind(
                 &*forwarder,
@@ -421,7 +449,12 @@ async fn renew_once(
                 &req,
                 previous_port,
                 previous_epoch,
-                tunnel_ip,
+                RebindTarget {
+                    tunnel_ip,
+                    profile: &id,
+                    listen: &listen,
+                    timeout: LISTEN_CONFIRM_TIMEOUT,
+                },
                 taken,
             )
         })
@@ -481,6 +514,11 @@ pub(crate) fn renewal_request(gateway: IpAddr, tunnel_ip: IpAddr, held: u16) -> 
 /// before it spends up to a tunnel bring-up and a negotiation on the next
 /// one; no torrent is loaded yet, so there is nothing to reannounce.
 ///
+/// The alert loop has not started at this point, so a rebind could never be
+/// confirmed: a port change found here leaves the session alone and is
+/// deferred to the monitor, which retries it every few seconds and confirms
+/// it once the loop has cleared its boot backlog.
+///
 /// Returns whether the mapping is current. A profile with nothing to renew
 /// (no tunnel address or no forwarded port) is left alone and reported
 /// current. `taken` is every port another profile holds or is configured
@@ -507,7 +545,13 @@ pub(crate) fn refresh_during_boot(
         &renewal_request(gateway, tunnel_ip, previous_port),
         previous_port,
         health.forwarded_epoch,
-        tunnel_ip,
+        RebindTarget {
+            tunnel_ip,
+            profile: e.id(),
+            // Never attached: the alert loop is not running yet.
+            listen: &ListenEvents::new(),
+            timeout: LISTEN_CONFIRM_TIMEOUT,
+        },
         |p| taken.contains(&p),
     );
     record_outcome(e, metrics, outcome)
@@ -603,7 +647,32 @@ pub(crate) fn record_outcome(
             }
             false
         }
-        RenewOutcome::RebindFailed { previous, new } => {
+        // Not a failure: the rebind was not tried, because nothing could
+        // confirm it yet. Uncounted, so a port change during boot does not
+        // raise the rebind alert; the gauge still says the session is not on
+        // the forwarded port, and the retry comes within seconds and repeats
+        // until the alert loop has cleared its boot backlog.
+        RenewOutcome::RebindFailed {
+            previous,
+            new,
+            reason: RebindFailure::Unobserved,
+        } => {
+            metrics.set_gauge("profile_port_forward_up", 0.0, &labels);
+            e.update_health(|h| h.port_forward_ok = false);
+            info!(
+                target: "torrentd::port_forward_monitor",
+                profile_id = %profile_id, previous_port = previous, new_port = new,
+                "NAT-PMP renewed with a new port before the alert loop cleared its boot \
+                 backlog; the rebind waits until it can be confirmed, still seeding on the \
+                 old port",
+            );
+            false
+        }
+        RenewOutcome::RebindFailed {
+            previous,
+            new,
+            reason,
+        } => {
             metrics.inc_counter(
                 FAILURES,
                 &[("profile_id", profile_id.as_str()), ("stage", "rebind")],
@@ -614,7 +683,9 @@ pub(crate) fn record_outcome(
             warn!(
                 target: "torrentd::port_forward_monitor",
                 profile_id = %profile_id, previous_port = previous, new_port = new,
-                "NAT-PMP renewed with a new port but rebind failed; still seeding on old port",
+                error.cause = %reason,
+                "NAT-PMP renewed with a new port but the session was not confirmed listening \
+                 on it; listening on the old port again, still seeding",
             );
             false
         }
@@ -732,6 +803,53 @@ mod tests {
         false
     }
 
+    /// A listen stream with a publisher attached, as the alert loop leaves it.
+    fn attached() -> Arc<ListenEvents> {
+        let l = Arc::new(ListenEvents::new());
+        l.attach();
+        l
+    }
+
+    /// Stand in for the alert loop: once `engine` is asked to rebind, publish
+    /// acct_a's listen outcome for `endpoint` (`failure` `None` for success).
+    fn answer_rebind(
+        engine: &Arc<MockEngine>,
+        listen: &Arc<ListenEvents>,
+        endpoint: &'static str,
+        failure: Option<&'static str>,
+    ) -> std::thread::JoinHandle<()> {
+        let (engine, listen) = (engine.clone(), listen.clone());
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !engine
+                .calls()
+                .iter()
+                .any(|c| matches!(c, torrentd_engine::RecordedCall::ApplySettings(_)))
+            {
+                assert!(Instant::now() < deadline, "no rebind was attempted");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            listen.publish(
+                &ProfileId::new("acct_a"),
+                endpoint,
+                failure.map(str::to_string),
+            );
+        })
+    }
+
+    fn failure_stages(sink: &RecordingSink) -> Vec<String> {
+        sink.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                MetricCall::IncCounter { name, labels } if name == FAILURES => labels
+                    .into_iter()
+                    .find(|(k, _)| k == "stage")
+                    .map(|(_, v)| v),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn gauge(sink: &RecordingSink, name: &str) -> Option<f64> {
         sink.calls().into_iter().rev().find_map(|c| match c {
             MetricCall::SetGauge { name: n, value, .. } if n == name => Some(value),
@@ -766,12 +884,13 @@ mod tests {
             gateway: IpAddr::V4(Ipv4Addr::new(10, 2, 0, 1)),
         });
         fwd.push_ok(6881);
+        let listen = attached();
 
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), free).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), &listen, free).await;
         assert_eq!(next.delay, RETRY_INTERVAL, "a failure is retried promptly");
         assert!(!entry.health().port_forward_ok);
 
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), free).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), &listen, free).await;
         assert_eq!(next.delay, RENEW_INTERVAL);
         assert!(entry.health().port_forward_ok);
 
@@ -789,12 +908,27 @@ mod tests {
         let (entry, _) = natpmp_entry("acct_a", 6881);
         let fwd = MockForwarder::new();
         fwd.push_ok_lifetime(6881, 40);
-        let next = renew_once(&entry, &RecordingSink::new(), &forwarder(&fwd), free).await;
+        let listen = attached();
+        let next = renew_once(
+            &entry,
+            &RecordingSink::new(),
+            &forwarder(&fwd),
+            &listen,
+            free,
+        )
+        .await;
         assert_eq!(next.delay, Duration::from_secs(20));
 
         // Longer than asked for: still half the requested lease.
         fwd.push_ok_lifetime(6881, 3600);
-        let next = renew_once(&entry, &RecordingSink::new(), &forwarder(&fwd), free).await;
+        let next = renew_once(
+            &entry,
+            &RecordingSink::new(),
+            &forwarder(&fwd),
+            &listen,
+            free,
+        )
+        .await;
         assert_eq!(next.delay, RENEW_INTERVAL);
     }
 
@@ -802,7 +936,14 @@ mod tests {
     async fn a_renewal_asks_to_keep_the_held_port() {
         let (entry, _) = natpmp_entry("acct_a", 51413);
         let fwd = MockForwarder::with_ports([51413]);
-        renew_once(&entry, &RecordingSink::new(), &forwarder(&fwd), free).await;
+        renew_once(
+            &entry,
+            &RecordingSink::new(),
+            &forwarder(&fwd),
+            &attached(),
+            free,
+        )
+        .await;
         let calls = fwd.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].suggested_port, 51413);
@@ -826,8 +967,12 @@ mod tests {
         );
         let sink = Arc::new(RecordingSink::new());
         let fwd = MockForwarder::with_ports([40001]);
+        let listen = attached();
+        let session = answer_rebind(&engine, &listen, "10.2.0.2:40001", None);
 
-        let next = renew_once(&entry, &*sink, &forwarder(&fwd), free).await;
+        let next = renew_once(&entry, &*sink, &forwarder(&fwd), &listen, free).await;
+        session.join().unwrap();
+
         assert_eq!(next.delay, RENEW_INTERVAL);
         let detected = next.rebound_at.expect("the session was rebound");
         assert!(
@@ -887,11 +1032,46 @@ mod tests {
         assert_eq!(reannounced(&engine), handles, "and then the rest");
     }
 
+    /// Stand in for the alert loop for each of the first `rebinds` rebinds:
+    /// every endpoint `engine` is asked to listen on, acct_a's success for it
+    /// is published.
+    fn confirm_rebinds(
+        engine: &Arc<MockEngine>,
+        listen: &Arc<ListenEvents>,
+        rebinds: usize,
+    ) -> std::thread::JoinHandle<()> {
+        let (engine, listen) = (engine.clone(), listen.clone());
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut answered = 0;
+            while answered < rebinds {
+                let binds: Vec<String> = engine
+                    .calls()
+                    .into_iter()
+                    .filter_map(|c| match c {
+                        torrentd_engine::RecordedCall::ApplySettings(s) => s.listen_interfaces,
+                        _ => None,
+                    })
+                    .collect();
+                for endpoint in binds.iter().skip(answered) {
+                    listen.publish(&ProfileId::new("acct_a"), endpoint, None);
+                }
+                answered = answered.max(binds.len());
+                if answered < rebinds {
+                    assert!(Instant::now() < deadline, "too few rebinds were attempted");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        })
+    }
+
     /// `2 * REANNOUNCE_BATCH` torrents in `acct_a`, so a reannounce is two
-    /// batches a pace apart, and the renewal loop driving them.
+    /// batches a pace apart, and the renewal loop driving them, its first
+    /// `rebinds` rebinds confirmed.
     fn two_batch_profile(
         fwd: &MockForwarder,
         pace: Duration,
+        rebinds: usize,
     ) -> (
         Arc<MockEngine>,
         Arc<RecordingSink>,
@@ -908,12 +1088,16 @@ mod tests {
             );
         }
         let sink = Arc::new(RecordingSink::new());
+        let listen = attached();
+        // Detached: it ends once the rebinds are answered.
+        let _session = confirm_rebinds(&engine, &listen, rebinds);
         let (stop_tx, stop) = watch::channel(false);
         let task = tokio::spawn(renew_profile(
             Arc::new(ProfileRegistry::new(vec![entry])),
             state,
             sink.clone() as Arc<dyn MetricsSink>,
             forwarder(fwd),
+            listen,
             ProfileId::new("acct_a"),
             pace,
             stop,
@@ -934,7 +1118,7 @@ mod tests {
         let fwd = MockForwarder::new();
         fwd.push_ok_lifetime(40001, 4);
         fwd.push_ok(40002);
-        let (engine, sink, stop_tx, task) = two_batch_profile(&fwd, Duration::from_secs(10));
+        let (engine, sink, stop_tx, task) = two_batch_profile(&fwd, Duration::from_secs(10), 2);
 
         tokio::time::sleep(Duration::from_secs(15)).await;
         assert_eq!(fwd.call_count(), 2, "two renewals, each a port change");
@@ -956,7 +1140,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stop_ends_a_running_reannounce() {
         let fwd = MockForwarder::with_ports([40001]);
-        let (engine, sink, stop_tx, task) = two_batch_profile(&fwd, Duration::from_secs(10));
+        let (engine, sink, stop_tx, task) = two_batch_profile(&fwd, Duration::from_secs(10), 1);
 
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert_eq!(
@@ -986,7 +1170,7 @@ mod tests {
         let (entry, engine) = natpmp_entry("acct_a", 6881);
         let sink = RecordingSink::new();
         let fwd = MockForwarder::with_ports([40001]);
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), |p| p == 40001).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), &attached(), |p| p == 40001).await;
         assert_eq!(next.delay, RETRY_INTERVAL);
         assert!(next.rebound_at.is_none());
         assert_eq!(
@@ -1045,6 +1229,7 @@ mod tests {
             a,
             &sink,
             &fwd,
+            &attached(),
             held_by_others_now(profiles.clone(), id.clone()),
         )
         .await;
@@ -1065,7 +1250,7 @@ mod tests {
         let (entry, _) = natpmp_entry("acct_a", 40001);
         let sink = RecordingSink::new();
         let fwd = MockForwarder::with_ports([40001]);
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), |p| p == 40001).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), &attached(), |p| p == 40001).await;
         assert_eq!(next.delay, RETRY_INTERVAL);
         assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
         assert_eq!(sink.count_for(FAILURES), 1);
@@ -1104,26 +1289,86 @@ mod tests {
             RenewOutcome::RebindFailed {
                 previous: 6881,
                 new: 40001,
+                reason: RebindFailure::Apply,
             },
         ));
 
         assert_eq!(sink.count_for("profile_port_forward_failures_total"), 2);
-        let stages: Vec<String> = sink
-            .calls()
-            .into_iter()
-            .filter_map(|c| match c {
-                MetricCall::IncCounter { name, labels } if name == FAILURES => labels
-                    .into_iter()
-                    .find(|(k, _)| k == "stage")
-                    .map(|(_, v)| v),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(stages, ["renew", "rebind"], "each failure names its stage");
+        assert_eq!(
+            failure_stages(&sink),
+            ["renew", "rebind"],
+            "each failure names its stage"
+        );
         assert_eq!(
             sink.count_for("profile_port_forward_rebind_failures_total"),
             1
         );
+        assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
+    }
+
+    #[tokio::test]
+    async fn a_rebind_the_session_fails_to_listen_on_is_a_rebind_failure_and_not_announced() {
+        let (entry, engine) = natpmp_entry("acct_a", 6881);
+        let sink = RecordingSink::new();
+        let fwd = MockForwarder::with_ports([40001]);
+        let listen = attached();
+        // apply_settings succeeds; the session then fails to open the socket.
+        let session = answer_rebind(
+            &engine,
+            &listen,
+            "10.2.0.2:40001",
+            Some("address already in use"),
+        );
+
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), &listen, free).await;
+        session.join().unwrap();
+
+        assert_eq!(
+            next.delay, RETRY_INTERVAL,
+            "retried like any rebind failure"
+        );
+        assert!(
+            next.rebound_at.is_none(),
+            "nothing for the caller to reannounce"
+        );
+        assert_eq!(failure_stages(&sink), ["rebind"]);
+        assert_eq!(
+            sink.count_for("profile_port_forward_rebind_failures_total"),
+            1
+        );
+        assert!(reannounced(&engine).is_empty(), "no reannounce dispatched");
+        assert_eq!(sink.count_for("profile_forwarded_port_changes_total"), 0);
+        let health = entry.health();
+        assert_eq!(
+            health.forwarded_port,
+            Some(6881),
+            "the new port is not reported"
+        );
+        assert!(!health.port_forward_ok);
+        assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
+    }
+
+    #[test]
+    fn a_port_change_at_boot_is_deferred_uncounted() {
+        let (entry, engine) = natpmp_entry("acct_a", 6881);
+        let sink = RecordingSink::new();
+        let fwd = MockForwarder::with_ports([40001]);
+        assert!(entry.health().port_forward_ok, "a fresh entry starts up");
+
+        assert!(!refresh_during_boot(&entry, &fwd, &sink, &BTreeSet::new()));
+
+        assert!(
+            !engine
+                .calls()
+                .iter()
+                .any(|c| matches!(c, torrentd_engine::RecordedCall::ApplySettings(_))),
+            "nothing can confirm a rebind before the alert loop runs",
+        );
+        assert!(failure_stages(&sink).is_empty(), "a deferral is no failure");
+        assert_eq!(entry.health().forwarded_port, Some(6881));
+        // Deferred, not ignored: the session is still on the old port, so the
+        // profile reports the forward down until the retried rebind lands.
+        assert!(!entry.health().port_forward_ok);
         assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
     }
 
@@ -1237,6 +1482,7 @@ mod tests {
             Arc::new(ProfileRegistry::new(vec![entry])),
             Arc::new(StateMap::new()),
             Arc::new(PromSink::new()),
+            attached(),
             shutdown,
             NatpmpForwarder::for_gateway_port(gw_port),
         ));

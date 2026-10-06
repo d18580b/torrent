@@ -604,21 +604,54 @@ pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
     }
 }
 
-/// Check whether any tracker host in a `.torrent` buffer matches one of
-/// `domains` (exact or subdomain). Misconfiguration guard for profile assignment
-///. Returns `Ok(false)` for an empty buffer
-/// or empty domain list.
-pub fn torrent_tracker_host_matches(bytes: &[u8], domains: &[String]) -> Result<bool> {
-    if bytes.is_empty() || domains.is_empty() {
+/// Whether every tracker `params` would announce to is on `domains`: its host
+/// is a domain or a subdomain of one, compared case-insensitively.
+///
+/// `params` is read the way [`Session::add_torrent`] hands it to libtorrent,
+/// so the trackers checked are the ones the session would announce to: a
+/// `.torrent`'s announce list, a magnet's `tr=` parameters, or — for resume
+/// data — its own `trackers` list, which replaces the attached `.torrent`'s.
+///
+/// `Ok(false)` when any tracker is outside `domains` or has no host libtorrent
+/// can read, when there is no tracker at all, and when `domains` is empty. An
+/// `Err` is a source the shim cannot parse, which the add would refuse too.
+pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<bool> {
+    if domains.is_empty() {
         return Ok(false);
     }
-    let csv = domains.join(",");
-    let csv_c = CString::new(csv).map_err(|_| Error::InteriorNul("domains".into()))?;
+    let csv_c = CString::new(domains.join(","))
+        .map_err(|_| Error::InteriorNul("allowed_tracker_domains".into()))?;
+    let buf = |b: Option<&Vec<u8>>| match b {
+        Some(b) if !b.is_empty() => (b.as_ptr(), b.len()),
+        _ => (std::ptr::null(), 0),
+    };
+    let (magnet, torrent, resume) = match params {
+        AddParams::File { bytes, .. } => {
+            if bytes.is_empty() {
+                return Err(Error::InvalidInput("empty .torrent buffer"));
+            }
+            (None, buf(Some(bytes)), buf(None))
+        }
+        AddParams::Magnet { uri, .. } => (
+            Some(CString::new(uri.as_str()).map_err(|_| Error::InteriorNul("magnet uri".into()))?),
+            buf(None),
+            buf(None),
+        ),
+        AddParams::Resume { bytes, torrent, .. } => {
+            if bytes.is_empty() {
+                return Err(Error::InvalidInput("empty resume buffer"));
+            }
+            (None, buf(torrent.as_ref()), buf(Some(bytes)))
+        }
+    };
     let mut err = ErrBuf::new();
     let rc = unsafe {
-        ffi::lt_torrent_tracker_host_matches(
-            bytes.as_ptr(),
-            bytes.len(),
+        ffi::lt_add_trackers_allowed(
+            magnet.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+            torrent.0,
+            torrent.1,
+            resume.0,
+            resume.1,
             csv_c.as_ptr(),
             err.ptr(),
             err.len() as i32,

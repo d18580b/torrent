@@ -234,6 +234,51 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         h.state.registry.lookup(&STALE).is_some(),
         "the entry stays, to clear with a plain delete"
     );
+    // A cross-seed claims the same file in the pool index: deleting this
+    // torrent's payload would delete that one's, so it is refused, and the
+    // torrent stays loaded.
+    let pool = h.state.pool.as_ref().unwrap();
+    let shared_with = "cd".repeat(20);
+    let add = |ih: &str| -> Result<(), torrentd_pool::PoolError> {
+        pool.with_store_mut(|st| {
+            st.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.to_owned(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "X".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.path().join(format!("{ih}.torrent")),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )?;
+            let root_id = st.upsert_root(&dir.path().join("pool"))?;
+            st.replace_claims(ih, &[(root_id, "X/data.bin".to_owned())])
+        })
+    };
+    add(&hex(LOADED)).unwrap();
+    add(&shared_with).unwrap();
+    let resp = h
+        .write(
+            "DELETE",
+            &format!("/v1/torrents/{}?delete_files=true", hex(LOADED)),
+        )
+        .await;
+    assert_problem(&resp, 409, "payload-shared");
+    assert!(resp.json::<Value>()["detail"]
+        .as_str()
+        .unwrap()
+        .contains(&shared_with));
+    assert!(h.state.registry.lookup(&LOADED).is_some());
+    pool.with_store_mut(|st| st.replace_claims(&shared_with, &[]))
+        .unwrap();
+
     // With mutations allowed, a loaded torrent's payload goes with it.
     let resp = h
         .write(
@@ -480,7 +525,16 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
     let before = e.p.calls().len();
     let resp = h.write_json("POST", "/v1/torrents", magnet("p")).await;
     assert_problem(&resp, 409, "torrent-exists");
-    let resp = h.write_json("POST", "/v1/torrents", magnet("strict")).await;
+    // To `strict` by way of a tracker its allow-list admits, so it is the
+    // duplicate that refuses it.
+    let allowed = format!("{MAGNET}&tr=https%3A%2F%2Ftracker.allowed.example%2Fannounce");
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "strict", "source": {"kind": "magnet", "uri": allowed}}),
+        )
+        .await;
     assert_problem(&resp, 409, "torrent-exists");
     assert_eq!(e.p.calls().len(), before);
 
@@ -542,7 +596,18 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
         .as_str()
         .unwrap()
         .contains("save_path must be inside"));
-    for outside in ["/etc/shadow", "/nonexistent/x.torrent"] {
+    // A missing directory followed by `..`: the non-existent tail used to be
+    // re-appended lexically and read as inside `default_save_path`.
+    let mut body = magnet("p");
+    body["save_path"] = json!(dir.join("nx/../../../etc"));
+    let resp = h.write_json("POST", "/v1/torrents", body).await;
+    assert_problem(&resp, 422, "path-not-confined");
+    let escaping = dir.join("nx/../../../etc/x.torrent");
+    for outside in [
+        "/etc/shadow",
+        "/nonexistent/x.torrent",
+        escaping.to_str().unwrap(),
+    ] {
         let resp = h
             .write_json(
                 "POST",
@@ -675,11 +740,18 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
         .await;
     resp.assert_status(StatusCode::CREATED);
 
-    body_framework_rejections(h, "POST", "/v1/torrents").await;
+    body_framework_rejections(
+        h,
+        "POST",
+        "/v1/torrents",
+        crate::http::v1::ADD_REQUEST_DEADLINE,
+    )
+    .await;
 }
 
-/// `400`, `415` and `413` for an operation with a JSON body.
-async fn body_framework_rejections(h: &Harness, method: &str, path: &str) {
+/// `400`, `415`, `413` and `408` for an operation with a JSON body, the
+/// `408` arriving at the operation's `deadline`.
+async fn body_framework_rejections(h: &Harness, method: &str, path: &str, deadline: Duration) {
     let token = h.tokens.write.clone();
     let resp = h
         .send_with(
@@ -712,6 +784,17 @@ async fn body_framework_rejections(h: &Harness, method: &str, path: &str) {
         )
         .await;
     assert_eq!(resp.status().as_u16(), 413, "{method} {path}");
+    // A body that stalls is cut off at the operation's deadline.
+    let (status, waited) = h.slow_body(method, path, Some(&token)).await;
+    assert_eq!(status.as_u16(), 408, "{method} {path}: stalled body");
+    assert!(
+        // The server arms its deadline a moment before the clock is paused,
+        // so the paused clock sees a hair less than the whole of it. The
+        // window is narrow enough that the add's 300 s cannot pass for the
+        // 30 s every other body gets, or the reverse.
+        waited + Duration::from_secs(1) > deadline && waited <= deadline + Duration::from_secs(1),
+        "{method} {path}: cut off at {deadline:?}, not before or long after: {waited:?}",
+    );
 }
 
 async fn controls(h: &Harness, e: &Engines) {
@@ -836,7 +919,7 @@ async fn controls(h: &Harness, e: &Engines) {
         .write_json("PUT", &path, json!({"bytes_per_sec": 5}))
         .await;
     assert_problem(&resp, 500, "internal");
-    body_framework_rejections(h, "PUT", &path).await;
+    body_framework_rejections(h, "PUT", &path, crate::http::v1::REQUEST_DEADLINE).await;
 }
 
 fn file(index: u32, path: &str) -> TorrentFile {
@@ -976,7 +1059,7 @@ async fn files(h: &Harness, e: &Engines) {
         .write_json("PUT", &priority(0), json!({"priority": 1}))
         .await;
     assert_problem(&resp, 404, "torrent-not-found");
-    body_framework_rejections(h, "PUT", &priority(0)).await;
+    body_framework_rejections(h, "PUT", &priority(0), crate::http::v1::REQUEST_DEADLINE).await;
 }
 
 async fn trackers(h: &Harness, e: &Engines) {
@@ -1356,6 +1439,152 @@ async fn a_torrent_file_that_cannot_be_persisted_is_counted_and_the_add_still_su
         ),
         "{text}"
     );
+}
+
+#[tokio::test]
+async fn a_magnet_whose_trackers_are_all_allowed_is_added() {
+    // The allow-list's other half: refusing a foreign tracker is only useful
+    // if a magnet naming nothing but allowed ones still gets through,
+    // whichever spelling of `tr` it uses.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let allowed = format!(
+        "{MAGNET}&tr=https%3A%2F%2Ftracker.allowed.example%2Fannounce\
+         &tr.1=udp%3A%2F%2Fsub.tracker.allowed.example%3A6969%2Fannounce"
+    );
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "strict", "source": {"kind": "magnet", "uri": allowed}}),
+        )
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap())
+            .unwrap()
+            .as_str(),
+        "strict"
+    );
+}
+
+#[tokio::test]
+async fn one_foreign_tracker_refuses_a_torrent_whatever_else_it_announces_to() {
+    // All-match: an allowed tracker beside a foreign one still announces the
+    // foreign one, and with it another account's passkey. And a torrent that
+    // announces to nothing names no account of this profile's.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let both = {
+        let (ours, theirs) = (
+            "https://tracker.allowed.example/announce",
+            "https://other.example/announce",
+        );
+        let mut t = format!(
+            "d8:announce{}:{ours}13:announce-listll{}:{ours}el{}:{theirs}ee\
+             4:infod6:lengthi1e4:name1:m12:piece lengthi16384e6:pieces20:",
+            ours.len(),
+            ours.len(),
+            theirs.len(),
+        )
+        .into_bytes();
+        t.extend_from_slice(&[0u8; 20]);
+        t.extend_from_slice(b"ee");
+        t
+    };
+    let resp = h
+        .write_json("POST", "/v1/torrents", metainfo("strict", &both))
+        .await;
+    assert_problem(&resp, 422, "tracker-not-allowed");
+    for uri in [
+        format!(
+            "{MAGNET}&tr=https%3A%2F%2Ftracker.allowed.example%2Fannounce\
+             &tr=https%3A%2F%2Fother.example%2Fannounce"
+        ),
+        MAGNET.to_owned(),
+    ] {
+        let resp = h
+            .write_json(
+                "POST",
+                "/v1/torrents",
+                json!({"profile_id": "strict", "source": {"kind": "magnet", "uri": uri}}),
+            )
+            .await;
+        assert_problem(&resp, 422, "tracker-not-allowed");
+    }
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&InfoHash::from_hex(MAGNET_HEX).unwrap()),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_server_path_that_is_a_symlink_is_refused_even_to_a_real_torrent() {
+    // The path is opened once, refusing a symlink at the last component, and
+    // everything after is read from that descriptor. A symlink planted in a
+    // confined directory therefore cannot point the read anywhere else.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        fixture(s, dir.path());
+    });
+    let real = dir.path().join("real.torrent");
+    std::fs::write(&real, torrent_bytes('r')).unwrap();
+    let link = dir.path().join("link.torrent");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "p", "source": {"kind": "server_path", "path": link}}),
+        )
+        .await;
+    assert_problem(&resp, 422, "invalid-metainfo");
+    // The file it names is still readable by its own path.
+    let resp = h
+        .write_json(
+            "POST",
+            "/v1/torrents",
+            json!({"profile_id": "p", "source": {"kind": "server_path", "path": real}}),
+        )
+        .await;
+    resp.assert_status(StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn status_counts_every_phase_across_profiles() {
+    // Every counter `GET /v1/status` reports, each non-zero, so a counter
+    // wired to the wrong phase cannot hide behind a zero.
+    let dir = tempfile::tempdir().unwrap();
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let e = fixture(s, dir.path());
+        load(s, &e.p, InfoHash([20; 20]), "p", TorrentPhase::Seeding);
+        load(s, &e.p, InfoHash([21; 20]), "p", TorrentPhase::Checking);
+        load(s, &e.p, InfoHash([22; 20]), "p", TorrentPhase::DiskError);
+        load(s, &e.p, InfoHash([23; 20]), "p", TorrentPhase::Errored);
+        load(s, &e.f, InfoHash([24; 20]), "f", TorrentPhase::Paused);
+    });
+    let status: Value = h.read("/v1/status").await.json();
+    // LOADED seeding, FENCED paused, ADDING and STALE assigned but not
+    // loaded, and the five above.
+    assert_eq!(status["torrents_total"], 9);
+    assert_eq!(status["seeding"], 2);
+    assert_eq!(status["paused"], 2);
+    assert_eq!(status["checking"], 1);
+    assert_eq!(status["disk_error"], 1);
+    assert_eq!(status["errored"], 1);
+    // Seven loaded torrents at 3 peers and 1234 B/s each.
+    assert_eq!(status["peers_total"], 21);
+    assert_eq!(status["upload_rate_total"], 7 * 1234);
+    assert_eq!(status["download_rate_total"], 0);
+    assert_eq!(status["profile_count"], 3);
 }
 
 #[tokio::test]

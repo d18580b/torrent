@@ -19,6 +19,7 @@ use crate::config::Config;
 use crate::pool_service::PoolService;
 use crate::profile_registry::test_entry;
 use crate::profile_registry::test_failed_profile;
+use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
 
 /// Matched under `movies/`, claiming both files there.
@@ -64,6 +65,7 @@ fn file_row(infohash: &str, idx: i64, rel_path: &str, size: u64) -> TorrentFileR
         rel_path: rel_path.to_owned(),
         size,
         pieces_root: None,
+        pad_file: false,
     }
 }
 
@@ -128,6 +130,9 @@ fn fixture(dir: &Path, allow_mutations: bool) -> (Arc<PoolService>, i64) {
             ],
         )
         .unwrap();
+        // What the matcher ends with, since this stands in for it: the
+        // materialised tree is read off the claim set.
+        st.rebuild_all_rollups().unwrap();
     });
     (pool, root_id)
 }
@@ -227,7 +232,8 @@ async fn reads(cov: &Arc<Coverage>) {
     assert_eq!(o["files"], 4);
     assert_eq!(
         o["states"],
-        json!({"missing": 0, "partial": 1, "matched": 1, "adopted": 0, "drifted": 0, "overlap": 0})
+        json!({"missing": 0, "partial": 1, "matched": 1, "adopted": 0, "drifted": 0, "overlap": 0,
+               "shared": 0})
     );
     assert_eq!(o["verify_queue_depth"], 0);
 
@@ -442,6 +448,175 @@ async fn a_scan_or_drift_check_holds_the_work_gate_after_its_request_is_gone() {
     }
 }
 
+#[tokio::test]
+async fn every_read_answers_while_a_scan_holds_the_writer() {
+    // A scan holds the writer for its whole run — on a large pool, an hour.
+    // Every read goes through the read connection, which sees the last
+    // committed index meanwhile; before, each waited on the writer's mutex.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), false);
+    let held = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        held.with_store_mut(|st| {
+            st.in_transaction(|_| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                Ok::<(), torrentd_pool::PoolError>(())
+            })
+        })
+        .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    for path in [
+        "/v1/pool".to_owned(),
+        "/v1/pool/torrents".to_owned(),
+        "/v1/pool/torrents?state=matched".to_owned(),
+        format!("/v1/pool/roots/{root_id}/tree"),
+        format!("/v1/pool/roots/{root_id}/tree?path=movies"),
+        format!("/v1/pool/roots/{root_id}/orphans"),
+        "/v1/pool/plans".to_owned(),
+    ] {
+        let resp = tokio::time::timeout(Duration::from_secs(5), h.read(&path))
+            .await
+            .unwrap_or_else(|_| panic!("{path} waited on the writer"));
+        assert_eq!(resp.status(), 200, "{path}");
+    }
+    let t: Value = h.read("/v1/pool/torrents?state=matched").await.json();
+    assert_eq!(
+        field(&t, "infohash"),
+        [IH_A],
+        "the committed index, in full"
+    );
+
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+}
+
+#[tokio::test]
+async fn a_token_read_before_a_scan_does_not_apply_after_it() {
+    // The plan reads come from the read connection, which shows the index
+    // as it was before a running scan. A confirm token taken from that view
+    // binds the old generation; once the scan commits it must no longer
+    // apply, or the plan deletes files the rescan may since have placed.
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    let held = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    let w = h.tokens.write.clone();
+    let plan: Value = h
+        .send(
+            "POST",
+            "/v1/pool/plans",
+            Some(&w),
+            Some(json!({"kind": "delete_orphans", "root_id": root_id, "prefix": "junk"})),
+        )
+        .await
+        .json();
+    let id = plan["id"].as_i64().unwrap();
+    let token = plan["confirm_token"].as_str().unwrap().to_owned();
+
+    // A scan in progress: the writer held, and the generation moved when it
+    // commits.
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        held.with_store_mut(|st| {
+            st.in_transaction(|st| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                torrentd_pool::match_all(st).map(|_| ())
+            })
+        })
+        .unwrap();
+    });
+    locked_rx.recv().unwrap();
+
+    // The token still reads as current while the scan runs.
+    let during: Value = h.read(&format!("/v1/pool/plans/{id}")).await.json();
+    assert_eq!(during["confirm_token"], token.as_str());
+
+    let apply = format!("/v1/pool/plans/{id}/apply");
+    let (resp, ()) = tokio::join!(
+        h.send(
+            "POST",
+            &apply,
+            Some(&w),
+            Some(json!({"confirm_token": token})),
+        ),
+        async {
+            // Let the apply read the plan from the pre-scan snapshot first.
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            release_tx.send(()).unwrap();
+        },
+    );
+    holder.join().unwrap();
+    assert_problem(&resp, 422, "confirm-token-mismatch");
+    assert!(dir.path().join("pool/junk/orphan.bin").exists());
+
+    // The plan re-read against the rescanned index carries a token that
+    // applies.
+    let after: Value = h.read(&format!("/v1/pool/plans/{id}")).await.json();
+    assert_ne!(after["confirm_token"], token.as_str());
+    let resp = h
+        .send(
+            "POST",
+            &apply,
+            Some(&w),
+            Some(json!({"confirm_token": after["confirm_token"]})),
+        )
+        .await;
+    resp.assert_status(StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_store_call_waiting_on_the_writer_does_not_take_a_runtime_worker() {
+    // Handlers outside the pool module, and the verify queue, still call the
+    // writer from async code. Waiting there for a scan used to hold a worker
+    // thread for the scan's whole run; with one worker, that was every task.
+    use std::time::Duration;
+
+    // The holder lets go on its own after `HOLD`, so a stalled runtime shows
+    // up as a late answer rather than a test that never ends: with the one
+    // worker blocked, not even a timer would fire.
+    const HOLD: Duration = Duration::from_secs(5);
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let held = Arc::clone(&pool);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        held.with_store(|_| {
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(HOLD);
+        });
+    });
+    locked_rx.recv().unwrap();
+
+    let waiter = tokio::spawn(async move { pool.with_store(|st| st.torrent_count().unwrap()) });
+    // Let the waiter take the one worker, then ask that worker for something
+    // else.
+    std::thread::sleep(Duration::from_millis(100));
+    let asked = std::time::Instant::now();
+    assert_eq!(tokio::spawn(async { 7 }).await.unwrap(), 7);
+    assert!(
+        asked.elapsed() < HOLD / 2,
+        "the runtime stalled behind a store call for {:?}",
+        asked.elapsed(),
+    );
+
+    let _ = release_tx.send(());
+    assert_eq!(waiter.await.unwrap(), 3);
+    holder.join().unwrap();
+}
+
 fn adopt(profile_id: &str, dry_run: bool, selector: Value) -> Option<Value> {
     Some(json!({"profile_id": profile_id, "dry_run": dry_run, "selector": selector}))
 }
@@ -618,34 +793,245 @@ async fn adoption_ignores_allow_mutations() {
     assert_eq!(r["queued_for_verification"], json!([IH_A]));
 }
 
+/// A one-file `.torrent` announcing to `announce`.
+fn metainfo(announce: &str) -> Vec<u8> {
+    let mut t = format!(
+        "d8:announce{}:{announce}4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:",
+        announce.len()
+    )
+    .into_bytes();
+    t.extend_from_slice(&[0u8; 20]);
+    t.extend_from_slice(b"ee");
+    t
+}
+
+/// A complete torrent's `.fastresume` as libtorrent writes one, with a
+/// `trackers` list naming `tracker` when given.
+fn fastresume(torrent: &[u8], tracker: Option<&str>) -> Vec<u8> {
+    let ih = libtorrent_safe::info_hash_from_torrent(torrent).unwrap();
+    let mut r =
+        b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+    r.extend_from_slice(&ih.0);
+    // Completion is the `pieces` bitfield with every piece had: `metainfo`
+    // has one piece.
+    r.extend_from_slice(b"6:pieces1:\x01");
+    r.extend_from_slice(b"9:seed_modei1e");
+    if let Some(url) = tracker {
+        r.extend_from_slice(format!("8:trackersll{}:{url}ee", url.len()).as_bytes());
+    }
+    r.extend_from_slice(b"e");
+    r
+}
+
+/// Issue #72's adoption acceptance: a torrent adopted into a profile with
+/// `allowed_tracker_domains` is held to it on both paths, through the
+/// trackers libtorrent would announce to; and the pool index's own owner
+/// refuses another profile.
+#[tokio::test]
+async fn adoption_holds_every_torrent_to_the_profiles_tracker_domains() {
+    const ALLOWED: &str = "http://tracker.allowed.example/announce";
+    const FOREIGN: &str = "http://tracker.foreign.example/announce";
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let source = library.join(format!("{IH_A}.torrent"));
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let mut acct = test_entry("acct", ProfileStatus::Active).config;
+        acct.allowed_tracker_domains = vec!["allowed.example".to_owned()];
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            test_entry("p", ProfileStatus::Active),
+            ProfileEntry::new(
+                acct,
+                Arc::new(torrentd_engine::MockEngine::new()),
+                None,
+                None,
+                0,
+            ),
+        ]));
+        *s = crate::app_state::build_test_state_with_sessions(Some(reg), &["p", "acct"]);
+        s.pool = Some(pool);
+    });
+    let w = h.tokens.write.clone();
+    let post = |dry_run, selector| {
+        let w = w.clone();
+        let h = &h;
+        async move {
+            let resp = h
+                .send(
+                    "POST",
+                    "/v1/pool/adoptions",
+                    Some(&w),
+                    adopt("acct", dry_run, selector),
+                )
+                .await;
+            resp.assert_status(StatusCode::OK);
+            resp.json::<Value>()
+        }
+    };
+    let subtree = json!({"kind": "subtree", "root_id": root_id, "path": ""});
+    let just_a = json!({"kind": "infohashes", "infohashes": [IH_A]});
+    let refused_for = |r: &Value, what: &str| {
+        let refused = r["refused"].as_array().unwrap();
+        assert!(
+            refused
+                .iter()
+                .any(|t| t["infohash"] == IH_A && t["reason"].as_str().unwrap().contains(what)),
+            "{IH_A} should be refused for {what:?}: {r}"
+        );
+        assert!(r["fast_path"].as_array().unwrap().is_empty(), "{r}");
+        assert!(
+            r["queued_for_verification"].as_array().unwrap().is_empty(),
+            "{r}"
+        );
+    };
+
+    // The verify path: a `.torrent` announcing outside the list is refused,
+    // by a dry run as by the adoption, and nothing is claimed.
+    std::fs::write(&source, metainfo(FOREIGN)).unwrap();
+    refused_for(
+        &post(true, subtree.clone()).await,
+        "allowed_tracker_domains",
+    );
+    refused_for(
+        &post(false, just_a.clone()).await,
+        "allowed_tracker_domains",
+    );
+    assert_eq!(h.state.registry.len(), 0);
+    // A `.torrent` whose trackers cannot be read is refused too, but it is
+    // not an isolation refusal, so the count at the end leaves it out.
+    std::fs::write(&source, b"not bencode").unwrap();
+    refused_for(&post(false, just_a.clone()).await, "could not be read");
+    assert_eq!(h.state.registry.len(), 0);
+    std::fs::write(&source, metainfo(ALLOWED)).unwrap();
+    let r = post(true, subtree.clone()).await;
+    assert_eq!(r["queued_for_verification"], json!([IH_A]), "{r}");
+
+    // The index's own owner: another profile's torrent is refused even with
+    // no session holding it.
+    index.with_store(|st| st.set_profile(IH_A, Some("p")).unwrap());
+    refused_for(
+        &post(false, just_a.clone()).await,
+        "assigns this torrent to profile p",
+    );
+    assert_eq!(h.state.registry.len(), 0);
+    index.with_store(|st| st.set_profile(IH_A, None).unwrap());
+
+    // The fast path: resume data whose own tracker list names a foreign
+    // tracker is refused behind an allowed `.torrent`, and does not fall back
+    // to verifying it.
+    let resume = library.join(format!("{IH_A}.fastresume"));
+    let mut row = torrent(dir.path(), IH_A, 96, 2);
+    row.fastresume_path = Some(resume.clone());
+    index.with_store_mut(|st| st.upsert_torrent(&row, 0).unwrap());
+    let allowed = metainfo(ALLOWED);
+    std::fs::write(&resume, fastresume(&allowed, Some(FOREIGN))).unwrap();
+    refused_for(&post(true, just_a.clone()).await, "allowed_tracker_domains");
+    refused_for(
+        &post(false, just_a.clone()).await,
+        "allowed_tracker_domains",
+    );
+    assert_eq!(h.state.registry.len(), 0);
+
+    // Without it, the `.torrent`'s allowed tracker is what is announced, and
+    // the adoption goes through.
+    std::fs::write(&resume, fastresume(&allowed, None)).unwrap();
+    let r = post(false, just_a).await;
+    assert_eq!(r["fast_path"], json!([IH_A]), "{r}");
+    assert_eq!(
+        h.state
+            .registry
+            .lookup(&libtorrent_safe::InfoHash::from_hex(IH_A).unwrap()),
+        Some(torrentd_engine::ProfileId::new("acct"))
+    );
+    assert_eq!(
+        index
+            .with_store(|st| st.profile_of(IH_A).unwrap())
+            .as_deref(),
+        Some("acct")
+    );
+    // The three refusals by an adoption are counted with every add path's;
+    // the dry runs, which change nothing, are not.
+    let text = String::from_utf8(h.state.metrics.render()).unwrap();
+    assert!(
+        text.contains("profile_assignment_registry_errors_total{profile_id=\"acct\"} 3"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_clears_the_pool_index_owner_it_set() {
+    // Adoption refuses a torrent the index says another profile owns, so the
+    // record has to go with the torrent, or it refuses every later adoption
+    // into anything else.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    for (ih, owner, kept) in [(IH_A, "p", None), (IH_B, "q", Some("q"))] {
+        let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
+        h.state
+            .registry
+            .assign(hash, torrentd_engine::ProfileId::new("p"))
+            .unwrap();
+        h.state.unloaded_at_boot.lock().insert(hash);
+        index.with_store(|st| st.set_profile(ih, Some(owner)).unwrap());
+        let resp = h.write("DELETE", &format!("/v1/torrents/{ih}")).await;
+        resp.assert_status(StatusCode::NO_CONTENT);
+        assert_eq!(
+            index.with_store(|st| st.profile_of(ih).unwrap()).as_deref(),
+            kept,
+            "a record naming {owner} after deleting p's torrent",
+        );
+    }
+}
+
 async fn verification(cov: &Arc<Coverage>) {
     let dir = tempfile::tempdir().unwrap();
     let (pool, _) = fixture(dir.path(), false);
+    let watched = Arc::clone(&pool);
     let h = Harness::authed(cov, |s| s.pool = Some(pool));
-    let a = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
-    h.state.state.insert(
-        a,
-        torrentd_engine::TorrentState::newly_added(
-            torrentd_engine::TorrentHandle { id: 1, infohash: a },
+    let loaded = |ih: &str, id: u64, phase: torrentd_engine::TorrentPhase| {
+        let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
+        let mut st = torrentd_engine::TorrentState::newly_added(
+            torrentd_engine::TorrentHandle { id, infohash: hash },
             torrentd_engine::ProfileId::new("p"),
             std::time::Instant::now(),
-        ),
-    );
+        );
+        st.phase = phase;
+        h.state.state.insert(hash, st);
+    };
+    loaded(IH_A, 1, torrentd_engine::TorrentPhase::Seeding);
+    // Loaded, but not a torrent the pool index holds.
+    const IH_OUTSIDE: &str = "dddddddddddddddddddddddddddddddddddddddd";
+    loaded(IH_OUTSIDE, 4, torrentd_engine::TorrentPhase::Seeding);
+    // Paused, as a failed verification leaves it.
+    loaded(IH_B, 2, torrentd_engine::TorrentPhase::Paused);
     let w = h.tokens.write.clone();
     let resp = h
         .send(
             "POST",
             "/v1/pool/verifications",
             Some(&w),
-            Some(json!({"infohashes": [IH_A, IH_C]})),
+            Some(json!({"infohashes": [IH_A, IH_C, IH_OUTSIDE, IH_B]})),
         )
         .await;
     resp.assert_status(StatusCode::ACCEPTED);
     let r: Value = resp.json();
-    assert_eq!(r["requested"], 2);
-    assert_eq!(r["started"], json!([IH_A]));
+    assert_eq!(r["requested"], 4);
+    assert_eq!(r["started"], json!([IH_A, IH_OUTSIDE]));
     assert_eq!(r["skipped"][0]["infohash"], IH_C);
     assert_eq!(r["skipped"][0]["reason"], "not loaded in any session");
+    assert_eq!(r["skipped"][1]["infohash"], IH_B);
+    let reason = r["skipped"][1]["reason"].as_str().unwrap();
+    assert!(reason.contains("paused"), "{reason}");
+    // Only the pool's own torrent has an outcome to record: the other is
+    // re-hashed, and neither paused on a failure nor written to the index.
+    let q = watched.verify_queue();
+    assert!(q.tracks_recheck(IH_A));
+    assert!(!q.tracks_recheck(IH_OUTSIDE));
+    assert!(!q.tracks_recheck(IH_B));
 
     let resp = h
         .send(
@@ -668,6 +1054,44 @@ async fn verification(cov: &Arc<Coverage>) {
         )
         .await;
     assert_eq!(resp.status().as_u16(), 422);
+    h.assert_conformance();
+
+    // A fenced profile's torrents are skipped, as resume-all skips them: a
+    // recheck puts the torrent back on the network once it finishes.
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let h = Harness::authed(cov, |s| {
+        profiles(s);
+        s.pool = Some(pool);
+    });
+    for (ih, profile) in [(IH_A, "p"), (IH_C, "down")] {
+        let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
+        h.state.state.insert(
+            hash,
+            torrentd_engine::TorrentState::newly_added(
+                torrentd_engine::TorrentHandle {
+                    id: 1,
+                    infohash: hash,
+                },
+                torrentd_engine::ProfileId::new(profile),
+                std::time::Instant::now(),
+            ),
+        );
+    }
+    let resp = h
+        .send(
+            "POST",
+            "/v1/pool/verifications",
+            Some(&h.tokens.write.clone()),
+            Some(json!({"infohashes": [IH_A, IH_C]})),
+        )
+        .await;
+    resp.assert_status(StatusCode::ACCEPTED);
+    let r: Value = resp.json();
+    assert_eq!(r["started"], json!([IH_A]));
+    assert_eq!(r["skipped"][0]["infohash"], IH_C);
+    let reason = r["skipped"][0]["reason"].as_str().unwrap();
+    assert!(reason.contains("vpn_down"), "{reason}");
     h.assert_conformance();
 }
 
@@ -1010,6 +1434,13 @@ async fn malformed_requests(cov: &Arc<Coverage>) {
             .send(method, path, Some(&w), Some(json!({"pad": huge})))
             .await;
         assert_eq!(resp.status().as_u16(), 413, "{method} {path}");
+        // Applying a plan waits for every step and carries no deadline, so
+        // a stalled body there is bounded by nothing but `write`; every
+        // other operation cuts one off.
+        if !path.ends_with("/apply") {
+            let (status, _) = h.slow_body(method, path, Some(&w)).await;
+            assert_eq!(status.as_u16(), 408, "{method} {path}: stalled body");
+        }
     }
     h.assert_conformance();
 }
@@ -1041,8 +1472,9 @@ async fn internal_failures(cov: &Arc<Coverage>) {
     let root_id = pool.roots()[0].0;
     const BAD: &str = "not-an-infohash";
     pool.with_store_mut(|st| {
-        // Two files whose sizes sum past `i64::MAX`: SQLite refuses the
-        // rollup with an integer overflow.
+        // Two files whose sizes sum past `i64::MAX`. The materialised tree
+        // saturates rather than failing the scan over them; the reads fail
+        // on the corrupt rows written below.
         let huge = |rel: &str, ino| PoolFile {
             root_id,
             rel_path: rel.to_owned(),
@@ -1073,6 +1505,16 @@ async fn internal_failures(cov: &Arc<Coverage>) {
         // A plan of a kind this build has no name for.
         st.create_plan("bogus", "{}", 0).unwrap();
     });
+    // Directory rows whose byte total does not read back as a number, as a
+    // corrupt index would hold: the overview and both listings fail to load
+    // the accounting.
+    rusqlite::Connection::open(dir.path().join("pool.db"))
+        .unwrap()
+        .execute(
+            "UPDATE dir SET bytes_total = 'corrupt' WHERE root_id = ?1",
+            [root_id],
+        )
+        .unwrap();
     let bogus_plan = pool
         .with_store(|st| st.plans())
         .unwrap()
