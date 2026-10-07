@@ -1997,11 +1997,11 @@ where
             // (falling back to one of the device's addresses where that is
             // refused), so where the binding takes the kernel sends it out of
             // the tunnel whatever the routing table says. Bound to the address
-            // alone, a socket's
-            // route still came from the rules — and with the source-address
-            // rule gone (a firewall reload, `ip rule flush`) the lookup fell
-            // through to the main table and the packets left by the physical
-            // interface with the tunnel's source address.
+            // alone, a socket's route still came from the rules — and with
+            // the source-address rule gone (a firewall reload, `ip rule
+            // flush`) the lookup fell through to the main table and the
+            // packets left by the physical interface with the tunnel's source
+            // address.
             //
             // This covers outgoing TCP only, and only where `SO_BINDTODEVICE`
             // is allowed: where it is refused (no `CAP_NET_RAW` before Linux

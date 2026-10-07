@@ -486,8 +486,9 @@ impl WireguardManager {
 
     /// What a raise that did not leave a link up is reported as.
     ///
-    /// A link that came up and whose routing could not be installed is
-    /// [`VpnError::RoutingFailed`], as OpenVPN reports it, so `vpn check
+    /// A link that came up and whose traffic could not be routed through it
+    /// (routing not installed, outranked, or `Table = off` with nothing
+    /// routing it) is [`VpnError::RoutingFailed`], as OpenVPN reports it, so `vpn check
     /// --bring-up` can say the tunnel did come up and is already gone. It is
     /// never a question for adoption: `native::up` removed that link itself,
     /// and nothing standing under the name now is the link it raised.
@@ -532,13 +533,16 @@ impl WireguardManager {
     /// by a partially completed `wg-quick down` — which removes routes and
     /// rules *before* it removes the interface — is adoptable.
     ///
-    /// That is deliberate, and it is not a leak. A daemon bound to an address
-    /// whose routes are gone cannot fall out over the physical interface: the
-    /// source address is not local to it, so the packets are dropped rather
-    /// than misrouted. `vpn_monitor` then fences the profile within one
-    /// `POLL_INTERVAL` on the handshake probe. The failure mode is a fenced
-    /// profile, and the four extra `wg`/`ip` subprocess calls per bring-up that
-    /// checking the rest would cost buy only a faster diagnosis of it.
+    /// That is deliberate, and it is bounded rather than leak-free. The link
+    /// keeps its address, so with its rules gone a packet from that address
+    /// falls through to the main table and can leave by the physical
+    /// interface with the tunnel's source address, wherever the socket's
+    /// device binding is refused or absent (see `startup.rs`).
+    /// `vpn_monitor`'s route probe fences the profile within one
+    /// `POLL_INTERVAL`, and the kill switch, when on, drops that traffic in
+    /// the meantime. The failure mode is a fenced profile, and the four extra
+    /// `wg`/`ip` subprocess calls per bring-up that checking the rest would
+    /// cost buy only an earlier refusal of it.
     ///
     /// Adoption is likewise attempted on **any** non-zero `wg-quick up` exit
     /// rather than on matching wg-quick's own "already exists" message, which

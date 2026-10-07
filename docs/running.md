@@ -318,7 +318,7 @@ Metrics, each labelled `profile_id`:
 | `torrentd_profile_port_forward_rebind_failures_total` | the same count as `stage="rebind"` above |
 | `torrentd_profile_forwarded_port_changes_total` | port changes the session followed |
 | `torrentd_profile_port_change_reannounce_seconds` | histogram: from the gateway naming a new port to the last reannounce being handed to the session |
-| `torrentd_profile_vpn_gateway_reboots_total` | gateway epoch went backwards; the mapping was re-created on the spot |
+| `torrentd_profile_vpn_gateway_reboots_total` | gateway epoch went backwards; the renewal that saw it re-created the mapping on the spot |
 
 Several Proton accounts cannot share one daemon: every Proton WireGuard
 config gives the tunnel `10.2.0.2/32`, and the paragraph above says what

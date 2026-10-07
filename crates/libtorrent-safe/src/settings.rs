@@ -72,8 +72,9 @@ pub struct Settings {
     ///
     /// A **device name** makes libtorrent bind each such socket to that device
     /// with `SO_BINDTODEVICE`, so the kernel cannot route the connection out
-    /// of any other interface; where that is refused it binds to one of the
-    /// device's addresses instead. An **address** only sets the source; the
+    /// of any other interface; where that is refused (no `CAP_NET_RAW` before
+    /// Linux 5.7) it binds to one of the device's addresses instead, and the
+    /// route is the routing table's again. An **address** only sets the source; the
     /// route is still the routing table's. A tunnelled profile names its
     /// tunnel device here for that reason. On Linux before 5.7,
     /// `SO_BINDTODEVICE` needs `CAP_NET_RAW`.

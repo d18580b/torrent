@@ -51,8 +51,10 @@ pub enum VpnError {
     /// failure it tears the interface down.
     #[error("vpn interface {iface} exists but belongs to something else")]
     ForeignInterface { iface: String },
-    /// The tunnel came up, but its source-address routing could not be
-    /// installed, so the bring-up has already taken it down again.
+    /// The tunnel came up, but its traffic could not be routed through it —
+    /// its source-address routing could not be installed, or (WireGuard) the
+    /// kernel still routes the tunnel address elsewhere afterwards — so the
+    /// bring-up has already taken it down again.
     ///
     /// Distinct from `Spawn` so a report can say that a tunnel did appear
     /// and is gone, rather than guess at what a failed start left behind.
@@ -114,8 +116,9 @@ impl MockVpn {
         self.inner.lock().foreign.push(iface.to_string());
     }
 
-    /// Make `bring_up` of `iface` fail the way a tunnel whose routing could
-    /// not be installed does: up, then taken down again by the bring-up.
+    /// Make `bring_up` of `iface` fail the way a tunnel whose traffic could
+    /// not be routed through it does: up, then taken down again by the
+    /// bring-up.
     pub fn set_unroutable(&self, iface: &str) {
         self.inner.lock().unroutable.push(iface.to_string());
     }

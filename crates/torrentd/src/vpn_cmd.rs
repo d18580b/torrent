@@ -3519,7 +3519,7 @@ user_agent           = "Transmission/4.0.5"
         );
     }
 
-    /// A tunnel whose routing could not be installed did come up, and the
+    /// A tunnel whose traffic could not be routed through it did come up, and the
     /// bring-up has already lowered it. For OpenVPN the report said "no tun
     /// appeared … may have left a process running", which is wrong on both
     /// counts; WireGuard reports the same `RoutingFailed`
