@@ -1341,7 +1341,6 @@ impl std::fmt::Display for ProfileChange {
     }
 }
 
-/// Result of `Config::diff`. Reloadable fields are populated with the
 /// Report `[[profile]]` changes that a reload cannot apply.
 ///
 /// Most of what is compared here is identity-critical: the tunnel a session is
@@ -1491,6 +1490,7 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
     out
 }
 
+/// Result of `Config::diff`. Reloadable fields are populated with the
 /// new value; `non_reloadable_changes` lists the names that differ but
 /// can't be applied without restart.
 #[derive(Debug, Default)]

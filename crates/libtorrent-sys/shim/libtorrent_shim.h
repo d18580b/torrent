@@ -192,8 +192,10 @@ void        lt_buf_free(uint8_t* buf);
 /* ------------------------------------------------------------------ */
 
 /* Add a torrent from a .torrent file buffer.
- * infohash_out: optional 20-byte buffer; if non-NULL, the v1 infohash is
- *               written here on success.
+ * infohash_out: optional 20-byte buffer; if non-NULL, the torrent's best
+ *               infohash (`info_hashes().get_best()`) is written here on
+ *               success: the v1 SHA-1 for a v1 torrent, and the v2 SHA-256
+ *               truncated to 20 bytes for a v2 or hybrid one.
  * Returns the lt_handle, or 0 on failure (with err_out populated).
  */
 lt_handle   lt_add_torrent_file(lt_session* s,

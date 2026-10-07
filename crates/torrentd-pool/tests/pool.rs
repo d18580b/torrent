@@ -3582,8 +3582,8 @@ fn a_destination_behind_a_symlink_is_refused() {
 
 #[test]
 fn a_panic_inside_a_transaction_does_not_wedge_the_connection() {
-    // Axum installs no panic layer, so a panicking HTTP handler can unwind out
-    // of a transaction. Without a rollback on that path the connection stays
+    // No torrentd HTTP operation opts into kynos's `catch_panics` boundary, so
+    // a panicking HTTP handler can unwind out of a transaction. Without a rollback on that path the connection stays
     // mid-transaction holding SQLite's write lock for the life of the process,
     // and the depth counter makes every later transaction believe it is
     // nested. Both are silent until the next scan hangs.
