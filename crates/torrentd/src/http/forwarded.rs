@@ -1090,7 +1090,7 @@ mod tests {
         let c = case(r#"for=198.51.100.9;host="a,proto=https""#);
         assert!(
             !c.secure,
-            "a quoted proto= is part of host=, and must not set Secure",
+            "a quoted proto= is part of host=, and must not set secure (via_https)",
         );
         assert_eq!(
             c.ip, proxy,
@@ -1838,6 +1838,9 @@ mod tests {
             &req("10.1.2.3", &[("x-forwarded-proto", "http")]),
             &trusted(&["10.0.0.0/8"]),
         );
-        assert!(!c.secure, "only https sets Secure; unknown must not");
+        assert!(
+            !c.secure,
+            "only https sets secure (via_https); unknown must not"
+        );
     }
 }
