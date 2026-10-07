@@ -1211,22 +1211,7 @@ listen_interfaces = "0.0.0.0:6881"
 
     #[test]
     fn a_trusted_proxies_entry_that_trusts_everyone_is_refused() {
-        // The property: `trusted_proxies` is validated for *posture*, not
-        // only for syntax. A `/0` prefix is every address there is, so it
-        // makes every caller a trusted proxy and every forwarding header
-        // client-controlled — the throttle key and the `client_ip` on the
-        // failed-login line both become the caller's to choose. README.md and docs/running.md §6a both
-        // promise this key "fails safe rather than open"; without this
-        // refusal the one value that defeats it is the one that validates.
-        //
-        // Every spelling of that value, not the two canonical ones. The
-        // prefix is parsed with `u8::from_str`, which takes a leading `+` and
-        // any number of leading zeros, so `/00`, `/000` and `/+0` are the
-        // same prefix reaching the same `prefix_match` — and a refusal
-        // written against the entry's *text* accepts all of them while
-        // refusing `/0`. That is not a hypothetical spelling: a daemon
-        // booted with `["0.0.0.0/00"]` believes a forged `X-Forwarded-For`
-        // from every caller on earth.
+        // A `/0` prefix, in any spelling, makes every caller a trusted proxy.
         let dir = tempdir().unwrap();
 
         for wide in [
@@ -1276,83 +1261,6 @@ listen_interfaces = "0.0.0.0:6881"
         }
         Config::load(&write_cfg(dir.path(), &single_session()))
             .expect("the empty default is the safe one and must still load");
-    }
-
-    #[test]
-    fn a_file_pool_size_change_is_reported_rather_than_swallowed() {
-        let dir = tempdir().unwrap();
-        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
-        let mut b = a.clone();
-        b.file_pool_size = Some(2048);
-        let d = Config::diff(&a, &b);
-        assert!(
-            d.non_reloadable_changes.contains(&"file_pool_size"),
-            "got {:?}",
-            d.non_reloadable_changes,
-        );
-    }
-
-    #[test]
-    fn an_auth_only_edit_is_reported_rather_than_called_unchanged() {
-        // The property: a config edit that changes nothing but the
-        // authentication posture is a *change*, and `diff` must say so. If it
-        // does not, `ConfigDiff::is_empty` is true and `reload::run` logs
-        // `SIGHUP: config unchanged` — positive confirmation that a reload
-        // took, to an operator whose daemon is still authenticating nothing.
-        let dir = tempdir().unwrap();
-        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
-
-        let mut with_auth = a.clone();
-        with_auth.auth = Some(crate::auth::AuthConfig {
-            password_hash: crate::auth::hash_password("hunter2").unwrap(),
-            session_ttl_secs: 43_200,
-            token: vec![],
-        });
-        with_auth.allow_unauthenticated = false;
-        let d = Config::diff(&a, &with_auth);
-        assert!(
-            !d.is_empty(),
-            "an auth-only edit must not look like an unchanged config",
-        );
-        assert!(
-            d.non_reloadable_changes.contains(&"auth"),
-            "got {:?}",
-            d.non_reloadable_changes,
-        );
-        assert!(
-            d.non_reloadable_changes.contains(&"allow_unauthenticated"),
-            "got {:?}",
-            d.non_reloadable_changes,
-        );
-
-        // The bind address is settled once, at `TcpListener::bind`, and is
-        // half of the posture the refusal in `validate_auth_posture` judges.
-        let mut moved = a.clone();
-        moved.http_listen = SocketAddr::from(([127, 0, 0, 1], 9090));
-        let d = Config::diff(&a, &moved);
-        assert!(!d.is_empty());
-        assert!(
-            d.non_reloadable_changes.contains(&"http_listen"),
-            "got {:?}",
-            d.non_reloadable_changes,
-        );
-
-        // And the trust set, settled once in `DaemonHandle::boot`. An
-        // operator who decommissions a proxy and deletes its address here is
-        // otherwise told the config did not change, while the daemon keeps
-        // believing that address's forwarding headers until it restarts.
-        let mut proxied = a.clone();
-        proxied.trusted_proxies = vec!["172.28.0.2".to_string()];
-        let d = Config::diff(&a, &proxied);
-        assert!(
-            !d.is_empty(),
-            "a trusted_proxies-only edit must not look like an unchanged config",
-        );
-        assert!(
-            d.non_reloadable_changes.contains(&"trusted_proxies"),
-            "got {:?}",
-            d.non_reloadable_changes,
-        );
     }
 
     fn host_profile() -> ProfileConfig {
@@ -1464,14 +1372,7 @@ listen_interfaces = "eth0:6882"
 
     #[test]
     fn a_host_profile_may_not_wear_a_vpn_profiles_identity() {
-        // The configuration this is written from: the operator writes the VPN
-        // profile, copies the table to make the public one, and edits `id`,
-        // `network` and `listen_interfaces`. The fingerprint and user agent
-        // come along. `startup.rs` applies `peer_fingerprint` to every
-        // session with no posture guard, so the private tracker then sees one
-        // peer-id prefix announcing from the tunnel address and from the
-        // host's real address — the cross-account correlation whose stated
-        // consequence is a permanent ban.
+        // A copied table: one peer-id prefix from the tunnel and the host.
         let msg = refusal(&vpn_plus_host("", r#"peer_fingerprint = "-AA1000-""#));
         assert!(
             msg.contains("peer_fingerprint")
@@ -1528,15 +1429,7 @@ allowed_tracker_domains = ["t.example"]
 
     #[test]
     fn a_host_profile_inheriting_the_top_level_identity_collides_with_a_vpn_profile() {
-        // F4, reopened. The host profile sets *neither* identity key — the
-        // documented way to use a top-level default (`docs/running.md`) — and
-        // the vpn profile spells out the same two values. Nothing in
-        // `[[profile]]` looks duplicated, so `validate_set` returns `Ok` and
-        // `--check-config` printed `config OK`; but `libtorrent_settings()`
-        // seeds every session from the top-level keys and `startup.rs`
-        // overrides only where a profile set its own, so both sessions put one
-        // 8-byte peer-id prefix and one client string on the wire — one from
-        // the tunnel address, one from the machine's real address.
+        // The host profile inherits the values the vpn profile declares.
         let msg = refusal(&vpn_plus_host(
             r#"peer_fingerprint = "-AA1000-"
 user_agent = "qBittorrent/5.0.3""#,
@@ -1587,16 +1480,7 @@ listen_interfaces = "eth0:6882"
 
     #[test]
     fn two_host_profiles_both_inheriting_the_top_level_identity_are_accepted() {
-        // C48. Two host profiles are one host, so requiring them to differ is
-        // theatre — the recorded answer to "require identity fields on host
-        // profiles too?" is No, and `validate_set`'s own doc says the same.
-        //
-        // Checking *effective* values put them in one set by construction:
-        // neither writes a key, so both take the top-level default and the
-        // pair collided. The operator's only remedies were to delete the
-        // top-level keys the sample documents as "Default peer identity for
-        // profiles that do not set their own", or to give the pair the
-        // distinct values the record calls theatre.
+        // Two host profiles are one host; sharing the default is its use.
         let dir = tempdir().unwrap();
         let body = format!(
             r#"
@@ -1622,13 +1506,7 @@ user_agent = "libtorrent/2.0"
 
     #[test]
     fn a_top_level_fingerprint_may_not_be_the_libtorrent_default_either() {
-        // F49. The refusal bound to the per-profile key and to nothing else,
-        // while `to_settings` hands the top-level `peer_fingerprint` to every
-        // session and `startup.rs` overrides it only for a profile that
-        // declared its own. So a host profile that writes neither key
-        // announced whatever the top level said, unchecked — including the one
-        // value the refusal exists for, and `--check-config` printed
-        // `config OK`.
+        // An inherited fingerprint announces as a declared one does.
         let msg = refusal(&two_host_profiles_with_top(
             r#"peer_fingerprint = "-LT20C0-""#,
         ));
@@ -1825,13 +1703,7 @@ listen_interfaces = "eth0:6882"
 
     #[test]
     fn an_override_containing_another_profiles_resume_dir_is_accepted() {
-        // C47, first half. This is the documented upgrade: `docs/running.md`
-        // step 3 tells an operator to point the pre-profiles profile's
-        // `resume_dir` at the old root, and every other profile's derived
-        // `<base>/<id>` is inside that root by construction. Refusing
-        // containment made that configuration unwritable for any deployment
-        // with more than one profile — which is every deployment this change
-        // exists for.
+        // The documented upgrade (`docs/running.md` step 3).
         let dir = tempdir().unwrap();
         let p = write_cfg(
             dir.path(),
@@ -1845,17 +1717,8 @@ listen_interfaces = "eth0:6882"
 
     #[test]
     fn a_contained_profiles_files_are_invisible_to_the_outer_profiles_load_all() {
-        // C47, second half — the property the refusal claimed to protect,
-        // pinned rather than assumed. The refusal asserted that "both
-        // profiles' sessions would read one store" because "`load_all`
-        // filters on the file name alone". Both stores walk exactly one level
-        // with `fs::read_dir` and keep only names ending in `.resume`, so the
-        // inner profile's directory — whose name is its id — is skipped, and
-        // the file inside it is never reached.
-        //
-        // Without this, dropping the containment rule rests on reading the
-        // stores correctly today and nothing notices when that stops being
-        // true.
+        // Why containment is allowed: a store scans one level, so the inner
+        // profile's `<id>/` directory is never read by the outer one.
         use torrentd_engine::FsResumeStore;
         use torrentd_engine::ProfileId;
         use torrentd_engine::ResumeStore;
@@ -1890,15 +1753,7 @@ listen_interfaces = "eth0:6882"
 
     #[test]
     fn a_contained_profiles_torrents_are_invisible_to_the_outer_profiles_load_all() {
-        // C53. The rule above is dropped for **both** stores —
-        // `validate_effective_store_dirs` says so, and `torrent_dir` is
-        // overridable in exactly the same way `resume_dir` is — but only the
-        // resume store's half was pinned. The torrent-directory inventory scan
-        // is what re-assigns an info-hash whose resume file is gone, so an
-        // outer profile that reached into an inner one's directory here would
-        // adopt another account's torrents under its own fingerprint, user
-        // agent and tunnel address: the same failure the refusal named, by the
-        // path nothing was watching.
+        // The torrent store's half of the same property.
         use torrentd_engine::FsTorrentStore;
         use torrentd_engine::ProfileId;
         use torrentd_engine::TorrentStore;
@@ -1946,13 +1801,7 @@ listen_interfaces = "eth0:6882"
     // The shipped samples.
     // -----------------------------------------------------------------
 
-    /// Nothing in this repository parsed either sample: no test, no CI step.
-    /// That is why 265 changed lines of `torrentd.sample.toml` shipped with a
-    /// duplicate listen port, a duplicate fingerprint and a duplicate user
-    /// agent between its own examples, two daemon-wide keys stranded behind a
-    /// `[[profile]]` header where TOML binds them to the table, and a
-    /// `network = "host"` profile that made the documented `vpn check`
-    /// invocation panic — while a 41-test suite stayed green.
+    /// A shipped sample config, which the tests below hold to loading.
     fn sample(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../deploy")
@@ -2059,13 +1908,7 @@ listen_interfaces = "eth0:6882"
 
     #[test]
     fn a_per_profile_upload_rate_limit_of_zero_means_unlimited_not_unset() {
-        // F40. `0` is the value both shipped samples use to illustrate this
-        // override, and the top-level key's own comment defines it as
-        // "unlimited". While the field was a plain `u32` the reload guard and
-        // the boot path both read an explicit `0` as an absent key and pushed
-        // the daemon-wide cap onto a session the operator had uncapped — with
-        // nothing logged, and nothing in `diff_profiles` to report it, because
-        // the two values compared equal.
+        // An explicit 0 is a value: the top-level cap must not override it.
         let diff = ConfigDiff {
             upload_rate_limit: Some(2_000_000),
             ..Default::default()
@@ -2113,134 +1956,6 @@ listen_interfaces = "eth0:6882"
     }
 
     #[test]
-    fn a_profile_only_upload_rate_limit_change_is_reported_rather_than_swallowed() {
-        // `ConfigDiff::is_empty()` was true for this edit, so `reload.rs`
-        // logged "SIGHUP: config unchanged" over a file that plainly had.
-        let dir = tempdir().unwrap();
-        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
-        let mut b = a.clone();
-        b.profile[0].upload_rate_limit = Some(100_000);
-
-        let d = Config::diff(&a, &b);
-        assert!(!d.is_empty(), "the file changed and the daemon must say so");
-        assert!(
-            d.profile_changes
-                .iter()
-                .any(|c| c.what == "public.upload_rate_limit"),
-            "got {:?}",
-            d.profile_changes,
-        );
-    }
-
-    #[test]
-    fn a_profile_only_allowed_tracker_domains_change_is_reported_rather_than_swallowed() {
-        let dir = tempdir().unwrap();
-        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
-        let mut b = a.clone();
-        b.profile[0].allowed_tracker_domains = vec!["tracker.example.com".into()];
-
-        let d = Config::diff(&a, &b);
-        assert!(!d.is_empty());
-        assert!(
-            d.profile_changes
-                .iter()
-                .any(|c| c.what == "public.allowed_tracker_domains"),
-            "got {:?}",
-            d.profile_changes,
-        );
-    }
-
-    #[test]
-    fn every_profile_field_the_diff_reports_states_which_warning_it_is_owed() {
-        // The classification that `reload.rs` used to keep as a list of key
-        // names beside a comment asking whoever edits this function to update
-        // it. Changing every `[[profile]]` field at once pins the classes: a
-        // field compared in `diff_profiles` cannot be recorded without one,
-        // and a field that changes class shows up here.
-        //
-        // What this cannot pin is a field added to `ProfileConfig` and never
-        // compared at all — it would not appear in `got`, and `want` would not
-        // ask for it, so no assertion here can notice. That is a compile
-        // property and not a test: `diff_profiles` destructures
-        // `ProfileConfig` exhaustively with no `..`, so a new field is
-        // `error[E0027]: pattern does not mention field` until somebody names
-        // it. No `#[test]` in this crate observes that, and none can.
-        let dir = tempdir().unwrap();
-        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
-        let mut b = a.clone();
-        let p = &mut b.profile[0];
-        p.network = torrentd_engine::ProfileNetwork::Host {
-            listen_interfaces: "0.0.0.0:6899".into(),
-            dht: true,
-        };
-        p.peer_fingerprint = Some("-AA1000-".into());
-        p.user_agent = Some("ua/1.0".into());
-        p.resume_dir = Some("/var/lib/torrentd/resume-public".into());
-        p.torrent_dir = Some("/var/lib/torrentd/torrents-public".into());
-        p.upload_rate_limit = Some(100_000);
-        p.allowed_tracker_domains = vec!["tracker.example.com".into()];
-
-        let mut got: Vec<(String, ProfileChangeKind)> = Config::diff(&a, &b)
-            .profile_changes
-            .into_iter()
-            .map(|c| (c.what, c.kind))
-            .collect();
-        got.sort_by(|x, y| x.0.cmp(&y.0));
-        let mut want = vec![
-            ("public.network", ProfileChangeKind::Identity),
-            ("public.peer_fingerprint", ProfileChangeKind::Identity),
-            ("public.user_agent", ProfileChangeKind::Identity),
-            ("public.resume_dir", ProfileChangeKind::NonIdentity),
-            ("public.torrent_dir", ProfileChangeKind::NonIdentity),
-            ("public.upload_rate_limit", ProfileChangeKind::NonIdentity),
-            (
-                "public.allowed_tracker_domains",
-                ProfileChangeKind::NonIdentity,
-            ),
-        ]
-        .into_iter()
-        .map(|(w, k)| (w.to_string(), k))
-        .collect::<Vec<_>>();
-        want.sort_by(|x, y| x.0.cmp(&y.0));
-        assert_eq!(got, want);
-    }
-
-    #[test]
-    fn the_runbooks_own_upgrade_step_does_not_fire_a_privacy_alert() {
-        // D36/Q23. Upgrade step 3 in `docs/running.md` tells an operator to
-        // "set that profile's own `resume_dir` and `torrent_dir` to the old
-        // paths" — the documented way to keep a library across the move to
-        // per-profile subdirectories. With the store directories classed as
-        // identity, doing exactly that emitted Safety Rule 7's privacy
-        // warning, which `reload.rs` reserves for "the privacy event" and
-        // which is the line an alert rule watches.
-        //
-        // They are still non-reloadable: the stores are opened at startup. The
-        // class is about which of the two warnings the operator is owed, and
-        // nothing a tracker reads carries where a profile keeps its files.
-        let dir = tempdir().unwrap();
-        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
-        let mut b = a.clone();
-        b.profile[0].resume_dir = Some("/var/lib/torrentd/resume".into());
-        b.profile[0].torrent_dir = Some("/var/lib/torrentd/torrents".into());
-
-        let d = Config::diff(&a, &b);
-        assert_eq!(d.profile_changes.len(), 2, "got {:?}", d.profile_changes);
-        for c in &d.profile_changes {
-            assert_eq!(
-                c.kind,
-                ProfileChangeKind::NonIdentity,
-                "{} must not be reported as an identity change",
-                c.what,
-            );
-        }
-        // Still reported — not reloadable is not the same as not a change.
-        let mut names: Vec<&str> = d.profile_changes.iter().map(|c| c.what.as_str()).collect();
-        names.sort_unstable();
-        assert_eq!(names, ["public.resume_dir", "public.torrent_dir"]);
-    }
-
-    #[test]
     fn a_profile_leaving_the_set_is_an_identity_change() {
         // `diff_profiles`'s entries with no `.key`. Which accounts exist is as
         // fixed at startup as who they announce as, so both must land in the
@@ -2265,13 +1980,8 @@ listen_interfaces = "eth0:6882"
     type FieldEdit = (&'static str, ProfileChangeKind, ProfileConfig);
 
     /// Every `[[profile]]` field of `base` changed alone, each paired with the
-    /// key and class `diff_profiles` owes it.
-    ///
-    /// `base` is destructured with no `..`, so a field added to
-    /// `ProfileConfig` stops this compiling until it has a row here, which is
-    /// the test-side twin of the pattern in `diff_profiles`. Each binding is
-    /// then read by an `assert_ne!` proving its row is a real change, so a
-    /// row cannot pass by setting a field to the value it already had.
+    /// key and class `diff_profiles` owes it. Destructured with no `..`, so a
+    /// new field needs a row; each row is asserted to be a real change.
     fn each_profile_field_changed_alone(base: &ProfileConfig) -> Vec<FieldEdit> {
         let ProfileConfig {
             id: _,
@@ -2350,13 +2060,7 @@ listen_interfaces = "eth0:6882"
 
     #[test]
     fn each_profile_field_changed_alone_is_reported_alone_with_its_class() {
-        // Safety Rule 7's enforcement is `diff_profiles` and nothing else. A
-        // field it misses is a SIGHUP that neither applies the change nor
-        // reports it, so the operator believes a new identity is live while
-        // the session keeps announcing the old one. Changing every field at
-        // once cannot show that one of them is reported only by accident of
-        // another, so each is changed on its own here, and must produce
-        // exactly its own entry and no other.
+        // Each alone, so none is reported only alongside another.
         let dir = tempdir().unwrap();
         let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
         for (key, kind, changed) in each_profile_field_changed_alone(&a.profile[0]) {
@@ -2530,6 +2234,73 @@ upload_rate_limit = 0"#,
         }
     }
 
+    /// A reload cannot apply any other top-level key, so a file differing in
+    /// exactly one of them is reported as that key, and is not unchanged.
+    #[test]
+    fn each_non_reloadable_top_level_key_changed_alone_is_reported_alone() {
+        let dir = tempdir().unwrap();
+        let a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        type TopLevelEdit = (&'static str, fn(&mut Config));
+        let edits: Vec<TopLevelEdit> = vec![
+            ("default_save_path", |c| {
+                c.default_save_path = "/data/elsewhere".into()
+            }),
+            ("resume_dir", |c| c.resume_dir = "/var/lib/other/r".into()),
+            ("torrent_dir", |c| c.torrent_dir = "/var/lib/other/t".into()),
+            ("file_pool_size", |c| c.file_pool_size = Some(2048)),
+            ("unchoke_slots_limit", |c| c.unchoke_slots_limit = Some(128)),
+            ("peer_fingerprint", |c| {
+                c.peer_fingerprint = Some("-ZZ1000-".into())
+            }),
+            ("user_agent", |c| c.user_agent = Some("other/1.0".into())),
+            ("auth", |c| {
+                c.auth = Some(crate::auth::AuthConfig {
+                    password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+                    session_ttl_secs: 43_200,
+                    token: vec![],
+                })
+            }),
+            ("allow_unauthenticated", |c| {
+                c.allow_unauthenticated = !c.allow_unauthenticated
+            }),
+            ("http_listen", |c| {
+                c.http_listen = SocketAddr::from(([127, 0, 0, 1], 9090))
+            }),
+            ("trusted_proxies", |c| {
+                c.trusted_proxies = vec!["172.28.0.2".into()]
+            }),
+            ("registry_path", |c| {
+                c.registry_path = Some("/var/lib/torrentd/assignments.json".into())
+            }),
+            ("vpn_handshake_max_age_secs", |c| {
+                c.vpn_handshake_max_age_secs += 60
+            }),
+            ("shutdown_drain_secs", |c| c.shutdown_drain_secs += 30),
+            ("network_kill_switch", |c| {
+                c.network_kill_switch = !c.network_kill_switch
+            }),
+            ("pool", |c| {
+                c.pool = Some(PoolConfig {
+                    roots: vec!["/data/pool".into()],
+                    library_dir: "/data/library".into(),
+                    db_path: None,
+                    max_concurrent_verify: 1,
+                    import_legacy_registry: false,
+                    allow_mutations: false,
+                })
+            }),
+        ];
+        for (key, edit) in edits {
+            let mut b = a.clone();
+            edit(&mut b);
+            let d = Config::diff(&a, &b);
+            assert!(!d.is_empty(), "{key}");
+            assert_eq!(d.non_reloadable_changes, vec![key]);
+            assert!(d.reloadable_changes.is_empty(), "{key}");
+            assert!(d.profile_changes.is_empty(), "{key}");
+        }
+    }
+
     #[test]
     fn parses_one_host_profile() {
         let dir = tempdir().unwrap();
@@ -2562,19 +2333,8 @@ upload_rate_limit = 0"#,
 
     #[test]
     fn a_malformed_value_is_reported_before_the_posture() {
-        // The property: shape before policy, for every shape check and not
-        // only the `[[profile]]` block. A zero `aio_threads`, a
-        // `password_hash` that is not a PHC string, and two `[pool]` roots
-        // that nest each name something the operator must physically change;
-        // a config with no stated posture is well-formed and not permitted.
-        //
-        // The order matters beyond tidiness. `load_for_operator_tool` skips
-        // the posture check and runs every other one, so while the posture
-        // was reported first, the refusal sent the operator to
-        // `hash-password` — the way out it names — and `hash-password` then
-        // refused for a malformed value `--check-config` had never shown
-        // them. Each configuration here is wrong in two ways at once, which
-        // is the only way to observe an ordering.
+        // Shape before policy: each config is wrong in shape and in posture,
+        // and the shape is what is reported.
         let dir = tempdir().unwrap();
         let root = dir.path().join("pool");
         std::fs::create_dir_all(root.join("inner")).unwrap();
@@ -2907,14 +2667,6 @@ upload_rate_limit = 0"#,
 
     #[test]
     fn check_config_refuses_a_kill_switch_with_no_tunnel_to_confine_egress_to() {
-        // `--check-config` is the pre-flight that catches a bad configuration
-        // before the daemon is restarted onto it. This refusal is a pure
-        // function of the file and `boot` makes it anyway, so the pre-flight
-        // has no reason not to.
-        //
-        // It is a refusal of `Config::load` itself, not of a second pass over
-        // a config that already loaded: being a pure function of the file is
-        // what puts it with the rest of the shape checks.
         let dir = tempdir().unwrap();
         let p = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
@@ -2926,15 +2678,6 @@ upload_rate_limit = 0"#,
 
     #[test]
     fn a_boot_rule_is_reported_before_the_authentication_posture() {
-        // The property: of two configs differing only in whether a posture is
-        // stated, the one that states none must still be told about the thing
-        // it has to physically change. `check_boot_rules` ran in
-        // `main::check_config`, after `Config::load` had returned, so it sat
-        // below the policy check: `--check-config` on a kill switch with no
-        // vpn profile and no posture answered "no [auth] section…", and the
-        // operator saw "Configure a vpn profile, or unset
-        // network_kill_switch" only on the next run. Demonstrated on both
-        // configs.
         let dir = tempdir().unwrap();
 
         let stated = write_cfg(dir.path(), &with_top_level("network_kill_switch = true"));
@@ -3273,30 +3016,8 @@ library_dir = "{d}/library"
     }
 
     #[test]
-    fn diff_separates_reloadable_from_non() {
-        let dir = tempdir().unwrap();
-        let p = write_cfg(dir.path(), &single_session());
-        let old = Config::load(&p).unwrap();
-        let mut new = old.clone();
-        new.connections_limit = Some(20000);
-        new.torrent_dir = std::path::PathBuf::from("/var/lib/torrentd/other");
-        let d = Config::diff(&old, &new);
-        assert_eq!(d.connections_limit, Some(20000));
-        assert_eq!(d.non_reloadable_changes, vec!["torrent_dir"]);
-    }
-
-    #[test]
     fn the_shared_test_fixture_states_a_posture() {
-        // The property: the config the HTTP and pool test modules build their
-        // `AppState`/`PoolService` from is a shape the daemon would start
-        // from, at least as far as the posture goes. It stated none — no
-        // `[auth]`, no opt-out — which is the one shape `--check-config`
-        // refuses outright, so every handler test using it exercised the
-        // serving path against a configuration the daemon refuses to serve.
-        //
-        // The fixture has no `[[profile]]`, so `validate()` as a whole is not
-        // what it can satisfy; the posture is, and the posture is what this
-        // change made a required statement.
+        // The fixture has no profile, so the posture is what it can satisfy.
         let dir = tempdir().unwrap();
         let cfg = Config::minimal_for_tests(dir.path(), false);
         cfg.validate_auth_posture()
@@ -3318,84 +3039,8 @@ library_dir = "{d}/library"
     }
 
     #[test]
-    fn an_edit_to_any_non_reloadable_key_is_reported() {
-        // The property: a config that differs in exactly one key the daemon
-        // cannot apply is not an unchanged config, and the warning names the
-        // key that changed. Five keys reached no branch of `diff` at all, so
-        // `is_empty()` stayed true and `reload::run` answered
-        // `SIGHUP: config unchanged` to a file that plainly had. Each is
-        // exercised on its own, because a change that only *happens* to
-        // travel with a reported key is not the failure this is about.
-        //
-        // `network_kill_switch` is the one with a security consequence: an
-        // operator who turns the fail-closed kill switch on and reloads was
-        // told nothing had changed.
-        let dir = tempdir().unwrap();
-        let base = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
-
-        let mut save_path = base.clone();
-        save_path.default_save_path = PathBuf::from("/data/elsewhere");
-
-        let mut registry = base.clone();
-        registry.registry_path = Some(PathBuf::from("/var/lib/torrentd/assignments.json"));
-
-        let mut handshake = base.clone();
-        handshake.vpn_handshake_max_age_secs = base.vpn_handshake_max_age_secs + 60;
-
-        let mut drain = base.clone();
-        drain.shutdown_drain_secs = base.shutdown_drain_secs + 30;
-
-        let mut kill_switch = base.clone();
-        kill_switch.network_kill_switch = !base.network_kill_switch;
-
-        let mut pool = base.clone();
-        pool.pool = Some(PoolConfig {
-            roots: vec![PathBuf::from("/data/pool")],
-            library_dir: PathBuf::from("/data/library"),
-            db_path: None,
-            max_concurrent_verify: 1,
-            import_legacy_registry: false,
-            allow_mutations: false,
-        });
-
-        for (field, edited) in [
-            ("default_save_path", &save_path),
-            ("registry_path", &registry),
-            ("vpn_handshake_max_age_secs", &handshake),
-            ("shutdown_drain_secs", &drain),
-            ("network_kill_switch", &kill_switch),
-            ("pool", &pool),
-        ] {
-            let d = Config::diff(&base, edited);
-            assert!(
-                !d.is_empty(),
-                "a config differing only in {field} must not look unchanged",
-            );
-            assert!(
-                d.non_reloadable_changes.contains(&field),
-                "the warning for a changed {field} must name it; got {:?}",
-                d.non_reloadable_changes,
-            );
-        }
-    }
-
-    #[test]
     fn deleting_a_reloadable_key_is_a_difference_and_is_named() {
-        // The property: a config that **deletes** one reloadable key is not an
-        // unchanged config, and the diff names the key that went away.
-        //
-        // The five below are `Option` on both sides, so the comparison that
-        // reports them had nothing to assign but `None` — and `None` is what
-        // `is_empty()` reads as "this key did not change". Every one of them
-        // answered `SIGHUP: config unchanged` on a live daemon, one deletion
-        // per reload; worse, that answer `continue`s before `current = next`,
-        // so the deletion stayed invisible to every later reload too. The
-        // sample config documents deleting a key as the way back to the
-        // preset default, so this is the documented edit and not an exotic
-        // one.
-        //
-        // Each is exercised on its own: a deletion that only *happens* to
-        // travel with a key that is reported some other way is not this.
+        // Deleting a key is the documented way back to the preset default.
         let dir = tempdir().unwrap();
         let base = Config::load(&write_cfg(
             dir.path(),
@@ -3459,17 +3104,7 @@ library_dir = "{d}/library"
 
     #[test]
     fn an_edit_to_only_non_reloadable_keys_applies_no_settings() {
-        // The property: the reload pump's per-profile settings loop is
-        // skipped for an edit it cannot apply anything from, so such a reload
-        // does not close with `INFO SIGHUP: settings applied`.
-        //
-        // Once the non-reloadable keys are reported, `is_empty()` is false for
-        // an edit that touched only them, so the pump falls through its
-        // warnings into that loop and calls `apply_settings` with a patch that
-        // sets nothing. It succeeds, and the journal's last word on a reload
-        // that was ignored is a success line. `reload::run` guards on this
-        // predicate; nothing in the workspace drives the pump itself, so the
-        // guard is pinned here rather than through `run`.
+        // So such a reload does not end with `SIGHUP: settings applied`.
         let dir = tempdir().unwrap();
         let base = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
 
