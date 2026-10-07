@@ -3511,38 +3511,41 @@ user_agent           = "Transmission/4.0.5"
         );
     }
 
-    /// An OpenVPN tunnel whose routing could not be installed did come up,
-    /// and the bring-up has already stopped it. The report said "no tun
+    /// A tunnel whose routing could not be installed did come up, and the
+    /// bring-up has already lowered it. For OpenVPN the report said "no tun
     /// appeared … may have left a process running", which is wrong on both
-    /// counts.
+    /// counts; WireGuard reports the same `RoutingFailed`
+    /// (`vpn::wireguard`'s `raise_failed`), so it reads the same.
     #[test]
     fn a_tunnel_lowered_for_want_of_routing_is_reported_as_having_come_up() {
-        let mut cfg = cfg_with_profile("");
-        match &mut cfg.profile[0].network {
-            torrentd_engine::ProfileNetwork::Vpn { vpn_type, .. } => {
-                *vpn_type = VpnType::Openvpn;
+        for kind in [VpnType::Openvpn, VpnType::Wireguard] {
+            let mut cfg = cfg_with_profile("");
+            match &mut cfg.profile[0].network {
+                torrentd_engine::ProfileNetwork::Vpn { vpn_type, .. } => {
+                    *vpn_type = kind;
+                }
+                torrentd_engine::ProfileNetwork::Host { .. } => unreachable!("a vpn profile"),
             }
-            torrentd_engine::ProfileNetwork::Host { .. } => unreachable!("a vpn profile"),
+            let host = FakeHost::new().with_exists_seq([false, false]);
+            host.vpn.set_unroutable("wg-acct-a");
+
+            let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
+
+            let bu = find(&r.checks, "bring_up").expect("a bring_up line");
+            assert_eq!(bu.verdict, Verdict::Fail, "{kind:?} detail: {}", bu.detail);
+            assert!(
+                bu.detail.contains("came up") && bu.detail.contains("taken down again"),
+                "{kind:?}: the tunnel appeared and is gone: {}",
+                bu.detail,
+            );
+            assert!(
+                !bu.detail.contains("no wg-acct-a appeared")
+                    && !bu.detail.contains("may have left a process running"),
+                "{kind:?}: {}",
+                bu.detail,
+            );
+            assert!(host.vpn.bring_down_calls().is_empty());
         }
-        let host = FakeHost::new().with_exists_seq([false, false]);
-        host.vpn.set_unroutable("wg-acct-a");
-
-        let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
-
-        let bu = find(&r.checks, "bring_up").expect("a bring_up line");
-        assert_eq!(bu.verdict, Verdict::Fail, "detail: {}", bu.detail);
-        assert!(
-            bu.detail.contains("came up") && bu.detail.contains("taken down again"),
-            "the tunnel appeared and is gone: {}",
-            bu.detail,
-        );
-        assert!(
-            !bu.detail.contains("no wg-acct-a appeared")
-                && !bu.detail.contains("may have left a process running"),
-            "{}",
-            bu.detail,
-        );
-        assert!(host.vpn.bring_down_calls().is_empty());
     }
 
     #[test]

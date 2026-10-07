@@ -1390,8 +1390,23 @@ On a scratch pool, not your real one.
       is refused. `DNS` and `SaveConfig` are ignored with a warning. With
       `Table = off` the routing is yours: traffic *from* the tunnel address
       must still route by the tunnel, because the health monitor checks
-      exactly that every poll and fences the profile (`route_mismatch`) when
-      it does not.
+      exactly that every poll (`ip route get 1.1.1.1 from <address>`) and
+      fences the profile (`route_mismatch`) when it does not.
+
+      The bring-up asks the same question once the link is up, and **refuses
+      a config whose answer would be fenced** rather than letting it come up
+      and be fenced on the first poll: a `Table = off` link that nothing
+      routes through the tunnel is taken down again, and a split `AllowedIPs`
+      that does not cover `1.1.1.1` (with an IPv4 `Address`) is refused before
+      anything is created, because only `AllowedIPs` are routed through the
+      tunnel and the probe's packet would leave by the main table. The
+      profile is reported failed with the reason. Use `AllowedIPs =
+      0.0.0.0/0` (plus `::/0` for IPv6). A link whose routing was installed
+      and that still does not route `1.1.1.1` through the tunnel — another
+      rule outranks it — is lowered and reported as a routing failure, as is
+      one whose routing could not be installed at all; `vpn check
+      --bring-up` reports either as a tunnel that came up and was taken down
+      again.
    4. Set `network_kill_switch = true` and start the unit.
 
    How the daemon raises a link: `ip link add <iface> type wireguard`,

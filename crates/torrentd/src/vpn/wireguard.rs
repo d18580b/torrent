@@ -14,9 +14,13 @@
 //! transport exempted by the ruleset (`vpn::killswitch`).
 //!
 //! What that costs a root deployment: `PreUp`/`PostUp`/`PreDown`/`PostDown`
-//! hooks and a named `Table` are refused rather than run (see [`native`]). A
-//! link root raised from such a config before the daemon started is still
-//! adopted by its key, exactly as for a non-root daemon.
+//! hooks and a named `Table` are refused rather than run (see [`native`]). So
+//! is a config the health monitor's route probe could not validate — split
+//! `AllowedIPs` that do not cover the probe's destination, or `Table = off`
+//! with nothing else routing the tunnel's traffic through it — which would
+//! otherwise come up and be fenced on its first poll. A link root raised from
+//! such a config before the daemon started is still adopted by its key,
+//! exactly as for a non-root daemon.
 
 use std::net::IpAddr;
 use std::path::Path;
@@ -469,14 +473,50 @@ impl WireguardManager {
         Self { raised }
     }
 
-    /// Raise `profile`'s link. `Ok(Err(text))` is a refusal — the link could
-    /// not be raised, which the caller answers by asking whether one it may
-    /// adopt is already standing; `Err` is a tool that could not be run.
+    /// Raise `profile`'s link. `Ok(Err(_))` is a link that is not up: a
+    /// refusal, which the caller answers by asking whether one it may adopt is
+    /// already standing, or a link that came up and was lowered again for want
+    /// of routing; `Err` is a tool that could not be run.
     ///
     /// Always the native path (`ip` and `wg`), whatever the uid; see the
     /// module documentation for why `wg-quick` is not run.
-    fn raise(&self, profile: &VpnTunnel) -> Result<Result<(), String>, std::io::Error> {
+    fn raise(&self, profile: &VpnTunnel) -> Result<Result<(), native::UpFailure>, std::io::Error> {
         Ok(native::up(&profile.interface, &profile.config_path))
+    }
+
+    /// What a raise that did not leave a link up is reported as.
+    ///
+    /// A link that came up and whose routing could not be installed is
+    /// [`VpnError::RoutingFailed`], as OpenVPN reports it, so `vpn check
+    /// --bring-up` can say the tunnel did come up and is already gone. It is
+    /// never a question for adoption: `native::up` removed that link itself,
+    /// and nothing standing under the name now is the link it raised.
+    fn raise_failed(
+        &self,
+        profile: &VpnTunnel,
+        standing_before: bool,
+        failure: native::UpFailure,
+    ) -> Result<IpAddr, VpnError> {
+        match failure {
+            native::UpFailure::Unrouted(cause) => {
+                warn!(
+                    target: "torrentd::vpn::wireguard",
+                    vpn_iface = %profile.interface,
+                    error.cause = %cause,
+                    "could not install the tunnel's source-address routing; took it down",
+                );
+                Err(VpnError::RoutingFailed {
+                    iface: profile.interface.clone(),
+                    cause,
+                })
+            }
+            native::UpFailure::Refused(refused) => refusal(
+                &profile.interface,
+                standing_before,
+                self.adoptable(profile),
+                &refused,
+            ),
+        }
     }
 
     /// The IP of an existing interface that is safe to adopt as `profile`'s
@@ -844,7 +884,7 @@ impl VpnManager for WireguardManager {
             config = %profile.config_path.display(),
             "raising wireguard link with ip and wg",
         );
-        if let Err(refused) = self.raise(profile).map_err(VpnError::Io)? {
+        if let Err(failure) = self.raise(profile).map_err(VpnError::Io)? {
             // `wg-quick up` refuses an interface that already exists, which is
             // what a previous process leaves behind when it is killed rather
             // than shut down: the tunnel outlives it, every profile then fails to
@@ -877,12 +917,11 @@ impl VpnManager for WireguardManager {
             // destroying a stranger's interface, its routes and its rules over
             // a name collision: decision 33's destructive direction arriving
             // through the door the record opened.
-            return refusal(
-                &profile.interface,
-                standing_before,
-                self.adoptable(profile),
-                &refused,
-            );
+            //
+            // A link that came up and was lowered again for want of routing
+            // is not a refusal, and goes nowhere near adoption: see
+            // `raise_failed`.
+            return self.raise_failed(profile, standing_before, failure);
         }
 
         // Claim the link this call just raised, by the key it is carrying.
@@ -1050,9 +1089,17 @@ impl WireguardManager {
 ///    daemon's own traffic needs, and nothing else on the host is rerouted.
 ///    `Table = off` skips this step, as it does for `wg-quick`. The rules and
 ///    table are `vpn::route`'s, shared with OpenVPN.
+/// 5. **The health monitor's route probe, once.** `ip route get 1.1.1.1 from
+///    <address>` must leave by the link, or the profile would be fenced
+///    `route_mismatch` on its first poll. Asked after routing for every
+///    config, so it also catches a `Table = off` link that nothing of the
+///    operator's routes through the tunnel. A split `AllowedIPs` that does not
+///    cover `1.1.1.1` is refused at parse time, before anything is created.
 ///
 /// Any failure after step 1 removes what this call made — the rules and the
-/// link — the same way `wg-quick`'s own exit trap does.
+/// link — the same way `wg-quick`'s own exit trap does. A failure in step 4,
+/// or in step 5 with routing installed, is [`UpFailure::Unrouted`]; every
+/// other failure is a refusal.
 ///
 /// **What does not carry over.** `DNS` needs `resolvconf` and root, and
 /// `SaveConfig` writes the config back as root; both are ignored with a
@@ -1067,6 +1114,8 @@ impl WireguardManager {
 /// A refused config still reaches adoption: a link root raised from it before
 /// the daemon started is adopted when its key matches, as before.
 mod native {
+    use std::net::IpAddr;
+    use std::net::Ipv4Addr;
     use std::path::Path;
 
     use tracing::warn;
@@ -1074,6 +1123,54 @@ mod native {
     use super::super::exec;
     use super::super::route;
     use super::super::route::family;
+    use super::super::route::RouteProbe;
+    use super::super::route::RouteProbeUnavailable;
+    use super::super::route::PROBE_DEST;
+
+    /// Why [`up`] did not leave a link up.
+    #[derive(Debug, PartialEq, Eq)]
+    pub(in super::super) enum UpFailure {
+        /// The config was refused, or a step before routing failed. The
+        /// caller asks whether a link it may adopt is standing.
+        Refused(String),
+        /// The link came up and its source-address routing could not be
+        /// installed, or was installed and the kernel still routes the
+        /// tunnel's traffic elsewhere. The link has been removed again.
+        Unrouted(String),
+    }
+
+    impl std::fmt::Display for UpFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                UpFailure::Refused(why) | UpFailure::Unrouted(why) => f.write_str(why),
+            }
+        }
+    }
+
+    /// Whether the IPv4 prefix `prefix` (`a.b.c.d[/len]`) holds `addr`. A
+    /// prefix that does not parse holds nothing.
+    fn covers(prefix: &str, addr: Ipv4Addr) -> bool {
+        let (net, len) = match prefix.split_once('/') {
+            Some((net, len)) => (net, len.parse::<u32>().ok()),
+            None => (prefix, Some(32)),
+        };
+        let (Ok(net), Some(len)) = (net.trim().parse::<Ipv4Addr>(), len) else {
+            return false;
+        };
+        if len > 32 {
+            return false;
+        }
+        let mask = u32::MAX.checked_shl(32 - len).unwrap_or(0);
+        u32::from(net) & mask == u32::from(addr) & mask
+    }
+
+    /// The first IPv4 `Address`, without its prefix length: the address the
+    /// bring-up waits for and the health monitor probes from.
+    fn first_v4(addresses: &[String]) -> Option<Ipv4Addr> {
+        addresses
+            .iter()
+            .find_map(|a| a.split('/').next().unwrap_or(a).trim().parse().ok())
+    }
 
     /// `wg-quick`'s MTU for a 1500-byte path, used when the config sets none.
     /// `wg-quick` derives it from the route MTU instead (minus 80); this path
@@ -1170,6 +1267,26 @@ mod native {
         if p.addresses.is_empty() {
             return Err("the config names no Address for the link".to_string());
         }
+        // The health monitor checks the tunnel by asking where a packet from
+        // its address to `PROBE_DEST` would go. The daemon routes only
+        // `AllowedIPs` through the tunnel, so with a split `AllowedIPs` that
+        // does not hold `PROBE_DEST` the answer is the main table, and the
+        // profile would be fenced on its first poll. Refused here, before
+        // anything is created. Only with an IPv4 address: the probe asks from
+        // one, and a link without one never finishes coming up.
+        if p.route
+            && first_v4(&p.addresses).is_some()
+            && !p.allowed_ips.iter().any(|a| covers(a, PROBE_DEST))
+        {
+            return Err(format!(
+                "AllowedIPs = {} does not cover {PROBE_DEST}: the daemon routes only AllowedIPs \
+                 through the tunnel, and the health monitor checks the tunnel by asking where a \
+                 packet from its address to {PROBE_DEST} would go, so this profile would be \
+                 fenced as route_mismatch on its first poll. Route the full IPv4 range \
+                 (AllowedIPs = 0.0.0.0/0, plus ::/0 for IPv6)",
+                p.allowed_ips.join(", "),
+            ));
+        }
         Ok(p)
     }
 
@@ -1182,11 +1299,11 @@ mod native {
             .map_err(|e| e.to_string())
     }
 
-    pub(super) fn up(iface: &str, config: &Path) -> Result<(), String> {
-        let iface = exec::iface(iface).map_err(|e| e.to_string())?;
+    pub(super) fn up(iface: &str, config: &Path) -> Result<(), UpFailure> {
+        let iface = exec::iface(iface).map_err(|e| UpFailure::Refused(e.to_string()))?;
         let text = std::fs::read_to_string(config)
-            .map_err(|e| format!("read {}: {e}", config.display()))?;
-        let parsed = parse(&text)?;
+            .map_err(|e| UpFailure::Refused(format!("read {}: {e}", config.display())))?;
+        let parsed = parse(&text).map_err(UpFailure::Refused)?;
         for key in &parsed.ignored {
             warn!(
                 target: "torrentd::vpn::wireguard",
@@ -1199,7 +1316,8 @@ mod native {
             "ip",
             &["link", "add", "dev", iface, "type", "wireguard"],
             None,
-        )?;
+        )
+        .map_err(UpFailure::Refused)?;
         // The link is this call's from here on, so a failure removes it.
         let configured = configure(iface, &parsed);
         if configured.is_err() {
@@ -1208,25 +1326,67 @@ mod native {
         configured
     }
 
-    fn configure(iface: &str, p: &Parsed) -> Result<(), String> {
-        run("wg", &["setconf", iface, "/dev/stdin"], Some(&p.wg_conf))?;
+    fn configure(iface: &str, p: &Parsed) -> Result<(), UpFailure> {
+        configure_with(
+            iface,
+            p,
+            run,
+            |iface, addresses, prefixes| {
+                route::install(iface, addresses, prefixes).map_err(|e| e.to_string())
+            },
+            |iface, src| route::probe(iface, src, IpAddr::V4(PROBE_DEST)),
+        )
+    }
+
+    /// [`configure`] over the commands it runs, the route install and the
+    /// route probe, so which failure is which can be tested without a link.
+    pub(super) fn configure_with(
+        iface: &str,
+        p: &Parsed,
+        mut run: impl FnMut(&str, &[&str], Option<&str>) -> Result<(), String>,
+        install: impl FnOnce(&str, &[String], &[String]) -> Result<(), String>,
+        probe: impl FnOnce(&str, IpAddr) -> Result<RouteProbe, RouteProbeUnavailable>,
+    ) -> Result<(), UpFailure> {
+        run("wg", &["setconf", iface, "/dev/stdin"], Some(&p.wg_conf))
+            .map_err(UpFailure::Refused)?;
         for addr in &p.addresses {
             run(
                 "ip",
                 &[family(addr), "address", "add", addr, "dev", iface],
                 None,
-            )?;
+            )
+            .map_err(UpFailure::Refused)?;
         }
         let mtu = p.mtu.unwrap_or(DEFAULT_MTU).to_string();
         run(
             "ip",
             &["link", "set", "mtu", &mtu, "up", "dev", iface],
             None,
-        )?;
-        if !p.route {
-            return Ok(());
+        )
+        .map_err(UpFailure::Refused)?;
+        if p.route {
+            install(iface, &p.addresses, &p.allowed_ips).map_err(UpFailure::Unrouted)?;
         }
-        route::install(iface, &p.addresses, &p.allowed_ips).map_err(|e| e.to_string())
+        // The health monitor's first question, asked now. A probe that cannot
+        // run is the monitor's to report (`profile_vpn_route_probe_ok`), and
+        // it does not fence on one, so neither does this.
+        let Some(src) = first_v4(&p.addresses) else {
+            return Ok(());
+        };
+        match probe(iface, IpAddr::V4(src)) {
+            Ok(RouteProbe::ViaTunnel) | Err(_) => Ok(()),
+            Ok(RouteProbe::Elsewhere(why)) if p.route => Err(UpFailure::Unrouted(format!(
+                "routing was installed, yet a packet from {src} to {PROBE_DEST} does not leave \
+                 by {iface} ({why}); another rule outranks the tunnel's"
+            ))),
+            Ok(RouteProbe::Elsewhere(why)) => Err(UpFailure::Refused(format!(
+                "Table = off, and nothing routes the tunnel's traffic through it: a packet from \
+                 {src} to {PROBE_DEST} does not leave by {iface} ({why}). The health monitor \
+                 asks exactly this each poll and would fence the profile as route_mismatch. \
+                 Use Table = auto, or route traffic from {src} through {iface} yourself before \
+                 the daemon starts"
+            ))),
+        }
     }
 
     /// Remove the link, then the rules this module added for it. Routes in
@@ -2142,7 +2302,7 @@ mod tests {
             })
             .expect("a refusal is not an I/O error")
             .expect_err("the native parser refuses the hook");
-        assert!(refused.contains("PostUp"), "got {refused}");
+        assert!(refused.to_string().contains("PostUp"), "got {refused}");
 
         // Whitespace removed, so a call rustfmt wrapped onto several lines is
         // still seen: `exec::run(`, `exec::run_ok(`, `exec::available(` and
@@ -2218,6 +2378,169 @@ Endpoint = 203.0.113.7:51820 # the exit
         assert!(e.contains("Address"), "got {e}");
     }
 
+    /// A split `AllowedIPs` is refused before anything is created: the
+    /// daemon routes only `AllowedIPs` through the tunnel, so the health
+    /// monitor's probe to 1.1.1.1 would fall through to the main table and
+    /// fence the profile on its first poll. Drop the check from `parse` and
+    /// the first assertion fails.
+    #[test]
+    fn allowed_ips_the_route_probe_cannot_validate_are_refused_at_parse() {
+        let with = |allowed: &str| {
+            PROVIDER_CONF.replace(
+                "AllowedIPs = 0.0.0.0/0,::/0",
+                &format!("AllowedIPs = {allowed}"),
+            )
+        };
+        let e = native::parse(&with("10.0.0.0/8, 192.168.0.0/16"))
+            .expect_err("a split tunnel that does not hold 1.1.1.1");
+        assert!(
+            e.contains("does not cover 1.1.1.1") && e.contains("route_mismatch"),
+            "got {e}"
+        );
+        native::parse(&with("::/0")).expect_err("no IPv4 route at all, but an IPv4 address");
+        for covering in [
+            "0.0.0.0/0",
+            "1.0.0.0/8, 10.0.0.0/8",
+            "1.1.1.1/32",
+            "1.1.1.1",
+        ] {
+            native::parse(&with(covering)).unwrap_or_else(|e| panic!("{covering}: {e}"));
+        }
+        let off = with("10.0.0.0/8").replace("DNS = 10.2.0.1", "Table = off");
+        native::parse(&off).expect("Table = off routes nothing; the bring-up probe judges it");
+    }
+
+    fn parsed(table_off: bool) -> native::Parsed {
+        let text = if table_off {
+            PROVIDER_CONF.replace("DNS = 10.2.0.1", "Table = off")
+        } else {
+            PROVIDER_CONF.to_string()
+        };
+        native::parse(&text).unwrap()
+    }
+
+    fn elsewhere(
+    ) -> Result<super::super::route::RouteProbe, super::super::route::RouteProbeUnavailable> {
+        Ok(super::super::route::RouteProbe::Elsewhere(
+            "leaves by eth0: 1.1.1.1 from 10.2.0.2 via 192.168.1.1 dev eth0".into(),
+        ))
+    }
+
+    /// Which failure of the configure step is which: the route install
+    /// failing, or the kernel still routing elsewhere after it, is
+    /// `Unrouted` — reported as `RoutingFailed` — and a `Table = off` link
+    /// that nothing routes through the tunnel is refused. A probe that could
+    /// not run is not a failure, as it is not for the health monitor.
+    #[test]
+    fn the_configure_step_tells_a_routing_failure_from_a_refusal() {
+        let ok_run = |_: &str, _: &[&str], _: Option<&str>| Ok(());
+        let via = |_: &str, _: IpAddr| Ok(super::super::route::RouteProbe::ViaTunnel);
+
+        assert_eq!(
+            native::configure_with("wg-a", &parsed(false), ok_run, |_, _, _| Ok(()), via),
+            Ok(())
+        );
+        assert!(matches!(
+            native::configure_with(
+                "wg-a",
+                &parsed(false),
+                ok_run,
+                |_, _, _| Err("ip rule add: Operation not permitted".to_string()),
+                via,
+            ),
+            Err(native::UpFailure::Unrouted(cause)) if cause.contains("Operation not permitted")
+        ));
+        assert!(matches!(
+            native::configure_with(
+                "wg-a",
+                &parsed(false),
+                ok_run,
+                |_, _, _| Ok(()),
+                |_, _| { elsewhere() }
+            ),
+            Err(native::UpFailure::Unrouted(_))
+        ));
+
+        let mut installed = false;
+        let refused = native::configure_with(
+            "wg-a",
+            &parsed(true),
+            ok_run,
+            |_, _, _| {
+                installed = true;
+                Ok(())
+            },
+            |_, src| {
+                assert_eq!(src, IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 2)));
+                elsewhere()
+            },
+        );
+        assert!(!installed, "Table = off installs nothing");
+        assert!(
+            matches!(&refused, Err(native::UpFailure::Refused(why))
+                if why.contains("Table = off") && why.contains("route_mismatch")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            native::configure_with("wg-a", &parsed(true), ok_run, |_, _, _| Ok(()), via),
+            Ok(()),
+            "Table = off with the operator's own routing through the tunnel"
+        );
+        assert_eq!(
+            native::configure_with(
+                "wg-a",
+                &parsed(true),
+                ok_run,
+                |_, _, _| Ok(()),
+                |_, _| { Err(super::super::route::RouteProbeUnavailable::NoTool) }
+            ),
+            Ok(())
+        );
+        assert!(matches!(
+            native::configure_with(
+                "wg-a",
+                &parsed(false),
+                |p: &str, _: &[&str], _: Option<&str>| if p == "wg" {
+                    Err("wg setconf: Invalid argument".to_string())
+                } else {
+                    Ok(())
+                },
+                |_, _, _| Ok(()),
+                via,
+            ),
+            Err(native::UpFailure::Refused(_))
+        ));
+    }
+
+    /// A link that came up and was lowered for want of routing is
+    /// `RoutingFailed`, as OpenVPN reports it, so `vpn check --bring-up`
+    /// says it came up. It was reported as `Spawn` through the adoption
+    /// path, which read as a link that never appeared.
+    #[test]
+    fn a_link_lowered_for_want_of_routing_is_reported_as_routing_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = WireguardManager::with_raised(raised_in(dir.path(), "one-boot"));
+        let profile = VpnTunnel {
+            r#type: torrentd_engine::VpnType::Wireguard,
+            interface: "tdnx-absent".to_string(),
+            config_path: dir.path().join("tdnx-absent.conf"),
+        };
+        let r = mgr.raise_failed(
+            &profile,
+            false,
+            native::UpFailure::Unrouted("ip rule add: Operation not permitted".to_string()),
+        );
+        assert!(
+            matches!(&r, Err(VpnError::RoutingFailed { iface, cause })
+                if iface == "tdnx-absent" && cause.contains("Operation not permitted")),
+            "{r:?}"
+        );
+        assert!(matches!(
+            mgr.raise_failed(&profile, false, native::UpFailure::Refused("no".into())),
+            Err(VpnError::Spawn(_))
+        ));
+    }
+
     fn native_manager(raised: RaisedInterfaces) -> WireguardManager {
         WireguardManager::with_raised(raised)
     }
@@ -2245,10 +2568,13 @@ Endpoint = 203.0.113.7:51820 # the exit
             interface: "tdnx-absent".to_string(),
             config_path: hooked.clone(),
         };
-        let refused = mgr
+        let native::UpFailure::Refused(refused) = mgr
             .raise(&profile)
             .expect("a refusal is not an I/O error")
-            .expect_err("a hook is refused before anything is run");
+            .expect_err("a hook is refused before anything is run")
+        else {
+            panic!("a parse refusal is a refusal");
+        };
         assert!(refused.contains("PostUp"), "got {refused}");
         assert_eq!(mgr.adoptable(&profile), Adoption::No);
         assert!(matches!(
@@ -2265,10 +2591,13 @@ Endpoint = 203.0.113.7:51820 # the exit
             interface: "lo".to_string(),
             config_path: plain,
         };
-        let refused = mgr
+        let native::UpFailure::Refused(refused) = mgr
             .raise(&profile)
             .expect("a refusal is not an I/O error")
-            .expect_err("`lo` exists, so `ip link add` fails");
+            .expect_err("`lo` exists, so `ip link add` fails")
+        else {
+            panic!("`ip link add` failing is a refusal");
+        };
         assert!(matches!(
             refusal(&profile.interface, true, mgr.adoptable(&profile), &refused),
             Err(VpnError::ForeignInterface { .. })
@@ -2519,7 +2848,10 @@ Endpoint = 203.0.113.7:51820 # the exit
         )
         .unwrap();
         let e = native::up("wg-rb", &conf).expect_err("ip rejects the address");
-        assert!(e.contains("address add"), "failed at configure: {e}");
+        assert!(
+            e.to_string().contains("address add"),
+            "failed at configure: {e}"
+        );
         assert!(gone("wg-rb"), "the half-configured link is removed");
 
         // 2. A link raised outside the daemon, carrying a key.
