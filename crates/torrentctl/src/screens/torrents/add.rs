@@ -389,6 +389,10 @@ fn expand_home(path: &str) -> PathBuf {
 }
 
 /// Send `request`, reading a local `.torrent` first.
+#[allow(
+    clippy::result_large_err,
+    reason = "an AddFailure is built once per failed add and moved straight to the dialog"
+)]
 pub async fn submit(api: Api, request: Request) -> Result<types::Torrent, AddFailure> {
     // A typed request's `validation-failed` carries its violations too, so
     // they land on their fields whichever way the torrent was sent.
@@ -426,6 +430,10 @@ pub async fn submit(api: Api, request: Request) -> Result<types::Torrent, AddFai
 }
 
 /// A local `.torrent`'s bytes, refused over [`MAX_METAINFO`].
+#[allow(
+    clippy::result_large_err,
+    reason = "an AddFailure is built once per failed add and moved straight to the dialog"
+)]
 async fn read_metainfo(path: &std::path::Path) -> Result<Vec<u8>, AddFailure> {
     let local = |message: String| AddFailure::Local {
         field: Field::Source,
@@ -457,6 +465,10 @@ async fn read_metainfo(path: &std::path::Path) -> Result<Vec<u8>, AddFailure> {
 /// API document declares, so the typed `add_torrent` cannot send a
 /// `.torrent`. This sends the same request with the data base64-encoded,
 /// through the client's own HTTP client, base URL and credential.
+#[allow(
+    clippy::result_large_err,
+    reason = "an AddFailure is built once per failed add and moved straight to the dialog"
+)]
 async fn post_metainfo(
     api: &Api,
     profile: &str,
@@ -741,7 +753,6 @@ pub fn view(
 
 #[cfg(test)]
 mod wire_tests {
-    use base64::Engine as _;
     use tokio::io::AsyncReadExt as _;
     use tokio::io::AsyncWriteExt as _;
 
