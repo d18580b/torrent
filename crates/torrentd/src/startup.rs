@@ -208,27 +208,17 @@ impl InstanceLock {
     }
 }
 
-/// Undoes what `boot` raised on the host, for every exit from `boot` that is
-/// not a successful one.
-///
-/// Tunnels and the nftables kill-switch table outlive the process that created
-/// them, and `boot` has a dozen `?`s after the point where it starts creating
-/// them — a pool database that will not open, a resume directory that cannot
-/// be read. Each of those used to leave the host with live tunnels, a table
-/// confining a uid that no longer exists, and no daemon to explain either.
-///
-/// Armed from construction; `disarm` hands ownership to the shutdown path.
+/// Undoes what `boot` raised on the host — sessions, tunnels and the kill
+/// switch, all of which outlive the process — for every exit from `boot` that
+/// is not a successful one. Armed from construction; `disarm` hands ownership
+/// to the shutdown path.
 struct BootCleanup {
     run_dir: std::path::PathBuf,
-    /// How a recorded tunnel's manager is built. Injected so the teardown
-    /// paths below are reachable by a test without shelling out to
-    /// `wg-quick` or `kill`; production always passes `vpn::for_type`.
+    /// How a tunnel's manager is built, for bring-up and teardown alike.
+    /// Production passes `vpn::for_type`; tests pass a mock.
     vpn_for: VpnFactory,
     tunnels: Vec<(torrentd_engine::VpnType, String)>,
-    /// Every session boot built, closed before any tunnel goes. Dropping
-    /// `boot`'s own handles does not destroy them once the port-forward
-    /// monitor holds the registry, and a session outliving its tunnel is
-    /// sockets bound to an address whose route is about to disappear.
+    /// Every session boot built, closed before any tunnel goes.
     sessions: Vec<Arc<dyn TorrentEngine>>,
     kill_switch: bool,
     armed: bool,
@@ -287,36 +277,13 @@ impl BootCleanup {
         self.sessions.extend(sessions);
     }
 
-    /// Bring one tunnel down and stop tracking it — for a profile that failed
-    /// after its tunnel came up, whose tunnel must go even if boot succeeds.
+    /// Bring one recorded tunnel down and stop tracking it — for a profile
+    /// that failed after its tunnel came up. The only teardown `boot` runs
+    /// outside `Drop`.
     ///
-    /// The wait goes to `spawn_blocking`, which is what makes this the only
-    /// teardown `boot` has. There used to be a synchronous `take_down`
-    /// beside it whose own doc asserted that "**every** `async` caller puts
-    /// the returned job on `spawn_blocking` rather than calling this", while
-    /// all three of its callers were statements inside this `async fn` and
-    /// none of them did — a wrapper that must not be called from `async`
-    /// code, living in an `async fn`'s own module, which is a hazard that
-    /// gets used again. It is gone rather than fixed at its call sites.
-    ///
-    /// "The only teardown `boot` has" was asserted here while a second shape
-    /// stood forty lines further down and a third in `bring_up_tracked` above
-    /// — each a `take_down_job` handed straight to `spawn_blocking`, each
-    /// byte-equivalent to this body, each correct today and each invisible to
-    /// a change made through this function. The job-returning helper they were
-    /// built from is gone too, for the reason `take_down` went: an API from
-    /// which a second teardown shape can be assembled is one that will be, and
-    /// deleting it closes the class where converting its call sites closes
-    /// three instances. Every teardown in `boot` is now this call.
-    ///
-    /// `OpenvpnManager::bring_down` signals the process and then polls for it
-    /// to exit — up to `TERM_GRACE + KILL_GRACE`, seven seconds, per tunnel.
-    /// On a runtime worker that is seven seconds in which nothing else
-    /// scheduled on that thread runs. This series already moved bring-up, the
-    /// NAT-PMP exchange and the monitor probes onto `spawn_blocking` for
-    /// exactly that reason.
-    ///
-    /// An interface this boot did not record spawns nothing at all.
+    /// On `spawn_blocking`, because an OpenVPN teardown polls for the process
+    /// to exit for up to seven seconds. An interface this boot did not record
+    /// spawns nothing.
     async fn take_down_off_worker(&mut self, iface: &str) -> anyhow::Result<()> {
         let Some(i) = self.tunnels.iter().position(|(_, n)| n == iface) else {
             return Ok(());
@@ -332,12 +299,6 @@ impl BootCleanup {
 
     /// The manager for a tunnel of this type, built by the same factory the
     /// teardown paths use.
-    ///
-    /// Bring-up called `crate::vpn::for_type` directly while teardown went
-    /// through the injected factory, so the manager that raised a tunnel and
-    /// the one that took it down were different objects and the seam covered
-    /// half the lifecycle — a test could drive teardown with a mock while
-    /// bring-up quietly shelled out to `wg-quick` beside it.
     fn manager_for(&self, t: torrentd_engine::VpnType) -> Arc<dyn torrentd_engine::VpnManager> {
         (self.vpn_for)(t, &self.run_dir)
     }
@@ -348,52 +309,14 @@ impl BootCleanup {
         self.tunnels.retain(|(_, n)| n != iface);
     }
 
-    /// Bring a profile's tunnel up, recording it **before** the attempt.
+    /// Bring a profile's tunnel up on `spawn_blocking`, recording it
+    /// **before** the attempt: a failed bring-up can leave a link or a forked
+    /// `openvpn` behind, and only a record lets this teardown or `Drop` reach
+    /// it. `bring_down` of something never raised is a logged no-op.
     ///
-    /// `bring_up` spawns the tunnel and only then polls up to 30 seconds for
-    /// an address, so every failure after the spawn leaves something running:
-    /// a WireGuard interface `wg-quick up` already created, or an
-    /// `openvpn --daemon` that forked, exited 0, and is still retrying. Both
-    /// outlive this process. Recording the tunnel only once an address had
-    /// appeared left that one failure path — and only that one — with nothing
-    /// tracking it: the failure teardown had nothing to remove, `Drop` had
-    /// nothing to bring down, `ProfileRegistry::iter()` excludes failed profiles so the
-    /// graceful-shutdown loop never saw it either, and the next boot
-    /// overwrote the `--writepid` file that was the only remaining handle on
-    /// the orphan.
-    ///
-    /// Recorded first, the tunnel is torn down on failure here and is still
-    /// tracked by the drop guard if boot aborts. `bring_down` on an interface
-    /// that was never raised is a logged no-op, which is the conservative
-    /// direction.
-    ///
-    /// With one exception, and it is the reason `VpnError::ForeignInterface`
-    /// exists: a bring-up that failed over an interface of that name that was
-    /// **already standing when the attempt started**. Recording before the
-    /// attempt turned that case into `wg-quick down <iface>` on a tunnel this
-    /// boot did not raise, taking its routes and rules with it — the daemon
-    /// destroying a stranger's tunnel over a name collision. Nothing of ours
-    /// is running there, so it is forgotten rather than torn down, and the
-    /// drop guard does not see it either.
-    ///
-    /// That exception is decided by `bring_up`, not here, and it is wider than
-    /// the key-based refusal it started as. A raised-interface record for a
-    /// link that some other tunnel has since taken the name of makes
-    /// `ownership` answer `Ours` on the record alone; the link then has no
-    /// address this boot can use, `adoptable` returns `Adoption::No`, and
-    /// before this the `Err(_)` arm below tore it down. Every non-adoption
-    /// over a link that was standing beforehand is now `ForeignInterface`, so
-    /// the only failures that reach the teardown arm are the ones where the
-    /// name was free when this attempt began and whatever is standing there is
-    /// this attempt's own residue.
-    ///
-    /// The bring-up itself runs on `spawn_blocking`: it shells out and polls,
-    /// and on a runtime worker that is 30 seconds per profile during which
-    /// nothing else — including the signal handler that is supposed to
-    /// interrupt exactly this — gets to run on that thread.
-    ///
-    /// The manager comes from the same factory the teardown uses, so the
-    /// object that raises a tunnel is the object that takes it down.
+    /// The exception is `VpnError::ForeignInterface`: an interface that was
+    /// already standing when the attempt began is not this boot's, so it is
+    /// forgotten rather than torn down.
     async fn bring_up_tracked(
         &mut self,
         t: torrentd_engine::VpnType,
@@ -428,26 +351,15 @@ impl BootCleanup {
 }
 
 impl Drop for BootCleanup {
-    /// The one teardown that stays on whatever thread it lands on.
-    ///
-    /// `drop` cannot await, so an OpenVPN tunnel's bounded exit wait — up to
-    /// `TERM_GRACE + KILL_GRACE` per tunnel — runs here on the worker that
-    /// happens to drop the guard, where every other teardown path in this
-    /// file hands the job to `spawn_blocking`. That is a forced move rather
-    /// than an oversight: this runs only on a boot that has already failed
-    /// and is on its way to exiting, so the worker it holds has nothing left
-    /// to serve.
+    /// Runs on whatever worker drops the guard, since `drop` cannot await:
+    /// acceptable only because the boot has failed and the process is exiting.
     fn drop(&mut self) {
         if !self.armed {
             return;
         }
-        // Sessions, then tunnels, then the kill switch, as on a clean
-        // shutdown (`teardown_network`). The sessions go first because a
-        // session left open while its tunnel goes keeps sockets bound to an
-        // address whose route is disappearing; the switch goes last because
-        // it is what confines the uid to the tunnels while they go, and
-        // removing it first opened the host's own interface to anything
-        // still bound for one.
+        // Sessions, then tunnels, then the kill switch, as `teardown_network`
+        // does: no socket outlives its route, and the switch confines the uid
+        // until the tunnels are gone.
         for session in std::mem::take(&mut self.sessions) {
             session.close();
         }
@@ -461,32 +373,11 @@ impl Drop for BootCleanup {
     }
 }
 
-/// Take both shutdown receivers `boot` needs, on one line.
-///
-/// `broadcast::Sender::subscribe()` sets the new receiver's cursor to the
-/// channel's current tail, so a receiver created later provably cannot see a
-/// send that already happened, and a send with no live receiver behind it is
-/// discarded outright. `boot` used to subscribe the receiver that outlives
-/// boot only after the resume and torrent-dir scans — 400-odd lines after the
-/// signal listener was installed, and the whole of a single-session boot after
-/// it. A SIGTERM in that window was consumed by `boot_shutdown`, which the
-/// profile loop has already finished with, and the HTTP server's graceful
-/// shutdown then waited on a receiver that could never see it: the daemon
-/// served indefinitely and only SIGKILL ended it, skipping the resume drain
-/// and the tunnel teardown this boot path exists to guarantee.
-///
-/// Returned as a pair so the two subscriptions cannot drift apart again, and
-/// taken **before the listener is installed**, which is the rest of the
-/// property. `signals::run` spawns its listener and returns without an await
-/// point, and the runtime is multi-threaded, so the spawned task can install
-/// all three handlers, take a SIGTERM and send on another worker before the
-/// next two instructions of `boot` execute. A send with no live receiver is
-/// not buffered for a later `subscribe()` — `broadcast::Sender::send` returns
-/// the value back in its error and writes nothing to the ring — so a send
-/// landing in that window is lost outright, and with the listener looping
-/// nothing re-reports it. After the install the guarantee is probabilistic;
-/// before it, where the sender already exists and is all this needs, it is
-/// structural.
+/// Take both shutdown receivers `boot` needs — the one boot's own loops
+/// watch, and the one that outlives boot — together, and **before the signal
+/// listener is installed**: a broadcast receiver sees only sends after it
+/// subscribes, and a send with no receiver is lost outright, so a SIGTERM
+/// during boot would otherwise never reach the running daemon.
 fn boot_shutdown_receivers(
     tx: &broadcast::Sender<ShutdownReason>,
 ) -> (
@@ -621,34 +512,6 @@ fn shutdown_requested(rx: &mut broadcast::Receiver<ShutdownReason>) -> bool {
     !matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Empty))
 }
 
-/// [`boot_shutdown_receivers`], and then install the signal listener — the
-/// order being the whole of the property.
-///
-/// Taking the pair and installing the listener were two adjacent statements
-/// in `boot`, and their order was pinned by nothing: swapping them left the
-/// entire suite green while reopening the window above. `boot` has no test at
-/// any revision, and `signals::run` cannot be called from one — tokio's
-/// handlers are process-wide and are never uninstalled, so a test that
-/// installs them leaves SIGINT swallowed and Ctrl-C ignored for the rest of
-/// the `cargo test` run. Taking the install as a closure puts the order
-/// inside one function, where a test drives it with a stand-in that sends the
-/// instant it is "installed" — which is precisely the race.
-async fn boot_shutdown_receivers_before<F, Fut>(
-    tx: &broadcast::Sender<ShutdownReason>,
-    install_listener: F,
-) -> (
-    broadcast::Receiver<ShutdownReason>,
-    broadcast::Receiver<ShutdownReason>,
-)
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = ()>,
-{
-    let pair = boot_shutdown_receivers(tx);
-    install_listener().await;
-    pair
-}
-
 pub struct DaemonHandle {
     cfg: Config,
     /// Where a VPN manager keeps state a *later* process has to find, as
@@ -738,15 +601,9 @@ pub async fn boot(
     let reload_tx_for_api = reload_tx.clone();
     let channels = SignalChannels::from_parts(channels.shutdown_tx, reload_tx);
     let shutdown_tx = channels.shutdown_tx.clone();
-    // Both shutdown receivers, taken here rather than 400 lines apart — the
-    // one the profile loop polls during bring-up, and the one that outlives boot
-    // and the HTTP server's graceful shutdown waits on — and taken *before*
-    // the listener that can send to them is installed. See
-    // `boot_shutdown_receivers` for what subscribing the second one late
-    // cost, and `boot_shutdown_receivers_before` for why the order is not two
-    // adjacent statements here any more.
-    let (mut boot_shutdown, shutdown_rx) =
-        boot_shutdown_receivers_before(&shutdown_tx, || signals::run(channels.clone())).await;
+    // Before the listener that can send to them: see `boot_shutdown_receivers`.
+    let (mut boot_shutdown, shutdown_rx) = boot_shutdown_receivers(&shutdown_tx);
+    signals::run(channels.clone()).await;
 
     // Tunnel bring-up (up to 30 s a profile) and the resume and torrent-dir
     // scans (minutes at 100K torrents) can outrun any fixed
@@ -3771,43 +3628,6 @@ mod tests {
         assert!(
             subscribed_after.try_recv().is_err(),
             "a receiver subscribed after the send cannot see it",
-        );
-    }
-
-    /// The *ordering*, which the test above does not reach.
-    ///
-    /// `boot` took the pair and then installed the listener as two adjacent
-    /// statements, and nothing pinned which came first: swapping them left
-    /// the whole suite green while reopening the window that `send` with no
-    /// live receiver discards outright. The stand-in listener below sends the
-    /// instant it is installed, which is the race — `signals::run` spawns and
-    /// returns with no await point, and its task can install all three
-    /// handlers and take a SIGTERM before the next statement of `boot` runs.
-    ///
-    /// Install before taking the pair in `boot_shutdown_receivers_before` and
-    /// this fails.
-    #[tokio::test]
-    async fn the_listener_is_installed_only_once_both_receivers_exist() {
-        let (tx, first) = broadcast::channel(8);
-        // No receiver of `boot`'s owns the channel at this point, which is
-        // what makes a send in the window lost rather than merely unseen.
-        drop(first);
-
-        let sender = tx.clone();
-        let (mut boot_shutdown, mut shutdown_rx) =
-            boot_shutdown_receivers_before(&tx, || async move {
-                let _ = sender.send(ShutdownReason::Sigterm);
-            })
-            .await;
-
-        assert!(
-            boot_shutdown.try_recv().is_ok(),
-            "a SIGTERM taken the instant the listener is installed still \
-             reaches the profile loop's check",
-        );
-        assert!(
-            matches!(shutdown_rx.try_recv(), Ok(ShutdownReason::Sigterm)),
-            "and the receiver the HTTP server's graceful shutdown waits on",
         );
     }
 }
