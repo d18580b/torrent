@@ -1313,17 +1313,20 @@ On a scratch pool, not your real one.
    afterwards; the rules come back with the tunnel.
 
    What can leave by the physical interface before the fence trips depends
-   on the socket. Outgoing TCP peer connections are bound to the tunnel
-   device (`outgoing_interfaces`, `SO_BINDTODEVICE`), so they keep leaving by
-   the tunnel. Outgoing uTP and UDP tracker announces are sent from the
-   listen sockets, which are bound to the tunnel address; libtorrent also
-   binds those to the first interface whose network holds that address,
-   which is the tunnel unless another interface's network covers the tunnel
-   address. Where that holds they stay in the tunnel too; where it does not,
-   or where `SO_BINDTODEVICE` is refused (no `CAP_NET_RAW` before Linux 5.7),
-   they follow the routing table and can leave by the physical interface,
-   with the tunnel's source address, until the next poll fences the profile.
-   With `network_kill_switch = true` the kill switch drops them.
+   on the socket and on whether the kernel lets the daemon bind a socket to a
+   device (`SO_BINDTODEVICE`, which needs `CAP_NET_RAW` before Linux 5.7;
+   the unit grants only `CAP_NET_ADMIN`). Outgoing TCP peer connections are
+   bound to the tunnel device (`outgoing_interfaces`). Outgoing uTP and UDP
+   tracker announces are sent from the listen sockets, which are bound to
+   the tunnel address; libtorrent also binds those to the first interface
+   whose network holds that address, which is the tunnel unless another
+   interface's network covers the tunnel address. Where the device binding
+   takes, that traffic keeps leaving by the tunnel. Where it is refused —
+   libtorrent then binds the socket to the address alone, for TCP as for the
+   listen sockets — or names the wrong interface, the traffic follows the
+   routing table and can leave by the physical interface, with the tunnel's
+   source address, until the next poll fences the profile. With
+   `network_kill_switch = true` the kill switch drops it.
 
    A WireGuard tunnel that comes up and **never handshakes** — a wrong key,
    a dead endpoint — is fenced with `reason=no_handshake` once it has gone
@@ -1396,17 +1399,20 @@ On a scratch pool, not your real one.
       The bring-up asks the same question once the link is up, and **refuses
       a config whose answer would be fenced** rather than letting it come up
       and be fenced on the first poll: a `Table = off` link that nothing
-      routes through the tunnel is taken down again, and a split `AllowedIPs`
+      routes through the tunnel is taken down again — which is every link the
+      daemon raises itself under `Table = off`, since a route naming the link
+      can only be added once it exists, so raise a `Table = off` link with
+      your own routing before the daemon starts and let the daemon adopt it —
+      and a split `AllowedIPs`
       that does not cover `1.1.1.1` (with an IPv4 `Address`) is refused before
       anything is created, because only `AllowedIPs` are routed through the
       tunnel and the probe's packet would leave by the main table. The
       profile is reported failed with the reason. Use `AllowedIPs =
-      0.0.0.0/0` (plus `::/0` for IPv6). A link whose routing was installed
-      and that still does not route `1.1.1.1` through the tunnel — another
-      rule outranks it — is lowered and reported as a routing failure, as is
-      one whose routing could not be installed at all; `vpn check
-      --bring-up` reports either as a tunnel that came up and was taken down
-      again.
+      0.0.0.0/0` (plus `::/0` for IPv6). The `Table = off` case, a link
+      whose installed routing is outranked by another rule, and one whose
+      routing could not be installed at all are reported as a routing
+      failure; `vpn check --bring-up` reports each as a tunnel that came up
+      and was taken down again.
    4. Set `network_kill_switch = true` and start the unit.
 
    How the daemon raises a link: `ip link add <iface> type wireguard`,

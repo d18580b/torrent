@@ -1097,9 +1097,9 @@ impl WireguardManager {
 ///    cover `1.1.1.1` is refused at parse time, before anything is created.
 ///
 /// Any failure after step 1 removes what this call made — the rules and the
-/// link — the same way `wg-quick`'s own exit trap does. A failure in step 4,
-/// or in step 5 with routing installed, is [`UpFailure::Unrouted`]; every
-/// other failure is a refusal.
+/// link — the same way `wg-quick`'s own exit trap does. A failure in step 4
+/// or step 5 is [`UpFailure::Unrouted`], reported as `RoutingFailed` because
+/// the link did come up; every other failure is a refusal.
 ///
 /// **What does not carry over.** `DNS` needs `resolvconf` and root, and
 /// `SaveConfig` writes the config back as root; both are ignored with a
@@ -1134,8 +1134,9 @@ mod native {
         /// caller asks whether a link it may adopt is standing.
         Refused(String),
         /// The link came up and its source-address routing could not be
-        /// installed, or was installed and the kernel still routes the
-        /// tunnel's traffic elsewhere. The link has been removed again.
+        /// installed, or the kernel routes the tunnel's traffic elsewhere
+        /// (routing installed and outranked, or `Table = off` with nothing
+        /// routing it). The link has been removed again.
         Unrouted(String),
     }
 
@@ -1379,12 +1380,17 @@ mod native {
                 "routing was installed, yet a packet from {src} to {PROBE_DEST} does not leave \
                  by {iface} ({why}); another rule outranks the tunnel's"
             ))),
-            Ok(RouteProbe::Elsewhere(why)) => Err(UpFailure::Refused(format!(
+            // A link this call raised has no route of anyone else's naming
+            // it, since such a route can only be added once the link exists,
+            // so under `Table = off` this is what is answered for every link
+            // the daemon raises itself. It is still asked rather than assumed:
+            // the answer is the monitor's, whatever the reason.
+            Ok(RouteProbe::Elsewhere(why)) => Err(UpFailure::Unrouted(format!(
                 "Table = off, and nothing routes the tunnel's traffic through it: a packet from \
                  {src} to {PROBE_DEST} does not leave by {iface} ({why}). The health monitor \
                  asks exactly this each poll and would fence the profile as route_mismatch. \
-                 Use Table = auto, or route traffic from {src} through {iface} yourself before \
-                 the daemon starts"
+                 Use Table = auto, or raise the link with your own routing before the daemon \
+                 starts, which the daemon then adopts"
             ))),
         }
     }
@@ -2427,10 +2433,11 @@ Endpoint = 203.0.113.7:51820 # the exit
     }
 
     /// Which failure of the configure step is which: the route install
-    /// failing, or the kernel still routing elsewhere after it, is
-    /// `Unrouted` — reported as `RoutingFailed` — and a `Table = off` link
-    /// that nothing routes through the tunnel is refused. A probe that could
-    /// not run is not a failure, as it is not for the health monitor.
+    /// failing, the kernel still routing elsewhere after it, and a
+    /// `Table = off` link that nothing routes through the tunnel are all
+    /// `Unrouted` — reported as `RoutingFailed`, since the link did come up —
+    /// and a failure before routing is a refusal. A probe that could not run
+    /// is not a failure, as it is not for the health monitor.
     #[test]
     fn the_configure_step_tells_a_routing_failure_from_a_refusal() {
         let ok_run = |_: &str, _: &[&str], _: Option<&str>| Ok(());
@@ -2477,9 +2484,9 @@ Endpoint = 203.0.113.7:51820 # the exit
         );
         assert!(!installed, "Table = off installs nothing");
         assert!(
-            matches!(&refused, Err(native::UpFailure::Refused(why))
+            matches!(&refused, Err(native::UpFailure::Unrouted(why))
                 if why.contains("Table = off") && why.contains("route_mismatch")),
-            "{refused:?}"
+            "the link came up, so it is reported as lowered for want of routing: {refused:?}"
         );
         assert_eq!(
             native::configure_with("wg-a", &parsed(true), ok_run, |_, _, _| Ok(()), via),
