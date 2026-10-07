@@ -657,6 +657,11 @@ pub(crate) fn record_outcome(
             });
             if rebooted {
                 metrics.inc_counter("profile_vpn_gateway_reboots_total", &labels);
+                info!(
+                    target: "torrentd::port_forward_monitor",
+                    profile_id = %profile_id, gateway_epoch = epoch,
+                    "NAT-PMP gateway rebooted; mapping re-established",
+                );
             }
             if previous == new {
                 warn!(
