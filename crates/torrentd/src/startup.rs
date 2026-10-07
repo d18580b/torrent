@@ -2002,11 +2002,14 @@ where
             // through to the main table and the packets left by the physical
             // interface with the tunnel's source address.
             //
-            // This covers outgoing TCP only. Outgoing uTP and UDP tracker
-            // traffic leave by the listen sockets above, whose device binding
-            // is libtorrent's best effort, so for them the window between a
-            // lost rule and the fence is not closed here: the health monitor
-            // fences the profile within a poll (`vpn_monitor`'s route check).
+            // This covers outgoing TCP only, and only where `SO_BINDTODEVICE`
+            // is allowed: where it is refused (no `CAP_NET_RAW` before Linux
+            // 5.7) libtorrent binds the address alone, and the route is the
+            // table's again. Outgoing uTP and UDP tracker traffic leave by
+            // the listen sockets above, whose device binding is libtorrent's
+            // best effort. So the window between a lost rule and the fence is
+            // narrowed here, not closed: the health monitor fences the profile
+            // within a poll (`vpn_monitor`'s route check).
             settings.outgoing_interfaces = Some(iface.to_string());
             // Not configurable, by construction: there is no key on a vpn
             // profile that reaches these.
