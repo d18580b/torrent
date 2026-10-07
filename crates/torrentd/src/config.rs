@@ -395,57 +395,10 @@ impl Config {
             .context("[[profile]] validation failed")?;
         self.validate_http_listen_port()?;
 
-        // Parsed at startup so a malformed CIDR is a config error rather than
-        // a proxy that silently stops being trusted. Not gated on
-        // `check_auth_posture`: a malformed CIDR is a syntax error in the file,
-        // not a posture judgement, so an operator tool reports it too.
+        // Not gated on `check_auth_posture`: a malformed or `/0` entry is a
+        // refusal for operator tools too.
         crate::http::forwarded::TrustedProxies::parse(&self.trusted_proxies)
             .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?;
-        // A `/0` prefix is every address there is. Syntax alone accepts it,
-        // and it is the one value that defeats the whole mechanism: with it
-        // set, every caller on earth is a trusted proxy, so every forwarding
-        // header is believed — the throttle keys on a value the caller
-        // chooses and rotates, `Secure` is set or withheld at the caller's
-        // discretion, and the `client_ip` on the failed-login line is
-        // whatever the caller wrote. That is the "a spoofable header is worse
-        // than none" posture this key exists to make impossible, and both
-        // README.md and docs/running.md §6a promise it "fails safe rather
-        // than open".
-        //
-        // Refused rather than warned, for the same reason
-        // `validate_auth_posture` refuses an unauthenticated routable bind: a
-        // silent footgun in a security posture is the daemon's problem. `/0`
-        // is the bright line — any stricter floor would be a guess about
-        // somebody's network, and refusing a legitimate `/8` would be worse
-        // than the startup log that now records the parsed set.
-        //
-        // Decided on the **parsed** prefix, never on the entry's text. A
-        // guard that reads `entry.split_once('/')` and compares the text to
-        // `"0"` closes one spelling of a value rather than the value:
-        // `Cidr::parse` reads the prefix with `u8::from_str`, which accepts a
-        // leading `+` and any number of leading zeros, so `0.0.0.0/00`,
-        // `0.0.0.0/000`, `0.0.0.0/+0`, `::/00` and `::/+0` all parse to the
-        // same `prefix == 0` and all reach the same `prefix_match`, which
-        // returns `true` before comparing a byte. The number is the value;
-        // the text is one of its spellings.
-        for entry in &self.trusted_proxies {
-            // Re-parsed rather than re-read. `TrustedProxies::parse` above
-            // has already established that every entry parses, so this cannot
-            // fail, and taking the prefix from the parser is the whole point.
-            let prefix = crate::http::forwarded::Cidr::parse(entry)
-                .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?
-                .prefix();
-            if prefix == 0 {
-                anyhow::bail!(
-                    "trusted_proxies: {entry:?} trusts every peer there is. Anything listed \
-                     here can claim to be any client, so a /0 prefix makes every forwarding \
-                     header client-controlled: the login throttle keys on a value the caller \
-                     picks, and the client_ip on the failed-login line is whatever the caller \
-                     wrote. \
-                     List the address your reverse proxy connects from, and only that."
-                );
-            }
-        }
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out

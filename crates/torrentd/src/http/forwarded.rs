@@ -229,10 +229,26 @@ fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
 pub struct TrustedProxies(Vec<Cidr>);
 
 impl TrustedProxies {
+    /// Parse every entry, refusing one with a `/0` prefix: it trusts every
+    /// peer there is, so every forwarding header becomes client-controlled.
+    /// Decided on the parsed prefix, so `/00` and `/+0` are refused too.
     pub fn parse(entries: &[String]) -> Result<Self, String> {
         entries
             .iter()
-            .map(|s| Cidr::parse(s))
+            .map(|entry| {
+                let cidr = Cidr::parse(entry)?;
+                if cidr.prefix() == 0 {
+                    return Err(format!(
+                        "{entry:?} trusts every peer there is. Anything listed here can claim \
+                         to be any client, so a /0 prefix makes every forwarding header \
+                         client-controlled: the login throttle keys on a value the caller \
+                         picks, and the client_ip on the failed-login line is whatever the \
+                         caller wrote. List the address your reverse proxy connects from, and \
+                         only that."
+                    ));
+                }
+                Ok(cidr)
+            })
             .collect::<Result<Vec<_>, _>>()
             .map(Self)
     }
@@ -1813,12 +1829,11 @@ mod tests {
             "::ffff:127.0.0.1".to_string(),
             "2001:db8::1/64".to_string(),
             "172.28.0.2".to_string(),
-            "10.0.0.0/00".to_string(),
         ])
         .unwrap();
         assert_eq!(
             set.to_string(),
-            "0.0.0.0/0, 10.0.0.0/8, 127.0.0.1/32, 2001:db8::/64, 172.28.0.2/32, 0.0.0.0/0"
+            "0.0.0.0/0, 10.0.0.0/8, 127.0.0.1/32, 2001:db8::/64, 172.28.0.2/32"
         );
         // And what it prints is what it matches.
         let every_v4 = Cidr::parse("::ffff:0:0/96").unwrap();

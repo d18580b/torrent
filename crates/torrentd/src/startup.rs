@@ -700,10 +700,8 @@ pub async fn boot(
     log_handle: crate::tracing_init::LogReloadHandle,
 ) -> anyhow::Result<DaemonHandle> {
     info!("starting torrentd");
-    // Refusals that are pure functions of the file, before any tunnel is
-    // raised: among them a host profile beside `network_kill_switch`, whose
-    // egress the ruleset would drop while it reported itself Active.
-    cfg.check_boot_rules().map_err(refused)?;
+    // `cfg` came from `Config::load`, whose validation ran
+    // `Config::check_boot_rules` before any tunnel could be raised.
     // Where a VPN manager keeps state a *later* process has to find — see
     // `vpn::for_type`. Resolved once here so bring-up and teardown agree.
     let run_dir = cfg.state_dir();
@@ -1022,19 +1020,9 @@ pub async fn boot(
             .filter_map(|e| e.config.vpn_interface().map(str::to_string))
             .collect();
         if tunnels.is_empty() {
-            // Fail closed, like every other path here. The operator set this
-            // flag precisely because they do not want traffic on the bare
-            // address; warning and continuing would give them exactly that,
-            // with a startup log line as the only trace.
-            //
-            // `--check-config` reproduces the configured-set half of this
-            // (`Config::check_boot_rules`), so an operator's pre-flight run
-            // refuses a config with no vpn profile, and the daemon refuses it
-            // as it loads the config, exiting 78. This check stays because it reads
-            // the profiles that actually came up: a config with one vpn
-            // profile whose tunnel failed lands here too, and no config check
-            // could have known.
-            cfg.check_boot_rules().map_err(refused)?;
+            // Fail closed. A config with no vpn profile at all was refused by
+            // `Config::check_boot_rules` as it loaded; this is the case no
+            // config check can see, where every vpn profile's tunnel failed.
             anyhow::bail!(
                 "network_kill_switch = true and no configured vpn profile came up, so there is \
                  no tunnel to confine the daemon's egress to. Every profile would keep seeding \
