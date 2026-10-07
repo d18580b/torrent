@@ -1542,6 +1542,7 @@ fn profile_checks(
             }
         };
         let routed = route_check.verdict == Verdict::Pass;
+        let route_unknown = route_check.verdict == Verdict::Unknown;
         checks.push(route_check);
         checks.push(match tunnel_ip {
             Some(src) if routed => egress_probe(src, dest),
@@ -1549,6 +1550,13 @@ fn profile_checks(
                 "egress",
                 format!(
                     "{dest} was not probed: it cannot be reached from {src} (see egress_route)"
+                ),
+            ),
+            Some(_) if route_unknown => Check::skip(
+                "egress",
+                format!(
+                    "{dest} was not probed: its route could not be asked (see egress_route), \
+                     so a reply would not show the tunnel carries traffic"
                 ),
             ),
             Some(_) => Check::skip(
@@ -4128,6 +4136,29 @@ user_agent           = "Transmission/4.0.5"
                 .any(|e| e == "route_probe wg-acct-a 10.2.0.2 192.0.2.53"),
             "the route is asked for the probe's own destination: {:?}",
             host.events(),
+        );
+    }
+
+    /// A route probe that could not run says nothing about where the route
+    /// goes, and the skipped round trip says so instead of claiming the route
+    /// does not leave by the tunnel.
+    #[test]
+    fn an_egress_route_that_could_not_be_asked_is_not_called_a_wrong_route() {
+        let cfg = cfg_with_profile("");
+        let dest: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let host = FakeHost::new()
+            .with_route(Err(vpn::route::RouteProbeUnavailable::NoTool))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, Some(dest), &host);
+        let route = find(&r.checks, "egress_route").expect("the egress route line");
+        assert_eq!(route.verdict, Verdict::Unknown, "detail: {}", route.detail);
+        let egress = find(&r.checks, "egress").expect("the egress line");
+        assert_eq!(egress.verdict, Verdict::Skip, "detail: {}", egress.detail);
+        assert!(
+            egress.detail.contains("could not be asked")
+                && !egress.detail.contains("does not leave by"),
+            "detail: {}",
+            egress.detail,
         );
     }
 
