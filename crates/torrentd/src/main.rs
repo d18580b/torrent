@@ -2,8 +2,9 @@
 //!
 //! This binary wires together the
 //! torrentd-engine layer (TorrentEngine, alert loop, registry) with
-//! configuration, signals, an axum HTTP control plane, and the VPN /
-//! netlink integration. The CLI takes one argument: `--config <path>`.
+//! configuration, signals, a kynos HTTP control plane, and the VPN /
+//! netlink integration. Run with `--config <path>` it is the daemon; the
+//! subcommands in [`cli`] are operator tools that run to completion instead.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -387,12 +388,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     // The one subcommand that reads no configuration: it describes the API
-    // this binary serves, which no config file changes.
+    // this binary serves, which no config file changes. `--check-config
+    // openapi` was refused just above, like every subcommand beside it.
     if let Some(Command::Openapi { out }) = &cli.command {
-        if cli.check_config {
-            eprintln!("error: --check-config cannot be combined with `openapi`");
-            std::process::exit(2);
-        }
         return openapi_cmd(out.as_deref());
     }
 
@@ -449,8 +447,7 @@ fn main() -> anyhow::Result<()> {
             },
             Command::HashPassword => hash_password_cmd(),
             Command::NewToken { name, scopes } => new_token_cmd(&name, &scopes),
-            // Handled before the config is loaded, above.
-            Command::Openapi { out } => openapi_cmd(out.as_deref()),
+            Command::Openapi { .. } => unreachable!("`openapi` returns before the config loads"),
         };
     }
 
@@ -623,6 +620,9 @@ mod tests {
                 vec!["torrentd", "-c", "x", "--check-config", "vpn", "check"],
                 "vpn check",
             ),
+            // No config: `main` relies on this refusal, not a second check of
+            // its own, before `openapi` returns without loading one.
+            (vec!["torrentd", "--check-config", "openapi"], "openapi"),
         ] {
             let cli = Cli::parse_from(argv.clone());
             let msg = check_config_with_subcommand(&cli)
