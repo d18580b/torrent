@@ -54,7 +54,7 @@ pub struct AppState {
     /// Save path used when `POST /v1/torrents` omits `save_path`.
     pub default_save_path: PathBuf,
     /// Root of the `.torrent` store on disk. Used to confine a caller-supplied
-    /// `torrent_path` to directories the daemon already owns.
+    /// `server_path` to directories the daemon already owns.
     pub torrent_dir: PathBuf,
     /// Asks the reload pump to re-read the config file. `None` only in tests,
     /// which do not run one.
@@ -168,10 +168,7 @@ impl WorkGate {
 }
 
 impl AppState {
-    /// True when `profile_id` names a profile whose VPN tunnel is down and whose
-    /// torrents the monitor has fenced (paused, awaiting operator restart).
-    /// this to refuse mutations that would un-quarantine a fenced profile.
-    /// Directories a caller-supplied `torrent_path` may point into.
+    /// Directories a caller-supplied `server_path` may point into.
     ///
     /// The daemon's own torrent store, the pool's `.torrent` library, and the
     /// managed roots — the places a `.torrent` the daemon is meant to load

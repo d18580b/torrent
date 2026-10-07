@@ -267,15 +267,10 @@ pub struct Client {
     /// Whether the *original* request was over TLS: **`https` anywhere in a
     /// readable chain**, under either header name.
     ///
-    /// **What it feeds now.** This once decided the session cookie's
-    /// `Secure` attribute. The API has had no cookies since `/v1` made every
-    /// credential a bearer token, and today this feeds one thing: the
-    /// `via_https` field on the log line that records a session being
-    /// issued. The reasoning below — here and in the comments and tests of
-    /// this module that speak of `Secure` and the session cookie — is kept
-    /// because it is still the reasoning about which value to believe; read
-    /// "the cookie's `Secure`" as "what `via_https` reports". A wrong value
-    /// now misstates a log field rather than exposing a credential.
+    /// **What it feeds.** One thing: the `via_https` field on the log line
+    /// that records a session being issued. The API sets no cookies — every
+    /// credential is a bearer token — so a wrong value misstates a log field
+    /// and exposes no credential.
     ///
     /// This and `ip` are different questions and they read the chain
     /// differently. `ip` wants the hop the trusted proxy saw, which is the
@@ -292,18 +287,15 @@ pub struct Client {
     /// appends rather than overwrites. Nothing in a request distinguishes
     /// "TLS edge, then plain inner proxy, both honest" from "client's forgery,
     /// then honest appending proxy" — they are the same bytes — so this is a
-    /// choice between two harms rather than a fix. Taking the last element
-    /// withholds `Secure` from a genuine TLS edge and sends the session
-    /// cookie in clear to any plain-HTTP origin on the host: a real weakening
-    /// of a correct deployment. Taking any element lets a client's forged
-    /// `https` mark **its own** cookie `Secure`, which the browser will then
-    /// neither store nor return over `http://` — self-inflicted, and bounded
-    /// to the requester's own session. The rule follows the harm.
+    /// choice between two errors rather than a fix. Taking the last element
+    /// records every login through a genuine two-hop TLS deployment as
+    /// plain HTTP, a correct deployment misreported on every line. Taking any
+    /// element lets a client's forged `https` misreport **its own** login,
+    /// and nothing else. The rule follows the smaller error.
     ///
-    /// `false` when unknown, which is the safe direction for the *unknown*
-    /// case: it only ever withholds the `Secure` cookie attribute, never adds
-    /// it wrongly. It is not the safe direction for a known TLS deployment,
-    /// which is why "unknown" has to stay narrow.
+    /// `false` when unknown: the log then never claims TLS it cannot show.
+    /// That is wrong for a known TLS deployment, which is why "unknown" has
+    /// to stay narrow.
     pub secure: bool,
 }
 
@@ -406,8 +398,7 @@ fn last_element<'a>(headers: &'a HeaderMap, name: &str) -> HeaderRead<'a> {
 /// honest ones locked out at the sixth and stayed locked, and the security
 /// log recorded eight addresses the client chose. On `X-Forwarded-Proto` the
 /// same byte runs the other way: a lone `"` merged a TLS edge's own `https`
-/// into one unmatchable element and the session cookie shipped without
-/// `Secure`.
+/// into one unmatchable element, and the request read as plain HTTP.
 ///
 /// A proxy that adds a *second field line* rather than extending the existing
 /// one — HAProxy's `option forwardfor` — is unaffected either way, which is
@@ -458,7 +449,7 @@ fn quotes_terminated(s: &str) -> bool {
 /// `for=198.51.100.9;host="a,for=6.6.6.6"` read as two elements and resolved
 /// to `6.6.6.6`; `host="a;for=6.6.6.6";for=198.51.100.9` read as two
 /// parameters and did the same; `for=198.51.100.9;host="a,proto=https"`
-/// destroyed the proxy's own `for=` *and* set `Secure`. The loss case needs
+/// destroyed the proxy's own `for=` *and* read the request as TLS. The loss case needs
 /// no attacker at all — a proxy legitimately quoting a separator silently
 /// loses its own claim.
 struct SplitList<'a> {
@@ -683,15 +674,12 @@ pub fn resolve(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &TrustedP
 
     // The same precedence, and the same presence rule, for the scheme. An
     // `||` across the two headers lets a client-supplied `proto=https`
-    // override the trusted proxy's explicit `X-Forwarded-Proto: http`, which
-    // issues the session cookie `Secure` over a plain-HTTP request: the
-    // browser then neither stores nor returns it over http:// and the
-    // operator cannot log in at all. One function must not carry two opposite
-    // rules.
+    // override the trusted proxy's explicit `X-Forwarded-Proto: http`, and
+    // report a plain-HTTP request as TLS. One function must not carry two
+    // opposite rules.
     //
     // Where `X-Forwarded-Proto` is present and unreadable the answer is
-    // `false`, not `Forwarded`'s. `false` is the safe direction here — it
-    // only ever withholds `Secure`, and the operator can still log in.
+    // `false`, not `Forwarded`'s: the log does not claim TLS it cannot show.
     //
     // *Which element* answers is the one thing that differs from the address,
     // and it differs because the question does. "Last" on the address chain
@@ -700,10 +688,7 @@ pub fn resolve(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &TrustedP
     // that says `https` answers it: a TLS-terminating edge in front of a
     // plain-HTTP inner proxy, each appending, writes `https, http`, and
     // taking the last element there returns `false` for a deployment whose
-    // original request genuinely was TLS — so the session cookie ships
-    // without `Secure` and the browser sends it in clear to any plain-HTTP
-    // origin on that host. That is the harm this change exists to remove,
-    // arriving from the rule meant to prevent it.
+    // original request genuinely was TLS.
     //
     // So: `https` anywhere in a readable chain means the original request was
     // over TLS. The two rules compose: `last` still decides whether the
@@ -716,17 +701,16 @@ pub fn resolve(peer: Option<SocketAddr>, headers: &HeaderMap, trusted: &TrustedP
     // already answer the two questions from different ends of the chain
     // without difficulty — and the cost of keeping it was that the same
     // two-hop TLS deployment got opposite answers depending on which header
-    // its proxies speak. Demonstrated live: `X-Forwarded-Proto: https, http`
-    // set `Secure` while `Forwarded: proto=https, proto=http` did not, as did
-    // the ordinary RFC 7239 chain `proto=https, for=1.2.3.4` — a TLS edge
-    // naming the scheme, an inner proxy appending only `for=` because it
-    // terminated no TLS. On the standardised name that is F23's original
-    // harm, live.
+    // its proxies speak: `X-Forwarded-Proto: https, http` read as TLS while
+    // `Forwarded: proto=https, proto=http` did not, and neither did the
+    // ordinary RFC 7239 chain `proto=https, for=1.2.3.4` — a TLS edge naming
+    // the scheme, an inner proxy appending only `for=` because it terminated
+    // no TLS.
     //
     // What is given up to get there is recorded on `Client::secure`: a
     // client's own earlier `https` now wins wherever a trusted proxy appends
-    // rather than overwrites. The two harms are the same bytes and nothing in
-    // a request separates them, so the rule follows the smaller harm.
+    // rather than overwrites. The two cases are the same bytes and nothing in
+    // a request separates them, so the rule follows the smaller error.
     let xfp = last_element(headers, "x-forwarded-proto");
     let secure = if xfp.present {
         xfp.last.is_some()
@@ -971,14 +955,12 @@ mod tests {
         // is the ordinary RFC 7239 one — a TLS edge that names the scheme and
         // an inner proxy that appends only `for=` because it terminated no
         // TLS — where the last element has no `proto=` at all and the
-        // last-element rule withheld `Secure` from a deployment that really
-        // was TLS-fronted.
+        // last-element rule reported a deployment that really was
+        // TLS-fronted as plain HTTP.
         //
         // What is conceded is the other reading of the same bytes: a client
-        // that plants `proto=https` in front of an appending proxy now marks
-        // its **own** session cookie `Secure`, which the browser will neither
-        // store nor return over `http://`. That breaks the forger's own
-        // login and nobody else's.
+        // that plants `proto=https` in front of an appending proxy now has
+        // its **own** login logged as over TLS, and nobody else's.
         let c = resolve(
             &req(
                 "10.1.2.3",
@@ -1035,10 +1017,8 @@ mod tests {
     #[test]
     fn the_scheme_rule_is_the_same_under_either_header_name() {
         // The property: a deployment gets the same answer whichever name its
-        // proxies speak. Before this, the same two-hop TLS chain set `Secure`
-        // on `X-Forwarded-Proto` and withheld it on `Forwarded`, so the
-        // standardised header was the one that shipped the session cookie in
-        // clear.
+        // proxies speak. Before this, the same two-hop TLS chain read as TLS
+        // on `X-Forwarded-Proto` and as plain HTTP on `Forwarded`.
         let case = |headers: &[(&str, &str)]| {
             resolve(&req("10.1.2.3", headers), &trusted(&["10.0.0.0/8"])).secure
         };
@@ -1110,7 +1090,7 @@ mod tests {
         let c = case(r#"for=198.51.100.9;host="a,proto=https""#);
         assert!(
             !c.secure,
-            "a quoted proto= is part of host=, and must not set Secure",
+            "a quoted proto= is part of host=, and must not set secure (via_https)",
         );
         assert_eq!(
             c.ip, proxy,
@@ -1204,9 +1184,8 @@ mod tests {
         );
 
         // And on the scheme, where the same byte runs the other way: merging
-        // a TLS edge's own `https` into one unmatchable element withholds
-        // `Secure` from a deployment that really is TLS-fronted, and the
-        // session cookie then travels in clear.
+        // a TLS edge's own `https` into one unmatchable element reports a
+        // deployment that really is TLS-fronted as plain HTTP.
         let secure = |v: &str| {
             resolve(
                 &req("10.1.2.3", &[("x-forwarded-proto", v)]),
@@ -1565,10 +1544,8 @@ mod tests {
         // of a plain-HTTP inner proxy — each appending — reads `https, http`,
         // and the original request there was over TLS.
         //
-        // Taking the last element instead returns `false` and issues the
-        // session cookie without `Secure` on a deployment that really is
-        // TLS-fronted, so the browser sends it in clear to any plain-HTTP
-        // origin on that host. That is the harm this change exists to remove.
+        // Taking the last element instead returns `false` on a deployment
+        // that really is TLS-fronted.
         for value in ["https, http", "https,http", "https, http, http"] {
             let c = resolve(
                 &req("10.1.2.3", &[("x-forwarded-proto", value)]),
@@ -1615,9 +1592,7 @@ mod tests {
         // it decides; its final element is the trusted proxy's, and where
         // that element carries nothing the header is unreadable and `secure`
         // is `false`. Reading leftward instead lets a client's own earlier
-        // `https` issue a `Secure` cookie over a plain-HTTP request, which
-        // the browser will neither store nor return — so the caller cannot
-        // log in.
+        // `https` report a plain-HTTP request as TLS.
         for value in ["https,", "https, ", "https, ,", "https,,"] {
             let c = resolve(
                 &req("10.1.2.3", &[("x-forwarded-proto", value)]),
@@ -1626,8 +1601,8 @@ mod tests {
             assert!(
                 !c.secure,
                 "X-Forwarded-Proto: {value:?} ends in an element that carries \
-                 nothing, so the header is unreadable and `Secure` is \
-                 withheld",
+                 nothing, so the header is unreadable and `secure` is \
+                 false",
             );
         }
 
@@ -1658,10 +1633,9 @@ mod tests {
     fn a_present_but_empty_x_forwarded_proto_does_not_let_forwarded_decide() {
         // The scheme arm, at the same spelling. `X-Forwarded-Proto` decides
         // wherever it is *present*; present and unreadable means `false`,
-        // which only ever withholds `Secure`. Letting the client's
-        // `Forwarded: proto=https` decide instead issues a `Secure` cookie
-        // over a plain-HTTP request, which the browser will neither store nor
-        // return — so the operator cannot log in at all.
+        // which never claims TLS it cannot show. Letting the client's
+        // `Forwarded: proto=https` decide instead reports a plain-HTTP
+        // request as TLS.
         let attacker = ("forwarded", "proto=https");
 
         for empty in ["", "  ", ",", " ,  , "] {
@@ -1719,10 +1693,7 @@ mod tests {
         // The scheme follows the same precedence as the address. The trusted
         // proxy terminated plain HTTP and said so; a client whose `Forwarded`
         // the proxy passed through verbatim — nginx's default for a header it
-        // does not know — must not turn that into https. It would issue the
-        // session cookie `Secure` over a plain-HTTP request, and the browser
-        // then neither stores nor returns it over http://, so the operator
-        // cannot log in at all.
+        // does not know — must not turn that into https.
         let c = resolve(
             &req(
                 "10.1.2.3",
@@ -1742,7 +1713,7 @@ mod tests {
         // The other direction of the same rule, so precedence is pinned both
         // ways: with no `X-Forwarded-Proto` there is nothing to take
         // precedence over, and a proxy emitting only RFC 7239 still sets
-        // `Secure`. One element, so last-wins has nothing to discard either.
+        // `secure`. One element, so last-wins has nothing to discard either.
         let c = resolve(
             &req("10.1.2.3", &[("forwarded", "proto=https")]),
             &trusted(&["10.0.0.0/8"]),
@@ -1867,6 +1838,9 @@ mod tests {
             &req("10.1.2.3", &[("x-forwarded-proto", "http")]),
             &trusted(&["10.0.0.0/8"]),
         );
-        assert!(!c.secure, "only https sets Secure; unknown must not");
+        assert!(
+            !c.secure,
+            "only https sets secure (via_https); unknown must not"
+        );
     }
 }

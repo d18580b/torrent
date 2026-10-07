@@ -717,8 +717,7 @@ pub async fn add_torrent(
     let engine = unfenced_engine(&s, &profile_id)?;
 
     // An unconstrained save_path points libtorrent at any directory the daemon
-    // can write, including inside a managed root — where the payload would
-    // have no claim rows until the next scan and would read as an orphan.
+    // can write, so it must resolve inside default_save_path or a managed root.
     let save_path = match save_path {
         None => s.default_save_path.to_string_lossy().into_owned(),
         Some(p) => {

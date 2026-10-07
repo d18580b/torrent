@@ -439,8 +439,8 @@ impl PoolStore {
         // one too high: the rollback never runs, every later `in_transaction`
         // takes the savepoint branch believing it is nested, and the open
         // write transaction keeps SQLite's write lock for the life of the
-        // process. Axum installs no panic layer, so an HTTP handler is enough
-        // to get there. Roll back, restore the depth, then re-raise.
+        // process. No torrentd HTTP operation opts into kynos's
+        // `catch_panics` boundary, so an HTTP handler is enough to get there. Roll back, restore the depth, then re-raise.
         let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         let out = match out {
             Ok(v) => v,

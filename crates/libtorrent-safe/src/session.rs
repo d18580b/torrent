@@ -1,8 +1,9 @@
 //! `Session` — RAII handle around a libtorrent session.
 //!
-//! The struct is `!Send + !Sync` by construction (raw pointer field). The
-//! engine layer wraps a `Session` in an `Arc<Mutex<…>>` or owns it from a
-//! single thread; concurrent access is the caller's responsibility.
+//! The struct is `Send` but not `Sync`: its raw pointer field would make it
+//! neither, and `Send` is asserted below on the shim's own locking. The
+//! engine layer owns it behind a `Mutex` (`torrentd-engine`'s `RealEngine`),
+//! so calls from several threads are ordered.
 //!
 //! Methods return `Result<…, Error>`, never panic on shim failures, and
 //! never expose raw pointers.

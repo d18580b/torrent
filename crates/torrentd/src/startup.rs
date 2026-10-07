@@ -1790,7 +1790,7 @@ where
     // `spawn_blocking`, or the runtime shutting down under it — fails **that
     // profile**, and the boot carries on with the rest. Every one of these
     // sites was a `?`, which aborted the whole boot: one profile's panicking
-    // `wg-quick` wrapper took every other profile's tunnel down with it, on a
+    // bring-up task took every other profile's tunnel down with it, on a
     // daemon whose entire purpose is to keep the remaining profiles seeding.
     // Failing the profile is what the surrounding code does with every other
     // per-profile failure, and a failed profile is still visible:
@@ -2118,10 +2118,12 @@ impl DaemonHandle {
         // teardown below waits for it before stopping the alert loop.
         let work: Arc<crate::app_state::WorkGate> = Arc::default();
 
-        // Re-drive any plan a crash or a kill left mid-apply, before the API
-        // can accept new ones. A half-applied reorganisation is exactly the
-        // state an operator cannot reason about. Held in the work gate like an
-        // API apply, and stopped between steps the same way.
+        // Re-drive any plan a crash or a kill left mid-apply. A half-applied
+        // reorganisation is exactly the state an operator cannot reason about.
+        // Started before the server, but not awaited: it first waits for every
+        // torrent the boot loaded to reach the state map, so it runs alongside
+        // the API rather than ahead of it. Held in the work gate like an API
+        // apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
             // What the boot handed to sessions: the re-drive waits for every
             // one to reach the state map before acting on what is loaded.

@@ -35,11 +35,12 @@ which torrents point at data that moved or vanished.
       that serves it, so the two cannot drift; JSON logs; Prometheus metrics
 - [x] **`torrentctl`, a terminal operator client** on a client generated from
       the API document: torrents, profiles, the pool and its plans, updated live
+- [x] **A Grafana dashboard and Prometheus alert rules** shipped in `deploy/`,
+      each alert with a `promtool` fixture
 - [ ] **Downloading torrents.** Deliberately absent today; every piece of the
       machinery exists except the policy, and enabling it is a decision about
       what this daemon is, not a missing feature
 - [ ] **A web client.** Deferred ([#40](https://github.com/d18580b/torrent/issues/40))
-- [ ] **Grafana dashboard and alert rules** shipped in `deploy/`
 - [ ] **Sequential streaming, RSS, torrent creation, auto-discovery,
       multi-instance coordination.** Not planned. You tell it what to load.
 
@@ -153,10 +154,12 @@ heading in [`docs/api/problems.md`](docs/api/problems.md).
 
 **Input is confined, not just size-capped.** A `.torrent` named by
 `server_path` is read from the daemon's own filesystem, so it is restricted to
-`torrent_dir`, the pool library and the managed roots, with a 64 MiB cap and
-errors that do not disclose whether a path exists. `save_path` must be inside
-`default_save_path` or a managed root, so an add cannot drop payload into a
-managed tree where the matcher would read it as an orphan.
+`torrent_dir`, the pool library and the managed roots, with a 64 MiB cap, no
+symlink followed at the last component, and errors that do not disclose
+whether a path exists. `save_path` must be inside `default_save_path` or a
+managed root, so an add cannot point libtorrent at any other directory the
+daemon can write. Either path is refused outright if it carries a `..`
+component or a leading `.`, and containment is judged with symlinks resolved.
 
 **Configuration is not settable at runtime, deliberately.** Several keys are
 reloadable — `log_level`, `upload_rate_limit`, `connections_limit`,
@@ -302,7 +305,7 @@ libtorrent session, no torrents and no tracker contact.
 ```bash
 torrentd --config … vpn check                 # only if every profile is vpn
 torrentd --config … vpn check --profile acct_a --json    # one profile, machine-readable
-torrentd --config … vpn check --egress 1.1.1.1:53      # prove traffic leaves the tunnel
+torrentd --config … vpn check --egress 1.1.1.1:53      # route it via the tunnel, then a reply through it
 ```
 
 Verdicts are four-valued — `pass`, `fail`, `skip`, `unknown` — so a green
@@ -442,10 +445,15 @@ prevent. `kill_switch_active` is none of these: it is a single unlabelled
 daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 `vpn` profile is configured.
 
-> A shipped Grafana dashboard and alert rules are planned rather than present.
-> Until then, note that series register on first emission, so anything not yet
-> emitted reads as "no data" rather than zero. The per-profile families do not
-> wait for one: every family a per-profile monitor owns is pre-registered at
+> Every series, and when it first exists, is listed in
+> [`deploy/metrics.md`](deploy/metrics.md). The alert rules in
+> [`deploy/prometheus/`](deploy/prometheus) and the Grafana dashboard in
+> [`deploy/dashboard.json`](deploy/dashboard.json) read only series that table
+> holds, and `cargo test -p torrentd` fails if either reads one it does not.
+> Most daemon counters are written at zero from boot, so `increase()` sees
+> their first event; a series the table marks "on first event" reads as "no
+> data" rather than zero until something happens. The per-profile families do
+> not wait for one: every family a per-profile monitor owns is pre-registered at
 > its baseline when that monitor starts, so `rate()` and alerting queries over
 > it resolve on a healthy daemon rather than on the first event ever to occur.
 > That is tunnel health and fencing on every profile, and port-forward state —
@@ -486,7 +494,8 @@ mise run test-daemon     # Layer 3: spawns the binary, drives it over HTTP
 mise run test-torrentctl # Layer 3: torrentctl's generated client against the daemon
 mise run openapi         # regenerate docs/api/openapi.json after an API change
 mise run openapi-check   # fail if the committed document is stale
-mise run test-all        # all of the above
+mise run test-alerts     # promtool over deploy/prometheus (needs podman or docker)
+mise run test-all        # test and every test-* task above, in turn; not check, deny or openapi-check
 mise run bench -- memory-scaling --count 50000   # Layer 4: manual, minutes
 ```
 
