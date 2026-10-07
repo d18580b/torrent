@@ -270,12 +270,60 @@ fn unanswered_clock(
     }
 }
 
+/// What one poll's probes of a tunnel returned: the interface's address,
+/// where a packet from it would be routed (asked only when there is an
+/// address), and — WireGuard only — the age of its latest handshake.
+pub(crate) struct TunnelProbes {
+    pub ip: Option<IpAddr>,
+    pub route: Option<Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>>,
+    pub handshake: Option<Result<Option<Duration>, vpn::HandshakeProbeUnavailable>>,
+}
+
+/// The probes [`run`] makes of `iface` each poll, on the host.
+fn probe_tunnel(iface: &str, is_wg: bool) -> TunnelProbes {
+    let ip = vpn::first_ipv4(iface).ok().map(IpAddr::V4);
+    // Asked from the address the interface holds now: if that is not the
+    // bound one the address check fences first, and with no address there is
+    // nothing to ask about.
+    let route = ip.map(|src| vpn::route::probe(iface, src, IpAddr::V4(vpn::route::PROBE_DEST)));
+    let handshake = is_wg.then(|| vpn::wireguard_handshake_age(iface));
+    TunnelProbes {
+        ip,
+        route,
+        handshake,
+    }
+}
+
+/// How [`run_with`] probes a tunnel: [`probe_tunnel`] outside tests.
+type Prober = Arc<dyn Fn(&str, bool) -> TunnelProbes + Send + Sync>;
+
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
     metrics: Arc<PromSink>,
     handshake_max_age: Duration,
+    shutdown: broadcast::Receiver<ShutdownReason>,
+) {
+    run_with(
+        profiles,
+        state,
+        metrics,
+        handshake_max_age,
+        shutdown,
+        Arc::new(probe_tunnel),
+    )
+    .await;
+}
+
+/// [`run`] with the host probes behind `probe`, so a test can drive the poll
+/// loop — the gauges it sets, the clock it keeps, the fence — without a tunnel.
+async fn run_with(
+    profiles: Arc<ProfileRegistry>,
+    state: Arc<StateMap>,
+    metrics: Arc<PromSink>,
+    handshake_max_age: Duration,
     mut shutdown: broadcast::Receiver<ShutdownReason>,
+    probe: Prober,
 ) {
     seed_baselines(&profiles, &metrics);
     // Per profile: when a poll first saw its WireGuard tunnel never
@@ -310,23 +358,14 @@ pub async fn run(
                 continue;
             };
             let is_wg = e.config.vpn_type() == Some(VpnType::Wireguard);
-            let probe = tokio::task::spawn_blocking({
+            let probed = tokio::task::spawn_blocking({
                 let iface = iface.clone();
-                move || {
-                    let ip = vpn::first_ipv4(&iface).ok().map(IpAddr::V4);
-                    // Asked from the address the interface holds now: if that
-                    // is not the bound one the address check fences first, and
-                    // with no address there is nothing to ask about.
-                    let route = ip.map(|src| {
-                        vpn::route::probe(&iface, src, IpAddr::V4(vpn::route::PROBE_DEST))
-                    });
-                    let hs = is_wg.then(|| vpn::wireguard_handshake_age(&iface));
-                    (ip, route, hs)
-                }
+                let probe = probe.clone();
+                move || probe(&iface, is_wg)
             })
             .await;
-            let (current, route_probe, handshake_probe) = match probe {
-                Ok(v) => v,
+            let (current, route_probe, handshake_probe) = match probed {
+                Ok(p) => (p.ip, p.route, p.handshake),
                 Err(e) => {
                     error!(
                         target: "torrentd::vpn_monitor",
@@ -403,7 +442,9 @@ pub async fn run(
                 &profile_id,
                 handshake,
                 carrying,
-                Instant::now(),
+                // The runtime's clock, which is the wall clock outside tests
+                // and the one the poll interval is measured on.
+                tokio::time::Instant::now().into_std(),
             );
             let observation = Observation {
                 current,
@@ -720,6 +761,126 @@ mod tests {
         ] {
             assert!(carries_traffic(phase), "{phase:?}");
         }
+    }
+
+    /// A probe that answers the same every poll: the bound address, the
+    /// given route, and the given handshake.
+    fn scripted(
+        route: Option<Result<RouteProbe, vpn::route::RouteProbeUnavailable>>,
+        handshake: Result<Option<Duration>, vpn::HandshakeProbeUnavailable>,
+    ) -> Prober {
+        Arc::new(move |_iface: &str, is_wg: bool| TunnelProbes {
+            ip: ip(2),
+            route: route.clone(),
+            handshake: is_wg.then_some(handshake),
+        })
+    }
+
+    /// Run the poll loop over one WireGuard profile, `acct_a` on 10.2.0.2,
+    /// for `polls` polls, then shut it down. Returns the profile's status and
+    /// the exported metrics.
+    async fn poll_acct_a(
+        state: StateMap,
+        max_age: Duration,
+        probe: Prober,
+        polls: u32,
+    ) -> (ProfileStatus, String) {
+        use crate::profile_registry::test_entry;
+
+        let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "acct_a",
+            ProfileStatus::Active,
+        )]));
+        let metrics = Arc::new(PromSink::new());
+        let (tx, rx) = broadcast::channel(1);
+        let task = tokio::spawn(run_with(
+            profiles.clone(),
+            Arc::new(state),
+            metrics.clone(),
+            max_age,
+            rx,
+            probe,
+        ));
+        tokio::time::sleep(POLL_INTERVAL * polls + Duration::from_secs(1)).await;
+        tx.send(ShutdownReason::Test).unwrap();
+        task.await.unwrap();
+        let status = profiles.iter().next().unwrap().health().status;
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        (status, exported)
+    }
+
+    fn fenced_once_for(exported: &str, reason: &str) -> bool {
+        exported.lines().any(|l| {
+            l.starts_with("torrentd_profile_vpn_fenced_total")
+                && l.contains(&format!("reason=\"{reason}\""))
+                && l.ends_with(" 1")
+        })
+    }
+
+    /// The route probe as `run` calls it: its answer reaches the verdict,
+    /// and `profile_vpn_route_probe_ok` says whether it could be asked.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_loop_fences_on_the_route_probe_and_reports_whether_it_ran() {
+        let elsewhere = Some(Ok(RouteProbe::Elsewhere(
+            "leaves by eth0: 1.1.1.1 from 10.2.0.2 via 192.168.1.1 dev eth0".into(),
+        )));
+        let fresh = Ok(Some(Duration::from_secs(5)));
+        let (status, exported) =
+            poll_acct_a(StateMap::new(), MAX, scripted(elsewhere, fresh), 1).await;
+        assert_eq!(status, ProfileStatus::VpnDown, "{exported}");
+        assert!(
+            exported.contains("torrentd_profile_vpn_route_probe_ok{profile_id=\"acct_a\"} 1"),
+            "{exported}"
+        );
+        assert!(fenced_once_for(&exported, "route_mismatch"), "{exported}");
+
+        let unavailable = Some(Err(vpn::route::RouteProbeUnavailable::NoTool));
+        let (status, exported) =
+            poll_acct_a(StateMap::new(), MAX, scripted(unavailable, fresh), 1).await;
+        assert_eq!(
+            status,
+            ProfileStatus::Active,
+            "a probe that could not run is reported, not fenced on: {exported}"
+        );
+        assert!(
+            exported.contains("torrentd_profile_vpn_route_probe_ok{profile_id=\"acct_a\"} 0"),
+            "{exported}"
+        );
+        assert!(
+            exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+            "{exported}"
+        );
+    }
+
+    /// `Ok(None)` from the handshake probe is `Never`, and the poll loop
+    /// runs the no-handshake clock on it only while the profile has a torrent
+    /// that can send.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_loop_fences_a_never_handshaked_tunnel_only_while_it_carries_traffic() {
+        let max_age = Duration::from_secs(60);
+        let never = || scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None));
+        let seeding = || {
+            let s = StateMap::new();
+            loaded(&s, 1, "acct_a", TorrentPhase::Seeding);
+            s
+        };
+
+        // The clock starts at the first poll; the threshold is passed at the
+        // fourth (90s > 60s), not the third (60s).
+        let (status, exported) = poll_acct_a(seeding(), max_age, never(), 3).await;
+        assert_eq!(status, ProfileStatus::Active, "{exported}");
+        let (status, exported) = poll_acct_a(seeding(), max_age, never(), 4).await;
+        assert_eq!(status, ProfileStatus::VpnDown, "{exported}");
+        assert!(fenced_once_for(&exported, "no_handshake"), "{exported}");
+
+        let paused = StateMap::new();
+        loaded(&paused, 1, "acct_a", TorrentPhase::Paused);
+        let (status, exported) = poll_acct_a(paused, max_age, never(), 8).await;
+        assert_eq!(
+            status,
+            ProfileStatus::Active,
+            "a fully paused profile sends nothing to be answered: {exported}"
+        );
     }
 
     #[test]

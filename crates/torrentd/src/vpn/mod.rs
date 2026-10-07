@@ -27,6 +27,7 @@ use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
 pub use wireguard::latest_handshake_age as wireguard_handshake_age;
 pub use wireguard::sweep_raised_records;
+pub use wireguard::ProbeUnavailable as HandshakeProbeUnavailable;
 pub use wireguard::WireguardManager;
 
 /// Build the matching real implementation for a `VpnType`.
