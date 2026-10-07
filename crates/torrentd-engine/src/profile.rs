@@ -34,10 +34,14 @@
 //!    tunnel device, so libtorrent binds outgoing peer connections to it at
 //!    the socket level (`SO_BINDTODEVICE`). If the tunnel drops, subsequent
 //!    attempts fail at `bind()` rather than falling out over the bare
-//!    interface, and a lost routing rule cannot route them there either.
-//!    Everything else — the listen sockets and what answers on them — is
-//!    bound to the tunnel address, and routed by the tunnel's source rule,
-//!    which the health monitor checks every poll.
+//!    interface, and where the device binding takes, a lost routing rule
+//!    cannot route them there either. Where the kernel refuses it (no
+//!    `CAP_NET_RAW` before Linux 5.7) libtorrent binds the device's address
+//!    alone, and the route is the routing table's. Everything else — the
+//!    listen sockets, which also carry uTP and UDP tracker traffic, and what
+//!    answers on them — is bound to the tunnel address (and device-bound only
+//!    as far as libtorrent's own best effort goes), and routed by the
+//!    tunnel's source rule, which the health monitor checks every poll.
 //! 3. **Global info-hash uniqueness.** An add is refused with 409 if the
 //!    info-hash is loaded in *any* profile, not just the target. The same torrent
 //!    seeding under two accounts is visible to the tracker as one info-hash

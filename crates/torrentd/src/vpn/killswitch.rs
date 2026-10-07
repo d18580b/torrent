@@ -132,7 +132,8 @@ pub fn render_ruleset_with_transport(
             io::ErrorKind::InvalidInput,
             format!(
                 "vpn_interface {bad:?} cannot be written into the kill-switch ruleset: an \
-                 interface name must be 1-15 characters of [A-Za-z0-9_=+.-]",
+                 interface name must be 1-15 characters of [A-Za-z0-9_=+.-], and not \".\", \
+                 \"..\", \"all\" or \"interfaces\"",
             ),
         ));
     }

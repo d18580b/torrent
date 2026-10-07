@@ -1995,8 +1995,9 @@ where
             // The device, not the address. libtorrent binds an outgoing TCP
             // peer connection to a device named here with `SO_BINDTODEVICE`
             // (falling back to one of the device's addresses where that is
-            // refused), so the kernel sends it out of the tunnel whatever the
-            // routing table says. Bound to the address alone, a socket's
+            // refused), so where the binding takes the kernel sends it out of
+            // the tunnel whatever the routing table says. Bound to the address
+            // alone, a socket's
             // route still came from the rules — and with the source-address
             // rule gone (a firewall reload, `ip rule flush`) the lookup fell
             // through to the main table and the packets left by the physical
@@ -4703,8 +4704,8 @@ mod profile_construction_tests {
             settings.outgoing_interfaces.as_deref(),
             Some("wg-a"),
             "outgoing connections are bound to the tunnel device (SO_BINDTODEVICE), \
-             not only to its address, so a lost routing rule cannot send them out \
-             of the physical interface",
+             not only to its address, so where the kernel allows the device binding \
+             a lost routing rule cannot send them out of the physical interface",
         );
         assert_eq!(settings.user_agent.as_deref(), Some("ua-acct_a"));
         assert_eq!(state, &None, "a vpn session restores no session state");

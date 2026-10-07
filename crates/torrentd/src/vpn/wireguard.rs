@@ -503,7 +503,7 @@ impl WireguardManager {
                     target: "torrentd::vpn::wireguard",
                     vpn_iface = %profile.interface,
                     error.cause = %cause,
-                    "could not install the tunnel's source-address routing; took it down",
+                    "the tunnel's traffic could not be routed through it; took it down",
                 );
                 Err(VpnError::RoutingFailed {
                     iface: profile.interface.clone(),

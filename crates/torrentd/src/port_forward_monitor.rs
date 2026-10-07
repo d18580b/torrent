@@ -660,7 +660,7 @@ pub(crate) fn record_outcome(
                 info!(
                     target: "torrentd::port_forward_monitor",
                     profile_id = %profile_id, gateway_epoch = epoch,
-                    "NAT-PMP gateway rebooted; mapping re-established",
+                    "NAT-PMP gateway rebooted (its epoch went backwards)",
                 );
             }
             if previous == new {

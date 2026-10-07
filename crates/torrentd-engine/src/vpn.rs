@@ -56,7 +56,7 @@ pub enum VpnError {
     ///
     /// Distinct from `Spawn` so a report can say that a tunnel did appear
     /// and is gone, rather than guess at what a failed start left behind.
-    #[error("vpn interface {iface} came up but its routing could not be installed ({cause}); it was taken down again")]
+    #[error("vpn interface {iface} came up but its traffic could not be routed through it ({cause}); it was taken down again")]
     RoutingFailed { iface: String, cause: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
