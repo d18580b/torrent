@@ -314,7 +314,7 @@ Metrics, each labelled `profile_id`:
 | `torrentd_profile_port_forward_up` | `1` while the last renewal succeeded and the session is bound to its result |
 | `torrentd_profile_port_forward_udp_mapped` | `0` while the gateway mapped TCP only; uTP peers cannot reach the session then |
 | `torrentd_profile_port_forward_renewals_total` | successful renewals |
-| `torrentd_profile_port_forward_failures_total` | every failed attempt, labelled `stage`: `renew` when the gateway did not answer or refused the lease, `rebind` when it answered with a port the session could not be rebound to |
+| `torrentd_profile_port_forward_failures_total` | every failed attempt, labelled `stage`: `renew` when the gateway did not answer or refused the lease, `rebind` when it answered with a port the session could not be rebound to, `port_taken` when it answered with a port another live profile holds |
 | `torrentd_profile_port_forward_rebind_failures_total` | the same count as `stage="rebind"` above |
 | `torrentd_profile_forwarded_port_changes_total` | port changes the session followed |
 | `torrentd_profile_port_change_reannounce_seconds` | histogram: from the gateway naming a new port to the last reannounce being handed to the session |
@@ -1309,10 +1309,21 @@ On a scratch pool, not your real one.
    `torrentd_profile_vpn_fenced_total{reason="route_mismatch"}` has risen (the
    log says `VPN tunnel unhealthy` with `reason=route_mismatch`). Set
    `METRICS_URL` and `METRICS_TOKEN` if `/metrics` is not on
-   `127.0.0.1:8080` or needs the scrape token. The profile's outgoing connections are bound to the tunnel
-   device as well as its address (`outgoing_interfaces`), so nothing leaves
-   by the physical interface in the meantime. Restart the daemon afterwards;
-   the rules come back with the tunnel.
+   `127.0.0.1:8080` or needs the scrape token. Restart the daemon
+   afterwards; the rules come back with the tunnel.
+
+   What can leave by the physical interface before the fence trips depends
+   on the socket. Outgoing TCP peer connections are bound to the tunnel
+   device (`outgoing_interfaces`, `SO_BINDTODEVICE`), so they keep leaving by
+   the tunnel. Outgoing uTP and UDP tracker announces are sent from the
+   listen sockets, which are bound to the tunnel address; libtorrent also
+   binds those to the first interface whose network holds that address,
+   which is the tunnel unless another interface's network covers the tunnel
+   address. Where that holds they stay in the tunnel too; where it does not,
+   or where `SO_BINDTODEVICE` is refused (no `CAP_NET_RAW` before Linux 5.7),
+   they follow the routing table and can leave by the physical interface,
+   with the tunnel's source address, until the next poll fences the profile.
+   With `network_kill_switch = true` the kill switch drops them.
 
    A WireGuard tunnel that comes up and **never handshakes** — a wrong key,
    a dead endpoint — is fenced with `reason=no_handshake` once it has gone

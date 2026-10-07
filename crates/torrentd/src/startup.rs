@@ -1973,18 +1973,40 @@ where
                 }
             };
 
+            // The listen sockets are named by address, not by device. They
+            // carry more than incoming connections: libtorrent sends outgoing
+            // uTP and every UDP tracker announce from them
+            // (`settings_pack::listen_interfaces`). libtorrent does bind them
+            // to a device as well — `expand_devices` tags an address endpoint
+            // with the first interface whose network holds the address, and
+            // `setup_listener` applies `SO_BINDTODEVICE` to it — but that is
+            // the tunnel only while no interface listed before it has a
+            // network covering the tunnel address, and a refused
+            // `SO_BINDTODEVICE` (no `CAP_NET_RAW` before Linux 5.7) is
+            // logged and ignored, leaving the address bind alone.
+            //
+            // Naming the device here instead (`wg-a:6891`) is not done: a
+            // device endpoint listens on every address the device holds, of
+            // both families and link-local included, there is no syntax for
+            // an address and a device together, and a listen socket that then
+            // fails to bind is fatal to a daemon with one live session
+            // (`handlers::listen`).
             settings.listen_interfaces = Some(torrentd_engine::bind_endpoint(ip, effective_port));
             // The device, not the address. libtorrent binds an outgoing TCP
             // peer connection to a device named here with `SO_BINDTODEVICE`
             // (falling back to one of the device's addresses where that is
             // refused), so the kernel sends it out of the tunnel whatever the
-            // routing table says. Bound to the address
-            // alone, a socket's route still came from the rules — and with
-            // the source-address rule gone (a firewall reload, `ip rule
-            // flush`) the lookup fell through to the main table and the
-            // packets left by the physical interface with the tunnel's source
-            // address. The health monitor fences that within a poll
-            // (`vpn_monitor`'s route check); this makes the window empty.
+            // routing table says. Bound to the address alone, a socket's
+            // route still came from the rules — and with the source-address
+            // rule gone (a firewall reload, `ip rule flush`) the lookup fell
+            // through to the main table and the packets left by the physical
+            // interface with the tunnel's source address.
+            //
+            // This covers outgoing TCP only. Outgoing uTP and UDP tracker
+            // traffic leave by the listen sockets above, whose device binding
+            // is libtorrent's best effort, so for them the window between a
+            // lost rule and the fence is not closed here: the health monitor
+            // fences the profile within a poll (`vpn_monitor`'s route check).
             settings.outgoing_interfaces = Some(iface.to_string());
             // Not configurable, by construction: there is no key on a vpn
             // profile that reaches these.
