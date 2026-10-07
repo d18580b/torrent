@@ -10,7 +10,6 @@
 
 use std::ffi::CString;
 use std::marker::PhantomData;
-use std::path::Path;
 
 use libtorrent_sys as ffi;
 use tracing::debug;
@@ -111,7 +110,7 @@ impl Session {
     /// libtorrent's `high_performance_seed()` preset.
     pub fn new(settings: &Settings) -> Result<Self> {
         let json = settings.to_shim_json()?;
-        let json_c = CString::new(json).map_err(|_| Error::InteriorNul("settings_json".into()))?;
+        let json_c = c_string(json, "settings_json")?;
         let mut err = ErrBuf::new();
         let ptr = unsafe { ffi::lt_session_create(json_c.as_ptr(), err.ptr(), err.len() as i32) };
         if ptr.is_null() {
@@ -129,7 +128,7 @@ impl Session {
     /// at startup for single-session (DHT-enabled) mode.
     pub fn with_state(settings: &Settings, state: &[u8]) -> Result<Self> {
         let json = settings.to_shim_json()?;
-        let json_c = CString::new(json).map_err(|_| Error::InteriorNul("settings_json".into()))?;
+        let json_c = c_string(json, "settings_json")?;
         let mut err = ErrBuf::new();
         let ptr = unsafe {
             ffi::lt_session_create_with_state(
@@ -154,7 +153,7 @@ impl Session {
     /// startup overrides.
     pub fn apply_settings(&self, settings: &Settings) -> Result<()> {
         let json = settings.to_shim_json()?;
-        let json_c = CString::new(json).map_err(|_| Error::InteriorNul("settings_json".into()))?;
+        let json_c = c_string(json, "settings_json")?;
         let mut err = ErrBuf::new();
         let rc = unsafe {
             ffi::lt_session_apply_settings(self.ptr, json_c.as_ptr(), err.ptr(), err.len() as i32)
@@ -186,27 +185,6 @@ impl Session {
         Ok(v)
     }
 
-    pub fn load_state(&self, buf: &[u8]) -> Result<()> {
-        if buf.is_empty() {
-            return Err(Error::InvalidInput("empty session-state buffer"));
-        }
-        let mut err = ErrBuf::new();
-        let rc = unsafe {
-            ffi::lt_session_load_state(
-                self.ptr,
-                buf.as_ptr(),
-                buf.len(),
-                err.ptr(),
-                err.len() as i32,
-            )
-        };
-        if rc == ffi::LT_OK as i32 {
-            Ok(())
-        } else {
-            Err(Error::Shim(err.into_string()))
-        }
-    }
-
     /// Add a torrent. Returns the stable `TorrentHandle` (or an error).
     pub fn add_torrent(&self, params: AddParams) -> Result<TorrentHandle> {
         let mut err = ErrBuf::new();
@@ -221,8 +199,7 @@ impl Session {
                 if bytes.is_empty() {
                     return Err(Error::InvalidInput("empty .torrent buffer"));
                 }
-                let save_c =
-                    CString::new(save_path).map_err(|_| Error::InteriorNul("save_path".into()))?;
+                let save_c = c_string(save_path, "save_path")?;
                 unsafe {
                     ffi::lt_add_torrent_file(
                         self.ptr,
@@ -241,10 +218,8 @@ impl Session {
                 save_path,
                 flags,
             } => {
-                let uri_c =
-                    CString::new(uri).map_err(|_| Error::InteriorNul("magnet uri".into()))?;
-                let save_c =
-                    CString::new(save_path).map_err(|_| Error::InteriorNul("save_path".into()))?;
+                let uri_c = c_string(uri, "magnet uri")?;
+                let save_c = c_string(save_path, "save_path")?;
                 unsafe {
                     ffi::lt_add_torrent_magnet(
                         self.ptr,
@@ -267,9 +242,7 @@ impl Session {
                 if bytes.is_empty() {
                     return Err(Error::InvalidInput("empty resume buffer"));
                 }
-                let save_c = save_path
-                    .map(|p| CString::new(p).map_err(|_| Error::InteriorNul("save_path".into())))
-                    .transpose()?;
+                let save_c = save_path.map(|p| c_string(p, "save_path")).transpose()?;
                 let (t_ptr, t_len) = match torrent.as_ref() {
                     Some(t) if !t.is_empty() => (t.as_ptr(), t.len()),
                     _ => (std::ptr::null(), 0),
@@ -379,7 +352,7 @@ impl Session {
     /// its storage state stays consistent. Asynchronous — completion arrives
     /// as `Alert::StorageMoved` or `Alert::StorageMovedFailed`.
     pub fn move_storage(&self, h: TorrentHandle, new_path: &str, flags: MoveFlags) -> Result<()> {
-        let path = CString::new(new_path).map_err(|_| Error::InteriorNul("new_path".into()))?;
+        let path = c_string(new_path, "new_path")?;
         let rc = unsafe {
             ffi::lt_torrent_move_storage(
                 self.ptr,
@@ -587,7 +560,7 @@ pub fn info_hash_from_torrent(bytes: &[u8]) -> Result<InfoHash> {
 
 /// Compute the info-hash encoded in a magnet URI without adding it.
 pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
-    let uri_c = CString::new(uri).map_err(|_| Error::InteriorNul("magnet uri".into()))?;
+    let uri_c = c_string(uri, "magnet uri")?;
     let mut out = [0u8; 20];
     let mut err = ErrBuf::new();
     let rc = unsafe {
@@ -620,8 +593,7 @@ pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<bo
     if domains.is_empty() {
         return Ok(false);
     }
-    let csv_c = CString::new(domains.join(","))
-        .map_err(|_| Error::InteriorNul("allowed_tracker_domains".into()))?;
+    let csv_c = c_string(domains.join(","), "allowed_tracker_domains")?;
     let buf = |b: Option<&Vec<u8>>| match b {
         Some(b) if !b.is_empty() => (b.as_ptr(), b.len()),
         _ => (std::ptr::null(), 0),
@@ -634,7 +606,7 @@ pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<bo
             (None, buf(Some(bytes)), buf(None))
         }
         AddParams::Magnet { uri, .. } => (
-            Some(CString::new(uri.as_str()).map_err(|_| Error::InteriorNul("magnet uri".into()))?),
+            Some(c_string(uri.as_str(), "magnet uri")?),
             buf(None),
             buf(None),
         ),
@@ -732,18 +704,7 @@ fn query_error(h: TorrentHandle, err: ErrBuf) -> Error {
     }
 }
 
-// `Path`-only helper for downstream callers. Not public; the AddParams
-// variants already accept `String`.
-#[allow(dead_code)]
-fn path_to_string(p: &Path) -> Result<String> {
-    p.to_str()
-        .map(|s| s.to_string())
-        .ok_or(Error::InvalidInput("non-UTF8 save_path"))
-}
-
-#[cfg(test)]
-mod tests {
-    // Real session tests require the C++ build to succeed; covered by the
-    // integration tests in `crates/torrentd/tests`. Pure unit tests live in
-    // settings.rs and handle.rs where they don't need libtorrent.
+/// `s` as a C string, or [`Error::InteriorNul`] naming the argument `what`.
+fn c_string(s: impl Into<Vec<u8>>, what: &str) -> Result<CString> {
+    CString::new(s).map_err(|_| Error::InteriorNul(what.into()))
 }
