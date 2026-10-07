@@ -62,17 +62,8 @@ use crate::vpn;
 const WATCHDOG_MAX_HEARTBEAT_AGE: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// The most HTTP connections the API holds open at once; the next waits in
-/// the listen backlog until one closes.
-///
-/// Sized against the descriptor limit the daemon shares with libtorrent,
-/// which is what `LimitNOFILE=65536` in `deploy/torrentd.service` is for:
-/// each profile's `connections_limit` (10,000 in the sample config) and
-/// `file_pool_size` draw on the same table. kynos' default of 10,000 would let
-/// the API alone take a sixth of it, and every descriptor the API holds is one
-/// a profile cannot open a peer or a file with. The API's own callers — an
-/// operator or two, `torrentctl`, a Prometheus scrape, a reverse proxy's
-/// pool — need a few dozen; 256 leaves room for a proxy that does not reuse
-/// connections, at under 0.4% of the table.
+/// the listen backlog until one closes. The descriptor table is shared with
+/// every session's peers and files, and the API's callers need a few dozen.
 const HTTP_MAX_CONNECTIONS: std::num::NonZeroUsize = match std::num::NonZeroUsize::new(256) {
     Some(n) => n,
     None => unreachable!(),
@@ -88,20 +79,9 @@ const HTTP_MAX_CONNECTIONS: std::num::NonZeroUsize = match std::num::NonZeroUsiz
 const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How often an HTTP/2 (h2c) connection is pinged, and how long the peer has
-/// to acknowledge before the connection is closed.
-///
-/// kynos leaves HTTP/2 keep-alive off, and HTTP/2 has no counterpart to
-/// [`HTTP_HEADER_READ_TIMEOUT`]: a peer that sent the preface and then went
-/// silent — crashed, partitioned, or never reading — would hold one of
-/// [`HTTP_MAX_CONNECTIONS`] until the daemon stopped. With pings, such a peer
-/// is dropped within 30 s.
-///
-/// This does not bound a peer that acknowledges pings and sends nothing
-/// else, nor a plaintext connection that sends no byte at all: hyper-util
-/// sniffs the protocol before either driver starts, with no timer, and kynos
-/// exposes neither a first-byte deadline nor an HTTP/2 idle timeout. Both are
-/// recorded in `docs/running.md` §7; a non-loopback `http_listen` belongs
-/// behind a proxy that bounds them.
+/// to acknowledge, so a silent peer is dropped within 30 s. It does not bound
+/// a peer that answers pings and sends nothing else, nor a connection that
+/// sends no byte at all (`docs/running.md` §7).
 const HTTP2_KEEP_ALIVE: kynos::server::protocol::Http2KeepAlive =
     kynos::server::protocol::Http2KeepAlive {
         interval: std::time::Duration::from_secs(20),
@@ -123,21 +103,10 @@ const HTTP_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1
 const POOL_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// An exclusive `flock` on [`Config::instance_lock_path`], held for the life
-/// of the daemon.
-///
-/// Nothing else stops a second `torrentd` against the same config, and the
-/// HTTP bind that eventually refuses one comes last. Before it, the second
-/// process used to replace the running daemon's kill-switch table with one
-/// naming only its own tunnels (`killswitch::enable` replaces whatever table
-/// is standing with its own), run the resume scan, and then — failing the bind — tear
-/// down the table and the tunnels on its way out. The running daemon was left
-/// seeding with no backstop, and nothing in it could notice.
-///
-/// Taken first in `boot`, so a second start refuses before any of that. The
-/// lock belongs to the open file, not to the path: the kernel releases it
-/// when this is dropped or when the process ends however it ends, SIGKILL
-/// included, so a crash never leaves a stale lock to clear by hand. `std`
-/// opens files close-on-exec, so no tunnel helper a boot spawns inherits it.
+/// of the daemon and taken first in `boot`, so a second `torrentd` against
+/// the same state refuses before it can replace the running daemon's kill
+/// switch or tear down its tunnels. The kernel releases it however the
+/// process ends, so a crash leaves no stale lock.
 #[derive(Debug)]
 struct InstanceLock {
     /// Never read. Holding the open file is the lock.
@@ -515,15 +484,7 @@ fn shutdown_requested(rx: &mut broadcast::Receiver<ShutdownReason>) -> bool {
 pub struct DaemonHandle {
     cfg: Config,
     /// Where a VPN manager keeps state a *later* process has to find, as
-    /// `boot` resolved it once at `run_dir`.
-    ///
-    /// Threaded through rather than re-derived from `cfg` in the shutdown
-    /// teardown. A manager built on one path and torn down through a manager
-    /// built on another cannot find the pid file or the raised-interface
-    /// record the first one wrote, and `boot` already resolves this once "so
-    /// bring-up and teardown agree". Re-deriving it here is the second source
-    /// of truth for one path that was rejected one frame further down, taken
-    /// one frame up.
+    /// `boot` resolved it, so teardown finds what bring-up wrote.
     run_dir: std::path::PathBuf,
     /// The `--config` path exactly as parsed by clap. Threaded through rather
     /// than re-derived from `std::env::args()`, which mishandles `--config=X`
@@ -570,15 +531,8 @@ pub async fn boot(
     let run_dir = cfg.state_dir();
 
     // One daemon per state directory, decided before anything with an effect
-    // outside this process — see `InstanceLock` for what a second start used
-    // to do to the running daemon's kill switch. Above the signal install
-    // because nothing here needs tearing down yet: a SIGTERM that kills the
-    // process while the lock is being taken leaves nothing behind.
-    //
-    // Declared before `cleanup` below, so on every failed boot the cleanup's
-    // teardown runs, in reverse declaration order, while this is still held:
-    // a new start cannot slip in between and have its fresh kill switch
-    // removed by the teardown of the boot it replaced.
+    // outside this process. Declared before `cleanup`, so a failed boot's
+    // teardown runs while the lock is still held.
     let instance_lock = {
         let path = cfg.instance_lock_path();
         tokio::task::spawn_blocking(move || InstanceLock::acquire(&path))
@@ -586,14 +540,8 @@ pub async fn boot(
             .context("single-instance lock")??
     };
 
-    // Signals, installed before anything that can block or fail.
-    //
-    // They used to go in after the resume and torrent-dir scans, which left
-    // the whole of startup running on the default disposition — and startup is
-    // where the daemon spends up to 30 seconds *per profile* waiting for a tunnel
-    // to come up. A SIGTERM in that window killed the process outright, with
-    // every tunnel it had already raised still up and nothing left to take
-    // them down.
+    // Signals, installed before anything that can block or fail, so a
+    // SIGTERM during a tunnel bring-up is handled rather than fatal.
     let channels = SignalChannels::new();
     let (reload_tx, reload_rx) = mpsc::channel::<()>(8);
     // The HTTP surface asks for a reload the same way SIGHUP does, through
@@ -614,23 +562,8 @@ pub async fn boot(
 
     warn_if_descriptors_are_short(&cfg);
 
-    // Discard raised-interface records whose interface is no longer standing,
-    // before anything can consult one.
-    //
-    // A record names a link this daemon raised. Nothing in the process is told
-    // when a link later goes away, so a record for an interface an operator
-    // removed by hand — the one remedy the runbook names for a stuck tunnel —
-    // stays on disk inside the same host boot. This is the only place that can
-    // drop it: the record outlives the process that wrote it, so the process
-    // that finds it spent is a later one entirely. It runs before any
-    // `bring_up`, and therefore before anything can consult or overwrite one.
-    //
-    // *Below* the signal install, and on `spawn_blocking`, for the two reasons
-    // this file already applies to every other blocking call in `boot`. It
-    // walks a directory and unlinks files, which is synchronous filesystem
-    // I/O on a runtime worker; and "signals first" is structural here, so a
-    // SIGTERM arriving while a slow or wedged state directory is being read is
-    // handled rather than killing the process outright.
+    // Discard raised-interface records whose interface is gone (removed by
+    // hand, say) before any bring-up can consult one.
     {
         let sweep_dir = run_dir.clone();
         tokio::task::spawn_blocking(move || crate::vpn::sweep_raised_records(&sweep_dir))
@@ -638,10 +571,6 @@ pub async fn boot(
             .context("raised-interface record sweep")?;
     }
 
-    // Undoes what boot has raised, for every exit that is not a successful
-    // one. Tunnels and the kill-switch table outlive the process, so a `?`
-    // anywhere after the profile loop used to leave a host with live tunnels, an
-    // nftables table confining a uid that no longer exists, and no daemon.
     let mut cleanup = BootCleanup::new(run_dir.clone());
 
     // Metrics sink — created before the stores, whose batched writers count
@@ -655,17 +584,9 @@ pub async fn boot(
     // below, which reannounces whatever it holds by the time a port changes.
     let state = Arc::new(StateMap::new());
 
-    // Resume store — rooted at the top-level `resume_dir` and partitioned by
-    // profile id, except where a `[[profile]]` names its own directory. Those keys
-    // were validated for uniqueness and then ignored, so files landed under
-    // the derived path and only matched the configured one by coincidence.
-    //
-    // The alert loop's writes are batched onto the store's own thread, and a
-    // write that fails there is counted as the handler used to count it. The
-    // handler has already cleared the torrent's `needs_save_resume` by then,
-    // and libtorrent its modified bit, so the hook also marks the file stale:
-    // otherwise no `ONLY_IF_MODIFIED` save, the shutdown drain's included,
-    // would ever rewrite it.
+    // Resume store — partitioned by profile id under `resume_dir`, or at a
+    // profile's own directory; the alert loop's writes are batched, and a
+    // failed one is counted and marks its torrent for a fresh save.
     let resume_store: Arc<dyn ResumeStore> = Arc::new(
         cfg.profile
             .iter()
@@ -705,24 +626,10 @@ pub async fn boot(
             .context("load assignment registry")?,
     );
 
-    // Reconcile it against the configured profiles before anything reads it.
-    //
-    // The import above carries a pre-profiles registry over verbatim, which
-    // means it still names that deployment's ids — `default`, on the
-    // single-session layout this release replaces. Nothing reconciles those
-    // with the `[[profile]]` tables, and nothing prunes them, so an id with no
-    // table behind it strands every torrent it holds: the resume and torrent
-    // scans are partitioned per profile and never look at the old paths, so
-    // nothing loads; re-adding answers 409 because the registry says the
-    // info-hash is taken; and `DELETE` cannot clear it either. The daemon
-    // reports itself healthy the whole time.
-    //
-    // Refusing is not the gentlest outcome, but it is the honest one: a silent
-    // total outage that answers 200 on `/healthz` is worse than a daemon that
-    // says which ids it does not recognise and what to do about them. The
-    // check runs against the *configured* set rather than the profiles that
-    // came up — a profile that failed its tunnel is Safety Rule 1's business,
-    // not this one's.
+    // Refuse a registry naming a profile id no `[[profile]]` configures (a
+    // pre-profiles `default`, say): its torrents would be stranded, unloadable
+    // and un-addable, behind a healthy `/healthz`. Checked against the
+    // configured set, not the profiles that came up.
     {
         let configured: HashSet<ProfileId> = cfg.profile.iter().map(|p| p.id.clone()).collect();
         let unknown = registry.unknown_profiles(&configured);
@@ -830,19 +737,11 @@ pub async fn boot(
         Arc::new(ProfileRegistry::new(profile_entries).with_failed(failed_profiles));
     let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(source_entries));
     // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
-    // live session if the forwarded port changes, and reannounces. Started
-    // here, the moment every profile is built, rather than from
-    // `run_until_signal`: everything between the two — the kill switch, the
-    // resume and `.torrent` scans, opening the pool — is time a 60-second
-    // lease negotiated during bring-up spent unrenewed. It renews at once.
-    // If boot fails below, the process exits and the task with it.
-    // It returns at once when no live profile negotiates a port, which is
-    // not a death, so it is supervised only where it has work.
-    //
-    // A rebind is confirmed against the session's listen outcomes, which only
-    // the alert loop sees; it publishes them into `listen_events`, handed to
-    // it below. Until it has cleared its boot backlog the monitor defers a
-    // port change rather than report a port nothing has confirmed.
+    // session if the forwarded port changes, and reannounces. Started as soon
+    // as the profiles are built, so a 60 s lease is not left unrenewed through
+    // the scans, and supervised only where a profile negotiates a port. It
+    // confirms a rebind against the listen outcomes the alert loop publishes
+    // into `listen_events`.
     let listen_events = Arc::new(torrentd_engine::port_forward::ListenEvents::new());
     let pf = crate::port_forward_monitor::run(
         profile_registry.clone(),
@@ -991,19 +890,9 @@ pub async fn boot(
             if torrent.is_none() {
                 missing_metadata += 1;
             }
-            // Which flags are re-asserted here, and why, is
-            // `torrentd_engine::policy`'s to decide — the short version is
-            // that a guard which lapses on restart is not a guard.
-            //
-            // PAUSED is deliberately *not* cleared. It is tempting: the VPN
-            // monitor pauses a whole profile when its tunnel drops, and if the
-            // resume sweep lands in that window every torrent comes back
-            // paused. But resume data does not record *why* a torrent was
-            // paused, so clearing it also silently restarts a torrent an
-            // operator paused on purpose — on a private tracker, the kind of
-            // mistake that ends an account. A pool that comes back paused is
-            // visible in `/status` and fixed with `resume-all`; a pool that
-            // comes back seeding when it was told not to is not recoverable.
+            // The flags re-asserted are `torrentd_engine::policy`'s. PAUSED is
+            // not cleared: resume data does not say why a torrent was paused,
+            // and restarting one an operator paused is not recoverable.
             let params = resume_scan_params(profile_cfg, data.into_inner(), torrent);
             // The account-isolation guard, on the trackers this resume data
             // would announce to — its own `trackers` list where it has one.
@@ -1182,25 +1071,10 @@ pub async fn boot(
         }
     }
 
-    // Reconcile what the registry claims against what the scans actually
-    // loaded.
-    //
-    // The boot check above catches the adjacent mistake — a registry naming an
-    // id no `[[profile]]` declares — and refuses well. But an operator who
-    // takes its own advice ("give one of the configured profiles the id the
-    // registry names") and stops there boots successfully with every file
-    // still at the old un-partitioned root: `resume scan complete
-    // torrent_count=0` at `info`, `/healthz` 200, and `GET /v1/profiles`
-    // reporting N torrents that no session holds, because it derives
-    // `torrent_count` from the registry rather than from loaded state. A
-    // silent total outage reported healthy is the failure mode this whole
-    // section exists to prevent; nothing was comparing the two numbers.
-    //
-    // A warning rather than a refusal: an operator may legitimately have
-    // deleted payload out from under a stale assignment, and the remedy — an
-    // override pointing at the old directory — is theirs to choose. The
-    // directory actually searched is named, because that is the value the
-    // remedy sets.
+    // Warn where the registry claims torrents for a profile that the scans
+    // did not load — files left at an old, un-partitioned root, say — naming
+    // the directory searched, since an override pointing elsewhere is the
+    // remedy. A warning: the payload may have been deleted on purpose.
     for profile in source.profiles() {
         let claimed = registry.for_profile(&profile).len();
         let loaded = loaded_by_profile.get(&profile).copied().unwrap_or(0);
@@ -1488,24 +1362,14 @@ fn boot_engine(
 /// Build every configured profile's session, in configuration order.
 ///
 /// Safety Rule 1: a profile whose tunnel does not come up never gets a
-/// session, and the others carry on. It still has to be *reported* as failed
-/// — skipping it outright made it vanish from `/profiles`, so an operator
-/// wondering why an account was quiet found no trace of it anywhere but the
-/// startup log. Returned as `(up, failed)`; an empty `up` is the caller's to
-/// refuse, since a daemon with no session has nothing to run.
+/// session, and the others carry on; it is returned in `failed`, so it is
+/// still reported. An empty `up` is the caller's to refuse.
 ///
-/// Every piece of the outside world arrives as a parameter — the tunnel
-/// managers through `cleanup`'s factory, NAT-PMP through `forwarder`, the
-/// session through `make_engine` — so a test drives this whole loop with
-/// `MockVpn`, `MockForwarder` and `MockEngine`. `boot` constructed each of
-/// them inline, and the safety rules below were guaranteed only by reading.
-///
-/// A natpmp profile's lease starts running when its port is negotiated, and
-/// every later profile's bring-up — up to 30 seconds for the tunnel and ~16
-/// for the negotiation — used to pass before anything renewed it. So before
-/// each bring-up the leases of the profiles already built are renewed here,
-/// which bounds a lease's age at boot to one profile's bring-up;
-/// `port_forward_monitor` takes over as soon as this returns.
+/// The outside world arrives as parameters — tunnel managers through
+/// `cleanup`'s factory, NAT-PMP through `forwarder`, sessions through
+/// `make_engine` — so tests drive it with mocks. Before each bring-up the
+/// leases of the profiles already built are renewed, bounding a lease's age
+/// at boot to one profile's bring-up.
 ///
 /// `Err` only for a shutdown asked for between two profiles' bring-ups.
 async fn build_profiles<F, E>(
@@ -1632,19 +1496,8 @@ where
         };
     }
 
-    // A bring-up or teardown task that does not join — a panic inside
-    // `spawn_blocking`, or the runtime shutting down under it — fails **that
-    // profile**, and the boot carries on with the rest. Every one of these
-    // sites was a `?`, which aborted the whole boot: one profile's panicking
-    // bring-up task took every other profile's tunnel down with it, on a
-    // daemon whose entire purpose is to keep the remaining profiles seeding.
-    // Failing the profile is what the surrounding code does with every other
-    // per-profile failure, and a failed profile is still visible:
-    // `ProfileRegistry::with_failed` keeps it in `/profiles` and `vpn_monitor`
-    // emits its tunnel-down series.
-    //
-    // `boot` as a whole still fails when *no* profile comes up, which is the
-    // check below its call to `build_profiles`.
+    // A bring-up or teardown task that does not join (it panicked) fails that
+    // profile, as every other per-profile failure does, rather than the boot.
     macro_rules! profile_task_failed {
         ($what:literal, $err:expr) => {{
             let e = $err;
@@ -1819,44 +1672,15 @@ where
                 }
             };
 
-            // The listen sockets are named by address, not by device. They
-            // carry more than incoming connections: libtorrent sends outgoing
-            // uTP and every UDP tracker announce from them
-            // (`settings_pack::listen_interfaces`). libtorrent does bind them
-            // to a device as well — `expand_devices` tags an address endpoint
-            // with the first interface whose network holds the address, and
-            // `setup_listener` applies `SO_BINDTODEVICE` to it — but that is
-            // the tunnel only while no interface listed before it has a
-            // network covering the tunnel address, and a refused
-            // `SO_BINDTODEVICE` (no `CAP_NET_RAW` before Linux 5.7) is
-            // logged and ignored, leaving the address bind alone.
-            //
-            // Naming the device here instead (`wg-a:6891`) is not done: a
-            // device endpoint listens on every address the device holds, of
-            // both families and link-local included, there is no syntax for
-            // an address and a device together, and a listen socket that then
-            // fails to bind is fatal to a daemon with one live session
-            // (`handlers::listen`).
+            // The listen sockets, which also carry outgoing uTP and UDP
+            // tracker traffic, are named by address: a device endpoint would
+            // listen on every address the device holds. libtorrent's own
+            // device binding of them is best effort.
             settings.listen_interfaces = Some(torrentd_engine::bind_endpoint(ip, effective_port));
-            // The device, not the address. libtorrent binds an outgoing TCP
-            // peer connection to a device named here with `SO_BINDTODEVICE`
-            // (falling back to one of the device's addresses where that is
-            // refused), so where the binding takes the kernel sends it out of
-            // the tunnel whatever the routing table says. Bound to the address
-            // alone, a socket's route still came from the rules — and with
-            // the source-address rule gone (a firewall reload, `ip rule
-            // flush`) the lookup fell through to the main table and the
-            // packets left by the physical interface with the tunnel's source
-            // address.
-            //
-            // This covers outgoing TCP only, and only where `SO_BINDTODEVICE`
-            // is allowed: where it is refused (no `CAP_NET_RAW` before Linux
-            // 5.7) libtorrent binds the address alone, and the route is the
-            // table's again. Outgoing uTP and UDP tracker traffic leave by
-            // the listen sockets above, whose device binding is libtorrent's
-            // best effort. So the window between a lost rule and the fence is
-            // narrowed here, not closed: the health monitor fences the profile
-            // within a poll (`vpn_monitor`'s route check).
+            // Outgoing TCP is bound to the device (`SO_BINDTODEVICE`, where
+            // permitted), so it leaves by the tunnel even if the source rule
+            // is lost. That narrows the window before `vpn_monitor`'s route
+            // check fences the profile; it does not close it.
             settings.outgoing_interfaces = Some(iface.to_string());
             // Not configurable, by construction: there is no key on a vpn
             // profile that reaches these.
@@ -2029,17 +1853,8 @@ impl DaemonHandle {
             events: Arc::default(),
         };
 
-        // What the daemon decided to believe, in the journal, once. Anything
-        // in this set can claim to be any client, and the key is read only at
-        // startup — so an operator who edits it and reloads is told the
-        // change requires a restart, and the running value can differ from
-        // the file indefinitely. Without this line there is no evidence
-        // anywhere of which value the process is actually running.
-        //
-        // `trusted_proxies` is the parsed set in its effective form, which is
-        // what the matcher uses: `::ffff:0:0/96` is logged as `0.0.0.0/0`,
-        // because that is every IPv4 peer. `configured` is the text as
-        // written, so the line still reads back against the file.
+        // The trust set the process runs with, once: effective blocks, and
+        // the text as configured beside them.
         if trusted_proxies.is_empty() {
             info!(
                 target: "torrentd::auth",
@@ -2383,16 +2198,11 @@ fn http_exit_code(outcome: kynos::Result<()>) -> i32 {
 
 /// Take the daemon off the network in the one order that leaks nothing:
 ///
-/// 1. **Close every session.** Peer and tracker sockets are bound to a
-///    tunnel's address; closing them first means nothing is left to send when
-///    the tunnel goes. Dropping the sessions was left to `source` going out of
-///    scope at the end of `run_until_signal`, after both steps below — and to
-///    every other task holding a clone letting go of it, which nothing waited
-///    for.
+/// 1. **Close every session**, so no socket bound to a tunnel's address is
+///    left to send when the tunnel goes.
 /// 2. **Bring the tunnels down**, link before rules (`wireguard::native`).
-/// 3. **Remove the kill switch last.** It confines the daemon's uid to the
-///    tunnels; removing it before they were down, as the teardown did, opened
-///    the host's own interface to every socket still bound for one.
+/// 3. **Remove the kill switch last**: it confines the daemon's uid to the
+///    tunnels while they go.
 ///
 /// Each session closes on the blocking pool — libtorrent's destructor waits for
 /// its sockets and disk threads — and all of them at once, then the tunnels
@@ -2427,22 +2237,10 @@ async fn teardown_network<K>(
     remove_kill_switch();
 }
 
-/// Put every tunnel teardown in flight at once, then join them.
-///
-/// Moving the bounded exit wait to `spawn_blocking` took it off the runtime's
-/// workers and left the daemon's **wall-clock** stop time where it was:
-/// awaiting each job before spawning the next is still up to
-/// `TERM_GRACE + KILL_GRACE` — seven seconds — per OpenVPN profile, serialized,
-/// which is the `7N` this series named as the thing it was avoiding. Each
-/// tunnel is an independent interface and an independent process, so there is
-/// nothing to serialise for, and every serialized second comes out of the
-/// stop budget `deploy/torrentd.service`'s `TimeoutStopSec` bounds.
-///
-/// Spawning happens in one pass and the awaits in a second, so the jobs run
-/// concurrently and the log still reads in profile order. A `JoinError` — the
-/// job panicked, or the runtime is shutting down — is warned and skipped:
-/// shutdown must not fail on a teardown, and the tunnels that did come down
-/// are still worth reporting.
+/// Put every tunnel teardown in flight at once, then join them in profile
+/// order: an OpenVPN teardown can take seven seconds, and serialized they
+/// would come out of the stop budget once per profile. A job that panicked is
+/// warned and skipped; shutdown must not fail on a teardown.
 async fn join_teardowns<J>(jobs: Vec<(ProfileId, String, J)>)
 where
     J: FnOnce() + Send + 'static,
@@ -3178,21 +2976,8 @@ mod tests {
         assert_eq!(vpn.bring_down_calls(), vec!["wg-a".to_string()]);
     }
 
-    /// The exception to "record it before the attempt": an interface of that
-    /// name that is already up and is **not** this profile's.
-    ///
-    /// `wg-quick up` refuses a name that exists, adoption then finds a
-    /// different public key and refuses it too — and the teardown-on-failure
-    /// arm ran `wg-quick down` on it anyway, removing a tunnel this daemon
-    /// did not raise along with its routes and its rules. Nothing of ours is
-    /// running there, so neither this arm nor the drop guard may touch it.
-    ///
-    /// This is the arm, and it is now reached by every non-adoption over a
-    /// link that was standing before the attempt began — not only the
-    /// key-based refusal it started as. `wireguard.rs`'s `refusal` decides
-    /// which failures arrive here and which reach the `Err(_)` catch-all
-    /// below; see `a_link_that_was_standing_before_the_attempt_is_never_torn_down`
-    /// for that half.
+    /// The exception to "record it before the attempt": a foreign interface
+    /// of that name is touched neither by this arm nor by the drop guard.
     #[tokio::test]
     async fn a_bring_up_refused_by_a_foreign_interface_leaves_it_standing() {
         let vpn = MockVpn::new();
@@ -3245,22 +3030,7 @@ mod tests {
         assert_eq!(vpn.bring_down_calls(), vec!["wg-a".to_string()]);
     }
 
-    /// `boot`'s only teardown keeps its bounded wait off the worker.
-    ///
-    /// `boot` had three call sites that reached a *synchronous* `take_down`
-    /// instead — a static profile with no `listen_port`, an unparseable
-    /// `port_forward_gateway`, and a NAT-PMP negotiation that failed, which
-    /// is what an `openvpn` profile on a provider account without port
-    /// forwarding looks like. `validate_set` ties `vpn_type` to neither
-    /// `port_forward` nor the gateway, so each reached
-    /// `OpenvpnManager::bring_down`'s `thread::sleep` poll — up to
-    /// `TERM_GRACE + KILL_GRACE`, seven seconds, on the runtime worker,
-    /// during which the signal handling the neighbouring commits exist to
-    /// keep responsive does not run either. `take_down` is deleted, so the
-    /// shape below is the only one `boot` has.
-    ///
-    /// Call `job()` directly in `take_down_off_worker` instead of handing it
-    /// to `spawn_blocking` and this fails.
+    /// `boot`'s teardown keeps its bounded wait off the runtime worker.
     #[tokio::test]
     async fn boots_only_teardown_keeps_its_bounded_wait_off_the_worker() {
         let vpn = ThreadWatchingVpn::default();
@@ -3313,23 +3083,9 @@ mod tests {
         );
     }
 
-    /// The graceful-shutdown drain does not scale with profile count.
-    ///
-    /// Moving the bounded exit wait onto `spawn_blocking` changed which
-    /// thread waits, not how long the daemon takes to stop: awaiting each
-    /// job before spawning the next left the wall-clock stop time at up to
-    /// seven seconds per OpenVPN profile, serialized, which is the `7N` this
-    /// series named as the thing it was avoiding, out of the stop budget
-    /// `deploy/torrentd.service`'s `TimeoutStopSec` bounds.
-    ///
-    /// The property is overlap, so overlap is what is counted: each job
-    /// announces itself and waits for the rest, and the peak count inside the
-    /// closure at once is asserted.
-    ///
-    /// The deadline is a failure bound, not a measurement. Serialized, job 0
-    /// waits it out alone, the peak is 1 and the assertion fails on what it
-    /// counted — where a stopwatch could only report a slow runner. Await each
-    /// job in turn in `join_teardowns` and this fails.
+    /// Every tunnel teardown is in flight at once: each job waits for the
+    /// rest, and the peak count inside the closure is asserted. The deadline
+    /// is a failure bound, not a measurement.
     #[tokio::test]
     async fn every_tunnel_teardown_is_in_flight_at_once() {
         const SLOTS: usize = 6;
