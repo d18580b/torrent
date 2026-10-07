@@ -251,6 +251,10 @@ pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Run a request under [`REQUEST_TIMEOUT`], flattening every failure into a
 /// [`Failure`].
+#[allow(
+    clippy::result_large_err,
+    reason = "a Failure is built once per failed request and moved straight to the UI"
+)]
 pub async fn call<T, E: AsProblem>(
     request: impl std::future::Future<Output = Result<generated::ResponseValue<T>, generated::Error<E>>>,
 ) -> Result<T, Failure> {
@@ -267,6 +271,10 @@ pub async fn call<T, E: AsProblem>(
 /// Run a request that may legitimately take minutes — a pool scan, a drift
 /// check, applying a plan — with no timeout: the daemon answers when the work
 /// is done, and giving up early would report a failure for work that went on.
+#[allow(
+    clippy::result_large_err,
+    reason = "a Failure is built once per failed request and moved straight to the UI"
+)]
 pub async fn call_unbounded<T, E: AsProblem>(
     request: impl std::future::Future<Output = Result<generated::ResponseValue<T>, generated::Error<E>>>,
 ) -> Result<T, Failure> {
