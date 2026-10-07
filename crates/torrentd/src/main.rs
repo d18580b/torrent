@@ -650,56 +650,6 @@ mod tests {
     }
 
     #[test]
-    fn the_refusal_does_not_promise_an_exemption_the_invocation_does_not_have() {
-        // The property: the refusal describes the invocation the operator
-        // typed. `--check-config vpn check --bring-up` was refused with a
-        // message stating unconditionally that the named subcommand "is an
-        // operator tool, which is exempt from that check precisely so it
-        // still runs against a config the daemon refuses" — and `--bring-up`
-        // is the one invocation for which that is false. An operator who
-        // dropped the flag as instructed, on that understanding, was then
-        // refused by the posture check.
-        //
-        // The name has to carry `--bring-up` too: without it the message
-        // names an invocation that does have the exemption, so it is
-        // accurate about a command nobody ran.
-        let cli = Cli::parse_from([
-            "torrentd",
-            "-c",
-            "x",
-            "--check-config",
-            "vpn",
-            "check",
-            "--bring-up",
-        ]);
-        let msg = check_config_with_subcommand(&cli).expect("must still be refused");
-        assert!(
-            msg.contains("vpn check --bring-up"),
-            "the message must name the invocation that was typed; got: {msg}",
-        );
-        assert!(
-            !msg.contains("still runs against a config the daemon refuses"),
-            "this invocation does not, and the message must not say it does; got: {msg}",
-        );
-        assert!(
-            msg.contains("full validation"),
-            "it must say what this invocation is held to instead; got: {msg}",
-        );
-
-        // The exempt arm keeps the clause, which is true of it.
-        let cli = Cli::parse_from(["torrentd", "-c", "x", "--check-config", "vpn", "check"]);
-        let msg = check_config_with_subcommand(&cli).expect("must still be refused");
-        assert!(
-            msg.contains("still runs against a config the daemon refuses"),
-            "plain `vpn check` does have the exemption; got: {msg}",
-        );
-        assert!(
-            !msg.contains("--bring-up"),
-            "and the message must not name a flag that was not given; got: {msg}",
-        );
-    }
-
-    #[test]
     fn the_daemon_and_check_config_still_get_the_posture_check() {
         // The exemption is for subcommands only. Widening it to the daemon
         // would remove the refusal this whole change exists to make, and

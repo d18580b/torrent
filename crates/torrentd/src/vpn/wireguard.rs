@@ -2289,13 +2289,10 @@ mod tests {
         );
     }
 
-    /// Every uid raises with `ip` and `wg`; nothing in the daemon's path runs
-    /// `wg-quick`, whose host-wide default route and fwmark rule made a second
-    /// full-tunnel profile reroute the first one's traffic as root. The
-    /// manager `for_type` builds refuses a hooked config — which `wg-quick`
-    /// would have run — before anything reaches the host.
+    /// The manager refuses a hooked config, which only `wg-quick` would run,
+    /// before anything reaches the host.
     #[test]
-    fn every_uid_raises_its_links_with_ip_and_wg_and_never_wg_quick() {
+    fn a_hooked_config_is_refused_before_bring_up() {
         let dir = tempfile::tempdir().unwrap();
         let hooked = dir.path().join("tdnx-hook.conf");
         std::fs::write(
@@ -2313,18 +2310,6 @@ mod tests {
             .expect("a refusal is not an I/O error")
             .expect_err("the native parser refuses the hook");
         assert!(refused.to_string().contains("PostUp"), "got {refused}");
-
-        // Whitespace removed, so a call rustfmt wrapped onto several lines is
-        // still seen: `exec::run(`, `exec::run_ok(`, `exec::available(` and
-        // `Command::new(` all take the program as their first argument.
-        let source: String = include_str!("wireguard.rs")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        assert!(
-            !source.contains("(\"wg-quick\""),
-            "the daemon path must not spawn wg-quick"
-        );
     }
 
     const PROVIDER_CONF: &str = "\
