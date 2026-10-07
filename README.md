@@ -158,8 +158,8 @@ heading in [`docs/api/problems.md`](docs/api/problems.md).
 symlink followed at the last component, and errors that do not disclose
 whether a path exists. `save_path` must be inside `default_save_path` or a
 managed root, so an add cannot point libtorrent at any other directory the
-daemon can write. Either path is refused outright if it carries a `..` or `.`
-component, and containment is judged with symlinks resolved.
+daemon can write. Either path is refused outright if it carries a `..`
+component or a leading `.`, and containment is judged with symlinks resolved.
 
 **Configuration is not settable at runtime, deliberately.** Several keys are
 reloadable — `log_level`, `upload_rate_limit`, `connections_limit`,
