@@ -9,11 +9,7 @@ use parking_lot::Mutex;
 
 pub trait MetricsSink: Send + Sync + std::fmt::Debug {
     fn inc_counter(&self, name: &str, labels: &[(&str, &str)]);
-    fn add_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
-        for _ in 0..value {
-            self.inc_counter(name, labels);
-        }
-    }
+    fn add_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]);
     fn set_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]);
     fn observe_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
         // Default: log via gauge so RecordingSink shows "the value was V".
@@ -28,6 +24,7 @@ pub struct NoopSink;
 
 impl MetricsSink for NoopSink {
     fn inc_counter(&self, _: &str, _: &[(&str, &str)]) {}
+    fn add_counter(&self, _: &str, _: u64, _: &[(&str, &str)]) {}
     fn set_gauge(&self, _: &str, _: f64, _: &[(&str, &str)]) {}
     fn observe_histogram(&self, _: &str, _: f64, _: &[(&str, &str)]) {}
 }

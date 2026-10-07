@@ -1086,6 +1086,9 @@ mod tests {
         fn inc_counter(&self, _n: &str, _l: &[(&str, &str)]) {
             panic!("metrics sink exploded");
         }
+        fn add_counter(&self, _n: &str, _v: u64, _l: &[(&str, &str)]) {
+            panic!("metrics sink exploded");
+        }
         fn set_gauge(&self, _n: &str, _v: f64, _l: &[(&str, &str)]) {}
     }
 
