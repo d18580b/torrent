@@ -11,10 +11,12 @@
 //! The `renew_and_rebind` helper is the testable core of the renewal loop: it
 //! renews a mapping and, if the port changed, rebinds the live libtorrent
 //! session via `TorrentEngine::apply_settings` (which reopens the listen
-//! sockets), waits for the session to report a listen socket on the new
-//! port, and only then reannounces every torrent in it. It is pure with
-//! respect to metrics and health state so it can be driven by
-//! `MockForwarder` + `MockEngine` in unit tests.
+//! sockets) and waits for the session to report a listen socket on the new
+//! port. Only a confirmed rebind is reported as one, and the caller then
+//! reannounces the torrents in paced batches ([`reannounce_batch`],
+//! [`REANNOUNCE_BATCH`], [`REANNOUNCE_PACE`]). It is pure with respect to
+//! metrics and health state so it can be driven by `MockForwarder` +
+//! `MockEngine` in unit tests.
 //!
 //! `apply_settings` returning `Ok` only means the new `listen_interfaces`
 //! was handed to the session: libtorrent reopens the sockets on its network
@@ -129,6 +131,60 @@ pub struct MapResult {
     /// the session is reachable over TCP only: the UDP request failed, or
     /// the gateway put it on another port.
     pub udp_mapped: bool,
+    /// The lease the gateway granted, in seconds — the shorter of the TCP and
+    /// (when mapped) UDP leases. RFC 6886 §3.3 lets a gateway grant a lifetime
+    /// other than the one requested, so the next renewal is scheduled from
+    /// this ([`renew_after`]) and not from the request.
+    pub lifetime_secs: u32,
+}
+
+/// When the next renewal of a lease granted for `granted_secs`, having asked
+/// for `requested_secs`, is due: half the lease (RFC 6886 §3.3's
+/// recommendation), so a renewal that fails still leaves room for retries
+/// before it lapses.
+///
+/// Never sooner than [`MIN_RENEW_AFTER`], so a gateway granting a lease of a
+/// second or two cannot turn the renewal loop into a busy loop. Never later
+/// than half the *requested* lease either: the renewal is also how a gateway
+/// reboot (its epoch reset) or a mapping it dropped is noticed, and a
+/// gateway granting an hour would otherwise leave either unseen for half
+/// of one.
+pub fn renew_after(granted_secs: u32, requested_secs: u32) -> Duration {
+    let lease = granted_secs.min(requested_secs);
+    Duration::from_secs(u64::from(lease / 2)).max(MIN_RENEW_AFTER)
+}
+
+/// The floor [`renew_after`] applies.
+pub const MIN_RENEW_AFTER: Duration = Duration::from_secs(2);
+
+/// How many torrents are asked to reannounce at once after a port change.
+///
+/// A rebind used to reannounce every torrent in the profile in one burst. At
+/// the scale this daemon runs — tens of thousands of torrents per session —
+/// that is tens of thousands of announces handed to the session in the same
+/// instant, which the trackers see as a flood from one address and which
+/// queues behind `max_concurrent_http_announces` anyway. Paced at
+/// `REANNOUNCE_BATCH` per [`REANNOUNCE_PACE`], 10 000 torrents are all
+/// reannounced within 100 seconds, and a tracker never sees more than a
+/// batch at once.
+pub const REANNOUNCE_BATCH: usize = 100;
+
+/// The pause between two reannounce batches. See [`REANNOUNCE_BATCH`].
+pub const REANNOUNCE_PACE: Duration = Duration::from_secs(1);
+
+/// Ask each torrent in `handles` to reannounce, and count what the session
+/// accepted and refused. One batch of the paced reannounce; the pacing is the
+/// caller's, since it has to sleep without holding a thread.
+pub fn reannounce_batch(engine: &dyn TorrentEngine, handles: &[TorrentHandle]) -> (usize, usize) {
+    let mut dispatched = 0;
+    let mut failed = 0;
+    for h in handles {
+        match engine.force_reannounce(*h) {
+            Ok(()) => dispatched += 1,
+            Err(_) => failed += 1,
+        }
+    }
+    (dispatched, failed)
 }
 
 /// Negotiates a forwarded listening port against a VPN gateway.
@@ -159,24 +215,45 @@ pub enum RenewOutcome {
         epoch: u32,
         rebooted: bool,
         udp_mapped: bool,
+        lifetime_secs: u32,
     },
-    /// Renewed with a new port, the live session was rebound, and every
-    /// torrent in it was asked to reannounce.
+    /// Renewed with a new port and the live session was rebound. Its torrents
+    /// are the caller's to reannounce, paced (see [`REANNOUNCE_BATCH`]);
+    /// `detected` is when the gateway answered, for the latency the caller
+    /// reports once the last batch is out.
     Rebound {
         previous: u16,
         new: u16,
         epoch: u32,
         rebooted: bool,
         udp_mapped: bool,
-        reannounce: Reannounce,
+        lifetime_secs: u32,
+        detected: Instant,
     },
     /// Renewed with a new port but the session was not confirmed listening
     /// on it. The listen interface is put back on the old port wherever it
-    /// was changed, and nothing was reannounced.
+    /// was changed, and nothing is to be reannounced.
     RebindFailed {
         previous: u16,
         new: u16,
         reason: RebindFailure,
+    },
+    /// Renewed onto a port that another profile already listens on. When
+    /// `new` differs from `previous` the session was **not** rebound to it:
+    /// two profiles announcing one port are correlatable by a tracker
+    /// operator even from different addresses (profile Safety Rule 8), and
+    /// the session stays on the old port. When they are equal, the session
+    /// is already on it — two renewals raced onto one port — and this is
+    /// the collision being reported rather than prevented.
+    ///
+    /// The gateway did answer, so `epoch` and `rebooted` are its, as for
+    /// [`RenewOutcome::Unchanged`]: the next renewal's reboot check compares
+    /// against this epoch.
+    PortTaken {
+        previous: u16,
+        new: u16,
+        epoch: u32,
+        rebooted: bool,
     },
     /// The renewal request itself failed; the previous mapping is kept.
     RenewFailed(PortForwardError),
@@ -374,19 +451,20 @@ pub struct Reannounce {
 
 /// Renew a profile's NAT-PMP mapping and, if the negotiated port changed, rebind
 /// the live libtorrent session by re-applying `listen_interfaces`
-/// (`apply_settings` triggers libtorrent's `reopen_listen_sockets`), wait for
-/// the session to confirm a listen socket on `tunnel_ip:new`, then ask every
-/// torrent in `handles()` to reannounce. Pure with respect to metrics/health
-/// so it is unit-testable with mocks.
+/// (`apply_settings` triggers libtorrent's `reopen_listen_sockets`), then wait
+/// for the session to confirm a listen socket on `tunnel_ip:new`. Pure with
+/// respect to metrics/health so it is unit-testable with mocks.
 ///
-/// The reannounce is what makes the new port reach trackers promptly.
+/// On [`RenewOutcome::Rebound`] the caller reannounces the profile's torrents,
+/// which is what makes the new port reach trackers promptly:
 /// `reopen_listen_sockets` re-enables the trackers but announces nothing, so
 /// without it a private tracker keeps handing out the dead port until each
-/// torrent's next scheduled announce, commonly 30–60 minutes away. It is sent
-/// only once the session reports `listen_succeeded` for the new endpoint:
-/// advertising a port nothing listens on is worse than advertising none.
-/// `handles` is called only on a confirmed rebind, so a steady-state renewal
-/// does not walk the torrent map.
+/// torrent's next scheduled announce, commonly 30–60 minutes away. `Rebound`
+/// is returned only once the session reports `listen_succeeded` for the new
+/// endpoint: advertising a port nothing listens on is worse than advertising
+/// none. The reannounce is not done here because it is paced
+/// ([`REANNOUNCE_BATCH`]), and pacing it here would hold the renewal — and the
+/// lease it is renewing — for as long as the reannounce takes.
 ///
 /// A rebind that is not confirmed — a `listen_failed` for the new endpoint,
 /// or no outcome within `target.timeout` — puts `listen_interfaces` back on
@@ -396,6 +474,15 @@ pub struct Reannounce {
 /// already set would never produce an outcome to wait for. A rebind is not
 /// attempted at all while nothing publishes listen outcomes
 /// ([`ListenEvents::is_attached`]).
+///
+/// `port_taken` says whether another profile already listens on a port; a new
+/// port it claims is not bound ([`RenewOutcome::PortTaken`]). Gateways assign
+/// ports independently, so two profiles on two gateways can be handed the same
+/// one. It is asked once the gateway has answered, so a caller that reads the
+/// other profiles' ports live sees any rebind that landed during the
+/// exchange; and it is asked of an unchanged port too, so two renewals that
+/// both rebound onto one port before either saw the other are reported on
+/// the next renewal instead of standing unseen.
 ///
 /// A gateway reboot (epoch regression vs `previous_epoch`) needs no special
 /// recovery here: the `map` call above already re-created the dropped mapping,
@@ -407,7 +494,7 @@ pub fn renew_and_rebind(
     previous_port: u16,
     previous_epoch: u32,
     target: RebindTarget<'_>,
-    handles: impl FnOnce() -> Vec<TorrentHandle>,
+    port_taken: impl Fn(u16) -> bool,
 ) -> RenewOutcome {
     let tunnel_ip = target.tunnel_ip;
     match forwarder.map(req) {
@@ -415,15 +502,28 @@ pub fn renew_and_rebind(
             port,
             epoch,
             udp_mapped,
+            lifetime_secs,
         }) => {
             let detected = Instant::now();
             let rebooted = gateway_rebooted(previous_epoch, epoch);
+            // Asked on the unchanged path too: a port bound already can have
+            // become another profile's since, and a collision that got past
+            // the rebind check is then still seen and counted.
+            if port_taken(port) {
+                return RenewOutcome::PortTaken {
+                    previous: previous_port,
+                    new: port,
+                    epoch,
+                    rebooted,
+                };
+            }
             if port == previous_port {
                 return RenewOutcome::Unchanged {
                     port,
                     epoch,
                     rebooted,
                     udp_mapped,
+                    lifetime_secs,
                 };
             }
             let failed = |reason| RenewOutcome::RebindFailed {
@@ -458,25 +558,14 @@ pub fn renew_and_rebind(
                 let _ = engine.apply_settings(&listen_on(previous_port));
                 return failed(reason);
             }
-            let mut dispatched = 0;
-            let mut failed = 0;
-            for h in handles() {
-                match engine.force_reannounce(h) {
-                    Ok(()) => dispatched += 1,
-                    Err(_) => failed += 1,
-                }
-            }
             RenewOutcome::Rebound {
                 previous: previous_port,
                 new: port,
                 epoch,
                 rebooted,
                 udp_mapped,
-                reannounce: Reannounce {
-                    dispatched,
-                    failed,
-                    elapsed: detected.elapsed(),
-                },
+                lifetime_secs,
+                detected,
             }
         }
         Err(e) => RenewOutcome::RenewFailed(e),
@@ -526,6 +615,17 @@ impl MockForwarder {
             port,
             epoch,
             udp_mapped: true,
+            lifetime_secs: Self::LIFETIME_SECS,
+        }));
+    }
+
+    /// Script a successful mapping granted for `lifetime_secs`.
+    pub fn push_ok_lifetime(&self, port: u16, lifetime_secs: u32) {
+        self.push_result(Ok(MapResult {
+            port,
+            epoch: 0,
+            udp_mapped: true,
+            lifetime_secs,
         }));
     }
 
@@ -535,8 +635,13 @@ impl MockForwarder {
             port,
             epoch: 0,
             udp_mapped: false,
+            lifetime_secs: Self::LIFETIME_SECS,
         }));
     }
+
+    /// The lease every scripted success grants unless it says otherwise: the
+    /// 60 seconds the daemon asks for.
+    pub const LIFETIME_SECS: u32 = 60;
 
     pub fn push_err(&self, err: PortForwardError) {
         self.push_result(Err(err));
@@ -596,8 +701,9 @@ mod tests {
         }
     }
 
-    fn no_handles() -> Vec<TorrentHandle> {
-        Vec::new()
+    /// No other profile holds any port.
+    fn port_free(_: u16) -> bool {
+        false
     }
 
     const TUNNEL: IpAddr = IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2));
@@ -698,14 +804,13 @@ mod tests {
         let fwd = MockForwarder::with_ports([6881]);
         let eng = MockEngine::new();
         let (p, listen) = (ProfileId::new("p"), attached());
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), || {
-            panic!("a steady-state renewal does not walk the torrent map")
-        });
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
         assert!(matches!(
             out,
             RenewOutcome::Unchanged {
                 port: 6881,
                 udp_mapped: true,
+                lifetime_secs: MockForwarder::LIFETIME_SECS,
                 ..
             }
         ));
@@ -717,64 +822,49 @@ mod tests {
     }
 
     #[test]
-    fn renew_changed_rebinds_live_session_then_reannounces_every_torrent() {
+    fn renew_changed_rebinds_the_live_session_and_leaves_the_reannounce_to_the_caller() {
         let fwd = MockForwarder::with_ports([40001]);
         let eng = Arc::new(MockEngine::new());
-        let a = eng.register_handle(InfoHash([1; 20]));
-        let b = eng.register_handle(InfoHash([2; 20]));
         let (p, listen) = (ProfileId::new("p"), attached());
         let session = answer_rebind(&eng, &listen, &p, "10.2.0.2:40001", None);
-        let out = renew_and_rebind(&fwd, &*eng, &req(), 6881, 0, target(&p, &listen), || {
-            vec![a, b]
-        });
+        let out = renew_and_rebind(&fwd, &*eng, &req(), 6881, 0, target(&p, &listen), port_free);
         session.join().unwrap();
-        let RenewOutcome::Rebound {
-            previous: 6881,
-            new: 40001,
-            reannounce,
-            ..
-        } = out
-        else {
-            panic!("expected a rebind, got {out:?}");
-        };
-        assert_eq!((reannounce.dispatched, reannounce.failed), (2, 0));
+        assert!(
+            matches!(
+                out,
+                RenewOutcome::Rebound {
+                    previous: 6881,
+                    new: 40001,
+                    ..
+                }
+            ),
+            "expected a rebind, got {out:?}"
+        );
         // Exactly one apply_settings carrying the new tunnel_ip:port bind.
         assert_eq!(applied_binds(&eng), vec!["10.2.0.2:40001".to_string()]);
-        assert_eq!(reannounced(&eng), vec![a, b]);
-        // The rebind comes first: an announce posted before the sockets are
-        // reopened would advertise the port being abandoned.
-        let first_reannounce = eng
-            .calls()
-            .iter()
-            .position(|c| matches!(c, RecordedCall::ForceReannounce(_)))
-            .unwrap();
-        let rebind = eng
-            .calls()
-            .iter()
-            .position(|c| matches!(c, RecordedCall::ApplySettings(_)))
-            .unwrap();
-        assert!(rebind < first_reannounce);
+        assert!(
+            reannounced(&eng).is_empty(),
+            "the reannounce is paced by the caller, after the rebind returns",
+        );
     }
 
     #[test]
-    fn a_refused_reannounce_is_counted_and_the_rest_still_go_out() {
-        let fwd = MockForwarder::with_ports([40001]);
-        let eng = Arc::new(MockEngine::new());
+    fn a_refused_reannounce_is_counted_and_the_rest_of_the_batch_still_goes_out() {
+        let eng = MockEngine::new();
         let a = eng.register_handle(InfoHash([1; 20]));
         let b = eng.register_handle(InfoHash([2; 20]));
         // One-shot: the first reannounce is refused, the second is not.
         eng.inject_error("force_reannounce", EngineError::Shutdown);
-        let (p, listen) = (ProfileId::new("p"), attached());
-        let session = answer_rebind(&eng, &listen, &p, "10.2.0.2:40001", None);
-        let out = renew_and_rebind(&fwd, &*eng, &req(), 6881, 0, target(&p, &listen), || {
-            vec![a, b]
-        });
-        session.join().unwrap();
-        let RenewOutcome::Rebound { reannounce, .. } = out else {
-            panic!("expected a rebind, got {out:?}");
-        };
-        assert_eq!((reannounce.dispatched, reannounce.failed), (1, 1));
+        assert_eq!(reannounce_batch(&eng, &[a, b]), (1, 1));
         assert_eq!(reannounced(&eng), vec![a, b]);
+    }
+
+    /// The pace the batch constants set is the one the docs state: 10 000
+    /// torrents within 100 seconds, never more than a batch at once.
+    #[test]
+    fn the_reannounce_pace_clears_ten_thousand_torrents_within_a_hundred_seconds() {
+        let batches = 10_000usize.div_ceil(REANNOUNCE_BATCH);
+        assert!(REANNOUNCE_PACE * (batches as u32 - 1) <= Duration::from_secs(100));
     }
 
     #[test]
@@ -783,9 +873,7 @@ mod tests {
         let eng = MockEngine::new();
         eng.inject_error("apply_settings", EngineError::Shutdown);
         let (p, listen) = (ProfileId::new("p"), attached());
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), || {
-            panic!("the session still listens on the old port; announcing it again is noise")
-        });
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
         assert!(matches!(
             out,
             RenewOutcome::RebindFailed {
@@ -795,6 +883,104 @@ mod tests {
             }
         ));
         assert!(reannounced(&eng).is_empty());
+    }
+
+    /// Two profiles on two gateways can be handed the same port, and a
+    /// tracker operator can correlate two addresses announcing one port. The
+    /// session is not rebound onto a port another profile holds.
+    #[test]
+    fn a_new_port_another_profile_holds_is_not_bound() {
+        let fwd = MockForwarder::with_ports([40001]);
+        let eng = MockEngine::new();
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), |p| {
+            p == 40001
+        });
+        assert!(
+            matches!(
+                out,
+                RenewOutcome::PortTaken {
+                    previous: 6881,
+                    new: 40001,
+                    ..
+                }
+            ),
+            "got {out:?}"
+        );
+        assert!(!eng
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::ApplySettings(_))));
+    }
+
+    /// Two renewals on two gateways can both rebind onto one port before
+    /// either sees the other's. The next renewal of either finds its port
+    /// unchanged; asked only of a new port, the collision (Safety Rule 8)
+    /// then went unreported for as long as it stood.
+    #[test]
+    fn an_unchanged_port_another_profile_now_holds_is_reported() {
+        let fwd = MockForwarder::with_ports([40001]);
+        let eng = MockEngine::new();
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 40001, 0, target(&p, &listen), |p| {
+            p == 40001
+        });
+        assert!(
+            matches!(
+                out,
+                RenewOutcome::PortTaken {
+                    previous: 40001,
+                    new: 40001,
+                    ..
+                }
+            ),
+            "got {out:?}"
+        );
+    }
+
+    /// A port-taken renewal still carries the gateway's epoch, and says
+    /// whether it went backwards: the gateway answered. Dropped, the next
+    /// renewal compared against an older epoch and could miss a reboot.
+    #[test]
+    fn a_port_taken_renewal_carries_the_gateways_epoch() {
+        let fwd = MockForwarder::new();
+        fwd.push_ok_epoch(40001, 7);
+        let eng = MockEngine::new();
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 500, target(&p, &listen), |p| {
+            p == 40001
+        });
+        assert!(
+            matches!(
+                out,
+                RenewOutcome::PortTaken {
+                    epoch: 7,
+                    rebooted: true,
+                    ..
+                }
+            ),
+            "got {out:?}"
+        );
+    }
+
+    /// Half the granted lease, with a floor. At a9eb5a1 the lease the gateway
+    /// granted was never read and every renewal ran on a fixed 30 seconds —
+    /// a lapse on a gateway granting 40.
+    #[test]
+    fn a_renewal_is_due_at_half_the_granted_lease() {
+        assert_eq!(renew_after(60, 60), Duration::from_secs(30));
+        assert_eq!(renew_after(40, 60), Duration::from_secs(20));
+        assert_eq!(renew_after(1, 60), MIN_RENEW_AFTER);
+    }
+
+    /// A lease longer than the one requested does not stretch the renewal
+    /// past half the *requested* one. Uncapped, a gateway granting 3600s
+    /// moved renewal from every 30s to every 30min, and a gateway reboot
+    /// (its epoch reset) or a lapsed mapping went unnoticed that long.
+    #[test]
+    fn a_longer_lease_than_requested_does_not_slow_the_renewal() {
+        assert_eq!(renew_after(3600, 60), Duration::from_secs(30));
+        assert_eq!(renew_after(7200, 60), Duration::from_secs(30));
     }
 
     #[test]
@@ -814,9 +1000,7 @@ mod tests {
                 (p.clone(), "10.2.0.2:40001", None),
             ],
         );
-        let out = renew_and_rebind(&fwd, &*eng, &req(), 6881, 0, target(&p, &listen), || {
-            panic!("nothing listens on the new port; announcing it would be a lie")
-        });
+        let out = renew_and_rebind(&fwd, &*eng, &req(), 6881, 0, target(&p, &listen), port_free);
         session.join().unwrap();
         assert!(
             matches!(
@@ -854,7 +1038,7 @@ mod tests {
                 timeout: Duration::from_millis(50),
                 ..target(&p, &listen)
             },
-            || panic!("an unconfirmed rebind is not announced"),
+            port_free,
         );
         assert!(matches!(
             out,
@@ -874,9 +1058,7 @@ mod tests {
         let fwd = MockForwarder::with_ports([40001]);
         let eng = MockEngine::new();
         let (p, listen) = (ProfileId::new("p"), ListenEvents::new());
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), || {
-            panic!("an unconfirmable rebind is not announced")
-        });
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
         assert!(matches!(
             out,
             RenewOutcome::RebindFailed {
@@ -907,7 +1089,7 @@ mod tests {
         fwd.push_ok_tcp_only(6881);
         let eng = MockEngine::new();
         let (p, listen) = (ProfileId::new("p"), attached());
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), no_handles);
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
         assert!(matches!(
             out,
             RenewOutcome::Unchanged {
@@ -923,7 +1105,7 @@ mod tests {
         fwd.push_err(PortForwardError::Gateway(3));
         let eng = MockEngine::new();
         let (p, listen) = (ProfileId::new("p"), attached());
-        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), no_handles);
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 0, target(&p, &listen), port_free);
         assert!(matches!(out, RenewOutcome::RenewFailed(_)));
         // Renewal failure must not rebind and must never pause torrents.
         assert!(eng.calls().iter().all(|c| !matches!(
@@ -953,7 +1135,7 @@ mod tests {
             6881,
             500,
             target(&p, &listen),
-            no_handles,
+            port_free,
         );
         assert!(matches!(
             out,

@@ -31,9 +31,17 @@
 //!    the host's public IP. The profile is recorded failed and reported; the
 //!    others proceed.
 //! 2. **No cross-profile announce.** `outgoing_interfaces` is pinned to the
-//!    tunnel IP, so libtorrent binds outgoing connections to it at the socket
-//!    level. If the tunnel drops, subsequent attempts fail at `bind()` rather
-//!    than falling out over the bare interface.
+//!    tunnel device, so libtorrent binds outgoing peer connections to it at
+//!    the socket level (`SO_BINDTODEVICE`). If the tunnel drops, subsequent
+//!    attempts fail at `bind()` rather than falling out over the bare
+//!    interface, and where the device binding takes, a lost routing rule
+//!    cannot route them there either. Where the kernel refuses it (no
+//!    `CAP_NET_RAW` before Linux 5.7) libtorrent binds the device's address
+//!    alone, and the route is the routing table's. Everything else — the
+//!    listen sockets, which also carry uTP and UDP tracker traffic, and what
+//!    answers on them — is bound to the tunnel address (and device-bound only
+//!    as far as libtorrent's own best effort goes), and routed by the
+//!    tunnel's source rule, which the health monitor checks every poll.
 //! 3. **Global info-hash uniqueness.** An add is refused with 409 if the
 //!    info-hash is loaded in *any* profile, not just the target. The same torrent
 //!    seeding under two accounts is visible to the tracker as one info-hash
@@ -77,8 +85,11 @@
 //!    profiles sharing one would be correlatable by a tracker operator even from
 //!    different IPs. Enforced for every profile that names its own port — a
 //!    `vpn` profile's static `listen_port`, and every port a `host` profile's
-//!    `listen_interfaces` binds. Gateway-assigned NAT-PMP ports are unique by
-//!    construction and are the one case nothing here checks.
+//!    `listen_interfaces` binds. Gateway-assigned NAT-PMP ports are not
+//!    unique by construction — two gateways assign independently — so they
+//!    are checked where they are assigned: a profile whose startup
+//!    negotiation lands on a port another profile holds is disabled, and a
+//!    renewal that moves onto one is not bound (`port_forward::renew_and_rebind`).
 //!
 //! `allowed_tracker_domains` is *not* in this list, but it is required on
 //! every `vpn` profile. It is the account-isolation guard: a profile that
@@ -675,9 +686,10 @@ pub enum ProfileConfigError {
     DuplicateInterface(String),
     #[error(
         "profile {profile:?}: vpn_interface {iface:?} is not a usable interface name: a name \
-         may be 1-15 characters of [A-Za-z0-9_=+.-] only, and not \".\" or \"..\". The kernel \
-         refuses a longer device name, and the network kill switch writes this name into an \
-         nftables ruleset that cannot carry any other character"
+         may be 1-15 characters of [A-Za-z0-9_=+.-] only, and not \".\", \"..\", \"all\" or \
+         \"interfaces\". The kernel refuses a longer device name, the network kill switch \
+         writes this name into an nftables ruleset that cannot carry any other character, and \
+         `wg show` reads \"all\" and \"interfaces\" as keywords"
     )]
     BadInterface { profile: String, iface: String },
     /// Two profiles announce one peer-id prefix.
@@ -888,7 +900,8 @@ impl ProfileConfig {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     }
 
-    /// `[A-Za-z0-9_=+.-]{1,15}`, excluding `.` and `..`.
+    /// `[A-Za-z0-9_=+.-]{1,15}`, excluding `.` and `..`, and `all` and
+    /// `interfaces`, which `wg show` reads as keywords rather than names.
     ///
     /// A `vpn_interface` is a Linux device name, and it is interpolated into
     /// the kill switch's nftables ruleset as a quoted string. The kernel's own
@@ -904,6 +917,8 @@ impl ProfileConfig {
             && name.len() <= 15
             && name != "."
             && name != ".."
+            && name != "all"
+            && name != "interfaces"
             && name
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'=' | b'+' | b'.' | b'-'))
@@ -1703,6 +1718,8 @@ mod tests {
             "wg:x",
             ".",
             "..",
+            "all",
+            "interfaces",
             "sixteen-chars-xx",
         ] {
             let profiles = vec![cfg("a", 6881, bad, "-AA1000-", "ua-a")];

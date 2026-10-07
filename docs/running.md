@@ -32,8 +32,8 @@ runtime and are easy to miss because nothing checks for them at startup:
 
 | Binary | Package | Needed for |
 | --- | --- | --- |
-| `ip` | `iproute2` / `iproute` | Any deployment with a `vpn` profile. Polled every 30s per profile for the tunnel IP. |
-| `wg`, `wg-quick` | `wireguard-tools` | WireGuard profiles — bring-up, teardown, handshake age. `wg-quick` only when the daemon runs as root; as any other user it raises links with `ip` and `wg` (§11.6). |
+| `ip` | `iproute2` / `iproute` | Any deployment with a `vpn` profile. Raises and routes each tunnel, and is polled every 30s per profile for the tunnel IP and the route from it. |
+| `wg` | `wireguard-tools` | WireGuard profiles — bring-up, teardown, handshake age. The daemon raises every link with `ip` and `wg` itself, as root or not, and never runs `wg-quick` (§11.6). |
 | `openvpn`, `kill` | `openvpn`, `util-linux` (`util-linux-core` on Fedora) | OpenVPN profiles. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. `kill` is spawned as a binary and not as a shell builtin, so `/usr/bin/kill` has to be on the host: that is `util-linux`, not `procps-ng`, which ships `pgrep` and `pkill` and no `kill`. |
 | `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
 
@@ -53,9 +53,10 @@ cannot come up in it — bring-up fails, the profile is reported failed, and wit
 no other profile the daemon exits. Run that configuration on a host, or add `openvpn` to
 the runtime stage yourself. `procps-ng` is there for the `sysctl` that
 `wg-quick` runs when it raises a full-tunnel (`AllowedIPs = 0.0.0.0/0`)
-profile; the daemon itself calls none of its binaries, and the `ps`, `pgrep`
-and `pkill` it also ships are what a `podman exec` into the image has for
-process inspection.
+profile — which the daemon no longer does, but an operator raising a link by
+hand inside the image still may; the daemon itself calls none of its
+binaries, and the `ps`, `pgrep` and `pkill` it also ships are what a
+`podman exec` into the image has for process inspection.
 
 ## 2. Submodules
 
@@ -137,13 +138,22 @@ while it is running:
   there is never a stale one to clear after a crash. Delete the file while the
   daemon runs and the next start no longer sees it.
 
-A deployment with no `vpn` profile has neither of the next two:
+A deployment with no `vpn` profile has none of the next three:
 
 - **`openvpn-<iface>.pid`** — the pid `openvpn --writepid` recorded for an
   OpenVPN profile. It is the only handle the teardown has on that process, and it
   is verified against `/proc/<pid>/cmdline` before anything is signalled, so a
   recycled pid is not signalled. Delete it while the daemon is running and the
   tunnel survives the next shutdown.
+- **`openvpn-<iface>.table`** — the routing table an OpenVPN profile's
+  source-address rules point at (§11.6), written before the first rule is
+  added. Teardown removes the rules pointing at it even when the openvpn
+  process has already died, then deletes the file; the next bring-up clears a
+  table left recorded by a run that never tore down. It carries the host's
+  **boot id** and is never believed after a reboot: a table number is an
+  ifindex, and after a reboot it may be a live WireGuard link's. Delete it while the
+  daemon is running and a tunnel whose openvpn dies on its own leaves its
+  `ip rule` entries behind.
 - **`wireguard-<iface>.raised`** — a note that *this boot of this host* raised
   the link now standing under that name. It is what lets a restart after an
   unclean shutdown adopt the tunnel still standing instead of leaving the
@@ -304,11 +314,11 @@ Metrics, each labelled `profile_id`:
 | `torrentd_profile_port_forward_up` | `1` while the last renewal succeeded and the session is bound to its result |
 | `torrentd_profile_port_forward_udp_mapped` | `0` while the gateway mapped TCP only; uTP peers cannot reach the session then |
 | `torrentd_profile_port_forward_renewals_total` | successful renewals |
-| `torrentd_profile_port_forward_failures_total` | every failed attempt, labelled `stage`: `renew` when the gateway did not answer or refused the lease, `rebind` when it answered with a port the session could not be rebound to |
+| `torrentd_profile_port_forward_failures_total` | every failed attempt, labelled `stage`: `renew` when the gateway did not answer or refused the lease, `rebind` when it answered with a port the session could not be rebound to, `port_taken` when it answered with a port another live profile holds |
 | `torrentd_profile_port_forward_rebind_failures_total` | the same count as `stage="rebind"` above |
 | `torrentd_profile_forwarded_port_changes_total` | port changes the session followed |
 | `torrentd_profile_port_change_reannounce_seconds` | histogram: from the gateway naming a new port to the last reannounce being handed to the session |
-| `torrentd_profile_vpn_gateway_reboots_total` | gateway epoch went backwards; the mapping was re-created on the spot |
+| `torrentd_profile_vpn_gateway_reboots_total` | gateway epoch went backwards; the renewal that saw it re-created the mapping on the spot |
 
 Several Proton accounts cannot share one daemon: every Proton WireGuard
 config gives the tunnel `10.2.0.2/32`, and the paragraph above says what
@@ -1149,20 +1159,28 @@ the same NAT-PMP client identity the daemon uses; whether a gateway coalesces
 it with the mapping the daemon already holds or hands out a second one is
 gateway behaviour, and nothing here tests it. `--bring-up` is the exception
 that changes the host: it skips an interface that already exists and lowers
-again only what it was observed to have raised, because `wg-quick down` on a
-live profile's tunnel fences that profile until the daemon is restarted.
+again only what it was observed to have raised, because lowering a live
+profile's tunnel fences that profile until the daemon is restarted.
 
-**`--bring-up` needs root, and it is not usable unattended without arranging
-for that.** `wg-quick` re-execs itself under `sudo` when it is not uid 0
-(`[[ $UID == 0 ]] || exec sudo -p … -- "$BASH" -- "$SELF" …`), so on a
-TTY-less invocation with no askpass helper configured it prompts for a
-password it cannot read and the bring-up fails. Run it under `sudo` yourself,
-or from a unit that already runs as root. If you put `vpn check` in a systemd
-`ExecStartPre`, that suggestion applies **only with `--bring-up` omitted, or
-with the unit running as root** — an `ExecStartPre` under `User=torrentd`
-with `--bring-up` hangs on the prompt and then fails the unit start. Without
-the flag the command changes nothing and needs no privilege at all, which is
-the form worth automating.
+**`--bring-up` needs `CAP_NET_ADMIN`.** It raises a WireGuard link exactly as
+the daemon does, with `ip` and `wg`, and routes it by source address; run it
+under `sudo`, or as a user holding the capability. Without the flag the
+command changes nothing and needs no privilege at all, which is the form worth
+automating.
+
+**It reports the health monitor's own verdict.** The `route` line is the
+monitor's route probe (`ip route get 1.1.1.1 from <tunnel address>` must
+leave by the tunnel device), and the `health` line is what the monitor's
+judgement — the same function, on the address, route and handshake just
+observed — would decide about the profile. The `kill_switch_ruleset` line
+dry-runs the exact script boot hands to `nft -f`, rendered by the same
+function, over the listen ports it can read; a tunnel that is not up has no
+port to read, and the line says which exemption it had to leave out.
+`--egress` asserts that the route to its destination leaves by the tunnel
+(`egress_route`) before it trusts a reply: a round trip that went out of the
+physical interface proves nothing about the tunnel, so it is not attempted.
+The tunnel address is IPv4, so an IPv6 destination fails `egress_route` as an
+address-family mismatch; give it an IPv4 one.
 
 **Run it as the daemon's user** where you can, so the `wg` probes describe the
 process that will actually run them. The kill-switch pair is the one place
@@ -1182,8 +1200,9 @@ report was *not* established, and a `0` does not carry it.
 | A pass establishes | Needs |
 | --- | --- |
 | the tunnel config is readable | nothing beyond read access to it |
-| `wg`, `wg-quick` and `ip` are executable | nothing — it is a binary-presence probe, and says nothing about the configuration |
+| `wg` and `ip` are executable | nothing — it is a binary-presence probe, and says nothing about the configuration |
 | the interface holds an IPv4 address | nothing |
+| a packet from that address would leave by the tunnel device | nothing — `ip route get` needs no privilege |
 | the effective `rp_filter` for that interface is not strict | nothing |
 | the gateway hands out a forwarded port when asked over the tunnel | a live tunnel and a live gateway; this is the strongest thing the command does |
 | the latest handshake is inside `vpn_handshake_max_age_secs` | **`CAP_NET_ADMIN`.** Without it `wg show <iface> latest-handshakes` is refused, the check reports `[?cap]`, and a `0` says nothing about handshake liveness |
@@ -1269,9 +1288,53 @@ On a scratch pool, not your real one.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
    /v1/pool/plans` and `DELETE /v1/torrents/{infohash}?delete_files=true` both
    answer 403 `mutations-disabled`.
-5. **Pull a tunnel down** (`wg-quick down <iface>`). Within 30s the
+5. **Pull a tunnel down** (`ip link delete <iface>`). Within 30s the
    profile should pause its torrents, report `vpn_down`, and refuse adds and
    resumes with 409 until you restart the daemon. It must not restart itself.
+
+   **Then take its route away and leave the tunnel up.** Each poll also asks
+   the kernel where a packet from the tunnel address would go
+   (`ip route get 1.1.1.1 from <tunnel address>`) and fences the profile
+   when the answer is not `dev <iface>` — the state a firewall reload or
+   another VPN client leaves when it flushes the rules, where the address and
+   the handshake still look healthy. On a scratch host, with the daemon up:
+
+   ```bash
+   sudo deploy/drill/route-fence.sh <iface>
+   ```
+
+   The script deletes only that tunnel's `from <address> lookup <table>`
+   rules — not the whole rule list, which would take the host's own routing
+   with it — waits up to one poll plus a grace, and exits 0 once
+   `torrentd_profile_vpn_fenced_total{reason="route_mismatch"}` has risen (the
+   log says `VPN tunnel unhealthy` with `reason=route_mismatch`). Set
+   `METRICS_URL` and `METRICS_TOKEN` if `/metrics` is not on
+   `127.0.0.1:8080` or needs the scrape token. Restart the daemon
+   afterwards; the rules come back with the tunnel.
+
+   What can leave by the physical interface before the fence trips depends
+   on the socket and on whether the kernel lets the daemon bind a socket to a
+   device (`SO_BINDTODEVICE`, which needs `CAP_NET_RAW` before Linux 5.7;
+   the unit grants only `CAP_NET_ADMIN`). Outgoing TCP peer connections are
+   bound to the tunnel device (`outgoing_interfaces`). Outgoing uTP and UDP
+   tracker announces are sent from the listen sockets, which are bound to
+   the tunnel address; libtorrent also binds those to the first interface
+   whose network holds that address, which is the tunnel unless another
+   interface's network covers the tunnel address. Where the device binding
+   takes, that traffic keeps leaving by the tunnel. Where it is refused —
+   libtorrent then binds the socket to the address alone, for TCP as for the
+   listen sockets — or names the wrong interface, the traffic follows the
+   routing table and can leave by the physical interface, with the tunnel's
+   source address, until the next poll fences the profile. With
+   `network_kill_switch = true` the kill switch drops it.
+
+   A WireGuard tunnel that comes up and **never handshakes** — a wrong key,
+   a dead endpoint — is fenced with `reason=no_handshake` once it has gone
+   `vpn_handshake_max_age_secs` with unpaused torrents in its profile and no
+   handshake. The clock runs only while the profile has a torrent that is not
+   paused (or stopped on an error): WireGuard handshakes on the first packet
+   sent into the tunnel, and an empty or fully paused profile sends none. A
+   poll whose handshake probe could not run leaves the clock where it was.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
    interfaces for the daemon's uid. Setting it with no `vpn` profile, or
@@ -1301,11 +1364,10 @@ On a scratch pool, not your real one.
    - **OpenVPN profiles: not at all.** The daemon spawns `openvpn` under its
      own uid, so the provider connection is dropped. The config is refused at
      load (and by `--check-config`).
-   - **WireGuard profiles: yes, with the daemon as its own user.** `wg-quick`
-     re-execs through `sudo` unless it runs as uid 0, and the packaged unit's
-     `NoNewPrivileges=yes` stops that `sudo` from elevating, so a daemon that
-     is not root raises its links itself with `ip` and `wg`, which need only
-     `CAP_NET_ADMIN`. A link root raised before the daemon started is still
+   - **WireGuard profiles: yes, with the daemon as its own user.** The daemon
+     raises its links itself with `ip` and `wg`, which need only
+     `CAP_NET_ADMIN`, and never runs `wg-quick` — as root either. A link root
+     raised before the daemon started is still
      adopted when its key matches, and is exempted the same way. The daemon
      does not remove such a link at shutdown: it removes only links its
      `wireguard-<iface>.raised` record (§4) names, so a root-raised link — and
@@ -1328,7 +1390,29 @@ On a scratch pool, not your real one.
       `PreUp`/`PostUp`/`PreDown`/`PostDown` are refused, so the
       `PostUp = wg set %i private-key …` pattern does not work here: put
       `PrivateKey` in the file. `Table` may be `auto` or `off`; anything else
-      is refused. `DNS` and `SaveConfig` are ignored with a warning.
+      is refused. `DNS` and `SaveConfig` are ignored with a warning. With
+      `Table = off` the routing is yours: traffic *from* the tunnel address
+      must still route by the tunnel, because the health monitor checks
+      exactly that every poll (`ip route get 1.1.1.1 from <address>`) and
+      fences the profile (`route_mismatch`) when it does not.
+
+      The bring-up asks the same question once the link is up, and **refuses
+      a config whose answer would be fenced** rather than letting it come up
+      and be fenced on the first poll: a `Table = off` link that nothing
+      routes through the tunnel is taken down again — which is every link the
+      daemon raises itself under `Table = off`, since a route naming the link
+      can only be added once it exists, so raise a `Table = off` link with
+      your own routing before the daemon starts and let the daemon adopt it —
+      and a split `AllowedIPs`
+      that does not cover `1.1.1.1` (with an IPv4 `Address`) is refused before
+      anything is created, because only `AllowedIPs` are routed through the
+      tunnel and the probe's packet would leave by the main table. The
+      profile is reported failed with the reason. Use `AllowedIPs =
+      0.0.0.0/0` (plus `::/0` for IPv6). The `Table = off` case, a link
+      whose installed routing is outranked by another rule, and one whose
+      routing could not be installed at all are reported as a routing
+      failure; `vpn check --bring-up` reports each as a tunnel that came up
+      and was taken down again.
    4. Set `network_kill_switch = true` and start the unit.
 
    How the daemon raises a link: `ip link add <iface> type wireguard`,
@@ -1340,6 +1424,24 @@ On a scratch pool, not your real one.
    sockets are bound to its tunnel address, so that is all the daemon needs,
    and nothing else on the host is rerouted. Shutdown removes the rules and
    the link it raised. `ip rule show` lists them as `from <address> lookup <table>`.
+   This is the only way the daemon raises a WireGuard link, as root too: as
+   root, `wg-quick`'s host-wide default route made a second full-tunnel
+   profile reroute the first one's traffic. An **OpenVPN** profile gets the
+   same table and rule: `openvpn` runs with `--route-noexec --pull-filter
+   ignore redirect-gateway`, so it installs no routes and never takes the
+   host's default route, and the daemon routes the tunnel (a routed `tun`
+   device; a bridged `tap` profile is not supported) once it has its address.
+   It also runs with `--persist-tun`, because the table is keyed on the
+   device's ifindex and its routes go with the device: a `ping-restart` or
+   `SIGUSR1` reconnect keeps the device and its routing. A reconnect that
+   recreates the device anyway — the server pushed different options — is
+   fenced as a route mismatch or an address change, and routing is not
+   re-installed behind the monitor's back.
+
+   The ruleset is installed as **one `nft -f` transaction** that replaces
+   whatever `torrentd_ks` table is standing, so there is no instant between
+   the old ruleset and the new one with neither in force, and an install that
+   fails leaves the previous one armed.
 
    **Name resolution does not go through the tunnel on this path.** The
    daemon's lookups use the host's resolver, and under the kill switch only a
@@ -1373,11 +1475,13 @@ On a scratch pool, not your real one.
       forgets the mapping. If the VPN monitor saw the tunnel down in
       between, the profile is paused and fenced as in drill 5 and stays so
       until a restart; that is the tunnel-loss path, not this one. Repeat
-      until the log shows `NAT-PMP port changed; rebound live session and
-      reannounced its torrents` with the profile still `active`.
-   3. Within 60 seconds of that line the tracker should show the new port.
-      `torrentd_profile_port_change_reannounce_seconds` shows how long the
-      reannounce took to go out.
+      until the log shows `NAT-PMP port changed; rebound live session,
+      reannouncing its torrents` with the profile still `active`.
+   3. The reannounce goes out 100 torrents a second, beside the renewals, and
+      `reannounced the profile's torrents after the port change` is logged
+      when the last batch is out; `torrentd_profile_port_change_reannounce_seconds`
+      is that time. Within 60 seconds of it the tracker should show the new
+      port.
    4. Across a slow boot — several profiles, a large resume directory —
       `torrentd_profile_port_forward_failures_total` should stay at `0`, and
       `torrentd_profile_port_forward_up` should not drop to `0`, with one
@@ -1486,7 +1590,7 @@ run it by hand instead, start the service again afterwards:
 | `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, bring the tunnels back, then restart — fenced profiles do not resume themselves by design. |
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
-| A WireGuard profile fails with "hooks are not run when the daemon raises the link itself" or "Table = … is not supported" | The daemon is not root, so it raises the link with `ip` and `wg` and cannot run `wg-quick`'s hooks or honour a named table (§11.6). Move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
+| A WireGuard profile fails with "hooks are not run" or "Table = … is not supported" | The daemon raises every link with `ip` and `wg`, as root too, and runs no `wg-quick` hooks and honours no named table (§11.6). Either raise the link as root before the daemon starts — it is adopted by its key — or move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
 | Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port`; a link re-raised by hand after the daemon started has a new port. Restart the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it will not `wg-quick down` something it cannot vouch for, because that would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |

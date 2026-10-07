@@ -4,23 +4,30 @@
 //! <iface>` rather than pulling in `rtnetlink` and its considerable
 //! transitive dependency footprint. The same `VpnManager` trait can host
 //! a netlink-based implementation later without changing any caller.
+//!
+//! Every host tool this subsystem runs goes through [`exec::run`]: one
+//! timeout, one locale, one rule for interface names.
 
+pub(crate) mod exec;
 mod ip_lookup;
 pub mod killswitch;
 mod natpmp;
 mod openvpn;
+pub mod route;
 mod wireguard;
 
 use std::path::Path;
 use std::sync::Arc;
 
 pub use ip_lookup::first_ipv4;
+pub use ip_lookup::link_exists;
 pub use natpmp::NatpmpForwarder;
 pub use openvpn::OpenvpnManager;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
 pub use wireguard::latest_handshake_age as wireguard_handshake_age;
 pub use wireguard::sweep_raised_records;
+pub use wireguard::ProbeUnavailable as HandshakeProbeUnavailable;
 pub use wireguard::WireguardManager;
 
 /// Build the matching real implementation for a `VpnType`.

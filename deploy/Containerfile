@@ -56,8 +56,9 @@ FROM registry.fedoraproject.org/fedora-minimal:43
 # and none ever has been, so a profile configured `vpn_type = "openvpn"` cannot
 # come up in this image: bring-up fails, the profile is fenced, and with no other
 # profile the daemon exits. Install `openvpn` here, or run that configuration on
-# a host, if you need it. `ip`, `wg`, `wg-quick` and `nft` are the whole of
-# what the daemon shells out to in this image, plus `stty`, which
+# a host, if you need it. `ip`, `wg` and `nft` are the whole of what the daemon
+# shells out to in this image: it raises every WireGuard link with `ip` and
+# `wg` itself, as root or not, and never runs `wg-quick`. Add `stty`, which
 # `torrentd hash-password` runs to stop the terminal echoing the password.
 #
 # curl: used by HEALTHCHECK below.
@@ -81,7 +82,10 @@ FROM registry.fedoraproject.org/fedora-minimal:43
 #
 # `procps-ng` is **not** where `kill` comes from: that package ships `pgrep`
 # and `pkill` and no `kill`. It is installed all the same, and the consumer is
-# **`wg-quick`, not this repository's source**.
+# **`wg-quick`, not the daemon**. The daemon no longer runs `wg-quick` on any
+# path, so nothing the daemon does needs this package; it stays for an operator
+# who raises a link by hand with `wg-quick` inside the image, and for the
+# process-inspection tools below.
 #
 # `wg-quick` line 241, inside `add_default()` and under `set -e -o pipefail`:
 #
@@ -95,25 +99,26 @@ FROM registry.fedoraproject.org/fedora-minimal:43
 # exits 127. `cmd_up`'s `trap 'del_if; exit' INT TERM EXIT` then deletes the
 # link it has just created. That path runs for `AllowedIPs = 0.0.0.0/0`, the
 # full-tunnel shape every commercial provider uses and the one
-# `deploy/torrentd.sample.toml` names for ProtonVPN and PIA, so dropping this
-# package means **no WireGuard profile can come up in this image** and the daemon
-# exits because no profile came up. A narrow `AllowedIPs` never reaches
-# `add_default()` and is unaffected, which is what makes the breakage easy to
-# miss.
+# `deploy/torrentd.sample.toml` names for ProtonVPN and PIA, so without this
+# package a full-tunnel link cannot be raised by hand with `wg-quick` in this
+# image. When the daemon still ran `wg-quick` as root, that meant no such
+# profile could come up at all; the daemon's own bring-up no longer reaches
+# this path. A narrow `AllowedIPs` never reaches `add_default()` and is
+# unaffected, which is what made the breakage easy to miss.
 #
 # The package was once here for a pattern-based `pkill` teardown that a
 # recycled pid made unsafe; that call site is gone, and it was dropped on the
 # evidence that `grep -rn 'pkill|pgrep' crates/` returns nothing. That search
 # was of **this repository's source**, for two of the package's binaries; the
-# dependency is a third binary, in a tool the daemon execs. The standing
-# lesson, recorded where the next reader meets it: **a runtime dependency of a
-# binary this daemon execs is not discoverable by grepping this repository.**
-# Before removing this package again, establish that nothing the daemon execs
-# — `ip`, `wg`, `wg-quick`, `nft` — needs it.
+# dependency was a third binary, in a tool the daemon then execed. The
+# standing lesson, recorded where the next reader meets it: **a runtime
+# dependency of a binary this daemon execs is not discoverable by grepping
+# this repository.** Before removing this package, establish that nothing the
+# daemon execs — `ip`, `wg`, `nft` — needs it, and decide whether a by-hand
+# `wg-quick` inside the image is still worth supporting.
 #
-# It also happens to restore the process-inspection tools (`ps`, `pgrep`,
-# `pkill`) for an operator who `podman exec`s in. That is a side effect, not
-# the reason.
+# It also restores the process-inspection tools (`ps`, `pgrep`, `pkill`) for
+# an operator who `podman exec`s in.
 RUN microdnf install -y \
         openssl ca-certificates curl iproute wireguard-tools nftables procps-ng \
         coreutils \

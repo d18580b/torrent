@@ -468,7 +468,15 @@ pub const CATALOGUE: &[Series] = &[
         "profile_vpn_fenced_total",
         Counter,
         VpnProfile,
-        ("reason", &["ip_lost_or_changed", "handshake_stale"]),
+        (
+            "reason",
+            &[
+                "ip_lost_or_changed",
+                "route_mismatch",
+                "handshake_stale",
+                "no_handshake",
+            ],
+        ),
         Seed::Owner("live vpn profiles"),
         "Times the VPN monitor fenced the profile, by reason.",
     ),
@@ -479,6 +487,14 @@ pub const CATALOGUE: &[Series] = &[
         Seed::Owner("live wireguard profiles"),
         "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or \
          unprivileged).",
+    ),
+    series(
+        "profile_vpn_route_probe_ok",
+        Gauge,
+        VpnProfile,
+        Seed::Owner("live vpn profiles"),
+        "1 while the route probe (ip route get from the tunnel address) runs; 0 when it \
+         cannot, and the tunnel's routing is not being checked.",
     ),
     series(
         "profile_vpn_handshake_age_seconds",
@@ -513,10 +529,11 @@ pub const CATALOGUE: &[Series] = &[
         "profile_port_forward_failures_total",
         Counter,
         NatpmpProfile,
-        ("stage", &["renew", "rebind"]),
+        ("stage", &["renew", "rebind", "port_taken"]),
         Seed::Owner("live natpmp profiles"),
         "NAT-PMP attempts that failed, by stage: renew when the gateway did not answer or \
-         refused the lease, rebind when it named a new port the session could not be rebound to.",
+         refused the lease, rebind when it named a new port the session could not be rebound to, \
+         port_taken when it named a port another profile holds.",
     ),
     series(
         "profile_port_forward_rebind_failures_total",

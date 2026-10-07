@@ -53,6 +53,7 @@ use torrentd_engine::PortForwardMode;
 use torrentd_engine::PortForwarder;
 use torrentd_engine::PortMapRequest;
 use torrentd_engine::ProfileConfig;
+use torrentd_engine::VpnError;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
 
@@ -290,13 +291,7 @@ fn has_cap_net_admin() -> bool {
 
 /// Whether `bin` can be executed at all.
 fn tool_available(bin: &str, probe_arg: &str) -> bool {
-    std::process::Command::new(bin)
-        .arg(probe_arg)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    vpn::exec::available(bin, probe_arg)
 }
 
 /// The host-touching operations a profile's checks perform, behind a trait so the
@@ -376,6 +371,19 @@ pub trait CheckHost {
     /// answer: `wg` refuses a non-WireGuard interface and an interface it
     /// lacks the capability to read with the same error.
     fn wireguard_device(&self, iface: &str) -> Option<bool>;
+
+    /// The UDP port the WireGuard link `iface` listens on — the probe
+    /// `killswitch::enable` reads each tunnel's transport exemption from.
+    fn listen_port(&self, iface: &str) -> std::io::Result<u16>;
+
+    /// Where the kernel would route a packet from `src` to `dest`, judged
+    /// against `iface` — the health monitor's route probe.
+    fn route_probe(
+        &self,
+        iface: &str,
+        src: IpAddr,
+        dest: IpAddr,
+    ) -> Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>;
 }
 
 /// `CheckHost` against the actual machine.
@@ -394,9 +402,12 @@ impl RealHost {
 
 impl CheckHost for RealHost {
     fn interface_exists(&self, iface: &str) -> bool {
-        // The kernel's own list. `ip link show` would answer the same question
-        // through a subprocess whose absence we already report separately.
-        Path::new("/sys/class/net").join(iface).exists()
+        // Asked of `ip`, from this process's network namespace — the view
+        // the tunnel managers act on — and not of `/sys/class/net`, which
+        // shows the namespace sysfs was mounted in. A probe that could not be
+        // answered reads as present: that is the answer that never lowers an
+        // interface this command did not raise.
+        vpn::link_exists(iface).unwrap_or(true)
     }
 
     fn first_ipv4(&self, iface: &str) -> std::io::Result<Ipv4Addr> {
@@ -436,32 +447,40 @@ impl CheckHost for RealHost {
     }
 
     fn nft_check(&self, ruleset: &str) -> std::io::Result<std::process::Output> {
-        nft_check(ruleset)
+        vpn::killswitch::check(ruleset)
     }
 
     fn wireguard_device(&self, iface: &str) -> Option<bool> {
-        // Both reads need no capability. `DEVTYPE=wireguard` in the kernel's
-        // own uevent is the cheap one and needs no subprocess; `ip -d link
-        // show` reports the same link type and is consulted second, because
-        // a device that sets no `DEVTYPE` is only evidence of "not WireGuard"
-        // once something else has looked. Neither answering is `None`, which
+        // `ip -d link show` needs no capability, and it reads the link type
+        // from this process's namespace — the one `wg` and the managers see.
+        // It used to be preceded by `/sys/class/net/<iface>/uevent`, which is
+        // the namespace sysfs was mounted in. Not answering is `None`, which
         // leaves the handshake verdict exactly where it was.
-        let uevent =
-            std::fs::read_to_string(Path::new("/sys/class/net").join(iface).join("uevent")).ok();
-        if uevent
-            .as_deref()
-            .is_some_and(|u| u.lines().any(|l| l.trim() == "DEVTYPE=wireguard"))
-        {
-            return Some(true);
-        }
-        let out = std::process::Command::new("ip")
-            .args(["-d", "link", "show", iface])
-            .output()
-            .ok()?;
+        let name = vpn::exec::iface(iface).ok()?;
+        let out = vpn::exec::run(
+            "ip",
+            &["-d", "link", "show", "dev", name],
+            None,
+            vpn::exec::QUICK,
+        )
+        .ok()?;
         if !out.status.success() {
             return None;
         }
         link_type_is_wireguard(&String::from_utf8_lossy(&out.stdout))
+    }
+
+    fn listen_port(&self, iface: &str) -> std::io::Result<u16> {
+        vpn::killswitch::listen_port(iface)
+    }
+
+    fn route_probe(
+        &self,
+        iface: &str,
+        src: IpAddr,
+        dest: IpAddr,
+    ) -> Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable> {
+        vpn::route::probe(iface, src, dest)
     }
 }
 
@@ -834,24 +853,6 @@ fn judge_handshake(
     }
 }
 
-/// Dry-run a ruleset through `nft --check --file -`: nftables parses it and
-/// validates it against the live kernel, and installs nothing.
-fn nft_check(ruleset: &str) -> std::io::Result<std::process::Output> {
-    use std::io::Write;
-    let mut child = std::process::Command::new("nft")
-        .args(["--check", "--file", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| std::io::Error::other("nft stdin unavailable"))?
-        .write_all(ruleset.as_bytes())?;
-    child.wait_with_output()
-}
-
 /// Checks that are about the host, not any one profile.
 ///
 /// `iproute2` and `nftables` are here because they genuinely are host-wide: a
@@ -924,9 +925,16 @@ fn host_checks(
                     .iter()
                     .filter_map(|p| p.vpn_interface().map(str::to_string))
                     .collect();
+                // The script boot hands to `nft -f` — `killswitch::install_script`,
+                // the same renderer `killswitch::enable` calls — over the
+                // listen ports that can be read now. Boot reads each one off
+                // the live link and refuses to install without it; a link
+                // that is not up yet has no port to read, so its exemption is
+                // named as missing rather than guessed at.
+                let (ruleset, unread) = boot_install_script(uid, &tunnels, host);
                 // A name the renderer refuses is the same boot abort as a
                 // ruleset `nft` rejects, reported before any `nft` runs.
-                let verdict = match vpn::killswitch::render_ruleset(uid, &tunnels) {
+                let verdict = match ruleset {
                     Ok(ruleset) => judge_nft_check(
                         host.nft_check(&ruleset),
                         host.has_cap_net_admin(),
@@ -935,6 +943,7 @@ fn host_checks(
                     ),
                     Err(e) => Check::fail("kill_switch_ruleset", e.to_string()),
                 };
+                let verdict = note_unread_ports(verdict, &unread);
                 attribute_ruleset_rejection(verdict, cfg, only, uid, host)
             }
         });
@@ -943,6 +952,52 @@ fn host_checks(
     }
 
     out
+}
+
+/// The kill-switch script boot would install for `uid` over `tunnels`, with
+/// the transport exemption for every tunnel whose listen port `host` can read,
+/// and the tunnels whose port it could not.
+///
+/// Rendered by [`vpn::killswitch::install_script`], which is what
+/// `killswitch::enable` renders with: for the same uid, tunnels and ports the
+/// two are the same bytes. They used to differ — this command dry-ran the bare
+/// table with no transport exemption and no replace, which is not the script
+/// boot installs.
+fn boot_install_script(
+    uid: u32,
+    tunnels: &[String],
+    host: &dyn CheckHost,
+) -> (std::io::Result<String>, Vec<String>) {
+    let mut ports = Vec::new();
+    let mut unread = Vec::new();
+    for iface in tunnels {
+        match host.listen_port(iface) {
+            Ok(p) => ports.push(p),
+            Err(_) => unread.push(iface.clone()),
+        }
+    }
+    (
+        vpn::killswitch::install_script(uid, tunnels, &ports),
+        unread,
+    )
+}
+
+/// Say which transport exemptions the dry-run could not include.
+///
+/// Not a verdict of its own: the ruleset's syntax and its acceptance by this
+/// kernel do not depend on a port number, so the dry-run still establishes
+/// what it establishes. What boot would do differently is stated: it reads
+/// the port off the live link and refuses the install if it cannot.
+fn note_unread_ports(mut verdict: Check, unread: &[String]) -> Check {
+    if !unread.is_empty() {
+        verdict.detail.push_str(&format!(
+            "\nno listen port could be read for {} (not up?), so this dry-run carries no \
+             transport exemption for it; boot reads each one off the live link and refuses \
+             to install the kill switch without it",
+            unread.join(", "),
+        ));
+    }
+    verdict
 }
 
 /// Keep an excluded profile's interface out of a scoped run's exit status.
@@ -992,7 +1047,7 @@ fn attribute_ruleset_rejection(
         .collect();
     // The selected profile's own name cannot be rendered: it owns the
     // rejection, and the verdict stands.
-    let Ok(scoped_ruleset) = vpn::killswitch::render_ruleset(uid, &scoped) else {
+    let Ok(scoped_ruleset) = boot_install_script(uid, &scoped, host).0 else {
         return verdict;
     };
     let scoped_parses = match host.nft_check(&scoped_ruleset) {
@@ -1029,7 +1084,7 @@ fn attribute_ruleset_rejection(
 ///
 /// This is the check that distinguishes a tunnel which exists from a tunnel
 /// which works, and it is the same question the daemon asks implicitly of
-/// every profile: `outgoing_interfaces` is pinned to the tunnel IP, so if traffic
+/// every profile: `outgoing_interfaces` is pinned to the tunnel, so if traffic
 /// cannot leave from that source address the profile connects to no peers and
 /// announces to no tracker, while looking perfectly healthy to the IP-presence
 /// check.
@@ -1141,7 +1196,8 @@ fn profile_checks(
         .vpn_type()
         .expect("only vpn profiles reach profile_checks");
 
-    // 1. The tunnel config the daemon would hand to wg-quick / openvpn.
+    // 1. The tunnel config the daemon would raise the link from / hand to
+    //    openvpn.
     checks.push(match host.profile_metadata(&vpn_config) {
         Ok(_) => Check::pass(
             "vpn_config",
@@ -1153,19 +1209,16 @@ fn profile_checks(
     // 2. The tools that profile's type needs.
     match vpn_type {
         VpnType::Wireguard => {
+            // No `wg-quick` line: the daemon raises every link with `ip` and
+            // `wg` itself and never runs it.
             checks.push(if host.tool_available("wg", "--version") {
                 Check::pass("wireguard_tools", "`wg` is available")
             } else {
                 Check::fail(
                     "wireguard_tools",
-                    "`wg` is not executable: the handshake half of the health monitor \
-                     cannot run, and the daemon would fall back to IP presence alone",
+                    "`wg` is not executable: the daemon cannot raise the link, and the \
+                     handshake half of the health monitor cannot run",
                 )
-            });
-            checks.push(if host.tool_available("wg-quick", "--help") {
-                Check::pass("wg_quick", "`wg-quick` is available")
-            } else {
-                Check::unknown("wg_quick", "`wg-quick --help` did not exit cleanly")
             });
         }
         VpnType::Openvpn => {
@@ -1239,6 +1292,11 @@ fn profile_checks(
                             "; {iface} is there even so, so this command raised it and is \
                              lowering it again"
                         )
+                    } else if matches!(e, VpnError::RoutingFailed { .. }) {
+                        // The tunnel did appear; the bring-up lowered it
+                        // itself. Nothing is missing, and nothing was
+                        // left running for want of a pid.
+                        String::new()
                     } else {
                         match vpn_type {
                             VpnType::Openvpn => format!(
@@ -1247,9 +1305,9 @@ fn profile_checks(
                                  process running that this command cannot see to stop"
                             ),
                             VpnType::Wireguard => format!(
-                                "; no {iface} appeared, and `wg-quick up` leaves no process \
-                                 behind, so there is nothing running for this command to \
-                                 have missed"
+                                "; no {iface} appeared, and raising a WireGuard link leaves \
+                                 no process behind, so there is nothing running for this \
+                                 command to have missed"
                             ),
                         }
                     };
@@ -1304,11 +1362,23 @@ fn profile_checks(
         }
     };
 
+    // 4b. The route the health monitor probes every poll: where a packet
+    //     from the tunnel address to the internet would go.
+    let route =
+        tunnel_ip.map(|src| host.route_probe(iface, src, IpAddr::V4(vpn::route::PROBE_DEST)));
+    checks.push(judge_route(
+        "route",
+        iface,
+        tunnel_ip,
+        IpAddr::V4(vpn::route::PROBE_DEST),
+        route.clone(),
+    ));
+
     // 5. Handshake liveness — the same probe and the same threshold the health
     //    monitor applies every 30 seconds.
-    match vpn_type {
+    let max = Duration::from_secs(cfg.vpn_handshake_max_age_secs);
+    let handshake_probe = match vpn_type {
         VpnType::Wireguard => {
-            let max = Duration::from_secs(cfg.vpn_handshake_max_age_secs);
             let probe = host.handshake_age(iface);
             checks.push(judge_handshake(
                 iface,
@@ -1317,13 +1387,48 @@ fn profile_checks(
                 host.has_cap_net_admin(),
                 host.wireguard_device(iface),
             ));
+            Some(probe)
         }
         VpnType::Openvpn => {
             checks.push(Check::skip(
                 "handshake",
                 "no cheap liveness probe for openvpn",
             ));
+            None
         }
+    };
+
+    // 5b. The health monitor's own verdict on what was just observed, from
+    //     the function the monitor itself calls. The session the monitor would
+    //     compare against is bound to the address the tunnel has now, and no
+    //     torrent has been waiting on this tunnel, so a WireGuard link that has
+    //     not handshaked yet is still inside its threshold (the `handshake`
+    //     line above reports it).
+    if let Some(ip) = tunnel_ip {
+        let observation = crate::vpn_monitor::Observation {
+            current: Some(ip),
+            expected: Some(ip),
+            route: route.and_then(Result::ok),
+            handshake: match handshake_probe {
+                Some(Ok(Some(age))) => crate::vpn_monitor::Handshake::Age(age),
+                Some(Ok(None)) => crate::vpn_monitor::Handshake::Never,
+                Some(Err(_)) | None => crate::vpn_monitor::Handshake::NoSignal,
+            },
+            unanswered_for: Duration::ZERO,
+        };
+        checks.push(match crate::vpn_monitor::evaluate(&observation, max) {
+            Ok(()) => Check::pass(
+                "health",
+                "the daemon's health monitor would keep this profile up on these observations",
+            ),
+            Err(reason) => Check::fail(
+                "health",
+                format!(
+                    "the daemon's health monitor would fence this profile ({})",
+                    reason.as_str()
+                ),
+            ),
+        });
     }
 
     // 6. Port forwarding, against the real gateway.
@@ -1408,9 +1513,59 @@ fn profile_checks(
     //    for reports a verdict either way: omitting the line and the JSON key
     //    when there is no address to bind to is the silent green the
     //    four-valued vocabulary exists to prevent.
+    //
+    //    A reply proves something left and came back; it does not prove it
+    //    left by the tunnel. A source-bound socket whose rule is gone is
+    //    routed by the main table, out of the physical interface with the
+    //    tunnel's address as its source, and on a host where that still gets
+    //    an answer the round trip passed. So the route to the probe's own
+    //    destination is asserted first, and the round trip is a pass only
+    //    over a route that leaves by the tunnel.
+    //
+    //    A destination of the other address family is said to be one before
+    //    anything is asked of `ip`: `ip route get <v6> from <v4>` fails, and
+    //    that failure read as a missing or outranked tunnel rule.
     if let Some(dest) = egress {
+        let mismatch = tunnel_ip.filter(|src| src.is_ipv4() != dest.ip().is_ipv4());
+        let route_check = match mismatch {
+            Some(src) => Check::fail(
+                "egress_route",
+                format!(
+                    "{dest} is not of the address family of {iface}'s address {src}, so no \
+                     socket bound to the tunnel address can reach it; give --egress a \
+                     destination of {src}'s family"
+                ),
+            ),
+            None => {
+                let route = tunnel_ip.map(|src| host.route_probe(iface, src, dest.ip()));
+                judge_route("egress_route", iface, tunnel_ip, dest.ip(), route)
+            }
+        };
+        let routed = route_check.verdict == Verdict::Pass;
+        let route_unknown = route_check.verdict == Verdict::Unknown;
+        checks.push(route_check);
         checks.push(match tunnel_ip {
-            Some(src) => egress_probe(src, dest),
+            Some(src) if routed => egress_probe(src, dest),
+            Some(src) if mismatch.is_some() => Check::skip(
+                "egress",
+                format!(
+                    "{dest} was not probed: it cannot be reached from {src} (see egress_route)"
+                ),
+            ),
+            Some(_) if route_unknown => Check::skip(
+                "egress",
+                format!(
+                    "{dest} was not probed: its route could not be asked (see egress_route), \
+                     so a reply would not show the tunnel carries traffic"
+                ),
+            ),
+            Some(_) => Check::skip(
+                "egress",
+                format!(
+                    "{dest} was not probed: its route does not leave by {iface} (see \
+                     egress_route), so a reply would not show the tunnel carries traffic"
+                ),
+            ),
             None => Check::skip(
                 "egress",
                 format!("{iface} has no address to send from, so {dest} was not probed"),
@@ -1429,6 +1584,38 @@ fn profile_checks(
         profile_id: profile.id.as_str().to_string(),
         vpn_type: vpn_type_str(vpn_type),
         checks,
+    }
+}
+
+/// The verdict a route probe implies: a route from the tunnel address to
+/// `dest` that leaves by `iface` passes, any other route fails, and a probe
+/// that could not run is `unknown`. With no tunnel address there is nothing to
+/// ask about, which the `tunnel_ip` line already fails.
+fn judge_route(
+    name: &'static str,
+    iface: &str,
+    src: Option<IpAddr>,
+    dest: IpAddr,
+    probe: Option<Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>>,
+) -> Check {
+    match (src, probe) {
+        (Some(src), Some(Ok(vpn::route::RouteProbe::ViaTunnel))) => Check::pass(
+            name,
+            format!("a packet from {src} to {dest} leaves by {iface}"),
+        ),
+        (Some(src), Some(Ok(vpn::route::RouteProbe::Elsewhere(why)))) => Check::fail(
+            name,
+            format!(
+                "a packet from {src} to {dest} does not leave by {iface} ({why}): the \
+                 source-address rule for the tunnel is missing or outranked, and the daemon's \
+                 health monitor fences a profile in this state"
+            ),
+        ),
+        (Some(_), Some(Err(why))) => Check::unknown(
+            name,
+            format!("`ip route get` could not run ({})", why.as_str()),
+        ),
+        _ => Check::skip(name, format!("{iface} has no address to route from")),
     }
 }
 
@@ -1660,6 +1847,12 @@ mod tests {
         /// What `handshake_age` answers for every interface. Defaults to a
         /// refusal, which is what an unprivileged `wg show` returns.
         handshake: Result<Option<Duration>, &'static str>,
+        /// Scripted `listen_port` answers. An interface not listed has no
+        /// port to read, which is a link that is not up.
+        ports: Vec<(String, u16)>,
+        /// What `route_probe` answers for every lookup. Defaults to a route by
+        /// the tunnel, which is the healthy host.
+        route: Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>,
     }
 
     impl FakeHost {
@@ -1678,7 +1871,24 @@ mod tests {
                 nft: Mutex::new(Vec::new()),
                 wg_devices: Vec::new(),
                 handshake: Err("refused"),
+                ports: Vec::new(),
+                route: Ok(vpn::route::RouteProbe::ViaTunnel),
             }
+        }
+
+        /// Script the listen port `iface`'s link reports.
+        fn with_listen_port(mut self, iface: &str, port: u16) -> Self {
+            self.ports.push((iface.to_string(), port));
+            self
+        }
+
+        /// Script what every route lookup answers.
+        fn with_route(
+            mut self,
+            route: Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>,
+        ) -> Self {
+            self.route = route;
+            self
         }
 
         /// Script what the `wg show <iface> latest-handshakes` probe answers.
@@ -1842,6 +2052,25 @@ mod tests {
                 .iter()
                 .find(|(i, _)| i == iface)
                 .map(|(_, v)| *v)
+        }
+
+        fn listen_port(&self, iface: &str) -> std::io::Result<u16> {
+            self.record(format!("listen_port {iface}"));
+            self.ports
+                .iter()
+                .find(|(i, _)| i == iface)
+                .map(|(_, p)| *p)
+                .ok_or_else(|| std::io::Error::other(format!("{iface} is not up")))
+        }
+
+        fn route_probe(
+            &self,
+            iface: &str,
+            src: IpAddr,
+            dest: IpAddr,
+        ) -> Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable> {
+            self.record(format!("route_probe {iface} {src} {dest}"));
+            self.route.clone()
         }
     }
 
@@ -3290,6 +3519,43 @@ user_agent           = "Transmission/4.0.5"
         );
     }
 
+    /// A tunnel whose traffic could not be routed through it did come up, and the
+    /// bring-up has already lowered it. For OpenVPN the report said "no tun
+    /// appeared … may have left a process running", which is wrong on both
+    /// counts; WireGuard reports the same `RoutingFailed`
+    /// (`vpn::wireguard`'s `raise_failed`), so it reads the same.
+    #[test]
+    fn a_tunnel_lowered_for_want_of_routing_is_reported_as_having_come_up() {
+        for kind in [VpnType::Openvpn, VpnType::Wireguard] {
+            let mut cfg = cfg_with_profile("");
+            match &mut cfg.profile[0].network {
+                torrentd_engine::ProfileNetwork::Vpn { vpn_type, .. } => {
+                    *vpn_type = kind;
+                }
+                torrentd_engine::ProfileNetwork::Host { .. } => unreachable!("a vpn profile"),
+            }
+            let host = FakeHost::new().with_exists_seq([false, false]);
+            host.vpn.set_unroutable("wg-acct-a");
+
+            let r = profile_checks(&cfg, &cfg.profile[0], true, None, &host);
+
+            let bu = find(&r.checks, "bring_up").expect("a bring_up line");
+            assert_eq!(bu.verdict, Verdict::Fail, "{kind:?} detail: {}", bu.detail);
+            assert!(
+                bu.detail.contains("came up") && bu.detail.contains("taken down again"),
+                "{kind:?}: the tunnel appeared and is gone: {}",
+                bu.detail,
+            );
+            assert!(
+                !bu.detail.contains("no wg-acct-a appeared")
+                    && !bu.detail.contains("may have left a process running"),
+                "{kind:?}: {}",
+                bu.detail,
+            );
+            assert!(host.vpn.bring_down_calls().is_empty());
+        }
+    }
+
     #[test]
     fn a_successful_bring_up_that_adopted_rather_than_created_is_not_lowered() {
         // F1(B)'s shape from the other side: `Ok` is not evidence of a raise,
@@ -3748,8 +4014,10 @@ user_agent           = "Transmission/4.0.5"
         assert_eq!(config.verdict, Verdict::Pass, "detail: {}", config.detail);
         let wg = find(&r.checks, "wireguard_tools").expect("the wg line is reported");
         assert_eq!(wg.verdict, Verdict::Fail, "detail: {}", wg.detail);
-        let quick = find(&r.checks, "wg_quick").expect("the wg-quick line is reported");
-        assert_eq!(quick.verdict, Verdict::Pass, "detail: {}", quick.detail);
+        assert!(
+            find(&r.checks, "wg_quick").is_none(),
+            "the daemon never runs wg-quick, so its presence is not checked",
+        );
         let hs = find(&r.checks, "handshake").expect("the handshake line is reported");
         assert_eq!(hs.verdict, Verdict::Fail, "detail: {}", hs.detail);
         assert!(hs.detail.contains("10000s"), "detail: {}", hs.detail);
@@ -3758,13 +4026,168 @@ user_agent           = "Transmission/4.0.5"
         for expected in [
             "profile_metadata /etc/wireguard/wg-acct-a.conf",
             "tool_available wg --version",
-            "tool_available wg-quick --help",
             "handshake_age wg-acct-a",
+            "route_probe wg-acct-a 127.0.0.1 1.1.1.1",
         ] {
             assert!(
                 events.iter().any(|e| e == expected),
                 "{expected} went through the seam: {events:?}",
             );
         }
+        assert!(
+            !events.iter().any(|e| e.contains("wg-quick")),
+            "nothing asks for wg-quick: {events:?}",
+        );
+    }
+
+    /// The acceptance test for sharing the ruleset: the script `vpn check`
+    /// dry-runs is byte-for-byte the script `killswitch::enable` hands to
+    /// `nft -f` for the same uid, tunnels and listen ports. At a9eb5a1 the
+    /// check rendered the bare table — no transport exemption, no replace —
+    /// which is not what boot installs.
+    #[test]
+    fn the_kill_switch_ruleset_renders_identically_in_vpn_check_and_at_boot() {
+        let cfg = cfg_with_two_profiles();
+        let host = FakeHost::new()
+            .with_listen_port("wg-acct-a", 51820)
+            .with_listen_port("wg-acct-b", 40001);
+        host_checks(&cfg, Some(998), None, &host);
+        let dry_run: Vec<String> = host
+            .events()
+            .into_iter()
+            .filter_map(|e| e.strip_prefix("nft_check ").map(str::to_string))
+            .collect();
+        assert_eq!(dry_run.len(), 1, "{dry_run:?}");
+
+        let installed = std::cell::RefCell::new(String::new());
+        let tunnels: Vec<String> = cfg
+            .profile
+            .iter()
+            .filter_map(|p| p.vpn_interface().map(str::to_string))
+            .collect();
+        vpn::killswitch::enable_for_uid(
+            998,
+            &tunnels,
+            |iface| {
+                Ok(match iface {
+                    "wg-acct-a" => 51820,
+                    _ => 40001,
+                })
+            },
+            |script| {
+                *installed.borrow_mut() = script.to_string();
+                Ok(())
+            },
+        )
+        .expect("the boot path installs");
+        assert_eq!(dry_run[0], *installed.borrow());
+    }
+
+    /// The route the monitor probes is reported, and a route that leaves by
+    /// another device fails both the route line and the monitor's verdict.
+    #[test]
+    fn a_route_that_does_not_leave_by_the_tunnel_fails_the_route_and_the_health_verdict() {
+        let cfg = cfg_with_profile("");
+        let host = FakeHost::new()
+            .with_handshake(Ok(Some(Duration::from_secs(5))))
+            .with_route(Ok(vpn::route::RouteProbe::Elsewhere(
+                "leaves by eth0".to_string(),
+            )))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &host);
+        let route = find(&r.checks, "route").expect("the route line is reported");
+        assert_eq!(route.verdict, Verdict::Fail, "detail: {}", route.detail);
+        let health = find(&r.checks, "health").expect("the monitor's verdict is reported");
+        assert_eq!(health.verdict, Verdict::Fail, "detail: {}", health.detail);
+        assert!(
+            health.detail.contains("route_mismatch"),
+            "{}",
+            health.detail
+        );
+
+        let healthy = FakeHost::new()
+            .with_handshake(Ok(Some(Duration::from_secs(5))))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, None, &healthy);
+        let health = find(&r.checks, "health").expect("the monitor's verdict is reported");
+        assert_eq!(health.verdict, Verdict::Pass, "detail: {}", health.detail);
+    }
+
+    /// `--egress` asserts the route before it trusts a reply: a round trip
+    /// that went out of the physical interface is not evidence the tunnel
+    /// carries traffic, so it is not attempted.
+    #[test]
+    fn egress_asserts_the_route_to_its_destination_before_the_round_trip() {
+        let cfg = cfg_with_profile("");
+        let dest: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let host = FakeHost::new()
+            .with_route(Ok(vpn::route::RouteProbe::Elsewhere(
+                "leaves by eth0".to_string(),
+            )))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, Some(dest), &host);
+        let route = find(&r.checks, "egress_route").expect("the egress route is asserted");
+        assert_eq!(route.verdict, Verdict::Fail, "detail: {}", route.detail);
+        let egress = find(&r.checks, "egress").expect("the egress line is still reported");
+        assert_eq!(egress.verdict, Verdict::Skip, "detail: {}", egress.detail);
+        assert!(
+            host.events()
+                .iter()
+                .any(|e| e == "route_probe wg-acct-a 10.2.0.2 192.0.2.53"),
+            "the route is asked for the probe's own destination: {:?}",
+            host.events(),
+        );
+    }
+
+    /// A route probe that could not run says nothing about where the route
+    /// goes, and the skipped round trip says so instead of claiming the route
+    /// does not leave by the tunnel.
+    #[test]
+    fn an_egress_route_that_could_not_be_asked_is_not_called_a_wrong_route() {
+        let cfg = cfg_with_profile("");
+        let dest: SocketAddr = "192.0.2.53:53".parse().unwrap();
+        let host = FakeHost::new()
+            .with_route(Err(vpn::route::RouteProbeUnavailable::NoTool))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, Some(dest), &host);
+        let route = find(&r.checks, "egress_route").expect("the egress route line");
+        assert_eq!(route.verdict, Verdict::Unknown, "detail: {}", route.detail);
+        let egress = find(&r.checks, "egress").expect("the egress line");
+        assert_eq!(egress.verdict, Verdict::Skip, "detail: {}", egress.detail);
+        assert!(
+            egress.detail.contains("could not be asked")
+                && !egress.detail.contains("does not leave by"),
+            "detail: {}",
+            egress.detail,
+        );
+    }
+
+    /// An IPv6 `--egress` destination from an IPv4 tunnel address is a family
+    /// mismatch, and is reported as one. `ip route get <v6> from <v4>` fails,
+    /// and that failure was reported as a missing or outranked tunnel rule.
+    #[test]
+    fn an_egress_destination_of_the_other_family_is_reported_as_such() {
+        let cfg = cfg_with_profile("");
+        let dest: SocketAddr = "[2001:db8::53]:53".parse().unwrap();
+        let host = FakeHost::new()
+            .with_route(Ok(vpn::route::RouteProbe::Elsewhere(
+                "RTNETLINK answers: Invalid argument".to_string(),
+            )))
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
+        let r = profile_checks(&cfg, &cfg.profile[0], false, Some(dest), &host);
+        let route = find(&r.checks, "egress_route").expect("the egress route line");
+        assert_eq!(route.verdict, Verdict::Fail, "detail: {}", route.detail);
+        assert!(
+            route.detail.contains("address family") && !route.detail.contains("outranked"),
+            "detail: {}",
+            route.detail,
+        );
+        assert!(
+            !host.events().iter().any(|e| e.ends_with("2001:db8::53")),
+            "no route is asked across families: {:?}",
+            host.events(),
+        );
+        let egress = find(&r.checks, "egress").expect("the egress line");
+        assert_eq!(egress.verdict, Verdict::Skip, "detail: {}", egress.detail);
     }
 }
