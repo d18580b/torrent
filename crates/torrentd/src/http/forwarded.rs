@@ -483,9 +483,12 @@ mod tests {
     const XFP: &str = "x-forwarded-proto";
     const FWD: &str = "forwarded";
 
+    /// Header lines, the client address they resolve to, and `secure`.
+    type Case = (&'static [(&'static str, &'static str)], &'static str, bool);
+
     /// Header sets from a trusted peer, and the client each must resolve to.
     #[rustfmt::skip]
-    const CASES: &[(&[(&str, &str)], &str, bool)] = &[
+    const CASES: &[Case] = &[
         (&[(XFF, "198.51.100.7"), (XFP, "https")], "198.51.100.7", true),
         // The trusted proxy appends, so its element is the last; earlier ones
         // are the client's, on one field line or across several.
