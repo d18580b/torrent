@@ -682,9 +682,10 @@ pub enum ProfileConfigError {
     DuplicateInterface(String),
     #[error(
         "profile {profile:?}: vpn_interface {iface:?} is not a usable interface name: a name \
-         may be 1-15 characters of [A-Za-z0-9_=+.-] only, and not \".\" or \"..\". The kernel \
-         refuses a longer device name, and the network kill switch writes this name into an \
-         nftables ruleset that cannot carry any other character"
+         may be 1-15 characters of [A-Za-z0-9_=+.-] only, and not \".\", \"..\", \"all\" or \
+         \"interfaces\". The kernel refuses a longer device name, the network kill switch \
+         writes this name into an nftables ruleset that cannot carry any other character, and \
+         `wg show` reads \"all\" and \"interfaces\" as keywords"
     )]
     BadInterface { profile: String, iface: String },
     /// Two profiles announce one peer-id prefix.
@@ -895,7 +896,8 @@ impl ProfileConfig {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
     }
 
-    /// `[A-Za-z0-9_=+.-]{1,15}`, excluding `.` and `..`.
+    /// `[A-Za-z0-9_=+.-]{1,15}`, excluding `.` and `..`, and `all` and
+    /// `interfaces`, which `wg show` reads as keywords rather than names.
     ///
     /// A `vpn_interface` is a Linux device name, and it is interpolated into
     /// the kill switch's nftables ruleset as a quoted string. The kernel's own
@@ -911,6 +913,8 @@ impl ProfileConfig {
             && name.len() <= 15
             && name != "."
             && name != ".."
+            && name != "all"
+            && name != "interfaces"
             && name
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'=' | b'+' | b'.' | b'-'))
@@ -1710,6 +1714,8 @@ mod tests {
             "wg:x",
             ".",
             "..",
+            "all",
+            "interfaces",
             "sixteen-chars-xx",
         ] {
             let profiles = vec![cfg("a", 6881, bad, "-AA1000-", "ua-a")];
