@@ -24,6 +24,7 @@ use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileStatus;
 use torrentd_engine::ShutdownReason;
 use torrentd_engine::StateMap;
+use torrentd_engine::TorrentPhase;
 use torrentd_engine::VpnType;
 use tracing::error;
 use tracing::info;
@@ -98,8 +99,8 @@ pub(crate) struct Observation {
     pub handshake: Handshake,
     /// How long a never-handshaked WireGuard tunnel has had traffic to carry
     /// and carried none: measured from the first poll that saw it with no
-    /// handshake **and** torrents in its profile, reset when either stops
-    /// being true.
+    /// handshake **and** torrents in its profile that can send (not paused),
+    /// reset when either stops being true.
     ///
     /// Not time since bring-up. WireGuard handshakes on the first packet sent
     /// into the tunnel, and a profile with no torrents sends none — a fresh
@@ -216,11 +217,40 @@ fn seed_baselines(profiles: &ProfileRegistry, metrics: &PromSink) {
     }
 }
 
+/// Whether a torrent in `phase` can send anything into the tunnel.
+///
+/// A paused torrent announces nothing and connects to nobody, and neither does
+/// one libtorrent stopped on an error or one being removed. Counting those made
+/// a profile whose torrents were all paused look as if it had traffic to
+/// carry: a static-port WireGuard profile with no keepalive then never
+/// handshaked, was fenced `no_handshake`, and — fenced — could not be resumed.
+fn carries_traffic(phase: TorrentPhase) -> bool {
+    !matches!(
+        phase,
+        TorrentPhase::Paused | TorrentPhase::Errored | TorrentPhase::Removed
+    )
+}
+
+/// Whether any of `id`'s torrents can send anything into its tunnel; see
+/// [`carries_traffic`].
+fn profile_carries_traffic(state: &StateMap, id: &torrentd_engine::ProfileId) -> bool {
+    state.handles_for_profile(id).iter().any(|h| {
+        state
+            .get(&h.infohash)
+            .is_some_and(|s| carries_traffic(s.phase))
+    })
+}
+
 /// Advance one profile's no-handshake clock and read it.
 ///
 /// Running only while the tunnel has never handshaked **and** the profile has
-/// torrents — traffic that would have made WireGuard handshake — and started
-/// from the first poll that saw both. Anything else stops and resets it.
+/// torrents that can send — traffic that would have made WireGuard handshake —
+/// and started from the first poll that saw both. A handshake, or no torrent
+/// able to send, stops and resets it.
+///
+/// A poll whose handshake probe could not run ([`Handshake::NoSignal`]) says
+/// nothing either way, so it leaves the clock as it stands: resetting it there
+/// let a probe that failed now and then hold off the fence indefinitely.
 fn unanswered_clock(
     since: &mut std::collections::HashMap<torrentd_engine::ProfileId, Instant>,
     id: &torrentd_engine::ProfileId,
@@ -228,11 +258,15 @@ fn unanswered_clock(
     carrying: bool,
     now: Instant,
 ) -> Duration {
-    if handshake == Handshake::Never && carrying {
-        now.saturating_duration_since(*since.entry(id.clone()).or_insert(now))
-    } else {
-        since.remove(id);
-        Duration::ZERO
+    match handshake {
+        Handshake::Never if carrying => {
+            now.saturating_duration_since(*since.entry(id.clone()).or_insert(now))
+        }
+        Handshake::NoSignal => Duration::ZERO,
+        _ => {
+            since.remove(id);
+            Duration::ZERO
+        }
     }
 }
 
@@ -363,7 +397,7 @@ pub async fn run(
                     Handshake::Age(age)
                 }
             };
-            let carrying = !state.handles_for_profile(&profile_id).is_empty();
+            let carrying = profile_carries_traffic(&state, &profile_id);
             let unanswered_for = unanswered_clock(
                 &mut unanswered_since,
                 &profile_id,
@@ -612,6 +646,80 @@ mod tests {
             "a handshake resets it",
         );
         assert!(since.is_empty());
+    }
+
+    /// A probe that could not run says nothing about the handshake, so it
+    /// neither advances nor resets the clock. Resetting it there let a probe
+    /// that failed now and then keep a dark tunnel from ever being fenced.
+    #[test]
+    fn a_failed_handshake_probe_leaves_the_no_handshake_clock_running() {
+        let id = torrentd_engine::ProfileId::new("acct_a");
+        let mut since = std::collections::HashMap::new();
+        let t0 = Instant::now();
+
+        unanswered_clock(&mut since, &id, Handshake::Never, true, t0);
+        assert_eq!(
+            unanswered_clock(
+                &mut since,
+                &id,
+                Handshake::NoSignal,
+                true,
+                t0 + Duration::from_secs(60)
+            ),
+            Duration::ZERO,
+            "no signal is no verdict",
+        );
+        let then = t0 + MAX + Duration::from_secs(1);
+        assert!(
+            unanswered_clock(&mut since, &id, Handshake::Never, true, then) > MAX,
+            "the clock kept its start across the failed probe",
+        );
+    }
+
+    fn loaded(state: &StateMap, id: u64, profile: &str, phase: TorrentPhase) {
+        let handle = torrentd_engine::TorrentHandle {
+            id,
+            infohash: torrentd_engine::InfoHash([id as u8; 20]),
+        };
+        let mut st = torrentd_engine::TorrentState::newly_added(
+            handle,
+            torrentd_engine::ProfileId::new(profile),
+            Instant::now(),
+        );
+        st.phase = phase;
+        state.insert(handle.infohash, st);
+    }
+
+    /// A profile whose torrents are all paused sends nothing into its
+    /// tunnel, so a WireGuard link with no keepalive never handshakes. Counted
+    /// as carrying, that profile was fenced `no_handshake` — and a fenced
+    /// profile refuses the resume that would have given it traffic.
+    #[test]
+    fn only_torrents_that_can_send_start_the_no_handshake_clock() {
+        let a = torrentd_engine::ProfileId::new("acct_a");
+        let state = StateMap::new();
+        assert!(!profile_carries_traffic(&state, &a), "no torrents");
+
+        loaded(&state, 1, "acct_a", TorrentPhase::Paused);
+        loaded(&state, 2, "acct_a", TorrentPhase::Errored);
+        loaded(&state, 3, "acct_b", TorrentPhase::Seeding);
+        assert!(
+            !profile_carries_traffic(&state, &a),
+            "paused and errored torrents send nothing, and another profile's \
+             torrents are not this one's",
+        );
+
+        loaded(&state, 4, "acct_a", TorrentPhase::Seeding);
+        assert!(profile_carries_traffic(&state, &a));
+        for phase in [
+            TorrentPhase::Checking,
+            TorrentPhase::AwaitingMetadata,
+            TorrentPhase::Incomplete,
+            TorrentPhase::Idle,
+            TorrentPhase::DiskError,
+        ] {
+            assert!(carries_traffic(phase), "{phase:?}");
+        }
     }
 
     #[test]

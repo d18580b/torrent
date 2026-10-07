@@ -1327,10 +1327,11 @@ On a scratch pool, not your real one.
 
    A WireGuard tunnel that comes up and **never handshakes** — a wrong key,
    a dead endpoint — is fenced with `reason=no_handshake` once it has gone
-   `vpn_handshake_max_age_secs` with torrents in its profile and no
-   handshake. The clock runs only while the profile has torrents: WireGuard
-   handshakes on the first packet sent into the tunnel, and an empty profile
-   sends none.
+   `vpn_handshake_max_age_secs` with unpaused torrents in its profile and no
+   handshake. The clock runs only while the profile has a torrent that is not
+   paused (or stopped on an error): WireGuard handshakes on the first packet
+   sent into the tunnel, and an empty or fully paused profile sends none. A
+   poll whose handshake probe could not run leaves the clock where it was.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
    interfaces for the daemon's uid. Setting it with no `vpn` profile, or
