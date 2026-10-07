@@ -133,8 +133,10 @@ cargo build --workspace          # debug
 cargo build --workspace --release
 ```
 
-The build is Rust and the vendored C++ alone; nothing else is needed.
-[`docs/running.md` §3](docs/running.md#3-build) has the details.
+Beyond Rust and the vendored C++, the build needs a C++ toolchain, CMake, Ninja,
+`pkg-config`, the OpenSSL headers and `libclang` (for `bindgen`): the package lists
+for Fedora and Ubuntu are in [`docs/running.md` §1](docs/running.md#1-packages), and
+[§3](docs/running.md#3-build) has the build itself.
 
 ### The shared native prefix
 
