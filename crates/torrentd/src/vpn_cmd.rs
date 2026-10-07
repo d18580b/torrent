@@ -141,24 +141,10 @@ impl Check {
             needs_capability: false,
         }
     }
-    /// An `Unknown` this invocation could not settle for want of a
-    /// capability, which does not colour the exit status. See
+    /// An `Unknown` nothing this invocation could be given would settle —
+    /// for want of a capability, or because the answer lies outside this
+    /// process — which does not colour the exit status. See
     /// [`Check::needs_capability`].
-    fn unknown_without_capability(name: &'static str, detail: impl Into<String>) -> Self {
-        Self {
-            needs_capability: true,
-            ..Self::unknown(name, detail)
-        }
-    }
-
-    /// An `Unknown` **nothing this process can be told would settle**, which
-    /// is the same non-colouring class for the same reason. See
-    /// [`Check::needs_capability`].
-    ///
-    /// The capability-bound ones are the common route into it. This is the
-    /// other: an answer that depends on a fact outside this process
-    /// altogether, where no argument, privilege or configuration change
-    /// available to this invocation produces one.
     fn unknown_unsettleable(name: &'static str, detail: impl Into<String>) -> Self {
         Self {
             needs_capability: true,
@@ -289,11 +275,6 @@ fn has_cap_net_admin() -> bool {
         .unwrap_or(true)
 }
 
-/// Whether `bin` can be executed at all.
-fn tool_available(bin: &str, probe_arg: &str) -> bool {
-    vpn::exec::available(bin, probe_arg)
-}
-
 /// The host-touching operations a profile's checks perform, behind a trait so the
 /// branch structure around them is testable without a tunnel or a gateway.
 ///
@@ -402,12 +383,7 @@ impl RealHost {
 
 impl CheckHost for RealHost {
     fn interface_exists(&self, iface: &str) -> bool {
-        // Asked of `ip`, from this process's network namespace — the view
-        // the tunnel managers act on — and not of `/sys/class/net`, which
-        // shows the namespace sysfs was mounted in. A probe that could not be
-        // answered reads as present: that is the answer that never lowers an
-        // interface this command did not raise.
-        vpn::link_exists(iface).unwrap_or(true)
+        vpn::link_standing(iface)
     }
 
     fn first_ipv4(&self, iface: &str) -> std::io::Result<Ipv4Addr> {
@@ -427,7 +403,7 @@ impl CheckHost for RealHost {
     }
 
     fn tool_available(&self, bin: &str, probe_arg: &str) -> bool {
-        tool_available(bin, probe_arg)
+        vpn::exec::available(bin, probe_arg)
     }
 
     fn profile_metadata(&self, path: &Path) -> std::io::Result<()> {
@@ -715,8 +691,8 @@ fn judge_nft_check(
     // came up, not from every configured profile. Without a live registry this
     // check cannot know that set; naming the discrepancy is honest, and
     // guessing at it would not be.
-    let caveat = "interfaces listed are the configured profiles; boot lists only the profiles \
-                  whose tunnel came up";
+    let caveat = "interfaces listed are the configured profiles this run checks; boot lists \
+                  every profile whose tunnel came up";
     match outcome {
         Err(e) => Check::unknown(
             "kill_switch_ruleset",
@@ -736,7 +712,7 @@ fn judge_nft_check(
                     "this process does not hold CAP_NET_ADMIN, which is what nft needs to \
                      reach the kernel"
                 };
-                Check::unknown_without_capability(
+                Check::unknown_unsettleable(
                     "kill_switch_ruleset",
                     format!(
                         "the ruleset for uid {uid} parses, but `nft --check` could not \
@@ -837,7 +813,7 @@ fn judge_handshake(
                      refusal has two possible causes and this run separated neither."
                 ),
             };
-            Check::unknown_without_capability(
+            Check::unknown_unsettleable(
                 "handshake",
                 format!(
                     "`wg show {iface} latest-handshakes` was refused and this process does \
@@ -920,9 +896,12 @@ fn host_checks(
                  nothing to render a ruleset for; see kill_switch_uid",
             ),
             Some(uid) => {
+                // `--profile` scopes the ruleset too, so an excluded profile's
+                // interface cannot decide this run.
                 let tunnels: Vec<String> = cfg
                     .profile
                     .iter()
+                    .filter(|p| only.is_none_or(|id| p.id.as_str() == id))
                     .filter_map(|p| p.vpn_interface().map(str::to_string))
                     .collect();
                 // The script boot hands to `nft -f` — `killswitch::install_script`,
@@ -943,8 +922,7 @@ fn host_checks(
                     ),
                     Err(e) => Check::fail("kill_switch_ruleset", e.to_string()),
                 };
-                let verdict = note_unread_ports(verdict, &unread);
-                attribute_ruleset_rejection(verdict, cfg, only, uid, host)
+                note_unread_ports(verdict, &unread)
             }
         });
     } else {
@@ -998,86 +976,6 @@ fn note_unread_ports(mut verdict: Check, unread: &[String]) -> Check {
         ));
     }
     verdict
-}
-
-/// Keep an excluded profile's interface out of a scoped run's exit status.
-///
-/// The kill-switch table is host-wide — boot installs it whole — so the
-/// rendered ruleset lists every configured vpn profile's interface, and the
-/// caveat in the detail already says so. That justifies *listing* them. It
-/// does not justify letting one decide the verdict of a run the operator
-/// narrowed with `--profile`: `cli.rs` says "Check only this profile." and
-/// `docs/running.md` "Check one profile instead of every configured profile",
-/// and a rejection caused by an interface belonging to a profile that was
-/// excluded is a `fail` and an exit `1` for a profile nobody asked about.
-///
-/// Attribution is by re-rendering: the same ruleset for the selected profile's
-/// interfaces alone, dry-run the same way. If that parses while the full one
-/// did not, the rejection is the excluded profiles' and this run reports it
-/// without colouring the status. If it fails too, the selected profile owns it
-/// and the verdict stands. A host profile has no interface in the table, so an
-/// excluded host profile can own no part of a rejection. Nothing here reads nft's message for interface
-/// names — every name is in it, including the ones that are fine.
-fn attribute_ruleset_rejection(
-    verdict: Check,
-    cfg: &Config,
-    only: Option<&str>,
-    uid: u32,
-    host: &dyn CheckHost,
-) -> Check {
-    // Only a `Fail` can colour a scoped run; the rest are already
-    // non-colouring and are left exactly as they are.
-    if verdict.verdict != Verdict::Fail {
-        return verdict;
-    }
-    let Some(id) = only else {
-        return verdict;
-    };
-    let (kept, excluded): (Vec<&ProfileConfig>, Vec<&ProfileConfig>) = cfg
-        .profile
-        .iter()
-        .filter(|p| p.vpn_interface().is_some())
-        .partition(|p| p.id.as_str() == id);
-    if excluded.is_empty() {
-        return verdict;
-    }
-    let scoped: Vec<String> = kept
-        .iter()
-        .filter_map(|p| p.vpn_interface().map(str::to_string))
-        .collect();
-    // The selected profile's own name cannot be rendered: it owns the
-    // rejection, and the verdict stands.
-    let Ok(scoped_ruleset) = boot_install_script(uid, &scoped, host).0 else {
-        return verdict;
-    };
-    let scoped_parses = match host.nft_check(&scoped_ruleset) {
-        Ok(o) => {
-            o.status.success() || !nft_rejected_the_ruleset(&String::from_utf8_lossy(&o.stderr))
-        }
-        // The probe that would attribute it did not run, so nothing is
-        // attributed and the rejection keeps the status it had.
-        Err(_) => return verdict,
-    };
-    if !scoped_parses {
-        return verdict;
-    }
-    let names: Vec<String> = excluded
-        .iter()
-        .filter_map(|p| {
-            p.vpn_interface()
-                .map(|iface| format!("{iface} (profile {})", p.id.as_str()))
-        })
-        .collect();
-    Check::skip(
-        "kill_switch_ruleset",
-        format!(
-            "{} — but the ruleset for profile {id}'s interfaces alone is accepted, so the \
-             rejection belongs to {}, which --profile {id} excluded. It is reported and it \
-             does not decide this run's status; re-run without --profile to have it do so",
-            verdict.detail,
-            names.join(", "),
-        ),
-    )
 }
 
 /// Prove that a socket **bound to the tunnel address** can send and receive.
@@ -2720,88 +2618,42 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         );
     }
 
+    /// `--profile` scopes the kill-switch ruleset: an excluded profile's
+    /// interface is not dry-run, so it cannot fail a run about another.
     #[test]
     fn an_excluded_profile_s_interface_does_not_decide_a_scoped_run() {
-        // C52 / F4, reopened. `rp_filter` moved into the profile when the
-        // same finding was first repaired, and `kill_switch_ruleset` kept
-        // building its interface list from every configured profile, ignoring
-        // `--profile`. A rejection caused by an interface belonging to a
-        // profile the operator excluded was a `fail` and an exit 1 for a
-        // profile that was not being checked, against a flag whose help says
-        // "Check only this profile."
-        //
-        // The table is still rendered whole, because boot installs it whole
-        // and the caveat says so. What changes is the verdict.
         let cfg = cfg_with_two_profiles();
-        let host = FakeHost::new()
-            // The full table is rejected; the selected profile's alone is not.
-            .with_nft([
-                (
-                    1,
-                    "/dev/stdin:5:39-39: Error: syntax error, unexpected string",
-                ),
-                (0, ""),
-            ]);
+        let rejected = "/dev/stdin:5:39-39: Error: syntax error, unexpected string";
 
-        let checks = host_checks(&cfg, Some(2000), Some("acct_a"), &host);
-        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is still reported");
-
-        assert_ne!(
-            c.verdict,
-            Verdict::Fail,
-            "an excluded profile's interface does not colour a scoped run: {}",
-            c.detail,
-        );
+        let host = FakeHost::new().with_nft([(0, "")]);
+        host_checks(&cfg, Some(2000), Some("acct_a"), &host);
+        let nft_calls: Vec<String> = host
+            .events()
+            .into_iter()
+            .filter(|e| e.starts_with("nft_check"))
+            .collect();
+        assert_eq!(nft_calls.len(), 1, "{nft_calls:?}");
         assert!(
-            c.detail.contains("wg-acct-b") && c.detail.contains("acct_b"),
-            "the offending interface and the profile it belongs to are both named: {}",
-            c.detail,
-        );
-        assert!(
-            c.detail.contains("syntax error"),
-            "nft's own words still reach the operator: {}",
-            c.detail,
-        );
-        let report = Report {
-            host: checks,
-            profiles: Vec::new(),
-        };
-        assert_eq!(
-            report.exit_code(),
-            EXIT_OK,
-            "a run scoped to a healthy profile is clean",
+            nft_calls[0].contains("wg-acct-a") && !nft_calls[0].contains("wg-acct-b"),
+            "the dry-run holds the selected profile's interface alone: {nft_calls:?}",
         );
 
-        // The complement: when the rejection survives scoping, it is the
-        // selected profile's and it still decides the run.
-        let host = FakeHost::new().with_nft([
-            (
-                1,
-                "/dev/stdin:5:39-39: Error: syntax error, unexpected string",
-            ),
-            (
-                1,
-                "/dev/stdin:4:39-39: Error: syntax error, unexpected string",
-            ),
-        ]);
+        // A rejection of the scoped ruleset is the selected profile's.
+        let host = FakeHost::new().with_nft([(1, rejected)]);
         let checks = host_checks(&cfg, Some(2000), Some("acct_a"), &host);
-        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is still reported");
-        assert_eq!(
-            c.verdict,
-            Verdict::Fail,
-            "a rejection the selected profile owns still fails: {}",
-            c.detail,
-        );
-
-        // And an unscoped run is untouched: nothing was excluded, so there is
-        // nothing to attribute elsewhere.
-        let host = FakeHost::new().with_nft([(
-            1,
-            "/dev/stdin:5:39-39: Error: syntax error, unexpected string",
-        )]);
-        let checks = host_checks(&cfg, Some(2000), None, &host);
-        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is still reported");
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
         assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+
+        // An unscoped run dry-runs every vpn profile's interface.
+        let host = FakeHost::new().with_nft([(1, rejected)]);
+        let checks = host_checks(&cfg, Some(2000), None, &host);
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
+        assert_eq!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
+        assert!(
+            c.detail.contains("wg-acct-a") && c.detail.contains("wg-acct-b"),
+            "detail: {}",
+            c.detail,
+        );
     }
 
     #[test]
@@ -3122,10 +2974,7 @@ http_listen = "127.0.0.1:8080"
 
     #[test]
     fn a_missing_tool_is_reported_rather_than_panicking() {
-        assert!(!tool_available(
-            "torrentd-definitely-not-a-binary",
-            "--version"
-        ));
+        assert!(!RealHost.tool_available("torrentd-definitely-not-a-binary", "--version"));
     }
 
     #[test]
@@ -3331,14 +3180,11 @@ user_agent           = "qBittorrent/5.0.3"
         );
     }
 
-    /// #33 under `--profile`: a render refusal goes through
-    /// `attribute_ruleset_rejection` like an `nft` rejection does. When the
-    /// selected profile's own name is the one refused, the scoped render is
-    /// refused too and the `fail` stands. When only an excluded profile's name
-    /// is refused, the scoped ruleset renders and parses, and the verdict is
-    /// downgraded to `skip` naming the excluded profile.
+    /// #33 under `--profile`: the ruleset holds the selected profile's
+    /// interfaces alone, so a name the renderer refuses fails the run that
+    /// selects its profile and no other.
     #[test]
-    fn a_render_refusal_is_attributed_to_the_profile_whose_name_was_refused() {
+    fn a_render_refusal_fails_only_the_run_that_selects_its_profile() {
         let mut cfg = cfg_with_tables(
             r#"
 [[profile]]
@@ -3387,18 +3233,12 @@ user_agent           = "Transmission/4.0.5"
             "the selected profile's refusal decides the run"
         );
 
-        // Only an excluded profile's name is refused: the selected profile's
-        // ruleset renders and parses, so the refusal is reported against the
-        // excluded profile without deciding the run.
+        // Only an excluded profile's name is refused: it is not in the scoped
+        // ruleset at all.
         let host = FakeHost::new().with_nft([(0, "")]);
         let checks = host_checks(&cfg, Some(2000), Some("acct_a"), &host);
         let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
-        assert_eq!(c.verdict, Verdict::Skip, "detail: {}", c.detail);
-        assert!(
-            c.detail.contains("\"wg}x\"") && c.detail.contains("wg}x (profile acct_b)"),
-            "the refused name and the excluded profile that owns it are both named: {}",
-            c.detail,
-        );
+        assert_ne!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
         let nft_calls: Vec<String> = host
             .events()
             .into_iter()
@@ -3596,14 +3436,14 @@ user_agent           = "Transmission/4.0.5"
         let r = Report {
             host: vec![
                 Check::pass("iproute2", ""),
-                Check::unknown_without_capability("kill_switch_ruleset", ""),
+                Check::unknown_unsettleable("kill_switch_ruleset", ""),
             ],
             profiles: vec![ProfileReport {
                 profile_id: "acct_a".into(),
                 vpn_type: "wireguard",
                 checks: vec![
                     Check::pass("tunnel_ip", ""),
-                    Check::unknown_without_capability("handshake", ""),
+                    Check::unknown_unsettleable("handshake", ""),
                 ],
             }],
         };
@@ -3619,7 +3459,7 @@ user_agent           = "Transmission/4.0.5"
         // nothing was established, and still exits 2.
         let r = Report {
             host: vec![
-                Check::unknown_without_capability("kill_switch_ruleset", ""),
+                Check::unknown_unsettleable("kill_switch_ruleset", ""),
                 Check::unknown("rp_filter", ""),
             ],
             profiles: vec![],
@@ -3629,7 +3469,7 @@ user_agent           = "Transmission/4.0.5"
         // And a real failure still outranks both.
         let r = Report {
             host: vec![
-                Check::unknown_without_capability("handshake", ""),
+                Check::unknown_unsettleable("handshake", ""),
                 Check::fail("iproute2", ""),
             ],
             profiles: vec![],
@@ -3643,7 +3483,7 @@ user_agent           = "Transmission/4.0.5"
         // an operator can learn it did not run. The JSON field is optional and
         // absent on every other check, so a consumer that does not know about
         // it sees exactly what it saw before.
-        let blocked = Check::unknown_without_capability("handshake", "no CAP_NET_ADMIN");
+        let blocked = Check::unknown_unsettleable("handshake", "no CAP_NET_ADMIN");
         assert_eq!(symbol(&blocked), "?cap");
         assert_eq!(symbol(&Check::unknown("rp_filter", "")), "?   ");
         assert_eq!(symbol(&Check::pass("iproute2", "")), "ok  ");
@@ -3765,7 +3605,7 @@ user_agent           = "Transmission/4.0.5"
         let c = judge_nft_check(nft_output(0, ""), true, 998, "table inet torrentd {}");
         assert_eq!(c.verdict, Verdict::Pass, "detail: {}", c.detail);
         assert!(
-            c.detail.contains("998") && c.detail.contains("boot lists only"),
+            c.detail.contains("998") && c.detail.contains("boot lists every"),
             "the uid judged and the interface-list caveat are both stated: {}",
             c.detail,
         );
