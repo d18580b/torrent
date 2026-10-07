@@ -245,7 +245,16 @@ pub enum RenewOutcome {
     /// the session stays on the old port. When they are equal, the session
     /// is already on it — two renewals raced onto one port — and this is
     /// the collision being reported rather than prevented.
-    PortTaken { previous: u16, new: u16 },
+    ///
+    /// The gateway did answer, so `epoch` and `rebooted` are its, as for
+    /// [`RenewOutcome::Unchanged`]: the next renewal's reboot check compares
+    /// against this epoch.
+    PortTaken {
+        previous: u16,
+        new: u16,
+        epoch: u32,
+        rebooted: bool,
+    },
     /// The renewal request itself failed; the previous mapping is kept.
     RenewFailed(PortForwardError),
 }
@@ -504,6 +513,8 @@ pub fn renew_and_rebind(
                 return RenewOutcome::PortTaken {
                     previous: previous_port,
                     new: port,
+                    epoch,
+                    rebooted,
                 };
             }
             if port == previous_port {
@@ -890,7 +901,8 @@ mod tests {
                 out,
                 RenewOutcome::PortTaken {
                     previous: 6881,
-                    new: 40001
+                    new: 40001,
+                    ..
                 }
             ),
             "got {out:?}"
@@ -918,7 +930,33 @@ mod tests {
                 out,
                 RenewOutcome::PortTaken {
                     previous: 40001,
-                    new: 40001
+                    new: 40001,
+                    ..
+                }
+            ),
+            "got {out:?}"
+        );
+    }
+
+    /// A port-taken renewal still carries the gateway's epoch, and says
+    /// whether it went backwards: the gateway answered. Dropped, the next
+    /// renewal compared against an older epoch and could miss a reboot.
+    #[test]
+    fn a_port_taken_renewal_carries_the_gateways_epoch() {
+        let fwd = MockForwarder::new();
+        fwd.push_ok_epoch(40001, 7);
+        let eng = MockEngine::new();
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let out = renew_and_rebind(&fwd, &eng, &req(), 6881, 500, target(&p, &listen), |p| {
+            p == 40001
+        });
+        assert!(
+            matches!(
+                out,
+                RenewOutcome::PortTaken {
+                    epoch: 7,
+                    rebooted: true,
+                    ..
                 }
             ),
             "got {out:?}"

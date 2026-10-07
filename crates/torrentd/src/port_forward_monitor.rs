@@ -639,13 +639,25 @@ pub(crate) fn record_outcome(
             );
             true
         }
-        RenewOutcome::PortTaken { previous, new } => {
+        RenewOutcome::PortTaken {
+            previous,
+            new,
+            epoch,
+            rebooted,
+        } => {
             metrics.inc_counter(
                 FAILURES,
                 &[("profile_id", profile_id.as_str()), ("stage", "port_taken")],
             );
             metrics.set_gauge("profile_port_forward_up", 0.0, &labels);
-            e.update_health(|h| h.port_forward_ok = false);
+            // The gateway answered, so its epoch is current whatever the port.
+            e.update_health(|h| {
+                h.forwarded_epoch = epoch;
+                h.port_forward_ok = false;
+            });
+            if rebooted {
+                metrics.inc_counter("profile_vpn_gateway_reboots_total", &labels);
+            }
             if previous == new {
                 warn!(
                     target: "torrentd::port_forward_monitor",
@@ -1272,6 +1284,28 @@ mod tests {
         assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
         assert_eq!(sink.count_for(FAILURES), 1);
         assert!(!entry.health().port_forward_ok);
+    }
+
+    /// The gateway answered a port-taken renewal, so its epoch is recorded
+    /// and a reboot is counted, as on an unchanged renewal.
+    #[test]
+    fn a_port_taken_renewal_records_the_gateways_epoch() {
+        let (entry, _) = natpmp_entry("acct_a", 40001);
+        entry.update_health(|h| h.forwarded_epoch = 500);
+        let sink = RecordingSink::new();
+        assert!(!record_outcome(
+            &entry,
+            &sink,
+            RenewOutcome::PortTaken {
+                previous: 40001,
+                new: 40002,
+                epoch: 7,
+                rebooted: true,
+            },
+        ));
+        assert_eq!(entry.health().forwarded_epoch, 7);
+        assert_eq!(entry.health().forwarded_port, Some(40001), "not rebound");
+        assert_eq!(sink.count_for("profile_vpn_gateway_reboots_total"), 1);
     }
 
     #[test]
