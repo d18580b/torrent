@@ -10397,7 +10397,6 @@
         "type": "string",
         "enum": [
           "move_torrent",
-          "move_file",
           "delete_file"
         ],
         "description": "One filesystem operation of a plan."

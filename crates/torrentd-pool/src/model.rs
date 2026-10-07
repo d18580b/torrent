@@ -286,7 +286,7 @@ pub struct PlanRow {
 /// One filesystem operation, written to the journal before it is attempted.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanStep {
-    /// `move_torrent` | `move_file` | `delete_file`
+    /// `move_torrent` | `delete_file`
     pub op: String,
     pub src: String,
     pub dst: Option<String>,
@@ -309,8 +309,6 @@ pub mod ops {
     /// Relocate an adopted torrent's payload. libtorrent performs the move so
     /// its storage state stays consistent with the session.
     pub const MOVE_TORRENT: &str = "move_torrent";
-    /// Move a file no torrent claims. torrentd performs this one directly.
-    pub const MOVE_FILE: &str = "move_file";
     /// Delete a file no torrent claims.
     pub const DELETE_FILE: &str = "delete_file";
 }
