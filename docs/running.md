@@ -537,40 +537,11 @@ and the reason, and the index is left exactly as it was — free some space and
 start the daemon again.
 
 If you ran one of this change's own pre-release builds, you may hold a
-`pool.db` that reports schema version 2 but already carries the `profile`
-column. This build recognises that file — whichever pre-release build wrote it
-— and stamps the version to match the columns. No data moves and the journal is
-kept.
-
-Those builds did not all leave the same file. One wrote the rename with both of
-v3's indexes in place; another could commit the rename and lose an index
-statement, leaving either no index on `profile` at all or the old
-`torrent_by_slot` name over the new column. So the version is stamped only
-together with whatever index work the file is still missing, in one
-transaction: after this open the file has `torrent_by_profile` and nothing
-called `torrent_by_slot`. The log line says which of these happened. Restoring
-`<db_path>.pre-v3.bak` is **not** the remedy for such a file: the copy is taken
-from the database as it stands, so it has the same contents.
-
-A pre-release build in between did stamp version 3 over that same incomplete
-schema, so a `pool.db` reporting **3** can be missing the index too. The index
-check runs before the version is trusted, for any version this build can open,
-which is why the sentence above holds whichever of those builds you ran.
-
-"Any version" includes **0 and 1**. Those builds ran each schema step as its
-own statement batch and wrote `user_version` afterwards, so a machine that lost
-power between the last schema statement and that write left a file reporting 0
-or 1 over a schema that is already complete v3. It is recognised on the same
-two checks as the rest — the columns are v3's and `torrent_by_profile` is
-there — plus a third below version 3, that the `plan` and `plan_step` tables
-exist, and stamped, with the journal kept. A file that lost power before those
-two tables were created is not complete v3 and is not stamped: it fails to
-migrate, and moving it aside for `torrentd pool scan` to rebuild costs nothing,
-because it never had a journal. Before, such a file could not be
-migrated at all: the version-keyed steps tried to create tables that already
-existed, the daemon exited non-zero on every start, and the only remedy the
-message offered that worked was to move the index aside and rescan, which
-costs the `plan`/`plan_step` journal.
+`pool.db` whose schema is not the one its version names, such as the `profile`
+column under version 2, or version 3 without `torrent_by_profile`. This build
+does not repair such a file; where the version is behind the schema, opening it
+fails and names the step. Move it aside and let `torrentd pool scan` rebuild
+it, which costs the `plan`/`plan_step` journal.
 
 **3. Point each profile at its files, or move them.** Resume and `.torrent`
 files used to live directly under `resume_dir` and `torrent_dir`; they now live
