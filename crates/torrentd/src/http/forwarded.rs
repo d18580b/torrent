@@ -48,11 +48,6 @@ impl Cidr {
         Ok(Self { addr, prefix })
     }
 
-    /// The parsed prefix length: `/0`, `/00` and `/+0` are all 0.
-    pub fn prefix(&self) -> u8 {
-        self.prefix
-    }
-
     /// Whether `ip` is inside this block.
     ///
     /// **Both sides** are folded to their v4 form first: a v4-mapped v6
@@ -153,18 +148,21 @@ fn prefix_match(a: &[u8], b: &[u8], prefix: u8) -> bool {
 pub struct TrustedProxies(Vec<Cidr>);
 
 impl TrustedProxies {
-    /// Parse every entry, refusing one with a `/0` prefix: it trusts every
-    /// peer there is, so every forwarding header becomes client-controlled.
-    /// Decided on the parsed prefix, so `/00` and `/+0` are refused too.
+    /// Parse every entry, refusing one whose **effective** prefix is `/0`: it
+    /// trusts every peer of its family, so every forwarding header becomes
+    /// client-controlled. Decided on the block [`Cidr::contains`] matches, so
+    /// `/00`, `/+0` and a v4-mapped `::ffff:0:0/96` (all of IPv4) are refused
+    /// too.
     pub fn parse(entries: &[String]) -> Result<Self, String> {
         entries
             .iter()
             .map(|entry| {
                 let cidr = Cidr::parse(entry)?;
-                if cidr.prefix() == 0 {
+                if cidr.effective().1 == 0 {
                     return Err(format!(
-                        "{entry:?} trusts every peer there is. Anything listed here can claim \
-                         to be any client, so a /0 prefix makes every forwarding header \
+                        "{entry:?} trusts every peer there is (it matches as {cidr}). Anything \
+                         listed here can claim to be any client, so a /0 prefix makes every \
+                         forwarding header \
                          client-controlled: the login throttle keys on a value the caller \
                          picks, and the client_ip on the failed-login line is whatever the \
                          caller wrote. List the address your reverse proxy connects from, and \
@@ -672,7 +670,7 @@ mod tests {
     #[test]
     fn a_trust_set_displays_its_effective_blocks() {
         let set = TrustedProxies::parse(&[
-            "::ffff:0:0/96".to_string(),
+            "::ffff:172.17.5.4/108".to_string(),
             "10.1.2.3/8".to_string(),
             "::ffff:127.0.0.1".to_string(),
             "2001:db8::1/64".to_string(),
@@ -681,7 +679,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             set.to_string(),
-            "0.0.0.0/0, 10.0.0.0/8, 127.0.0.1/32, 2001:db8::/64, 172.28.0.2/32"
+            "172.16.0.0/12, 10.0.0.0/8, 127.0.0.1/32, 2001:db8::/64, 172.28.0.2/32"
         );
         assert_eq!(TrustedProxies::default().to_string(), "");
     }
@@ -692,5 +690,19 @@ mod tests {
             let err = TrustedProxies::parse(&[wide.to_string()]).expect_err(wide);
             assert!(err.contains(wide), "{err}");
         }
+    }
+
+    /// The refusal is decided on the block `contains` matches, not on the
+    /// spelling: a v4-mapped entry at or below the mapped `/96` is all of
+    /// IPv4.
+    #[test]
+    fn a_trust_set_refuses_a_mapped_entry_whose_effective_prefix_is_zero() {
+        for wide in ["::ffff:0:0/96", "::ffff:1.2.3.4/96", "::ffff:0:0/80"] {
+            let err = TrustedProxies::parse(&[wide.to_string()]).expect_err(wide);
+            assert!(err.contains(wide), "{err}");
+            assert!(err.contains("0.0.0.0/0"), "{err}");
+        }
+        // One bit past the mapped /96 is half of IPv4, not all of it.
+        assert!(TrustedProxies::parse(&["::ffff:0:0/97".to_string()]).is_ok());
     }
 }

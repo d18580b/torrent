@@ -1211,7 +1211,8 @@ listen_interfaces = "0.0.0.0:6881"
 
     #[test]
     fn a_trusted_proxies_entry_that_trusts_everyone_is_refused() {
-        // A `/0` prefix, in any spelling, makes every caller a trusted proxy.
+        // A `/0` prefix, in any spelling, makes every caller a trusted proxy,
+        // and so does a v4-mapped entry whose effective prefix is `/0`.
         let dir = tempdir().unwrap();
 
         for wide in [
@@ -1223,6 +1224,8 @@ listen_interfaces = "0.0.0.0:6881"
             "::/00",
             "::/000",
             "::/+0",
+            // v4-mapped: matched as 0.0.0.0/0, every IPv4 peer.
+            "::ffff:0:0/96",
         ] {
             let body = with_top_level(&format!("trusted_proxies = [\"{wide}\"]"));
             // `parse` alone, so the refusal is attributed to `validate`
