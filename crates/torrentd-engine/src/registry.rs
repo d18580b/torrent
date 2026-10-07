@@ -652,7 +652,7 @@ fn import_into(
     };
     // Sorted, so a refusal names the same entry on every run over one file.
     let mut entries: Vec<(InfoHash, ProfileId)> = entries.into_iter().collect();
-    entries.sort_by(|a, b| a.0 .0.cmp(&b.0 .0));
+    entries.sort_by_key(|a| a.0 .0);
     let mut fresh = Vec::new();
     for (ih, profile) in entries {
         match map.get(&ih) {
@@ -1143,7 +1143,7 @@ mod tests {
         };
         let r = AssignmentRegistry::new_empty(PathBuf::from(db));
         let mut out = std::io::stdout().lock();
-        for i in 0u64.. {
+        for i in 0u64..=u64::MAX {
             let mut b = [0u8; 20];
             b[..8].copy_from_slice(&i.to_be_bytes());
             let ih = InfoHash(b);
