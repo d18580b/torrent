@@ -13,6 +13,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use torrentd_engine::batch_writer::write_atomic;
 use torrentd_engine::AddParams;
 use torrentd_engine::AlertLoopBuilder;
 use torrentd_engine::AlertSource;
@@ -2332,7 +2333,7 @@ impl DaemonHandle {
             };
             match engine.session_state() {
                 Ok(bytes) if !bytes.is_empty() => {
-                    match save_session_state(&cfg.session_state_path(&p.id), &bytes) {
+                    match write_atomic(&cfg.session_state_path(&p.id), &bytes) {
                         Ok(()) => {
                             info!(profile_id = %p.id, bytes = bytes.len(), "session state saved")
                         }
@@ -2618,7 +2619,6 @@ where
     }
 }
 
-/// Read the persisted DHT/session-state blob, or `None` if absent/empty.
 /// `s` as one POSIX shell word: single-quoted, with each `'` closed, escaped
 /// and reopened. The registry refusal prints a command to paste, and a state
 /// directory holding a space or a shell metacharacter must not break it.
@@ -2626,40 +2626,12 @@ fn sh_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Read the persisted DHT/session-state blob, or `None` if absent/empty.
 fn load_session_state(path: &std::path::Path) -> Option<Vec<u8>> {
     match std::fs::read(path) {
         Ok(b) if !b.is_empty() => Some(b),
         _ => None,
     }
-}
-
-/// Atomically persist the DHT/session-state blob (temp + fsync + rename), so a
-/// crash mid-write leaves the previous blob intact.
-fn save_session_state(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let mut tmp = path.as_os_str().to_owned();
-    tmp.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp);
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)?;
-    // Fsync the directory too. Without it the rename may not survive a crash,
-    // which loses the DHT routing table and the session's listen state. The
-    // resume store, the torrent store and the assignment registry all do this;
-    // this was the one atomic-write site that claimed the guarantee in its
-    // comment without providing it.
-    if let Some(dir) = path.parent() {
-        if let Ok(d) = std::fs::File::open(dir) {
-            d.sync_all()?;
-        }
-    }
-    Ok(())
 }
 
 /// What one profile's boot scans could not load, by the `source` label of
@@ -2703,7 +2675,7 @@ fn shutdown_report_path(state_dir: &std::path::Path) -> std::path::PathBuf {
 /// ignored: the process is exiting, and the journal line is all that is left.
 fn write_shutdown_report(state_dir: &std::path::Path, report: &ShutdownReport) {
     let bytes = serde_json::to_vec(report).expect("a plain struct serializes");
-    if let Err(e) = save_session_state(&shutdown_report_path(state_dir), &bytes) {
+    if let Err(e) = write_atomic(&shutdown_report_path(state_dir), &bytes) {
         warn!(
             path = %shutdown_report_path(state_dir).display(),
             error.cause = %e,

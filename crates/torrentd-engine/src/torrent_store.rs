@@ -5,11 +5,6 @@
 //! is added from a buffer / file so the startup
 //! inventory scan can re-add it if its resume file is ever lost, and the
 //! `metadata_received` handler writes the fetched metadata for magnet adds.
-//!
-//! Like the resume store, this always partitions by profile id — there is no
-//! count of profiles at which files go directly under `base`, because a
-//! deployment with one profile is a deployment with n = 1, not a mode of its
-//! own. Two profiles' torrents are therefore never co-mingled.
 
 use std::fs;
 use std::path::PathBuf;
@@ -17,14 +12,10 @@ use std::path::PathBuf;
 use dashmap::DashMap;
 use libtorrent_safe::InfoHash;
 use thiserror::Error;
-use tracing::debug;
 
-use crate::batch_writer::remove_if_present;
-use crate::batch_writer::write_atomic;
-use crate::batch_writer::BatchWriter;
 use crate::batch_writer::WriteErrorHook;
 use crate::profile::ProfileId;
-use crate::resume_store::scan_dir;
+use crate::resume_store::PartitionedDir;
 use crate::resume_store::Scan;
 
 pub trait TorrentStore: Send + Sync + std::fmt::Debug {
@@ -95,68 +86,34 @@ pub enum TorrentStoreError {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub struct FsTorrentStore {
-    base: PathBuf,
-    /// Explicit directory for a profile, from its `[[profile]]` config.
-    ///
-    /// Without this the layout is always `<base>/<profile_id>`, and a profile that
-    /// configured a directory elsewhere had it validated for uniqueness and
-    /// then silently ignored — the files landed somewhere the operator had not
-    /// asked for, and matched only by coincidence when the configured path
-    /// happened to equal the derived one.
-    overrides: std::collections::HashMap<ProfileId, PathBuf>,
-    /// Where `write_batched` queues, when set; otherwise it writes at once.
-    writer: Option<BatchWriter>,
-}
+pub struct FsTorrentStore(PartitionedDir);
 
 impl FsTorrentStore {
     pub fn new(base: impl Into<PathBuf>) -> Self {
-        Self {
-            base: base.into(),
-            overrides: std::collections::HashMap::new(),
-            writer: None,
-        }
+        Self(PartitionedDir::new(base.into(), ".torrent", "torrent"))
     }
 
     /// Queue `write_batched` onto a writer thread of the store's own, which
     /// reports each failure to `on_error`.
     pub fn with_batched_writes(mut self, on_error: Option<WriteErrorHook>) -> Self {
-        self.writer = Some(BatchWriter::spawn("torrentd-torrent-writer", on_error));
+        self.0.batch_writes("torrentd-torrent-writer", on_error);
         self
     }
 
     /// Pin `profile` to an explicit directory rather than the derived one.
     pub fn with_profile_dir(mut self, profile: ProfileId, dir: impl Into<PathBuf>) -> Self {
-        self.overrides.insert(profile, dir.into());
+        self.0.pin(profile, dir.into());
         self
     }
 
-    fn dir_for(&self, profile: &ProfileId) -> PathBuf {
-        if let Some(dir) = self.overrides.get(profile) {
-            return dir.clone();
-        }
-        // Always partitioned by profile id. There is no profile that owns
-        // the base directory: that was the single-session special case, and
-        // with it went the last place two profiles could co-mingle files.
-        self.base.join(profile.as_str())
-    }
-
     pub fn path_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
-        self.dir_for(profile)
-            .join(format!("{}.torrent", ih.to_hex()))
+        self.0.path_for(profile, ih)
     }
 }
 
 impl TorrentStore for FsTorrentStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<Vec<u8>>, TorrentStoreError> {
-        // Whatever is still queued lands first, so the scan reads the newest.
-        self.flush();
-        Ok(scan_dir(
-            &self.dir_for(profile),
-            ".torrent",
-            profile,
-            "torrent",
-        )?)
+        Ok(self.0.scan(profile)?)
     }
 
     fn write(
@@ -165,21 +122,7 @@ impl TorrentStore for FsTorrentStore {
         ih: &InfoHash,
         data: &[u8],
     ) -> Result<(), TorrentStoreError> {
-        // Atomic write: temp file → fsync(file) → rename → fsync(dir), same
-        // as the resume store.
-        let path = self.path_for(profile, ih);
-        match &self.writer {
-            Some(w) => w.write_now(&path, data)?,
-            None => write_atomic(&path, data)?,
-        }
-        debug!(
-            target: "torrentd_engine::torrent_store",
-            profile_id = %profile,
-            infohash = %ih,
-            bytes = data.len(),
-            "wrote torrent file",
-        );
-        Ok(())
+        Ok(self.0.write(profile, ih, data)?)
     }
 
     fn write_batched(
@@ -188,36 +131,20 @@ impl TorrentStore for FsTorrentStore {
         ih: &InfoHash,
         data: &[u8],
     ) -> Result<(), TorrentStoreError> {
-        match &self.writer {
-            Some(w) => {
-                w.enqueue(self.path_for(profile, ih), profile, ih, data);
-                Ok(())
-            }
-            None => self.write(profile, ih, data),
-        }
+        Ok(self.0.write_batched(profile, ih, data)?)
     }
 
     fn flush(&self) {
-        if let Some(w) = &self.writer {
-            w.flush();
-        }
+        self.0.flush();
     }
 
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), TorrentStoreError> {
-        let path = self.path_for(profile, ih);
-        match &self.writer {
-            Some(w) => w.delete_now(&path)?,
-            None => remove_if_present(&path)?,
-        }
-        Ok(())
+        Ok(self.0.delete(profile, ih)?)
     }
 
     fn exists(&self, profile: &ProfileId, ih: &InfoHash) -> bool {
         let path = self.path_for(profile, ih);
-        self.writer
-            .as_ref()
-            .is_some_and(|w| w.pending(&path).is_some())
-            || path.exists()
+        self.0.pending(&path).is_some() || path.exists()
     }
 
     fn read(
@@ -226,7 +153,7 @@ impl TorrentStore for FsTorrentStore {
         ih: &InfoHash,
     ) -> Result<Option<Vec<u8>>, TorrentStoreError> {
         let path = self.path_for(profile, ih);
-        if let Some(queued) = self.writer.as_ref().and_then(|w| w.pending(&path)) {
+        if let Some(queued) = self.0.pending(&path) {
             return Ok(Some(queued.to_vec()));
         }
         match fs::read(&path) {

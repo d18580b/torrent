@@ -12,6 +12,7 @@
 //! `(profile, infohash)`. Used by Layer 1 unit tests so we don't hit the
 //! filesystem.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -155,69 +156,148 @@ pub enum ResumeStoreError {
     InvalidName(String),
 }
 
+/// One `<infohash><suffix>` file per torrent under a directory per profile:
+/// `<base>/<profile_id>/`, or the directory the profile's config pins. The
+/// filesystem half of both [`FsResumeStore`] and
+/// [`crate::torrent_store::FsTorrentStore`].
+#[derive(Debug)]
+pub(crate) struct PartitionedDir {
+    base: PathBuf,
+    /// Explicit directory for a profile, from its `[[profile]]` config.
+    overrides: HashMap<ProfileId, PathBuf>,
+    /// Where `write_batched` queues, when set; otherwise it writes at once.
+    writer: Option<BatchWriter>,
+    /// `".resume"` or `".torrent"`.
+    suffix: &'static str,
+    /// The store's name in the log.
+    what: &'static str,
+}
+
+impl PartitionedDir {
+    pub(crate) fn new(base: PathBuf, suffix: &'static str, what: &'static str) -> Self {
+        Self {
+            base,
+            overrides: HashMap::new(),
+            writer: None,
+            suffix,
+            what,
+        }
+    }
+
+    pub(crate) fn batch_writes(&mut self, thread: &str, on_error: Option<WriteErrorHook>) {
+        self.writer = Some(BatchWriter::spawn(thread, on_error));
+    }
+
+    pub(crate) fn pin(&mut self, profile: ProfileId, dir: PathBuf) {
+        self.overrides.insert(profile, dir);
+    }
+
+    fn dir_for(&self, profile: &ProfileId) -> PathBuf {
+        match self.overrides.get(profile) {
+            Some(dir) => dir.clone(),
+            None => self.base.join(profile.as_str()),
+        }
+    }
+
+    pub(crate) fn path_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
+        self.dir_for(profile)
+            .join(format!("{}{}", ih.to_hex(), self.suffix))
+    }
+
+    pub(crate) fn scan(&self, profile: &ProfileId) -> std::io::Result<Scan<Vec<u8>>> {
+        // Whatever is still queued lands first, so the scan reads the newest.
+        self.flush();
+        scan_dir(&self.dir_for(profile), self.suffix, profile, self.what)
+    }
+
+    /// Replace the file durably before returning: temp file, `fsync`,
+    /// `rename`, `fsync` of the directory.
+    pub(crate) fn write(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        let path = self.path_for(profile, ih);
+        match &self.writer {
+            Some(w) => w.write_now(&path, data)?,
+            None => write_atomic(&path, data)?,
+        }
+        debug!(
+            target: "torrentd_engine::store",
+            profile_id = %profile,
+            infohash = %ih,
+            bytes = data.len(),
+            "wrote {} file",
+            self.what,
+        );
+        Ok(())
+    }
+
+    pub(crate) fn write_batched(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        data: &[u8],
+    ) -> std::io::Result<()> {
+        match &self.writer {
+            Some(w) => {
+                w.enqueue(self.path_for(profile, ih), profile, ih, data);
+                Ok(())
+            }
+            None => self.write(profile, ih, data),
+        }
+    }
+
+    pub(crate) fn flush(&self) {
+        if let Some(w) = &self.writer {
+            w.flush();
+        }
+    }
+
+    pub(crate) fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> std::io::Result<()> {
+        let path = self.path_for(profile, ih);
+        match &self.writer {
+            Some(w) => w.delete_now(&path),
+            None => remove_if_present(&path),
+        }
+    }
+
+    /// The bytes queued for `path` and not yet on disk, if any.
+    pub(crate) fn pending(&self, path: &Path) -> Option<std::sync::Arc<[u8]>> {
+        self.writer.as_ref().and_then(|w| w.pending(path))
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FsResumeStore
 // ---------------------------------------------------------------------------
 
 #[derive(Debug)]
-pub struct FsResumeStore {
-    base: PathBuf,
-    /// Explicit directory for a profile, from its `[[profile]]` config.
-    ///
-    /// Without this the layout is always `<base>/<profile_id>`, and a profile that
-    /// configured a directory elsewhere had it validated for uniqueness and
-    /// then silently ignored — the files landed somewhere the operator had not
-    /// asked for, and matched only by coincidence when the configured path
-    /// happened to equal the derived one.
-    overrides: std::collections::HashMap<ProfileId, PathBuf>,
-    /// Where `write_batched` queues, when set; otherwise it writes at once.
-    writer: Option<BatchWriter>,
-}
+pub struct FsResumeStore(PartitionedDir);
 
 impl FsResumeStore {
     pub fn new(base: impl Into<PathBuf>) -> Self {
-        Self {
-            base: base.into(),
-            overrides: std::collections::HashMap::new(),
-            writer: None,
-        }
+        Self(PartitionedDir::new(base.into(), ".resume", "resume"))
     }
 
     /// Queue `write_batched` onto a writer thread of the store's own, which
     /// reports each failure to `on_error`.
     pub fn with_batched_writes(mut self, on_error: Option<WriteErrorHook>) -> Self {
-        self.writer = Some(BatchWriter::spawn("torrentd-resume-writer", on_error));
+        self.0.batch_writes("torrentd-resume-writer", on_error);
         self
     }
 
     /// Pin `profile` to an explicit directory rather than the derived one.
     pub fn with_profile_dir(mut self, profile: ProfileId, dir: impl Into<PathBuf>) -> Self {
-        self.overrides.insert(profile, dir.into());
+        self.0.pin(profile, dir.into());
         self
-    }
-
-    fn dir_for(&self, profile: &ProfileId) -> PathBuf {
-        if let Some(dir) = self.overrides.get(profile) {
-            return dir.clone();
-        }
-        // Always partitioned by profile id. There is no profile that
-        // owns the base directory: that was the single-session special
-        // case, and with it went the last place two profiles could
-        // co-mingle files by accident.
-        self.base.join(profile.as_str())
-    }
-
-    fn file_for(&self, profile: &ProfileId, ih: &InfoHash) -> PathBuf {
-        self.dir_for(profile)
-            .join(format!("{}.resume", ih.to_hex()))
     }
 }
 
 impl ResumeStore for FsResumeStore {
     fn scan(&self, profile: &ProfileId) -> Result<Scan<ResumeData>, ResumeStoreError> {
-        // Whatever is still queued lands first, so the scan reads the newest.
-        self.flush();
-        let raw = scan_dir(&self.dir_for(profile), ".resume", profile, "resume")?;
+        let raw = self.0.scan(profile)?;
         Ok(Scan {
             entries: raw
                 .entries
@@ -234,22 +314,7 @@ impl ResumeStore for FsResumeStore {
         ih: &InfoHash,
         data: &[u8],
     ) -> Result<(), ResumeStoreError> {
-        // Atomic write: temp file → fsync(file) → rename → fsync(dir). The
-        // temp file is in the same directory so the rename is
-        // same-filesystem.
-        let path = self.file_for(profile, ih);
-        match &self.writer {
-            Some(w) => w.write_now(&path, data)?,
-            None => write_atomic(&path, data)?,
-        }
-        debug!(
-            target: "torrentd_engine::resume_store",
-            profile_id = %profile,
-            infohash = %ih,
-            bytes = data.len(),
-            "wrote resume file",
-        );
-        Ok(())
+        Ok(self.0.write(profile, ih, data)?)
     }
 
     fn write_batched(
@@ -258,28 +323,15 @@ impl ResumeStore for FsResumeStore {
         ih: &InfoHash,
         data: &[u8],
     ) -> Result<(), ResumeStoreError> {
-        match &self.writer {
-            Some(w) => {
-                w.enqueue(self.file_for(profile, ih), profile, ih, data);
-                Ok(())
-            }
-            None => self.write(profile, ih, data),
-        }
+        Ok(self.0.write_batched(profile, ih, data)?)
     }
 
     fn flush(&self) {
-        if let Some(w) = &self.writer {
-            w.flush();
-        }
+        self.0.flush();
     }
 
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
-        let path = self.file_for(profile, ih);
-        match &self.writer {
-            Some(w) => w.delete_now(&path)?,
-            None => remove_if_present(&path)?,
-        }
-        Ok(())
+        Ok(self.0.delete(profile, ih)?)
     }
 }
 
@@ -357,11 +409,6 @@ mod tests {
         let ih = InfoHash([0x42u8; 20]);
         store.write(&profile, &ih, b"hello").unwrap();
 
-        // Pinned to the literal path, not just to the round trip. Reading
-        // back what this same store wrote passes whether or not `dir_for`
-        // partitions at all — and partitioning is the property: with it went
-        // the last place two profiles could co-mingle files by accident.
-        // `FsTorrentStore`'s equivalent asserts the path; this one did not.
         let expected = dir.path().join("p").join(format!("{}.resume", ih.to_hex()));
         assert!(
             expected.exists(),
