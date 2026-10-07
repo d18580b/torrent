@@ -106,9 +106,19 @@ const FAILURES: &str = "profile_port_forward_failures_total";
 /// renewal that moved onto a port another profile holds, which is not bound.
 const FAILURE_STAGES: [&str; 3] = ["renew", "rebind", "port_taken"];
 
-/// The ports every profile but `except` holds: each one's forwarded port, or
-/// the ports its configuration binds. What a NAT-PMP port must not collide
-/// with (profile Safety Rule 8).
+/// The ports every profile but `except` holds: each live one's forwarded
+/// port, and the ports every one's configuration binds. What a NAT-PMP port
+/// must not collide with (profile Safety Rule 8).
+///
+/// A fenced profile's forwarded port is not held. Its torrents are paused and
+/// announce nothing, so a second profile on that port is correlatable with
+/// nothing; nothing renews the fenced profile's mapping, so the gateway lets
+/// it lapse and may hand the port to another profile; and the fence lifts only
+/// with a restart, which negotiates afresh. Counting it kept a live profile
+/// off a port nobody was announcing, retrying every `RETRY_INTERVAL` with
+/// `port_forward_up` lowered, for as long as the daemon ran. The configured
+/// ports stay held whatever the status: they are the config's, and unique by
+/// validation.
 pub(crate) fn ports_held_by_others<'a>(
     entries: impl IntoIterator<Item = &'a ProfileEntry>,
     except: &ProfileId,
@@ -119,7 +129,11 @@ pub(crate) fn ports_held_by_others<'a>(
             continue;
         }
         held.extend(e.config.configured_listen_ports());
-        if let Some(p) = e.health().forwarded_port {
+        let health = e.health();
+        if health.status != ProfileStatus::Active {
+            continue;
+        }
+        if let Some(p) = health.forwarded_port {
             held.insert(p);
         }
     }
@@ -133,8 +147,11 @@ pub(crate) fn ports_held_by_others<'a>(
 /// A copy made before it missed a rebind another profile's renewal made in
 /// that window, and both profiles then bound the port the two gateways had
 /// handed out. Read when the gateway has answered, the window is the other
-/// profile's `apply_settings` alone, and what still gets through is reported
-/// on the next renewal ([`renew_and_rebind`] asks of an unchanged port too).
+/// profile's rebind: its `apply_settings` and then the wait for the session to
+/// confirm the new listen socket (up to [`LISTEN_CONFIRM_TIMEOUT`], 5s), since
+/// its forwarded port is recorded only once that is confirmed. What still
+/// gets through is reported on the next renewal ([`renew_and_rebind`] asks of
+/// an unchanged port too).
 fn held_by_others_now(
     profiles: Arc<ProfileRegistry>,
     id: ProfileId,
@@ -1271,6 +1288,37 @@ mod tests {
         assert!(!held.contains(&40001), "a profile's own port is not taken");
         assert!(held.contains(&40002));
         assert!(held.is_superset(&static_ports));
+    }
+
+    /// A fenced profile's forwarded port is released: its torrents are paused
+    /// and announce nothing, and nothing renews its mapping. Counting it kept
+    /// a live profile retrying off that port for the rest of the run. Its
+    /// configured ports stay held. Drop the status check and the first
+    /// assertion fails.
+    #[test]
+    fn a_fenced_profiles_forwarded_port_is_not_held() {
+        let (a, _) = natpmp_entry("acct_a", 40001);
+        let (b, _) = natpmp_entry("acct_b", 40002);
+        let c = test_vpn_entry("acct_c", ProfileStatus::VpnDown);
+        b.update_health(|h| h.status = ProfileStatus::VpnDown);
+
+        let held = ports_held_by_others([&a, &b, &c], a.id());
+        assert!(!held.contains(&40002), "fenced: {held:?}");
+        assert!(
+            held.is_superset(&c.config.configured_listen_ports()),
+            "a fenced profile's configured ports are still the config's: {held:?}"
+        );
+
+        // Through the live reader a renewal uses.
+        let profiles = Arc::new(ProfileRegistry::new(vec![a, b]));
+        let taken = held_by_others_now(profiles.clone(), ProfileId::new("acct_a"));
+        assert!(!taken(40002));
+        profiles
+            .iter()
+            .find(|e| e.id().as_str() == "acct_b")
+            .unwrap()
+            .update_health(|h| h.status = ProfileStatus::Active);
+        assert!(taken(40002), "held again once live");
     }
 
     #[test]
