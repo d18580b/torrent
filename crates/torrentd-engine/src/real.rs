@@ -60,8 +60,8 @@ impl RealEngine {
         })
     }
 
-    /// Build from an existing `Session`. Useful when the caller wants to
-    /// `load_state` first.
+    /// Build from an existing `Session`, such as one restored with
+    /// `Session::with_state`.
     pub fn from_session(session: Session) -> Self {
         Self {
             session: Mutex::new(Some(session)),

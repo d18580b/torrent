@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
+use prometheus::core::MetricVec;
+use prometheus::core::MetricVecBuilder;
 use prometheus::register_counter_vec_with_registry;
 use prometheus::register_gauge_vec_with_registry;
 use prometheus::register_histogram_vec_with_registry;
@@ -76,48 +78,23 @@ pub struct Series {
     pub help: &'static str,
 }
 
-const fn series(
-    name: &'static str,
-    kind: MetricType,
-    scope: Scope,
-    seed: Seed,
-    help: &'static str,
-) -> Series {
-    Series {
-        name,
-        kind,
-        scope,
-        label: None,
-        seed,
-        help,
-    }
+/// Builds [`CATALOGUE`], one row per series:
+/// `name Type Scope [(label: values)] seed => help;`.
+macro_rules! catalogue {
+    ($($name:literal $kind:ident $scope:ident $(($label:literal: $values:expr))?
+       $seed:ident $(($when:literal))? => $help:expr;)*) => {
+        &[$(Series {
+            name: $name,
+            kind: MetricType::$kind,
+            scope: Scope::$scope,
+            label: catalogue!(@label $(($label, $values))?),
+            seed: Seed::$seed $(($when))?,
+            help: $help,
+        },)*]
+    };
+    (@label) => { None };
+    (@label $label:tt) => { Some($label) };
 }
-
-const fn labelled(
-    name: &'static str,
-    kind: MetricType,
-    scope: Scope,
-    label: (&'static str, &'static [&'static str]),
-    seed: Seed,
-    help: &'static str,
-) -> Series {
-    Series {
-        name,
-        kind,
-        scope,
-        label: Some(label),
-        seed,
-        help,
-    }
-}
-
-use MetricType::Counter;
-use MetricType::Gauge;
-use MetricType::Histogram;
-use Scope::Daemon;
-use Scope::NatpmpProfile;
-use Scope::Profile;
-use Scope::VpnProfile;
 
 /// The `task` values of `task_up`: every long-running task the daemon
 /// supervises.
@@ -130,602 +107,163 @@ pub const TASKS: &[&str] = &[
 ];
 
 /// Every series `/metrics` can contain. See the module docs.
-pub const CATALOGUE: &[Series] = &[
-    // ---- engine: torrents and sessions (per profile) ----------------------
-    series(
-        "torrents_added_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Torrents a session accepted.",
-    ),
-    series(
-        "torrents_removed_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Torrents removed from a session.",
-    ),
-    series(
-        "torrent_add_errors_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Adds libtorrent rejected after accepting the call.",
-    ),
-    series(
-        "torrents_finished_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Torrents that finished downloading.",
-    ),
-    series(
-        "torrent_errors_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Torrents that entered libtorrent's error state.",
-    ),
-    labelled(
-        "disk_errors_total",
-        Counter,
-        Profile,
-        ("op", &[]),
-        Seed::OnFirstEvent,
-        "File errors, by libtorrent operation; the torrent enters the disk-error phase.",
-    ),
-    series(
-        "hash_failures_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Pieces that failed their hash check.",
-    ),
-    series(
-        "torrents_checked_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Forced rechecks that completed.",
-    ),
-    series(
-        "storage_moves_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Storage moves that completed.",
-    ),
-    series(
-        "storage_move_failures_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Storage moves that failed; the torrent is still served from its old path.",
-    ),
-    series(
-        "resume_writes_total",
-        Counter,
-        Profile,
-        Seed::Zero,
+pub const CATALOGUE: &[Series] = catalogue! {
+    // engine: torrents and sessions
+    "torrents_added_total" Counter Profile Zero => "Torrents a session accepted.";
+    "torrents_removed_total" Counter Profile Zero => "Torrents removed from a session.";
+    "torrent_add_errors_total" Counter Profile Zero => "Adds libtorrent rejected after accepting the call.";
+    "torrents_finished_total" Counter Profile Zero => "Torrents that finished downloading.";
+    "torrent_errors_total" Counter Profile Zero => "Torrents that entered libtorrent's error state.";
+    "disk_errors_total" Counter Profile ("op": &[]) OnFirstEvent =>
+        "File errors, by libtorrent operation; the torrent enters the disk-error phase.";
+    "hash_failures_total" Counter Profile Zero => "Pieces that failed their hash check.";
+    "torrents_checked_total" Counter Profile Zero => "Forced rechecks that completed.";
+    "storage_moves_total" Counter Profile Zero => "Storage moves that completed.";
+    "storage_move_failures_total" Counter Profile Zero =>
+        "Storage moves that failed; the torrent is still served from its old path.";
+    "resume_writes_total" Counter Profile Zero =>
         "Resume data accepted for writing; a write that later fails also counts in \
-         resume_write_errors_total.",
-    ),
-    series(
-        "resume_write_errors_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Resume data libtorrent produced that could not be written to disk.",
-    ),
-    series(
-        "resume_save_failures_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "save_resume_data requests libtorrent failed.",
-    ),
-    series(
-        "resume_save_dispatch_errors_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "save_resume_data requests that failed before reaching libtorrent.",
-    ),
-    series(
-        "listen_failures_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Listen sockets that failed.",
-    ),
-    series(
-        "listen_failure_active",
-        Gauge,
-        Profile,
-        Seed::Zero,
-        "1 while the profile's listen socket is failed.",
-    ),
-    series(
-        "disk_error_retry_attempts_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Torrents the disk-error retry timer resumed to clear a libtorrent error.",
-    ),
-    series(
-        "disk_error_retry_errors_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Retry-timer resumes that failed.",
-    ),
-    series(
-        "alert_queue_overflows_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Times libtorrent's alert queue overflowed and dropped alerts.",
-    ),
-    series(
-        "resume_saves_requeued_total",
-        Counter,
-        Profile,
-        Seed::Zero,
+         resume_write_errors_total.";
+    "resume_write_errors_total" Counter Profile Zero =>
+        "Resume data libtorrent produced that could not be written to disk.";
+    "resume_save_failures_total" Counter Profile Zero => "save_resume_data requests libtorrent failed.";
+    "resume_save_dispatch_errors_total" Counter Profile Zero =>
+        "save_resume_data requests that failed before reaching libtorrent.";
+    "listen_failures_total" Counter Profile Zero => "Listen sockets that failed.";
+    "listen_failure_active" Gauge Profile Zero => "1 while the profile's listen socket is failed.";
+    "disk_error_retry_attempts_total" Counter Profile Zero =>
+        "Torrents the disk-error retry timer resumed to clear a libtorrent error.";
+    "disk_error_retry_errors_total" Counter Profile Zero => "Retry-timer resumes that failed.";
+    "alert_queue_overflows_total" Counter Profile Zero =>
+        "Times libtorrent's alert queue overflowed and dropped alerts.";
+    "resume_saves_requeued_total" Counter Profile Zero =>
         "Resume saves asked for again because an overflow of this profile's alert queue may \
-         have dropped their answer.",
-    ),
-    labelled(
-        "tracker_alerts_total",
-        Counter,
-        Profile,
-        ("kind", torrentd_engine::handlers::warning::TRACKER_KINDS),
-        Seed::Zero,
-        "Tracker announce errors, successful announces (reply), tracker warnings, and scrape failures.",
-    ),
-    labelled(
-        "session_alerts_total",
-        Counter,
-        Profile,
-        ("kind", torrentd_engine::handlers::warning::SESSION_KINDS),
-        Seed::Zero,
-        "Port-mapping and UDP socket errors, rejected fast-resume data, and \
-         performance warnings.",
-    ),
-    labelled(
-        "torrent_file_persist_errors_total",
-        Counter,
-        Profile,
-        ("source", &["metadata", "api"]),
-        Seed::Zero,
-        ".torrent files that could not be written: magnet metadata, or an API add.",
-    ),
-    series(
-        "profile_assignment_registry_errors_total",
-        Counter,
-        Profile,
-        Seed::Zero,
+         have dropped their answer.";
+    "tracker_alerts_total" Counter Profile ("kind": torrentd_engine::handlers::warning::TRACKER_KINDS) Zero =>
+        "Tracker announce errors, successful announces (reply), tracker warnings, and scrape failures.";
+    "session_alerts_total" Counter Profile ("kind": torrentd_engine::handlers::warning::SESSION_KINDS) Zero =>
+        "Port-mapping and UDP socket errors, rejected fast-resume data, and performance warnings.";
+    "torrent_file_persist_errors_total" Counter Profile ("source": &["metadata", "api"]) Zero =>
+        ".torrent files that could not be written: magnet metadata, or an API add.";
+    "profile_assignment_registry_errors_total" Counter Profile Zero =>
         "Loads and adds refused because the assignment registry disagreed or could not be \
-         written.",
-    ),
-    series(
-        "profile_fence_pause_errors_total",
-        Counter,
-        Profile,
-        Seed::Zero,
-        "Torrents the VPN monitor failed to pause while fencing the profile.",
-    ),
-    // ---- boot (per profile) -----------------------------------------------
-    series(
-        "profile_boot_failed",
-        Gauge,
-        Profile,
-        Seed::Owner("always"),
+         written.";
+    "profile_fence_pause_errors_total" Counter Profile Zero =>
+        "Torrents the VPN monitor failed to pause while fencing the profile.";
+    // boot
+    "profile_boot_failed" Gauge Profile Owner("always") =>
         "1 if the profile got no session at boot (tunnel, port forward, or session \
-         construction failed).",
-    ),
-    labelled(
-        "boot_torrent_load_failures",
-        Gauge,
-        Profile,
-        (
-            "source",
-            &[
-                "resume_add",
-                "torrent_read",
-                "torrent_dir_add",
-                "resume_file",
-                "torrent_file",
-            ],
-        ),
-        Seed::Owner("always"),
+         construction failed).";
+    "boot_torrent_load_failures" Gauge Profile
+        ("source": &["resume_add", "torrent_read", "torrent_dir_add", "resume_file", "torrent_file"])
+        Owner("always") =>
         "Torrents the boot scans could not load: a resume add that failed, a .torrent that \
          could not be read, a torrent-dir add that failed, or a resume or torrent-dir file \
-         the scan could not read and skipped.",
-    ),
-    series(
-        "profile_unloaded_registry_torrents",
-        Gauge,
-        Profile,
-        Seed::Owner("live profiles"),
-        "Torrents the assignment registry claims for the profile that no boot scan loaded.",
-    ),
-    // ---- libtorrent session stats (per profile) ---------------------------
-    series(
-        "libtorrent_net_sent_payload_bytes_total",
-        Counter,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent net.sent_payload_bytes.",
-    ),
-    series(
-        "libtorrent_net_sent_bytes_total",
-        Counter,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent net.sent_bytes.",
-    ),
-    series(
-        "libtorrent_peers_connected",
-        Gauge,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent peer.num_peers_connected.",
-    ),
-    series(
-        "libtorrent_peers_up_unchoked",
-        Gauge,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent peer.num_peers_up_unchoked.",
-    ),
-    series(
-        "libtorrent_disk_queued_jobs",
-        Gauge,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent disk.queued_disk_jobs.",
-    ),
-    series(
-        "libtorrent_disk_request_latency",
-        Gauge,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent disk.request_latency.",
-    ),
-    series(
-        "libtorrent_disk_file_pool_hits_total",
-        Counter,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent disk.file_pool_hits, where the linked build has it.",
-    ),
-    series(
-        "libtorrent_disk_file_pool_misses_total",
-        Counter,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent disk.file_pool_misses, where the linked build has it.",
-    ),
-    series(
-        "libtorrent_peer_error_peers_total",
-        Counter,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent peer.error_peers.",
-    ),
-    series(
-        "libtorrent_peer_disconnected_peers_total",
-        Counter,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent peer.disconnected_peers.",
-    ),
-    series(
-        "libtorrent_num_seeding_torrents",
-        Gauge,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent ses.num_seeding_torrents.",
-    ),
-    series(
-        "libtorrent_num_error_torrents",
-        Gauge,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent ses.num_error_torrents.",
-    ),
-    series(
-        "libtorrent_limiter_up_queue",
-        Gauge,
-        Profile,
-        Seed::OnFirstEvent,
-        "libtorrent net.limiter_up_queue.",
-    ),
-    // ---- VPN (per vpn profile) --------------------------------------------
-    series(
-        "profile_vpn_tunnel_up",
-        Gauge,
-        VpnProfile,
-        Seed::Owner("always"),
-        "1 while the profile's tunnel is healthy; 0 once fenced, or if it never came up.",
-    ),
-    series(
-        "profile_torrents_paused_vpn_down",
-        Gauge,
-        VpnProfile,
-        Seed::Owner("live vpn profiles"),
-        "Torrents paused when the profile was fenced.",
-    ),
-    series(
-        "profile_vpn_tunnel_ip_changes_total",
-        Counter,
-        VpnProfile,
-        Seed::Owner("live vpn profiles"),
-        "Tunnel address losses or changes.",
-    ),
-    labelled(
-        "profile_vpn_fenced_total",
-        Counter,
-        VpnProfile,
-        (
-            "reason",
-            &[
-                "ip_lost_or_changed",
-                "route_mismatch",
-                "handshake_stale",
-                "no_handshake",
-            ],
-        ),
-        Seed::Owner("live vpn profiles"),
-        "Times the VPN monitor fenced the profile, by reason.",
-    ),
-    series(
-        "profile_vpn_handshake_probe_ok",
-        Gauge,
-        VpnProfile,
-        Seed::Owner("live wireguard profiles"),
+         the scan could not read and skipped.";
+    "profile_unloaded_registry_torrents" Gauge Profile Owner("live profiles") =>
+        "Torrents the assignment registry claims for the profile that no boot scan loaded.";
+    // libtorrent session stats
+    "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
+    "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
+    "libtorrent_peers_connected" Gauge Profile OnFirstEvent => "libtorrent peer.num_peers_connected.";
+    "libtorrent_peers_up_unchoked" Gauge Profile OnFirstEvent => "libtorrent peer.num_peers_up_unchoked.";
+    "libtorrent_disk_queued_jobs" Gauge Profile OnFirstEvent => "libtorrent disk.queued_disk_jobs.";
+    "libtorrent_disk_request_latency" Gauge Profile OnFirstEvent => "libtorrent disk.request_latency.";
+    "libtorrent_disk_file_pool_hits_total" Counter Profile OnFirstEvent =>
+        "libtorrent disk.file_pool_hits, where the linked build has it.";
+    "libtorrent_disk_file_pool_misses_total" Counter Profile OnFirstEvent =>
+        "libtorrent disk.file_pool_misses, where the linked build has it.";
+    "libtorrent_peer_error_peers_total" Counter Profile OnFirstEvent => "libtorrent peer.error_peers.";
+    "libtorrent_peer_disconnected_peers_total" Counter Profile OnFirstEvent => "libtorrent peer.disconnected_peers.";
+    "libtorrent_num_seeding_torrents" Gauge Profile OnFirstEvent => "libtorrent ses.num_seeding_torrents.";
+    "libtorrent_num_error_torrents" Gauge Profile OnFirstEvent => "libtorrent ses.num_error_torrents.";
+    "libtorrent_limiter_up_queue" Gauge Profile OnFirstEvent => "libtorrent net.limiter_up_queue.";
+    // VPN
+    "profile_vpn_tunnel_up" Gauge VpnProfile Owner("always") =>
+        "1 while the profile's tunnel is healthy; 0 once fenced, or if it never came up.";
+    "profile_torrents_paused_vpn_down" Gauge VpnProfile Owner("live vpn profiles") =>
+        "Torrents paused when the profile was fenced.";
+    "profile_vpn_tunnel_ip_changes_total" Counter VpnProfile Owner("live vpn profiles") =>
+        "Tunnel address losses or changes.";
+    "profile_vpn_fenced_total" Counter VpnProfile
+        ("reason": &["ip_lost_or_changed", "route_mismatch", "handshake_stale", "no_handshake"])
+        Owner("live vpn profiles") =>
+        "Times the VPN monitor fenced the profile, by reason.";
+    "profile_vpn_handshake_probe_ok" Gauge VpnProfile Owner("live wireguard profiles") =>
         "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or \
-         unprivileged).",
-    ),
-    series(
-        "profile_vpn_route_probe_ok",
-        Gauge,
-        VpnProfile,
-        Seed::Owner("live vpn profiles"),
+         unprivileged).";
+    "profile_vpn_route_probe_ok" Gauge VpnProfile Owner("live vpn profiles") =>
         "1 while the route probe (ip route get from the tunnel address) runs; 0 when it \
-         cannot, and the tunnel's routing is not being checked.",
-    ),
-    series(
-        "profile_vpn_handshake_age_seconds",
-        Gauge,
-        VpnProfile,
-        Seed::OnFirstEvent,
-        "Age of the last WireGuard handshake.",
-    ),
-    // ---- port forwarding (per natpmp profile) -----------------------------
-    series(
-        "profile_port_forward_up",
-        Gauge,
-        NatpmpProfile,
-        Seed::Owner("live natpmp profiles"),
-        "1 while the NAT-PMP lease is held.",
-    ),
-    series(
-        "profile_forwarded_port",
-        Gauge,
-        NatpmpProfile,
-        Seed::Owner("live natpmp profiles"),
-        "The forwarded port.",
-    ),
-    series(
-        "profile_port_forward_renewals_total",
-        Counter,
-        NatpmpProfile,
-        Seed::Owner("live natpmp profiles"),
-        "NAT-PMP lease renewals.",
-    ),
-    labelled(
-        "profile_port_forward_failures_total",
-        Counter,
-        NatpmpProfile,
-        ("stage", &["renew", "rebind", "port_taken"]),
-        Seed::Owner("live natpmp profiles"),
+         cannot, and the tunnel's routing is not being checked.";
+    "profile_vpn_handshake_age_seconds" Gauge VpnProfile OnFirstEvent => "Age of the last WireGuard handshake.";
+    // port forwarding
+    "profile_port_forward_up" Gauge NatpmpProfile Owner("live natpmp profiles") => "1 while the NAT-PMP lease is held.";
+    "profile_forwarded_port" Gauge NatpmpProfile Owner("live natpmp profiles") => "The forwarded port.";
+    "profile_port_forward_renewals_total" Counter NatpmpProfile Owner("live natpmp profiles") =>
+        "NAT-PMP lease renewals.";
+    "profile_port_forward_failures_total" Counter NatpmpProfile ("stage": &["renew", "rebind", "port_taken"])
+        Owner("live natpmp profiles") =>
         "NAT-PMP attempts that failed, by stage: renew when the gateway did not answer or \
          refused the lease, rebind when it named a new port the session could not be rebound to, \
-         port_taken when it named a port another profile holds.",
-    ),
-    series(
-        "profile_port_forward_rebind_failures_total",
-        Counter,
-        NatpmpProfile,
-        Seed::Owner("live natpmp profiles"),
-        "The failures above where the gateway named a new port and the session could not be rebound to it.",
-    ),
-    series(
-        "profile_forwarded_port_changes_total",
-        Counter,
-        NatpmpProfile,
-        Seed::Owner("live natpmp profiles"),
-        "Times the gateway handed out a different port.",
-    ),
-    series(
-        "profile_vpn_gateway_reboots_total",
-        Counter,
-        NatpmpProfile,
-        Seed::Owner("live natpmp profiles"),
-        "Gateway epoch resets observed by NAT-PMP.",
-    ),
-    series(
-        "profile_port_forward_udp_mapped",
-        Gauge,
-        NatpmpProfile,
-        Seed::OnFirstEvent,
-        "1 while the UDP (uTP) mapping sits on the forwarded port; 0 while the gateway mapped TCP only.",
-    ),
-    series(
-        "profile_port_change_reannounce_seconds",
-        Histogram,
-        NatpmpProfile,
-        Seed::OnFirstEvent,
-        "Seconds from the gateway naming a new port to the last reannounce being handed to the session.",
-    ),
-    // ---- daemon liveness --------------------------------------------------
-    series(
-        "alert_loop_heartbeat_age_seconds",
-        Gauge,
-        Daemon,
-        Seed::Owner("always"),
-        "Seconds since the alert loop last completed an iteration; computed at scrape.",
-    ),
-    labelled(
-        "task_up",
-        Gauge,
-        Daemon,
-        ("task", TASKS),
-        Seed::Owner("always"),
+         port_taken when it named a port another profile holds.";
+    "profile_port_forward_rebind_failures_total" Counter NatpmpProfile Owner("live natpmp profiles") =>
+        "The failures above where the gateway named a new port and the session could not be rebound to it.";
+    "profile_forwarded_port_changes_total" Counter NatpmpProfile Owner("live natpmp profiles") =>
+        "Times the gateway handed out a different port.";
+    "profile_vpn_gateway_reboots_total" Counter NatpmpProfile Owner("live natpmp profiles") =>
+        "Gateway epoch resets observed by NAT-PMP.";
+    "profile_port_forward_udp_mapped" Gauge NatpmpProfile OnFirstEvent =>
+        "1 while the UDP (uTP) mapping sits on the forwarded port; 0 while the gateway mapped TCP only.";
+    "profile_port_change_reannounce_seconds" Histogram NatpmpProfile OnFirstEvent =>
+        "Seconds from the gateway naming a new port to the last reannounce being handed to the session.";
+    // daemon liveness
+    "alert_loop_heartbeat_age_seconds" Gauge Daemon Owner("always") =>
+        "Seconds since the alert loop last completed an iteration; computed at scrape.";
+    "task_up" Gauge Daemon ("task": TASKS) Owner("always") =>
         "1 while a supervised background task runs; 0 once it has exited or panicked. \
-         Only the tasks this configuration starts are present.",
-    ),
-    // ---- control plane ----------------------------------------------------
-    labelled(
-        "auth_login_failures_total",
-        Counter,
-        Daemon,
-        (
-            "reason",
-            &["bad_password", "throttled", "verification_budget"],
-        ),
-        Seed::Zero,
+         Only the tasks this configuration starts are present.";
+    // control plane
+    "auth_login_failures_total" Counter Daemon ("reason": &["bad_password", "throttled", "verification_budget"]) Zero =>
         "Refused logins: a wrong password, a client locked out by the throttle, or the \
-         daemon-wide verification budget spent.",
-    ),
-    series(
-        "auth_token_scope_denials_total",
-        Counter,
-        Daemon,
-        Seed::Zero,
-        "Requests carrying a valid token without the scope the route needs.",
-    ),
-    labelled(
-        "config_reload_failures_total",
-        Counter,
-        Daemon,
-        ("stage", &["load", "log_level", "apply_settings"]),
-        Seed::Zero,
-        "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.",
-    ),
-    // ---- kill switch ------------------------------------------------------
-    series(
-        "kill_switch_active",
-        Gauge,
-        Daemon,
-        Seed::Owner("always"),
-        "1 while the daemon holds the nftables kill switch installed.",
-    ),
-    series(
-        "kill_switch_table_present",
-        Gauge,
-        Daemon,
-        Seed::Owner("kill switch on"),
-        "1 if the kill switch's nftables table was present at the last check.",
-    ),
-    series(
-        "kill_switch_probe_errors_total",
-        Counter,
-        Daemon,
-        Seed::Zero,
-        "Runtime kill-switch checks that could not list the nftables tables.",
-    ),
-    // ---- the previous run's shutdown --------------------------------------
-    series(
-        "last_shutdown_unsaved_resumes",
-        Gauge,
-        Daemon,
-        Seed::Owner("always"),
-        "Resume saves the previous run's shutdown drain left unsaved; 0 if unknown.",
-    ),
-    series(
-        "last_shutdown_kill_switch_removal_failed",
-        Gauge,
-        Daemon,
-        Seed::Owner("always"),
-        "1 if the previous run could not remove the kill switch on its way out.",
-    ),
-    // ---- pool -------------------------------------------------------------
-    labelled(
-        "pool_plan_failures_total",
-        Counter,
-        Daemon,
-        ("kind", &["step_failed", "index_diverged", "resume_failed"]),
-        Seed::Zero,
+         daemon-wide verification budget spent.";
+    "auth_token_scope_denials_total" Counter Daemon Zero =>
+        "Requests carrying a valid token without the scope the route needs.";
+    "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "apply_settings"]) Zero =>
+        "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.";
+    // kill switch
+    "kill_switch_active" Gauge Daemon Owner("always") => "1 while the daemon holds the nftables kill switch installed.";
+    "kill_switch_table_present" Gauge Daemon Owner("kill switch on") =>
+        "1 if the kill switch's nftables table was present at the last check.";
+    "kill_switch_probe_errors_total" Counter Daemon Zero =>
+        "Runtime kill-switch checks that could not list the nftables tables.";
+    // the previous run's shutdown
+    "last_shutdown_unsaved_resumes" Gauge Daemon Owner("always") =>
+        "Resume saves the previous run's shutdown drain left unsaved; 0 if unknown.";
+    "last_shutdown_kill_switch_removal_failed" Gauge Daemon Owner("always") =>
+        "1 if the previous run could not remove the kill switch on its way out.";
+    // pool
+    "pool_plan_failures_total" Counter Daemon ("kind": &["step_failed", "index_diverged", "resume_failed"]) Zero =>
         "Pool plans that stopped: a step failed, the index stopped accounting for what is \
-         loaded, or re-driving an interrupted plan failed.",
-    ),
-    labelled(
-        "pool_scan_errors_total",
-        Counter,
-        Daemon,
-        ("kind", &["walk", "stat", "path", "read", "parse"]),
-        Seed::Zero,
+         loaded, or re-driving an interrupted plan failed.";
+    "pool_scan_errors_total" Counter Daemon ("kind": &["walk", "stat", "path", "read", "parse"]) Zero =>
         "Entries a pool scan skipped: walk and stat errors, non-UTF-8 paths, unreadable or \
-         unparseable .torrent files.",
-    ),
-    series(
-        "pool_verify_completed_total",
-        Counter,
-        Daemon,
-        Seed::Zero,
-        "Adopted torrents that verified and are seeding.",
-    ),
-    series(
-        "pool_verify_failed_total",
-        Counter,
-        Daemon,
-        Seed::Zero,
-        "Adopted torrents whose verification failed or was dropped.",
-    ),
-    series(
-        "pool_verify_queue_depth",
-        Gauge,
-        Daemon,
-        Seed::Owner("pool configured, from the first queue tick"),
-        "Adoptions waiting to verify.",
-    ),
-    series(
-        "pool_verify_in_flight",
-        Gauge,
-        Daemon,
-        Seed::Owner("pool configured, from the first queue tick"),
-        "Adoptions verifying now.",
-    ),
-    series(
-        "pool_index_profile_disagreements",
-        Gauge,
-        Daemon,
-        Seed::Owner("pool configured"),
-        "Torrents whose pool-index profile disagrees with the assignment registry at boot.",
-    ),
-    // ---- persistence and the exporter itself ------------------------------
-    labelled(
-        "store_write_errors_total",
-        Counter,
-        Daemon,
-        ("store", &["registry", "pool_index"]),
-        Seed::Zero,
+         unparseable .torrent files.";
+    "pool_verify_completed_total" Counter Daemon Zero => "Adopted torrents that verified and are seeding.";
+    "pool_verify_failed_total" Counter Daemon Zero => "Adopted torrents whose verification failed or was dropped.";
+    "pool_verify_queue_depth" Gauge Daemon Owner("pool configured, from the first queue tick") =>
+        "Adoptions waiting to verify.";
+    "pool_verify_in_flight" Gauge Daemon Owner("pool configured, from the first queue tick") =>
+        "Adoptions verifying now.";
+    "pool_index_profile_disagreements" Gauge Daemon Owner("pool configured") =>
+        "Torrents whose pool-index profile disagrees with the assignment registry at boot.";
+    // persistence and the exporter itself
+    "store_write_errors_total" Counter Daemon ("store": &["registry", "pool_index"]) Zero =>
         "Writes to the assignment registry or the pool index that failed where nothing \
-         else reports them.",
-    ),
-    labelled(
-        "metrics_dropped_samples_total",
-        Counter,
-        Daemon,
-        ("reason", &["registration", "labels"]),
-        Seed::Zero,
+         else reports them.";
+    "metrics_dropped_samples_total" Counter Daemon ("reason": &["registration", "labels"]) Zero =>
         "Samples the exporter dropped: a series that could not be registered, or an emission \
-         whose labels differ from the series' first use.",
-    ),
-];
+         whose labels differ from the series' first use.";
+};
 
 /// The catalogue row for `name`.
 pub fn catalogued(name: &str) -> Option<&'static Series> {
@@ -753,16 +291,18 @@ pub struct PromSink {
     counters: Mutex<HashMap<String, CounterVec>>,
     gauges: Mutex<HashMap<String, GaugeVec>>,
     histos: Mutex<HashMap<String, HistogramVec>>,
-    /// Registered directly rather than through `counter_for`: counting a
-    /// failure of that path through that path could not report itself.
+    /// Registered in [`PromSink::new`], so counting a failed registration
+    /// never depends on a registration.
     dropped: CounterVec,
 }
+
+const DROPPED: &str = "metrics_dropped_samples_total";
 
 impl PromSink {
     pub fn new() -> Self {
         let registry =
             Registry::new_custom(Some("torrentd".into()), None).expect("create registry");
-        let row = catalogued("metrics_dropped_samples_total").expect("catalogued");
+        let row = catalogued(DROPPED).expect("catalogued");
         let dropped =
             register_counter_vec_with_registry!(row.name, row.help, &["reason"], registry,)
                 .expect("register metrics_dropped_samples_total on a fresh registry");
@@ -774,7 +314,7 @@ impl PromSink {
         }
         Self {
             registry,
-            counters: Mutex::new(HashMap::new()),
+            counters: Mutex::new(HashMap::from([(DROPPED.to_string(), dropped.clone())])),
             gauges: Mutex::new(HashMap::new()),
             histos: Mutex::new(HashMap::new()),
             dropped,
@@ -828,47 +368,53 @@ impl PromSink {
         buf
     }
 
-    fn counter_for(&self, name: &str, labels: &[(&str, &str)]) -> Option<CounterVec> {
-        if name == self.dropped_name() {
-            return Some(self.dropped.clone());
+    /// The child of `name`'s vector for `labels`, registering the vector with
+    /// those label names on first use. `None` when the sample is dropped,
+    /// which has then been logged and counted.
+    fn child<B: MetricVecBuilder>(
+        &self,
+        vectors: &Mutex<HashMap<String, MetricVec<B>>>,
+        kind: &str,
+        name: &str,
+        labels: &[(&str, &str)],
+        register: impl FnOnce(&str, &[&str]) -> prometheus::Result<MetricVec<B>>,
+    ) -> Option<B::M> {
+        let vector = {
+            let mut vectors = vectors.lock();
+            match vectors.get(name) {
+                Some(v) => v.clone(),
+                None => {
+                    let names: Vec<&str> = labels.iter().map(|(k, _)| *k).collect();
+                    let v = register(name, &names)
+                        .map_err(|e| self.warn_registration(kind, name, &e))
+                        .ok()?;
+                    vectors.insert(name.to_string(), v.clone());
+                    v
+                }
+            }
+        };
+        // By name, not position: the same labels in another order are the
+        // same sample.
+        let by_name: HashMap<&str, &str> = labels.iter().copied().collect();
+        if by_name.len() != labels.len() {
+            self.warn_labels(name, &prometheus::Error::Msg("duplicate label name".into()));
+            return None;
         }
-        let mut g = self.counters.lock();
-        if let Some(c) = g.get(name) {
-            return Some(c.clone());
-        }
-        let label_names: Vec<&str> = labels.iter().map(|(k, _)| *k).collect();
-        let cv = register_counter_vec_with_registry!(
-            name,
-            help_for(name, "torrentd counter"),
-            &label_names,
-            self.registry,
-        )
-        .map_err(|e| self.warn_registration("counter", name, &e))
-        .ok()?;
-        g.insert(name.to_string(), cv.clone());
-        Some(cv)
+        vector
+            .get_metric_with(&by_name)
+            .map_err(|e| self.warn_labels(name, &e))
+            .ok()
     }
 
-    fn gauge_for(&self, name: &str, labels: &[(&str, &str)]) -> Option<GaugeVec> {
-        let mut g = self.gauges.lock();
-        if let Some(c) = g.get(name) {
-            return Some(c.clone());
-        }
-        let label_names: Vec<&str> = labels.iter().map(|(k, _)| *k).collect();
-        let gv = register_gauge_vec_with_registry!(
-            name,
-            help_for(name, "torrentd gauge"),
-            &label_names,
-            self.registry,
-        )
-        .map_err(|e| self.warn_registration("gauge", name, &e))
-        .ok()?;
-        g.insert(name.to_string(), gv.clone());
-        Some(gv)
-    }
-
-    fn dropped_name(&self) -> &'static str {
-        "metrics_dropped_samples_total"
+    fn counter(&self, name: &str, labels: &[(&str, &str)]) -> Option<prometheus::Counter> {
+        self.child(&self.counters, "counter", name, labels, |name, names| {
+            register_counter_vec_with_registry!(
+                name,
+                help_for(name, "torrentd counter"),
+                names,
+                self.registry,
+            )
+        })
     }
 
     /// Log a registration failure and count the sample it costs.
@@ -898,23 +444,6 @@ impl PromSink {
         );
         self.dropped.with_label_values(&["labels"]).inc();
     }
-
-    fn histogram_for(&self, name: &str, labels: &[(&str, &str)]) -> Option<HistogramVec> {
-        let mut g = self.histos.lock();
-        if let Some(c) = g.get(name) {
-            return Some(c.clone());
-        }
-        let label_names: Vec<&str> = labels.iter().map(|(k, _)| *k).collect();
-        let hv = register_histogram_vec_with_registry!(
-            prometheus::HistogramOpts::new(name, "torrentd histogram"),
-            &label_names,
-            self.registry,
-        )
-        .map_err(|e| self.warn_registration("histogram", name, &e))
-        .ok()?;
-        g.insert(name.to_string(), hv.clone());
-        Some(hv)
-    }
 }
 
 /// The catalogue's help text for `name`, or `fallback` for a series the
@@ -923,48 +452,43 @@ fn help_for(name: &str, fallback: &'static str) -> &'static str {
     catalogued(name).map(|s| s.help).unwrap_or(fallback)
 }
 
-fn label_values<'a>(labels: &'a [(&str, &str)]) -> Vec<&'a str> {
-    labels.iter().map(|(_, v)| *v).collect()
-}
-
 impl MetricsSink for PromSink {
     fn inc_counter(&self, name: &str, labels: &[(&str, &str)]) {
-        let Some(c) = self.counter_for(name, labels) else {
-            return;
-        };
-        match c.get_metric_with_label_values(&label_values(labels)) {
-            Ok(child) => child.inc(),
-            Err(e) => self.warn_labels(name, &e),
+        if let Some(c) = self.counter(name, labels) {
+            c.inc();
         }
     }
 
     fn add_counter(&self, name: &str, value: u64, labels: &[(&str, &str)]) {
-        let Some(c) = self.counter_for(name, labels) else {
-            return;
-        };
-        match c.get_metric_with_label_values(&label_values(labels)) {
-            Ok(child) => child.inc_by(value as f64),
-            Err(e) => self.warn_labels(name, &e),
+        if let Some(c) = self.counter(name, labels) {
+            c.inc_by(value as f64);
         }
     }
 
     fn set_gauge(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
-        let Some(g) = self.gauge_for(name, labels) else {
-            return;
-        };
-        match g.get_metric_with_label_values(&label_values(labels)) {
-            Ok(child) => child.set(value),
-            Err(e) => self.warn_labels(name, &e),
+        let gauge = self.child(&self.gauges, "gauge", name, labels, |name, names| {
+            register_gauge_vec_with_registry!(
+                name,
+                help_for(name, "torrentd gauge"),
+                names,
+                self.registry,
+            )
+        });
+        if let Some(g) = gauge {
+            g.set(value);
         }
     }
 
     fn observe_histogram(&self, name: &str, value: f64, labels: &[(&str, &str)]) {
-        let Some(h) = self.histogram_for(name, labels) else {
-            return;
-        };
-        match h.get_metric_with_label_values(&label_values(labels)) {
-            Ok(child) => child.observe(value),
-            Err(e) => self.warn_labels(name, &e),
+        let histogram = self.child(&self.histos, "histogram", name, labels, |name, names| {
+            register_histogram_vec_with_registry!(
+                prometheus::HistogramOpts::new(name, help_for(name, "torrentd histogram")),
+                names,
+                self.registry,
+            )
+        });
+        if let Some(h) = histogram {
+            h.observe(value);
         }
     }
 }
@@ -1228,16 +752,32 @@ mod tests {
     fn a_label_mismatch_is_counted_as_a_dropped_sample() {
         let sink = PromSink::new();
         sink.inc_counter("config_reload_failures_total", &[("stage", "load")]);
-        // Values are matched by position, so the mismatch that loses a sample
-        // is a different number of labels.
         sink.inc_counter(
             "config_reload_failures_total",
             &[("stage", "load"), ("extra", "x")],
         );
+        sink.inc_counter("config_reload_failures_total", &[("phase", "load")]);
         let text = String::from_utf8(sink.render()).unwrap();
         assert!(
-            text.contains("torrentd_metrics_dropped_samples_total{reason=\"labels\"} 1"),
+            text.contains("torrentd_metrics_dropped_samples_total{reason=\"labels\"} 2"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn labels_are_matched_by_name_not_position() {
+        let sink = PromSink::new();
+        sink.set_gauge("g", 1.0, &[("profile_id", "a"), ("task", "t")]);
+        sink.set_gauge("g", 2.0, &[("task", "t"), ("profile_id", "b")]);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(
+            text.contains("torrentd_g{profile_id=\"a\",task=\"t\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("torrentd_g{profile_id=\"b\",task=\"t\"} 2"),
+            "{text}"
+        );
+        assert!(!text.contains("profile_id=\"t\""), "{text}");
     }
 }

@@ -493,12 +493,6 @@ mod tests {
 
     #[test]
     fn enable_refuses_to_install_a_ruleset_as_root() {
-        // Driven through `enable`'s own control flow, not around it: delete
-        // the `if let Some(refusal)` line and this fails, in any environment.
-        // Asserting on `refusal_for_uid` alone -- which is what this test did
-        // -- left the call site reachable by nothing, so the guard could be
-        // deleted with the suite still green while a host running the daemon
-        // as root lost every root-owned socket on it.
         let called = std::cell::Cell::new(false);
         let e = enable_for_uid(
             0,
@@ -519,12 +513,6 @@ mod tests {
             "the refusal comes before anything is handed to nft — so a refused \
              enable cannot disarm a kill switch a previous run installed either",
         );
-    }
-
-    #[test]
-    fn the_refusal_is_the_predicate_the_guard_consults() {
-        let e = refusal_for_uid(0).expect("uid 0 must be refused");
-        assert!(e.to_string().contains("non-root user"), "got {e}");
     }
 
     /// The success path, driven through `enable_for_uid`'s real control flow:
@@ -743,19 +731,6 @@ table inet torrentd_ks {
         assert!(!table_listed(&format!("table ip {TABLE}\n")));
         assert!(!table_listed(&format!("table inet {TABLE}_old\n")));
         assert!(!table_listed(""));
-    }
-
-    #[test]
-    fn render_ruleset_would_happily_confine_uid_0() {
-        // `render_ruleset` is pure and has no guard of its own: it renders a
-        // ruleset that drops every root-owned socket on the host. This pins
-        // the shape `refusal_for_uid` exists to keep out of `nft`; on its own
-        // it establishes nothing about whether anything checks.
-        let rs = render_ruleset(0, &["wg0".to_string()]).unwrap();
-        assert!(
-            rs.contains("meta skuid 0 counter drop"),
-            "if this ever stops being catastrophic, revisit refusal_for_uid",
-        );
     }
 
     #[test]

@@ -243,11 +243,6 @@ fn apply_inner(
         }
         let result = match step.op.as_str() {
             ops::MOVE_TORRENT => move_torrent(pool, source, state, &step),
-            ops::MOVE_FILE => move_file(
-                Path::new(&step.src),
-                Path::new(step.dst.as_deref().unwrap_or("")),
-            )
-            .map_err(StepFailure::Failed),
             ops::DELETE_FILE => delete_file(pool, Path::new(&step.src), plan_id, &mut guards)
                 .map_err(StepFailure::Failed),
             other => Err(StepFailure::Failed(format!(
@@ -533,76 +528,6 @@ fn move_directory(src: &Path, dst: &Path) -> Result<(), String> {
         )),
         Err(e) => Err(format!("rename {} → {}: {e}", src.display(), dst.display())),
     }
-}
-
-/// Move one file, falling back to copy-verify-unlink across filesystems.
-fn move_file(src: &Path, dst: &Path) -> Result<(), String> {
-    if dst.as_os_str().is_empty() {
-        return Err("move_file step has no destination".into());
-    }
-    if dst.exists() {
-        return Err(format!("destination {} already exists", dst.display()));
-    }
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
-    }
-
-    match std::fs::rename(src, dst) {
-        Ok(()) => return sync_parents(&[src, dst]),
-        Err(e) if e.raw_os_error() != Some(libc_exdev()) => {
-            return Err(format!("rename {} → {}: {e}", src.display(), dst.display()));
-        }
-        Err(_) => {}
-    }
-
-    // Different filesystem: copy, flush to disk, confirm the size, and only
-    // then remove the source. `fs::copy` alone would leave the destination
-    // unflushed, so a crash could unlink a good source against a truncated
-    // destination.
-    let src_len = std::fs::metadata(src)
-        .map_err(|e| format!("stat {}: {e}", src.display()))?
-        .len();
-    if let Err(e) = std::fs::copy(src, dst) {
-        // A partial destination would make every retry fail on "destination
-        // already exists", wedging the plan on its own debris. The source is
-        // untouched, so removing the fragment is safe.
-        let _ = std::fs::remove_file(dst);
-        return Err(format!("copy {} → {}: {e}", src.display(), dst.display()));
-    }
-    {
-        use std::io::Write;
-        let f = std::fs::OpenOptions::new()
-            .write(true)
-            .open(dst)
-            .map_err(|e| format!("reopen {}: {e}", dst.display()))?;
-        let mut f = f;
-        f.flush()
-            .map_err(|e| format!("flush {}: {e}", dst.display()))?;
-        f.sync_all()
-            .map_err(|e| format!("fsync {}: {e}", dst.display()))?;
-    }
-    let dst_len = std::fs::metadata(dst)
-        .map_err(|e| format!("stat {}: {e}", dst.display()))?
-        .len();
-    if dst_len != src_len {
-        // Leave both copies. Removing the source here is exactly the mistake
-        // this whole path exists to avoid.
-        return Err(format!(
-            "copy verification failed: {} is {dst_len} bytes, source is {src_len}",
-            dst.display(),
-        ));
-    }
-    // Fsync the destination *directory* too. Without it the file's data is on
-    // disk but its directory entry may not be, so a crash after the unlink
-    // below leaves neither copy reachable.
-    if let Some(parent) = dst.parent() {
-        if let Ok(d) = std::fs::File::open(parent) {
-            d.sync_all()
-                .map_err(|e| format!("fsync {}: {e}", parent.display()))?;
-        }
-    }
-    std::fs::remove_file(src).map_err(|e| format!("unlink {}: {e}", src.display()))?;
-    sync_parents(&[src])
 }
 
 /// Fsync the directory holding each path, so a rename or unlink in it

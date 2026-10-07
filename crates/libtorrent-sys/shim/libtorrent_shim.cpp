@@ -840,11 +840,6 @@ static lt::alert_category_t alert_mask(bool logs) {
 static lt::settings_pack make_seed_settings(const char* settings_json) {
     lt::settings_pack pack = lt::high_performance_seed();
     apply_settings_from_json(pack, settings_json);
-
-    // Make sure the alert queue is configured for our scale.
-    if (pack.has_val(lt::settings_pack::alert_queue_size) == false) {
-        pack.set_int(lt::settings_pack::alert_queue_size, 10000);
-    }
     pack.set_int(lt::settings_pack::alert_mask,
                  alert_mask(pseudo_bool(settings_json, "_alert_logs") == 1));
     return pack;
@@ -932,19 +927,6 @@ extern "C" int lt_session_save_state(lt_session* s,
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)
 }
 
-extern "C" int lt_session_load_state(lt_session* s,
-                                     const uint8_t* buf, size_t len,
-                                     char* err_out, int err_len)
-{
-    if (!s || !buf) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
-    LT_SHIM_TRY
-    lt::session_params params = lt::read_session_params(
-        lt::span<char const>(reinterpret_cast<const char*>(buf), len));
-    s->ses.apply_settings(params.settings);
-    return LT_OK;
-    LT_SHIM_CATCH(err_out, err_len, LT_ERR)
-}
-
 extern "C" void lt_buf_free(uint8_t* buf) { std::free(buf); }
 
 // -------------------------------------------------------------------------
@@ -1001,33 +983,6 @@ extern "C" lt_handle lt_add_torrent_magnet(lt_session* s,
     if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
     apply_add_params_common(atp, save_path, flags);
 
-    lt::torrent_handle h = s->ses.add_torrent(std::move(atp), ec);
-    if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
-    if (!h.is_valid()) { set_err(err_out, err_len, "invalid handle"); return 0; }
-    if (infohash_out) {
-        auto ih = h.info_hashes().get_best();
-        std::memcpy(infohash_out, ih.data(), 20);
-    }
-    return s->register_handle(h, /*authoritative=*/true);
-    LT_SHIM_CATCH(err_out, err_len, 0)
-}
-
-extern "C" lt_handle lt_add_torrent_resume(lt_session* s,
-                                           const uint8_t* resume_buf, size_t resume_len,
-                                           uint8_t* infohash_out,
-                                           char* err_out, int err_len)
-{
-    if (!s || !resume_buf) { set_err(err_out, err_len, "null arg"); return 0; }
-    LT_SHIM_TRY
-    lt::error_code ec;
-    lt::add_torrent_params atp = lt::read_resume_data(
-        lt::span<char const>(reinterpret_cast<const char*>(resume_buf), resume_len), ec);
-    if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
-    // Resume data already carries flags + save_path + ti; the only override is
-    // the no-download invariant and the status subscription, for the reasons
-    // lt_add_torrent_resume_ex gives.
-    atp.flags |= lt::torrent_flags::update_subscribe;
-    enforce_no_download(atp.flags);
     lt::torrent_handle h = s->ses.add_torrent(std::move(atp), ec);
     if (ec) { set_err(err_out, err_len, ec.message()); return 0; }
     if (!h.is_valid()) { set_err(err_out, err_len, "invalid handle"); return 0; }

@@ -158,25 +158,10 @@ impl Serialize for ProfileId {
         s.serialize_str(&self.0)
     }
 }
-/// Enforces the charset rule at the only door untrusted text comes through.
-///
-/// `[A-Za-z0-9_-]{1,64}`, the same rule
-/// [`ProfileConfig::validate_set`] applies — see
-/// [`ProfileConfig::is_valid_id`] for why the set is what it is.
-///
-/// It is checked here as well because two files deserialize into `ProfileId`
-/// and only one of them passes through the validator: the config file does,
-/// and `profile_assignments.json` does not. An id read from a hand-edited
-/// registry reached `dir_for` and was joined onto a path with nothing between
-/// it and the filesystem, so the safety of `<resume_dir>/<id>` rested entirely
-/// on the startup bail staying correct. Making it a property of the type
-/// rather than of having called something means the raw string cannot get that
-/// far.
-///
-/// `ProfileId::new` stays infallible. Making it fallible and routing every
-/// construction through it is the tidier end state, but it ripples through
-/// every internal call site for no additional safety once this door is closed
-/// — the remaining callers build ids from values that already validated.
+/// Refuses an id outside [`ProfileConfig::is_valid_id`]'s rule, so an id
+/// read from a hand-edited registry file cannot reach a path join.
+/// `ProfileId::new` stays infallible: its callers build ids from values that
+/// already validated.
 impl<'de> Deserialize<'de> for ProfileId {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
@@ -189,12 +174,8 @@ impl<'de> Deserialize<'de> for ProfileId {
     }
 }
 
-/// Why an id outside `[A-Za-z0-9_-]{1,64}` cannot be used, in one sentence.
-///
-/// Shared rather than written twice. Two doors refuse an id — this module's
-/// `Deserialize`, and the pre-profiles registry conversion in
-/// [`crate::registry`], which has to say the same thing in a message built by
-/// hand. Two spellings of one rule is how the two stop agreeing.
+/// Why an id outside `[A-Za-z0-9_-]{1,64}` cannot be used: the one wording
+/// every refusal of an id shares.
 pub(crate) const ID_CHARSET_RULE: &str =
     "an id may be 1-64 characters of [A-Za-z0-9_-] only. The id is a path component in three \
      places (<resume_dir>/<id>, <torrent_dir>/<id>, session_state-<id>.dat) and a URL path \
@@ -670,13 +651,7 @@ pub fn bind_endpoint(ip: std::net::IpAddr, port: u16) -> String {
 pub enum ProfileConfigError {
     #[error("profile id {0:?} appears more than once")]
     DuplicateId(String),
-    #[error(
-        "profile id {0:?} is not usable: an id may be 1-64 characters of \
-         [A-Za-z0-9_-] only. The id is a path component in three places \
-         (<resume_dir>/<id>, <torrent_dir>/<id>, session_state-<id>.dat) and a \
-         URL path segment, so anything else either escapes those directories or \
-         cannot be addressed."
-    )]
+    #[error("profile id {0:?} is not usable: {ID_CHARSET_RULE}")]
     BadId(String),
     #[error("listen_port {0} appears more than once")]
     DuplicatePort(u16),

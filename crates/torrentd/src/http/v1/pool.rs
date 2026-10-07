@@ -1458,8 +1458,6 @@ pub enum StepOp {
     /// Relocate an adopted torrent's payload; libtorrent performs the move so
     /// its session stays consistent.
     MoveTorrent,
-    /// Move a file no torrent claims.
-    MoveFile,
     /// Delete a file no torrent claims.
     DeleteFile,
 }
@@ -1512,7 +1510,6 @@ wire_enum_from_str!(PlanStatus {
 });
 wire_enum_from_str!(StepOp {
     "move_torrent" => MoveTorrent,
-    "move_file" => MoveFile,
     "delete_file" => DeleteFile,
 });
 wire_enum_from_str!(StepStatus {
@@ -2284,7 +2281,7 @@ mod tests {
         ] {
             assert_eq!(StepStatus::parse(s).unwrap().as_str(), s);
         }
-        for s in [ops::MOVE_TORRENT, ops::MOVE_FILE, ops::DELETE_FILE] {
+        for s in [ops::MOVE_TORRENT, ops::DELETE_FILE] {
             assert_eq!(StepOp::parse(s).unwrap().as_str(), s);
         }
         for spec in [

@@ -90,7 +90,6 @@ typedef uintptr_t lt_handle;
  * allocation at ~256 MiB. */
 #define LT_MAX_TORRENT_FILES 250000u
 #define LT_MSG_MAX  2048
-#define LT_NAME_MAX 64
 #define LT_ADDR_MAX 64
 #define LT_OP_MAX   64
 
@@ -180,10 +179,6 @@ int         lt_session_save_state(lt_session* s,
                                   uint8_t** buf_out, size_t* len_out,
                                   char* err_out, int err_len);
 
-int         lt_session_load_state(lt_session* s,
-                                  const uint8_t* buf, size_t len,
-                                  char* err_out, int err_len);
-
 /* Free a buffer handed out by the shim (save_state, alert payloads). */
 void        lt_buf_free(uint8_t* buf);
 
@@ -210,13 +205,7 @@ lt_handle   lt_add_torrent_magnet(lt_session* s,
                                   uint8_t* infohash_out,
                                   char* err_out, int err_len);
 
-lt_handle   lt_add_torrent_resume(lt_session* s,
-                                  const uint8_t* resume_buf, size_t resume_len,
-                                  uint8_t* infohash_out,
-                                  char* err_out, int err_len);
-
-/* Add from resume data with caller overrides — the general form of
- * lt_add_torrent_resume.
+/* Add from resume data, with caller overrides.
  *
  * torrent_buf:        optional .torrent bytes. libtorrent only embeds the info
  *                     dict in resume data when save_resume_data was called with

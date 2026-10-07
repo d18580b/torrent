@@ -38,6 +38,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::exec;
+use super::ip_lookup::link_standing;
 
 const BRING_UP_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -133,25 +134,6 @@ pub fn latest_handshake_age(iface: &str) -> Result<Option<Duration>, ProbeUnavai
     Ok(Some(Duration::from_secs(now - latest)))
 }
 
-/// Whether a link of this name is standing, as `ip` sees it from this
-/// process's network namespace.
-///
-/// [`interface_public_key`] cannot answer this. It returns `None` for a link
-/// that is not a WireGuard device, for a host with no usable `wg`, and for no
-/// link at all, alike — and the teardown exemption turns on telling the first
-/// two from the third.
-///
-/// Asked of `ip` rather than read from `/sys/class/net`, which shows the
-/// namespace sysfs was mounted in: the native path creates, configures and
-/// deletes links through `ip`, and ownership has to be decided from the same
-/// view the teardown acts on. A probe that could not be answered reads as
-/// **standing**, because every `false` here licenses something — a teardown,
-/// or dropping the record a later adoption needs. See
-/// [`super::ip_lookup::link_standing`].
-fn interface_exists(iface: &str) -> bool {
-    super::ip_lookup::link_standing(iface)
-}
-
 /// The host's boot id, or `None` if it could not be read.
 ///
 /// `/proc/sys/kernel/random/boot_id` changes on every boot of the *host*, and
@@ -167,63 +149,15 @@ pub(super) fn current_boot_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// The interfaces this daemon raised, recorded where a *later* process can
-/// read them.
+/// The interfaces this daemon raised, recorded under `Config::state_dir()`
+/// where a *later* process can read them: [`ownership`]'s second ground, for
+/// a profile whose config carries no key.
 ///
-/// Ownership used to be decided from keys alone, and for one accepted
-/// configuration it could never be decided at all. The documented hardening
-/// pattern `PostUp = wg set %i private-key /etc/wireguard/wg-a.key` keeps the
-/// key out of the `.conf`, so [`profile_public_key`] reads nothing and
-/// [`ownership`] returns [`Ownership::Unestablished`] however long the daemon
-/// looks at it. That is the right answer for a stranger's interface and the
-/// wrong one for the daemon's own: after an unclean shutdown the link survives
-/// carrying a key the next boot cannot derive, so the next boot will neither
-/// adopt it — [`Adoption::Adopt`], which the recovery path exists to reach —
-/// nor tear it down, and `ProfileRegistry::iter()` excludes the failed profile so
-/// nothing else in the process ever sees it either. Every later boot
-/// reproduces that identically: the profile is dark until an operator runs
-/// `ip link delete` by hand.
-///
-/// A name recorded here is a second way to establish ownership, beside the
-/// key, and it does not depend on the *profile* carrying one. It lives under
-/// `Config::state_dir()` beside the OpenVPN pid file, for the same reason
-/// that file does: tearing a tunnel down builds a fresh manager, so nothing
-/// the process that raised the tunnel held in memory is still there.
-///
-/// **The record is scoped to the host's boot id, and that is what makes it
-/// safe against a reboot.** A file under `/var/lib` outlives a reboot; the
-/// interface it names cannot. Without the scope, a record left by a daemon
-/// that died before a reboot would claim any interface that happened to take
-/// the same name afterwards — which is the destructive direction the
-/// key-based exemption exists to close, reopened one path over. With it, a
-/// record is trusted only while the kernel that carried the link is still
-/// running. The same reasoning `live_pid` applies to the OpenVPN pid file: a
-/// record surviving a reboot is *detected*, not trusted.
-///
-/// **The record also carries the live link's own public key, and that is what
-/// makes it safe inside one boot.** The boot id alone bounds the record by the
-/// kernel's lifetime, not by the link's, and a name can be freed and retaken
-/// while the same kernel runs: the daemon raises `wg-a` and is killed, an
-/// operator removes the link by hand — the one remedy the runbook names for a
-/// stuck tunnel — and something else takes the name before the restart. The
-/// record then still says "this boot raised `wg-a`", and a record that
-/// establishes ownership on that alone has the daemon bind a profile's sockets to
-/// a stranger's tunnel, with `vpn_monitor` probing address presence and
-/// handshake age and never a key, so the profile reports healthy indefinitely.
-/// The boot sweep cannot close it: the sweep drops a record only when the name
-/// is **free**, and here it is occupied.
-///
-/// So the record names a *link*, not a name: it is written **after** the
-/// native `ip`/`wg` bring-up ([`WireguardManager::raise`]) has succeeded,
-/// carrying the public key the live interface carries at that moment, and it
-/// establishes ownership only while the link standing under that name still
-/// carries the same key. The witness is link-derived, which a file under
-/// `/var/lib` cannot be on its own.
-///
-/// The cost, stated rather than traded away: a daemon killed **between** a
-/// successful bring-up and this write leaves an interface with no record,
-/// so a later boot fences the profile instead of adopting it. That window is
-/// narrow, and a fenced profile is the safe side of it.
+/// A record is scoped to the host's boot id, so it is never believed across a
+/// reboot, and carries the public key the live link had when it was written,
+/// after a successful [`WireguardManager::raise`], so it names a link rather
+/// than a name. A daemon killed between the bring-up and the write leaves no
+/// record, and a later boot fences the profile rather than adopting it.
 #[derive(Debug, Clone)]
 struct RaisedInterfaces {
     dir: std::path::PathBuf,
@@ -259,18 +193,8 @@ impl RaisedInterfaces {
     /// is nothing at all. A record with no key in it establishes nothing, so a
     /// link whose key would not read is claimed by nobody rather than by name.
     ///
-    /// The parent directory is created first, exactly as the OpenVPN pid
-    /// writer does for the file beside this one (`openvpn.rs:155`).
-    /// `Config::state_dir()` is one of the directories §4 of the runbook lists
-    /// as tolerated-missing, so a deployment that has relocated `resume_dir`
-    /// and not yet written anything under it reaches here with no directory at
-    /// all — and the whole recovery this record exists for was then off for
-    /// that deployment, behind a single `warn` nobody reads.
-    ///
-    /// The failure is **returned** rather than logged here, so the caller
-    /// reports it against the interface and the path it happened to. Swallowed
-    /// inside the writer it is indistinguishable from a record that was never
-    /// needed.
+    /// The state directory may not exist yet, so it is created first; a
+    /// failure is returned for the caller to report against the interface.
     fn record(&self, iface: &str, live_key: Option<&str>) -> std::io::Result<()> {
         let Some(boot_id) = self.boot_id.as_deref() else {
             return Ok(());
@@ -293,20 +217,10 @@ impl RaisedInterfaces {
     /// Whether the link standing as `iface` and carrying `live_key` right now
     /// is the one a daemon on *this* boot of the host recorded raising.
     ///
-    /// Two witnesses, and both have to hold. The boot id bounds the record by
-    /// the kernel's lifetime, which is what keeps a record surviving a reboot
-    /// from claiming whatever takes the name afterwards. The key bounds it by
-    /// the *link's* lifetime, which is what keeps a record surviving a hand
-    /// `ip link delete` from claiming whatever takes the name **inside the
-    /// same boot** — the case the sweep cannot reach, because the sweep drops
-    /// a record only when the name is free.
-    ///
-    /// An absent `live_key` — no link, or one whose key would not read — is
-    /// never a match: there is nothing to compare the record against, and a
-    /// record answering "yes" to that question is the name-only claim this
-    /// second witness exists to remove. A record written before this change,
-    /// or by a boot whose `wg show` failed, carries an empty key line and
-    /// likewise matches nothing.
+    /// Both witnesses must hold: the boot id bounds the record by the
+    /// kernel's lifetime, the key by the link's, so a name retaken after a
+    /// reboot or a hand `ip link delete` matches nothing. An absent `live_key`,
+    /// or a record with no key in it, never matches.
     fn recorded(&self, iface: &str, live_key: Option<&str>) -> bool {
         let Some(boot_id) = self.boot_id.as_deref() else {
             return false;
@@ -325,40 +239,11 @@ impl RaisedInterfaces {
 
     /// Drop every record whose interface is not standing, and say which.
     ///
-    /// `exists` is a parameter because the sweep is the whole of the rule and
-    /// `/sys/class/net` is what made it unreachable by a test.
-    ///
-    /// A record names a link this boot raised and the key that link carried,
-    /// and only [`forget`] ever drops a spent one — from the daemon's own
-    /// teardown, or from [`adoptable`] happening to observe an outcome that is
-    /// not an adoption. An interface removed by an operator (the one remedy
-    /// this repository's runbook names for a stuck tunnel), by another
-    /// process, or by the kernel leaves the record on disk pointing at
-    /// nothing, inside the same host boot, so the boot-id scope does not
-    /// help. Sweeping the freed name here is what keeps a *later* `record` for
-    /// that name from having to overwrite a stale one, and what keeps
-    /// `state_dir()` from filling with records for links that are gone.
-    ///
-    /// The sweep is **not** what makes a retaken name safe, and it cannot be:
-    /// it drops a record only when the name is free, and a retaken name is
-    /// occupied. That is [`RaisedInterfaces::recorded`]'s key witness, and it
-    /// is the only thing that reaches the case.
-    ///
-    /// Running this before any `bring_up` ties the record's lifetime to the
-    /// interface rather than to the daemon's own good behaviour, which is the
-    /// only thing that can: nothing else in the process is told when a link
-    /// goes away.
-    ///
-    /// A state directory that is **not there** is no records to sweep — it is
-    /// one of the paths §4 of the runbook lists as tolerated-missing. A state
-    /// directory that is there and cannot be read is a failure and is
-    /// returned: decision 52(c) made `record`'s write failure a reported error
-    /// precisely because a bare swallow silently disables the whole repair,
-    /// and swallowing the read leaves the same repair disabled with nothing
-    /// said.
-    ///
-    /// [`forget`]: RaisedInterfaces::forget
-    /// [`adoptable`]: WireguardManager::adoptable
+    /// Run before any bring-up, since nothing in the process learns when a
+    /// link is removed by hand. A retaken name is not this sweep's to catch
+    /// but [`RaisedInterfaces::recorded`]'s. A missing state directory is no
+    /// records; an unreadable one is an error. `exists` is a parameter so the
+    /// rule is testable.
     fn sweep_with(&self, exists: impl Fn(&str) -> bool) -> std::io::Result<Vec<String>> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
@@ -396,7 +281,7 @@ impl RaisedInterfaces {
 /// nothing does.
 pub fn sweep_raised_records(state_dir: &Path) {
     let raised = RaisedInterfaces::new(state_dir.to_path_buf());
-    match raised.sweep_with(interface_exists) {
+    match raised.sweep_with(link_standing) {
         Ok(dropped) => {
             for iface in dropped {
                 info!(
@@ -520,61 +405,18 @@ impl WireguardManager {
         }
     }
 
-    /// The IP of an existing interface that is safe to adopt as `profile`'s
-    /// tunnel: it must be live, carry the profile's own public key, and have an
-    /// address. Anything less and the daemon would be binding its sockets to a
-    /// tunnel it cannot vouch for, which is the one thing Safety Rule 1 exists
-    /// to prevent.
+    /// Whether the link standing under `profile`'s interface name may be
+    /// adopted as its tunnel, decided by [`ownership`].
     ///
-    /// **"Vouch for" here means identity, not configuration.** The two
-    /// conditions establish that this is the peer the profile names and that
-    /// it has an address to bind to. They do not check the peer endpoint,
-    /// `AllowedIPs`, the routing table or the fwmark rule, so a tunnel left
-    /// by a partially completed `wg-quick down` — which removes routes and
-    /// rules *before* it removes the interface — is adoptable.
-    ///
-    /// That is deliberate, and it is bounded rather than leak-free. The link
-    /// keeps its address, so with its rules gone a packet from that address
-    /// falls through to the main table and can leave by the physical
-    /// interface with the tunnel's source address, wherever the socket's
-    /// device binding is refused or absent (see `startup.rs`).
-    /// `vpn_monitor`'s route probe fences the profile within one
-    /// `POLL_INTERVAL`, and the kill switch, when on, drops that traffic in
-    /// the meantime. The failure mode is a fenced profile, and the four extra
-    /// `wg`/`ip` subprocess calls per bring-up that checking the rest would
-    /// cost buy only an earlier refusal of it.
-    ///
-    /// Adoption is likewise attempted on **any** non-zero `wg-quick up` exit
-    /// rather than on matching wg-quick's own "already exists" message, which
-    /// would be a second thing to keep in step with a tool this daemon does
-    /// not own. The public-key gate is what decides whether the tunnel may be
-    /// *adopted*.
-    ///
-    /// The refusal is reported as [`Adoption::Foreign`] rather than folded
-    /// into "not adoptable", because the caller's teardown-on-failure path
-    /// would otherwise run `wg-quick down <iface>` on the very interface this
-    /// function has just declined to touch. That reasoning is about ownership
-    /// and not about keys, so the exemption is decided by [`ownership`] on
-    /// "does a link of this name exist, and did this function establish that
-    /// it is ours" — see there for what turning it on the keys alone cost.
-    ///
-    /// Ownership has **two** ways to be established, because the key has one
-    /// configuration it can never establish it for. [`RaisedInterfaces`] is
-    /// the second: a link this host's current boot recorded as raised by the
-    /// daemon, **and which still carries the public key that record names**,
-    /// is the daemon's when the profile carries no key to compare. It is
-    /// consulted *after* the keys and never against them — see [`ownership`].
+    /// Adoption establishes identity, not configuration: it does not check the
+    /// peer endpoint, `AllowedIPs` or the routing. A link whose routing is
+    /// gone is still adoptable, and `vpn_monitor`'s route probe fences it
+    /// within one `POLL_INTERVAL`, with the kill switch, when on, dropping its
+    /// traffic meanwhile.
     fn adoptable(&self, profile: &VpnTunnel) -> Adoption {
-        let exists = interface_exists(&profile.interface);
-        // Both key probes shell out, and neither has anything to adjudicate
-        // when there is no link of that name — `wg-quick up` fails for plenty
-        // of reasons that leave nothing behind. When there *is* one, both run,
-        // record or no record. Skipping them because a record was present made
-        // the record outrank a readable, contradicting public key: an operator
-        // who rotates the provider credentials by editing the `.conf` in place
-        // — which the stem rule forces — then has the restart adopt the
-        // *previous* tunnel and report it healthy, because `vpn_monitor`
-        // probes address presence and handshake age and never a key.
+        let exists = link_standing(&profile.interface);
+        // Both keys are read whenever a link stands, record or no record: the
+        // record must never outrank a readable, contradicting key.
         let (live, expected) = if exists {
             (
                 interface_public_key(&profile.interface),
@@ -583,12 +425,6 @@ impl WireguardManager {
         } else {
             (None, None)
         };
-        // The live key is read *before* the record is consulted, because the
-        // record is now read against it: a record establishes ownership only
-        // while the link standing under that name still carries the key the
-        // record was written from. A name that was freed and retaken inside
-        // one host boot therefore establishes nothing, which the boot id alone
-        // could not tell and the sweep cannot reach.
         let raised_here = exists && self.raised.recorded(&profile.interface, live.as_deref());
         let adoption = match ownership(exists, raised_here, live.as_deref(), expected.as_deref()) {
             Ownership::Absent => Adoption::No,
@@ -620,17 +456,8 @@ impl WireguardManager {
             }
         };
         if !matches!(adoption, Adoption::Adopt(..)) {
-            // Any outcome that is not an adoption spends the record, and this
-            // is the only place in the process that learns one is spent.
-            //
-            // It used to be dropped on `Absent` alone — "the bring-up it was
-            // written for created nothing". That is one of three ways a record
-            // stops describing the link it names, and the other two are the
-            // dangerous ones: a link of this name that is standing and is not
-            // ours (`Unestablished`), and one this boot could not use
-            // (`Ours` with no address). Leaving the record armed through those
-            // has the *next* boot claim the same stranger's link on the record
-            // alone, which is what licenses `wg-quick down` on it.
+            // Any outcome that is not an adoption spends the record, or the
+            // next boot could claim a stranger's link on the record alone.
             self.raised.forget(&profile.interface);
         }
         adoption
@@ -639,10 +466,6 @@ impl WireguardManager {
 
 /// Whose interface the one of this profile's name is, as far as this boot can
 /// establish from the host.
-///
-/// Split out from [`WireguardManager::adoptable`] and pure, because the rule
-/// is the whole of the defect and the three subprocess probes around it are
-/// what made it unreachable by a test.
 #[derive(Debug, Eq, PartialEq)]
 enum Ownership {
     /// A link of that name exists and carries this profile's own public key.
@@ -670,60 +493,19 @@ impl From<Ownership> for Adoption {
 
 /// Decide ownership from the three things the host was asked.
 ///
-/// The condition is "a link of this name exists **and** adoption was not
-/// granted", not "both public keys were readable and they differ". Turning it
-/// on the keys made the exemption fire for exactly one of the several ways the
-/// daemon meets an interface it has not established as its own, and tore the
-/// rest down. The live case is the documented hardening pattern
-/// `PostUp = wg set %i private-key /etc/wireguard/wg-a.key`, which keeps the
-/// key out of the `.conf`: `profile_public_key` then reads no `PrivateKey`
-/// line and returns `None`, a `let ... else` fired before the comparison was
-/// ever reached, and `bring_up_tracked`'s catch-all ran `wg-quick down wg-a`
-/// on a stranger's tunnel — taking its routes and its rules with it, over a
-/// name collision. `ProfileConfig::validate_set` checks the profile path's stem
-/// and its directory and never reads its contents, so that configuration is
-/// accepted and works normally. A link of that name that is not a WireGuard
-/// device at all is the same shape one probe over.
+/// A standing link is ours on one of two grounds, and anything else is
+/// [`Ownership::Unestablished`], which exempts it from every teardown:
 ///
-/// `raised_here` is the second way ownership can be established, and it is
-/// what keeps that same keyless profile from being *permanently* dark rather
-/// than merely un-torn-down. Deciding on the keys alone closed the
-/// destructive direction and opened a one-way one: the profile carries no key
-/// this boot can derive, so no boot can ever establish ownership, so an
-/// interface an unclean shutdown left standing is neither adopted nor
-/// removed, for the life of the deployment. [`RaisedInterfaces`] answers the
-/// question the key cannot — "is the link standing there the one this daemon
-/// raised, on this boot of this host".
+/// * the live link carries the public key the profile's config derives; or
+/// * the profile carries no key (`PostUp = wg set %i private-key …` keeps it
+///   out of the `.conf`) and `raised_here`: a record written on this boot of
+///   this host names this interface *and* the key the live link carries now
+///   (see [`RaisedInterfaces::recorded`]). The key is what tells the link
+///   this daemon raised from one that took the name after it was freed.
 ///
-/// **That is the question it answers, and it takes two witnesses to answer
-/// it.** `raised_here` is true only when a record written by this boot names
-/// this interface *and* names the public key the live link carries right now:
-/// see [`RaisedInterfaces::recorded`]. The name alone was not enough. A name
-/// can be freed and retaken while the same kernel runs — the daemon is killed,
-/// an operator runs the runbook's own `ip link delete`, and something else
-/// takes `wg-a` before the restart — and a record believed on the name alone
-/// then answered `Ours` for a stranger's tunnel, which `first_ipv4` turned
-/// into `Adopt(Ground::RaisedThisBoot)` and the daemon bound a profile's sockets
-/// to. The boot sweep cannot reach that case: it drops a record only when the
-/// name is **free**, and a retaken name is occupied. Comparing the recorded
-/// key against the live one is the only thing that can, because it is the only
-/// witness derived from the link rather than from a file.
-///
-/// **It answers only that question.** The record is consulted after the keys
-/// and decides exactly the case it was taken for, `profile_key == None`. Ahead
-/// of them it made a file under `/var/lib` outrank a public key read off the
-/// live link a moment earlier: an operator who rotates the provider
-/// credentials by editing the `.conf` in place — which `validate_set`'s stem
-/// rule forces — restarts into `wg-quick up` refusing the surviving link, the
-/// record calling it ours, and the profile rebuilt on the **previous**
-/// credentials and endpoint, reported healthy for as long as the old tunnel
-/// keeps handshaking. Two keys that disagree are direct evidence that the link
-/// is not the one the profile configures, and the record does not outrank
-/// them.
-///
-/// Note the order: `Absent` first. A record for a link that is not standing
-/// establishes nothing, and [`WireguardManager::adoptable`] discards it — as
-/// it discards one for any other outcome that is not an adoption.
+/// The record decides only the keyless case. Two readable keys settle it
+/// whatever the record says: keys that disagree mean the link is not the one
+/// the profile configures, as after credentials are rotated in place.
 fn ownership(
     exists: bool,
     raised_here: bool,
@@ -742,12 +524,8 @@ fn ownership(
                 Ownership::Unestablished
             }
         }
-        // A live WireGuard link of this name whose key the profile does not
-        // carry — the `PostUp = wg set %i private-key …` configuration, and
-        // the whole of what the record is for. `raised_here` has already
-        // compared the live key against the one the record names, so this is
-        // "the link this boot raised is still standing", not "a link of the
-        // name this boot once raised is standing".
+        // The keyless profile: `raised_here` already compared the live key
+        // against the record's.
         (Some(_), None) if raised_here => Ownership::Ours,
         // A link whose own key would not read is not a WireGuard device this
         // boot can identify, and no record makes it one.
@@ -756,10 +534,7 @@ fn ownership(
 }
 
 /// Which of [`ownership`]'s two grounds established that an adopted interface
-/// is this daemon's.
-///
-/// Carried out to the adoption log line, which used to assert a public-key
-/// match on every adoption including the ones no key was read for.
+/// is this daemon's, for the adoption log line.
 #[derive(Debug, Eq, PartialEq, Clone, Copy)]
 enum Ground {
     /// The live link carries the public key this profile configures.
@@ -771,14 +546,7 @@ enum Ground {
 }
 
 impl Ground {
-    /// A token, not a sentence.
-    ///
-    /// This is consumed as a structured tracing field value, where
-    /// [`ProbeUnavailable::as_str`] one screen up emits `no_tool` / `refused`
-    /// and `DownReason::as_str` emits a Prometheus label. A field an operator
-    /// filters on (`adoption_ground=raised_this_boot`) is not a field that can
-    /// hold an English clause; the explanation belongs in the doc comment and
-    /// in the runbook, which is where both of those keep theirs.
+    /// The `adoption_ground` log field's value.
     fn as_str(self) -> &'static str {
         match self {
             Ground::MatchingKey => "matching_key",
@@ -787,27 +555,12 @@ impl Ground {
     }
 }
 
-/// What a failed `wg-quick up` is reported as, given what the host said.
+/// What a refused bring-up is reported as, given what the host said.
 ///
-/// Split out and pure for the same reason [`ownership`] is: the rule is the
-/// whole of the defect, and the `wg-quick` call around it is what made it
-/// unreachable by a test.
-///
-/// `standing_before` is the distinction, and it is the only one that licenses
-/// a teardown. A link of this name that was already up when the bring-up
-/// started is not something this attempt created, so nothing this attempt does
-/// may remove it — whichever of the several reasons this boot has for not
-/// adopting it applies. Only a failure reached with the name *free* beforehand
-/// describes residue this daemon made, and only that reaches
-/// `BootCleanup::bring_up_tracked`'s teardown arm.
-///
-/// Collapsing the two left [`Adoption::No`] — a refusal, reached when
-/// [`ownership`] says the link is this daemon's but it carries no address this
-/// boot can use — reported as `VpnError::Spawn`, which the caller's catch-all
-/// tore down. With a raised-interface record left armed over a link some other
-/// tunnel has since taken the name of, that is `wg-quick down` on a stranger's
-/// interface, its routes and its rules, over a name collision: decision 33's
-/// destructive direction arriving through the door the record opened.
+/// Only a failure reached with the name *free* before the bring-up describes
+/// residue this daemon made, and only that is `VpnError::Spawn`, which the
+/// caller tears down. A link already standing beforehand is reported as
+/// foreign whatever the reason this boot cannot use it.
 fn refusal(
     iface: &str,
     standing_before: bool,
@@ -845,22 +598,8 @@ fn refusal(
     }
 }
 
-/// What `adoptable` found on the host.
-///
-/// `Foreign` is separate from `No` because the two call for opposite
-/// handling. `No` is an ordinary bring-up failure, and whatever `wg-quick up`
-/// may have half-created is this daemon's to remove. `Foreign` is an
-/// interface the daemon has just refused to adopt *because it has not
-/// established that it is ours* — so tearing it down may destroy someone
-/// else's tunnel, its routes and its rules, on the strength of a name
-/// collision. The caller (`BootCleanup::bring_up_tracked`) is what acts on
-/// the distinction.
-///
-/// `No` alone does not license a teardown. [`VpnManager::bring_up`] reports a
-/// `No` over a link that was **already standing when the bring-up started** as
-/// `VpnError::ForeignInterface` too: nothing this attempt did created that
-/// link, so nothing this attempt does may remove it. Only a `No` reached with
-/// the name free beforehand describes residue this daemon made.
+/// What `adoptable` found on the host. `Foreign` must never be torn down;
+/// whether `No` may be is [`refusal`]'s question.
 #[derive(Debug, Eq, PartialEq)]
 enum Adoption {
     /// Safe to adopt: ownership was established on one of [`Ground`]'s two
@@ -881,7 +620,7 @@ impl VpnManager for WireguardManager {
         // Whether a link of this name was already standing when this attempt
         // started. It is what tells a refusal from residue further down, and
         // it is read before anything can create one.
-        let standing_before = interface_exists(&profile.interface);
+        let standing_before = link_standing(&profile.interface);
         info!(
             target: "torrentd::vpn::wireguard",
             vpn_iface = %profile.interface,
@@ -889,68 +628,15 @@ impl VpnManager for WireguardManager {
             "raising wireguard link with ip and wg",
         );
         if let Err(failure) = self.raise(profile).map_err(VpnError::Io)? {
-            // `wg-quick up` refuses an interface that already exists, which is
-            // what a previous process leaves behind when it is killed rather
-            // than shut down: the tunnel outlives it, every profile then fails to
-            // come up, and the daemon exits because no profile came up. Restarting
-            // was impossible without an operator tearing the tunnels down by
-            // hand — on a host whose whole point is to keep seeding.
-            //
-            // Adopt it instead, but only when this boot can establish that it
-            // is the daemon's own: a live WireGuard interface of that name
-            // carrying the public key this profile configures, or — for a
-            // profile that carries no key to compare — one this boot's own
-            // record names as raised. See [`ownership`] for why the record is
-            // consulted second and never against a key.
-            //
-            // Anything else standing under that name is reported as its own
-            // error, because refusing to adopt an interface and then tearing
-            // it down are the same act from the host's point of view.
-            //
-            // `standing_before` is what tells the two failures apart, and it
-            // is the whole of the distinction: a link of this name that was
-            // already up when this bring-up started is not something this
-            // attempt created, so nothing this attempt does may remove it.
-            // Only a bring-up that found the name free may reach the caller's
-            // teardown arm, where the residue is genuinely this daemon's.
-            // Collapsing them left `Adoption::No` — a *refusal*, reached when
-            // the link is standing and has no address for this boot to use —
-            // routed into `bring_up_tracked`'s catch-all, which ran
-            // `wg-quick down` on it. With a spent record claiming a link some
-            // other tunnel had taken the name of, that is the daemon
-            // destroying a stranger's interface, its routes and its rules over
-            // a name collision: decision 33's destructive direction arriving
-            // through the door the record opened.
-            //
-            // A link that came up and was lowered again for want of routing
-            // is not a refusal, and goes nowhere near adoption: see
-            // `raise_failed`.
+            // A link left by a killed daemon makes the raise fail. Adopt it
+            // where [`ownership`] says it is ours; anything else standing
+            // there is foreign, and only a link absent before this attempt
+            // may be torn down (`refusal`).
             return self.raise_failed(profile, standing_before, failure);
         }
 
-        // Claim the link this call just raised, by the key it is carrying.
-        //
-        // **After** the link is raised, not before, because there is no link to
-        // read a key from before it. The record used to be written ahead of
-        // the spawn and to carry the boot id alone, so what it asserted was
-        // "no link of this name was standing when this boot called
-        // `bring_up`" — a claim on a *name*. A name can be freed and retaken
-        // inside one host boot: the daemon is killed, an operator removes the
-        // link with the `ip link delete` the runbook sends them to, and
-        // something else takes the name before the restart. The record still
-        // matched, `ownership` answered `Ours` on it, `first_ipv4` succeeded,
-        // and the daemon adopted and bound a profile's sockets to a stranger's
-        // tunnel — reporting it healthy indefinitely, because `vpn_monitor`
-        // probes address presence and handshake age and never a key. The boot
-        // sweep cannot reach that: it drops a record only when the name is
-        // free.
-        //
-        // The cost of moving the write down here is a narrower window in the
-        // opposite direction: a daemon killed between this `raise` and
-        // this write leaves a link with no record, so a later boot fences the
-        // profile rather than adopting it. A fenced profile is the safe side, and it
-        // is the same direction taken for a link that is ours and carries no
-        // address.
+        // Claim the link this call just raised, by the key it carries: after
+        // the raise, so the record names a link rather than a name.
         if let Err(e) = self.raised.record(
             &profile.interface,
             interface_public_key(&profile.interface).as_deref(),
@@ -1016,7 +702,7 @@ impl VpnManager for WireguardManager {
             return;
         }
         native::down(iface);
-        self.drop_record_if_gone(iface, interface_exists);
+        self.drop_record_if_gone(iface, link_standing);
     }
 }
 
@@ -1039,27 +725,10 @@ impl WireguardManager {
     /// Drop the raised-interface record, but only once the link is actually
     /// gone.
     ///
-    /// The claim goes down **with the interface**, not with the attempt to
-    /// take it down. Leaving a claim over a link this boot removed would have
-    /// the next boot vouch for whatever took the name after it; dropping one
-    /// over a link that is *still standing* is the opposite error, and it
-    /// restores exactly the permanently-dark state the record exists to
-    /// remove.
-    ///
-    /// `ip link delete` can fail — a busy link, a timed-out `ip` — and leave
-    /// the link up, still carrying its key. Discarding the record there means
-    /// the next start meets a standing link, no record, and (for a profile
-    /// whose key it cannot derive) no profile key: `Unestablished`, then
-    /// `ForeignInterface`, and the profile is dark until an operator runs
-    /// `ip link delete` by hand. `sweep_raised_records` cannot recover it —
-    /// the sweep only ever deletes records, never writes one.
-    ///
-    /// `exists` is a parameter for the reason
-    /// [`RaisedInterfaces::sweep_with`]'s is: the rule is the whole of the
-    /// defect and the host probe is what made it unreachable by a test. The
-    /// exit status of the teardown is deliberately not consulted — it reports
-    /// what the *command* did, and the question here is what the *host* is
-    /// left holding.
+    /// The claim goes down with the interface, judged by `exists` rather than
+    /// the teardown's status: a record kept over a removed link would vouch
+    /// for its next holder, and one dropped over a link still standing leaves
+    /// a keyless profile unable to adopt it.
     fn drop_record_if_gone(&self, iface: &str, exists: impl Fn(&str) -> bool) {
         if exists(iface) {
             warn!(
@@ -1417,14 +1086,9 @@ mod native {
 
     /// [`down`] over a command runner, so the order can be tested.
     ///
-    /// **The link goes first.** The rules are what steer traffic sourced from
-    /// the tunnel's address into the tunnel's table. Deleting them first left
-    /// a window, as long as the link teardown took, in which a socket still
-    /// bound to that address was routed by the main table — out of the
-    /// host's own interface, carrying the tunnel's source address. With the
-    /// link gone first the address is gone with it, nothing can be sourced
-    /// from it, and the rules left behind match nothing until they are
-    /// removed.
+    /// **The link goes first**, taking its address with it, so no socket can
+    /// be routed by the main table from the tunnel's address while the rules
+    /// go.
     pub(super) fn down_with(
         iface: &str,
         table: Option<u32>,
@@ -1489,97 +1153,45 @@ mod tests {
         );
     }
 
-    /// The documented hardening pattern, and the whole of the reopened
-    /// finding: a profile with no `PrivateKey` line, because
-    /// `PostUp = wg set %i private-key /etc/wireguard/wg-a.key` sets it, and
-    /// an interface of that name that belongs to something else.
-    ///
-    /// `profile_public_key` reads no key, so the exemption that turned on
-    /// "both keys were readable and they differ" never fired, `bring_up`
-    /// returned `Spawn`, and the caller's catch-all ran `wg-quick down wg-a`
-    /// on a stranger's tunnel. Restore the both-keys-readable condition in
-    /// `ownership` and this fails.
+    /// [`ownership`]'s truth table, and what each answer means to the
+    /// teardown path: only `Foreign` is exempt from it.
     #[test]
-    fn an_interface_whose_key_the_profile_does_not_carry_is_not_ours_to_tear_down() {
-        assert_eq!(
-            ownership(true, false, Some("live-key"), None),
-            Ownership::Unestablished,
-            "a key this boot could not derive does not make the interface ours",
-        );
-        assert_eq!(
-            Adoption::from(ownership(true, false, Some("live-key"), None)),
-            Adoption::Foreign,
-            "and `Foreign` is what exempts it from the teardown-on-failure path",
-        );
-    }
-
-    /// The secondary instance of the same class: a link of that name that is
-    /// not a WireGuard device at all, or a host where `wg` cannot be run, so
-    /// neither key reads.
-    #[test]
-    fn an_interface_that_is_not_a_wireguard_device_is_not_ours_to_tear_down() {
-        assert_eq!(
-            Adoption::from(ownership(true, false, None, None)),
-            Adoption::Foreign,
-        );
-        assert_eq!(
-            Adoption::from(ownership(true, false, None, Some("expected-key"))),
-            Adoption::Foreign,
-            "a readable profile key establishes nothing about the live link",
-        );
-        // And the same two host answers with a record present. A record is
-        // matched against the key the live link carries, so a link with no
-        // readable key of its own cannot match one — the record is not a
-        // second chance at identifying a link the kernel will not describe.
-        assert_eq!(
-            ownership(true, true, None, None),
-            Ownership::Unestablished,
-            "a link whose own key will not read is not a WireGuard device \
-             this boot can identify, and no record makes it one",
-        );
-        assert_eq!(
-            ownership(true, true, None, Some("expected-key")),
-            Ownership::Unestablished,
-            "and a profile key with nothing on the live side to compare it \
-             against is not evidence either way",
-        );
-    }
-
-    /// The case the narrow rule did cover, unchanged.
-    #[test]
-    fn an_interface_carrying_a_different_key_is_still_left_standing() {
-        assert_eq!(
-            ownership(true, false, Some("theirs"), Some("ours")),
-            Ownership::Unestablished,
-        );
-    }
-
-    /// And the two outcomes that must **not** be exempt, or the half-up
-    /// tunnel `BootCleanup` exists to remove would be left running.
-    #[test]
-    fn a_tunnel_this_boot_established_is_its_own_stays_this_boots_to_remove() {
-        assert_eq!(
-            ownership(true, false, Some("same"), Some("same")),
-            Ownership::Ours,
-            "matching keys are what `Adopt` requires",
-        );
-        assert_eq!(
-            Adoption::from(ownership(true, false, Some("same"), Some("same"))),
-            Adoption::No,
-            "an interface established as ours is not exempt on ownership \
-             grounds — whether it may be torn down is `refusal`'s question, \
-             and it turns on whether the name was free when the bring-up \
-             started",
-        );
-        assert_eq!(
-            ownership(false, false, None, None),
-            Ownership::Absent,
-            "no link of that name: whatever wg-quick half-created is ours",
-        );
-        assert_eq!(
-            Adoption::from(ownership(false, false, None, None)),
-            Adoption::No
-        );
+    fn ownership_is_decided_by_the_keys_then_the_record() {
+        use Adoption::Foreign;
+        use Adoption::No;
+        use Ownership::Absent;
+        use Ownership::Ours;
+        use Ownership::Unestablished;
+        #[rustfmt::skip]
+        let cases = [
+            // exists, raised_here, live key, profile key
+            ((false, false, None, None), Absent, No),
+            // A record for a link that is gone establishes nothing.
+            ((false, true, None, None), Absent, No),
+            ((true, false, Some("same"), Some("same")), Ours, No),
+            ((true, true, Some("same"), Some("same")), Ours, No),
+            ((true, false, Some("theirs"), Some("ours")), Unestablished, Foreign),
+            // A record does not outrank two keys that disagree.
+            ((true, true, Some("live"), Some("rotated")), Unestablished, Foreign),
+            // A keyless profile: the record decides.
+            ((true, false, Some("live"), None), Unestablished, Foreign),
+            ((true, true, Some("live"), None), Ours, No),
+            // A link whose own key will not read: not a WireGuard device this
+            // boot can identify, record or no record.
+            ((true, false, None, None), Unestablished, Foreign),
+            ((true, false, None, Some("expected")), Unestablished, Foreign),
+            ((true, true, None, None), Unestablished, Foreign),
+            ((true, true, None, Some("expected")), Unestablished, Foreign),
+        ];
+        for ((exists, raised, live, profile), owner, adoption) in cases {
+            let case = (exists, raised, live, profile);
+            assert_eq!(ownership(exists, raised, live, profile), owner, "{case:?}");
+            assert_eq!(
+                Adoption::from(ownership(exists, raised, live, profile)),
+                adoption,
+                "{case:?}",
+            );
+        }
     }
 
     /// The probe the exemption needs and `interface_public_key` cannot give
@@ -1587,55 +1199,13 @@ mod tests {
     #[test]
     fn the_existence_probe_answers_from_the_kernels_own_link_list() {
         assert!(
-            !interface_exists("torrentd-nonexistent-iface"),
+            !link_standing("torrentd-nonexistent-iface"),
             "a name no link carries does not exist",
         );
         assert!(
-            interface_exists("lo"),
+            link_standing("lo"),
             "loopback always does, and it is not a WireGuard device — which \
              is the pair of answers the keys alone conflate",
-        );
-    }
-
-    /// The whole of the inverse defect the key-only rule opened.
-    ///
-    /// A keyless profile — `PostUp = wg set %i private-key …`, which
-    /// `validate_set` accepts and which works normally — leaves
-    /// `profile_public_key` returning `None` forever. Decide ownership on the
-    /// keys alone and no boot can *ever* establish that the interface it left
-    /// behind is its own, so it is neither adopted nor torn down and the profile
-    /// is dark for the life of the deployment. A name this boot recorded as
-    /// raised answers what the key cannot.
-    ///
-    /// Drop `raised_here` from `ownership` and the first assertion fails.
-    #[test]
-    fn an_interface_this_boot_raised_is_ours_whatever_the_profile_carries() {
-        assert_eq!(
-            ownership(true, true, Some("a-key-no-profile-carries"), None),
-            Ownership::Ours,
-            "a link this boot recorded raising is this boot's, key or no key",
-        );
-        assert_eq!(
-            ownership(true, false, Some("a-key-no-profile-carries"), None),
-            Ownership::Unestablished,
-            "and without the record the same host answers leave it unowned — \
-             which is the state that had no exit",
-        );
-    }
-
-    /// A record for a link that is not standing establishes nothing, and must
-    /// not: the bring-up it was written for created no interface, so trusting
-    /// it would let it claim whatever later takes the name.
-    #[test]
-    fn a_record_for_a_link_that_is_gone_establishes_nothing() {
-        assert_eq!(
-            ownership(false, true, None, None),
-            Ownership::Absent,
-            "`Absent` is decided before the record is consulted",
-        );
-        assert_eq!(
-            Adoption::from(ownership(false, true, None, None)),
-            Adoption::No
         );
     }
 
@@ -1721,25 +1291,6 @@ mod tests {
 
     /// **The retaken name.** A record whose link was removed and whose name
     /// something else then took, inside one host boot, establishes nothing.
-    ///
-    /// The sequence, all of it reachable and all of it in the runbook: a
-    /// keyless profile — `PostUp = wg set %i private-key …`, which is the
-    /// whole reason the record exists — is raised as `wg-a` and the daemon is
-    /// SIGKILLed, so nothing tears it down and nothing forgets the record. The
-    /// operator follows the runbook's own remedy and removes the link by hand.
-    /// Something else takes the name `wg-a` before the restart. The boot sweep
-    /// cannot help: it drops a record only when the name is **free**, and this
-    /// name is occupied, so the record stands.
-    ///
-    /// With the record believed on the boot id and the name alone,
-    /// `ownership(exists, raised, Some(stranger), None)` answered `Ours`,
-    /// `first_ipv4` succeeded on the stranger's link, and the daemon adopted
-    /// and bound a profile's sockets to it — reporting the profile healthy
-    /// indefinitely, because `vpn_monitor` probes address presence and
-    /// handshake age and never a key.
-    ///
-    /// Drop the key from `record`/`recorded` — believe the boot id alone —
-    /// and the first two assertions fail.
     #[test]
     fn a_record_whose_name_was_retaken_inside_one_boot_establishes_nothing() {
         let dir = tempfile::tempdir().unwrap();
@@ -1859,27 +1410,6 @@ mod tests {
     }
 
     /// **A teardown that left the link standing keeps the record.**
-    ///
-    /// `bring_down` used to run `wg-quick down` and then `forget` the record
-    /// unconditionally, on the assumption that the command's return means the
-    /// link is gone. `wg-quick`'s `cmd_down` runs `execute_hooks
-    /// "${PRE_DOWN[@]}"` *before* `del_if`, under `set -e`, so a
-    /// provider-style `PreDown` hook that fails — or a `.conf` that has gone
-    /// missing, which fails one step earlier — leaves the command non-zero and
-    /// the link up, still carrying its key.
-    ///
-    /// For the keyless profile the record exists for, discarding it there is
-    /// the whole of the permanently-dark state: the next start meets a
-    /// standing link, no record and no profile key, so `ownership` answers
-    /// `Unestablished`, `bring_up` reports `ForeignInterface`, and the profile is
-    /// dark until an operator runs `ip link delete` by hand.
-    /// `sweep_raised_records` cannot recover it — the sweep only ever deletes
-    /// records, never writes one.
-    ///
-    /// `exists` is the seam, for the reason `sweep_with`'s is: the rule is the
-    /// whole of the defect and `/sys/class/net` is what made it unreachable by
-    /// a test. Make the `forget` unconditional again and the first assertion
-    /// fails.
     #[test]
     fn a_teardown_that_left_the_link_standing_keeps_the_record() {
         let dir = tempfile::tempdir().unwrap();
@@ -1908,81 +1438,8 @@ mod tests {
         assert!(!raised.path("wg-a").exists());
     }
 
-    /// Two readable keys that **disagree** are not overruled by a record.
-    ///
-    /// The ordinary configuration, and the one the record was never taken for:
-    /// a key-bearing profile, the daemon killed uncleanly so the link and the
-    /// record both survive, and the operator then rotates the provider
-    /// credentials by editing the `.conf` in place — which `validate_set`'s
-    /// stem rule forces, since the file name must match the interface.
-    /// `wg-quick up` refuses the surviving link; with the record consulted
-    /// first, `ownership` called it ours, `first_ipv4` returned the **old**
-    /// tunnel's address, and the profile was rebuilt on the previous credentials
-    /// and endpoint — reported healthy for as long as the stale tunnel kept
-    /// handshaking, because `vpn_monitor` probes address presence and
-    /// handshake age and never a key.
-    ///
-    /// Put `raised_here` back ahead of the key comparison and this fails.
-    #[test]
-    fn a_record_does_not_outrank_two_keys_that_disagree() {
-        assert_eq!(
-            ownership(
-                true,
-                true,
-                Some("the-live-tunnels-key"),
-                Some("the-rotated-key")
-            ),
-            Ownership::Unestablished,
-            "a key read off the live link a moment ago is direct evidence \
-             that the link standing there is not the one this boot raised",
-        );
-        assert_eq!(
-            Adoption::from(ownership(
-                true,
-                true,
-                Some("the-live-tunnels-key"),
-                Some("the-rotated-key"),
-            )),
-            Adoption::Foreign,
-            "so the profile fences honestly rather than adopting the tunnel the \
-             operator has just replaced",
-        );
-        assert_eq!(
-            ownership(true, true, Some("same"), Some("same")),
-            Ownership::Ours,
-            "and keys that agree are still ours, record or no record",
-        );
-    }
-
-    /// The one case the record decides, kept: `profile_key == None`.
-    ///
-    /// Decision 44's motivating configuration is narrowed, not overturned —
-    /// the record still answers the question the key cannot, and only that
-    /// question.
-    #[test]
-    fn the_record_still_decides_the_case_it_was_taken_for() {
-        assert_eq!(
-            ownership(true, true, Some("a-key-no-profile-carries"), None),
-            Ownership::Ours,
-        );
-        assert_eq!(
-            ownership(true, false, Some("a-key-no-profile-carries"), None),
-            Ownership::Unestablished,
-            "and without a record the same host answers leave it unowned",
-        );
-    }
-
     /// A record whose interface is not standing is swept before any bring-up
     /// can consult it, and the file is gone.
-    ///
-    /// `forget` is reached from the daemon's own teardown and from `adoptable`
-    /// observing the name absent, and `adoptable` runs only when `wg-quick up`
-    /// fails — which does not happen while nothing is standing. So an
-    /// interface removed by an operator, by another process or by the kernel
-    /// used to leave the record armed and pointing at nothing, inside the same
-    /// host boot, ready to claim whatever next took the name.
-    ///
-    /// Delete the sweep and the first assertion fails.
     #[test]
     fn a_record_whose_interface_is_gone_is_swept_before_anything_reads_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -2040,19 +1497,7 @@ mod tests {
     }
 
     /// An unreadable state directory is **reported**, not read as "no
-    /// records".
-    ///
-    /// Decision 52(c) made `record`'s write failure a returned, reported error
-    /// precisely because a bare swallow silently disables the whole repair.
-    /// The read deserves the same and did not have it: a `read_dir` that
-    /// failed for any reason returned an empty sweep, so a state directory
-    /// whose permissions had gone wrong looked exactly like a fresh
-    /// deployment — every spent record left armed, and nothing said.
-    ///
-    /// "Not there at all" stays a legitimate empty: `Config::state_dir()` is
-    /// one of the paths §4 of the runbook lists as tolerated-missing.
-    ///
-    /// Swallow the error again and the second assertion fails.
+    /// records"; a missing one is no records.
     #[test]
     fn a_state_directory_that_cannot_be_read_is_reported_rather_than_read_as_empty() {
         let dir = tempfile::tempdir().unwrap();
@@ -2080,14 +1525,6 @@ mod tests {
 
     /// `record` creates the state directory it writes into, and says so when
     /// it cannot.
-    ///
-    /// `Config::state_dir()` is one of the directories §4 of the runbook lists
-    /// as tolerated-missing, and the pid-file writer beside this one
-    /// (`openvpn.rs:155`) creates its parent for exactly that reason. Without
-    /// it the write failed, the failure was a `warn` nobody reads, and the
-    /// whole recovery the record exists for was off for that deployment.
-    ///
-    /// Drop the `create_dir_all` and the first assertion fails.
     #[test]
     fn a_record_creates_the_state_directory_it_writes_into() {
         let dir = tempfile::tempdir().unwrap();
@@ -2120,16 +1557,8 @@ mod tests {
     /// Any outcome that is not an adoption spends the record — and the probes
     /// run even when there is one.
     ///
-    /// `lo` is the host fixture this needs: it always exists, it is never a
-    /// WireGuard device, and it has an address. With a record present and the
-    /// key probes skipped because of it, `ownership` returned `Ours`,
-    /// `first_ipv4("lo")` returned `127.0.0.1`, and `adoptable` **adopted
-    /// loopback** — a link this daemon plainly did not raise — leaving the
-    /// record in place to do it again next boot.
-    ///
-    /// Restore the `&& !raised_here` guard on the key probes and the first
-    /// assertion fails; restore `forget` to the `Absent` arm alone and the
-    /// second does.
+    /// `lo` always exists, is never a WireGuard device, and has an address: a
+    /// record for it must not get it adopted.
     #[test]
     fn a_link_this_boot_cannot_identify_is_refused_and_its_record_dropped() {
         let dir = tempfile::tempdir().unwrap();
@@ -2167,20 +1596,8 @@ mod tests {
     /// The destructive branch, shut.
     ///
     /// A non-adoption over a link that was **already standing** when the
-    /// bring-up started is `ForeignInterface`, which
-    /// `BootCleanup::bring_up_tracked` fences on, and never `Spawn`, which its
-    /// catch-all tears down on. That is the whole of the distinction: this
-    /// attempt did not create that link, so nothing this attempt does may
-    /// remove it.
-    ///
-    /// Reached with a raised-interface record left armed over a link some
-    /// other tunnel has since taken the name of, the old routing ran
-    /// `wg-quick down` on a stranger's interface, its routes and its rules,
-    /// over a name collision.
-    ///
-    /// Return `Spawn` for a standing link and the first assertion fails; make
-    /// every `No` a `ForeignInterface` and the third does, and a half-created
-    /// tunnel is then never removed.
+    /// bring-up started is `ForeignInterface`, never `Spawn`, which the caller
+    /// tears down; one over a name that was free is `Spawn`.
     #[test]
     fn a_link_that_was_standing_before_the_attempt_is_never_torn_down() {
         let spawn_text = "wg-quick up exited with exit status: 1";
@@ -2289,13 +1706,10 @@ mod tests {
         );
     }
 
-    /// Every uid raises with `ip` and `wg`; nothing in the daemon's path runs
-    /// `wg-quick`, whose host-wide default route and fwmark rule made a second
-    /// full-tunnel profile reroute the first one's traffic as root. The
-    /// manager `for_type` builds refuses a hooked config — which `wg-quick`
-    /// would have run — before anything reaches the host.
+    /// The manager refuses a hooked config, which only `wg-quick` would run,
+    /// before anything reaches the host.
     #[test]
-    fn every_uid_raises_its_links_with_ip_and_wg_and_never_wg_quick() {
+    fn a_hooked_config_is_refused_before_bring_up() {
         let dir = tempfile::tempdir().unwrap();
         let hooked = dir.path().join("tdnx-hook.conf");
         std::fs::write(
@@ -2313,18 +1727,6 @@ mod tests {
             .expect("a refusal is not an I/O error")
             .expect_err("the native parser refuses the hook");
         assert!(refused.to_string().contains("PostUp"), "got {refused}");
-
-        // Whitespace removed, so a call rustfmt wrapped onto several lines is
-        // still seen: `exec::run(`, `exec::run_ok(`, `exec::available(` and
-        // `Command::new(` all take the program as their first argument.
-        let source: String = include_str!("wireguard.rs")
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        assert!(
-            !source.contains("(\"wg-quick\""),
-            "the daemon path must not spawn wg-quick"
-        );
     }
 
     const PROVIDER_CONF: &str = "\

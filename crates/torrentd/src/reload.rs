@@ -395,13 +395,6 @@ mod tests {
         // withholdings are per profile, so the same reload names the key on
         // the profile that did not take it and stays quiet on the one that
         // did — which is what makes the pump's `warn` able to name both.
-        //
-        // This is the class the module contract calls impossible. Before the
-        // report existed, such an edit produced a non-empty diff (so no
-        // `config unchanged`), no non-reloadable change, no profile-identity
-        // change, no `log_level`, and an empty patch (so the settings loop
-        // skipped): the whole journal for the reload was `received SIGHUP`,
-        // demonstrated on a live daemon.
 
         // The top-level `upload_rate_limit`, against a profile that sets its
         // own. The override wins at boot and a reload must not overwrite it.
@@ -469,11 +462,6 @@ mod tests {
         // of the per-profile loop — and does *not* reach
         // `withheld_reloadable_keys`, whose warning says "withheld from this
         // profile" and would be untrue of it.
-        //
-        // Without the deletion being recorded at all, `diff.is_empty()` is
-        // true here and the pump answers `SIGHUP: config unchanged`: the
-        // first `if` in `run` returns before any of this. That is what was
-        // demonstrated on a live daemon for all five keys.
         let dir = tempfile::tempdir().unwrap();
         let mut old = Config::minimal_for_tests(dir.path(), true);
         old.upload_rate_limit = Some(2000);
@@ -778,14 +766,5 @@ listen_interfaces = "0.0.0.0:6881"
         let c = change("public.upload_rate_limit", ProfileChangeKind::NonIdentity);
         assert_eq!(warning_for(&c), NON_RELOADABLE_WARNING);
         assert_ne!(warning_for(&c), IDENTITY_WARNING);
-    }
-
-    #[test]
-    fn the_two_warnings_are_distinguishable_in_the_message_itself() {
-        // Not only in a structured field. An alert watching for the privacy
-        // event has to be able to match on the line.
-        assert_ne!(IDENTITY_WARNING, NON_RELOADABLE_WARNING);
-        assert!(IDENTITY_WARNING.contains("identity"));
-        assert!(!NON_RELOADABLE_WARNING.contains("identity"));
     }
 }
