@@ -249,8 +249,10 @@ fn profile_carries_traffic(state: &StateMap, id: &torrentd_engine::ProfileId) ->
 /// able to send, stops and resets it.
 ///
 /// A poll whose handshake probe could not run ([`Handshake::NoSignal`]) says
-/// nothing either way, so it leaves the clock as it stands: resetting it there
-/// let a probe that failed now and then hold off the fence indefinitely.
+/// nothing about the handshake, so while the profile carries traffic it leaves
+/// the clock as it stands: resetting it there let a probe that failed now and
+/// then hold off the fence indefinitely. With nothing to carry it resets, as
+/// any poll with nothing to carry does.
 fn unanswered_clock(
     since: &mut std::collections::HashMap<torrentd_engine::ProfileId, Instant>,
     id: &torrentd_engine::ProfileId,
@@ -262,7 +264,7 @@ fn unanswered_clock(
         Handshake::Never if carrying => {
             now.saturating_duration_since(*since.entry(id.clone()).or_insert(now))
         }
-        Handshake::NoSignal => Duration::ZERO,
+        Handshake::NoSignal if carrying => Duration::ZERO,
         _ => {
             since.remove(id);
             Duration::ZERO
@@ -714,6 +716,12 @@ mod tests {
         assert!(
             unanswered_clock(&mut since, &id, Handshake::Never, true, then) > MAX,
             "the clock kept its start across the failed probe",
+        );
+
+        unanswered_clock(&mut since, &id, Handshake::NoSignal, false, then);
+        assert!(
+            since.is_empty(),
+            "with nothing to carry, a failed probe resets it like any other poll",
         );
     }
 
