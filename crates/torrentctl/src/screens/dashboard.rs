@@ -71,6 +71,10 @@ pub fn on_key(state: &State, key: KeyEvent) -> Option<Msg> {
     }
 }
 
+#[allow(
+    clippy::result_large_err,
+    reason = "a Failure is built once per failed request and moved straight to the UI"
+)]
 pub fn refresh(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
     if state.loading {
         return Vec::new();

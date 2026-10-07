@@ -1724,7 +1724,7 @@ where
                 }
                 profile_entries.push(entry);
             }
-            Err(failed) => failed_profiles.push(failed),
+            Err(failed) => failed_profiles.push(*failed),
         }
     }
     Ok((profile_entries, failed_profiles))
@@ -1772,17 +1772,17 @@ async fn build_profile<F, E>(
     forwarder: &dyn PortForwarder,
     held: Held<'_>,
     make_engine: &mut F,
-) -> Result<ProfileEntry, FailedProfile>
+) -> Result<ProfileEntry, Box<FailedProfile>>
 where
     F: FnMut(&torrentd_engine::Settings, Option<Vec<u8>>) -> Result<Arc<dyn TorrentEngine>, E>,
     E: std::fmt::Display,
 {
     macro_rules! fail_profile {
         ($reason:expr) => {
-            return Err(FailedProfile {
+            return Err(Box::new(FailedProfile {
                 config: p.clone(),
                 reason: $reason,
-            })
+            }))
         };
     }
 

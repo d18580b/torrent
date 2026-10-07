@@ -291,6 +291,10 @@ impl Model {
 }
 
 /// Ask the daemon who we are.
+#[allow(
+    clippy::result_large_err,
+    reason = "a Failure is built once per failed request and moved straight to the UI"
+)]
 pub fn check_session(api: &Api) -> Effect {
     let api = api.clone();
     Effect::new(async move {
