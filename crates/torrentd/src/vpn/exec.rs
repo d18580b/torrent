@@ -51,13 +51,21 @@ const OUTPUT_GRACE: Duration = Duration::from_millis(500);
 /// `name`, if it is safe to hand to a tool as an interface argument.
 ///
 /// Refuses the empty name and any name starting with `-`, which a tool would
-/// parse as an option. The error is `InvalidInput`, so a caller can tell a
+/// parse as an option, and `all` and `interfaces`, which `wg show` reads as
+/// keywords: `wg show all latest-handshakes` reports every link on the host,
+/// not one named `all`. The error is `InvalidInput`, so a caller can tell a
 /// refused name from a tool that failed.
 pub(crate) fn iface(name: &str) -> io::Result<&str> {
     if name.is_empty() || name.starts_with('-') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("interface name {name:?} cannot be passed to a tool: it is empty or starts with '-'"),
+        ));
+    }
+    if name == "all" || name == "interfaces" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("interface name {name:?} cannot be passed to a tool: `wg show` reads it as a keyword"),
         ));
     }
     Ok(name)
@@ -199,8 +207,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_name_that_would_parse_as_an_option_is_refused() {
-        for bad in ["-x", "--help", ""] {
+    fn a_name_that_would_parse_as_an_option_or_a_wg_keyword_is_refused() {
+        for bad in ["-x", "--help", "", "all", "interfaces"] {
             let e = iface(bad).expect_err("refused");
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{bad:?}");
         }
