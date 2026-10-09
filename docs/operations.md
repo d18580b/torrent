@@ -21,7 +21,7 @@ The small state files are described in full in
 | `pool.db.pre-v3.bak` | The index as it stood before this build's one-way schema migration. | Nothing the daemon reads. It is the only way back to a pre-v3 build. | Nothing. |
 | `resume/<profile>/<infohash>.resume` (`resume_dir`, or a profile's own `resume_dir`) | libtorrent resume data: save path, piece state, and settings. | Piece state and settings. A torrent whose `.torrent` survives is re-added at the save path recorded beside it and hashed there, or, with no such record, at `default_save_path`, which is logged and counted in `torrentd_boot_save_path_fallbacks_total`. | Nothing. Pool torrents can be re-adopted after a rescan. |
 | `torrents/<profile>/<infohash>.torrent` (`torrent_dir`, or a profile's own `torrent_dir`) | The metainfo of every torrent the profile holds. | Metadata. A resume entry with no `.torrent` relies on peers to supply it, which a private tracker's torrent usually cannot. | Nothing, except the copy in `library_dir` for pool torrents. |
-| `torrents/<profile>/<infohash>.save_path` (beside the `.torrent`) | The save path a torrent was added at through `POST /v1/torrents`, as UTF-8 text. | Where a torrent with no resume file is re-added: without it, `default_save_path`. | Nothing. Each API add writes it, and a pool relocation of a loaded torrent rewrites it. |
+| `torrents/<profile>/<infohash>.save_path` (beside the `.torrent`) | The save path a torrent was added at through `POST /v1/torrents` or adopted at from the pool, as UTF-8 text. | Where a torrent with no resume file is re-added: without it, `default_save_path`. | Nothing. Each API add and each adoption writes it, and a pool relocation of a loaded torrent rewrites it. |
 | `session_state-<profile>.dat` | That profile's DHT routing table. | A few minutes of DHT bootstrap. | The session, on its own. |
 | `profile_state.json` | The operator's online/offline choices: the profiles set offline through `PATCH /v1/profiles/{id}`, and whether `offline_all` is on. Rewritten whole before each change takes effect, and read at boot before any torrent is loaded. | Every profile comes up online at the next boot, including one you held offline. A file that exists but cannot be parsed holds every profile offline instead, until `POST /v1/profiles/online-all` rewrites it. | Nothing. Each `PATCH` or `offline-all`/`online-all` writes it again. |
 | `last_shutdown.json` | The last exit's unsaved-resume count and kill-switch-removal result. The next boot exports it as the `torrentd_last_shutdown_*` gauges, then deletes it. | One boot's report. | Every graceful exit writes a new one. |
@@ -427,12 +427,16 @@ by the shutdown drain. A crash loses whatever changed since the last save,
 such as a pause. A torrent killed before its first save landed has no resume
 file at all:
 
-- **Added through `POST /v1/torrents`.** The boot finds only its `.torrent`
-  and re-adds it at `default_save_path`, whatever `save_path` it was added
-  with (#110). Nothing reports the move. If its payload is elsewhere, the
-  torrent finds nothing at `default_save_path` and never seeds. `DELETE` it
-  without `delete_files`, then add it again with its `save_path`.
-- **Adopted.** It has neither a resume file nor a `.torrent` in the stores,
+- **Added through `POST /v1/torrents` or adopted from the pool.** The boot
+  finds its `.torrent` and re-adds it at the save path recorded beside it
+  (the `save_path` it was added with, or the library path it was adopted
+  at), hashing it there. Where that record is missing, because its write
+  failed (`torrentd_torrent_file_persist_errors_total`) or the torrent
+  predates it, the boot re-adds it at `default_save_path` instead, logs a
+  warning, and counts it in `torrentd_boot_save_path_fallbacks_total`. If its
+  payload is elsewhere, the torrent finds nothing there and never seeds.
+  `DELETE` it without `delete_files`, then add or adopt it again. An adopted
+  torrent whose `.torrent` write failed too has neither file in the stores,
   so it is one of the unloaded claims above.
 
 ### Recovering a fenced profile
