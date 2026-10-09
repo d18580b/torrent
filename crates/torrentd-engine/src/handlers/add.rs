@@ -1,6 +1,10 @@
 //! `AddTorrent` and `TorrentRemoved` alert handlers.
 
+use std::sync::atomic::fence;
+use std::sync::atomic::Ordering;
+
 use libtorrent_safe::Alert;
+use libtorrent_safe::TorrentHandle;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -42,6 +46,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 handle.infohash,
                 TorrentState::newly_added(handle, ctx.profile_id.clone(), now),
             );
+            hold_if_fenced(handle, ctx);
             info!(
                 target: "torrentd_engine::handler::add",
                 infohash = %handle.infohash,
@@ -94,6 +99,44 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             }
         }
         _ => unreachable!("add::handle called with non-add alert"),
+    }
+}
+
+/// Pause a torrent just inserted into the state map if its profile is fenced.
+///
+/// The VPN monitor fences a profile by pausing the torrents the state map
+/// holds, and a torrent enters the map only here, when its `add_torrent_alert`
+/// is handled. One the session added before the fence and whose alert lands
+/// after it was not in the map the fence walked, so without this it would seed
+/// on in a profile whose tunnel is down.
+///
+/// The fence marks the profile before it walks the map, and this inserts
+/// before it asks. The `SeqCst` fence here pairs with the one in the VPN
+/// monitor between those two steps, so at least one side sees the other: the
+/// fence finds the torrent in the map, or this finds the profile fenced.
+fn hold_if_fenced(handle: TorrentHandle, ctx: &HandlerCtx<'_>) {
+    fence(Ordering::SeqCst);
+    if !ctx.profile_fenced.is_some_and(|f| f(&ctx.profile_id)) {
+        return;
+    }
+    match ctx.engine.pause_torrent(handle) {
+        Ok(()) => info!(
+            target: "torrentd_engine::handler::add",
+            infohash = %handle.infohash,
+            "torrent added into a fenced profile; paused",
+        ),
+        Err(e) => {
+            error!(
+                target: "torrentd_engine::handler::add",
+                infohash = %handle.infohash,
+                error.cause = %e,
+                "could not pause a torrent added into a fenced profile",
+            );
+            ctx.metrics.inc_counter(
+                "profile_fence_pause_errors_total",
+                &[("profile_id", ctx.profile_id.as_str())],
+            );
+        }
     }
 }
 
@@ -158,6 +201,7 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
+            profile_fenced: None,
             profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };
@@ -203,6 +247,7 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
+            profile_fenced: None,
             profile_id: profile.clone(),
             span: tracing::info_span!("test"),
         };

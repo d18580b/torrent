@@ -108,6 +108,7 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
+            profile_fenced: None,
             profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
@@ -154,6 +155,7 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
+            profile_fenced: None,
             profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
