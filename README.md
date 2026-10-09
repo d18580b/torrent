@@ -293,8 +293,9 @@ a `vpn` profile's isolation is layered:
   only if it passes. No daemon restart is needed.
 - **Online/offline** — an operator can hold one profile offline, or every
   profile with `POST /v1/profiles/offline-all`. Offline pauses the profile's
-  whole libtorrent session, so torrents added to it later are held too, and
-  adds and adoptions into it are refused. The choice is persisted in the state
+  whole libtorrent session, so torrents added to it later are held too, stops
+  its DHT node where a host profile runs one, and refuses adds and adoptions
+  into it. The choice is persisted in the state
   directory and applied at boot before any torrent is loaded.
 - **Kill switch** (opt-in) — a fail-closed nftables table confining the
   daemon's egress to loopback and its tunnel interfaces, so a dropped tunnel

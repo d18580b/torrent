@@ -14,6 +14,7 @@ use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
+use torrentd_engine::Settings;
 use torrentd_engine::TorrentEngine;
 
 use crate::profile_state::DesiredStates;
@@ -304,13 +305,34 @@ impl ProfileRegistry {
 
     /// Pause each live session `record` holds offline and resume each one it
     /// does not, returning the sessions that refused.
+    ///
+    /// A paused session still runs its DHT node, so a host profile with DHT
+    /// has it stopped while offline and started again when online. Setting
+    /// an unchanged value is a no-op in libtorrent.
     fn apply_record(&self, record: &Record) -> Vec<(ProfileId, EngineError)> {
+        let dht = |on: bool| Settings {
+            enable_dht: Some(on),
+            ..Settings::default()
+        };
         let mut refused = Vec::new();
         for e in &self.entries {
+            let has_dht = e.config.dht_enabled();
             let outcome = if record.holds_offline(e.id()) {
-                e.engine.pause_session()
+                e.engine.pause_session().and_then(|()| {
+                    if has_dht {
+                        e.engine.apply_settings(&dht(false))
+                    } else {
+                        Ok(())
+                    }
+                })
             } else {
-                e.engine.resume_session()
+                e.engine.resume_session().and_then(|()| {
+                    if has_dht {
+                        e.engine.apply_settings(&dht(true))
+                    } else {
+                        Ok(())
+                    }
+                })
             };
             if let Err(err) = outcome {
                 refused.push((e.id().clone(), err));
@@ -511,5 +533,58 @@ mod tests {
         assert!(r.resolve(&ProfileId::new("public")).active().is_some());
         assert!(r.resolve(&ProfileId::new("acct_a")).active().is_none());
         assert!(r.resolve(&ProfileId::new("typo")).active().is_none());
+    }
+
+    /// The session pause leaves libtorrent's DHT node running, so a host
+    /// profile with DHT has it stopped while offline and started again when
+    /// online; one without DHT is never sent the setting.
+    #[test]
+    fn a_host_profile_with_dht_has_it_stopped_while_offline() {
+        use torrentd_engine::DesiredState;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::ProfileNetwork;
+        use torrentd_engine::RecordedCall;
+
+        let entry = |id: &str, dht: bool| {
+            let mut e = test_host_entry(id);
+            e.config.network = ProfileNetwork::Host {
+                listen_interfaces: "0.0.0.0:6881".to_string(),
+                dht,
+            };
+            let mock = Arc::new(MockEngine::new());
+            e.engine = mock.clone();
+            (e, mock)
+        };
+        let (with, with_mock) = entry("with", true);
+        let (without, without_mock) = entry("without", false);
+        let r = ProfileRegistry::new(vec![with, without]);
+        let metrics = crate::metrics_sink::PromSink::new();
+        let dht_settings = |mock: &MockEngine| -> Vec<Option<bool>> {
+            mock.calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    RecordedCall::ApplySettings(s) => Some(s.enable_dht),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        r.change_states(|rec| rec.offline_all = true, &metrics)
+            .unwrap();
+        assert_eq!(dht_settings(&with_mock), vec![Some(false)]);
+        assert!(with_mock.session_paused().unwrap());
+
+        r.change_states(|rec| rec.offline_all = false, &metrics)
+            .unwrap();
+        assert_eq!(dht_settings(&with_mock), vec![Some(false), Some(true)]);
+        assert!(!with_mock.session_paused().unwrap());
+
+        r.change_states(
+            |rec| rec.set(&ProfileId::new("without"), DesiredState::Offline),
+            &metrics,
+        )
+        .unwrap();
+        assert!(without_mock.session_paused().unwrap());
+        assert!(dht_settings(&without_mock).is_empty());
     }
 }

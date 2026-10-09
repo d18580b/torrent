@@ -70,7 +70,8 @@ pub(crate) use body_routes;
 pub enum ProfileState {
     /// On the network.
     Online,
-    /// Held off it: no announce, no peer, no incoming connection.
+    /// Held off it: no announce, no peer, no incoming connection, and no DHT
+    /// node.
     Offline,
 }
 
@@ -435,11 +436,12 @@ pub enum SetProfileStateError {
 ///
 /// `offline` pauses the profile's whole session: no announce, no peer, no
 /// incoming connection, for every torrent in it and every torrent that
-/// reaches it later. Adds, adoptions, and resumes into it are refused with
+/// reaches it later; a host profile with `dht` also has its DHT node stopped.
+/// Adds, adoptions, and resumes into it are refused with
 /// `409 profile-unavailable` (`offline`) until it is set online. `online`
-/// resumes the session, and every torrent goes back to what its own paused
-/// flag says. The setting is written to the state directory before it takes
-/// effect, so it survives a crash and a restart; a profile left offline
+/// resumes the session (and its DHT), and every torrent goes back to what
+/// its own paused flag says. The setting is written to the state directory
+/// before it takes effect, so it survives a crash and a restart; a profile left offline
 /// starts with its session paused, before any torrent is loaded into it.
 ///
 /// Setting a fenced (`vpn_down`) profile online is how the fence is lifted

@@ -1589,9 +1589,14 @@ where
             dht,
         } => {
             settings.listen_interfaces = Some(listen_interfaces.clone());
-            settings.enable_dht = Some(*dht);
+            // A paused session still runs its DHT node, so a profile left
+            // offline starts with it stopped; setting it online starts it
+            // (`ProfileRegistry::change_states`).
+            settings.enable_dht = Some(*dht && !held_offline);
             // DHT keeps a routing table worth restoring; without DHT there
-            // is nothing in session state worth the file.
+            // is nothing in session state worth the file. Restored while
+            // offline too: the node starts from it once the profile is set
+            // online.
             if *dht {
                 session_state = load_session_state(session_state_path);
                 if let Some(bytes) = &session_state {
@@ -2042,8 +2047,14 @@ impl DaemonHandle {
         // Persist DHT routing tables for the next start. Only a host profile
         // with DHT enabled has one; a tunnelled profile runs with DHT off by
         // construction and has nothing to save. The sessions are still alive
-        // here — `teardown_network` below closes them.
-        for p in cfg.profile.iter().filter(|p| p.dht_enabled()) {
+        // here — `teardown_network` below closes them. A profile held
+        // offline has its DHT node stopped and nothing to save; the file
+        // from before keeps the last table it had.
+        for p in cfg
+            .profile
+            .iter()
+            .filter(|p| p.dht_enabled() && !profile_registry.held_offline(&p.id))
+        {
             let Some(engine) = source.engine_for(&p.id) else {
                 continue;
             };
@@ -4059,6 +4070,47 @@ mod profile_construction_tests {
         assert!(acct_b.session_paused().unwrap());
         assert!(!public.session_paused().unwrap());
         assert!(public.calls().is_empty(), "{:?}", public.calls());
+    }
+
+    /// The session pause leaves the DHT node running, so a host profile with
+    /// DHT left offline starts with it stopped, its saved routing table still
+    /// handed to the session for when it is set online.
+    #[tokio::test]
+    async fn a_dht_profile_left_offline_boots_with_its_dht_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[host("acct_b", true)]);
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        std::fs::write(cfg.session_state_path(&ProfileId::new("acct_b")), b"table").unwrap();
+        let record = crate::profile_state::Record {
+            offline_all: true,
+            ..Default::default()
+        };
+        let mut cleanup = BootCleanup::new(cfg.state_dir());
+        let (_tx, mut boot_shutdown) = broadcast::channel(8);
+        let built: Built = Arc::default();
+        let seen = Arc::clone(&built);
+        let (up, failed) = build_profiles(
+            &cfg,
+            &mut cleanup,
+            &MockForwarder::new(),
+            &torrentd_engine::NoopSink,
+            &mut boot_shutdown,
+            &record,
+            move |settings: &Settings,
+                  state: Option<Vec<u8>>|
+                  -> Result<Arc<dyn TorrentEngine>, String> {
+                seen.lock().unwrap().push((settings.clone(), state));
+                Ok(Arc::new(MockEngine::new()))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(failed.is_empty());
+        assert_eq!(up.len(), 1);
+        let built = built.lock().unwrap();
+        let (settings, state) = &built[0];
+        assert_eq!(settings.enable_dht, Some(false));
+        assert_eq!(state.as_deref(), Some(&b"table"[..]));
     }
 
     /// A session that cannot be held offline gets no torrents: the profile
