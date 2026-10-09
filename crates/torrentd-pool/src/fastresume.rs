@@ -5,8 +5,9 @@
 //! and those carry exactly the migration hints worth having: where the payload
 //! actually lives, and how the operator had it organised.
 //!
-//! Scope is deliberately tiny: read strings and flat lists of strings at the
-//! **top level** of one bencoded dict, and give up on anything unexpected. This is
+//! Scope is deliberately tiny: read strings, flat lists of strings, and lists
+//! of those (libtorrent's `trackers` tiers) at the **top level** of one
+//! bencoded dict, and give up on anything unexpected. This is
 //! not a general bencode implementation and must never grow into one — in
 //! particular it is never used to compute an info-hash, which stays in
 //! libtorrent so the daemon cannot disagree with itself about a torrent's
@@ -35,6 +36,12 @@ pub struct ResumeHints {
     /// qBittorrent's `qBt-contentLayout`: `Original`, `Subfolder` or
     /// `NoSubfolder`.
     pub content_layout: Option<String>,
+    /// libtorrent's `trackers`: the announce URLs by tier, as the previous
+    /// client last had them. qBittorrent 4.4 and later keep a torrent's
+    /// trackers here and may write its `.torrent` without any. Empty URLs,
+    /// URLs that are not UTF-8 or hold a NUL, and tiers left empty are
+    /// dropped.
+    pub trackers: Vec<Vec<String>>,
 }
 
 /// Where the previous client put a torrent's files, when not where the
@@ -190,6 +197,23 @@ pub fn parse_hints(bytes: &[u8]) -> ResumeHints {
         _ => Vec::new(),
     };
 
+    // A list of tiers, each a list of URLs. A flat list, or one holding
+    // anything else, is not libtorrent's format and reads as none.
+    let trackers = match top.get("trackers") {
+        Some(Value::Tiers(tiers)) => tiers
+            .iter()
+            .map(|tier| {
+                tier.iter()
+                    .filter_map(|u| String::from_utf8(u.clone()).ok())
+                    // A NUL cannot cross to libtorrent as a C string.
+                    .filter(|u| !u.is_empty() && !u.contains('\0'))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|tier| !tier.is_empty())
+            .collect(),
+        _ => Vec::new(),
+    };
+
     ResumeHints {
         save_path: save_path.filter(|s| !s.is_empty()),
         category: get_str("qBt-category").filter(|s| !s.is_empty()),
@@ -198,6 +222,7 @@ pub fn parse_hints(bytes: &[u8]) -> ResumeHints {
         mapped_files,
         mapped_files_unreadable,
         content_layout: get_str("qBt-contentLayout").filter(|s| !s.is_empty()),
+        trackers,
     }
 }
 
@@ -206,6 +231,8 @@ enum Value {
     Str(Vec<u8>),
     /// A list of strings — `mapped_files` is the one read.
     List(Vec<Vec<u8>>),
+    /// A list of lists of strings — `trackers`, by tier.
+    Tiers(Vec<Vec<Vec<u8>>>),
     /// Present but not a value we read; kept so key iteration stays aligned.
     Skipped,
 }
@@ -289,18 +316,32 @@ impl Parser<'_> {
             }
             b'0'..=b'9' => self.read_bytes().map(Value::Str),
             b'l' => {
-                // A flat list of strings is read; anything else in it means
-                // it is not one, and the whole list is stepped over instead.
+                // A flat list of strings, or a list of flat lists of strings,
+                // is read; anything else in it — a mix of the two included —
+                // means it is neither, and the whole list is stepped over.
                 let start = self.i;
                 self.i += 1;
                 let mut items = Vec::new();
+                let mut tiers = Vec::new();
                 loop {
                     match self.peek()? {
                         b'e' => {
                             self.i += 1;
-                            return Some(Value::List(items));
+                            return Some(if tiers.is_empty() {
+                                Value::List(items)
+                            } else {
+                                Value::Tiers(tiers)
+                            });
                         }
-                        b'0'..=b'9' => items.push(self.read_bytes()?),
+                        b'0'..=b'9' if tiers.is_empty() => items.push(self.read_bytes()?),
+                        b'l' if items.is_empty() => match self.read_flat_list() {
+                            Some(tier) => tiers.push(tier),
+                            None => {
+                                self.i = start;
+                                self.skip_container()?;
+                                return Some(Value::Skipped);
+                            }
+                        },
                         _ => {
                             self.i = start;
                             self.skip_container()?;
@@ -314,6 +355,22 @@ impl Parser<'_> {
                 Some(Value::Skipped)
             }
             _ => None,
+        }
+    }
+
+    /// `l<string>*e`, or `None` at anything else.
+    fn read_flat_list(&mut self) -> Option<Vec<Vec<u8>>> {
+        self.expect(b'l')?;
+        let mut items = Vec::new();
+        loop {
+            match self.peek()? {
+                b'e' => {
+                    self.i += 1;
+                    return Some(items);
+                }
+                b'0'..=b'9' => items.push(self.read_bytes()?),
+                _ => return None,
+            }
         }
     }
 
@@ -465,6 +522,79 @@ mod tests {
         let h = parse_hints(&b);
         assert!(h.mapped_files.is_empty());
         assert_eq!(h.save_path.as_deref(), Some("/p"));
+    }
+
+    /// libtorrent's `trackers`: a list of tiers, each a list of URLs.
+    fn btiers(tiers: &[&[&str]]) -> Vec<u8> {
+        let mut v = b"l".to_vec();
+        for t in tiers {
+            v.extend_from_slice(&blist(t));
+        }
+        v.push(b'e');
+        v
+    }
+
+    #[test]
+    fn trackers_are_read_by_tier() {
+        let b = bdict(&[
+            (
+                "trackers",
+                btiers(&[
+                    &["https://t.example/a", "udp://t.example:6969/a"],
+                    &[],
+                    &["", "http://backup.example/a"],
+                ]),
+            ),
+            ("qBt-savePath", bstr("/p")),
+        ]);
+        let h = parse_hints(&b);
+        assert_eq!(
+            h.trackers,
+            vec![
+                vec!["https://t.example/a", "udp://t.example:6969/a"],
+                vec!["http://backup.example/a"],
+            ],
+            "empty URLs and the tiers they leave empty are dropped",
+        );
+        assert_eq!(h.save_path.as_deref(), Some("/p"));
+
+        // A URL that is not UTF-8, or holds a NUL, is dropped; its tier's
+        // others stay.
+        let mut tier = b"l".to_vec();
+        tier.extend_from_slice(&bbytes(&[0xff, 0xfe]));
+        tier.extend_from_slice(&bstr("https://t.example/\0a"));
+        tier.extend_from_slice(&bstr("https://t.example/a"));
+        tier.push(b'e');
+        let mut list = b"l".to_vec();
+        list.extend_from_slice(&tier);
+        list.push(b'e');
+        let h = parse_hints(&bdict(&[("trackers", list)]));
+        assert_eq!(h.trackers, vec![vec!["https://t.example/a"]]);
+    }
+
+    #[test]
+    fn trackers_not_in_libtorrents_shape_read_as_none() {
+        for (shape, value) in [
+            ("absent", None),
+            ("empty", Some(b"le".to_vec())),
+            ("flat", Some(blist(&["https://t.example/a"]))),
+            ("a string", Some(bstr("https://t.example/a"))),
+            ("an integer in a tier", Some(b"lli1eee".to_vec())),
+            ("a dict in a tier", Some(b"lldeee".to_vec())),
+            ("a tier beside a string", Some(b"l1:al1:bee".to_vec())),
+            ("a string beside a tier", Some(b"ll1:ae1:be".to_vec())),
+            ("nested too deep", Some(b"lll1:aeee".to_vec())),
+        ] {
+            let mut entries = vec![("qBt-savePath", bstr("/p"))];
+            if let Some(v) = value {
+                entries.push(("trackers", v));
+            }
+            let h = parse_hints(&bdict(&entries));
+            assert!(h.trackers.is_empty(), "{shape}: {:?}", h.trackers);
+            assert_eq!(h.save_path.as_deref(), Some("/p"), "{shape}");
+        }
+        // A truncated tier is a malformed file, not a skipped key.
+        assert_eq!(parse_hints(b"d8:trackersll1:a"), ResumeHints::default());
     }
 
     #[test]

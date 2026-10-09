@@ -799,6 +799,7 @@ pub async fn add_torrent(
                 bytes: bytes.clone(),
                 save_path,
                 flags,
+                trackers: Vec::new(),
             },
             Some(bytes),
         ),
@@ -810,7 +811,8 @@ pub async fn add_torrent(
     // `.torrent`'s announce list, a magnet's `tr=` — must be on it.
     match torrentd_engine::check_trackers(profile_cfg, &params) {
         Ok(()) => {}
-        Err(TrackerRefusal::NotAllowed) => {
+        // The problem type already covers a torrent with no tracker.
+        Err(TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers) => {
             registry_error();
             return Err(AddTorrentError::TrackerNotAllowed);
         }

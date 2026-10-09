@@ -107,6 +107,8 @@ pub enum AddParamsSummary {
         save_path: String,
         byte_len: usize,
         flags_bits: u32,
+        /// The trackers, by tier, that replace the `.torrent`'s own.
+        trackers: Vec<Vec<String>>,
     },
     Magnet {
         uri: String,
@@ -165,10 +167,12 @@ impl From<&AddParams> for AddParamsSummary {
                 save_path,
                 bytes,
                 flags,
+                trackers,
             } => AddParamsSummary::File {
                 save_path: save_path.clone(),
                 byte_len: bytes.len(),
                 flags_bits: flags.bits(),
+                trackers: trackers.clone(),
             },
             AddParams::Magnet {
                 uri,

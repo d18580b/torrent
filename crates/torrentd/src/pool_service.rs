@@ -335,6 +335,10 @@ pub struct PendingVerify {
     /// Whether the enqueue wrote `profile` as the pool index's owner, which a
     /// drop then has to clear.
     pub owner_recorded: bool,
+    /// The previous client's trackers, by tier, read from its `.fastresume`
+    /// at the enqueue; the add announces to these in place of the
+    /// `.torrent`'s. Empty keeps the `.torrent`'s.
+    pub trackers: Vec<Vec<String>>,
 }
 
 impl VerifyQueue {
@@ -530,9 +534,11 @@ pub async fn run_verify_queue(
                 profile_cfg,
                 bytes,
                 item.save_path.to_string_lossy().into_owned(),
+                item.trackers.clone(),
             );
             // The adopt checked this `.torrent` before queueing it; these are
-            // the bytes read now, which are what the session gets.
+            // the bytes read now, which are what the session gets, with the
+            // trackers the adopt read.
             if verify_guard(metrics.as_ref(), profile_cfg, &item, &params).is_err() {
                 q.failed.fetch_add(1, Ordering::Relaxed);
                 release_dropped_claim(&pool, &registry, &item);
@@ -582,7 +588,7 @@ pub async fn run_verify_queue(
 /// Hold the bytes the verify worker is about to add to the account-isolation
 /// guard.
 ///
-/// A refusal is logged, and a `NotAllowed` one is counted in
+/// A refusal is logged, and a `NotAllowed` or `NoTrackers` one is counted in
 /// `profile_assignment_registry_errors_total`, where `POST /v1/torrents`, both
 /// boot scans and the adoption's enqueue count theirs. Bytes whose trackers
 /// cannot be read are a failed verify, not an isolation refusal.
@@ -603,7 +609,7 @@ fn verify_guard(
         error.cause = %refusal,
         "verify dropped: refused by the profile's allowed_tracker_domains",
     );
-    if matches!(refusal, TrackerRefusal::NotAllowed) {
+    if refusal.is_guard_refusal() {
         metrics.inc_counter(
             "profile_assignment_registry_errors_total",
             &[("profile_id", item.profile.as_str())],
@@ -729,17 +735,36 @@ enum VerifyOutcome {
     Failed(&'static str),
 }
 
-/// What pool adoption hands a session to verify a payload before seeding it.
+/// What pool adoption hands a session to verify a payload before seeding it:
+/// the `.torrent`, announcing to the previous client's `trackers` in place of
+/// its own where that client kept any.
 fn verify_add_params(
     profile: &torrentd_engine::ProfileConfig,
     bytes: Vec<u8>,
     save_path: String,
+    trackers: Vec<Vec<String>>,
 ) -> AddParams {
     AddParams::File {
         bytes,
         save_path,
         flags: torrentd_engine::verify_flags(profile),
+        trackers,
     }
+}
+
+/// The trackers a verify-path adopt announces to in place of the
+/// `.torrent`'s: the previous client's `.fastresume` `trackers` list, where
+/// it left one with any.
+///
+/// qBittorrent 4.4 and later keep a torrent's trackers there and may write
+/// its `.torrent` without any. The fast path hands libtorrent that resume
+/// data, which applies the list itself; the verify path adds from the
+/// `.torrent`, and without this the torrent announced to nothing — or, on a
+/// profile with `allowed_tracker_domains`, was refused.
+fn previous_trackers(resume_path: Option<&std::path::Path>) -> Vec<Vec<String>> {
+    resume_path
+        .map(|p| torrentd_pool::fastresume::read_hints(p).trackers)
+        .unwrap_or_default()
 }
 
 /// What pool adoption hands a session to seed a payload straight from resume
@@ -872,8 +897,8 @@ pub struct AdoptRefusal {
     /// What the response's `refused` entry says.
     pub reason: String,
     /// Refused by the account-isolation guard because the torrent announces
-    /// outside the profile's `allowed_tracker_domains`
-    /// (`TrackerRefusal::NotAllowed`), which the caller counts in
+    /// outside the profile's `allowed_tracker_domains`, or to no tracker at
+    /// all (`TrackerRefusal::is_guard_refusal`), which the caller counts in
     /// `profile_assignment_registry_errors_total` as every add path does. A
     /// `.torrent` whose trackers cannot be read is not one.
     pub isolation: bool,
@@ -890,12 +915,18 @@ impl From<String> for AdoptRefusal {
 
 /// The refusal an adoption the account-isolation guard refused carries.
 ///
-/// Only `NotAllowed` is an isolation refusal, as on `POST /v1/torrents` and
-/// both boot scans; an unreadable `.torrent` is refused uncounted.
+/// A foreign tracker or none at all is an isolation refusal, as on
+/// `POST /v1/torrents` and both boot scans; an unreadable `.torrent` is
+/// refused uncounted. A torrent with no tracker says so in its reason rather
+/// than reading as a foreign one.
 fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
+    let reason = match e {
+        TrackerRefusal::NoTrackers => format!("refused: {e}"),
+        _ => format!("refused by the profile's allowed_tracker_domains: {e}"),
+    };
     AdoptRefusal {
-        reason: format!("refused by the profile's allowed_tracker_domains: {e}"),
-        isolation: matches!(e, TrackerRefusal::NotAllowed),
+        reason,
+        isolation: e.is_guard_refusal(),
     }
 }
 
@@ -908,9 +939,10 @@ fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
 /// Either path first holds what it would hand the session to the
 /// account-isolation guard (`torrentd_engine::check_trackers`): the fast path
 /// the resume data with its `.torrent`, whose own `trackers` list is what
-/// libtorrent announces to where it has one; the verify path the `.torrent`.
-/// A torrent outside the profile's `allowed_tracker_domains` is refused, and
-/// never falls back to the other path. `dry_run` runs everything up to the
+/// libtorrent announces to where it has one; the verify path the `.torrent`
+/// with that same list in place of its own trackers. A torrent outside the
+/// profile's `allowed_tracker_domains`, or announcing to no tracker at all, is
+/// refused, and never falls back to the other path. `dry_run` runs everything up to the
 /// add or the enqueue, and does neither.
 pub fn execute_adopt(
     pool: &PoolService,
@@ -939,6 +971,7 @@ pub fn execute_adopt(
                     infohash,
                     torrent_path,
                     save_path,
+                    Some(resume_path.as_path()),
                     profile,
                     dry_run,
                 )
@@ -990,7 +1023,9 @@ pub fn execute_adopt(
             );
             match torrentd_engine::check_trackers(profile_cfg, &params) {
                 Ok(()) => {}
-                Err(e @ TrackerRefusal::NotAllowed) => return Err(tracker_refusal(&e)),
+                Err(e @ (TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers)) => {
+                    return Err(tracker_refusal(&e));
+                }
                 Err(TrackerRefusal::Unreadable(e)) if files_renamed => {
                     return Err(no_fallback(&format!("resume data unparseable: {e}")));
                 }
@@ -1068,12 +1103,14 @@ pub fn execute_adopt(
         AdoptPlan::Verify {
             torrent_path,
             save_path,
+            resume_path,
         } => enqueue_verify(
             pool,
             profiles,
             infohash,
             torrent_path,
             save_path,
+            resume_path.as_deref(),
             profile,
             dry_run,
         ),
@@ -1083,26 +1120,37 @@ pub fn execute_adopt(
 /// Queue a torrent for hashing before it is allowed to seed, once its
 /// `.torrent` has passed the account-isolation guard. The queue's worker
 /// holds the bytes it actually adds to the guard again.
+///
+/// `resume_path` is the previous client's `.fastresume`, whose `trackers`
+/// the add announces to in place of the `.torrent`'s
+/// ([`previous_trackers`]).
+#[allow(clippy::too_many_arguments)]
 fn enqueue_verify(
     pool: &PoolService,
     profiles: &crate::profile_registry::ProfileRegistry,
     infohash: &str,
     torrent_path: PathBuf,
     save_path: PathBuf,
+    resume_path: Option<&std::path::Path>,
     profile: ProfileId,
     dry_run: bool,
 ) -> Result<&'static str, AdoptRefusal> {
     let Some(profile_cfg) = profiles.config(&profile) else {
         return Err(format!("profile {profile} is not live").into());
     };
+    let trackers = previous_trackers(resume_path);
     // A profile with no allow-list has nothing to check, and the worker reads
     // the file when it admits the item; one with a list cannot pass the guard
     // without its trackers, so a `.torrent` that cannot be read is refused.
     if !profile_cfg.allowed_tracker_domains.is_empty() {
         let bytes = std::fs::read(&torrent_path)
             .map_err(|e| format!("cannot read the .torrent to check its trackers: {e}"))?;
-        let params =
-            verify_add_params(profile_cfg, bytes, save_path.to_string_lossy().into_owned());
+        let params = verify_add_params(
+            profile_cfg,
+            bytes,
+            save_path.to_string_lossy().into_owned(),
+            trackers.clone(),
+        );
         torrentd_engine::check_trackers(profile_cfg, &params).map_err(|e| tracker_refusal(&e))?;
     }
     if dry_run {
@@ -1126,6 +1174,7 @@ fn enqueue_verify(
         save_path,
         profile,
         owner_recorded,
+        trackers,
     });
     Ok("queued_for_verification")
 }
@@ -1179,7 +1228,12 @@ mod tests {
         };
         let engine = MockEngine::new();
         engine
-            .add_torrent(super::verify_add_params(&profile, vec![1; 32], "/p".into()))
+            .add_torrent(super::verify_add_params(
+                &profile,
+                vec![1; 32],
+                "/p".into(),
+                Vec::new(),
+            ))
             .unwrap();
         engine
             .add_torrent(super::adoption_resume_params(
@@ -1391,6 +1445,7 @@ mod tests {
             save_path: "/nonexistent".into(),
             profile: ProfileId::new(profile),
             owner_recorded: false,
+            trackers: Vec::new(),
         }
     }
 
@@ -1447,6 +1502,7 @@ mod tests {
             &ih.to_hex(),
             dir.path().join("t.torrent"),
             dir.path().join("payload"),
+            None,
             ProfileId::new("p"),
             false,
         )
@@ -1458,6 +1514,130 @@ mod tests {
         super::release_dropped_claim(&pool, &reg, &item);
         assert_eq!(owner_of(&pool, ih), None);
         assert_eq!(reg.lookup(&ih), None);
+    }
+
+    /// The enqueue reads the `.fastresume`'s trackers into the item, so the
+    /// worker adds with them; on a profile with an allow-list it holds a
+    /// tracker-less `.torrent` to them, and admits it.
+    #[test]
+    fn the_enqueue_carries_the_fastresumes_trackers_to_the_worker() {
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash([0x56; 20]);
+        let pool = pool_with(dir.path(), ih, None);
+        let mut acct = test_entry("acct", ProfileStatus::Active);
+        acct.config.allowed_tracker_domains = vec!["allowed.example".to_owned()];
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active), acct]);
+        let torrent = dir.path().join("t.torrent");
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(&torrent, bare).unwrap();
+        let resume = dir.path().join("t.fastresume");
+        std::fs::write(
+            &resume,
+            "d8:trackersll39:http://tracker.allowed.example/announceeee",
+        )
+        .unwrap();
+        let want = vec![vec!["http://tracker.allowed.example/announce".to_owned()]];
+
+        for profile in ["p", "acct"] {
+            super::enqueue_verify(
+                &pool,
+                &profiles,
+                &ih.to_hex(),
+                torrent.clone(),
+                dir.path().join("payload"),
+                Some(&resume),
+                ProfileId::new(profile),
+                false,
+            )
+            .unwrap_or_else(|e| panic!("{profile}: {}", e.reason));
+            let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+            assert_eq!(item.trackers, want, "{profile}");
+            pool.with_store(|s| s.set_profile(&ih.to_hex(), None).unwrap());
+        }
+
+        // Without the `.fastresume`, the allow-list refuses it for having
+        // no tracker at all.
+        let e = super::enqueue_verify(
+            &pool,
+            &profiles,
+            &ih.to_hex(),
+            torrent,
+            dir.path().join("payload"),
+            None,
+            ProfileId::new("acct"),
+            false,
+        )
+        .unwrap_err();
+        assert!(e.isolation);
+        assert!(e.reason.contains("no tracker"), "{}", e.reason);
+    }
+
+    /// `execute_adopt` hands the verify queue the `.fastresume` the scan
+    /// paired, both from a verify plan and when the fast path's add is
+    /// rejected and falls back to verifying, so either announces to its
+    /// trackers.
+    #[test]
+    fn an_adopt_that_verifies_carries_the_paired_fastresumes_trackers() {
+        use torrentd_engine::AlertSource;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::TorrentEngine;
+
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        std::fs::write(dir.path().join("pool/a"), b"x").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), bare).unwrap();
+        // `pieces` is the bitfield the fast path trusts: one piece had, or not.
+        let resume = |had: u8| {
+            let mut b = b"d6:pieces1:".to_vec();
+            b.push(had);
+            b.extend_from_slice(b"8:trackersll39:http://tracker.allowed.example/announceeee");
+            std::fs::write(dir.path().join("library/t.fastresume"), b).unwrap();
+        };
+        let want = vec![vec!["http://tracker.allowed.example/announce".to_owned()]];
+        resume(0);
+        pool.scan().unwrap();
+        let ih = pool.with_store(|s| s.torrents().unwrap())[0]
+            .infohash
+            .clone();
+
+        let engine = std::sync::Arc::new(MockEngine::new());
+        let source: std::sync::Arc<dyn AlertSource> =
+            std::sync::Arc::new(torrentd_engine::ProfileSource::new(vec![(
+                ProfileId::new("p"),
+                std::sync::Arc::clone(&engine) as std::sync::Arc<dyn TorrentEngine>,
+            )]));
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        let adopt = || {
+            super::execute_adopt(&pool, &source, &profiles, &ih, ProfileId::new("p"), false)
+                .unwrap_or_else(|e| panic!("{}", e.reason))
+        };
+
+        // Incomplete: planned as a verify.
+        assert_eq!(adopt(), "queued_for_verification");
+        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        assert_eq!(item.trackers, want);
+        assert!(engine.calls().is_empty(), "{:?}", engine.calls());
+
+        // Complete: the fast path adds, the add is rejected, and it falls
+        // back to verifying.
+        resume(1);
+        engine.inject_error("add_torrent", torrentd_engine::EngineError::Shutdown);
+        assert_eq!(adopt(), "queued_for_verification");
+        assert_eq!(engine.calls().len(), 1, "{:?}", engine.calls());
+        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        assert_eq!(item.trackers, want);
     }
 
     /// An owner record the enqueue did not write, or that names another
@@ -1480,6 +1660,7 @@ mod tests {
             &ih.to_hex(),
             dir.path().join("t.torrent"),
             dir.path().join("payload"),
+            None,
             ProfileId::new("p"),
             false,
         )
@@ -1516,7 +1697,7 @@ mod tests {
             .into_bytes();
             t.extend_from_slice(&[0u8; 20]);
             t.extend_from_slice(b"ee");
-            super::verify_add_params(&profile, t, "/p".into())
+            super::verify_add_params(&profile, t, "/p".into(), Vec::new())
         };
         let counted = || {
             let text = String::from_utf8(metrics.render()).unwrap();
@@ -1539,7 +1720,12 @@ mod tests {
                 &metrics,
                 &profile,
                 &item,
-                &super::verify_add_params(&profile, b"not bencode".to_vec(), "/p".into()),
+                &super::verify_add_params(
+                    &profile,
+                    b"not bencode".to_vec(),
+                    "/p".into(),
+                    Vec::new()
+                ),
             ),
             Err(super::TrackerRefusal::Unreadable(_))
         ));
@@ -1561,6 +1747,69 @@ mod tests {
             counted().is_some_and(|l| l.ends_with(" 1")),
             "{:?}",
             counted()
+        );
+    }
+
+    /// Issue 113: a `.torrent` qBittorrent wrote without trackers is added on
+    /// the verify path with the ones its `.fastresume` kept, and held to the
+    /// allow-list on those; with neither, the refusal says there is no
+    /// tracker, and is counted as the guard's.
+    #[test]
+    fn the_verify_path_announces_to_the_fastresumes_trackers() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = crate::profile_registry::test_entry("acct", ProfileStatus::Active).config;
+        profile.allowed_tracker_domains = vec!["allowed.example".to_owned()];
+        let metrics = crate::metrics_sink::PromSink::new();
+        let item = pending(InfoHash([0x45; 20]), "acct");
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        let resume = |trackers: &str| {
+            let p = dir.path().join("t.fastresume");
+            std::fs::write(&p, format!("d8:trackers{trackers}e")).unwrap();
+            super::previous_trackers(Some(&p))
+        };
+
+        let kept = resume("ll39:http://tracker.allowed.example/announceee");
+        assert_eq!(
+            kept,
+            vec![vec!["http://tracker.allowed.example/announce".to_owned()]]
+        );
+        let params = super::verify_add_params(&profile, bare.clone(), "/p".into(), kept);
+        super::verify_guard(&metrics, &profile, &item, &params).unwrap();
+        let foreign = resume("ll39:http://tracker.foreign.example/announceee");
+        assert!(matches!(
+            super::verify_guard(
+                &metrics,
+                &profile,
+                &item,
+                &super::verify_add_params(&profile, bare.clone(), "/p".into(), foreign),
+            ),
+            Err(super::TrackerRefusal::NotAllowed)
+        ));
+
+        // No `.fastresume`, or one with no trackers: none to announce to.
+        assert!(super::previous_trackers(None).is_empty());
+        let none = resume("le");
+        assert!(none.is_empty());
+        let refusal = super::verify_guard(
+            &metrics,
+            &profile,
+            &item,
+            &super::verify_add_params(&profile, bare, "/p".into(), none),
+        )
+        .unwrap_err();
+        assert!(matches!(refusal, super::TrackerRefusal::NoTrackers));
+        let adopt = super::tracker_refusal(&refusal);
+        assert!(adopt.isolation);
+        assert!(adopt.reason.contains("no tracker"), "{}", adopt.reason);
+        assert!(!adopt.reason.contains("outside"), "{}", adopt.reason);
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l
+                    .ends_with("profile_assignment_registry_errors_total{profile_id=\"acct\"} 2")),
+            "{text}"
         );
     }
 

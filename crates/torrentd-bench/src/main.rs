@@ -175,6 +175,7 @@ fn memory_scaling(count: usize) {
             save_path: "/tmp/torrentd-bench".into(),
             bytes: make_torrent(i),
             flags: TorrentFlags::SEED_MODE,
+            trackers: Vec::new(),
         });
         if i > 0 && i % 10_000 == 0 {
             let rss = vmrss_kb();
@@ -206,6 +207,7 @@ fn startup_time(count: usize) {
             save_path: "/tmp/torrentd-bench".into(),
             bytes: make_torrent(i),
             flags: TorrentFlags::SEED_MODE,
+            trackers: Vec::new(),
         });
     }
     let dt = start.elapsed().as_secs_f64();

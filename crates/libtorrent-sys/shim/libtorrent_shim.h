@@ -207,11 +207,19 @@ int         lt_session_is_paused(lt_session* s);
  *               infohash (`info_hashes().get_best()`) is written here on
  *               success: the v1 SHA-1 for a v1 torrent, and the v2 SHA-256
  *               truncated to 20 bytes for a v2 or hybrid one.
+ * tracker_urls / tracker_tiers / num_trackers:
+ *               optional; when num_trackers > 0, these trackers (URL i in
+ *               tier tracker_tiers[i]) replace the .torrent's announce list,
+ *               as a resume file's `trackers` list does. Used to keep the
+ *               trackers another client held in its resume data when adding
+ *               from a .torrent written without them.
  * Returns the lt_handle, or 0 on failure (with err_out populated).
  */
 lt_handle   lt_add_torrent_file(lt_session* s,
                                 const uint8_t* data, size_t len,
                                 const char* save_path, uint32_t flags,
+                                const char* const* tracker_urls,
+                                const int* tracker_tiers, size_t num_trackers,
                                 uint8_t* infohash_out,
                                 char* err_out, int err_len);
 
@@ -341,14 +349,21 @@ void        lt_torrent_meta_free(struct lt_torrent_meta* m);
  * The source is read as the matching add reads it: resume data when
  * `resume_buf` is given (with `torrent_buf` as the metadata it lacks, as
  * lt_add_torrent_resume_ex attaches it), else the magnet URI, else the
- * .torrent. The trackers checked are the ones libtorrent assembles from those
- * params — a resume file's own `trackers` list replaces the metadata's.
+ * .torrent with the tracker override lt_add_torrent_file takes
+ * (tracker_urls / tracker_tiers / num_trackers, ignored for the other two
+ * sources). The trackers checked are the ones libtorrent assembles from those
+ * params — a resume file's own `trackers` list, or that override, replaces
+ * the metadata's.
  *
  * Returns 1 when there is at least one tracker and every one is allowed; 0
- * when any is outside the list, cannot be parsed, or there is none at all;
- * LT_ERR when the source cannot be parsed (err_out populated). */
+ * when any is outside the list or cannot be parsed; LT_NO_TRACKERS when there
+ * is none at all; LT_ERR when the source cannot be parsed (err_out
+ * populated). */
+#define LT_NO_TRACKERS 2
 int         lt_add_trackers_allowed(const char* magnet_uri,
                                     const uint8_t* torrent_buf, size_t torrent_len,
+                                    const char* const* tracker_urls,
+                                    const int* tracker_tiers, size_t num_trackers,
                                     const uint8_t* resume_buf, size_t resume_len,
                                     const char* domains_csv,
                                     char* err_out, int err_len);

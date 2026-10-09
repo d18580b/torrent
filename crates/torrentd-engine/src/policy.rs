@@ -8,6 +8,7 @@
 //! `UPLOAD_MODE` came to be asserted on none of them.
 
 use libtorrent_safe::TorrentFlags;
+use libtorrent_safe::TrackerVerdict;
 
 use crate::profile::ProfileConfig;
 
@@ -108,13 +109,17 @@ pub fn resume_flags_clear() -> TorrentFlags {
 #[derive(Debug, thiserror::Error)]
 pub enum TrackerRefusal {
     /// The add would announce to a tracker outside the profile's
-    /// `allowed_tracker_domains`, to one whose host cannot be read, or to
-    /// none at all.
-    #[error(
-        "the torrent announces to a tracker outside the profile's allowed_tracker_domains, \
-         or to no tracker at all"
-    )]
+    /// `allowed_tracker_domains`, or to one whose host cannot be read.
+    #[error("the torrent announces to a tracker outside the profile's allowed_tracker_domains")]
     NotAllowed,
+    /// The add would announce to no tracker at all, which names no account
+    /// the profile holds. A `.torrent` another client wrote without its
+    /// trackers, and no resume data carrying them, is the usual cause.
+    #[error(
+        "the torrent announces to no tracker at all, so the profile's allowed_tracker_domains \
+         cannot admit it"
+    )]
+    NoTrackers,
     /// The source could not be parsed, so its trackers could not be read.
     /// The add would fail on the same bytes.
     #[error("the torrent's trackers could not be read: {0}")]
@@ -148,9 +153,19 @@ pub fn check_trackers(
         return Ok(());
     }
     match libtorrent_safe::add_trackers_allowed(params, domains) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(TrackerRefusal::NotAllowed),
+        Ok(TrackerVerdict::Allowed) => Ok(()),
+        Ok(TrackerVerdict::NotAllowed) => Err(TrackerRefusal::NotAllowed),
+        Ok(TrackerVerdict::NoTrackers) => Err(TrackerRefusal::NoTrackers),
         Err(e) => Err(TrackerRefusal::Unreadable(e)),
+    }
+}
+
+impl TrackerRefusal {
+    /// Whether the guard itself refused the add — a foreign tracker or none
+    /// at all — as opposed to a source it could not read. Each add path
+    /// counts these in `profile_assignment_registry_errors_total`.
+    pub fn is_guard_refusal(&self) -> bool {
+        matches!(self, Self::NotAllowed | Self::NoTrackers)
     }
 }
 
@@ -310,10 +325,19 @@ mod tests {
     }
 
     fn file(bytes: Vec<u8>) -> libtorrent_safe::AddParams {
+        file_with(bytes, &[])
+    }
+
+    /// A `.torrent` add carrying `trackers`, by tier, in place of its own.
+    fn file_with(bytes: Vec<u8>, trackers: &[&[&str]]) -> libtorrent_safe::AddParams {
         libtorrent_safe::AddParams::File {
             bytes,
             save_path: "/data".into(),
             flags: TorrentFlags::empty(),
+            trackers: trackers
+                .iter()
+                .map(|t| t.iter().map(|u| u.to_string()).collect())
+                .collect(),
         }
     }
 
@@ -338,9 +362,13 @@ mod tests {
     fn allowed(p: &ProfileConfig, params: &libtorrent_safe::AddParams) -> bool {
         match check_trackers(p, params) {
             Ok(()) => true,
-            Err(TrackerRefusal::NotAllowed) => false,
+            Err(TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers) => false,
             Err(e) => panic!("unexpected {e}"),
         }
+    }
+
+    fn no_trackers(p: &ProfileConfig, params: &libtorrent_safe::AddParams) -> bool {
+        matches!(check_trackers(p, params), Err(TrackerRefusal::NoTrackers))
     }
 
     const OURS: &str = "https://tracker.example/announce?passkey=a";
@@ -421,6 +449,37 @@ mod tests {
         // Without metadata, the list is all there is.
         assert!(allowed(&p, &resumed(resume(&ours, Some(&[SUB])), None)));
         assert!(!allowed(&p, &resumed(resume(&ours, None), None)));
+    }
+
+    #[test]
+    fn a_torrent_with_no_tracker_is_refused_as_such() {
+        let p = guarded();
+        assert!(no_trackers(&p, &file(torrent(&[]))));
+        assert!(no_trackers(&p, &magnet("")));
+        let bare = torrent(&[]);
+        assert!(no_trackers(&p, &resumed(resume(&bare, None), Some(bare))));
+        // A foreign tracker is not "no tracker".
+        assert!(!no_trackers(&p, &file(torrent(&[FOREIGN]))));
+        assert!(TrackerRefusal::NoTrackers.is_guard_refusal());
+        assert!(TrackerRefusal::NotAllowed.is_guard_refusal());
+    }
+
+    #[test]
+    fn a_torrent_add_is_held_to_the_trackers_given_in_place_of_its_own() {
+        let p = guarded();
+        // The case issue 113 is about: a `.torrent` qBittorrent wrote
+        // without trackers, added with the ones its resume data kept.
+        let bare = torrent(&[]);
+        assert!(allowed(&p, &file_with(bare.clone(), &[&[OURS], &[SUB]])));
+        assert!(!allowed(&p, &file_with(bare.clone(), &[&[OURS, FOREIGN]])));
+        // They replace the `.torrent`'s: a foreign one behind an allowed
+        // `.torrent` is refused, an allowed one in front of a foreign
+        // `.torrent` is what is announced.
+        assert!(!allowed(&p, &file_with(torrent(&[OURS]), &[&[FOREIGN]])));
+        assert!(allowed(&p, &file_with(torrent(&[FOREIGN]), &[&[OURS]])));
+        // None given keeps the `.torrent`'s.
+        assert!(allowed(&p, &file_with(torrent(&[OURS]), &[])));
+        assert!(no_trackers(&p, &file_with(bare, &[&[]])));
     }
 
     #[test]

@@ -966,11 +966,31 @@ void apply_add_params_common(lt::add_torrent_params& atp,
     atp.flags = build_torrent_flags(flags);
 }
 
+// Replace the metadata's trackers with the caller's, the way read_resume_data
+// applies a resume file's `trackers` list: `override_trackers` drops the
+// .torrent's announce list, and these are what the torrent announces to.
+// Applied after the flags, which build_torrent_flags would otherwise reset.
+// A null or empty URL is skipped; no trackers leaves the metadata's alone.
+void apply_tracker_override(lt::add_torrent_params& atp,
+                            const char* const* urls, const int* tiers,
+                            size_t n)
+{
+    if (!urls || n == 0) return;
+    for (size_t i = 0; i < n; ++i) {
+        if (!urls[i] || !*urls[i]) continue;
+        atp.trackers.emplace_back(urls[i]);
+        atp.tracker_tiers.push_back(tiers ? tiers[i] : 0);
+    }
+    if (!atp.trackers.empty()) atp.flags |= lt::torrent_flags::override_trackers;
+}
+
 }  // namespace
 
 extern "C" lt_handle lt_add_torrent_file(lt_session* s,
                                          const uint8_t* data, size_t len,
                                          const char* save_path, uint32_t flags,
+                                         const char* const* tracker_urls,
+                                         const int* tracker_tiers, size_t num_trackers,
                                          uint8_t* infohash_out,
                                          char* err_out, int err_len)
 {
@@ -980,6 +1000,7 @@ extern "C" lt_handle lt_add_torrent_file(lt_session* s,
     atp.ti = std::make_shared<lt::torrent_info>(
         reinterpret_cast<const char*>(data), static_cast<int>(len));
     apply_add_params_common(atp, save_path, flags);
+    apply_tracker_override(atp, tracker_urls, tracker_tiers, num_trackers);
 
     lt::error_code ec;
     lt::torrent_handle h = s->ses.add_torrent(std::move(atp), ec);
@@ -1208,6 +1229,8 @@ extern "C" void lt_torrent_meta_free(struct lt_torrent_meta* m) {
 
 extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
                                        const uint8_t* torrent_buf, size_t torrent_len,
+                                       const char* const* tracker_urls,
+                                       const int* tracker_tiers, size_t num_trackers,
                                        const uint8_t* resume_buf, size_t resume_len,
                                        const char* domains_csv,
                                        char* err_out, int err_len)
@@ -1247,6 +1270,7 @@ extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
     } else if (torrent_buf && torrent_len > 0) {
         atp.ti = std::make_shared<lt::torrent_info>(
             reinterpret_cast<const char*>(torrent_buf), static_cast<int>(torrent_len));
+        apply_tracker_override(atp, tracker_urls, tracker_tiers, num_trackers);
     } else {
         set_err(err_out, err_len, "no torrent source");
         return LT_ERR;
@@ -1254,8 +1278,8 @@ extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
 
     // The announce list torrent::torrent() assembles: the metadata's trackers
     // unless the params override them (resume data with a `trackers` list
-    // always does), then every tracker the params carry — a magnet's `tr=`,
-    // or that resume list.
+    // always does, as does a .torrent add given trackers of its own), then
+    // every tracker the params carry — a magnet's `tr=`, or either list.
     std::vector<std::string> urls;
     if (atp.ti && !(atp.flags & lt::torrent_flags::override_trackers)) {
         for (auto const& ae : atp.ti->trackers()) urls.push_back(ae.url);
@@ -1263,7 +1287,7 @@ extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
     for (auto const& url : atp.trackers) {
         if (!url.empty()) urls.push_back(url);
     }
-    if (urls.empty()) return 0;
+    if (urls.empty()) return LT_NO_TRACKERS;
     for (auto const& url : urls) {
         if (!tracker_url_allowed(url, domains)) return 0;
     }

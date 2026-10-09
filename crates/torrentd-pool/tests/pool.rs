@@ -1431,7 +1431,14 @@ fn an_incomplete_fastresume_falls_back_to_verifying() {
     let r = root.clone();
     let plan =
         torrentd_pool::adopt::plan(&store, "fb", |id| (id == root_id).then(|| r.clone())).unwrap();
-    assert!(matches!(plan, AdoptPlan::Verify { .. }), "got {plan:?}");
+    // The sidecar the scan paired still rides along: its trackers are what
+    // the verify path announces to.
+    match plan {
+        AdoptPlan::Verify { resume_path, .. } => {
+            assert_eq!(resume_path, Some(lib.join("fb.fastresume")));
+        }
+        other => panic!("expected verify, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1451,7 +1458,16 @@ fn no_fastresume_means_verify() {
     let r = root.clone();
     let plan =
         torrentd_pool::adopt::plan(&store, "fc", |id| (id == root_id).then(|| r.clone())).unwrap();
-    assert!(matches!(plan, AdoptPlan::Verify { .. }), "got {plan:?}");
+    assert!(
+        matches!(
+            plan,
+            AdoptPlan::Verify {
+                resume_path: None,
+                ..
+            }
+        ),
+        "got {plan:?}"
+    );
 }
 
 #[test]
