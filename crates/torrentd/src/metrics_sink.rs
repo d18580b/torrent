@@ -261,6 +261,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "pool_index_profile_disagreements" Gauge Daemon Owner("pool configured") =>
         "Torrents whose pool-index profile disagrees with the assignment registry at boot.";
     // persistence and the exporter itself
+    "dir_fsync_errors_total" Counter Daemon Zero =>
+        "Directory fsyncs after a rename that failed, every one rather than only the logged \
+         first; the renamed file is on disk, but a power loss may revert its name.";
     "store_write_errors_total" Counter Daemon ("store": &["registry", "pool_index"]) Zero =>
         "Writes to the assignment registry or the pool index that failed where nothing \
          else reports them.";
@@ -298,9 +301,13 @@ pub struct PromSink {
     /// Registered in [`PromSink::new`], so counting a failed registration
     /// never depends on a registration.
     dropped: CounterVec,
+    /// The engine's process-wide directory-fsync failure count as of the
+    /// last time it was exported. See [`PromSink::export_dir_fsync_errors`].
+    dir_fsync_exported: Mutex<u64>,
 }
 
 const DROPPED: &str = "metrics_dropped_samples_total";
+const DIR_FSYNC_ERRORS: &str = "dir_fsync_errors_total";
 
 impl PromSink {
     pub fn new() -> Self {
@@ -322,6 +329,7 @@ impl PromSink {
             gauges: Mutex::new(HashMap::new()),
             histos: Mutex::new(HashMap::new()),
             dropped,
+            dir_fsync_exported: Mutex::new(0),
         }
     }
 
@@ -365,11 +373,28 @@ impl PromSink {
     }
 
     pub fn render(&self) -> Vec<u8> {
+        self.export_dir_fsync_errors(torrentd_engine::batch_writer::dir_fsync_errors());
         let metric_families = self.registry.gather();
         let encoder = TextEncoder::new();
         let mut buf = Vec::new();
         let _ = encoder.encode(&metric_families, &mut buf);
         buf
+    }
+
+    /// Bring `dir_fsync_errors_total` up to `total`, the engine's
+    /// process-wide count of failed directory fsyncs, by the failures since
+    /// the last export.
+    ///
+    /// Read at scrape time rather than pushed: the writes that sync a
+    /// directory (`write_atomic` and every `BatchWriter`) hold no sink. A
+    /// failure between two scrapes is therefore in the second, as it would be
+    /// had it been pushed.
+    fn export_dir_fsync_errors(&self, total: u64) {
+        let mut exported = self.dir_fsync_exported.lock();
+        if total > *exported {
+            self.add_counter(DIR_FSYNC_ERRORS, total - *exported, &[]);
+            *exported = total;
+        }
     }
 
     /// The child of `name`'s vector for `labels`, registering the vector with
@@ -739,6 +764,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn dir_fsync_errors_are_exported_by_the_failures_since_the_last_scrape() {
+        let sink = PromSink::new();
+        sink.seed(&[]);
+        // Above anything this process has really counted, so the scrape's own
+        // read of the engine's count does not move it.
+        let total = torrentd_engine::batch_writer::dir_fsync_errors() + 3;
+        let sample = |n: u64| format!("torrentd_dir_fsync_errors_total {n}\n");
+        sink.export_dir_fsync_errors(total);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(text.contains(&sample(total)), "{text}");
+        sink.export_dir_fsync_errors(total);
+        sink.export_dir_fsync_errors(total + 2);
+        let text = String::from_utf8(sink.render()).unwrap();
+        assert!(text.contains(&sample(total + 2)), "counted once: {text}");
     }
 
     #[test]

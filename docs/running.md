@@ -1373,7 +1373,8 @@ On a scratch pool, not your real one.
    the previous file survives a partial write. The fsync-dir step is best
    effort: on a filesystem that refuses to fsync a directory the write still
    succeeds, and the daemon logs `directory fsync failed` once per directory,
-   until it next syncs. A `kill -9` does not depend on that step; a power loss
+   until it next syncs, and counts every failure in
+   `torrentd_dir_fsync_errors_total`. A `kill -9` does not depend on that step; a power loss
    does, and can revert such a directory's renamed files to their previous
    version or remove them. Each torrent's first resume
    file is written as soon as the session adds it; after that, changes are
