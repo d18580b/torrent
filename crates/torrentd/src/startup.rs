@@ -574,17 +574,23 @@ pub async fn boot(
             .context("raised-interface record sweep")?;
     }
 
+    // Every tunnel interface this config names, of either type. Network state
+    // an earlier run left under any other name is a retired profile's, and
+    // nothing but the boot below would ever take it down.
+    let configured: Arc<HashSet<String>> = Arc::new(
+        cfg.profile
+            .iter()
+            .filter_map(|p| p.vpn_interface().map(str::to_string))
+            .collect(),
+    );
+
     // A WireGuard link an earlier run raised for a profile this config no
     // longer declares: nothing would adopt it or ever take it down, and its
     // per-source rules stay in the routing policy with it. A configured
     // profile's link is left to adoption and bring-up, as before.
     {
         let state_dir = run_dir.clone();
-        let configured: HashSet<String> = cfg
-            .profile
-            .iter()
-            .filter_map(|p| p.vpn_interface().map(str::to_string))
-            .collect();
+        let configured = Arc::clone(&configured);
         let released = tokio::task::spawn_blocking(move || {
             crate::vpn::release_recorded_wireguard(&state_dir, |iface| configured.contains(iface))
         })
@@ -596,6 +602,29 @@ pub async fn boot(
                 error.cause = %e,
                 "could not read the state directory for WireGuard links raised by an earlier \
                  run; a link no configured profile names is left standing",
+            );
+        }
+    }
+
+    // The same for OpenVPN: an `openvpn-<iface>.pid` or `.table` record whose
+    // interface this config no longer names gets the teardown `bring_down`
+    // runs, so a retired profile's openvpn, its source-address rules and its
+    // records do not outlive an unclean exit. A configured profile's records
+    // are its own bring-up's to consume, as before.
+    {
+        let state_dir = run_dir.clone();
+        let configured = Arc::clone(&configured);
+        let released = tokio::task::spawn_blocking(move || {
+            vpn::OpenvpnManager::new(state_dir).release_recorded(|iface| configured.contains(iface))
+        })
+        .await
+        .context("unconfigured OpenVPN profile teardown")?;
+        if let Err(e) = released {
+            error!(
+                path = %run_dir.display(),
+                error.cause = %e,
+                "could not read the state directory for OpenVPN records an earlier run left; \
+                 an interface no configured profile names keeps its openvpn, rules and records",
             );
         }
     }
