@@ -296,8 +296,48 @@ fn probe_tunnel(iface: &str, is_wg: bool) -> TunnelProbes {
     }
 }
 
-/// How [`run_with`] probes a tunnel: [`probe_tunnel`] outside tests.
-type Prober = Arc<dyn Fn(&str, bool) -> TunnelProbes + Send + Sync>;
+/// How [`run_with`] and [`recovery_check`] probe a tunnel: [`probe_tunnel`]
+/// outside tests.
+pub(crate) type Prober = Arc<dyn Fn(&str, bool) -> TunnelProbes + Send + Sync>;
+
+/// The host's own probes, as a [`Prober`].
+pub(crate) fn host_prober() -> Prober {
+    Arc::new(probe_tunnel)
+}
+
+/// Whether a fenced profile's tunnel is healthy enough to lift the fence,
+/// asked when the operator sets the profile online. Blocking: it shells out.
+///
+/// The same verdict as the monitor's ([`evaluate`]) on the address and the
+/// route: the interface must hold the very address the session is bound to
+/// (`ProfileEntry::session_ip`, which a fence does not overwrite), since the
+/// session's sockets cannot follow a new one, and a packet from it must leave
+/// by the tunnel.
+///
+/// The handshake is not asked. WireGuard handshakes only when it has a packet
+/// to send, and a fenced profile sends none, so its handshake is stale by
+/// construction and would keep every fence up for good. The monitor measures
+/// it again from its next poll, once the profile carries traffic, and fences
+/// the profile again if no handshake follows.
+///
+/// A host profile has no tunnel and is never fenced; it passes.
+pub(crate) fn recovery_check(
+    entry: &crate::profile_registry::ProfileEntry,
+    probe: &Prober,
+) -> Result<(), DownReason> {
+    let Some(iface) = entry.config.vpn_interface() else {
+        return Ok(());
+    };
+    let probes = probe(iface, entry.config.vpn_type() == Some(VpnType::Wireguard));
+    let observation = Observation {
+        current: probes.ip,
+        expected: entry.session_ip,
+        route: probes.route.and_then(Result::ok),
+        handshake: Handshake::NoSignal,
+        unanswered_for: Duration::ZERO,
+    };
+    evaluate(&observation, Duration::MAX)
+}
 
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
@@ -312,7 +352,7 @@ pub async fn run(
         metrics,
         handshake_max_age,
         shutdown,
-        Arc::new(probe_tunnel),
+        host_prober(),
     )
     .await;
 }
@@ -346,8 +386,9 @@ async fn run_with(
         for e in profiles.iter() {
             let profile_id = e.id().clone();
             let health = e.health();
-            // Once a profile is down it stays down until the operator restarts
-            // the daemon — no auto-recovery.
+            // Once a profile is down it stays down until the operator sets it
+            // online and its tunnel passes `recovery_check` — no
+            // auto-recovery.
             if health.status == ProfileStatus::VpnDown {
                 continue;
             }
@@ -438,7 +479,10 @@ async fn run_with(
                     Handshake::Age(age)
                 }
             };
-            let carrying = profile_carries_traffic(&state, &profile_id);
+            // A profile the operator holds offline has its whole session
+            // paused, so nothing in it sends, whatever its torrents' phases.
+            let carrying =
+                !profiles.held_offline(&profile_id) && profile_carries_traffic(&state, &profile_id);
             let unanswered_for = unanswered_clock(
                 &mut unanswered_since,
                 &profile_id,

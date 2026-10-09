@@ -1,5 +1,6 @@
-//! Profiles: listing them, describing one, and pausing or resuming every
-//! torrent in one profile or in all of them.
+//! Profiles: listing them, describing one, setting one or all of them online
+//! or offline, and pausing or resuming every torrent in one profile or in all
+//! of them.
 //!
 //! A daemon always has at least one profile, so these are always mounted.
 
@@ -7,11 +8,15 @@ use std::sync::Arc;
 
 use kynos::prelude::*;
 use kynos::security::auth::Scoped;
+use serde::Deserialize;
 use serde::Serialize;
+use torrentd_engine::DesiredState;
+use torrentd_engine::MetricsSink;
 use torrentd_engine::PortForwardMode as EnginePortForwardMode;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus as EngineProfileStatus;
 use torrentd_engine::TorrentEngine;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -22,6 +27,7 @@ use crate::http::security::Write;
 use crate::http::v1::common::blocking;
 use crate::http::v1::common::engine_for;
 use crate::http::v1::common::from_profile_problem;
+use crate::http::v1::common::internal;
 use crate::http::v1::common::unfenced_engine;
 use crate::http::v1::common::InfoHashHex;
 use crate::http::v1::common::ProfileProblem;
@@ -39,6 +45,8 @@ macro_rules! bodyless_routes {
         $group.mount(kynos::routes![
             crate::http::v1::profiles::list_profiles,
             crate::http::v1::profiles::get_profile,
+            crate::http::v1::profiles::set_offline_all,
+            crate::http::v1::profiles::set_online_all,
             crate::http::v1::profiles::pause_profile,
             crate::http::v1::profiles::resume_profile,
             crate::http::v1::profiles::pause_all_torrents,
@@ -48,13 +56,41 @@ macro_rules! bodyless_routes {
 }
 pub(crate) use bodyless_routes;
 
-/// Operations whose body is bounded by `MAX_BODY_BYTES`. None here.
+/// Operations whose body is bounded by `MAX_BODY_BYTES`.
 macro_rules! body_routes {
     ($group:expr) => {
-        $group
+        $group.mount(kynos::routes![crate::http::v1::profiles::set_profile_state])
     };
 }
 pub(crate) use body_routes;
+
+/// Whether a profile is on the network.
+#[derive(Clone, Copy, Debug, Schema, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProfileState {
+    /// On the network.
+    Online,
+    /// Held off it: no announce, no peer, no incoming connection.
+    Offline,
+}
+
+impl From<DesiredState> for ProfileState {
+    fn from(d: DesiredState) -> Self {
+        match d {
+            DesiredState::Online => Self::Online,
+            DesiredState::Offline => Self::Offline,
+        }
+    }
+}
+
+impl From<ProfileState> for DesiredState {
+    fn from(s: ProfileState) -> Self {
+        match s {
+            ProfileState::Online => Self::Online,
+            ProfileState::Offline => Self::Offline,
+        }
+    }
+}
 
 /// Whether a profile has a session, and whether its tunnel is up.
 #[derive(Clone, Copy, Debug, Schema, Serialize, PartialEq, Eq)]
@@ -67,7 +103,8 @@ pub enum ProfileStatus {
     /// are not loaded; `failure_reason` says why.
     Failed,
     /// The VPN monitor fenced the profile after its tunnel failed: its
-    /// torrents are paused and stay paused until the daemon restarts.
+    /// torrents are paused and stay paused until the operator sets the
+    /// profile online and its tunnel checks healthy.
     VpnDown,
 }
 
@@ -109,6 +146,13 @@ pub struct Profile {
     pub profile_id: String,
     /// Whether the profile has a session, and whether its tunnel is up.
     pub status: ProfileStatus,
+    /// The profile's own online/offline setting, persisted across restarts.
+    /// `offline_all` holds every profile offline without changing it.
+    pub desired_state: ProfileState,
+    /// Whether the profile is on the network now: `online` only when it has
+    /// a session, its `status` is `active`, its `desired_state` is `online`,
+    /// and `offline_all` is off.
+    pub effective_state: ProfileState,
     /// The tunnel's address; `null` for a host profile, a failed one, or
     /// before the tunnel reported one.
     pub tunnel_ip: Option<String>,
@@ -139,6 +183,10 @@ pub struct ProfileList {
     /// profile came up: pick a default by filtering on `status`, not by
     /// taking the first.
     pub items: Vec<Profile>,
+    /// Whether `POST /v1/profiles/offline-all` holds every profile offline.
+    /// Each profile's own `desired_state` stands beneath it, and is what
+    /// `online-all` restores.
+    pub offline_all: bool,
 }
 
 /// One profile, with its tunnel and tracker configuration.
@@ -211,9 +259,17 @@ pub struct ProfilePath {
 fn profile_of(s: &AppState, e: &ProfileEntry) -> Profile {
     let h = e.health();
     let listen_port = e.config.listen_port();
+    let states = s.profiles.states();
+    let on_network = h.status == EngineProfileStatus::Active && !states.holds_offline(e.id());
     Profile {
         profile_id: e.config.id.as_str().to_owned(),
         status: ProfileStatus::from(&h.status),
+        desired_state: states.desired(e.id()).into(),
+        effective_state: if on_network {
+            ProfileState::Online
+        } else {
+            ProfileState::Offline
+        },
         tunnel_ip: h.tunnel_ip.map(|ip| ip.to_string()),
         torrent_count: count(s.registry.for_profile(&e.config.id).len()),
         listen_port,
@@ -235,6 +291,10 @@ fn profile_of_failed(s: &AppState, f: &FailedProfile) -> Profile {
     Profile {
         profile_id: f.config.id.as_str().to_owned(),
         status: ProfileStatus::Failed,
+        // Kept for a failed profile too: it is what the profile starts in
+        // once a restart brings it up.
+        desired_state: s.profiles.states().desired(&f.config.id).into(),
+        effective_state: ProfileState::Offline,
         tunnel_ip: None,
         // From the registry, like every other profile's. Hardcoding 0 here
         // reported no stranded torrents for the profile whose stranded
@@ -261,11 +321,19 @@ pub async fn list_profiles(
     _caller: Scoped<Bearer, Read>,
     Inject(s): Inject<Arc<AppState>>,
 ) -> Json<ProfileList> {
+    Json(profile_list(&s))
+}
+
+/// Every profile, in the order [`list_profiles`] documents.
+fn profile_list(s: &AppState) -> ProfileList {
     // Configured order is what the registry's `Vec` gives every other
     // consumer and what the operator wrote; sorting by id would throw it away.
-    let mut items: Vec<Profile> = s.profiles.iter().map(|e| profile_of(&s, e)).collect();
-    items.extend(s.profiles.failed().iter().map(|f| profile_of_failed(&s, f)));
-    Json(ProfileList { items })
+    let mut items: Vec<Profile> = s.profiles.iter().map(|e| profile_of(s, e)).collect();
+    items.extend(s.profiles.failed().iter().map(|f| profile_of_failed(s, f)));
+    ProfileList {
+        items,
+        offline_all: s.profiles.states().offline_all,
+    }
 }
 
 /// Why a profile could not be described.
@@ -291,26 +359,261 @@ pub async fn get_profile(
     Path(path): Path<ProfilePath>,
 ) -> Result<Json<ProfileDetail>, GetProfileError> {
     let profile_id = ProfileId::new(path.profile_id);
-    match s.profiles.resolve(&profile_id) {
+    detail_of(&s, &profile_id)
+        .map(Json)
+        .ok_or(GetProfileError::ProfileNotFound)
+}
+
+/// What [`get_profile`] reports for `profile_id`, or `None` for an id no
+/// profile declares.
+fn detail_of(s: &AppState, profile_id: &ProfileId) -> Option<ProfileDetail> {
+    match s.profiles.resolve(profile_id) {
         Resolution::Active(e) => {
             let h = e.health();
-            Ok(Json(ProfileDetail {
-                profile: profile_of(&s, e),
+            Some(ProfileDetail {
+                profile: profile_of(s, e),
                 vpn_interface: e.config.vpn_interface().map(str::to_owned),
                 allowed_tracker_domains: e.config.allowed_tracker_domains.clone(),
                 paused_for_vpn: h.paused_for_vpn,
                 port_forward_ok: h.port_forward_ok,
-            }))
+            })
         }
-        Resolution::Failed(f) => Ok(Json(ProfileDetail {
-            profile: profile_of_failed(&s, f),
+        Resolution::Failed(f) => Some(ProfileDetail {
+            profile: profile_of_failed(s, f),
             vpn_interface: f.config.vpn_interface().map(str::to_owned),
             allowed_tracker_domains: f.config.allowed_tracker_domains.clone(),
             paused_for_vpn: 0,
             port_forward_ok: false,
-        })),
-        Resolution::Unknown => Err(GetProfileError::ProfileNotFound),
+        }),
+        Resolution::Unknown => None,
     }
+}
+
+/// The state to set a profile to.
+#[derive(Debug, Deserialize, Schema)]
+#[serde(deny_unknown_fields)]
+pub struct SetProfileState {
+    /// `offline` holds the profile off the network; `online` puts it back.
+    pub state: ProfileState,
+}
+
+/// Why a profile's state was not set.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum SetProfileStateError {
+    /// No profile with this id is configured.
+    #[error("unknown profile_id")]
+    #[problem(status = 404, title = "Profile not found")]
+    ProfileNotFound,
+    /// The profile is fenced (`vpn_down`) and its tunnel still fails the
+    /// health check, so it stays fenced and its state is unchanged.
+    #[error("{detail}")]
+    #[problem(status = 409, title = "The profile is unavailable")]
+    ProfileUnavailable {
+        detail: String,
+        /// `vpn_down`.
+        #[problem(extension)]
+        profile_status: &'static str,
+    },
+    /// The state could not be recorded, or a session refused it.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
+}
+
+/// Set one profile online or offline.
+///
+/// `offline` pauses the profile's whole session: no announce, no peer, no
+/// incoming connection, for every torrent in it and every torrent that
+/// reaches it later. Adds, adoptions, and resumes into it are refused with
+/// `409 profile-unavailable` (`offline`) until it is set online. `online`
+/// resumes the session, and every torrent goes back to what its own paused
+/// flag says. The setting is written to the state directory before it takes
+/// effect, so it survives a crash and a restart; a profile left offline
+/// starts with its session paused, before any torrent is loaded into it.
+///
+/// Setting a fenced (`vpn_down`) profile online is how the fence is lifted
+/// without a restart. The tunnel is checked first: its interface must hold
+/// the address the session is bound to, and a packet from that address must
+/// route by the tunnel. If it passes, the fence's pauses are undone and the
+/// VPN monitor watches the profile again, handshake included; if it fails,
+/// `409` and nothing changes. A profile that never came up keeps the setting
+/// for its next boot. `offline_all`, while on, keeps every profile offline
+/// whatever this sets.
+#[kynos::patch("/profiles/{profile_id}", tag = Profiles)]
+pub async fn set_profile_state(
+    _caller: Scoped<Bearer, Write>,
+    Inject(s): Inject<Arc<AppState>>,
+    Path(path): Path<ProfilePath>,
+    Json(body): Json<SetProfileState>,
+) -> Result<Json<ProfileDetail>, SetProfileStateError> {
+    let profile_id = ProfileId::new(path.profile_id);
+    if matches!(s.profiles.resolve(&profile_id), Resolution::Unknown) {
+        return Err(SetProfileStateError::ProfileNotFound);
+    }
+    let desired = DesiredState::from(body.state);
+    // On the blocking pool: the tunnel probe shells out, the record is
+    // fsynced, and each session call takes its session's lock.
+    let state = Arc::clone(&s);
+    let id = profile_id.clone();
+    blocking(move || set_state(&state, &id, desired)).await?;
+    detail_of(&s, &profile_id)
+        .map(Json)
+        .ok_or(SetProfileStateError::ProfileNotFound)
+}
+
+/// [`set_profile_state`]'s work, on the blocking pool.
+fn set_state(
+    s: &AppState,
+    profile_id: &ProfileId,
+    desired: DesiredState,
+) -> Result<(), SetProfileStateError> {
+    let fenced = s
+        .profiles
+        .resolve(profile_id)
+        .active()
+        .filter(|e| e.health().status == EngineProfileStatus::VpnDown);
+    let lift = match (desired, fenced) {
+        (DesiredState::Online, Some(entry)) => {
+            if let Err(reason) = crate::vpn_monitor::recovery_check(entry, &s.tunnel_probe) {
+                warn!(
+                    profile_id = %profile_id,
+                    reason = reason.as_str(),
+                    "profile set online while fenced; its tunnel still fails the check, so it \
+                     stays fenced",
+                );
+                return Err(SetProfileStateError::ProfileUnavailable {
+                    detail: format!(
+                        "profile vpn_down: its tunnel still fails the health check \
+                         ({}), so it stays fenced and its state is unchanged. Bring the \
+                         tunnel back on the address the session is bound to, then retry.",
+                        reason.as_str()
+                    ),
+                    profile_status: ProfileUnavailableReason::VpnDown.as_str(),
+                });
+            }
+            Some(entry)
+        }
+        _ => None,
+    };
+    s.profiles
+        .change_states(|r| r.set(profile_id, desired), &*s.metrics)
+        .map_err(|e| SetProfileStateError::Internal {
+            detail: internal("setting the profile's state", e),
+        })?;
+    if let Some(entry) = lift {
+        lift_fence(s, entry);
+    }
+    info!(profile_id = %profile_id, state = desired.as_str(), "profile state set");
+    Ok(())
+}
+
+/// Undo a fence whose tunnel has just passed [`crate::vpn_monitor::recovery_check`]:
+/// mark the profile active, so the VPN monitor watches it again, and resume
+/// the torrents the fence paused.
+///
+/// The fence paused every torrent in the profile and recorded none of them,
+/// so every one is resumed, including one the operator had paused on its own
+/// before the fence. Pause it again after.
+fn lift_fence(s: &AppState, entry: &ProfileEntry) {
+    let profile_id = entry.id();
+    entry.update_health(|h| {
+        h.status = EngineProfileStatus::Active;
+        h.tunnel_ip = entry.session_ip;
+        h.paused_for_vpn = 0;
+    });
+    let labels = [("profile_id", profile_id.as_str())];
+    s.metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
+    s.metrics
+        .set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
+    let mut resumed = 0u64;
+    let mut refused = 0u64;
+    for h in s.state.handles_for_profile(profile_id) {
+        match entry.engine.resume_torrent(h) {
+            Ok(()) => resumed += 1,
+            Err(e) => {
+                refused += 1;
+                error!(
+                    profile_id = %profile_id,
+                    infohash = %h.infohash,
+                    error.cause = %e,
+                    "could not resume a torrent while lifting the profile's fence",
+                );
+            }
+        }
+    }
+    info!(
+        profile_id = %profile_id,
+        torrent_count = resumed,
+        failed_count = refused,
+        "fence lifted: the tunnel checked healthy and the profile was set online",
+    );
+}
+
+/// Why offline-all or online-all did not fully apply.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum StateSwitchError {
+    /// The switch could not be recorded, or a session refused it.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
+}
+
+/// [`set_offline_all`] and [`set_online_all`]: set the daemon-wide switch and
+/// apply it.
+async fn switch_all(
+    s: Arc<AppState>,
+    offline: bool,
+) -> Result<Json<ProfileList>, StateSwitchError> {
+    let state = Arc::clone(&s);
+    blocking(move || {
+        state
+            .profiles
+            .change_states(|r| r.offline_all = offline, &*state.metrics)
+    })
+    .await
+    .map_err(|e| StateSwitchError::Internal {
+        detail: internal(
+            if offline {
+                "taking every profile offline"
+            } else {
+                "clearing offline-all"
+            },
+            e,
+        ),
+    })?;
+    info!(offline_all = offline, "daemon-wide profile state set");
+    Ok(Json(profile_list(&s)))
+}
+
+/// Take every profile offline.
+///
+/// The same session pause a single profile's `offline` uses, applied to every
+/// profile, and recorded as its own switch: each profile's `desired_state` is
+/// left as it was, so `online-all` restores exactly the states that stood
+/// before. Persisted like them, and in force from boot while set. Adds,
+/// adoptions and resumes into any profile are refused until it is cleared.
+#[kynos::post("/profiles/offline-all", tag = Profiles)]
+pub async fn set_offline_all(
+    _caller: Scoped<Bearer, Write>,
+    Inject(s): Inject<Arc<AppState>>,
+) -> Result<Json<ProfileList>, StateSwitchError> {
+    switch_all(s, true).await
+}
+
+/// Clear offline-all.
+///
+/// Each profile returns to its own `desired_state`: one set offline on its
+/// own stays offline. A fenced (`vpn_down`) profile stays fenced; setting it
+/// online with `PATCH /v1/profiles/{profile_id}` is what checks its tunnel
+/// and lifts the fence.
+#[kynos::post("/profiles/online-all", tag = Profiles)]
+pub async fn set_online_all(
+    _caller: Scoped<Bearer, Write>,
+    Inject(s): Inject<Arc<AppState>>,
+) -> Result<Json<ProfileList>, StateSwitchError> {
+    switch_all(s, false).await
 }
 
 /// Why a profile's torrents could not all be paused or resumed.
@@ -322,12 +625,12 @@ pub enum ProfileBulkError {
     #[problem(status = 404, title = "Profile not found")]
     ProfileNotFound,
     /// The profile is configured but has no session, or (for a resume) the
-    /// VPN monitor fenced it.
+    /// VPN monitor fenced it or the operator set it offline.
     #[error("{detail}")]
     #[problem(status = 409, title = "The profile is unavailable")]
     ProfileUnavailable {
         detail: String,
-        /// `failed` or `vpn_down`.
+        /// `failed`, `vpn_down` or `offline`.
         #[problem(extension)]
         profile_status: &'static str,
     },
@@ -481,10 +784,10 @@ pub async fn pause_profile(
 /// Resume every torrent in one profile.
 ///
 /// Refused with `409 profile-unavailable` for a profile that never came up
-/// (nothing of it is loaded) and for a fenced (`vpn_down`) one: its torrents
-/// were paused because the tunnel is gone, and they stay paused until the
-/// operator restarts the daemon. `failed_count` counts torrents the engine
-/// refused.
+/// (nothing of it is loaded), for a fenced (`vpn_down`) one, whose torrents
+/// were paused because the tunnel is gone and stay paused until the profile
+/// is set online and its tunnel checks healthy, and for an `offline` one.
+/// `failed_count` counts torrents the engine refused.
 #[kynos::post("/profiles/{profile_id}/resume-all", tag = Profiles)]
 pub async fn resume_profile(
     _caller: Scoped<Bearer, Write>,
@@ -564,12 +867,13 @@ pub async fn pause_all_torrents(
     Json(out)
 }
 
-/// Resume every torrent in every profile that is not fenced.
+/// Resume every torrent in every profile that is not fenced or offline.
 ///
-/// A fenced (`vpn_down`) profile is skipped and listed in `skipped_profiles`,
-/// not refused wholesale: one account's dead tunnel must not stop the others
-/// resuming, and resuming it is exactly what the profile's own resume-all
-/// refuses. Profiles that never came up are listed too.
+/// A fenced (`vpn_down`) or `offline` profile is skipped and listed in
+/// `skipped_profiles`, not refused wholesale: one account's dead tunnel must
+/// not stop the others resuming, and resuming it is exactly what the
+/// profile's own resume-all refuses. Profiles that never came up are listed
+/// too.
 #[kynos::post("/torrents/resume-all", tag = Torrents)]
 pub async fn resume_all_torrents(
     _caller: Scoped<Bearer, Write>,
@@ -580,9 +884,16 @@ pub async fn resume_all_torrents(
         ..BulkOutcome::default()
     };
     for entry in s.profiles.iter() {
-        if entry.health().status == EngineProfileStatus::VpnDown {
-            let ProfileProblem::Unavailable { reason, detail } = ProfileProblem::vpn_down() else {
-                unreachable!("vpn_down is an unavailable profile");
+        let held = if entry.health().status == EngineProfileStatus::VpnDown {
+            Some(ProfileProblem::vpn_down())
+        } else if s.profile_offline(entry.id()) {
+            Some(ProfileProblem::offline())
+        } else {
+            None
+        };
+        if let Some(problem) = held {
+            let ProfileProblem::Unavailable { reason, detail } = problem else {
+                unreachable!("vpn_down and offline are unavailable profiles");
             };
             out.skipped_profiles.push(SkippedProfile {
                 profile_id: entry.id().as_str().to_owned(),

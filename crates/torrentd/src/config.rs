@@ -892,6 +892,13 @@ impl Config {
         self.state_dir()
             .join(format!("session_state-{}.dat", profile.as_str()))
     }
+
+    /// Where the operator's online/offline choice for each profile is kept;
+    /// see `profile_state`.
+    pub fn profile_state_path(&self) -> PathBuf {
+        self.state_dir()
+            .join(crate::profile_state::PROFILE_STATE_FILE)
+    }
 }
 
 /// Which of the two non-reloadable warnings a `[[profile]]` change is owed.

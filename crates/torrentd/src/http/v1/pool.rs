@@ -980,13 +980,13 @@ pub enum AdoptError {
     #[error("unknown root_id")]
     #[problem(status = 404, title = "Root not found")]
     RootNotFound,
-    /// The profile failed to start or is fenced, so it cannot receive
-    /// torrents.
+    /// The profile failed to start, is fenced, or is set offline, so it
+    /// cannot receive torrents.
     #[error("{detail}")]
     #[problem(status = 409, title = "The profile is unavailable")]
     ProfileUnavailable {
         detail: String,
-        /// `failed` or `vpn_down`.
+        /// `failed`, `vpn_down` or `offline`.
         #[problem(extension)]
         profile_status: &'static str,
     },
@@ -1359,8 +1359,8 @@ pub async fn verify_pool_torrents(
                 continue;
             };
             // A recheck resumes the torrent's network activity once it ends,
-            // so a fenced profile is skipped as resume-all skips it: its
-            // torrents wait for the operator's restart.
+            // so a fenced or offline profile is skipped as resume-all skips
+            // it: its torrents wait for the operator to set it online.
             let engine = match unfenced_engine(&s, &st.profile_id) {
                 Ok(engine) => engine,
                 Err(crate::http::v1::common::ProfileProblem::Unavailable { detail, .. }) => {

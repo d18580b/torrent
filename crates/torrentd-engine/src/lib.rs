@@ -87,6 +87,7 @@ pub use port_forward::PortForwarder;
 pub use port_forward::PortMapRequest;
 pub use port_forward::RenewOutcome;
 pub use profile::bind_endpoint;
+pub use profile::DesiredState;
 pub use profile::ProfileConfig;
 pub use profile::ProfileConfigError;
 pub use profile::ProfileId;

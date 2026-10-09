@@ -288,7 +288,14 @@ a `vpn` profile's isolation is layered:
 - **Health monitor** — every 30s it checks the tunnel address and, for
   WireGuard, the latest-handshake age. On loss, change, or a stale handshake it
   pauses that profile's torrents and **fences** it: no auto-restart, and
-  `add`/`resume` return 409 until an operator intervenes.
+  `add`/`resume` return 409 until an operator sets the profile online
+  (`PATCH /v1/profiles/{id}`), which re-checks the tunnel and lifts the fence
+  only if it passes. No daemon restart is needed.
+- **Online/offline** — an operator can hold one profile offline, or every
+  profile with `POST /v1/profiles/offline-all`. Offline pauses the profile's
+  whole libtorrent session, so torrents added to it later are held too, and
+  adds and adoptions into it are refused. The choice is persisted in the state
+  directory and applied at boot before any torrent is loaded.
 - **Kill switch** (opt-in) — a fail-closed nftables table confining the
   daemon's egress to loopback and its tunnel interfaces, so a dropped tunnel
   fails closed at the kernel regardless of socket binds or poll timing. It is

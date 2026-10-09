@@ -714,6 +714,29 @@ async fn adoption(cov: &Arc<Coverage>) {
     assert_problem(&resp, 409, "profile-unavailable");
     let body: Value = resp.json();
     assert_eq!(body["profile_status"], "vpn_down");
+    // And one the operator set offline, refused the same way and for the
+    // same reason: nothing it claimed could seed.
+    let set_p = |state| {
+        h.state
+            .profiles
+            .change_states(
+                |r| r.set(&torrentd_engine::ProfileId::new("p"), state),
+                &torrentd_engine::NoopSink,
+            )
+            .unwrap()
+    };
+    set_p(torrentd_engine::DesiredState::Offline);
+    let claims = h.state.registry.len();
+    let resp = post(adopt(
+        "p",
+        false,
+        json!({"kind": "infohashes", "infohashes": [IH_C]}),
+    ))
+    .await;
+    assert_problem(&resp, 409, "profile-unavailable");
+    assert_eq!(resp.json::<Value>()["profile_status"], "offline");
+    assert_eq!(h.state.registry.len(), claims, "nothing was claimed");
+    set_p(torrentd_engine::DesiredState::Online);
 
     // An unknown root in the selector.
     let resp = post(adopt(

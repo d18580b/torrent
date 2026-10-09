@@ -154,6 +154,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "profile_boot_failed" Gauge Profile Owner("always") =>
         "1 if the profile got no session at boot (tunnel, port forward, or session \
          construction failed).";
+    "profile_offline" Gauge Profile Owner("always") =>
+        "1 while the operator holds the profile offline, by its own state or by offline-all.";
     "boot_torrent_load_failures" Gauge Profile
         ("source": &["resume_add", "torrent_read", "torrent_dir_add", "resume_file", "torrent_file"])
         Owner("always") =>

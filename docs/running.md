@@ -1280,8 +1280,15 @@ On a scratch pool, not your real one.
    `torrentd_profile_vpn_fenced_total{reason="route_mismatch"}` has risen (the
    log says `VPN tunnel unhealthy` with `reason=route_mismatch`). Set
    `METRICS_URL` and `METRICS_TOKEN` if `/metrics` is not on
-   `127.0.0.1:8080` or needs the scrape token. Restart the daemon
-   afterwards; the rules come back with the tunnel.
+   `127.0.0.1:8080` or needs the scrape token. Afterwards, restore the
+   rules (or restart the tunnel) and set the profile online —
+   `torrentctl`'s Profiles screen, or
+   `curl -X PATCH -H 'content-type: application/json' -d '{"state":"online"}' …/v1/profiles/<id>`.
+   That request re-runs the address and route checks and lifts the fence
+   only if they pass; while they fail it answers `409` and the profile stays
+   fenced. The handshake is not part of that check — a fenced profile sends
+   nothing, so its handshake is stale by construction — and the monitor
+   measures it again from its next poll.
 
    What can leave by the physical interface before the fence trips depends
    on the socket and on whether the kernel lets the daemon bind a socket to a
