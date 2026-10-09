@@ -40,6 +40,9 @@ fn exception_isolation_bad_torrent_returns_null() {
             garbage.len(),
             save.as_ptr(),
             0,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
             ih.as_mut_ptr(),
             err.as_mut_ptr(),
             512,
@@ -396,6 +399,9 @@ fn add_file(s: *mut lt_session, bytes: &[u8]) -> lt_handle {
             bytes.len(),
             save.as_ptr(),
             LT_TF_PAUSED,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
             ih.as_mut_ptr(),
             err.as_mut_ptr(),
             512,
@@ -589,6 +595,106 @@ fn trackers_report_every_url_with_its_tier() {
     unsafe { lt_session_destroy(s) };
 }
 
+/// Trackers given with a `.torrent` add replace its announce list, tiers
+/// kept, the way a resume file's `trackers` list does.
+#[test]
+fn a_file_add_announces_to_the_trackers_given_in_place_of_its_own() {
+    let s = make_session();
+    let bytes = multi_file_tracker_torrent();
+    let urls = [
+        CString::new("http://a.override.example:9/announce").unwrap(),
+        CString::new("").unwrap(),
+        CString::new("http://b.override.example:10/announce").unwrap(),
+    ];
+    let ptrs: Vec<*const c_char> = urls.iter().map(|c| c.as_ptr()).collect();
+    let tiers = [0i32, 0, 1];
+    let save = CString::new("/tmp").unwrap();
+    let mut ih = [0u8; 20];
+    let mut err = [0 as c_char; 512];
+    let h = unsafe {
+        lt_add_torrent_file(
+            s,
+            bytes.as_ptr(),
+            bytes.len(),
+            save.as_ptr(),
+            LT_TF_PAUSED,
+            ptrs.as_ptr(),
+            tiers.as_ptr(),
+            ptrs.len(),
+            ih.as_mut_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_ne!(h, 0, "add .torrent failed: {}", c_buf(&err));
+
+    let mut list: lt_tracker_list = unsafe { std::mem::zeroed() };
+    let rc = unsafe { lt_torrent_trackers(s, h, &mut list, err.as_mut_ptr(), 512) };
+    assert_eq!(rc, LT_OK as i32, "lt_torrent_trackers: {}", c_buf(&err));
+    let entries = unsafe { std::slice::from_raw_parts(list.entries, list.num_entries) };
+    let got: Vec<(String, u8)> = entries.iter().map(|e| (c_buf(&e.url), e.tier)).collect();
+    // None of the `.torrent`'s own, and the empty URL is skipped.
+    assert_eq!(
+        got,
+        vec![
+            ("http://a.override.example:9/announce".to_string(), 0),
+            ("http://b.override.example:10/announce".to_string(), 1),
+        ]
+    );
+    unsafe { lt_tracker_list_free(&mut list) };
+
+    // The guard reads the same list: the override's domain admits it, and
+    // the `.torrent`'s own (all on 127.0.0.1) no longer count.
+    let overrides = CString::new("override.example").unwrap();
+    let own = CString::new("127.0.0.1").unwrap();
+    let mut allowed = |csv: &CString, n: usize| unsafe {
+        lt_add_trackers_allowed(
+            ptr::null(),
+            bytes.as_ptr(),
+            bytes.len(),
+            ptrs.as_ptr(),
+            tiers.as_ptr(),
+            n,
+            ptr::null(),
+            0,
+            csv.as_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_eq!(allowed(&overrides, ptrs.len()), 1);
+    assert_eq!(allowed(&own, ptrs.len()), 0);
+    // None given: the `.torrent`'s own.
+    assert_eq!(allowed(&own, 0), 1);
+    assert_eq!(allowed(&overrides, 0), 0);
+    unsafe { lt_session_destroy(s) };
+}
+
+/// A source announcing to nothing is told apart from one announcing
+/// somewhere it may not.
+#[test]
+fn the_tracker_guard_reports_no_trackers_on_its_own() {
+    let uri = CString::new("magnet:?xt=urn:btih:0404040404040404040404040404040404040404").unwrap();
+    let domains = CString::new("example.com").unwrap();
+    let mut err = [0 as c_char; 512];
+    let rc = unsafe {
+        lt_add_trackers_allowed(
+            uri.as_ptr(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            domains.as_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_eq!(rc, LT_NO_TRACKERS as i32, "{}", c_buf(&err));
+}
+
 #[test]
 fn trackers_fold_a_failed_announce_into_fails_error_and_next_announce() {
     // Every tracker URL points at a closed loopback port (HTTP ones, so the
@@ -765,6 +871,9 @@ fn every_add_forces_upload_mode_and_clears_the_forbidden_flags() {
             bytes.len(),
             save.as_ptr(),
             LT_TF_PAUSED | forbidden,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
             ih.as_mut_ptr(),
             err.as_mut_ptr(),
             512,

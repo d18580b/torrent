@@ -36,6 +36,9 @@ pub enum AddParams {
         bytes: Vec<u8>,
         save_path: String,
         flags: TorrentFlags,
+        /// Announce URLs by tier that replace the `.torrent`'s own, the way a
+        /// resume file's `trackers` list does. Empty keeps the `.torrent`'s.
+        trackers: Vec<Vec<String>>,
     },
     Magnet {
         uri: String,
@@ -229,11 +232,13 @@ impl Session {
                 bytes,
                 save_path,
                 flags,
+                trackers,
             } => {
                 if bytes.is_empty() {
                     return Err(Error::InvalidInput("empty .torrent buffer"));
                 }
                 let save_c = c_string(save_path, "save_path")?;
+                let trackers = TrackerOverride::new(&trackers)?;
                 unsafe {
                     ffi::lt_add_torrent_file(
                         self.ptr,
@@ -241,6 +246,9 @@ impl Session {
                         bytes.len(),
                         save_c.as_ptr(),
                         flags.bits(),
+                        trackers.urls_ptr(),
+                        trackers.tiers.as_ptr(),
+                        trackers.len(),
                         infohash.as_mut_ptr(),
                         err.ptr(),
                         err.len() as i32,
@@ -617,38 +625,49 @@ pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
 ///
 /// `params` is read the way [`Session::add_torrent`] hands it to libtorrent,
 /// so the trackers checked are the ones the session would announce to: a
-/// `.torrent`'s announce list, a magnet's `tr=` parameters, or — for resume
-/// data — its own `trackers` list, which replaces the attached `.torrent`'s.
+/// `.torrent`'s announce list, or the `trackers` given with it in its place,
+/// a magnet's `tr=` parameters, or — for resume data — its own `trackers`
+/// list, which replaces the attached `.torrent`'s.
 ///
-/// `Ok(false)` when any tracker is outside `domains` or has no host libtorrent
-/// can read, when there is no tracker at all, and when `domains` is empty. An
-/// `Err` is a source the shim cannot parse, which the add would refuse too.
-pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<bool> {
+/// [`TrackerVerdict::NotAllowed`] when any tracker is outside `domains` or has
+/// no host libtorrent can read, and when `domains` is empty;
+/// [`TrackerVerdict::NoTrackers`] when there is no tracker at all. An `Err` is
+/// a source the shim cannot parse, which the add would refuse too.
+pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<TrackerVerdict> {
     if domains.is_empty() {
-        return Ok(false);
+        return Ok(TrackerVerdict::NotAllowed);
     }
     let csv_c = c_string(domains.join(","), "allowed_tracker_domains")?;
     let buf = |b: Option<&Vec<u8>>| match b {
         Some(b) if !b.is_empty() => (b.as_ptr(), b.len()),
         _ => (std::ptr::null(), 0),
     };
-    let (magnet, torrent, resume) = match params {
-        AddParams::File { bytes, .. } => {
+    let no_override = TrackerOverride::new(&[])?;
+    let (magnet, torrent, trackers, resume) = match params {
+        AddParams::File {
+            bytes, trackers, ..
+        } => {
             if bytes.is_empty() {
                 return Err(Error::InvalidInput("empty .torrent buffer"));
             }
-            (None, buf(Some(bytes)), buf(None))
+            (
+                None,
+                buf(Some(bytes)),
+                TrackerOverride::new(trackers)?,
+                buf(None),
+            )
         }
         AddParams::Magnet { uri, .. } => (
             Some(c_string(uri.as_str(), "magnet uri")?),
             buf(None),
+            no_override,
             buf(None),
         ),
         AddParams::Resume { bytes, torrent, .. } => {
             if bytes.is_empty() {
                 return Err(Error::InvalidInput("empty resume buffer"));
             }
-            (None, buf(torrent.as_ref()), buf(Some(bytes)))
+            (None, buf(torrent.as_ref()), no_override, buf(Some(bytes)))
         }
     };
     let mut err = ErrBuf::new();
@@ -657,6 +676,9 @@ pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<bo
             magnet.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             torrent.0,
             torrent.1,
+            trackers.urls_ptr(),
+            trackers.tiers.as_ptr(),
+            trackers.len(),
             resume.0,
             resume.1,
             csv_c.as_ptr(),
@@ -665,9 +687,62 @@ pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<bo
         )
     };
     match rc {
-        1 => Ok(true),
-        0 => Ok(false),
+        1 => Ok(TrackerVerdict::Allowed),
+        0 => Ok(TrackerVerdict::NotAllowed),
+        rc if rc == ffi::LT_NO_TRACKERS as i32 => Ok(TrackerVerdict::NoTrackers),
         _ => Err(Error::Shim(err.into_string())),
+    }
+}
+
+/// What [`add_trackers_allowed`] found.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrackerVerdict {
+    /// There is at least one tracker, and every one is allowed.
+    Allowed,
+    /// A tracker is outside the domains, or has no host libtorrent can read.
+    NotAllowed,
+    /// The add would announce to no tracker at all.
+    NoTrackers,
+}
+
+/// [`AddParams::File`]'s `trackers` in the shape the shim takes them: one
+/// C string per URL, and each URL's tier alongside it.
+struct TrackerOverride {
+    _urls: Vec<CString>,
+    ptrs: Vec<*const std::os::raw::c_char>,
+    tiers: Vec<i32>,
+}
+
+impl TrackerOverride {
+    fn new(trackers: &[Vec<String>]) -> Result<Self> {
+        let mut urls = Vec::new();
+        let mut tiers = Vec::new();
+        for (tier, tier_urls) in trackers.iter().enumerate() {
+            for url in tier_urls {
+                urls.push(c_string(url.as_str(), "tracker url")?);
+                tiers.push(i32::try_from(tier).unwrap_or(i32::MAX));
+            }
+        }
+        let ptrs = urls.iter().map(|c| c.as_ptr()).collect();
+        Ok(Self {
+            _urls: urls,
+            ptrs,
+            tiers,
+        })
+    }
+
+    /// Null when there are none, which the shim reads as "keep the
+    /// `.torrent`'s".
+    fn urls_ptr(&self) -> *const *const std::os::raw::c_char {
+        if self.ptrs.is_empty() {
+            std::ptr::null()
+        } else {
+            self.ptrs.as_ptr()
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.ptrs.len()
     }
 }
 

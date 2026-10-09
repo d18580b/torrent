@@ -1472,7 +1472,7 @@ fn boot_scan_guard(
         error.cause = %refusal,
         "boot scan: torrent refused by the profile's allowed_tracker_domains; not loaded",
     );
-    if matches!(refusal, torrentd_engine::TrackerRefusal::NotAllowed) {
+    if refusal.is_guard_refusal() {
         metrics.inc_counter(
             "profile_assignment_registry_errors_total",
             &[("profile_id", profile.id.as_str())],
@@ -1492,6 +1492,7 @@ fn torrent_dir_scan_params(
         bytes,
         save_path,
         flags: torrentd_engine::seed_flags(profile),
+        trackers: Vec::new(),
     }
 }
 

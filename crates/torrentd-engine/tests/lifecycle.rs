@@ -58,6 +58,7 @@ fn resume_round_trip_skips_reverify() {
                 bytes: torrent.clone(),
                 save_path: save.clone(),
                 flags: TorrentFlags::SEED_MODE,
+                trackers: Vec::new(),
             })
             .unwrap();
         assert!(
@@ -127,6 +128,7 @@ fn resume_without_info_dict_needs_the_torrent_file() {
                 bytes: torrent.clone(),
                 save_path: save.clone(),
                 flags: TorrentFlags::SEED_MODE,
+                trackers: Vec::new(),
             })
             .unwrap();
         assert!(support::wait_for_seeding(&s1, h, Duration::from_secs(15)));
@@ -213,6 +215,7 @@ fn a_resume_add_that_clears_flags_still_reports_status() {
                 bytes: torrent.clone(),
                 save_path: save.clone(),
                 flags: TorrentFlags::SEED_MODE,
+                trackers: Vec::new(),
             })
             .unwrap();
         assert!(support::wait_for_seeding(&s1, h, Duration::from_secs(15)));
@@ -267,6 +270,7 @@ fn full_check_verifies_and_rejects_corrupt_payload() {
                 bytes: torrent.clone(),
                 save_path: save.clone(),
                 flags: TorrentFlags::default(), // no SEED_MODE → libtorrent checks files
+                trackers: Vec::new(),
             })
             .unwrap();
         assert!(
@@ -287,6 +291,7 @@ fn full_check_verifies_and_rejects_corrupt_payload() {
                 bytes: torrent,
                 save_path: save,
                 flags: TorrentFlags::default(),
+                trackers: Vec::new(),
             })
             .unwrap();
         let status = support::settle_status(&s, h, Duration::from_secs(4));
@@ -399,6 +404,7 @@ fn alert_queue_overflow_surfaces_drop_and_keeps_draining() {
             bytes: torrent,
             save_path: save.clone(),
             flags: TorrentFlags::SEED_MODE,
+            trackers: Vec::new(),
         });
     }
 
@@ -442,6 +448,7 @@ fn upload_mode_survives_a_failed_verification() {
             bytes: torrent,
             save_path: save,
             flags: TorrentFlags::UPLOAD_MODE,
+            trackers: Vec::new(),
         })
         .unwrap();
 
@@ -489,6 +496,7 @@ fn resume_data_carrying_auto_managed_cannot_lift_upload_mode() {
                 bytes: torrent,
                 save_path: save,
                 flags: TorrentFlags::UPLOAD_MODE,
+                trackers: Vec::new(),
             })
             .unwrap();
         support::settle_status(&s1, h, Duration::from_secs(2))
@@ -611,6 +619,7 @@ fn resume_clears_the_error_a_disk_failure_left_and_keeps_upload_mode() {
             bytes: torrent,
             save_path: save,
             flags: TorrentFlags::UPLOAD_MODE,
+            trackers: Vec::new(),
         })
         .unwrap();
 
@@ -686,6 +695,7 @@ fn engine_queries_report_details_files_and_trackers() {
             bytes: torrent,
             save_path: save.clone(),
             flags: TorrentFlags::SEED_MODE,
+            trackers: Vec::new(),
         })
         .unwrap();
     engine.set_upload_limit(h, 123_456).unwrap();

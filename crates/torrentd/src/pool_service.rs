@@ -576,7 +576,7 @@ pub async fn run_verify_queue(
 /// Hold the bytes the verify worker is about to add to the account-isolation
 /// guard.
 ///
-/// A refusal is logged, and a `NotAllowed` one is counted in
+/// A refusal is logged, and a `NotAllowed` or `NoTrackers` one is counted in
 /// `profile_assignment_registry_errors_total`, where `POST /v1/torrents`, both
 /// boot scans and the adoption's enqueue count theirs. Bytes whose trackers
 /// cannot be read are a failed verify, not an isolation refusal.
@@ -597,7 +597,7 @@ fn verify_guard(
         error.cause = %refusal,
         "verify dropped: refused by the profile's allowed_tracker_domains",
     );
-    if matches!(refusal, TrackerRefusal::NotAllowed) {
+    if refusal.is_guard_refusal() {
         metrics.inc_counter(
             "profile_assignment_registry_errors_total",
             &[("profile_id", item.profile.as_str())],
@@ -733,6 +733,7 @@ fn verify_add_params(
         bytes,
         save_path,
         flags: torrentd_engine::verify_flags(profile),
+        trackers: Vec::new(),
     }
 }
 
@@ -866,8 +867,8 @@ pub struct AdoptRefusal {
     /// What the response's `refused` entry says.
     pub reason: String,
     /// Refused by the account-isolation guard because the torrent announces
-    /// outside the profile's `allowed_tracker_domains`
-    /// (`TrackerRefusal::NotAllowed`), which the caller counts in
+    /// outside the profile's `allowed_tracker_domains`, or to no tracker at
+    /// all (`TrackerRefusal::is_guard_refusal`), which the caller counts in
     /// `profile_assignment_registry_errors_total` as every add path does. A
     /// `.torrent` whose trackers cannot be read is not one.
     pub isolation: bool,
@@ -884,12 +885,18 @@ impl From<String> for AdoptRefusal {
 
 /// The refusal an adoption the account-isolation guard refused carries.
 ///
-/// Only `NotAllowed` is an isolation refusal, as on `POST /v1/torrents` and
-/// both boot scans; an unreadable `.torrent` is refused uncounted.
+/// A foreign tracker or none at all is an isolation refusal, as on
+/// `POST /v1/torrents` and both boot scans; an unreadable `.torrent` is
+/// refused uncounted. A torrent with no tracker says so in its reason rather
+/// than reading as a foreign one.
 fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
+    let reason = match e {
+        TrackerRefusal::NoTrackers => format!("refused: {e}"),
+        _ => format!("refused by the profile's allowed_tracker_domains: {e}"),
+    };
     AdoptRefusal {
-        reason: format!("refused by the profile's allowed_tracker_domains: {e}"),
-        isolation: matches!(e, TrackerRefusal::NotAllowed),
+        reason,
+        isolation: e.is_guard_refusal(),
     }
 }
 
@@ -984,7 +991,9 @@ pub fn execute_adopt(
             );
             match torrentd_engine::check_trackers(profile_cfg, &params) {
                 Ok(()) => {}
-                Err(e @ TrackerRefusal::NotAllowed) => return Err(tracker_refusal(&e)),
+                Err(e @ (TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers)) => {
+                    return Err(tracker_refusal(&e));
+                }
                 Err(TrackerRefusal::Unreadable(e)) if files_renamed => {
                     return Err(no_fallback(&format!("resume data unparseable: {e}")));
                 }

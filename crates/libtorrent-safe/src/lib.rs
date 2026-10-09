@@ -35,6 +35,7 @@ pub use session::session_stats_metric_index;
 pub use session::AddParams;
 pub use session::RawFileList;
 pub use session::Session;
+pub use session::TrackerVerdict;
 pub use settings::MoveFlags;
 pub use settings::ResumeFlags;
 pub use settings::Settings;
