@@ -208,7 +208,9 @@ directly, between 1 and 1000 at a time:
 /v1/pool/torrents?state=matched` lists candidates.
 
 The dry run goes as far as the add, the tracker check included, and changes
-nothing. Read:
+nothing. It does not claim the info-hash in the profile registry, so an
+`info-hash already loaded in profile …` refusal (§6) shows up only on the real
+run. Read:
 
 - **`fast_path`**: added in seed mode on the strength of the qBittorrent
   resume data; these seed at once.
@@ -231,21 +233,25 @@ the verify queue and logs `falling back to verification`.
 ## 6. Refusals
 
 A refusal changes nothing for that torrent; the rest of the batch goes on.
-Fix the cause and adopt it again. The `reason` in each `refused[]` entry is
-one of these:
+Fix the cause and adopt it again. The `reason` in each `refused[]` entry
+starts with one of these, unless the pool index itself could not be read, in
+which case it is that error's message:
 
 | Reason starts with | Meaning | What to do |
 | --- | --- | --- |
-| `already adopted` | The index records it adopted | It is in a session already, or left one since the last scan (a rescan demotes an adopted torrent no session holds and no profile owns). To move it to another profile, `DELETE /v1/torrents/{infohash}` without `delete_files` first, which resets the entry ([Retiring a torrent](operations.md#retiring-a-torrent)) |
+| `already adopted` | The index records it adopted | It is in a session already, or left one since the last scan (a daemon rescan, `POST /v1/pool/scan`, demotes an adopted torrent no session holds and no profile owns; the CLI `pool scan` runs without a session and keeps every `adopted` verdict). To move it to another profile, `DELETE /v1/torrents/{infohash}` without `delete_files` first, which resets the entry ([Retiring a torrent](operations.md#retiring-a-torrent)) |
 | `payload is incomplete` | `partial` | Put the missing files under a root and rescan. torrentd will not download them |
 | `no payload found under any managed root` | `missing` | Add the root it lives under, or move it under one, and rescan |
 | `another torrent claims some of the same files` | `overlap` | Remove one of the two `.torrent` files from the library, rescan |
 | `the previous client renamed these files…`, `…content layout moved these files…`, `…resume data maps a file outside…` | qBittorrent moved or renamed files in a way only its resume data describes, and that resume data cannot be used here | Rename the files back to the `.torrent`'s own paths in the old client, recopy `BT_backup`, rescan |
+| `resume data unreadable: …`, `resume data unparseable: …`, `resume add rejected: …`, each ending `…and the previous client renamed this torrent's files…` | A fast-path torrent whose resume data failed, for a torrent whose files qBittorrent renamed. A torrent without renamed files falls back to the verify queue instead (§5), but this one cannot: verifying from the `.torrent` looks for the files at paths where they are not | Recopy that torrent's `.fastresume` from `BT_backup` and rescan, or rename the files back to the `.torrent`'s own paths in the old client |
+| `cannot read the .torrent to check its trackers: …` | The profile has `allowed_tracker_domains`, and the `.torrent` in `library_dir` could not be read to check them | Fix the file's permissions (§2) or recopy it, rescan |
 | `refused by the profile's allowed_tracker_domains` | The torrent announces to a tracker outside the profile's list | Wrong profile, or the list is missing a domain. Never widen the list to fit another account's tracker |
 | `refused: the torrent announces to no tracker at all` | No tracker in the `.torrent` or the resume data | Supply a `.torrent` that carries its trackers |
 | `info-hash already loaded in profile …` | Another profile (or this one) already holds it | Adopt it into that profile, or `DELETE` it there first |
 | `the pool index assigns this torrent to profile …` | The index records another profile as its owner, even with no session holding it | Adopt into that profile, or `DELETE` it first, which clears the owner |
 | `profile … is not live`, `profile failed to start: …` | The session is not running | Fix the profile, then adopt |
+| `unknown profile_id` | The profile stopped being configured while the batch ran (an unknown id up front is a `404` for the whole request) | Check the `profile_id` against the configuration, then adopt |
 | `matched against a root that is no longer configured`, `matched but no base directory was recorded`, `torrent is not in the library` | The index is stale | Rescan |
 
 A profile that is fenced (`vpn_down`), set offline, or failed refuses the
