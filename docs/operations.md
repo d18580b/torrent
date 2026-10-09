@@ -331,8 +331,11 @@ curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8080/metrics \
   `shutdown_drain_secs`.
 - **`torrentd_last_shutdown_kill_switch_removal_failed` is 1.** The tunnels
   went down, but the nftables table stayed. A boot with
-  `network_kill_switch = true` replaces it. With the kill switch off, remove
-  it by hand as [Retiring a profile](#retiring-a-profile) describes.
+  `network_kill_switch = true` replaces it, and one with the kill switch off
+  removes it and warns `removed a stale network kill-switch table left by an
+  earlier run`. Remove it by hand, as
+  [After a crash](#after-a-crash) shows, only when that boot logged that it
+  could not remove the table or `nft` is not installed.
 - **`torrentd_profile_unloaded_registry_torrents` above 0.** The registry
   claims torrents that no boot scan loaded. See
   [After a crash](#after-a-crash).
@@ -364,10 +367,15 @@ what it has a record of:
 - An OpenVPN profile's bring-up clears the rules its `openvpn-<iface>.table`
   record names, as long as the host has not rebooted.
 - The `torrentd_ks` table is replaced when `network_kill_switch = true`. When
-  it is `false`, for instance because you turned it off to debug, nothing
-  removes it. The stale table goes on dropping every packet the daemon's uid
-  sends outside the tunnels, and trackers time out with no other sign. Check
-  for it, and remove it:
+  it is `false`, for instance because you turned it off to debug, the boot
+  removes the stale table before any session opens a socket and warns
+  `removed a stale network kill-switch table left by an earlier run`. Left in
+  place it would go on dropping every packet the daemon's uid sends outside
+  the tunnels, and trackers would time out with no other sign. The removal can
+  fail: listing the tables needs `CAP_NET_ADMIN`, and a failure is logged at
+  `info` as `could not check for, or remove, a network kill-switch table`.
+  When `nft` is not installed the boot does not look at all. In either case,
+  check for the table and remove it by hand:
 
   ```bash
   sudo nft list table inet torrentd_ks
