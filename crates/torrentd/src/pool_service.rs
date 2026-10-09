@@ -533,7 +533,16 @@ pub async fn run_verify_queue(
                 continue;
             }
             match engine.add_torrent(params) {
-                Ok(_) => {
+                Ok(handle) => {
+                    // The tunnel was up when this was admitted above, and
+                    // can have dropped since.
+                    crate::vpn_monitor::hold_if_fenced(
+                        &profiles,
+                        &item.profile,
+                        engine.as_ref(),
+                        handle,
+                        metrics.as_ref(),
+                    );
                     q.in_flight.lock().push(item.infohash.clone());
                     info!(
                         target: "torrentd::pool",
@@ -995,22 +1004,38 @@ pub fn execute_adopt(
             if dry_run {
                 return Ok("fast_path");
             }
-            if let Err(e) = engine.add_torrent(params) {
-                // Resume data another client wrote can be truncated, from an
-                // incompatible version, or simply not libtorrent's format at
-                // all. None of that is a reason to leave the payload
-                // unadopted when the .torrent is right there and verifying
-                // reaches the same place.
-                if files_renamed {
-                    return Err(no_fallback(&format!("resume add rejected: {e}")));
+            match engine.add_torrent(params) {
+                Ok(handle) => {
+                    // The caller checked the tunnel before adopting; a bulk
+                    // adopt runs long enough for it to drop since.
+                    let noop = torrentd_engine::NoopSink;
+                    let metrics: &dyn MetricsSink =
+                        pool.metrics.get().map_or(&noop, |m| m.as_ref());
+                    crate::vpn_monitor::hold_if_fenced(
+                        profiles,
+                        &profile,
+                        engine.as_ref(),
+                        handle,
+                        metrics,
+                    );
                 }
-                warn!(
-                    target: "torrentd::pool",
-                    infohash = %infohash,
-                    error.cause = %e,
-                    "resume add rejected; falling back to verification",
-                );
-                return verify(torrent_path, save_path, profile);
+                Err(e) => {
+                    // Resume data another client wrote can be truncated, from
+                    // an incompatible version, or simply not libtorrent's
+                    // format at all. None of that is a reason to leave the
+                    // payload unadopted when the .torrent is right there and
+                    // verifying reaches the same place.
+                    if files_renamed {
+                        return Err(no_fallback(&format!("resume add rejected: {e}")));
+                    }
+                    warn!(
+                        target: "torrentd::pool",
+                        infohash = %infohash,
+                        error.cause = %e,
+                        "resume add rejected; falling back to verification",
+                    );
+                    return verify(torrent_path, save_path, profile);
+                }
             }
 
             let (adoption, owner) = pool.with_store(|s| {
