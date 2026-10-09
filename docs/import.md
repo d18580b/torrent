@@ -169,18 +169,20 @@ Before trusting the counts:
 - **`overlap`.** Two torrents disagree about the same bytes. Neither adopts,
   and no plan touches those files, until one torrent leaves the library.
 
-Run a drift check **immediately before each adopt**, not just after the scan:
+Every adopt, dry run included, runs a drift check over the torrents it
+selected before it plans any of them. It re-stats each file a `matched` or
+`shared` torrent claims and marks a torrent whose files changed or vanished
+since the scan `drifted`, which the adopt then hashes instead of trusting. A
+qBittorrent torrent rewritten at the same size between the scan and the adopt
+is therefore queued for verification, not fast-pathed. To check the whole pool,
+adopted torrents included, run one yourself:
 
 ```bash
 sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool check
 ```
 
-(or `POST /v1/pool/drift-check`). It re-stats every claimed file and marks a
-torrent whose files changed or vanished since the scan `drifted`, which the
-adopt then hashes instead of trusting. The adopt does not run one itself
-(#115): a qBittorrent torrent rewritten at the same size between the scan and
-the adopt goes down the fast path and seeds unverified bytes. Do not rescan
-in its place. A rescan records the rewritten file as the new truth.
+(or `POST /v1/pool/drift-check`). Do not rescan in place of either. A rescan
+records the rewritten file as the new truth.
 
 Then see what no torrent claims:
 

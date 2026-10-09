@@ -929,7 +929,8 @@ pub struct AdoptRequest {
     /// required: a profile is an account identity, and there is no count of
     /// profiles at which the daemon may pick one for the caller.
     pub profile_id: String,
-    /// Report what would happen and change nothing.
+    /// Report what would happen and adopt nothing. The drift check every
+    /// adoption runs first still marks changed payload `drifted`.
     #[serde(default)]
     pub dry_run: bool,
     /// Which torrents to adopt.
@@ -1015,8 +1016,14 @@ from_profile_problem!(AdoptError);
 /// a second account. A torrent whose previous client left trustworthy resume
 /// data seeds at once (`fast_path`); any other is hashed by libtorrent before
 /// it seeds (`queued_for_verification`). Torrents that are not `matched` are
-/// refused, each with the reason. `dry_run` reports all of this and changes
+/// refused, each with the reason. `dry_run` reports all of this and adopts
 /// nothing.
+///
+/// Every adoption, dry run included, first runs the drift check over the
+/// selected `matched` and `shared` torrents: any whose files changed since the
+/// last scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`
+/// would mark it, and is queued for verification rather than trusted on its
+/// resume data.
 ///
 /// Not gated on `[pool] allow_mutations`: adoption records an existing file's
 /// ownership and moves nothing on disk.
@@ -1087,6 +1094,19 @@ fn adopt_each(
         .map(|ih| hex(&ih).map(|infohash| (ih, infohash)))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|detail| AdoptError::Internal { detail })?;
+
+    // The fast path trusts the previous client's "complete" only as far as
+    // the index is fresh, and the scan may be weeks old: payload rewritten in
+    // place at the same size since then would seed as complete and serve bad
+    // pieces. Stat the selection first, so anything that changed is marked
+    // `drifted` and planned through verification instead. Before any target
+    // is acted on, so a failure here is a whole-request error, not a refusal.
+    let selected: Vec<String> = targets.iter().map(|(ih, _)| ih.clone()).collect();
+    let drift = pool
+        .check_drift_before_adopt(&selected)
+        .map_err(|e| AdoptError::Internal {
+            detail: internal("the drift check before adopting", e),
+        })?;
 
     let mut resp = AdoptionResult {
         dry_run: req.dry_run,
@@ -1197,6 +1217,7 @@ fn adopt_each(
         fast_path = resp.fast_path.len(),
         queued = resp.queued_for_verification.len(),
         refused = resp.refused.len(),
+        drifted = drift.drifted.len(),
         "adopt",
     );
     Ok(resp)

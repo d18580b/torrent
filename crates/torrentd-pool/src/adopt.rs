@@ -10,7 +10,8 @@
 //! * **Fast path** — the previous client left a `.fastresume` saying the
 //!   torrent was complete, and every file is still in the index at the size the
 //!   torrent declares. Payload rewritten in place at the same size is caught
-//!   separately by the drift pass, which marks the torrent `Drifted` and so
+//!   separately by the drift pass an adopt runs over its selection first,
+//!   which marks the torrent `Drifted` and so
 //!   refuses it here. Given both, its piece state is as good as a verification
 //!   we would have performed ourselves, so the torrent is added in seed mode
 //!   and seeds immediately.
@@ -229,7 +230,10 @@ fn relayout_of(torrent: &crate::model::PoolTorrent) -> Option<crate::fastresume:
 /// rewritten in place at the same size is caught by [`crate::drift`], which
 /// stats the live filesystem and marks the torrent `Drifted` — and `Drifted` is
 /// refused above. The guarantee is therefore only as fresh as the last drift
-/// pass, which is why one runs before a bulk adopt.
+/// pass, which is why `POST /v1/pool/adoptions` runs
+/// [`crate::drift::detect_before_adopt`] over its selection before planning
+/// any of it. A caller of this planner that skips that pass trusts whatever
+/// the last scan or drift check saw.
 fn fastresume_is_trustworthy(store: &PoolStore, infohash: &str) -> Result<bool, PoolError> {
     let Some(torrent) = store.torrent(infohash)? else {
         return Ok(false);

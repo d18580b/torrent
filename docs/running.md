@@ -1355,8 +1355,21 @@ curl -sX POST localhost:8080/v1/pool/adoptions \
 `profile_id` is required: adoption hands every matched torrent to one
 profile's session, and the daemon will not pick one for you. The selector may
 instead name torrents directly, as
-`{"kind":"infohashes","infohashes":["…"]}`. Set `dry_run` to `false` to adopt
-for real:
+`{"kind":"infohashes","infohashes":["…"]}`.
+
+Every adopt, dry run included, first runs the drift check over the torrents it
+selected: it stats each file a `matched` or `shared` torrent claims and marks
+the torrent `drifted` if any changed or vanished since the scan. The fast path
+seeds on the previous client's word that the payload is complete, and the index
+only rules out files that changed size; a file re-encoded or corrupted at the
+same size since the scan would otherwise seed as complete and serve bad pieces.
+A drifted torrent is queued for verification instead, so a dry run that moves
+torrents from `fast_path` to `queued_for_verification` compared with an earlier
+one is reporting payload that changed underneath it. You do not need to run
+`pool check` first for this; it remains the way to check the whole pool,
+adopted torrents included.
+
+Set `dry_run` to `false` to adopt for real:
 
 ```bash
 curl -sX POST localhost:8080/v1/pool/adoptions \
