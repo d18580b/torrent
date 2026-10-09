@@ -2,14 +2,21 @@
 //!
 //! Multi-profile isolation's primary guard is that every profile's libtorrent sockets
 //! are source-bound to the tunnel IP (`startup.rs`), and [`crate::vpn_monitor`]
-//! pauses a profile within ~30s of tunnel loss. Both live at the application layer:
+//! pauses a profile on its next 30s poll after its tunnel's address goes, or
+//! once its WireGuard handshake is older than `vpn_handshake_max_age_secs`
+//! (default 180s) — up to that age plus a poll after the tunnel stops
+//! carrying. Both live at the application layer:
 //! the "no bare-IP leak" guarantee ultimately rests on libtorrent honouring the
 //! bind and on the poll reacting in time.
 //!
 //! This module adds an independent, **fail-closed** nftables ruleset so the
 //! daemon's own egress can only leave via loopback or a configured tunnel
 //! interface. If a tunnel disappears its `oifname` is gone and the packets are
-//! dropped by the kernel — no dependency on the source-bind or the 30s poll.
+//! dropped by the kernel — no dependency on the source-bind or the monitor's
+//! poll, for as long as the ruleset stands. A ruleset flushed or replaced by
+//! another tool is caught by `watch` on its next 30s check, which fences
+//! every vpn profile until the table is intact again; until that check runs,
+//! the source-bind is the only guard.
 //!
 //! **Each profile is held to its own tunnel.** A tunnel is accepted only for
 //! the address its profile's sessions are bound to: one rule per profile,
@@ -36,8 +43,10 @@
 //! daemon looks up is therefore visible to the host's upstream resolver unless the resolver itself is
 //! pointed through a tunnel; see `docs/running.md`, "Kill switch".
 //!
-//! Opt-in (`network_kill_switch = true`); needs `CAP_NET_ADMIN` (the packaged
-//! systemd unit already grants it). The daemon's traffic is matched by its
+//! Opt-in (`network_kill_switch = true`); needs `CAP_NET_ADMIN`, which the
+//! packaged systemd unit does not grant as shipped: uncomment its
+//! `AmbientCapabilities=` and `CapabilityBoundingSet=` lines for
+//! `CAP_NET_ADMIN`. The daemon's traffic is matched by its
 //! runtime uid, so torrentd must run as a dedicated user (the unit uses
 //! `User=torrentd`).
 //!
