@@ -639,6 +639,22 @@ tests:
             exp_annotations:
               summary: "A write to the pool_index failed; it no longer matches what the daemon did"
 
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_dir_fsync_errors_total'
+        values: '0 0 1 1'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: TorrentdDirFsyncFailed
+        exp_alerts: []
+      - eval_time: 3m
+        alertname: TorrentdDirFsyncFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "A state directory could not be fsynced; renames into it may not survive a power loss (see the log)"
+
   # ---- control plane ----------------------------------------------------
   - interval: 1m
     input_series:
