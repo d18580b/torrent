@@ -390,6 +390,11 @@ async fn run_with(
             // online and its tunnel passes `recovery_check` — no
             // auto-recovery.
             if health.status == ProfileStatus::VpnDown {
+                // A fence that is lifted later starts the no-handshake clock
+                // afresh, rather than from a poll before the fence: that
+                // would read as the whole fenced span without a handshake and
+                // fence the profile again on the first poll after it.
+                unanswered_since.remove(&profile_id);
                 continue;
             }
 
@@ -1065,6 +1070,66 @@ mod tests {
         assert!(
             !exported.contains("profile_id=\"public\""),
             "got:\n{exported}",
+        );
+    }
+
+    fn answering(
+        ip: Option<IpAddr>,
+        route: Option<RouteProbe>,
+        handshake: Option<Duration>,
+    ) -> Prober {
+        Arc::new(move |_, _| TunnelProbes {
+            ip,
+            route: route.clone().map(Ok),
+            handshake: Some(Ok(handshake)),
+        })
+    }
+
+    /// Lifting a fence asks for the address the session is bound to and a
+    /// route through the tunnel, and nothing about the handshake, which a
+    /// fenced profile has had no traffic to refresh.
+    #[test]
+    fn the_recovery_check_wants_the_bound_address_routed_by_the_tunnel() {
+        // `test_vpn_entry` binds its session to 10.2.0.2.
+        let entry = crate::profile_registry::test_vpn_entry("acct_a", ProfileStatus::VpnDown);
+        let stale = Some(Duration::from_secs(86_400));
+        assert_eq!(
+            recovery_check(
+                &entry,
+                &answering(ip(2), Some(RouteProbe::ViaTunnel), stale)
+            ),
+            Ok(()),
+            "a stale handshake does not hold the fence",
+        );
+        assert_eq!(
+            recovery_check(&entry, &answering(ip(2), Some(RouteProbe::ViaTunnel), None)),
+            Ok(()),
+            "nor does a handshake that never happened",
+        );
+        assert_eq!(
+            recovery_check(
+                &entry,
+                &answering(ip(9), Some(RouteProbe::ViaTunnel), stale)
+            ),
+            Err(DownReason::IpLostOrChanged),
+            "the session cannot follow a new address",
+        );
+        assert_eq!(
+            recovery_check(&entry, &answering(None, None, stale)),
+            Err(DownReason::IpLostOrChanged),
+        );
+        assert_eq!(
+            recovery_check(
+                &entry,
+                &answering(ip(2), Some(RouteProbe::Elsewhere("eth0".into())), stale),
+            ),
+            Err(DownReason::RouteMismatch),
+        );
+        let host = crate::profile_registry::test_host_entry("public");
+        assert_eq!(
+            recovery_check(&host, &answering(None, None, None)),
+            Ok(()),
+            "a host profile has no tunnel to check",
         );
     }
 }
