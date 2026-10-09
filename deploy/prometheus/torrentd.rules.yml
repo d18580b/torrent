@@ -317,6 +317,13 @@ groups:
         annotations:
           summary: "A write to the {{ $labels.store }} failed; it no longer matches what the daemon did"
 
+      - alert: TorrentdDirFsyncFailed
+        expr: increase(torrentd_dir_fsync_errors_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A state directory could not be fsynced; renames into it may not survive a power loss (see the log)"
+
       # ---- control plane -----------------------------------------------
       - alert: TorrentdLoginThrottled
         expr: increase(torrentd_auth_login_failures_total{reason=~"throttled|verification_budget"}[15m]) > 0
