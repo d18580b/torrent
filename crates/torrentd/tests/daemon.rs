@@ -1443,6 +1443,21 @@ fn session_name(addr: &str, ih: &str, within: Duration) -> Option<String> {
     }
 }
 
+/// Poll `path` until it can be read, returning its bytes, or `None` once
+/// `within` has passed.
+fn read_within(path: &std::path::Path, within: Duration) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Ok(bytes) = std::fs::read(path) {
+            return Some(bytes);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Issue #108's acceptance: a torrent the pool adopts keeps its metadata
 /// across a restart.
 ///
@@ -1532,8 +1547,10 @@ fn an_adopted_torrent_keeps_its_metadata_across_a_restart() {
         Some("a"),
         "the adopted torrent never loaded",
     );
+    // The verify queue writes the `.torrent` once the session holds the
+    // torrent, so the session can report it a moment before the write lands.
     assert_eq!(
-        std::fs::read(&stored).ok().as_deref(),
+        read_within(&stored, Duration::from_secs(10)).as_deref(),
         Some(torrent.as_slice()),
         "the adoption did not write its .torrent to the torrent store",
     );
