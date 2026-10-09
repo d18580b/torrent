@@ -1172,7 +1172,7 @@ pub async fn delete_torrent(
                     .map_err(|e| DeleteTorrentError::Internal {
                         detail: internal("removing the torrent from its session", e),
                     })?;
-                clear_assignment(&settler, &ih, &profile)
+                clear_assignment(&settler, &ih, &profile, delete_files)
             })
             .await?;
         }
@@ -1184,7 +1184,8 @@ pub async fn delete_torrent(
                 "no session holds an info-hash the registry still assigns; the startup \
                  scans did not load it, so clearing the assignment alone",
             );
-            clear_assignment(&s, &ih, &profile)?;
+            // No session held it, so `delete_files` reached no payload.
+            clear_assignment(&s, &ih, &profile, false)?;
         }
         None => return Err(DeleteTorrentError::TorrentAdding),
     }
@@ -1192,10 +1193,12 @@ pub async fn delete_torrent(
 }
 
 /// Clear `ih`'s assignment to `profile` once no session holds it.
+/// `payload_deleted` says its session deleted its files as it removed it.
 fn clear_assignment(
     s: &AppState,
     ih: &InfoHash,
     profile: &ProfileId,
+    payload_deleted: bool,
 ) -> Result<(), DeleteTorrentError> {
     // Report a persist failure rather than discarding it. On a full or
     // read-only state directory the payload is gone and the assignment write
@@ -1216,31 +1219,30 @@ fn clear_assignment(
     // Cleared, so a later add of the same info-hash is this process's own
     // and must not be mistaken for one the boot left unloaded.
     s.unloaded_at_boot.lock().remove(ih);
-    release_index_owner(s, ih, profile);
+    release_index_owner(s, ih, profile, payload_deleted);
     Ok(())
 }
 
 /// Forget the pool index's record that `profile` owns `ih`, once the torrent
 /// is gone from it.
 ///
-/// Adoption refuses a torrent the index says another profile owns, so a record
-/// left behind after a delete would refuse every later adoption of it into
-/// any other profile, with nothing but the database to clear it from. Only a
-/// record naming `profile` is cleared; one naming anything else was never this
-/// delete's. A failed write is logged and counted by the pool, and leaves
-/// adoption refusing rather than allowing.
-fn release_index_owner(s: &AppState, ih: &InfoHash, profile: &ProfileId) {
+/// Adoption refuses a torrent the index says another profile owns, and one
+/// it records as `adopted`, so either left behind after a delete would refuse
+/// every later adoption of it into any other profile, with nothing but the
+/// database to clear it from. Only a record naming `profile` is cleared, and
+/// its `adopted` verdict with it (`missing` where `payload_deleted`, as the
+/// files are gone); one naming anything else was never this delete's. A
+/// failed write is logged and counted by the pool, and leaves adoption
+/// refusing rather than allowing.
+fn release_index_owner(s: &AppState, ih: &InfoHash, profile: &ProfileId, payload_deleted: bool) {
     let Some(pool) = s.pool.as_ref() else {
         return;
     };
     let hex = ih.to_hex();
-    let cleared = pool.with_store(|st| match st.profile_of(&hex) {
-        Ok(Some(owner)) if owner == profile.as_str() => st.set_profile(&hex, None),
-        Ok(_) => Ok(()),
-        Err(e) => Err(e),
-    });
-    if let Err(e) = cleared {
-        pool.note_store_error("set_profile", &e);
+    let released =
+        pool.with_store_mut(|st| st.release_owner(&hex, profile.as_str(), payload_deleted));
+    if let Err(e) = released {
+        pool.note_store_error("release_owner", &e);
     }
 }
 
@@ -1321,7 +1323,7 @@ fn clear_sessionless(
          and .torrent files so the startup scan does not re-assign it",
     );
     s.unloaded_at_boot.lock().remove(ih);
-    release_index_owner(s, ih, profile);
+    release_index_owner(s, ih, profile, false);
     Ok(NoContent)
 }
 

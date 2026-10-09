@@ -241,18 +241,24 @@ impl PoolService {
                 summary.errors += s.errors;
                 count(&s);
             }
-            let loaded: std::collections::HashSet<String> = self
+            let serving: Option<std::collections::HashSet<String>> = self
                 .loaded
                 .get()
-                .map(|s| s.infohashes().iter().map(|ih| ih.to_hex()).collect())
-                .unwrap_or_default();
-            let lib = torrentd_pool::scan_library(store, &self.library_dir, &loaded)
+                .map(|s| s.infohashes().iter().map(|ih| ih.to_hex()).collect());
+            let none = std::collections::HashSet::new();
+            let loaded = serving.as_ref().unwrap_or(&none);
+            let lib = torrentd_pool::scan_library(store, &self.library_dir, loaded)
                 .with_context(|| format!("scan library {}", self.library_dir.display()))?;
             summary.torrents = lib.torrents_indexed;
             summary.errors += lib.errors;
             count(&lib);
 
-            let m = torrentd_pool::match_all(store)?;
+            // Only where the sessions' view is known may an `adopted` verdict
+            // nothing holds be demoted; without one, every verdict stands.
+            let m = match &serving {
+                Some(loaded) => torrentd_pool::match_all_serving(store, loaded)?,
+                None => torrentd_pool::match_all(store)?,
+            };
             summary.matched = m.matched;
             summary.partial = m.partial;
             summary.missing = m.missing;

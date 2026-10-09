@@ -72,10 +72,30 @@ pub fn match_all(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
     // last `replace_claims` the claim table does not describe the pool, and a
     // claim table that does not describe the pool is a delete plan that
     // enumerates every file in every root as an orphan.
-    store.in_transaction(match_all_inner)
+    //
+    // No session's view is available, so every `adopted` verdict stands.
+    store.in_transaction(|store| match_all_inner(store, None))
 }
 
-fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
+/// [`match_all`], where the caller knows what the sessions serve.
+///
+/// `loaded` is the hex info-hashes every session holds. An `adopted` torrent
+/// in none of them, and with no owner recorded in the index, is held by
+/// nothing: it is demoted to the verdict its payload earns, so it can be
+/// adopted again. One the index still records an owner for keeps `adopted`:
+/// that profile may be offline, or its session may not have reported the
+/// torrent yet, and the owner record refuses other profiles either way.
+pub fn match_all_serving(
+    store: &mut PoolStore,
+    loaded: &HashSet<String>,
+) -> Result<MatchStats, PoolError> {
+    store.in_transaction(|store| match_all_inner(store, Some(loaded)))
+}
+
+fn match_all_inner(
+    store: &mut PoolStore,
+    loaded: Option<&HashSet<String>>,
+) -> Result<MatchStats, PoolError> {
     let roots = store.roots()?;
     let torrents = store.torrents()?;
     let mut stats = MatchStats::default();
@@ -120,10 +140,12 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
             Some(p) if p.is_complete() => {
                 // Preserve an existing `adopted` verdict: matching runs on
                 // every rescan and must not demote a torrent the daemon is
-                // already seeding back to `matched`.
+                // already seeding back to `matched`. One nothing holds any
+                // more is demoted, or adoption would refuse it for good.
+                let held = loaded.is_none_or(|l| l.contains(&t.infohash) || t.profile.is_some());
                 let state = if drift_at.is_some() {
                     AdoptionState::Drifted
-                } else if prior == Some(AdoptionState::Adopted) {
+                } else if prior == Some(AdoptionState::Adopted) && held {
                     AdoptionState::Adopted
                 } else {
                     AdoptionState::Matched
@@ -197,43 +219,9 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
     // marker rides along either way.
     for ih in store.overlapping_torrents()? {
         let current = store.adoption_state(&ih)?;
-        if current == Some(AdoptionState::Adopted) {
+        let Some(shared) = reclassify_overlap(store, &ih, current)? else {
             continue;
-        }
-        let mine = store.claims_of(&ih)?;
-        let mut same_set = true;
-        for other in store.co_claimants(&ih)? {
-            if store.claims_of(&other)? != mine {
-                same_set = false;
-                break;
-            }
-        }
-        if current == Some(AdoptionState::Drifted) && same_set {
-            continue;
-        }
-        let shared = same_set && current == Some(AdoptionState::Matched);
-        let (state, note) = if shared {
-            (
-                AdoptionState::Shared,
-                "another torrent claims exactly these files",
-            )
-        } else {
-            (
-                AdoptionState::Overlap,
-                "another torrent claims some of the same file(s), but not the same set",
-            )
         };
-        let base = store.adoption_base(&ih)?;
-        let drift_at = store.drift_at(&ih)?;
-        store.set_adoption(
-            &ih,
-            state,
-            base.as_ref().map(|(r, _)| *r),
-            base.as_ref().map(|(_, b)| b.as_str()),
-            None,
-            drift_at,
-            Some(note),
-        )?;
         // Counted as matched or partial above; move it.
         match current {
             Some(AdoptionState::Partial) => stats.partial = stats.partial.saturating_sub(1),
@@ -263,6 +251,104 @@ fn match_all_inner(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
         "library matched against the file index",
     );
     Ok(stats)
+}
+
+/// Relabel `ih`, which claims files another torrent claims too, as `shared` or
+/// `overlap`, and say which: `Some(true)` for shared. `None` where its label
+/// stands: `adopted`, or `drifted` over a clean share.
+fn reclassify_overlap(
+    store: &PoolStore,
+    ih: &str,
+    current: Option<AdoptionState>,
+) -> Result<Option<bool>, PoolError> {
+    if current == Some(AdoptionState::Adopted) {
+        return Ok(None);
+    }
+    let mine = store.claims_of(ih)?;
+    let mut same_set = true;
+    for other in store.co_claimants(ih)? {
+        if store.claims_of(&other)? != mine {
+            same_set = false;
+            break;
+        }
+    }
+    if current == Some(AdoptionState::Drifted) && same_set {
+        return Ok(None);
+    }
+    let shared = same_set && current == Some(AdoptionState::Matched);
+    let (state, note) = if shared {
+        (
+            AdoptionState::Shared,
+            "another torrent claims exactly these files",
+        )
+    } else {
+        (
+            AdoptionState::Overlap,
+            "another torrent claims some of the same file(s), but not the same set",
+        )
+    };
+    let base = store.adoption_base(ih)?;
+    let drift_at = store.drift_at(ih)?;
+    store.set_adoption(
+        ih,
+        state,
+        base.as_ref().map(|(r, _)| *r),
+        base.as_ref().map(|(_, b)| b.as_str()),
+        None,
+        drift_at,
+        Some(note),
+    )?;
+    Ok(Some(shared))
+}
+
+/// What an `adopted` torrent no session holds any more reads as.
+///
+/// The verdict the matcher would give it, from what the index already
+/// records rather than a rescan: `matched` over its recorded base, `drifted`
+/// where drift is still on it, then `shared` or `overlap` where another
+/// torrent claims its files. `payload_deleted` says its files went with it,
+/// which leaves nothing to adopt until a rescan finds them again: `missing`.
+/// Any other state is left alone, since only `adopted` outlives the session
+/// that held it.
+pub(crate) fn settle_released(
+    store: &PoolStore,
+    ih: &str,
+    payload_deleted: bool,
+) -> Result<(), PoolError> {
+    if store.adoption_state(ih)? != Some(AdoptionState::Adopted) {
+        return Ok(());
+    }
+    if payload_deleted {
+        return store.set_adoption(
+            ih,
+            AdoptionState::Missing,
+            None,
+            None,
+            None,
+            None,
+            Some("payload deleted with the torrent; rescan to match it again"),
+        );
+    }
+    let base = store.adoption_base(ih)?;
+    let drift_at = store.drift_at(ih)?;
+    let state = if drift_at.is_some() {
+        AdoptionState::Drifted
+    } else {
+        AdoptionState::Matched
+    };
+    store.set_adoption(
+        ih,
+        state,
+        base.as_ref().map(|(r, _)| *r),
+        base.as_ref().map(|(_, b)| b.as_str()),
+        None,
+        drift_at,
+        drift_at.map(|_| DRIFT_NOTE),
+    )?;
+    if store.shares_claims(ih)? {
+        reclassify_overlap(store, ih, Some(state))?;
+    }
+    Ok(())
 }
 
 /// Try every candidate base across every root, keeping the one that resolves

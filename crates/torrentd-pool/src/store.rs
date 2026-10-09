@@ -1122,6 +1122,29 @@ impl PoolStore {
         Ok(())
     }
 
+    /// Forget that `profile` owns `infohash`, now that no session holds it.
+    ///
+    /// Only a record naming `profile` is cleared. With it, an `adopted`
+    /// verdict goes too: nothing serves the torrent, and adoption refuses
+    /// `adopted` outright, so left behind it would refuse every later
+    /// adoption, into any profile. `payload_deleted` says its files were
+    /// deleted with it. Returns whether the record named `profile`.
+    pub fn release_owner(
+        &mut self,
+        infohash: &str,
+        profile: &str,
+        payload_deleted: bool,
+    ) -> Result<bool, PoolError> {
+        self.in_transaction(|st| {
+            if st.profile_of(infohash)?.as_deref() != Some(profile) {
+                return Ok(false);
+            }
+            st.set_profile(infohash, None)?;
+            crate::matcher::settle_released(st, infohash, payload_deleted)?;
+            Ok(true)
+        })
+    }
+
     /// Fold a legacy `profile_assignments.json` in. Existing assignments win, so
     /// re-running is safe and the JSON can stay on disk as a backup.
     pub fn import_legacy_registry(
