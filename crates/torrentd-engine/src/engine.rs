@@ -89,6 +89,17 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     ) -> Result<(), EngineError>;
     fn apply_settings(&self, settings: &Settings) -> Result<(), EngineError>;
     fn session_state(&self) -> Result<Vec<u8>, EngineError>;
+    /// Take the whole session offline: no announce, peer, or incoming
+    /// connection for any torrent it holds or is given while paused. Each
+    /// torrent's own paused flag is untouched, and resuming one torrent while
+    /// the session is paused leaves it paused. Ordered with every other
+    /// call, so a pause before an add covers the add. Idempotent.
+    fn pause_session(&self) -> Result<(), EngineError>;
+    /// Undo [`TorrentEngine::pause_session`]: each torrent goes back to what
+    /// its own paused flag says. Idempotent.
+    fn resume_session(&self) -> Result<(), EngineError>;
+    /// Whether the session is paused.
+    fn session_paused(&self) -> Result<bool, EngineError>;
     /// Name, size, save path, upload limit and added time of one torrent.
     /// Synchronous query; an unknown handle is `Safe(TorrentNotFound)`.
     fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError>;
@@ -160,6 +171,15 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn session_state(&self) -> Result<Vec<u8>, EngineError> {
         (**self).session_state()
+    }
+    fn pause_session(&self) -> Result<(), EngineError> {
+        (**self).pause_session()
+    }
+    fn resume_session(&self) -> Result<(), EngineError> {
+        (**self).resume_session()
+    }
+    fn session_paused(&self) -> Result<bool, EngineError> {
+        (**self).session_paused()
     }
     fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError> {
         (**self).torrent_details(h)

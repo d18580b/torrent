@@ -91,6 +91,8 @@ pub enum RecordedCall {
     /// Boxed: `Settings` is several times larger than every other variant.
     ApplySettings(Box<Settings>),
     SessionState,
+    PauseSession,
+    ResumeSession,
     TorrentDetails(TorrentHandle),
     TorrentFiles(TorrentHandle),
     TorrentTrackers(TorrentHandle),
@@ -254,6 +256,8 @@ pub struct MockEngine {
     files: DashMap<InfoHash, Option<Vec<TorrentFile>>>,
     /// infohash → what `torrent_trackers` returns. Unset: empty.
     trackers: DashMap<InfoHash, Vec<TrackerEntry>>,
+    /// Whether `pause_session` is in force.
+    session_paused: AtomicBool,
 }
 
 impl Default for MockEngine {
@@ -281,6 +285,7 @@ impl MockEngine {
             details: DashMap::new(),
             files: DashMap::new(),
             trackers: DashMap::new(),
+            session_paused: AtomicBool::new(false),
         }
     }
 
@@ -622,6 +627,25 @@ impl TorrentEngine for MockEngine {
         self.record(RecordedCall::SessionState);
         self.check_error("session_state")?;
         Ok(Vec::new())
+    }
+
+    fn pause_session(&self) -> Result<(), EngineError> {
+        self.record(RecordedCall::PauseSession);
+        self.check_error("pause_session")?;
+        self.session_paused.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn resume_session(&self) -> Result<(), EngineError> {
+        self.record(RecordedCall::ResumeSession);
+        self.check_error("resume_session")?;
+        self.session_paused.store(false, Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn session_paused(&self) -> Result<bool, EngineError> {
+        self.check_error("session_paused")?;
+        Ok(self.session_paused.load(Ordering::SeqCst))
     }
 
     fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError> {

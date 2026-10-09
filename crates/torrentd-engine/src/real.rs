@@ -170,6 +170,20 @@ impl TorrentEngine for RealEngine {
         Ok(self.session()?.save_state()?)
     }
 
+    #[instrument(skip_all, fields(op = "pause_session"))]
+    fn pause_session(&self) -> Result<(), EngineError> {
+        Ok(self.session()?.pause()?)
+    }
+
+    #[instrument(skip_all, fields(op = "resume_session"))]
+    fn resume_session(&self) -> Result<(), EngineError> {
+        Ok(self.session()?.resume()?)
+    }
+
+    fn session_paused(&self) -> Result<bool, EngineError> {
+        Ok(self.session()?.is_paused()?)
+    }
+
     #[instrument(skip_all, fields(op = "torrent_details", infohash = %h.infohash))]
     fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError> {
         Ok(self.session()?.torrent_details(h)?)
