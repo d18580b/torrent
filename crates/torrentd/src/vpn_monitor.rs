@@ -545,6 +545,12 @@ async fn run_with(
                     }
                 }
             }
+            // Set before the status flips: the boot scans' fence
+            // (`startup::ScanFence`) acts only once it sees `VpnDown`, adds
+            // what it paused to `paused_for_vpn`, and sets this gauge from the
+            // sum. Set after the flip, this count would overwrite that sum,
+            // and the monitor never revisits a `VpnDown` profile to correct it.
+            metrics.set_gauge("profile_torrents_paused_vpn_down", paused as f64, &labels);
             e.update_health(|hh| {
                 hh.status = ProfileStatus::VpnDown;
                 hh.tunnel_ip = current;
@@ -569,7 +575,6 @@ async fn run_with(
                     ("reason", reason.as_str()),
                 ],
             );
-            metrics.set_gauge("profile_torrents_paused_vpn_down", paused as f64, &labels);
             error!(
                 target: "torrentd::vpn_monitor",
                 profile_id = %profile_id,
