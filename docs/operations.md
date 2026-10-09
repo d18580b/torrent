@@ -119,9 +119,19 @@ guards (#112):
   the co-claimant check has nothing to look at.
 
 It is refused for a torrent with no running session (`profile-unavailable`),
-because only the session can reach the payload. Prefer a plain `DELETE`
-followed by a `delete_orphans` plan, which keeps the files recoverable, until
-#112 is fixed.
+because only the session can reach the payload.
+
+Until #111 and #112 are fixed, choose by where the payload lies:
+
+- **A torrent that was never adopted, under a managed root.** Use a plain
+  `DELETE`. Then remove its `.torrent` from `library_dir` if it is there, rescan, and plan
+  `delete_orphans` over its directory. The files go to the trash and stay
+  recoverable.
+- **An adopted torrent.** Its payload stays claimed after the `DELETE`, so no
+  plan will trash it. Either accept `delete_files=true` and its missing guards,
+  or `DELETE` without it and move the payload out of the root by hand.
+- **Outside every managed root.** No plan reaches it. The choice is
+  `delete_files=true` or removing the files by hand.
 
 ### Archiving payload
 
