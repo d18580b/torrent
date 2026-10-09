@@ -15,15 +15,19 @@
 //! reports the verdict this monitor would reach on the same observations.
 
 use std::net::IpAddr;
+use std::sync::atomic;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
 use tokio::sync::broadcast;
 use torrentd_engine::MetricsSink;
+use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
 use torrentd_engine::ShutdownReason;
 use torrentd_engine::StateMap;
+use torrentd_engine::TorrentEngine;
+use torrentd_engine::TorrentHandle;
 use torrentd_engine::TorrentPhase;
 use torrentd_engine::VpnType;
 use tracing::error;
@@ -31,6 +35,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::metrics_sink::PromSink;
+use crate::profile_registry::ProfileEntry;
 use crate::profile_registry::ProfileRegistry;
 use crate::vpn;
 
@@ -339,6 +344,114 @@ pub(crate) fn recovery_check(
     evaluate(&observation, Duration::MAX)
 }
 
+/// Fence `entry`: mark it `vpn_down`, then pause every torrent the state map
+/// holds in it. Returns how many it paused.
+///
+/// The mark goes first. A torrent the session holds but the state map does not
+/// yet (its `add_torrent_alert` is still queued) is not in the walk below; the
+/// alert loop's add handler pauses it on insert once it reads the profile as
+/// fenced, and adds re-check after `add_torrent` ([`hold_if_fenced`]). Marking
+/// after the walk left a window in which neither side paused it. The
+/// `SeqCst` fence pairs with the one in the add handler between its insert and
+/// its read of the mark, so at least one side sees the other.
+fn fence(
+    entry: &ProfileEntry,
+    state: &StateMap,
+    current: Option<IpAddr>,
+    metrics: &dyn MetricsSink,
+) -> u64 {
+    let profile_id = entry.id();
+    entry.update_health(|h| {
+        h.status = ProfileStatus::VpnDown;
+        h.tunnel_ip = current;
+        h.paused_for_vpn = 0;
+    });
+    atomic::fence(atomic::Ordering::SeqCst);
+    let labels = [("profile_id", profile_id.as_str())];
+    let mut paused = 0u64;
+    for h in state.handles_for_profile(profile_id) {
+        match entry.engine.pause_torrent(h) {
+            Ok(()) => paused += 1,
+            // A torrent the fence did not pause keeps seeding from a
+            // profile whose tunnel is down — the one thing fencing is
+            // for. The failure was discarded, so nothing said so.
+            Err(err) => {
+                error!(
+                    target: "torrentd::vpn_monitor",
+                    profile_id = %profile_id,
+                    infohash = %h.infohash,
+                    error.cause = %err,
+                    "could not pause a torrent while fencing the profile",
+                );
+                metrics.inc_counter("profile_fence_pause_errors_total", &labels);
+            }
+        }
+    }
+    // Added, not assigned: the boot scans' fence (`startup::ScanFence`) acts
+    // as soon as it sees the mark above, which may be before this walk ends,
+    // and adds what it paused to the same count. Both writers set the gauge
+    // from the sum under the health lock, so the last write is the full sum.
+    entry.update_health(|h| {
+        h.paused_for_vpn += paused;
+        metrics.set_gauge(
+            "profile_torrents_paused_vpn_down",
+            h.paused_for_vpn as f64,
+            &labels,
+        );
+    });
+    paused
+}
+
+/// Pause `handle`, which the caller has just added to `profile_id`'s session,
+/// if the VPN monitor fenced the profile since the caller last checked.
+///
+/// Every add path refuses or holds a fenced profile before it adds, but the
+/// add itself comes later, and a fence can land in between. The add handler
+/// pauses the torrent when its alert lands; this covers the torrent whose
+/// alert never does (dropped on an alert-queue overflow), which no fence walk
+/// of the state map will find. Pausing twice is harmless.
+///
+/// What this pauses is not added to `paused_for_vpn` or its gauge, and neither
+/// is what the add handler pauses: the two (and the fence's walk) can pause the
+/// same torrent, so the count stays what the fence itself paused.
+pub(crate) fn hold_if_fenced(
+    profiles: &ProfileRegistry,
+    profile_id: &ProfileId,
+    engine: &dyn TorrentEngine,
+    handle: TorrentHandle,
+    metrics: &dyn MetricsSink,
+) {
+    atomic::fence(atomic::Ordering::SeqCst);
+    let fenced = profiles
+        .resolve(profile_id)
+        .active()
+        .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
+    if !fenced {
+        return;
+    }
+    match engine.pause_torrent(handle) {
+        Ok(()) => warn!(
+            target: "torrentd::vpn_monitor",
+            profile_id = %profile_id,
+            infohash = %handle.infohash,
+            "profile was fenced while the torrent was being added; paused it",
+        ),
+        Err(err) => {
+            error!(
+                target: "torrentd::vpn_monitor",
+                profile_id = %profile_id,
+                infohash = %handle.infohash,
+                error.cause = %err,
+                "could not pause a torrent added while its profile was being fenced",
+            );
+            metrics.inc_counter(
+                "profile_fence_pause_errors_total",
+                &[("profile_id", profile_id.as_str())],
+            );
+        }
+    }
+}
+
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -526,36 +639,7 @@ async fn run_with(
             };
 
             // Tunnel down, IP changed, or handshake stale → pause the profile.
-            let mut paused = 0u64;
-            for h in state.handles_for_profile(&profile_id) {
-                match e.engine.pause_torrent(h) {
-                    Ok(()) => paused += 1,
-                    // A torrent the fence did not pause keeps seeding from a
-                    // profile whose tunnel is down — the one thing fencing is
-                    // for. The failure was discarded, so nothing said so.
-                    Err(err) => {
-                        error!(
-                            target: "torrentd::vpn_monitor",
-                            profile_id = %profile_id,
-                            infohash = %h.infohash,
-                            error.cause = %err,
-                            "could not pause a torrent while fencing the profile",
-                        );
-                        metrics.inc_counter("profile_fence_pause_errors_total", &labels);
-                    }
-                }
-            }
-            // Set before the status flips: the boot scans' fence
-            // (`startup::ScanFence`) acts only once it sees `VpnDown`, adds
-            // what it paused to `paused_for_vpn`, and sets this gauge from the
-            // sum. Set after the flip, this count would overwrite that sum,
-            // and the monitor never revisits a `VpnDown` profile to correct it.
-            metrics.set_gauge("profile_torrents_paused_vpn_down", paused as f64, &labels);
-            e.update_health(|hh| {
-                hh.status = ProfileStatus::VpnDown;
-                hh.tunnel_ip = current;
-                hh.paused_for_vpn = paused;
-            });
+            let paused = fence(e, &state, current, metrics.as_ref());
             // The clock goes with the fence, not with the next poll: a fence
             // lifted before that poll would otherwise keep the clock from
             // before it and be fenced `no_handshake` on the first poll after.
@@ -1260,5 +1344,78 @@ mod tests {
             Ok(()),
             "a host profile has no tunnel to check",
         );
+    }
+
+    /// An `acct_a` profile at `status` whose session is a mock the test holds.
+    fn mock_entry(status: ProfileStatus) -> (ProfileEntry, Arc<torrentd_engine::MockEngine>) {
+        let engine = Arc::new(torrentd_engine::MockEngine::new());
+        let entry = ProfileEntry::new(
+            crate::profile_registry::test_vpn_entry("acct_a", ProfileStatus::Active).config,
+            engine.clone(),
+            ip(2),
+            None,
+            0,
+        );
+        entry.update_health(|h| h.status = status);
+        (entry, engine)
+    }
+
+    fn pauses(engine: &torrentd_engine::MockEngine) -> Vec<TorrentHandle> {
+        engine
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                torrentd_engine::RecordedCall::PauseTorrent(h) => Some(h),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The fence marks the profile `vpn_down` before it pauses anything, so
+    /// an add alert handled while it walks the state map already reads the
+    /// profile as fenced and pauses its own torrent.
+    #[test]
+    fn the_fence_marks_the_profile_before_it_pauses_a_torrent() {
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let held = engine.hold_next("pause_torrent");
+        std::thread::scope(|s| {
+            let fencing = s.spawn(|| fence(&entry, &state, ip(9), &PromSink::new()));
+            held.wait_entered();
+            let mid_walk = entry.health().status;
+            // Released before asserting, so a failure fails rather than hangs.
+            held.release();
+            assert_eq!(
+                mid_walk,
+                ProfileStatus::VpnDown,
+                "marked before the walk pauses anything",
+            );
+            assert_eq!(fencing.join().unwrap(), 1);
+        });
+        let health = entry.health();
+        assert_eq!(health.paused_for_vpn, 1);
+        assert_eq!(health.tunnel_ip, ip(9));
+    }
+
+    /// An add re-checks the fence after `add_torrent` and pauses what it just
+    /// added only when the profile was fenced in between.
+    #[test]
+    fn an_add_pauses_its_torrent_only_when_the_profile_was_fenced_meanwhile() {
+        let th = TorrentHandle {
+            id: 7,
+            infohash: torrentd_engine::InfoHash([7; 20]),
+        };
+        let id = ProfileId::new("acct_a");
+        for (status, want) in [
+            (ProfileStatus::VpnDown, vec![th]),
+            (ProfileStatus::Active, vec![]),
+        ] {
+            let label = format!("{status:?}");
+            let (entry, engine) = mock_entry(status);
+            let profiles = ProfileRegistry::new(vec![entry]);
+            hold_if_fenced(&profiles, &id, engine.as_ref(), th, &PromSink::new());
+            assert_eq!(pauses(&engine), want, "{label}");
+        }
     }
 }

@@ -1425,16 +1425,19 @@ impl ScanFence {
             }
         }
         fenced.paused = fenced.handles.len();
-        // The monitor set the count from the state map as it fenced; what
-        // the scans held is added to it. The monitor sets its gauge before it
-        // marks the profile `VpnDown`, and this runs only once that mark is
-        // seen, so the gauge written here is the last one.
-        entry.update_health(|hh| hh.paused_for_vpn += paused);
-        metrics.set_gauge(
-            "profile_torrents_paused_vpn_down",
-            entry.health().paused_for_vpn as f64,
-            &labels,
-        );
+        // The monitor's fence (`vpn_monitor::fence`) marks the profile
+        // `VpnDown` before it walks the state map and adds what it paused to
+        // the count afterwards, so this can run in between: what the scans
+        // held is added, never assigned. Each writer sets the gauge from the
+        // sum under the health lock, so whichever writes last writes it all.
+        entry.update_health(|hh| {
+            hh.paused_for_vpn += paused;
+            metrics.set_gauge(
+                "profile_torrents_paused_vpn_down",
+                hh.paused_for_vpn as f64,
+                &labels,
+            );
+        });
         warn!(
             profile_id = %profile,
             torrent_count = paused,

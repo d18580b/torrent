@@ -149,7 +149,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Loads and adds refused because the assignment registry disagreed or could not be \
          written.";
     "profile_fence_pause_errors_total" Counter Profile Zero =>
-        "Torrents the VPN monitor failed to pause while fencing the profile.";
+        "Torrents the daemon failed to pause in a fenced profile: while the VPN monitor fenced \
+         it, or as one being added landed after the fence.";
     // boot
     "profile_boot_failed" Gauge Profile Owner("always") =>
         "1 if the profile got no session at boot (tunnel, port forward, or session \

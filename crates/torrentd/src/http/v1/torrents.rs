@@ -915,6 +915,9 @@ fn add_and_settle(
             return Err(e);
         }
     };
+    // `unfenced_engine` let this add through, but a fence can have landed
+    // between that check and the add.
+    crate::vpn_monitor::hold_if_fenced(&s.profiles, profile_id, engine, handle, &*s.metrics);
 
     // Persist the .torrent so the startup inventory scan can recover it if
     // resume data is ever lost.

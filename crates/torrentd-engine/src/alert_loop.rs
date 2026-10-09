@@ -442,6 +442,7 @@ fn run(
                 &torrents,
                 &metrics,
                 &clock,
+                hooks.profile_fenced.as_ref(),
             );
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
@@ -484,7 +485,15 @@ fn run(
                 }
             }
             dispatch_alert(
-                profile, alert, &source, &state, &resume, &torrents, &metrics, &clock,
+                profile,
+                alert,
+                &source,
+                &state,
+                &resume,
+                &torrents,
+                &metrics,
+                &clock,
+                hooks.profile_fenced.as_ref(),
             );
         }
         if fatal {
@@ -505,6 +514,7 @@ fn run(
                 &torrents,
                 &metrics,
                 &clock,
+                hooks.profile_fenced.as_ref(),
             );
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
@@ -569,6 +579,7 @@ fn dispatch_alert(
     torrents: &Arc<dyn TorrentStore>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
+    profile_fenced: Option<&ProfileFenced>,
 ) {
     let Some(engine) = source.engine_for(&profile) else {
         warn!(
@@ -590,6 +601,7 @@ fn dispatch_alert(
         metrics: metrics.as_ref(),
         clock: clock.as_ref(),
         engine: &engine,
+        profile_fenced,
         profile_id: profile,
         span,
     };
@@ -843,6 +855,7 @@ fn run_shutdown(
     torrents: &Arc<dyn TorrentStore>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
+    profile_fenced: Option<&ProfileFenced>,
 ) -> u64 {
     let started = clock.now();
     let started_count = state.len();
@@ -852,7 +865,16 @@ fn run_shutdown(
     // Drain whatever's pending so the resume queue is in a known state. A pop
     // is capped at `MAX_ALERTS_PER_POP`, so one drain may leave a backlog;
     // keep draining while it comes back non-empty, bounded by the deadline.
-    while drain_once(source, state, resume, torrents, metrics, clock) && clock.now() < stop_at {}
+    while drain_once(
+        source,
+        state,
+        resume,
+        torrents,
+        metrics,
+        clock,
+        profile_fenced,
+    ) && clock.now() < stop_at
+    {}
 
     // Queue one save per torrent; the dispatcher below hands them to
     // libtorrent a capped number at a time, and the resume handlers settle
@@ -882,7 +904,15 @@ fn run_shutdown(
         if state.pending_resume_count() == 0 {
             break;
         }
-        let drained = drain_once(source, state, resume, torrents, metrics, clock);
+        let drained = drain_once(
+            source,
+            state,
+            resume,
+            torrents,
+            metrics,
+            clock,
+            profile_fenced,
+        );
         if state.pending_resume_count() == 0 {
             break;
         }
@@ -933,12 +963,21 @@ fn drain_once(
     torrents: &Arc<dyn TorrentStore>,
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
+    profile_fenced: Option<&ProfileFenced>,
 ) -> bool {
     let alerts = source.drain();
     let drained = !alerts.is_empty();
     for (profile, alert) in alerts {
         dispatch_alert(
-            profile, alert, source, state, resume, torrents, metrics, clock,
+            profile,
+            alert,
+            source,
+            state,
+            resume,
+            torrents,
+            metrics,
+            clock,
+            profile_fenced,
         );
     }
     drained
@@ -1430,6 +1469,7 @@ mod tests {
                 metrics: recording.as_ref(),
                 clock: &mock_clock,
                 engine: &ctx_engine,
+                profile_fenced: None,
                 profile_id: ProfileId::new("p"),
                 span: tracing::info_span!("test"),
             };
@@ -1682,6 +1722,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
         );
 
         assert_eq!(state.len(), 1);
@@ -1725,6 +1766,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -1754,6 +1796,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
         );
 
         assert_eq!(state.pending_resume_count(), 1);
@@ -1795,6 +1838,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -1842,6 +1886,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
         );
         (
             unsaved,
@@ -1973,6 +2018,7 @@ mod tests {
                 &torrents,
                 &metrics,
                 &clock,
+                None,
             )
         };
 
@@ -2040,6 +2086,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2073,6 +2120,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
         );
 
         assert_eq!(state.pending_resume_count(), 1);
@@ -2133,6 +2181,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
         );
 
         assert_eq!(unsaved, 0, "every save settles inside the deadline");
@@ -2173,6 +2222,7 @@ mod tests {
             &torrents,
             &metrics,
             &clock,
+            None,
         );
 
         assert_eq!(unsaved, 0);

@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use tracing::Span;
 
+use crate::alert_loop::ProfileFenced;
 use crate::clock::Clock;
 use crate::engine::TorrentEngine;
 use crate::metrics::MetricsSink;
@@ -36,6 +37,9 @@ pub struct HandlerCtx<'a> {
     pub metrics: &'a dyn MetricsSink,
     pub clock: &'a dyn Clock,
     pub engine: &'a Arc<dyn TorrentEngine>,
+    /// Which profiles the VPN monitor has fenced, when the daemon said so.
+    /// The add handler pauses a torrent it inserts into a fenced profile.
+    pub profile_fenced: Option<&'a ProfileFenced>,
     pub profile_id: ProfileId,
     pub span: Span,
 }

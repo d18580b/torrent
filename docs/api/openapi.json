@@ -10392,7 +10392,7 @@
             "type": "integer",
             "minimum": 0.0,
             "format": "uint64",
-            "description": "Torrents currently paused because the tunnel went down."
+            "description": "Torrents the fence paused when the tunnel went down. A torrent added\nwhile the profile is fenced is paused as well, but not counted here."
           },
           "port_forward_ok": {
             "type": "boolean",
