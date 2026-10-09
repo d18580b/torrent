@@ -203,7 +203,8 @@ pub struct ProfileDetail {
     /// Tracker domains this profile's torrents may announce to. Empty admits
     /// any.
     pub allowed_tracker_domains: Vec<String>,
-    /// Torrents currently paused because the tunnel went down.
+    /// Torrents the fence paused when the tunnel went down. A torrent added
+    /// while the profile is fenced is paused as well, but not counted here.
     pub paused_for_vpn: u64,
     /// Whether the last NAT-PMP renewal succeeded. Always `true` for a
     /// `static` profile, which has nothing to renew, and `false` for a

@@ -25,7 +25,11 @@ use crate::profile_state::Record;
 pub struct ProfileHealth {
     pub status: ProfileStatus,
     pub tunnel_ip: Option<IpAddr>,
-    /// Number of torrents currently paused because the tunnel went down.
+    /// Number of torrents the fence paused when the tunnel went down: the
+    /// monitor's walk of the state map and the boot scans' `ScanFence`. A
+    /// torrent added into an already-fenced profile and paused by the add
+    /// handler or `vpn_monitor::hold_if_fenced` is not counted, because both
+    /// of those (and the walk) can pause the same torrent.
     pub paused_for_vpn: u64,
     /// Current NAT-PMP-negotiated listening port (natpmp profiles only; `None`
     /// for static profiles).

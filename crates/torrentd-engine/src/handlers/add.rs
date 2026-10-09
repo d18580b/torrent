@@ -114,6 +114,10 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
 /// before it asks. The `SeqCst` fence here pairs with the one in the VPN
 /// monitor between those two steps, so at least one side sees the other: the
 /// fence finds the torrent in the map, or this finds the profile fenced.
+///
+/// A torrent paused here is not added to the profile's `paused_for_vpn`
+/// count: the fence's walk and the daemon's own post-add re-check can pause
+/// the same torrent, so counting each pause would overcount.
 fn hold_if_fenced(handle: TorrentHandle, ctx: &HandlerCtx<'_>) {
     fence(Ordering::SeqCst);
     if !ctx.profile_fenced.is_some_and(|f| f(&ctx.profile_id)) {

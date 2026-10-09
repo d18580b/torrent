@@ -410,6 +410,10 @@ fn fence(
 /// pauses the torrent when its alert lands; this covers the torrent whose
 /// alert never does (dropped on an alert-queue overflow), which no fence walk
 /// of the state map will find. Pausing twice is harmless.
+///
+/// What this pauses is not added to `paused_for_vpn` or its gauge, and neither
+/// is what the add handler pauses: the two (and the fence's walk) can pause the
+/// same torrent, so the count stays what the fence itself paused.
 pub(crate) fn hold_if_fenced(
     profiles: &ProfileRegistry,
     profile_id: &ProfileId,
