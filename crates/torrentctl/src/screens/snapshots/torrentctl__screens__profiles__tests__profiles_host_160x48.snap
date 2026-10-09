@@ -5,25 +5,25 @@ expression: screen
 ╭ profiles (4) ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
 │    profile              status     torrents tunnel          listen forward        user agent                                                                 │
 │    acct_a               ● active        900 10.2.0.2             — natpmp :51413  qBittorrent/4.6.2                                                          │
-│▶ ! acct_b               ✖ vpn_down      334 10.3.0.2         51414 static         default                                                                    │
-│    host                 ‖ offline         1 host              6881 static         default                                                                    │
+│  ! acct_b               ✖ vpn_down      334 10.3.0.2         51414 static         default                                                                    │
+│▶   host                 ‖ offline         1 host              6881 static         default                                                                    │
 │  ! acct_c               ✖ failed         12 —                    — natpmp —       default                                                                    │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
-╭ acct_b ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
-│✖ FENCED — once the tunnel is back, r checks it and brings the profile online                                                                                 │
-│Its tunnel failed after it came up, so the VPN monitor paused its torrents. Bringing it online re-checks the tunnel and lifts the fence only if the check     │
-│passes; no restart is needed.                                                                                                                                 │
+╭ host ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+│‖ OFFLINE — r brings it online                                                                                                                                │
+│Set offline: its session is paused, so none of its torrents announces or connects to peers, and adds into it are refused. Kept across restarts.               │
 │                                                                                                                                                              │
-│         status  ✖ vpn_down                     allowed trackers                                                                                              │
-│         set to  online                         · tracker.example.org                                                                                         │
-│       torrents  334                                                                                                                                          │
-│      tunnel ip  10.3.0.2                       actions                                                                                                       │
-│  vpn interface  wg-b                           p     take offline                                                                                            │
-│    listen port  51414                          r     check the tunnel, lift the fence, bring online                                                          │
+│         status  ● active                       allowed trackers                                                                                              │
+│         set to  offline                        any (no allow-list)                                                                                           │
+│       torrents  1                                                                                                                                            │
+│      tunnel ip  host                           actions                                                                                                       │
+│  vpn interface  none (host)                    p     take offline                                                                                            │
+│    listen port  6881                           r     bring online                                                                                            │
 │   port forward  static                         Enter show its torrents                                                                                       │
 │ forward health  ● ok                                                                                                                                         │
-│ paused for vpn  334                                                                                                                                          │
+│ paused for vpn  0                                                                                                                                            │
 │     user agent  default                                                                                                                                      │
+│                                                                                                                                                              │
 │                                                                                                                                                              │
 │                                                                                                                                                              │
 │                                                                                                                                                              │

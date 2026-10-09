@@ -268,7 +268,10 @@ pub fn view(state: &State, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
     let rows = state.profiles.iter().map(|p| {
         let note = match (&p.status, &p.failure_reason) {
             (types::ProfileStatus::Failed, Some(reason)) => format!("never came up: {reason}"),
-            (types::ProfileStatus::VpnDown, _) => "fenced: restart the daemon to resume".to_owned(),
+            (types::ProfileStatus::VpnDown, _) => "fenced: bring online in Profiles (r)".to_owned(),
+            _ if p.effective_state == types::ProfileState::Offline => {
+                "offline: held off the network".to_owned()
+            }
             _ => match p.forwarded_port {
                 Some(port) => format!("forwarded :{port}"),
                 None => p.port_forward.to_string(),
@@ -367,12 +370,15 @@ mod tests {
         }));
         let profiles: Vec<types::Profile> = testing::from_json(json!([
             {"profile_id": "acct_a", "status": "active", "tunnel_ip": "10.2.0.2",
+             "desired_state": "online", "effective_state": "online",
              "torrent_count": 900, "listen_port": 51413, "port_forward": "natpmp",
              "forwarded_port": 51413, "user_agent": null, "failure_reason": null},
             {"profile_id": "acct_b", "status": "vpn_down", "tunnel_ip": "10.3.0.2",
+             "desired_state": "online", "effective_state": "offline",
              "torrent_count": 334, "listen_port": 51414, "port_forward": "static",
              "forwarded_port": null, "user_agent": null, "failure_reason": null},
             {"profile_id": "acct_c", "status": "failed", "tunnel_ip": null,
+             "desired_state": "online", "effective_state": "offline",
              "torrent_count": 0, "listen_port": null, "port_forward": "static",
              "forwarded_port": null, "user_agent": null,
              "failure_reason": "wg-c did not come up within 30s"},
@@ -405,7 +411,11 @@ mod tests {
             view(&loaded(), ctx, frame, area)
         });
         assert!(screen.contains("✖ vpn_down"), "{screen}");
-        assert!(screen.contains("fenced: restart the daemon to resume"));
+        assert!(
+            screen.contains("fenced: bring online in Profiles (r)"),
+            "{screen}"
+        );
+        assert!(!screen.contains("restart the daemon"), "{screen}");
         assert!(screen.contains("never came up: wg-c did not come up within 30s"));
     }
 

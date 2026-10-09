@@ -880,12 +880,13 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
     }
 }
 
-/// The ids of the profiles that can take a new torrent.
+/// The ids of the profiles that can take a new torrent: on the network, so
+/// neither fenced nor set offline, both of which the daemon refuses.
 fn active_profiles(state: &State) -> Vec<String> {
     state
         .profiles
         .iter()
-        .filter(|p| matches!(p.status, types::ProfileStatus::Active))
+        .filter(|p| p.effective_state == types::ProfileState::Online)
         .map(|p| p.profile_id.clone())
         .collect()
 }
@@ -1615,12 +1616,15 @@ mod tests {
     fn profiles() -> Vec<types::Profile> {
         testing::from_json(json!([
             {"profile_id": "acct_a", "status": "active", "tunnel_ip": "10.2.0.2",
+             "desired_state": "online", "effective_state": "online",
              "torrent_count": 900, "listen_port": 51413, "port_forward": "natpmp",
              "forwarded_port": 51413, "user_agent": null, "failure_reason": null},
             {"profile_id": "acct_b", "status": "vpn_down", "tunnel_ip": "10.3.0.2",
+             "desired_state": "online", "effective_state": "offline",
              "torrent_count": 334, "listen_port": 51414, "port_forward": "static",
              "forwarded_port": null, "user_agent": null, "failure_reason": null},
             {"profile_id": "acct_c", "status": "active", "tunnel_ip": null,
+             "desired_state": "online", "effective_state": "online",
              "torrent_count": 0, "listen_port": 51415, "port_forward": "static",
              "forwarded_port": null, "user_agent": null, "failure_reason": null},
         ]))
