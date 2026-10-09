@@ -42,6 +42,7 @@ pub mod store;
 pub use adopt::AdoptPlan;
 pub use adopt::AdoptPreview;
 pub use matcher::match_all;
+pub use matcher::match_all_serving;
 pub use matcher::MatchStats;
 pub use model::AdoptionState;
 pub use model::DirRollup;

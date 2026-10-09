@@ -485,6 +485,117 @@ fn rematching_does_not_demote_an_adopted_torrent() {
     assert_eq!(state_of(&store, "3c"), AdoptionState::Adopted);
 }
 
+/// An index holding `aa`, complete under `T/`, recorded `adopted`.
+fn adopted_store(root: &Path) -> PoolStore {
+    write_file(root, "T/a.bin", 64);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(&mut store, "aa", "T", None, &[("T/a.bin", 64)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    let (r, b) = store.adoption_base("aa").unwrap().unwrap();
+    store
+        .set_adoption(
+            "aa",
+            AdoptionState::Adopted,
+            Some(r),
+            Some(&b),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+    store
+}
+
+#[test]
+fn a_rescan_demotes_an_adopted_torrent_nothing_holds() {
+    // Adoption refuses `adopted` outright, so a verdict no session stands
+    // behind any more refused every later adoption until pool.db was edited.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = adopted_store(dir.path());
+    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+
+    // Loaded in a session: kept.
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    // Not loaded, but a profile still owns it (offline, or its add alert not
+    // in yet): kept.
+    store.set_profile("aa", Some("p")).unwrap();
+    torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    // Neither, and no view of the sessions (`torrentd pool scan`): kept.
+    store.set_profile("aa", None).unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    // Neither, with the sessions' view: demoted, and adoptable again.
+    let stats = torrentd_pool::match_all_serving(&mut store, &Default::default()).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
+    assert_eq!(stats.matched, 1);
+}
+
+#[test]
+fn releasing_the_owner_clears_its_adopted_verdict() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = adopted_store(dir.path());
+    let base = store.adoption_base("aa").unwrap();
+    store.set_profile("aa", Some("p")).unwrap();
+
+    // Another profile's release touches neither the owner nor the verdict.
+    assert!(!store.release_owner("aa", "q", false).unwrap());
+    assert_eq!(store.profile_of("aa").unwrap().as_deref(), Some("p"));
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+
+    assert!(store.release_owner("aa", "p", false).unwrap());
+    assert_eq!(store.profile_of("aa").unwrap(), None);
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Matched);
+    assert_eq!(store.adoption_base("aa").unwrap(), base);
+}
+
+#[test]
+fn releasing_the_owner_keeps_drift_and_sharing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = adopted_store(dir.path());
+    // A cross-seed of the same payload, which the rescan left `aa` adopted
+    // over.
+    add_torrent(&mut store, "bb", "T", None, &[("T/a.bin", 64)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Adopted);
+    store.set_profile("aa", Some("p")).unwrap();
+    store.release_owner("aa", "p", false).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Shared);
+
+    // Drift still on an adopted torrent survives its release: only a
+    // verification clears it.
+    let (r, b) = store.adoption_base("aa").unwrap().unwrap();
+    store
+        .set_adoption(
+            "aa",
+            AdoptionState::Adopted,
+            Some(r),
+            Some(&b),
+            None,
+            Some(7),
+            None,
+        )
+        .unwrap();
+    store.set_profile("aa", Some("p")).unwrap();
+    store.release_owner("aa", "p", false).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Drifted);
+    assert_eq!(store.drift_at("aa").unwrap(), Some(7));
+}
+
+#[test]
+fn releasing_the_owner_with_its_payload_leaves_it_missing() {
+    // `delete_files` took the bytes: `matched` would offer up a payload that
+    // is gone, so nothing is adoptable until a rescan finds it again.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = adopted_store(dir.path());
+    store.set_profile("aa", Some("p")).unwrap();
+    store.release_owner("aa", "p", true).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Missing);
+    assert_eq!(store.adoption_base("aa").unwrap(), None);
+}
+
 #[test]
 fn empty_files_do_not_block_a_match() {
     // A genuinely empty file has no bytes to locate.

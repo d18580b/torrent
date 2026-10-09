@@ -100,13 +100,16 @@ else.
 
 What stays behind:
 
-- **The `adopted` state.** An adopted torrent stays `adopted` in the pool
-  index, with its claims, for as long as its `.torrent` remains in
-  `library_dir` and after it leaves (#111). Two things follow. Re-adopting it,
-  into this profile or another, is refused as `already adopted`. Its payload
-  is never offered as orphaned, so a `delete_orphans` plan never trashes it.
-  Until #111 is fixed, the only way to clear the state is to edit `pool.db` by
-  hand with the daemon stopped.
+- **The index entry.** The delete resets an adopted torrent's `adopted`
+  state to `matched` (or `drifted`, `shared` or `overlap`, as a rescan would
+  label it), so it can be adopted again, into this profile or another. It
+  keeps its claims while its `.torrent` remains in `library_dir`. Once the
+  `.torrent` leaves and a rescan drops it, its payload is offered as
+  orphaned like any other unclaimed file. The exception is a torrent the
+  delete leaves `drifted`: a rescan never drops a `drifted` torrent, so its
+  files stay claimed and are never offered as orphaned. A rescan also demotes an `adopted`
+  torrent that no session holds and no profile owns, which clears one a
+  delete before this fix left behind.
 - **The payload,** which you remove by archiving it (next section), or by hand
   where it lies outside every managed root.
 
@@ -125,15 +128,19 @@ guards (#112):
 It is refused for a torrent with no running session (`profile-unavailable`),
 because only the session can reach the payload.
 
-Until #111 and #112 are fixed, choose by where the payload lies:
+With `delete_files=true`, an adopted torrent's index entry reads `missing`
+until a rescan, since its payload is gone.
 
-- **A torrent that was never adopted, under a managed root.** Use a plain
-  `DELETE`. Then remove its `.torrent` from `library_dir` if it is there, rescan, and plan
+Until #112 is fixed, choose by where the payload lies:
+
+- **Under a managed root, adopted or not.** Use a plain `DELETE`. Then
+  remove its `.torrent` from `library_dir` if it is there, rescan, and plan
   `delete_orphans` over its directory. The files go to the trash and stay
-  recoverable.
-- **An adopted torrent.** Its payload stays claimed after the `DELETE`, so no
-  plan will trash it. Either accept `delete_files=true` and its missing guards,
-  or `DELETE` without it and move the payload out of the root by hand.
+  recoverable. The exception is a torrent with drift on it, which the delete
+  leaves `drifted` rather than `matched`: a rescan keeps a `drifted` torrent
+  in the index even once its `.torrent` has left `library_dir`, so its files
+  stay claimed and `delete_orphans` never offers them. After the delete,
+  `GET /v1/pool/torrents?state=drifted` lists it; remove its files by hand.
 - **Outside every managed root.** No plan reaches it. The choice is
   `delete_files=true` or removing the files by hand.
 
@@ -394,10 +401,9 @@ while read -r ih; do
 done < unloaded.txt
 ```
 
-A torrent that was still waiting in the verify queue adopts again normally. A
-fast-path adoption had already recorded `adopted` in the pool index before
-the crash. Adopting it again is refused as `already adopted` (#111), and
-editing `pool.db` with the daemon stopped is the only way past that.
+A torrent that was still waiting in the verify queue adopts again normally,
+and so does a fast-path adoption that had already recorded `adopted` in the
+pool index before the crash: the `DELETE` resets that state.
 
 **Plans.** The boot re-drives every plan left `applying`. It first waits up
 to 10 minutes for every torrent it loaded to reach the state map. Check that
