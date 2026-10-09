@@ -415,6 +415,31 @@ async fn states(cov: &Arc<Coverage>) {
     assert_problem(&resp, 409, "profile-unavailable");
     assert_eq!(resp.json::<Value>()["profile_status"], "offline");
 
+    // The daemon-wide resume skips it by name rather than refusing, and
+    // resumes none of its torrents.
+    load(&h.state, 3, "acct_a");
+    let resp = h.write("POST", "/v1/torrents/resume-all").await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    let out: Value = resp.json();
+    assert_eq!(out["torrent_count"], 0);
+    let skipped: Vec<(&str, &str)> = out["skipped_profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["profile_id"].as_str().unwrap(),
+                p["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert!(skipped.contains(&("acct_a", "offline")), "{skipped:?}");
+    assert_eq!(
+        calls(&eng_a, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
+        0,
+        "a bulk resume never reaches an offline profile's session",
+    );
+
     // Online again.
     let detail: Value = set("acct_a", "online").await.json();
     assert_eq!(detail["effective_state"], "online");
