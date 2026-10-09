@@ -193,9 +193,12 @@ tunnel_carries() {
 }
 
 # The kill switch as `killswitch::render_ruleset_with_transport` renders it
-# for one tunnel: loopback, the tunnel from its own address, the tunnel's
-# transport as a UDP source port, and the drop. $1 is the transport port.
-# Kept line for line with that function; its tests pin the same text.
+# for one tunnel: the tunnel's address fenced to its own interface and
+# loopback whoever sends it, loopback, the tunnel from its own address, the
+# tunnel's transport from its listen port to its peer's endpoint, and the
+# drop. $1 is the listen port, as the daemon reads it with `wg show <iface>
+# listen-port`; the endpoint is the one `wg_raise` gives the link. Kept line
+# for line with that function; its tests pin the same text.
 ks_install() {
   local uid
   uid=$(id -u)
@@ -205,9 +208,10 @@ delete table inet torrentd_ks
 table inet torrentd_ks {
 	chain output {
 		type filter hook output priority 0; policy accept;
+		ip saddr $WG_ADDR oifname != { "lo", "$WG_IF" } drop
 		meta skuid $uid oifname "lo" accept
 		meta skuid $uid ip saddr $WG_ADDR oifname "$WG_IF" accept
-		meta skuid $uid udp sport { $1 } accept
+		meta skuid $uid ip daddr $PEER_V4 udp sport $1 udp dport $WG_PEER_PORT accept
 		meta skuid $uid counter drop
 	}
 }

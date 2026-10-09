@@ -58,13 +58,39 @@
 //! raised the link. (Handshakes are built by the kernel with no socket
 //! attached and match no uid rule, which is why a tunnel under the bare drop
 //! handshakes and then carries nothing.) So the ruleset carries one
-//! exemption per tunnel: its UDP **listen port**, read off the live link with
-//! `wg show <iface> listen-port` when the ruleset is installed, is accepted
-//! as a source port for the daemon's uid on any interface
-//! ([`render_ruleset_with_transport`]). Nothing the daemon opens itself can
-//! hold that port: the WireGuard socket binds it on the wildcard address
-//! without address reuse, so a libtorrent bind to it fails with `EADDRINUSE`
-//! rather than sharing it.
+//! exemption per tunnel and provider endpoint: a UDP datagram of the daemon's
+//! uid from the tunnel's **listen port** to the **peer endpoint**, each read
+//! off the live link (`wg show <iface> listen-port` and `wg show <iface>
+//! endpoints`) — `meta skuid <uid> ip daddr <endpoint> udp sport <listen
+//! port> udp dport <endpoint port> accept` ([`render_ruleset_with_transport`]).
+//! While the link is up nothing the daemon opens itself can hold that port:
+//! the WireGuard socket binds it on the wildcard address without address
+//! reuse, so a libtorrent bind to it fails with `EADDRINUSE`. Once the link
+//! goes the port is free, and a socket that then holds it — bound to it, or
+//! handed it as an ephemeral port — reaches only the provider's endpoint
+//! through the exemption, never anywhere else.
+//!
+//! **The exemption follows the link.** A link taken down and raised again
+//! without a `ListenPort` comes back on a port the kernel picks, and possibly
+//! to another endpoint. Handshakes carry no socket and pass whatever the
+//! ruleset says, so a tunnel whose exemption names the old port handshakes,
+//! passes every health check, and carries nothing. [`watch`] re-reads each
+//! tunnel's transport on every check and, when it changed, installs the
+//! ruleset again with the live one ([`refresh`]); a reinstall that does not
+//! take is the loss its check already handles, which fences every vpn
+//! profile.
+//!
+//! **A tunnel's address leaves by that tunnel or not at all, whoever sent
+//! it.** Ahead of every uid rule, `ip saddr <tunnel address> oifname != {
+//! "lo", "<iface>" } drop` takes any packet carrying a tunnel's address out of
+//! any other interface. The uid rules cannot: a TCP reset for a closed port
+//! and an ICMP port-unreachable are built by the kernel with no socket of the
+//! daemon's attached, so with a tunnel's `from <address>` routing rule lost,
+//! the kernel's answer to a probe of the tunnel address arriving on the
+//! physical link went back out of it from the tunnel address, tying that
+//! address to the host. Tunnels sharing an address (providers that hand
+//! every client the same one) share the rule, each of their interfaces
+//! allowed.
 //!
 //! - **OpenVPN: never.** The daemon spawns `openvpn` under its own uid, so the
 //!   ruleset drops the client's connection to the provider. `Config::validate`
@@ -98,8 +124,11 @@
 //! module exists not to depend on. Reach the API through a reverse proxy on the
 //! same host (loopback), or scrape from inside the tunnel.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io;
 use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 
 use torrentd_engine::profile::ProfileConfig;
 use tracing::info;
@@ -124,6 +153,26 @@ impl Tunnel {
         Self {
             iface: iface.into(),
             addr,
+        }
+    }
+}
+
+/// One WireGuard link's own transport as the ruleset exempts it: the UDP port
+/// the link listens on, and the endpoint of each peer that has one.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Transport {
+    pub listen_port: u16,
+    pub endpoints: Vec<SocketAddr>,
+}
+
+impl Transport {
+    pub fn new(listen_port: u16, endpoints: impl IntoIterator<Item = SocketAddr>) -> Self {
+        let mut endpoints: Vec<SocketAddr> = endpoints.into_iter().collect();
+        endpoints.sort_unstable();
+        endpoints.dedup();
+        Self {
+            listen_port,
+            endpoints,
         }
     }
 }
@@ -178,19 +227,27 @@ pub fn render_ruleset(uid: u32, tunnels: &[Tunnel]) -> io::Result<String> {
     render_ruleset_with_transport(uid, tunnels, &[])
 }
 
-/// [`render_ruleset`], plus the tunnels' own transport: each port in
-/// `transport_ports` is accepted as a UDP source port for `uid` on any
-/// interface, ahead of the drop.
+/// [`render_ruleset`], plus the tunnels' own transport: for each of
+/// `transports`, a UDP datagram of `uid`'s from its listen port to each of its
+/// peer endpoints is accepted on any interface, ahead of the drop.
 ///
 /// This is the ruleset `enable` installs. Without it no WireGuard link
 /// carries the daemon's traffic: the encrypted UDP to the provider leaves by
 /// the physical interface still attached to the daemon's sending socket, so
-/// it matches `meta skuid <uid>` and the final `drop` takes it. Ports are
-/// de-duplicated and sorted, like the tunnels, so the output is deterministic.
+/// it matches `meta skuid <uid>` and the final `drop` takes it. It is scoped
+/// to the endpoint, not the port alone, because the port outlives the link:
+/// once the link is down any socket can hold it, and a port-only exemption
+/// let that socket's traffic out to anywhere.
+///
+/// Every tunnel address is fenced to its own interfaces (and loopback) first,
+/// for every uid: see the module documentation.
+///
+/// Tunnels, addresses and exemptions are de-duplicated and sorted, so the
+/// output is deterministic regardless of profile ordering.
 pub fn render_ruleset_with_transport(
     uid: u32,
     tunnels: &[Tunnel],
-    transport_ports: &[u16],
+    transports: &[Transport],
 ) -> io::Result<String> {
     check_interface_names(tunnels.iter().map(|t| t.iface.as_str()))?;
     let mut pairs: Vec<&Tunnel> = tunnels.iter().collect();
@@ -199,23 +256,37 @@ pub fn render_ruleset_with_transport(
 
     let mut chain = String::new();
     chain.push_str("\t\ttype filter hook output priority 0; policy accept;\n");
+    // Interfaces each address may leave by. Sorted as nft lists a set's
+    // elements, so the table reads back as rendered.
+    let mut fenced: BTreeMap<Ipv4Addr, BTreeSet<&str>> = BTreeMap::new();
+    for Tunnel { iface, addr } in &pairs {
+        fenced
+            .entry(*addr)
+            .or_insert_with(|| BTreeSet::from(["lo"]))
+            .insert(iface.as_str());
+    }
+    for (addr, ifaces) in fenced {
+        chain.push_str(&format!(
+            "\t\tip saddr {addr} oifname != {} drop\n",
+            name_set(ifaces)
+        ));
+    }
     chain.push_str(&format!("\t\tmeta skuid {uid} oifname \"lo\" accept\n"));
     for Tunnel { iface, addr } in pairs {
         chain.push_str(&format!(
             "\t\tmeta skuid {uid} ip saddr {addr} oifname \"{iface}\" accept\n"
         ));
     }
-    let mut ports = transport_ports.to_vec();
-    ports.sort_unstable();
-    ports.dedup();
-    if !ports.is_empty() {
-        let set = ports
-            .iter()
-            .map(u16::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
+    let exempt: BTreeSet<(u16, SocketAddr)> = transports
+        .iter()
+        .flat_map(|t| t.endpoints.iter().map(|e| (t.listen_port, *e)))
+        .collect();
+    for (port, endpoint) in exempt {
+        let family = if endpoint.is_ipv4() { "ip" } else { "ip6" };
         chain.push_str(&format!(
-            "\t\tmeta skuid {uid} udp sport {{ {set} }} accept\n"
+            "\t\tmeta skuid {uid} {family} daddr {} udp sport {port} udp dport {} accept\n",
+            endpoint.ip(),
+            endpoint.port(),
         ));
     }
     chain.push_str(&format!("\t\tmeta skuid {uid} counter drop\n"));
@@ -223,6 +294,12 @@ pub fn render_ruleset_with_transport(
     Ok(format!(
         "table inet {TABLE} {{\n\tchain output {{\n{chain}\t}}\n}}\n"
     ))
+}
+
+/// Interface names as an nft anonymous set, in the order given.
+fn name_set<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    let quoted: Vec<String> = names.into_iter().map(|n| format!("\"{n}\"")).collect();
+    format!("{{ {} }}", quoted.join(", "))
 }
 
 /// The script `enable` hands to `nft -f`, and the one `torrentd vpn check`
@@ -240,8 +317,12 @@ pub fn render_ruleset_with_transport(
 /// A replace is needed at all because `nft -f` *merges* a table definition
 /// into an existing table: loaded over a stale one, the old run's tunnel
 /// interfaces would still be accepted.
-pub fn install_script(uid: u32, tunnels: &[Tunnel], transport_ports: &[u16]) -> io::Result<String> {
-    let table = render_ruleset_with_transport(uid, tunnels, transport_ports)?;
+pub fn install_script(
+    uid: u32,
+    tunnels: &[Tunnel],
+    transports: &[Transport],
+) -> io::Result<String> {
+    let table = render_ruleset_with_transport(uid, tunnels, transports)?;
     Ok(replace_script(&table))
 }
 
@@ -251,16 +332,43 @@ fn replace_script(table: &str) -> String {
     format!("add table inet {TABLE}\ndelete table inet {TABLE}\n{table}")
 }
 
-/// The kill switch as `enable` installed it: the uid it confines, and the
-/// table it rendered, which [`verify`] compares the live one with and
-/// [`watch`] installs again when they differ.
+/// The kill switch as `enable` installed it: the uid it confines, the
+/// tunnels and the transport of each it was rendered over, and the table it
+/// rendered, which [`verify`] compares the live one with and [`watch`]
+/// installs again when they differ. [`refresh`] replaces the transports and
+/// the table when a link's transport changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Installed {
     pub uid: u32,
+    tunnels: Vec<Tunnel>,
+    /// Each tunnel interface's transport, as last read.
+    transports: Vec<(String, Transport)>,
     table: String,
 }
 
 impl Installed {
+    /// Render the table for `uid` over `tunnels` and `transports`.
+    fn render(
+        uid: u32,
+        tunnels: Vec<Tunnel>,
+        transports: Vec<(String, Transport)>,
+    ) -> io::Result<Self> {
+        let table = render_ruleset_with_transport(
+            uid,
+            &tunnels,
+            &transports
+                .iter()
+                .map(|(_, t)| t.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(Self {
+            uid,
+            tunnels,
+            transports,
+            table,
+        })
+    }
+
     /// The script that installs this table again, replacing whatever stands
     /// in its place, as one transaction.
     fn script(&self) -> String {
@@ -340,9 +448,55 @@ pub fn enable(tunnels: &[String]) -> io::Result<Installed> {
         current_uid()?,
         tunnels,
         super::ip_lookup::first_ipv4,
-        listen_port,
+        transport,
         apply,
     )
+}
+
+/// The WireGuard link `iface`'s own transport: its [`listen_port`] and the
+/// endpoint of each of its peers, from `wg show <iface> endpoints`.
+///
+/// A link with no peer endpoint at all is an error, like a link with no
+/// listen port: there is nowhere to exempt its transport to, and it could
+/// not carry anyway.
+pub(crate) fn transport(iface: &str) -> io::Result<Transport> {
+    let port = listen_port(iface)?;
+    let out = exec::run_ok(
+        "wg",
+        &["show", exec::iface(iface)?, "endpoints"],
+        None,
+        exec::QUICK,
+    )?;
+    let endpoints = parse_endpoints(iface, &String::from_utf8_lossy(&out.stdout))?;
+    Ok(Transport::new(port, endpoints))
+}
+
+/// `wg show <iface> endpoints`'s output — a line per peer, its public key and
+/// its endpoint or `(none)` — as the endpoints the ruleset can exempt.
+fn parse_endpoints(iface: &str, text: &str) -> io::Result<Vec<SocketAddr>> {
+    let mut endpoints = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let Some(endpoint) = line.split_whitespace().nth(1) else {
+            return Err(io::Error::other(format!(
+                "wg show {iface} endpoints printed {line:?}, not a peer and its endpoint",
+            )));
+        };
+        if endpoint == "(none)" {
+            continue;
+        }
+        endpoints.push(endpoint.parse::<SocketAddr>().map_err(|_| {
+            io::Error::other(format!(
+                "wg show {iface} endpoints printed {endpoint:?}, not an endpoint",
+            ))
+        })?);
+    }
+    if endpoints.is_empty() {
+        return Err(io::Error::other(format!(
+            "WireGuard link {iface} has no peer endpoint, so the kill switch has no \
+             transport to exempt for it",
+        )));
+    }
+    Ok(endpoints)
 }
 
 /// The UDP port the WireGuard link `iface` listens on, from
@@ -394,7 +548,7 @@ fn parse_listen_port(iface: &str, text: &str) -> io::Result<u16> {
 /// the two no kill switch was in force; a load that then failed left none for
 /// the rest of the run.
 ///
-/// `tunnel_addr` and `transport_port` are the other host probes, handed in
+/// `tunnel_addr` and `transport` are the other host probes, handed in
 /// for the same reason: the pairing the first feeds is what keeps one
 /// profile's traffic out of another's tunnel, and the exemption the second
 /// feeds is the difference between a WireGuard link the daemon raised
@@ -405,7 +559,7 @@ pub(crate) fn enable_for_uid(
     uid: u32,
     tunnels: &[String],
     tunnel_addr: impl Fn(&str) -> io::Result<Ipv4Addr>,
-    transport_port: impl Fn(&str) -> io::Result<u16>,
+    transport: impl Fn(&str) -> io::Result<Transport>,
     apply: impl Fn(&str) -> io::Result<()>,
 ) -> io::Result<Installed> {
     if let Some(refusal) = refusal_for_uid(uid) {
@@ -431,22 +585,19 @@ pub(crate) fn enable_for_uid(
                 })
         })
         .collect::<io::Result<Vec<Tunnel>>>()?;
-    let ports = tunnels
+    let transports = tunnels
         .iter()
-        .map(|iface| transport_port(iface))
-        .collect::<io::Result<Vec<u16>>>()?;
+        .map(|iface| transport(iface).map(|t| (iface.clone(), t)))
+        .collect::<io::Result<Vec<(String, Transport)>>>()?;
     // A name the ruleset cannot carry fails here, before nft, so a previous
     // run's kill switch stays armed.
-    let installed = Installed {
-        uid,
-        table: render_ruleset_with_transport(uid, &paired, &ports)?,
-    };
+    let installed = Installed::render(uid, paired, transports)?;
     apply(&installed.script())?;
     info!(
         target: "torrentd::vpn::killswitch",
         uid,
-        tunnels = ?paired,
-        transport_ports = ?ports,
+        tunnels = ?installed.tunnels,
+        transports = ?installed.transports,
         "network kill switch installed (nftables, fail-closed)",
     );
     Ok(installed)
@@ -567,8 +718,8 @@ pub(crate) fn verify_with(
 /// expression of a kind this module never installs is not this module's
 /// table.
 ///
-/// Counters are read without their values, and a one-port `udp sport` set,
-/// which nft stores as a single value, is read as the set it was written as.
+/// Counters are read without their values, and an interface-name set in the
+/// order the renderer writes it.
 fn live_table(json: &serde_json::Value) -> Result<String, String> {
     use serde_json::Value;
     let items = json
@@ -649,9 +800,6 @@ fn rule_line(exprs: &serde_json::Value) -> Result<String, String> {
     let mut words = Vec::with_capacity(exprs.len());
     for e in exprs {
         if let Some(m) = e.get("match") {
-            if m["op"] != "==" {
-                return Err(unread(e));
-            }
             let (left, right) = (&m["left"], &m["right"]);
             let key = match (
                 left.pointer("/meta/key").and_then(|k| k.as_str()),
@@ -661,23 +809,32 @@ fn rule_line(exprs: &serde_json::Value) -> Result<String, String> {
                 (Some("skuid"), ..) => "meta skuid",
                 (Some("oifname"), ..) => "oifname",
                 (None, Some("ip"), Some("saddr")) => "ip saddr",
+                (None, Some("ip"), Some("daddr")) => "ip daddr",
+                (None, Some("ip6"), Some("daddr")) => "ip6 daddr",
                 (None, Some("udp"), Some("sport")) => "udp sport",
+                (None, Some("udp"), Some("dport")) => "udp dport",
+                _ => return Err(unread(e)),
+            };
+            // `!=` only where the renderer writes it: an interface-name set.
+            let op = match (m["op"].as_str(), key) {
+                (Some("=="), _) => "",
+                (Some("!="), "oifname") if right.get("set").is_some() => "!= ",
                 _ => return Err(unread(e)),
             };
             let value = match key {
-                "oifname" => right.as_str().map(|s| format!("\"{s}\"")),
-                "udp sport" => match right.pointer("/set").and_then(|s| s.as_array()) {
+                "oifname" => match right.pointer("/set").and_then(|s| s.as_array()) {
+                    // Sorted as the renderer sorts them.
                     Some(set) => set
                         .iter()
-                        .map(scalar)
-                        .collect::<Option<Vec<_>>>()
-                        .map(|ports| format!("{{ {} }}", ports.join(", "))),
-                    None => scalar(right).map(|port| format!("{{ {port} }}")),
+                        .map(|n| n.as_str())
+                        .collect::<Option<BTreeSet<&str>>>()
+                        .map(name_set),
+                    None => right.as_str().map(|s| format!("\"{s}\"")),
                 },
                 _ => scalar(right),
             }
             .ok_or_else(|| unread(e))?;
-            words.push(format!("{key} {value}"));
+            words.push(format!("{key} {op}{value}"));
         } else if e.get("counter").is_some() {
             words.push("counter".to_string());
         } else if e.get("accept").is_some() {
@@ -748,6 +905,13 @@ enum Watch {
 /// cannot run counts in `kill_switch_probe_errors_total` and changes nothing,
 /// since not knowing is not the same as absent.
 ///
+/// Before each check, each tunnel's transport is read off its link again
+/// ([`refresh`]), and a change installs the ruleset again with the live one,
+/// so a link re-raised on another port or to another endpoint carries again
+/// at the next check rather than at the next restart. A reinstall that fails
+/// leaves the live table differing from the one now rendered, which the
+/// check reads as drift.
+///
 /// Only spawned when the kill switch is active.
 pub(crate) async fn watch(
     installed: Installed,
@@ -758,7 +922,7 @@ pub(crate) async fn watch(
     use torrentd_engine::MetricsSink;
     // Installed moments ago by `enable`, and verified by the boot.
     metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
-    let installed = std::sync::Arc::new(installed);
+    let installed = std::sync::Arc::new(std::sync::Mutex::new(installed));
     let mut state = Watch::default();
     loop {
         tokio::select! {
@@ -770,9 +934,12 @@ pub(crate) async fn watch(
         let ticked = tokio::task::spawn_blocking({
             let (installed, fence, metrics) = (installed.clone(), fence.clone(), metrics.clone());
             move || {
+                let mut installed = installed.lock().unwrap_or_else(|p| p.into_inner());
+                refresh(&mut installed, transport, apply);
+                let installed = &*installed;
                 tick(
                     state,
-                    || verify(&installed),
+                    || verify(installed),
                     || apply(&installed.script()),
                     &*fence,
                     &*metrics,
@@ -793,6 +960,73 @@ pub(crate) async fn watch(
             }
         }
     }
+}
+
+/// Read each tunnel's transport off its link, and where any changed since
+/// `installed` was rendered, render it again with the live ones and install
+/// that. Returns whether it changed.
+///
+/// A link that cannot be read — down, or gone while its provider's client
+/// raises it again — keeps the transport last read: the exemption is scoped
+/// to the provider's endpoint, so a stale one reaches nothing else, and
+/// dropping it on a read that failed for any other reason would silence a
+/// working tunnel until the next check. The VPN monitor reports and fences a
+/// link that is down.
+///
+/// `installed` is replaced whether or not the install takes: a failed one
+/// leaves the live table differing from the rendered one, and the check that
+/// follows reads that as drift, fences every vpn profile, and installs it
+/// again.
+fn refresh(
+    installed: &mut Installed,
+    transport: impl Fn(&str) -> io::Result<Transport>,
+    apply: impl Fn(&str) -> io::Result<()>,
+) -> bool {
+    let mut live = installed.transports.clone();
+    for (iface, t) in &mut live {
+        match transport(iface) {
+            Ok(now) => *t = now,
+            Err(e) => tracing::debug!(
+                target: "torrentd::vpn::killswitch",
+                iface = %iface,
+                error.cause = %e,
+                "could not read the tunnel's transport; keeping its exemption as last read",
+            ),
+        }
+    }
+    if live == installed.transports {
+        return false;
+    }
+    let next = match Installed::render(installed.uid, installed.tunnels.clone(), live) {
+        Ok(next) => next,
+        // Not reached: the same names rendered at install.
+        Err(e) => {
+            tracing::error!(
+                target: "torrentd::vpn::killswitch",
+                table = TABLE,
+                error.cause = %e,
+                "could not render the kill switch over the tunnels' live transport",
+            );
+            return false;
+        }
+    };
+    tracing::warn!(
+        target: "torrentd::vpn::killswitch",
+        was = ?installed.transports,
+        now = ?next.transports,
+        "a tunnel's transport changed since the kill switch was installed; installing it \
+         again with the live one",
+    );
+    *installed = next;
+    if let Err(e) = apply(&installed.script()) {
+        tracing::error!(
+            target: "torrentd::vpn::killswitch",
+            table = TABLE,
+            error.cause = %e,
+            "could not install the kill switch with the tunnels' live transport",
+        );
+    }
+    true
 }
 
 /// One check of [`watch`]'s, from where the last one left it: verify, fence
@@ -941,31 +1175,74 @@ mod tests {
         Tunnel::new(iface, addr_of(iface).unwrap())
     }
 
-    /// What the rendered chain does with one packet of `uid`'s, read the way
-    /// nftables reads it: the first rule whose every match holds decides, and
-    /// a packet no rule decides takes the chain's `accept` policy.
+    /// The provider endpoint every test tunnel's peer has.
+    const ENDPOINT: &str = "198.51.100.1:51820";
+
+    /// A transport on `port` to [`ENDPOINT`].
+    fn transport_on(port: u16) -> Transport {
+        Transport::new(port, [ENDPOINT.parse().unwrap()])
+    }
+
+    /// One packet leaving the host, as the output hook sees it.
+    #[derive(Clone, Copy)]
+    struct Packet<'a> {
+        /// The socket owner's uid, `None` for one the kernel built with no
+        /// socket attached: a reset, an ICMP error.
+        uid: Option<u32>,
+        saddr: Ipv4Addr,
+        oif: &'a str,
+        /// `(sport, daddr, dport)` for a UDP packet.
+        udp: Option<(u16, std::net::IpAddr, u16)>,
+    }
+
+    fn pkt(uid: u32, saddr: Ipv4Addr, oif: &str) -> Packet<'_> {
+        Packet {
+            uid: Some(uid),
+            saddr,
+            oif,
+            udp: None,
+        }
+    }
+
+    impl<'a> Packet<'a> {
+        fn udp(mut self, sport: u16, to: &str) -> Self {
+            let to: SocketAddr = to.parse().unwrap();
+            self.udp = Some((sport, to.ip(), to.port()));
+            self
+        }
+        fn kernel(mut self) -> Self {
+            self.uid = None;
+            self
+        }
+    }
+
+    /// What the rendered chain does with one packet, read the way nftables
+    /// reads it: the first rule whose every match holds decides, and a packet
+    /// no rule decides takes the chain's `accept` policy.
     ///
     /// Reads only the shapes this module renders — `meta skuid`, `ip saddr`,
-    /// `oifname` (one name or a set), `udp sport` (a set) — and panics on
-    /// anything else, so a new kind of match cannot be silently ignored here.
-    ///
-    /// `udp_sport` is `None` for a packet that is not UDP, which no
-    /// `udp sport` match holds for.
-    fn verdict(
-        ruleset: &str,
-        uid: u32,
-        saddr: Ipv4Addr,
-        oif: &str,
-        udp_sport: Option<u16>,
-    ) -> &'static str {
-        const MATCHES: [&str; 4] = ["meta skuid ", "ip saddr ", "oifname ", "udp sport "];
+    /// `ip daddr`/`ip6 daddr`, `oifname` (one name or a set, `!=` a set),
+    /// `udp sport`/`udp dport` (a set or one value) — and panics on anything
+    /// else, so a new kind of match cannot be silently ignored here.
+    fn verdict(ruleset: &str, p: Packet<'_>) -> &'static str {
+        const MATCHES: [&str; 7] = [
+            "meta skuid ",
+            "ip saddr ",
+            "ip daddr ",
+            "ip6 daddr ",
+            "oifname ",
+            "udp sport ",
+            "udp dport ",
+        ];
         for line in ruleset.lines().map(str::trim) {
-            if !line.starts_with("meta skuid ") {
+            if !(line.starts_with("meta skuid ") || line.starts_with("ip saddr ")) {
                 continue;
             }
             let (mut rest, verdict) = if let Some(m) = line.strip_suffix(" accept") {
                 (m, "accept")
             } else if let Some(m) = line.strip_suffix(" counter drop") {
+                (m, "drop")
+            } else if let Some(m) = line.strip_suffix(" drop") {
                 (m, "drop")
             } else {
                 panic!("unread verdict in {line:?}");
@@ -976,6 +1253,10 @@ mod tests {
                     .iter()
                     .find_map(|k| rest.strip_prefix(k).map(|r| (*k, r)))
                     .unwrap_or_else(|| panic!("unread match {rest:?} in {line:?}"));
+                let (negated, r) = match r.strip_prefix("!= ") {
+                    Some(r) => (true, r),
+                    None => (false, r),
+                };
                 let end = if r.starts_with('{') {
                     r.find('}').expect("a closed set") + 1
                 } else {
@@ -986,13 +1267,22 @@ mod tests {
                     .split(", ")
                     .map(|v| v.trim_matches('"'))
                     .collect();
-                let packet = match key {
-                    "meta skuid " => Some(uid.to_string()),
-                    "ip saddr " => Some(saddr.to_string()),
-                    "oifname " => Some(oif.to_string()),
-                    _ => udp_sport.map(|p| p.to_string()),
+                let field = match key {
+                    "meta skuid " => p.uid.map(|u| u.to_string()),
+                    "ip saddr " => Some(p.saddr.to_string()),
+                    "oifname " => Some(p.oif.to_string()),
+                    "udp sport " => p.udp.map(|(s, ..)| s.to_string()),
+                    "udp dport " => p.udp.map(|(.., d)| d.to_string()),
+                    "ip daddr " => p
+                        .udp
+                        .filter(|(_, a, _)| a.is_ipv4())
+                        .map(|(_, a, _)| a.to_string()),
+                    _ => p
+                        .udp
+                        .filter(|(_, a, _)| a.is_ipv6())
+                        .map(|(_, a, _)| a.to_string()),
                 };
-                holds &= packet.is_some_and(|p| values.contains(&p.as_str()));
+                holds &= field.is_some_and(|f| values.contains(&f.as_str()) != negated);
                 rest = r[end..].trim_start();
             }
             if holds {
@@ -1009,7 +1299,7 @@ mod tests {
             0,
             &["wg-a".to_string()],
             addr_of,
-            |_| Ok(51820),
+            |_| Ok(transport_on(51820)),
             |_| {
                 called.set(true);
                 Ok(())
@@ -1042,7 +1332,13 @@ mod tests {
             998,
             &["wg-b".to_string(), "wg-a".to_string()],
             addr_of,
-            |iface| Ok(if iface == "wg-a" { 51820 } else { 40001 }),
+            |iface| {
+                Ok(if iface == "wg-a" {
+                    transport_on(51820)
+                } else {
+                    Transport::new(40001, ["[2001:db8::7]:4500".parse().unwrap()])
+                })
+            },
             |script| {
                 calls.borrow_mut().push(script.to_string());
                 Ok(())
@@ -1060,10 +1356,13 @@ delete table inet torrentd_ks
 table inet torrentd_ks {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
+\t\tip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\" } drop
+\t\tip saddr 10.64.0.7 oifname != { \"lo\", \"wg-b\" } drop
 \t\tmeta skuid 998 oifname \"lo\" accept
 \t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-a\" accept
 \t\tmeta skuid 998 ip saddr 10.64.0.7 oifname \"wg-b\" accept
-\t\tmeta skuid 998 udp sport { 40001, 51820 } accept
+\t\tmeta skuid 998 ip6 daddr 2001:db8::7 udp sport 40001 udp dport 4500 accept
+\t\tmeta skuid 998 ip daddr 198.51.100.1 udp sport 51820 udp dport 51820 accept
 \t\tmeta skuid 998 counter drop
 \t}
 }
@@ -1116,7 +1415,7 @@ table inet torrentd_ks {
                     addr_of(iface)
                 }
             },
-            |_| Ok(51820),
+            |_| Ok(transport_on(51820)),
             |_| {
                 applied.set(true);
                 Ok(())
@@ -1137,30 +1436,34 @@ table inet torrentd_ks {
     /// `oifname { "wg-a", "wg-b" }` accept let it out with B's exit address.
     #[test]
     fn a_profiles_address_on_another_profiles_tunnel_falls_through_to_the_drop() {
-        let rs = render_ruleset_with_transport(998, &[tunnel("wg-a"), tunnel("wg-b")], &[51820])
-            .unwrap();
+        let rs = render_ruleset_with_transport(
+            998,
+            &[tunnel("wg-a"), tunnel("wg-b")],
+            &[transport_on(51820)],
+        )
+        .unwrap();
 
-        assert_eq!(verdict(&rs, 998, ADDR_A, "wg-a", None), "accept");
-        assert_eq!(verdict(&rs, 998, ADDR_B, "wg-b", None), "accept");
+        assert_eq!(verdict(&rs, pkt(998, ADDR_A, "wg-a")), "accept");
+        assert_eq!(verdict(&rs, pkt(998, ADDR_B, "wg-b")), "accept");
         assert_eq!(
-            verdict(&rs, 998, ADDR_A, "wg-b", None),
+            verdict(&rs, pkt(998, ADDR_A, "wg-b")),
             "drop",
             "A's address on B's tunnel is dropped:\n{rs}"
         );
         assert_eq!(
-            verdict(&rs, 998, ADDR_B, "wg-a", Some(6881)),
+            verdict(&rs, pkt(998, ADDR_B, "wg-a").udp(6881, "203.0.113.9:6881")),
             "drop",
             "and B's on A's, UDP included:\n{rs}"
         );
         assert_eq!(
-            verdict(&rs, 998, Ipv4Addr::new(192, 168, 1, 20), "wg-a", None),
+            verdict(&rs, pkt(998, Ipv4Addr::new(192, 168, 1, 20), "wg-a")),
             "drop",
             "an address no profile holds is dropped on every tunnel:\n{rs}"
         );
         assert_eq!(
-            verdict(&rs, 1000, ADDR_A, "wg-b", None),
+            verdict(&rs, pkt(1000, Ipv4Addr::new(192, 168, 1, 20), "eth0")),
             "accept",
-            "another uid's traffic is not this ruleset's to judge"
+            "another uid's traffic from another address is not this ruleset's to judge"
         );
 
         // The control: the shared accept this replaced let A out of B's tunnel.
@@ -1169,7 +1472,122 @@ table inet torrentd_ks {
 \t\tmeta skuid 998 oifname { \"wg-a\", \"wg-b\" } accept
 \t\tmeta skuid 998 counter drop
 ";
-        assert_eq!(verdict(shared, 998, ADDR_A, "wg-b", None), "accept");
+        assert_eq!(verdict(shared, pkt(998, ADDR_A, "wg-b")), "accept");
+    }
+
+    /// #136, the stale exemption: once a link is down its listen port is
+    /// free, and a socket holding it — bound to it, or handed it as an
+    /// ephemeral port by a resolver query — sent out of the physical
+    /// interface through a port-only exemption. Scoped to the provider's
+    /// endpoint, only the tunnel's own transport passes.
+    #[test]
+    fn the_transport_exemption_reaches_the_provider_endpoint_and_nowhere_else() {
+        let rs =
+            render_ruleset_with_transport(998, &[tunnel("wg-a")], &[transport_on(51820)]).unwrap();
+        let phys = Ipv4Addr::new(192, 0, 2, 1);
+
+        assert_eq!(
+            verdict(&rs, pkt(998, phys, "eth0").udp(51820, ENDPOINT)),
+            "accept",
+            "the encrypted transport to the provider leaves:\n{rs}"
+        );
+        for (label, to) in [
+            ("a datagram to another host", "192.0.2.2:7"),
+            ("a resolver query", "192.0.2.53:53"),
+            ("another port on the provider", "198.51.100.1:53"),
+        ] {
+            assert_eq!(
+                verdict(&rs, pkt(998, phys, "eth0").udp(51820, to)),
+                "drop",
+                "{label} from the freed listen port is dropped:\n{rs}"
+            );
+        }
+        assert_eq!(
+            verdict(&rs, pkt(998, phys, "eth0").udp(40000, ENDPOINT)),
+            "drop",
+            "another source port to the provider is dropped:\n{rs}"
+        );
+
+        // The control: the port-only exemption this replaced let both out.
+        let port_only = "\
+\t\tmeta skuid 998 oifname \"lo\" accept
+\t\tmeta skuid 998 udp sport { 51820 } accept
+\t\tmeta skuid 998 counter drop
+";
+        assert_eq!(
+            verdict(
+                port_only,
+                pkt(998, phys, "eth0").udp(51820, "192.0.2.53:53")
+            ),
+            "accept"
+        );
+    }
+
+    /// #136, the kernel's replies: a reset or an ICMP error carries no socket
+    /// of the daemon's, so no uid rule judges it. With the tunnel's source
+    /// rule lost it left by the physical interface from the tunnel address.
+    /// The address fence drops it whoever built it, and still lets the
+    /// tunnel and loopback carry that address.
+    #[test]
+    fn a_tunnel_address_leaves_by_its_own_tunnel_or_loopback_whoever_sent_it() {
+        let rs = render_ruleset_with_transport(
+            998,
+            &[tunnel("wg-a"), tunnel("wg-b")],
+            &[transport_on(51820)],
+        )
+        .unwrap();
+        for (label, p) in [
+            ("a kernel reset", pkt(998, ADDR_A, "eth0").kernel()),
+            ("another uid's socket", pkt(0, ADDR_A, "eth0")),
+            ("into the other tunnel", pkt(0, ADDR_A, "wg-b")),
+        ] {
+            assert_eq!(verdict(&rs, p), "drop", "{label}:\n{rs}");
+        }
+        assert_eq!(verdict(&rs, pkt(998, ADDR_A, "wg-a").kernel()), "accept");
+        assert_eq!(verdict(&rs, pkt(0, ADDR_A, "lo")), "accept");
+        assert_eq!(
+            verdict(&rs, pkt(0, Ipv4Addr::new(192, 0, 2, 1), "eth0").kernel()),
+            "accept",
+            "the host's own address is not the ruleset's to judge"
+        );
+    }
+
+    /// Providers that hand every client the same address: two tunnels on it
+    /// share one fence that allows both, or each would drop the other.
+    #[test]
+    fn tunnels_sharing_an_address_share_its_fence() {
+        let rs = render_ruleset(
+            998,
+            &[Tunnel::new("wg-b", ADDR_A), Tunnel::new("wg-a", ADDR_A)],
+        )
+        .unwrap();
+        assert_eq!(
+            rs.matches("oifname != ").count(),
+            1,
+            "one fence for the address:\n{rs}"
+        );
+        assert!(
+            rs.contains("ip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\", \"wg-b\" } drop"),
+            "{rs}"
+        );
+        assert_eq!(verdict(&rs, pkt(998, ADDR_A, "wg-a")), "accept");
+        assert_eq!(verdict(&rs, pkt(998, ADDR_A, "wg-b")), "accept");
+    }
+
+    #[test]
+    fn endpoints_are_read_and_a_link_with_none_is_refused() {
+        let out = "a2V5MQ==\t198.51.100.1:51820\nb2V5Mg==\t(none)\nc2V5Mw==\t[2001:db8::7]:4500\n";
+        assert_eq!(
+            parse_endpoints("wg-a", out).unwrap(),
+            vec![
+                "198.51.100.1:51820".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::7]:4500".parse().unwrap(),
+            ],
+        );
+        let e = parse_endpoints("wg-a", "a2V5MQ==\t(none)\n").expect_err("no endpoint");
+        assert!(e.to_string().contains("no peer endpoint"), "got {e}");
+        parse_endpoints("wg-a", "").expect_err("no peers at all");
+        parse_endpoints("wg-a", "a2V5MQ==\tsomewhere\n").expect_err("not an endpoint");
     }
 
     #[test]
@@ -1182,24 +1600,36 @@ table inet torrentd_ks {
     }
 
     /// The exemption, byte for byte: after the tunnel accept and before the
-    /// drop, keyed on this uid **and** the source port, so it lets out the
-    /// WireGuard socket's encrypted UDP and nothing else this uid owns.
+    /// drop, keyed on this uid, the source port **and** the provider
+    /// endpoint, so it lets out the WireGuard socket's encrypted UDP and
+    /// nothing else this uid owns. One line per endpoint, de-duplicated.
     #[test]
     fn ruleset_exempts_each_tunnels_transport_ahead_of_the_drop() {
+        let two_peers = Transport::new(
+            40001,
+            [
+                "203.0.113.5:51820".parse().unwrap(),
+                "198.51.100.1:51820".parse().unwrap(),
+            ],
+        );
         let rs = render_ruleset_with_transport(
             998,
             &[tunnel("wg-a"), tunnel("wg-b")],
-            &[51820, 40001, 51820],
+            &[transport_on(51820), two_peers, transport_on(51820)],
         )
         .unwrap();
         let expected = "\
 table inet torrentd_ks {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
+\t\tip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\" } drop
+\t\tip saddr 10.64.0.7 oifname != { \"lo\", \"wg-b\" } drop
 \t\tmeta skuid 998 oifname \"lo\" accept
 \t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-a\" accept
 \t\tmeta skuid 998 ip saddr 10.64.0.7 oifname \"wg-b\" accept
-\t\tmeta skuid 998 udp sport { 40001, 51820 } accept
+\t\tmeta skuid 998 ip daddr 198.51.100.1 udp sport 40001 udp dport 51820 accept
+\t\tmeta skuid 998 ip daddr 203.0.113.5 udp sport 40001 udp dport 51820 accept
+\t\tmeta skuid 998 ip daddr 198.51.100.1 udp sport 51820 udp dport 51820 accept
 \t\tmeta skuid 998 counter drop
 \t}
 }
@@ -1308,7 +1738,7 @@ table inet torrentd_ks {
     fn disable_against_real_nft() {
         disable().expect("no table yet: success, in any locale");
         apply(&install_script(998, &[tunnel("wg0")], &[]).unwrap()).expect("install onto no table");
-        apply(&install_script(998, &[tunnel("wg1")], &[51820]).unwrap())
+        apply(&install_script(998, &[tunnel("wg1")], &[transport_on(51820)]).unwrap())
             .expect("and replace a standing one in the same transaction");
         let listed = exec::run_ok("nft", &["list", "table", "inet", TABLE], None, exec::QUICK)
             .expect("list the table");
@@ -1339,6 +1769,8 @@ table inet torrentd_ks {
 table inet torrentd_ks {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
+\t\tip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\" } drop
+\t\tip saddr 10.64.0.7 oifname != { \"lo\", \"wg-b\" } drop
 \t\tmeta skuid 998 oifname \"lo\" accept
 \t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-a\" accept
 \t\tmeta skuid 998 ip saddr 10.64.0.7 oifname \"wg-b\" accept
@@ -1352,7 +1784,7 @@ table inet torrentd_ks {
     #[test]
     fn ruleset_dedups_shared_interface() {
         let rs = render_ruleset(1000, &[tunnel("wg0"), tunnel("wg0")]).unwrap();
-        assert_eq!(rs.matches("wg0").count(), 1);
+        assert_eq!(rs.matches("wg0").count(), 2, "one fence, one accept:\n{rs}");
         // Still fails closed: lo accept, one tunnel accept, then drop.
         assert!(rs.contains("meta skuid 1000 counter drop"));
     }
@@ -1387,7 +1819,7 @@ table inet torrentd_ks {
             998,
             &["wg\"x".to_string()],
             addr_of,
-            |_| Ok(51820),
+            |_| Ok(transport_on(51820)),
             |_| {
                 applied.set(true);
                 Ok(())
@@ -1411,19 +1843,34 @@ table inet torrentd_ks {
         })
     }
 
-    /// What `enable` installs for uid 998 over `wg-a` with two transport
-    /// ports: the table [`LIVE`] is nft's listing of.
+    /// The transport [`installed`] exempts: two peers, one on IPv6.
+    fn two_peer_transport() -> Transport {
+        Transport::new(
+            51820,
+            [
+                ENDPOINT.parse().unwrap(),
+                "[2001:db8::7]:4500".parse().unwrap(),
+            ],
+        )
+    }
+
+    /// What `enable` installs for uid 998 over `wg-a` with two peer
+    /// endpoints: the table the listings below are nft's listing of.
     fn installed() -> Installed {
-        Installed {
-            uid: 998,
-            table: render_ruleset_with_transport(998, &[tunnel("wg-a")], &[51820, 40001]).unwrap(),
-        }
+        Installed::render(
+            998,
+            vec![tunnel("wg-a")],
+            vec![("wg-a".to_string(), two_peer_transport())],
+        )
+        .unwrap()
     }
 
     const META: &str = r#"{"metainfo": {"version": "1.1.6", "release_name": "Commodore Bullmoose #7", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "torrentd_ks", "handle": 1}}, {"chain": {"family": "inet", "table": "torrentd_ks", "name": "output", "handle": 1, "type": "filter", "hook": "output", "prio": 0, "policy": "accept"}}"#;
+    const FENCE: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 2, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "10.2.0.2"}}, {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": {"set": ["lo", "wg-a"]}}}, {"drop": null}]}}"#;
     const LO: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 2, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "lo"}}, {"accept": null}]}}"#;
     const WG_A: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 3, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "10.2.0.2"}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg-a"}}, {"accept": null}]}}"#;
-    const PORTS: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 5, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": {"set": [40001, 51820]}}}, {"accept": null}]}}"#;
+    const PORT_V4: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 4, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": "198.51.100.1"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 51820}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 51820}}, {"accept": null}]}}"#;
+    const PORT_V6: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 5, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}}, "right": "2001:db8::7"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 51820}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 4500}}, {"accept": null}]}}"#;
     const DROP: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 6, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"counter": {"packets": 12, "bytes": 960}}, {"drop": null}]}}"#;
 
     /// `nft -j list table` as nftables 1.1.6 printed it for [`installed`]'s
@@ -1443,7 +1890,7 @@ table inet torrentd_ks {
     #[test]
     fn the_table_as_installed_verifies_intact() {
         assert_eq!(
-            verify_listing(listing(&[META, LO, WG_A, PORTS, DROP])).unwrap(),
+            verify_listing(listing(&[META, FENCE, LO, WG_A, PORT_V4, PORT_V6, DROP])).unwrap(),
             Verdict::Intact,
             "counter values and rule handles are not drift",
         );
@@ -1458,7 +1905,9 @@ table inet torrentd_ks {
             panic!("a flushed chain is drift; got {verdict:?}");
         };
         assert!(
-            why.starts_with("installed \"meta skuid 998 oifname \\\"lo\\\" accept\""),
+            why.starts_with(
+                "installed \"ip saddr 10.2.0.2 oifname != { \\\"lo\\\", \\\"wg-a\\\" } drop\""
+            ),
             "says which rule is missing; got {why}",
         );
     }
@@ -1484,23 +1933,40 @@ table inet torrentd_ks {
         let drop_policy = META.replace(r#""policy": "accept""#, r#""policy": "drop""#);
         let set = r#"{"set": {"family": "inet", "name": "s", "table": "torrentd_ks", "type": "ipv4_addr", "handle": 4}}"#;
         let unread = DROP.replace(r#"{"drop": null}"#, r#"{"jump": {"target": "x"}}"#);
+        let fence_widened = FENCE.replace(r#"["lo", "wg-a"]"#, r#"["eth0", "lo", "wg-a"]"#);
+        let fence_eq = FENCE.replace(r#""op": "!=""#, r#""op": "==""#);
+        let other_endpoint = PORT_V4.replace("198.51.100.1", "192.0.2.53");
+        let port_only = PORT_V4.replace(
+            r#"{"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": "198.51.100.1"}}, "#,
+            "",
+        );
+        let rest = [LO, WG_A, PORT_V4, PORT_V6, DROP];
+        let with = |head: &[&str], tail: &[&str]| listing(&[head, tail].concat());
         for (label, json) in [
             (
                 "an accept ahead of the drop",
-                listing(&[META, LO, accept_all, WG_A, PORTS, DROP]),
+                with(&[META, FENCE, LO, accept_all], &rest[1..]),
             ),
             (
                 "a tunnel address replaced",
-                listing(&[META, LO, &other_addr, PORTS, DROP]),
+                listing(&[META, FENCE, LO, &other_addr, PORT_V4, PORT_V6, DROP]),
             ),
-            (
-                "the policy changed",
-                listing(&[&drop_policy, LO, WG_A, PORTS, DROP]),
-            ),
-            ("a set", listing(&[META, set, LO, WG_A, PORTS, DROP])),
+            ("the policy changed", with(&[&drop_policy, FENCE], &rest)),
+            ("a set", with(&[META, set, FENCE], &rest)),
             (
                 "an unread verdict",
-                listing(&[META, LO, WG_A, PORTS, &unread]),
+                listing(&[META, FENCE, LO, WG_A, PORT_V4, PORT_V6, &unread]),
+            ),
+            ("the fence gone", with(&[META], &rest)),
+            ("the fence widened", with(&[META, &fence_widened], &rest)),
+            ("the fence inverted", with(&[META, &fence_eq], &rest)),
+            (
+                "an exemption to another endpoint",
+                listing(&[META, FENCE, LO, WG_A, &other_endpoint, PORT_V6, DROP]),
+            ),
+            (
+                "an exemption by port alone",
+                listing(&[META, FENCE, LO, WG_A, &port_only, PORT_V6, DROP]),
             ),
         ] {
             assert!(
@@ -1510,23 +1976,112 @@ table inet torrentd_ks {
         }
     }
 
-    /// nft stores a one-element set as the single value; it is read back as
-    /// the set the renderer writes.
+    /// A set's elements are compared in the order the renderer writes them,
+    /// whatever order the listing gives them in.
     #[test]
-    fn a_one_port_set_reads_back_as_rendered() {
-        let one = Installed {
-            uid: 998,
-            table: render_ruleset_with_transport(998, &[tunnel("wg-a")], &[51820]).unwrap(),
-        };
-        let port = PORTS.replace(r#"{"set": [40001, 51820]}"#, "51820");
-        let json = listing(&[META, LO, WG_A, &port, DROP]);
+    fn a_fence_set_listed_in_another_order_reads_back_as_rendered() {
+        let reordered = FENCE.replace(r#"["lo", "wg-a"]"#, r#"["wg-a", "lo"]"#);
+        assert_eq!(
+            verify_listing(listing(&[
+                META, &reordered, LO, WG_A, PORT_V4, PORT_V6, DROP
+            ]))
+            .unwrap(),
+            Verdict::Intact,
+        );
+    }
+
+    /// The transport read at the next check, scripted per interface.
+    fn reads<'a>(
+        answers: &'a [(&'static str, io::Result<Transport>)],
+    ) -> impl Fn(&str) -> io::Result<Transport> + 'a {
+        move |iface| match answers.iter().find(|(i, _)| *i == iface) {
+            Some((_, Ok(t))) => Ok(t.clone()),
+            Some((_, Err(e))) => Err(io::Error::new(e.kind(), e.to_string())),
+            None => panic!("{iface} was not scripted"),
+        }
+    }
+
+    /// #136, the re-raised link: back on a port the kernel picked, the
+    /// exemption installed at boot named the old one, and the tunnel
+    /// handshook and carried nothing until a restart. The next check reads
+    /// the new port and installs the ruleset again with it.
+    #[test]
+    fn a_transport_that_changed_is_installed_again_with_the_live_one() {
+        let mut installed = installed();
+        let before = installed.clone();
+        let applied = std::cell::RefCell::new(Vec::<String>::new());
+        let moved = Transport::new(45136, [ENDPOINT.parse().unwrap()]);
+        let changed = refresh(
+            &mut installed,
+            reads(&[("wg-a", Ok(moved.clone()))]),
+            |script| {
+                applied.borrow_mut().push(script.to_string());
+                Ok(())
+            },
+        );
+        assert!(changed);
+        assert_eq!(installed.transports, vec![("wg-a".to_string(), moved)]);
+        assert_eq!(installed.tunnels, before.tunnels, "the pairing is kept");
+        let applied = applied.borrow();
+        assert_eq!(applied.len(), 1, "one install: {applied:?}");
+        assert_eq!(applied[0], installed.script());
+        assert!(
+            applied[0].contains("udp sport 45136 udp dport 51820 accept")
+                && !applied[0].contains("udp sport 51820"),
+            "the live port is exempted and the old one no longer is: {}",
+            applied[0],
+        );
+    }
+
+    #[test]
+    fn an_unchanged_transport_installs_nothing() {
+        let mut installed = installed();
+        let before = installed.clone();
+        let changed = refresh(
+            &mut installed,
+            reads(&[("wg-a", Ok(two_peer_transport()))]),
+            |_| panic!("nothing changed, nothing to install"),
+        );
+        assert!(!changed);
+        assert_eq!(installed, before);
+    }
+
+    /// A link that cannot be read keeps the exemption last read: scoped to
+    /// the endpoint it reaches nothing else, and a read that failed for any
+    /// other reason must not silence a working tunnel.
+    #[test]
+    fn a_transport_that_will_not_read_keeps_the_last_one() {
+        let mut installed = installed();
+        let before = installed.clone();
+        let changed = refresh(
+            &mut installed,
+            reads(&[("wg-a", Err(io::Error::other("Unable to access interface")))]),
+            |_| panic!("nothing read, nothing to install"),
+        );
+        assert!(!changed);
+        assert_eq!(installed, before);
+    }
+
+    /// An install of the live transport that fails still replaces what the
+    /// watch compares the live table with, so the check that follows reads
+    /// the old table as drift and fences every vpn profile.
+    #[test]
+    fn a_failed_install_of_the_live_transport_is_drift_at_the_check() {
+        let mut installed = installed();
+        let changed = refresh(
+            &mut installed,
+            reads(&[("wg-a", Ok(transport_on(45136)))]),
+            |_| Err(io::Error::other("nft -f - exited 1")),
+        );
+        assert!(changed);
+        let live = listing(&[META, FENCE, LO, WG_A, PORT_V4, PORT_V6, DROP]);
         let verdict = verify_with(
-            &one,
+            &installed,
             || Ok(format!("table inet {TABLE}\n")),
-            move || Ok(json.clone()),
+            move || Ok(live.clone()),
         )
         .unwrap();
-        assert_eq!(verdict, Verdict::Intact);
+        assert!(matches!(verdict, Verdict::Drifted(_)), "got {verdict:?}");
     }
 
     /// A check that cannot run is an error, not a verdict: not knowing is
