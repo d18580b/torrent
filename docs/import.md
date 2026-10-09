@@ -249,6 +249,8 @@ which case it is that error's message:
 | `refused by the profile's allowed_tracker_domains` | The torrent announces to a tracker outside the profile's list | Wrong profile, or the list is missing a domain. Never widen the list to fit another account's tracker |
 | `refused: the torrent announces to no tracker at all` | No tracker in the `.torrent` or the resume data | Supply a `.torrent` that carries its trackers |
 | `info-hash already loaded in profile …` | Another profile (or this one) already holds it | Adopt it into that profile, or `DELETE` it there first |
+| `infohash … already assigned to profile …` | The assignment registry gives it to another profile in a row the daemon had not seen yet, such as one `torrentd pool scan` wrote while the daemon ran | Adopt it into that profile, or `DELETE` it there first |
+| `assignment registry database …` | The assignment registry could not be written, or holds a row with an unusable profile id. A `torrentd pool scan` holding the database for longer than the 5-second busy timeout gives `database is locked` | Adopt again once the other writer finishes. For any other cause, the message names the database and what is wrong with it |
 | `the pool index assigns this torrent to profile …` | The index records another profile as its owner, even with no session holding it | Adopt into that profile, or `DELETE` it first, which clears the owner |
 | `profile … is not live`, `profile failed to start: …` | The session is not running | Fix the profile, then adopt |
 | `unknown profile_id` | The profile stopped being configured while the batch ran (an unknown id up front is a `404` for the whole request) | Check the `profile_id` against the configuration, then adopt |
