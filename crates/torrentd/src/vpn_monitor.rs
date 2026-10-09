@@ -550,6 +550,10 @@ async fn run_with(
                 hh.tunnel_ip = current;
                 hh.paused_for_vpn = paused;
             });
+            // The clock goes with the fence, not with the next poll: a fence
+            // lifted before that poll would otherwise keep the clock from
+            // before it and be fenced `no_handshake` on the first poll after.
+            unanswered_since.remove(&profile_id);
 
             metrics.set_gauge("profile_vpn_tunnel_up", 0.0, &labels);
             // Only an actual IP change increments the IP-change counter. It
@@ -1017,6 +1021,47 @@ mod tests {
         let (status, exported) = poll_acct_a_held(seeding(), max_age, elsewhere, 1, true).await;
         assert_eq!(status, ProfileStatus::VpnDown, "{exported}");
         assert!(fenced_once_for(&exported, "route_mismatch"), "{exported}");
+    }
+
+    /// A fence lifted before the monitor's next poll starts the no-handshake
+    /// clock afresh: the fence drops it, not the poll that would have seen
+    /// the profile `vpn_down`.
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_lifted_before_the_next_poll_restarts_the_no_handshake_clock() {
+        use crate::profile_registry::test_entry;
+
+        let max_age = Duration::from_secs(60);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "acct_a",
+            ProfileStatus::Active,
+        )]));
+        let metrics = Arc::new(PromSink::new());
+        let (tx, rx) = broadcast::channel(1);
+        let task = tokio::spawn(run_with(
+            profiles.clone(),
+            Arc::new(state),
+            metrics.clone(),
+            max_age,
+            rx,
+            scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None)),
+        ));
+        let entry = profiles.iter().next().unwrap();
+
+        // Fenced `no_handshake` at the fourth poll, as above.
+        tokio::time::sleep(POLL_INTERVAL * 4 + Duration::from_secs(1)).await;
+        assert_eq!(entry.health().status, ProfileStatus::VpnDown);
+
+        // Lifted before the fifth poll; the clock restarts there, so the
+        // fifth and sixth polls (0s, 30s unanswered) leave it up.
+        entry.update_health(|h| h.status = ProfileStatus::Active);
+        tokio::time::sleep(POLL_INTERVAL * 2).await;
+        tx.send(ShutdownReason::Test).unwrap();
+        task.await.unwrap();
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        assert_eq!(entry.health().status, ProfileStatus::Active, "{exported}");
+        assert!(fenced_once_for(&exported, "no_handshake"), "{exported}");
     }
 
     #[test]
