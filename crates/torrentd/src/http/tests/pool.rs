@@ -983,6 +983,75 @@ async fn adoption_holds_every_torrent_to_the_profiles_tracker_domains() {
     );
 }
 
+/// Issue #115's acceptance: payload rewritten in place at the same size after
+/// the scan is caught by the adopt itself, with no drift check run first. The
+/// index's sizes still match, so without the adopt's own pass the previous
+/// client's "complete" would seed bytes nobody verified.
+#[tokio::test]
+async fn an_adopt_checks_its_selection_for_drift_before_trusting_resume_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let source = metainfo("http://tracker.example/announce");
+    std::fs::write(library.join(format!("{IH_A}.torrent")), &source).unwrap();
+    let resume = library.join(format!("{IH_A}.fastresume"));
+    std::fs::write(&resume, fastresume(&source, None)).unwrap();
+    let mut row = torrent(dir.path(), IH_A, 96, 2);
+    row.fastresume_path = Some(resume);
+    index.with_store_mut(|st| st.upsert_torrent(&row, 0).unwrap());
+
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+    let w = h.tokens.write.clone();
+    let post = |dry_run| {
+        let w = w.clone();
+        let h = &h;
+        async move {
+            let resp = h
+                .send(
+                    "POST",
+                    "/v1/pool/adoptions",
+                    Some(&w),
+                    adopt(
+                        "p",
+                        dry_run,
+                        json!({"kind": "subtree", "root_id": root_id, "path": "movies"}),
+                    ),
+                )
+                .await;
+            resp.assert_status(StatusCode::OK);
+            resp.json::<Value>()
+        }
+    };
+
+    // Untouched since the scan: the pass finds nothing, the fast path stands.
+    let r = post(true).await;
+    assert_eq!(r["fast_path"], json!([IH_A]), "{r}");
+    assert_eq!(
+        index.with_store(|st| st.adoption_state(IH_A).unwrap()),
+        Some(AdoptionState::Matched)
+    );
+
+    // Re-encoded at the same size. The dry run already sees it: the pass
+    // runs before its result is computed, and records what it found.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    write(&dir.path().join("pool"), "movies/a.bin", 64);
+    let r = post(true).await;
+    assert!(r["fast_path"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(r["queued_for_verification"], json!([IH_A]), "{r}");
+    assert_eq!(
+        index.with_store(|st| st.adoption_state(IH_A).unwrap()),
+        Some(AdoptionState::Drifted)
+    );
+    assert_eq!(h.state.registry.len(), 0, "a dry run claims nothing");
+
+    // And the adoption hashes it rather than seeding it on the old claim.
+    let r = post(false).await;
+    assert!(r["fast_path"].as_array().unwrap().is_empty(), "{r}");
+    assert_eq!(r["queued_for_verification"], json!([IH_A]), "{r}");
+}
+
 #[tokio::test]
 async fn a_delete_clears_the_pool_index_owner_it_set() {
     // Adoption refuses a torrent the index says another profile owns, so the
