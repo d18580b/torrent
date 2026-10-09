@@ -71,7 +71,8 @@ pub struct PoolInfo {
     /// answers `404 pool-not-configured`.
     pub configured: bool,
     /// Whether `[pool] allow_mutations` is set: mutation plans and
-    /// `DELETE /v1/torrents/{infohash}?delete_files=true` need it.
+    /// `DELETE /v1/torrents/{infohash}?delete_files=true`, which moves a
+    /// torrent's payload to the trash, need it.
     pub allow_mutations: bool,
 }
 

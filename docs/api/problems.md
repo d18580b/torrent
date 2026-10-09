@@ -181,6 +181,21 @@ cross-seed of the same payload, or a conflict — so deleting them would delete
 that torrent's payload too. `detail` names the first. Retry without
 `delete_files` to remove the torrent alone.
 
+## `payload-untrashable`
+
+**409**, from `DELETE /v1/torrents/{infohash}?delete_files=true`. The payload
+goes to the trash, never away, and this one cannot be shown safe to move
+there. `detail` names the first file and which of these failed:
+
+- it lies outside every managed root, so there is no trash to move it to;
+- the pool index does not record it, or does not record this torrent
+  claiming it, so the co-claimant check cannot see it;
+- it changed since the scan that indexed it (size, mtime, inode or device).
+
+Nothing was changed: the torrent is still in its session. Rescan
+(`POST /v1/pool/scan`) and retry, or retry without `delete_files` to remove
+the torrent alone and deal with the files by hand.
+
 ## `metadata-pending`
 
 **409.** The torrent was added from a magnet URI and has not received its
@@ -253,6 +268,13 @@ with.
 **422**, from `POST /v1/pool/plans/{plan_id}/apply`. The `confirm_token` is not
 this plan's. Tokens are derived from the plan's steps, so a token cannot be
 carried over from another plan.
+
+## `delete-unconfirmed`
+
+**422**, from `DELETE /v1/torrents/{infohash}?delete_files=true`. Deleting a
+torrent's payload needs `confirm` set to the same infohash as the path, and it
+was absent or named another torrent. Check that this is the torrent whose
+files should go, then re-send with `confirm={infohash}`.
 
 ## `reload-pending`
 

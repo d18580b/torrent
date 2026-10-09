@@ -615,12 +615,39 @@ fn delete_file(
         return Err(format!("{}: {why}", path.display()));
     }
 
+    let stamp = (row.size, row.mtime_ns, row.ino, row.dev);
+    move_into_trash(&root, path, &rel, stamp, &plan_id.to_string())?;
+    info!(
+        target: "torrentd::pool::apply",
+        plan_id,
+        path = %path.display(),
+        "moved to the trash",
+    );
+    Ok(())
+}
+
+/// Move the file at `rel` under `root` (`path` is the two joined, for
+/// messages) into `<root>/.torrentd-trash/<bucket>/`, keeping its
+/// root-relative directories, once its `(size, mtime, inode, device)` is
+/// still `stamp` — the scan's record of it.
+///
+/// The path is walked from the root one directory at a time with
+/// `O_NOFOLLOW`, the file is examined and moved through its parent's
+/// descriptor, the move is `renameat2(RENAME_NOREPLACE)`, and both
+/// directories are fsynced so it survives a crash.
+fn move_into_trash(
+    root: &Path,
+    path: &Path,
+    rel: &str,
+    stamp: (u64, i64, u64, u64),
+    bucket: &str,
+) -> Result<(), String> {
     let (dirs, name) = match rel.rsplit_once('/') {
         Some((d, n)) => (d.split('/').collect::<Vec<_>>(), n),
-        None => (Vec::new(), rel.as_str()),
+        None => (Vec::new(), rel),
     };
     let root_dir =
-        std::fs::File::open(&root).map_err(|e| format!("open {}: {e}", root.display()))?;
+        std::fs::File::open(root).map_err(|e| format!("open {}: {e}", root.display()))?;
     let parent = fsat::walk(&root_dir, &dirs, false)
         .map_err(|e| format!("{}: {e}; refusing to follow it", path.display()))?;
     let parent = parent.as_ref().unwrap_or(&root_dir);
@@ -630,38 +657,197 @@ fn delete_file(
     if !md.is_file() {
         return Err(format!("{} is not a regular file", path.display()));
     }
-    if torrentd_pool::file_stamp(&md) != (row.size, row.mtime_ns, row.ino, row.dev) {
+    if torrentd_pool::file_stamp(&md) != stamp {
         return Err(format!(
-            "{} changed since the scan that called it unclaimed; rescan before deleting",
+            "{} changed since the scan that indexed it; rescan before deleting",
             path.display(),
         ));
     }
 
-    let plan_dir = plan_id.to_string();
-    let mut trash_dirs = vec![torrentd_pool::plan::TRASH_DIR, plan_dir.as_str()];
+    let mut trash_dirs = vec![torrentd_pool::plan::TRASH_DIR, bucket];
     trash_dirs.extend(dirs.iter().copied());
     let trash = fsat::walk(&root_dir, &trash_dirs, true)
         .map_err(|e| format!("trash for {}: {e}", path.display()))?
         .expect("a non-empty walk yields a directory");
     fsat::rename_noreplace(parent, name, &trash, name).map_err(|e| {
         format!(
-            "move {} into {}/{}: {e}",
+            "move {} into {}/{bucket}: {e}",
             path.display(),
             torrentd_pool::plan::TRASH_DIR,
-            plan_dir,
         )
     })?;
     // Both directory entries changed; without these the rename can be lost
     // to a crash and the file reappear where the journal says it is gone.
     fsat::fsync(parent).map_err(|e| format!("fsync {}: {e}", path.display()))?;
     fsat::fsync(&trash).map_err(|e| format!("fsync trash: {e}"))?;
-    info!(
-        target: "torrentd::pool::apply",
-        plan_id,
-        path = %path.display(),
-        "moved to the trash",
-    );
     Ok(())
+}
+
+/// A torrent's payload, proven movable to the trash before anything is
+/// done to the torrent. Built by [`torrent_payload`], consumed by
+/// [`trash_torrent_payload`].
+#[derive(Debug)]
+pub struct TorrentPayload {
+    infohash: String,
+    files: Vec<PayloadFile>,
+}
+
+#[derive(Debug)]
+struct PayloadFile {
+    path: std::path::PathBuf,
+    root: std::path::PathBuf,
+    rel: String,
+    stamp: (u64, i64, u64, u64),
+}
+
+impl TorrentPayload {
+    /// How many files the trash move covers. Files the torrent lists that
+    /// were never created on disk are not among them.
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+}
+
+/// What [`trash_torrent_payload`] did.
+#[derive(Debug)]
+pub struct TrashOutcome {
+    /// Where the files went: `<root>/.torrentd-trash/<bucket>/` under each
+    /// root the payload spans.
+    pub trash: Vec<std::path::PathBuf>,
+    /// How many files were moved.
+    pub moved: usize,
+    /// The first file that could not be moved, and why. The move stops
+    /// there, so it and every file after it are still in place.
+    pub failed: Option<(std::path::PathBuf, String)>,
+}
+
+/// Prove that every file of the torrent `infohash` can go to the trash, and
+/// say which.
+///
+/// `save_path` and `files` (torrent-relative, `/`-separated) are the
+/// session's view of where the payload lies. Each file that exists must:
+///
+/// 1. lie inside a managed root, because the trash is a directory of a root
+///    and a payload outside every root has no trash to go to;
+/// 2. be in the index, and claimed there by this torrent — the index's
+///    record is what the co-claimant check and the re-stat below rest on,
+///    and a torrent the matcher has not placed contributes neither;
+/// 3. still be the file the index recorded: the same `(size, mtime, inode,
+///    device)`, checked here and again at the move.
+///
+/// A listed file that is on neither the disk nor the index was never
+/// written, and is skipped. Nothing is changed on any outcome.
+pub fn torrent_payload(
+    pool: &PoolService,
+    infohash: &str,
+    save_path: &Path,
+    files: &[String],
+) -> Result<TorrentPayload, String> {
+    let claims: std::collections::HashSet<(i64, String)> = pool
+        .with_store(|s| s.claims_of(infohash))
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .collect();
+    let mut out = Vec::with_capacity(files.len());
+    for file in files {
+        let path = save_path.join(file);
+        let Some((root_id, root, rel)) = pool.roots().iter().find_map(|(id, root)| {
+            path.strip_prefix(root)
+                .ok()
+                .map(|r| (*id, root.clone(), r.to_string_lossy().replace('\\', "/")))
+        }) else {
+            return Err(format!(
+                "{} is outside every managed root, so there is no trash to move it to",
+                path.display(),
+            ));
+        };
+        if !torrentd_pool::plan::contains(&root, &path) {
+            return Err(format!(
+                "{} is outside every managed root, so there is no trash to move it to",
+                path.display(),
+            ));
+        }
+        let on_disk = match std::fs::symlink_metadata(&path) {
+            Ok(md) => Some(md),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(format!("stat {}: {e}", path.display())),
+        };
+        let row = pool
+            .with_store(|s| s.file(root_id, &rel))
+            .map_err(|e| e.to_string())?;
+        let (md, row) = match (on_disk, row) {
+            (None, None) => continue,
+            (Some(md), Some(row)) => (md, row),
+            (None, Some(_)) => {
+                return Err(format!(
+                    "{} is in the index but not on disk; rescan before deleting",
+                    path.display(),
+                ))
+            }
+            (Some(_), None) => {
+                return Err(format!(
+                    "{} is not in the index; rescan before deleting",
+                    path.display(),
+                ))
+            }
+        };
+        if !claims.contains(&(root_id, rel.clone())) {
+            return Err(format!(
+                "the index does not record this torrent claiming {}; rescan before deleting",
+                path.display(),
+            ));
+        }
+        if !md.is_file() {
+            return Err(format!("{} is not a regular file", path.display()));
+        }
+        let stamp = (row.size, row.mtime_ns, row.ino, row.dev);
+        if torrentd_pool::file_stamp(&md) != stamp {
+            return Err(format!(
+                "{} changed since the scan that indexed it; rescan before deleting",
+                path.display(),
+            ));
+        }
+        out.push(PayloadFile {
+            path,
+            root,
+            rel,
+            stamp,
+        });
+    }
+    Ok(TorrentPayload {
+        infohash: infohash.to_owned(),
+        files: out,
+    })
+}
+
+/// Move `payload` into `<root>/.torrentd-trash/<bucket>/`, each file
+/// re-stat'd against the index at the moment it moves. Stops at the first
+/// file that cannot be moved, and leaves it and the rest in place: nothing
+/// is ever unlinked.
+pub fn trash_torrent_payload(payload: &TorrentPayload, bucket: &str) -> TrashOutcome {
+    let mut out = TrashOutcome {
+        trash: Vec::new(),
+        moved: 0,
+        failed: None,
+    };
+    for f in &payload.files {
+        if let Err(e) = move_into_trash(&f.root, &f.path, &f.rel, f.stamp, bucket) {
+            out.failed = Some((f.path.clone(), e));
+            break;
+        }
+        let trash = f.root.join(torrentd_pool::plan::TRASH_DIR).join(bucket);
+        if !out.trash.contains(&trash) {
+            out.trash.push(trash);
+        }
+        out.moved += 1;
+        info!(
+            target: "torrentd::pool::apply",
+            infohash = %payload.infohash,
+            path = %f.path.display(),
+            "moved a deleted torrent's file to the trash",
+        );
+    }
+    out
 }
 
 /// The planner's unresolved-payload guards, per root, as of one index
@@ -1674,6 +1860,131 @@ mod tests {
             orphans.is_empty(),
             "the trash is never indexed: {orphans:?}"
         );
+    }
+
+    /// Index `rel` under the root and record `infohash` claiming it.
+    fn claimed(pool: &PoolService, dir: &Path, infohash: &str, rel: &str) {
+        pool.with_store_mut(|st| {
+            st.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: infohash.to_owned(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "T".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.join("t.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )?;
+            st.replace_claims(infohash, &[(pool.roots()[0].0, rel.to_owned())])
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_torrents_payload_goes_to_the_trash_once_every_file_is_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let f = write(&root, "T/a.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+
+        // A listed file never written is skipped, not refused.
+        let files = ["T/a.bin".to_owned(), "T/never.bin".to_owned()];
+        let payload = torrent_payload(&pool, &ih, &root, &files).unwrap();
+        assert_eq!(payload.file_count(), 1);
+        let out = trash_torrent_payload(&payload, "torrent-x-1");
+        assert!(out.failed.is_none(), "{:?}", out.failed);
+        assert_eq!(out.moved, 1);
+        assert_eq!(out.trash, vec![root.join(".torrentd-trash/torrent-x-1")]);
+        assert!(!f.exists());
+        assert_eq!(
+            std::fs::read(root.join(".torrentd-trash/torrent-x-1/T/a.bin")).unwrap(),
+            vec![7u8; 16]
+        );
+    }
+
+    #[test]
+    fn a_torrents_payload_is_refused_unless_every_file_is_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let claimed_file = write(&root, "T/a.bin", 16);
+        let unclaimed = write(&root, "T/b.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        let refusal = |save: &Path, files: &[&str]| {
+            let files: Vec<String> = files.iter().map(|f| (*f).to_owned()).collect();
+            torrent_payload(&pool, &ih, save, &files).unwrap_err()
+        };
+
+        // Outside every root: there is no trash to go to.
+        let outside = dir.path().join("data");
+        write(&outside, "T/a.bin", 16);
+        let e = refusal(&outside, &["T/a.bin"]);
+        assert!(e.contains("outside every managed root"), "{e}");
+
+        // Indexed, but the index does not say it is this torrent's.
+        let e = refusal(&root, &["T/a.bin", "T/b.bin"]);
+        assert!(e.contains("does not record this torrent claiming"), "{e}");
+
+        // On disk, never scanned.
+        write(&root, "T/new.bin", 16);
+        let e = refusal(&root, &["T/new.bin"]);
+        assert!(e.contains("not in the index"), "{e}");
+
+        // Rewritten since the scan.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&claimed_file, vec![9u8; 48]).unwrap();
+        let e = refusal(&root, &["T/a.bin"]);
+        assert!(e.contains("changed since the scan"), "{e}");
+
+        assert!(claimed_file.exists() && unclaimed.exists());
+        assert!(!root.join(".torrentd-trash").exists());
+    }
+
+    #[test]
+    fn a_file_that_changes_after_the_proof_stops_the_move_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let a = write(&root, "T/a.bin", 16);
+        let b = write(&root, "T/b.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        pool.with_store_mut(|st| {
+            st.replace_claims(
+                &ih,
+                &[
+                    (pool.roots()[0].0, "T/a.bin".to_owned()),
+                    (pool.roots()[0].0, "T/b.bin".to_owned()),
+                ],
+            )
+        })
+        .unwrap();
+
+        let files = ["T/a.bin".to_owned(), "T/b.bin".to_owned()];
+        let payload = torrent_payload(&pool, &ih, &root, &files).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&b, vec![9u8; 48]).unwrap();
+
+        let out = trash_torrent_payload(&payload, "torrent-x-1");
+        assert_eq!(out.moved, 1);
+        let (path, why) = out.failed.unwrap();
+        assert_eq!(path, b);
+        assert!(why.contains("changed since the scan"), "{why}");
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&b).unwrap(), vec![9u8; 48], "never unlinked");
     }
 
     #[test]

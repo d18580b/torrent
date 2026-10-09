@@ -30,6 +30,7 @@ use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileId;
 use torrentd_engine::TorrentDetails;
 use torrentd_engine::TorrentEngine;
+use torrentd_engine::TorrentHandle;
 use torrentd_engine::TorrentState;
 use torrentd_engine::TrackerRefusal;
 use tracing::warn;
@@ -1038,9 +1039,13 @@ const O_NONBLOCK: i32 = 0x800;
 /// How to remove a torrent.
 #[derive(Schema, QueryParams)]
 pub struct DeleteTorrentQuery {
-    /// Also delete the payload from disk. Needs `[pool] allow_mutations`;
-    /// `false` when absent.
+    /// Also move the payload into the trash of the managed root it lies in
+    /// (`<root>/.torrentd-trash/torrent-<infohash>-<unix seconds>/`). Needs
+    /// `[pool] allow_mutations` and `confirm`; `false` when absent.
     pub delete_files: Option<bool>,
+    /// With `delete_files=true`: this torrent's infohash, repeated, to confirm
+    /// that its payload is the one to delete. Ignored otherwise.
+    pub confirm: Option<String>,
 }
 
 torrent_error! {
@@ -1050,6 +1055,13 @@ torrent_error! {
         #[error("deleting payload requires a [pool] section with `allow_mutations = true`")]
         #[problem(status = 403, title = "Mutations are disabled")]
         MutationsDisabled,
+        /// `delete_files=true` without `confirm` repeating the infohash.
+        #[error(
+            "deleting payload needs `confirm` set to this torrent's infohash; re-send with \
+             `confirm={infohash}` once it is the torrent whose payload should go"
+        )]
+        #[problem(status = 422, title = "The delete is not confirmed")]
+        DeleteUnconfirmed { infohash: String },
         /// No torrent with this infohash is assigned to any profile.
         #[error("no torrent with this infohash")]
         #[problem(status = 404, title = "Torrent not found")]
@@ -1067,6 +1079,13 @@ torrent_error! {
         #[error("{detail}")]
         #[problem(status = 409, title = "The payload is shared")]
         PayloadShared { detail: String },
+        /// `delete_files=true` for a torrent whose payload cannot be proven
+        /// safe to move to the trash: a file outside every managed root, one
+        /// the index does not record this torrent claiming, or one that
+        /// changed since the scan. Nothing was changed.
+        #[error("{detail}")]
+        #[problem(status = 409, title = "The payload cannot be trashed")]
+        PayloadUntrashable { detail: String },
         /// `delete_files=true` for a torrent whose profile has no running
         /// session: its payload is reachable only through one.
         #[error("{detail}")]
@@ -1087,10 +1106,14 @@ torrent_error! {
 /// Remove a torrent.
 ///
 /// Removes it from its session and clears its assignment, so the infohash can
-/// be added again. `delete_files=true` also deletes the payload, and needs
-/// `[pool] allow_mutations`. A torrent whose profile has no running session,
-/// or that the boot left unloaded, is cleared from the daemon's records
-/// alone (`delete_files` is refused there: nothing can reach the payload). A
+/// be added again. `delete_files=true` also moves the payload into the trash
+/// of the managed root it lies in, never unlinking it, and needs `[pool]
+/// allow_mutations` and `confirm` repeating the infohash. It is refused,
+/// changing nothing, unless every file is under a managed root, claimed by
+/// this torrent alone in the pool index, and unchanged since the scan that
+/// indexed it. A torrent whose profile has no running session, or that the
+/// boot left unloaded, is cleared from the daemon's records alone
+/// (`delete_files` is refused there: nothing can reach the payload). A
 /// torrent still being added is `409 torrent-adding`; retry once it lists a
 /// phase other than `unknown`.
 #[kynos::delete("/torrents/{infohash}", tag = Torrents)]
@@ -1113,6 +1136,19 @@ pub async fn delete_torrent(
     // operation wide open on exactly the deployments with the least context.
     if delete_files && s.pool.as_ref().is_none_or(|p| !p.allow_mutations()) {
         return Err(DeleteTorrentError::MutationsDisabled);
+    }
+    // One flag is too little to stand between a request and a payload: the
+    // infohash has to be said twice, so a client that sets `delete_files` on
+    // the wrong call, or a script that templates it in, is refused.
+    if delete_files
+        && !q
+            .confirm
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&ih.to_hex()))
+    {
+        return Err(DeleteTorrentError::DeleteUnconfirmed {
+            infohash: ih.to_hex(),
+        });
     }
     // The planner refuses to delete a file two torrents claim, and this is the
     // same deletion spelled differently: libtorrent removes every file in this
@@ -1169,12 +1205,43 @@ pub async fn delete_torrent(
             // delete a `409 torrent-adding`, so the clear runs in the task.
             let settler = Arc::clone(&s);
             blocking(move || {
-                engine
-                    .remove_torrent(st.handle, delete_files)
-                    .map_err(|e| DeleteTorrentError::Internal {
+                // Proven before the torrent leaves its session, so a refusal
+                // changes nothing and the torrent goes on seeding.
+                let payload = if delete_files {
+                    Some(payload_to_trash(&settler, &engine, &ih, st.handle)?)
+                } else {
+                    None
+                };
+                // libtorrent never deletes the files itself: they go to the
+                // trash below, where an operator can take them back.
+                engine.remove_torrent(st.handle, false).map_err(|e| {
+                    DeleteTorrentError::Internal {
                         detail: internal("removing the torrent from its session", e),
-                    })?;
-                clear_assignment(&settler, &ih, &profile, delete_files)
+                    }
+                })?;
+                let Some(payload) = payload else {
+                    return clear_assignment(&settler, &ih, &profile, false);
+                };
+                let bucket = format!("torrent-{}-{}", ih.to_hex(), unix_now());
+                let outcome = crate::pool_apply::trash_torrent_payload(&payload, &bucket);
+                // The session no longer holds it, so the assignment is
+                // cleared whatever the move did: left in place it would answer
+                // every later delete `409 torrent-adding`.
+                clear_assignment(&settler, &ih, &profile, outcome.failed.is_none())?;
+                if let Some((path, why)) = outcome.failed {
+                    return Err(DeleteTorrentError::Internal {
+                        detail: format!(
+                            "{} The torrent was removed from its session and its assignment \
+                             cleared; {} of {} file(s) were moved to the trash, and {} and \
+                             the rest are where they were. Nothing was unlinked.",
+                            internal("moving the payload to the trash", why),
+                            outcome.moved,
+                            payload.file_count(),
+                            path.display(),
+                        ),
+                    });
+                }
+                Ok(())
             })
             .await?;
         }
@@ -1192,6 +1259,47 @@ pub async fn delete_torrent(
         None => return Err(DeleteTorrentError::TorrentAdding),
     }
     Ok(NoContent)
+}
+
+/// The files `delete_files` would move to the trash for the torrent `h`,
+/// each proven to lie under a managed root, to be claimed by this torrent in
+/// the pool index, and to be unchanged since the scan — or why not.
+fn payload_to_trash(
+    s: &AppState,
+    engine: &Arc<dyn TorrentEngine>,
+    ih: &InfoHash,
+    h: TorrentHandle,
+) -> Result<crate::pool_apply::TorrentPayload, DeleteTorrentError> {
+    let Some(pool) = s.pool.as_ref() else {
+        // Checked by the handler already; a pool is what holds the trash.
+        return Err(DeleteTorrentError::MutationsDisabled);
+    };
+    let session_err = |e| DeleteTorrentError::Internal {
+        detail: internal("reading the torrent's files from its session", e),
+    };
+    let details = engine.torrent_details(h).map_err(session_err)?;
+    let files: Vec<String> = engine
+        .torrent_files(h)
+        .map_err(session_err)?
+        .unwrap_or_default()
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    crate::pool_apply::torrent_payload(pool, &ih.to_hex(), FsPath::new(&details.save_path), &files)
+        .map_err(|why| DeleteTorrentError::PayloadUntrashable {
+            detail: format!(
+                "{why}. Nothing was changed; the torrent is still in its session. Retry \
+             without `delete_files` to remove the torrent alone."
+            ),
+        })
+}
+
+/// Seconds since the epoch, naming a deleted torrent's trash directory.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Clear `ih`'s assignment to `profile` once no session holds it.

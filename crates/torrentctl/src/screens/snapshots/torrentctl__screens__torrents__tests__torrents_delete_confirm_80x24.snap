@@ -9,10 +9,10 @@ expression: screen
 │         profile  acct_a                                                      │
 │           phase  ● seeding                                                   │
 │        progress  100.0%                                                      │
-│     upload rate  1.5 MiB/s                                                   │
-│   down╭ Remove torrent and delete files ─────────────────────────────╮       │
-│       │Remove debian-13.1.0-amd64-netinst.iso (01a1b2c3d4e5) and     │       │
-│payload│DELETE its payload from disk? This cannot be undone.          │       │
+│     up╭ Remove torrent and delete files ─────────────────────────────╮       │
+│   down│Remove debian-13.1.0-amd64-netinst.iso (01a1b2c3d4e5) and move│       │
+│       │its payload to the pool's trash? The daemon forgets it; the   │       │
+│payload│files can be restored from .torrentd-trash.                   │       │
 │       │                                                              │       │
 │       │Type delete to confirm:                                       │       │
 │       │› del                                                         │       │

@@ -752,14 +752,14 @@ pub fn view(
 }
 
 #[cfg(test)]
-mod wire_tests {
+pub(super) mod wire_tests {
     use tokio::io::AsyncReadExt as _;
     use tokio::io::AsyncWriteExt as _;
 
     use super::*;
 
     /// Serve one request with `status` and `body`, returning what was sent.
-    async fn serve_once(
+    pub(in crate::screens::torrents) async fn serve_once(
         status: &'static str,
         body: String,
     ) -> (String, tokio::task::JoinHandle<String>) {

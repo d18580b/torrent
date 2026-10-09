@@ -209,19 +209,43 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     // `delete_files` on a sessionless profile, with mutations allowed so the
     // guard in front of it is not what refuses.
     let dir = tempfile::tempdir().unwrap();
+    let mut engines = None;
     let h = Harness::authed(cov, |s| {
-        fixture(s, dir.path());
+        engines = Some(fixture(s, dir.path()));
         s.pool = crate::pool_service::PoolService::open(&crate::config::Config::minimal_for_tests(
             dir.path(),
             true,
         ))
         .unwrap();
     });
+    let engines = engines.unwrap();
     assert!(h.state.pool.as_ref().is_some_and(|p| p.allow_mutations()));
+    // One flag is not enough: the infohash has to be repeated as `confirm`,
+    // and another torrent's is refused the same way.
+    for query in [
+        "delete_files=true".to_owned(),
+        format!("delete_files=true&confirm={}", hex(STALE)),
+    ] {
+        let resp = h
+            .write("DELETE", &format!("/v1/torrents/{}?{query}", hex(LOADED)))
+            .await;
+        assert_problem(&resp, 422, "delete-unconfirmed");
+        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        assert!(detail.contains(&hex(LOADED)), "{detail}");
+        assert!(h.state.registry.lookup(&LOADED).is_some());
+    }
+    assert!(
+        engines.p.calls().is_empty(),
+        "an unconfirmed delete reaches no session"
+    );
     let resp = h
         .write(
             "DELETE",
-            &format!("/v1/torrents/{}?delete_files=true", hex(STALE)),
+            &format!(
+                "/v1/torrents/{}?delete_files=true&confirm={}",
+                hex(STALE),
+                hex(STALE)
+            ),
         )
         .await;
     assert_problem(&resp, 409, "profile-unavailable");
@@ -262,14 +286,14 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
             st.replace_claims(ih, &[(root_id, "X/data.bin".to_owned())])
         })
     };
+    let delete_files = format!(
+        "/v1/torrents/{}?delete_files=true&confirm={}",
+        hex(LOADED),
+        hex(LOADED)
+    );
     add(&hex(LOADED)).unwrap();
     add(&shared_with).unwrap();
-    let resp = h
-        .write(
-            "DELETE",
-            &format!("/v1/torrents/{}?delete_files=true", hex(LOADED)),
-        )
-        .await;
+    let resp = h.write("DELETE", &delete_files).await;
     assert_problem(&resp, 409, "payload-shared");
     assert!(resp.json::<Value>()["detail"]
         .as_str()
@@ -279,14 +303,69 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     pool.with_store_mut(|st| st.replace_claims(&shared_with, &[]))
         .unwrap();
 
-    // With mutations allowed, a loaded torrent's payload goes with it.
-    let resp = h
-        .write(
-            "DELETE",
-            &format!("/v1/torrents/{}?delete_files=true", hex(LOADED)),
-        )
-        .await;
+    // The session puts the payload under the managed root, where a file the
+    // index has never scanned sits: nothing proves it is this torrent's, so
+    // the delete changes nothing and the torrent keeps seeding.
+    let loaded = handle(&engines.p, LOADED);
+    let root = dir.path().join("pool");
+    engines.p.set_torrent_details(
+        loaded,
+        TorrentDetails {
+            save_path: root.to_string_lossy().into_owned(),
+            ..MockEngine::default_details()
+        },
+    );
+    engines
+        .p
+        .set_torrent_files(loaded, Some(vec![file(0, "X/data.bin")]));
+    let data = root.join("X/data.bin");
+    std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+    std::fs::write(&data, vec![5u8; 64]).unwrap();
+    let resp = h.write("DELETE", &delete_files).await;
+    assert_problem(&resp, 409, "payload-untrashable");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("not in the index"), "{detail}");
+    assert!(data.exists());
+    assert!(h.state.registry.lookup(&LOADED).is_some());
+    assert!(!engines
+        .p
+        .calls()
+        .iter()
+        .any(|c| matches!(c, RecordedCall::RemoveTorrent { .. })));
+
+    // Scanned and claimed: the torrent leaves its session with libtorrent
+    // deleting nothing, and the file moves to the root's trash intact.
+    pool.scan().unwrap();
+    add(&hex(LOADED)).unwrap();
+    let resp = h.write("DELETE", &delete_files).await;
     resp.assert_status(StatusCode::NO_CONTENT);
+    assert!(called(
+        &engines.p,
+        &RecordedCall::RemoveTorrent {
+            handle: loaded,
+            delete_files: false
+        }
+    ));
+    assert!(!data.exists());
+    let buckets: Vec<_> = std::fs::read_dir(root.join(".torrentd-trash"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(buckets.len(), 1, "{buckets:?}");
+    let bucket = buckets[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        bucket.starts_with(&format!("torrent-{}-", hex(LOADED))),
+        "{bucket}"
+    );
+    assert_eq!(
+        std::fs::read(buckets[0].join("X/data.bin")).unwrap(),
+        vec![5u8; 64]
+    );
+    assert!(h.state.registry.lookup(&LOADED).is_none());
     h.assert_conformance();
 }
 

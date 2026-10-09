@@ -517,7 +517,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                     format!("reannounce sent for {short}; its trackers show the outcome")
                 }
                 Action::Remove => format!("removed {short}; its payload stays on disk"),
-                Action::RemoveFiles => format!("removed {short} and deleted its files"),
+                Action::RemoveFiles => format!("removed {short} and moved its files to the trash"),
                 Action::PauseAll | Action::ResumeAll => String::new(),
             };
             if matches!(action, Action::Remove | Action::RemoveFiles)
@@ -1260,7 +1260,8 @@ fn act(state: &mut State, action: Action, ctx: &Ctx<'_>) -> Vec<Effect> {
                 Confirm::new(
                     "Remove torrent and delete files",
                     format!(
-                        "Remove {what} and DELETE its payload from disk? This cannot be undone."
+                        "Remove {what} and move its payload to the pool's trash? The daemon \
+                         forgets it; the files can be restored from .torrentd-trash."
                     ),
                 )
                 .typed("delete"),
@@ -1284,8 +1285,11 @@ fn perform(api: &Api, action: Action, hash: String) -> Effect {
             Action::Reannounce => crate::api::call(client.reannounce_torrent(h)).await,
             Action::Remove => crate::api::call(client.delete_torrent(h, None)).await,
             Action::RemoveFiles => {
+                // The typed confirmation the operator gave is what the
+                // daemon's `confirm` stands for: name the torrent again.
                 let params = crate::api::generated::DeleteTorrentParams {
                     delete_files: Some(true),
+                    confirm: Some(h.clone()),
                 };
                 crate::api::call(client.delete_torrent(h, params)).await
             }
@@ -2068,6 +2072,33 @@ mod tests {
             );
             assert!(state.confirm.is_none());
         });
+    }
+
+    #[tokio::test]
+    async fn deleting_files_sends_the_infohash_as_confirm() {
+        let (url, server) = add::wire_tests::serve_once("204 No Content", String::new()).await;
+        let api = Api::new(&url, Some("tdp_wire")).unwrap();
+        let msg = perform(&api, Action::RemoveFiles, hash(1)).0.await;
+        assert!(
+            matches!(
+                msg,
+                crate::app::Msg::Torrents(Msg::Acted {
+                    action: Action::RemoveFiles,
+                    result: Ok(()),
+                    ..
+                })
+            ),
+            "{msg:?}"
+        );
+        let request = server.await.unwrap();
+        let line = request.lines().next().unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "DELETE /v1/torrents/{h}?delete_files=true&confirm={h} HTTP/1.1",
+                h = hash(1)
+            )
+        );
     }
 
     #[test]
