@@ -159,6 +159,23 @@ fn held_by_others_now(
     move |p| ports_held_by_others(profiles.iter(), &id).contains(&p)
 }
 
+/// Whether `id` is fenced (or gone), read from `profiles` each time it is
+/// asked.
+///
+/// [`renew_once`] reads the profile's status once, before the NAT-PMP
+/// exchange, and a renewal that then rebinds starts a reannounce that runs
+/// for as long as the profile has batches. A fence that lands in either
+/// window has to be seen in it: this is asked before the rebind and before
+/// each reannounce batch.
+fn fenced_now(profiles: Arc<ProfileRegistry>, id: ProfileId) -> impl Fn() -> bool + Send + 'static {
+    move || {
+        profiles
+            .resolve(&id)
+            .active()
+            .is_none_or(|e| e.health().status != ProfileStatus::Active)
+    }
+}
+
 /// `listen` is the stream the alert loop publishes listen outcomes into; a
 /// rebind waits on it, and defers until the loop has cleared its boot
 /// backlog.
@@ -301,7 +318,8 @@ async fn renew_profile(
             break;
         };
         let taken = held_by_others_now(profiles.clone(), id.clone());
-        let next = renew_once(e, &*metrics, &forwarder, &listen, taken).await;
+        let fenced = fenced_now(profiles.clone(), id.clone());
+        let next = renew_once(e, &*metrics, &forwarder, &listen, taken, fenced).await;
         delay = next.delay;
         if let Some(detected) = next.rebound_at {
             // The old port's reannounce has nothing left worth saying.
@@ -317,6 +335,7 @@ async fn renew_profile(
                 detected,
                 pace,
                 stop.clone(),
+                fenced_now(profiles.clone(), id.clone()),
             )));
         }
     }
@@ -350,6 +369,12 @@ impl Next {
 /// A rebind used to reannounce every torrent in the profile in one burst,
 /// inside the blocking renewal; at tens of thousands of torrents that was a
 /// flood at the trackers and a renewal held for as long as it took.
+///
+/// `fenced` is asked before each batch, the first included: a profile fenced
+/// after the rebind, or between two batches, has its torrents paused, and
+/// the batches left are dropped rather than handed to the session. Nothing
+/// is recorded for a reannounce cut short that way.
+#[allow(clippy::too_many_arguments)]
 async fn reannounce_paced(
     engine: Arc<dyn torrentd_engine::TorrentEngine>,
     handles: Vec<TorrentHandle>,
@@ -358,6 +383,7 @@ async fn reannounce_paced(
     detected: Instant,
     pace: Duration,
     mut stop: watch::Receiver<bool>,
+    fenced: impl Fn() -> bool,
 ) {
     let mut dispatched = 0;
     let mut failed = 0;
@@ -367,6 +393,16 @@ async fn reannounce_paced(
                 _ = tokio::time::sleep(pace) => {}
                 _ = stop.changed() => return,
             }
+        }
+        if fenced() {
+            info!(
+                target: "torrentd::port_forward_monitor",
+                profile_id = %id,
+                torrent_count = handles.len() - i * REANNOUNCE_BATCH,
+                "the profile was fenced during the reannounce after the port change; \
+                 not reannouncing the rest",
+            );
+            return;
         }
         let (d, f) = reannounce_batch(&*engine, batch);
         dispatched += d;
@@ -411,13 +447,17 @@ fn record_reannounce(metrics: &dyn MetricsSink, id: &ProfileId, r: Reannounce) {
 
 /// Renew `e`'s mapping once, record what happened, and say when the next
 /// attempt is due. `taken` says whether another profile holds a port; it is
-/// asked once the gateway has answered ([`held_by_others_now`]).
+/// asked once the gateway has answered ([`held_by_others_now`]). `fenced`
+/// says whether `e` has been fenced since its status was read below; it is
+/// asked once the gateway has answered with a new port, before the session
+/// is rebound ([`fenced_now`]).
 async fn renew_once(
     e: &ProfileEntry,
     metrics: &dyn MetricsSink,
     forwarder: &Arc<dyn PortForwarder>,
     listen: &Arc<ListenEvents>,
     taken: impl Fn(u16) -> bool + Send + 'static,
+    fenced: impl Fn() -> bool + Send + 'static,
 ) -> Next {
     let profile_id = e.id().clone();
     let health = e.health();
@@ -471,6 +511,7 @@ async fn renew_once(
                     profile: &id,
                     listen: &listen,
                     timeout: LISTEN_CONFIRM_TIMEOUT,
+                    fenced: &fenced,
                 },
                 taken,
             )
@@ -568,6 +609,7 @@ pub(crate) fn refresh_during_boot(
             // Never attached: the alert loop is not running yet.
             listen: &ListenEvents::new(),
             timeout: LISTEN_CONFIRM_TIMEOUT,
+            fenced: &|| e.health().status != ProfileStatus::Active,
         },
         |p| taken.contains(&p),
     );
@@ -699,6 +741,26 @@ pub(crate) fn record_outcome(
                 "NAT-PMP renewed with a new port before the alert loop cleared its boot \
                  backlog; the rebind waits until it can be confirmed, still seeding on the \
                  old port",
+            );
+            false
+        }
+        // Not a failure either: the profile was fenced while the gateway
+        // answered, and a fenced profile is neither rebound nor reannounced.
+        // Uncounted, so a fence does not also raise the rebind alert. The
+        // retry finds the profile fenced and renews nothing until the fence
+        // lifts.
+        RenewOutcome::RebindFailed {
+            previous,
+            new,
+            reason: RebindFailure::Fenced,
+        } => {
+            metrics.set_gauge("profile_port_forward_up", 0.0, &labels);
+            e.update_health(|h| h.port_forward_ok = false);
+            info!(
+                target: "torrentd::port_forward_monitor",
+                profile_id = %profile_id, previous_port = previous, new_port = new,
+                "NAT-PMP renewed with a new port after the profile was fenced; not rebinding \
+                 the session or reannouncing",
             );
             false
         }
@@ -837,6 +899,11 @@ mod tests {
         false
     }
 
+    /// The profile stays unfenced throughout.
+    fn unfenced() -> bool {
+        false
+    }
+
     /// A listen stream with a publisher attached, as the alert loop leaves it.
     fn attached() -> Arc<ListenEvents> {
         let l = Arc::new(ListenEvents::new());
@@ -920,11 +987,11 @@ mod tests {
         fwd.push_ok(6881);
         let listen = attached();
 
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), &listen, free).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), &listen, free, unfenced).await;
         assert_eq!(next.delay, RETRY_INTERVAL, "a failure is retried promptly");
         assert!(!entry.health().port_forward_ok);
 
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), &listen, free).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), &listen, free, unfenced).await;
         assert_eq!(next.delay, RENEW_INTERVAL);
         assert!(entry.health().port_forward_ok);
 
@@ -949,6 +1016,7 @@ mod tests {
             &forwarder(&fwd),
             &listen,
             free,
+            unfenced,
         )
         .await;
         assert_eq!(next.delay, Duration::from_secs(20));
@@ -961,6 +1029,7 @@ mod tests {
             &forwarder(&fwd),
             &listen,
             free,
+            unfenced,
         )
         .await;
         assert_eq!(next.delay, RENEW_INTERVAL);
@@ -976,6 +1045,7 @@ mod tests {
             &forwarder(&fwd),
             &attached(),
             free,
+            unfenced,
         )
         .await;
         let calls = fwd.calls();
@@ -1004,7 +1074,7 @@ mod tests {
         let listen = attached();
         let session = answer_rebind(&engine, &listen, "10.2.0.2:40001", None);
 
-        let next = renew_once(&entry, &*sink, &forwarder(&fwd), &listen, free).await;
+        let next = renew_once(&entry, &*sink, &forwarder(&fwd), &listen, free, unfenced).await;
         session.join().unwrap();
 
         assert_eq!(next.delay, RENEW_INTERVAL);
@@ -1025,6 +1095,7 @@ mod tests {
             detected,
             Duration::ZERO,
             stop,
+            unfenced,
         )
         .await;
         assert_eq!(reannounced(&engine), vec![mine]);
@@ -1052,6 +1123,7 @@ mod tests {
             Instant::now(),
             Duration::from_secs(2),
             stop,
+            unfenced,
         ));
         let deadline = Instant::now() + Duration::from_secs(1);
         while reannounced(&engine).len() < REANNOUNCE_BATCH && Instant::now() < deadline {
@@ -1204,7 +1276,15 @@ mod tests {
         let (entry, engine) = natpmp_entry("acct_a", 6881);
         let sink = RecordingSink::new();
         let fwd = MockForwarder::with_ports([40001]);
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), &attached(), |p| p == 40001).await;
+        let next = renew_once(
+            &entry,
+            &sink,
+            &forwarder(&fwd),
+            &attached(),
+            |p| p == 40001,
+            unfenced,
+        )
+        .await;
         assert_eq!(next.delay, RETRY_INTERVAL);
         assert!(next.rebound_at.is_none());
         assert_eq!(
@@ -1265,6 +1345,7 @@ mod tests {
             &fwd,
             &attached(),
             held_by_others_now(profiles.clone(), id.clone()),
+            unfenced,
         )
         .await;
 
@@ -1277,6 +1358,126 @@ mod tests {
         assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
     }
 
+    /// A forwarder whose exchange the VPN monitor's fence lands in: while it
+    /// is on the wire, `profile` is marked `VpnDown`, and then the gateway
+    /// answers with a new port.
+    #[derive(Debug)]
+    struct FencedDuringExchange {
+        profiles: Arc<ProfileRegistry>,
+        profile: ProfileId,
+        port: u16,
+    }
+
+    impl PortForwarder for FencedDuringExchange {
+        fn map(&self, _: &PortMapRequest) -> Result<torrentd_engine::MapResult, PortForwardError> {
+            let e = self.profiles.resolve(&self.profile).active().unwrap();
+            e.update_health(|h| h.status = ProfileStatus::VpnDown);
+            Ok(torrentd_engine::MapResult {
+                port: self.port,
+                epoch: 1,
+                udp_mapped: true,
+                lifetime_secs: LEASE_SECS,
+            })
+        }
+    }
+
+    /// The status is read again once the gateway has answered. At the head
+    /// this replaces it was read only before the exchange, so a fence that
+    /// landed in the exchange was followed by a rebind and then a reannounce
+    /// for the fenced profile.
+    #[tokio::test]
+    async fn a_fence_during_the_exchange_is_not_followed_by_a_rebind() {
+        let (a, engine) = natpmp_entry("acct_a", 6881);
+        let profiles = Arc::new(ProfileRegistry::new(vec![a]));
+        let id = ProfileId::new("acct_a");
+        let fwd: Arc<dyn PortForwarder> = Arc::new(FencedDuringExchange {
+            profiles: profiles.clone(),
+            profile: id.clone(),
+            port: 40001,
+        });
+        let a = profiles.resolve(&id).active().unwrap();
+        let sink = RecordingSink::new();
+
+        let next = renew_once(
+            a,
+            &sink,
+            &fwd,
+            &attached(),
+            free,
+            fenced_now(profiles.clone(), id.clone()),
+        )
+        .await;
+
+        assert!(next.rebound_at.is_none(), "nothing to reannounce");
+        assert_eq!(next.delay, RETRY_INTERVAL);
+        assert_eq!(a.health().forwarded_port, Some(6881), "not rebound");
+        assert!(!engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::ApplySettings(_))));
+        assert!(
+            failure_stages(&sink).is_empty(),
+            "a fence is not a rebind failure"
+        );
+        assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
+    }
+
+    /// A fence that lands while the reannounce is running stops it before
+    /// its next batch, and one that lands between the rebind and the first
+    /// batch stops it before anything is sent. At the head this replaces the
+    /// reannounce never looked at the profile's status.
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_stops_the_reannounce_before_its_next_batch() {
+        let (a, engine) = natpmp_entry("acct_a", 6881);
+        let handles: Vec<TorrentHandle> = (0..=(REANNOUNCE_BATCH as u8))
+            .map(|i| engine.register_handle(InfoHash([i; 20])))
+            .collect();
+        let profiles = Arc::new(ProfileRegistry::new(vec![a]));
+        let id = ProfileId::new("acct_a");
+        let a = profiles.resolve(&id).active().unwrap();
+        let sink = Arc::new(RecordingSink::new());
+        let (_stop_tx, stop) = watch::channel(false);
+        let reannounce = |stop| {
+            tokio::spawn(reannounce_paced(
+                a.engine.clone(),
+                handles.clone(),
+                sink.clone() as Arc<dyn MetricsSink>,
+                id.clone(),
+                Instant::now(),
+                Duration::from_secs(10),
+                stop,
+                fenced_now(profiles.clone(), id.clone()),
+            ))
+        };
+
+        let task = reannounce(stop.clone());
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(
+            reannounced(&engine).len(),
+            REANNOUNCE_BATCH,
+            "the first batch"
+        );
+        a.update_health(|h| h.status = ProfileStatus::VpnDown);
+        task.await.unwrap();
+        assert_eq!(
+            reannounced(&engine).len(),
+            REANNOUNCE_BATCH,
+            "nothing after the fence"
+        );
+
+        reannounce(stop).await.unwrap();
+        assert_eq!(
+            reannounced(&engine).len(),
+            REANNOUNCE_BATCH,
+            "a reannounce that starts fenced sends nothing"
+        );
+        assert_eq!(
+            histograms(&sink, "profile_port_change_reannounce_seconds"),
+            0,
+            "a reannounce cut short is not observed"
+        );
+    }
+
     /// Two profiles already bound to one port — the race above won by both —
     /// are reported on the next renewal, and counted under `port_taken`.
     #[tokio::test]
@@ -1284,7 +1485,15 @@ mod tests {
         let (entry, _) = natpmp_entry("acct_a", 40001);
         let sink = RecordingSink::new();
         let fwd = MockForwarder::with_ports([40001]);
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), &attached(), |p| p == 40001).await;
+        let next = renew_once(
+            &entry,
+            &sink,
+            &forwarder(&fwd),
+            &attached(),
+            |p| p == 40001,
+            unfenced,
+        )
+        .await;
         assert_eq!(next.delay, RETRY_INTERVAL);
         assert_eq!(gauge(&sink, "profile_port_forward_up"), Some(0.0));
         assert_eq!(sink.count_for(FAILURES), 1);
@@ -1407,7 +1616,7 @@ mod tests {
             Some("address already in use"),
         );
 
-        let next = renew_once(&entry, &sink, &forwarder(&fwd), &listen, free).await;
+        let next = renew_once(&entry, &sink, &forwarder(&fwd), &listen, free, unfenced).await;
         session.join().unwrap();
 
         assert_eq!(
