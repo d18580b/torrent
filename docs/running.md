@@ -1370,8 +1370,13 @@ On a scratch pool, not your real one.
 1. **Restart with resume data.** Start, add torrents, `systemctl restart`.
    They should come back seeding without re-hashing, and unpaused.
 2. **`kill -9`.** Resume files are written temp → fsync → rename → fsync-dir, so
-   the previous file survives a partial write. On restart nothing should be
-   lost beyond the last 30-minute sweep.
+   the previous file survives a partial write. Each torrent's first resume
+   file is written as soon as the session adds it; after that, changes are
+   saved by the 30-minute sweep. On restart every torrent the session had
+   added should come back, with nothing lost beyond its state at the last
+   sweep. A torrent killed before its first save landed has no resume file,
+   and an adoption still waiting in the verify queue was never added at all:
+   [After a crash](operations.md#after-a-crash) covers both.
 3. **A delete is refused against a stale index.** Add a torrent through the API
    with a `save_path` inside a managed root, then try a `delete_orphans` plan
    over that path. It must refuse, naming the info-hash: claims are written

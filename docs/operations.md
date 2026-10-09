@@ -369,9 +369,11 @@ cleans up only what its config still names:
   them as [Retiring a profile](#retiring-a-profile) describes.
 
 **Adoptions (#109).** The verify queue lives in memory only, and an adoption
-writes its registry claim before the add. No resume data is saved at the add
-itself. A crash before a torrent's first save leaves a claim with nothing
-behind it, so no scan loads the torrent, and adopting it again is refused with
+writes its registry claim before the add. Each torrent's first resume save is
+queued as soon as the session adds it, but a torrent still waiting in the
+verify queue was never added, and one killed in the moments before its first
+save landed has no resume file yet. Either leaves a claim with nothing behind
+it, so no scan loads the torrent, and adopting it again is refused with
 `info-hash already loaded in profile …`. The boot counts these per profile in
 `torrentd_profile_unloaded_registry_torrents`. List them: the registry lists
 them, and their phase is `unknown` because no session holds them.
@@ -417,10 +419,11 @@ curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer
 - With `[pool] allow_mutations` off, nothing is re-driven. The plan stays
   `applying` until a boot that allows mutations.
 
-**Resume data (#109, #110).** Resume data is saved every 30 minutes and by
-the shutdown drain. A crash loses whatever changed since the last save, such
-as a pause. A torrent added within that window may have no resume file at
-all:
+**Resume data (#109, #110).** A torrent's first resume file is saved as soon
+as the session adds it; after that, resume data is saved every 30 minutes and
+by the shutdown drain. A crash loses whatever changed since the last save,
+such as a pause. A torrent killed before its first save landed has no resume
+file at all:
 
 - **Added through `POST /v1/torrents`.** The boot finds only its `.torrent`
   and re-adds it at `default_save_path`, whatever `save_path` it was added
