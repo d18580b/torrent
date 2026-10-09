@@ -758,12 +758,35 @@ pub async fn boot(
     } else {
         tokio::spawn(pf);
     }
+    // VPN health monitor, started here for the same reason: the scans below
+    // run for minutes on a large pool, and a tunnel that drops during them
+    // has to be fenced then, not at the first poll after boot. Its fence
+    // pauses what the state map holds, which the scans do not fill, so the
+    // scans pause what they add to a fenced profile themselves (`ScanFence`).
+    spawn_supervised(
+        "vpn_monitor",
+        metrics.clone(),
+        crate::vpn_monitor::run(
+            profile_registry.clone(),
+            state.clone(),
+            metrics.clone(),
+            std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
+            shutdown_tx.subscribe(),
+        ),
+    );
 
     // Network-layer kill switch (defence-in-depth; multi-profile + opt-in).
     // Installed once, after every profile's tunnel is up, so the ruleset covers all
     // tunnel interfaces, each accepted only from the address its own link holds
     // — the one that profile's sessions were just bound to. Fail-closed: if the operator asked for it and it can't
     // be installed, abort rather than seed without the backstop.
+    //
+    // That leaves a window: each profile's bring-up can take up to 30 s, so
+    // the sessions built first exist, with their listen sockets open, before
+    // the backstop does. They hold no torrents until the scans below, which
+    // run only after it is installed, so nothing is announced or seeded in
+    // that window. Installing it before the sessions would need every
+    // tunnel's transport port, which is known only once its link is up.
     let mut kill_switch_active = false;
     // Seed the gauge at zero so `kill_switch_active == 0` is a series that
     // exists and can be alerted on. Registered lazily on first emission, it
@@ -819,6 +842,9 @@ pub async fn boot(
     // incremented and `increase()` would never see it move.
     let mut load_failures: std::collections::HashMap<ProfileId, BootLoadFailures> =
         std::collections::HashMap::new();
+    // What the scans add, so a profile the VPN monitor fences mid-scan has
+    // it paused.
+    let mut scan_fence = ScanFence::default();
 
     // Resume scan: load every saved resume file per profile. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
@@ -846,8 +872,11 @@ pub async fn boot(
             // answered now, while `BootCleanup` still owns the tunnels, not
             // after the scan has added everything only for the drain to save
             // it all again.
-            if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 && shutdown_requested(&mut boot_shutdown) {
-                anyhow::bail!("shutdown requested during the resume scan");
+            if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 {
+                if shutdown_requested(&mut boot_shutdown) {
+                    anyhow::bail!("shutdown requested during the resume scan");
+                }
+                scan_fence.enforce_all(&profile_registry, &metrics);
             }
             // Cross-check the registry; the spec aborts the profile on
             // mismatch. A resume file under one profile's directory that the
@@ -931,9 +960,10 @@ pub async fn boot(
                 continue;
             }
             match engine.add_torrent(params) {
-                Ok(_) => {
+                Ok(h) => {
                     added_from_resume += 1;
                     loaded.insert(ih);
+                    scan_fence.added(&profile_registry, &metrics, &profile, h);
                 }
                 Err(e) => {
                     warn!(profile_id = %profile, infohash = %ih, error.cause = %e, "resume add failed");
@@ -974,8 +1004,11 @@ pub async fn boot(
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
         let mut added = 0usize;
         for (i, (ih, bytes)) in entries.into_iter().enumerate() {
-            if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 && shutdown_requested(&mut boot_shutdown) {
-                anyhow::bail!("shutdown requested during the torrent-dir scan");
+            if i % SCAN_SHUTDOWN_CHECK_EVERY == 0 {
+                if shutdown_requested(&mut boot_shutdown) {
+                    anyhow::bail!("shutdown requested during the torrent-dir scan");
+                }
+                scan_fence.enforce_all(&profile_registry, &metrics);
             }
             // Resume data already loaded this torrent (the registry holds
             // every resume-loaded info-hash after the scan above) — skip.
@@ -1015,9 +1048,10 @@ pub async fn boot(
                 continue;
             }
             match engine.add_torrent(params) {
-                Ok(_) => {
+                Ok(h) => {
                     added += 1;
                     loaded.insert(ih);
+                    scan_fence.added(&profile_registry, &metrics, &profile, h);
                 }
                 Err(e) => {
                     warn!(
@@ -1053,6 +1087,12 @@ pub async fn boot(
             .and_modify(|n| *n += added)
             .or_insert(added);
     }
+
+    // A profile fenced after its own scan's last add would otherwise keep
+    // what that scan loaded running until the alert loop below has put it in
+    // the state map, where the monitor no longer looks: a fenced profile is
+    // skipped from then on.
+    scan_fence.enforce_all(&profile_registry, &metrics);
 
     // Every configured profile, so a failed one reads zero rather than absent.
     for profile in cfg.profile.iter().map(|p| &p.id) {
@@ -1276,6 +1316,102 @@ fn resume_scan_params(
         save_path: None,
         flags_set: torrentd_engine::resume_flags_set(profile),
         flags_clear: torrentd_engine::resume_flags_clear(),
+    }
+}
+
+/// The torrents the boot scans hand each profile's session, held so the VPN
+/// monitor's fence reaches them.
+///
+/// The monitor runs from the moment the profiles are built, but its fence
+/// pauses what the state map holds, and the state map is filled by the alert
+/// loop, which starts only once both scans have run. A profile fenced
+/// mid-scan would otherwise be marked down with nothing paused, and every
+/// torrent the scans went on to add to it would seed over whatever route was
+/// left.
+#[derive(Default)]
+struct ScanFence {
+    profiles: std::collections::HashMap<ProfileId, ScanFenced>,
+}
+
+#[derive(Default)]
+struct ScanFenced {
+    /// Every handle the scans added to the profile, in order.
+    handles: Vec<torrentd_engine::TorrentHandle>,
+    /// How many of `handles`, from the front, have been paused.
+    paused: usize,
+}
+
+impl ScanFence {
+    /// Record a torrent a scan just added to `profile`, pausing it, and
+    /// everything added before it, where the profile is fenced.
+    fn added(
+        &mut self,
+        profiles: &ProfileRegistry,
+        metrics: &PromSink,
+        profile: &ProfileId,
+        h: torrentd_engine::TorrentHandle,
+    ) {
+        let fenced = self.profiles.entry(profile.clone()).or_default();
+        fenced.handles.push(h);
+        Self::enforce(profiles, metrics, profile, fenced);
+    }
+
+    /// Pause what the scans have added to every profile fenced since.
+    /// Between scan batches, so a profile whose own scan has finished is
+    /// still reached, and once after both.
+    fn enforce_all(&mut self, profiles: &ProfileRegistry, metrics: &PromSink) {
+        for (profile, fenced) in &mut self.profiles {
+            Self::enforce(profiles, metrics, profile, fenced);
+        }
+    }
+
+    fn enforce(
+        profiles: &ProfileRegistry,
+        metrics: &PromSink,
+        profile: &ProfileId,
+        fenced: &mut ScanFenced,
+    ) {
+        if fenced.paused == fenced.handles.len() {
+            return;
+        }
+        let Some(entry) = profiles.resolve(profile).active() else {
+            return;
+        };
+        if entry.health().status != ProfileStatus::VpnDown {
+            return;
+        }
+        let labels = [("profile_id", profile.as_str())];
+        let mut paused = 0u64;
+        for &h in &fenced.handles[fenced.paused..] {
+            match entry.engine.pause_torrent(h) {
+                Ok(()) => paused += 1,
+                // As in the monitor's own fence: a torrent left running on a
+                // fenced profile is the one thing fencing is for.
+                Err(err) => {
+                    error!(
+                        profile_id = %profile,
+                        infohash = %h.infohash,
+                        error.cause = %err,
+                        "could not pause a boot-scan torrent on a fenced profile",
+                    );
+                    metrics.inc_counter("profile_fence_pause_errors_total", &labels);
+                }
+            }
+        }
+        fenced.paused = fenced.handles.len();
+        // The monitor set the count from the state map as it fenced; what
+        // the scans held is added to it.
+        entry.update_health(|hh| hh.paused_for_vpn += paused);
+        metrics.set_gauge(
+            "profile_torrents_paused_vpn_down",
+            entry.health().paused_for_vpn as f64,
+            &labels,
+        );
+        warn!(
+            profile_id = %profile,
+            torrent_count = paused,
+            "paused boot-scan torrents on a profile the VPN monitor fenced",
+        );
     }
 }
 
@@ -1758,20 +1894,8 @@ impl DaemonHandle {
             instance_lock: _instance_lock,
         } = self;
 
-        // VPN health monitor (multi-profile only). Spawned before AppState
-        // consumes the registry/state/metrics. The port-forward monitor is
-        // not here: `boot` starts it as soon as the profiles are built.
-        spawn_supervised(
-            "vpn_monitor",
-            metrics.clone(),
-            crate::vpn_monitor::run(
-                profile_registry.clone(),
-                state.clone(),
-                metrics.clone(),
-                std::time::Duration::from_secs(cfg.vpn_handshake_max_age_secs),
-                shutdown_tx.subscribe(),
-            ),
-        );
+        // The VPN health and port-forward monitors are not here: `boot`
+        // starts both as soon as the profiles are built.
 
         // The kill switch was checked once, at install. Anything that flushes
         // the ruleset afterwards — an `nft flush ruleset` from a firewall
@@ -3385,6 +3509,89 @@ mod tests {
         assert!(
             subscribed_after.try_recv().is_err(),
             "a receiver subscribed after the send cannot see it",
+        );
+    }
+
+    /// The VPN monitor runs through the boot scans, but its fence pauses what
+    /// the state map holds, and nothing the scans add is there yet. What a
+    /// scan added to a profile fenced mid-scan is paused by the scan: once,
+    /// all of it, the moment the fence is seen, and each add after that as
+    /// it lands. A profile left healthy keeps running.
+    #[test]
+    fn a_profile_fenced_mid_scan_has_what_the_scans_added_paused() {
+        use torrentd_engine::RecordedCall;
+
+        use crate::profile_registry::test_vpn_entry;
+
+        let entry = |id: &str| {
+            let engine = Arc::new(torrentd_engine::MockEngine::new());
+            let config = test_vpn_entry(id, ProfileStatus::Active).config;
+            let dyn_engine: Arc<dyn TorrentEngine> = engine.clone();
+            (ProfileEntry::new(config, dyn_engine, None, None, 0), engine)
+        };
+        let (a_entry, a_engine) = entry("acct_a");
+        let (b_entry, b_engine) = entry("acct_b");
+        let profiles = ProfileRegistry::new(vec![a_entry, b_entry]);
+        let metrics = PromSink::new();
+        let (a, b) = (ProfileId::new("acct_a"), ProfileId::new("acct_b"));
+        let handle = |engine: &torrentd_engine::MockEngine, n: u8| {
+            engine.register_handle(libtorrent_safe::InfoHash([n; 20]))
+        };
+        let paused = |engine: &torrentd_engine::MockEngine| {
+            engine
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    RecordedCall::PauseTorrent(h) => Some(h),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let fence = |id: &ProfileId| {
+            profiles
+                .resolve(id)
+                .active()
+                .unwrap()
+                .update_health(|h| h.status = ProfileStatus::VpnDown);
+        };
+
+        let mut scan = ScanFence::default();
+        let (a1, a2, a3) = (
+            handle(&a_engine, 1),
+            handle(&a_engine, 2),
+            handle(&a_engine, 3),
+        );
+        let b1 = handle(&b_engine, 4);
+        scan.added(&profiles, &metrics, &a, a1);
+        scan.added(&profiles, &metrics, &a, a2);
+        scan.added(&profiles, &metrics, &b, b1);
+        assert!(paused(&a_engine).is_empty(), "nothing is fenced yet");
+
+        // Fenced between two adds: the next add pauses everything so far.
+        fence(&a);
+        scan.added(&profiles, &metrics, &a, a3);
+        assert_eq!(paused(&a_engine), vec![a1, a2, a3]);
+        scan.enforce_all(&profiles, &metrics);
+        assert_eq!(paused(&a_engine), vec![a1, a2, a3], "each is paused once");
+        assert_eq!(
+            profiles
+                .resolve(&a)
+                .active()
+                .unwrap()
+                .health()
+                .paused_for_vpn,
+            3
+        );
+
+        // Fenced after its own scan's last add: the sweep reaches it.
+        assert!(paused(&b_engine).is_empty());
+        fence(&b);
+        scan.enforce_all(&profiles, &metrics);
+        assert_eq!(paused(&b_engine), vec![b1]);
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        assert!(
+            exported.contains("torrentd_profile_torrents_paused_vpn_down{profile_id=\"acct_a\"} 3"),
+            "{exported}"
         );
     }
 }
