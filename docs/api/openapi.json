@@ -10280,7 +10280,7 @@
           },
           "effective_state": {
             "$ref": "#/components/schemas/ProfileState",
-            "description": "Whether the profile is on the network now: `online` only when it has\na session, its `status` is `active`, its `desired_state` is `online`,\nand `offline_all` is off."
+            "description": "Whether the profile is on the network now: `online` only when it has\na session, its `status` is `active`, and its session is not paused.\nRead from the session, so it differs from what `desired_state` and\n`offline_all` ask for only when a session refused the pause or resume\nthat applies them (the change that hit it answered `500`)."
           },
           "tunnel_ip": {
             "type": [

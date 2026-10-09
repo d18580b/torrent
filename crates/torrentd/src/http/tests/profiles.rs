@@ -594,6 +594,36 @@ async fn bulk_operations_count_what_the_engine_refused() {
 }
 
 #[tokio::test]
+async fn a_session_that_refuses_to_pause_is_reported_on_the_network() {
+    let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+    let h = Harness::authed(&Coverage::new(), |s| install(s, vec![a], vec![]));
+    eng_a.inject_error(
+        "pause_session",
+        EngineError::MockInjected {
+            op: "pause_session",
+            message: "boom".into(),
+        },
+    );
+
+    let resp = h
+        .send(
+            "PATCH",
+            "/v1/profiles/acct_a",
+            Some(&h.tokens.write.clone()),
+            Some(json!({ "state": "offline" })),
+        )
+        .await;
+    assert_problem(&resp, 500, "internal");
+    assert!(!eng_a.session_paused().unwrap());
+
+    // The record keeps the change, and the session that refused it is still
+    // running: GET says both, rather than calling the profile offline.
+    let list: Value = h.read("/v1/profiles").await.json();
+    assert_eq!(profile_of(&list, "acct_a")["desired_state"], "offline");
+    assert_eq!(profile_of(&list, "acct_a")["effective_state"], "online");
+}
+
+#[tokio::test]
 async fn a_profile_with_nothing_loaded_reports_zero_and_a_natpmp_one_its_negotiated_port() {
     let (a, _) = live("acct_a", ProfileStatus::Active);
     // Host profiles have no tunnel; they are still listed.

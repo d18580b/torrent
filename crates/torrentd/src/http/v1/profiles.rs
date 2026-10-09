@@ -150,8 +150,10 @@ pub struct Profile {
     /// `offline_all` holds every profile offline without changing it.
     pub desired_state: ProfileState,
     /// Whether the profile is on the network now: `online` only when it has
-    /// a session, its `status` is `active`, its `desired_state` is `online`,
-    /// and `offline_all` is off.
+    /// a session, its `status` is `active`, and its session is not paused.
+    /// Read from the session, so it differs from what `desired_state` and
+    /// `offline_all` ask for only when a session refused the pause or resume
+    /// that applies them (the change that hit it answered `500`).
     pub effective_state: ProfileState,
     /// The tunnel's address; `null` for a host profile, a failed one, or
     /// before the tunnel reported one.
@@ -260,7 +262,15 @@ fn profile_of(s: &AppState, e: &ProfileEntry) -> Profile {
     let h = e.health();
     let listen_port = e.config.listen_port();
     let states = s.profiles.states();
-    let on_network = h.status == EngineProfileStatus::Active && !states.holds_offline(e.id());
+    // Read from the session, not the record: a session that refused the
+    // pause or resume applying a change keeps running (or stays paused)
+    // while the record says otherwise, and this field reports which. Only
+    // a session whose pause state cannot be read falls back to the record.
+    let session_running = match e.engine.session_paused() {
+        Ok(paused) => !paused,
+        Err(_) => !states.holds_offline(e.id()),
+    };
+    let on_network = h.status == EngineProfileStatus::Active && session_running;
     Profile {
         profile_id: e.config.id.as_str().to_owned(),
         status: ProfileStatus::from(&h.status),
