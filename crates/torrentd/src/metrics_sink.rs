@@ -243,7 +243,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "1 if the kill switch's nftables table was present and matched the rendered ruleset at \
          the last check; 0 if it was missing or had drifted.";
     "kill_switch_probe_errors_total" Counter Daemon Zero =>
-        "Runtime kill-switch checks that could not list the nftables tables.";
+        "Runtime kill-switch checks that could not run: nft could not list the nftables tables \
+         or the kill switch's table as JSON, its output could not be read, or the check task \
+         itself failed (it panicked or was cancelled).";
     // the previous run's shutdown
     "last_shutdown_unsaved_resumes" Gauge Daemon Owner("always") =>
         "Resume saves the previous run's shutdown drain left unsaved; 0 if unknown.";
