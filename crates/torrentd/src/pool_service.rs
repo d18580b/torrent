@@ -176,6 +176,38 @@ impl PoolService {
         }
     }
 
+    /// Record `save_path` as where `profile`'s torrent `infohash` now lives,
+    /// beside its `.torrent`, after a relocation moved its storage there.
+    ///
+    /// The torrent-dir scan re-adds a torrent whose resume file is lost at
+    /// the save path recorded beside its `.torrent`; left at the old
+    /// directory, it would come back where its payload no longer is, with
+    /// nothing reported. A failed write is logged and counted as the API add
+    /// path counts its own, under `source="api"`. The move itself stands.
+    pub(crate) fn record_save_path(&self, profile: &ProfileId, infohash: &str, save_path: &str) {
+        let Some(store) = self.torrents.get() else {
+            return;
+        };
+        let Some(ih) = libtorrent_safe::InfoHash::from_hex(infohash) else {
+            return;
+        };
+        if let Err(e) = off_worker(|| store.write_save_path(profile, &ih, save_path)) {
+            warn!(
+                target: "torrentd::pool",
+                profile_id = %profile,
+                infohash = %infohash,
+                save_path = %save_path,
+                error.cause = %e,
+                "failed to record a relocated torrent's new save path; if its resume file \
+                 is lost it will be re-added at its old one",
+            );
+            self.count(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile.as_str()), ("source", "api")],
+            );
+        }
+    }
+
     /// The library's `.torrent` for `ih`, read from the path the pool index
     /// records, when it is still there and still describes `ih`.
     ///
@@ -1804,6 +1836,47 @@ mod tests {
         std::fs::write(dir.path().join("library/t.torrent"), other).unwrap();
         assert_eq!(pool.library_torrent(&hash), None);
         assert_eq!(pool.library_torrent(&InfoHash([0x77; 20])), None);
+    }
+
+    /// A relocation rewrites the save path recorded beside the `.torrent`,
+    /// which the boot scan re-adds a torrent at when its resume file is
+    /// lost; a write that fails is counted, and the move still stands.
+    #[test]
+    fn a_relocated_torrent_records_its_new_save_path() {
+        use torrentd_engine::TorrentStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let p = ProfileId::new("p");
+        let hash = InfoHash([0x5a; 20]);
+
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let store = std::sync::Arc::new(torrentd_engine::MemoryTorrentStore::new());
+        pool.set_torrent_store(store.clone());
+        store.write_save_path(&p, &hash, "/pool/old").unwrap();
+        pool.record_save_path(&p, &hash.to_hex(), "/pool/new/place");
+        assert_eq!(
+            store.read_save_path(&p, &hash).unwrap().as_deref(),
+            Some("/pool/new/place"),
+        );
+
+        // A torrent store whose base is a regular file: every write fails.
+        drop(pool);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let metrics = std::sync::Arc::new(crate::metrics_sink::PromSink::new());
+        pool.set_metrics(metrics.clone());
+        std::fs::write(dir.path().join("blocker"), b"not a directory").unwrap();
+        pool.set_torrent_store(std::sync::Arc::new(torrentd_engine::FsTorrentStore::new(
+            dir.path().join("blocker"),
+        )));
+        pool.record_save_path(&p, &hash.to_hex(), "/pool/new/place");
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(
+            text.contains(
+                "torrentd_torrent_file_persist_errors_total{profile_id=\"p\",source=\"api\"} 1"
+            ),
+            "{text}"
+        );
     }
 
     /// An owner record the enqueue did not write, or that names another
