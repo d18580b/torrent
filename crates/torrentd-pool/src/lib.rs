@@ -50,6 +50,7 @@ pub use model::PoolError;
 pub use model::PoolFile;
 pub use model::PoolTorrent;
 pub use model::TorrentFileRow;
+pub use model::VerifyQueueRow;
 pub use plan::PlanSpec;
 pub use scan::file_stamp;
 pub use scan::scan_library;

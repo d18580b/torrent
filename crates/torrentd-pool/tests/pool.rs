@@ -1222,7 +1222,7 @@ fn a_v4_index_migrates_to_the_materialised_tree() {
     }
 
     let store = PoolStore::open(&db).unwrap();
-    assert_eq!(user_version(&db), 5);
+    assert_eq!(user_version(&db), 6);
     let root_id = store.root_id(&root).unwrap();
     assert_eq!(
         store.children(root_id, "").unwrap(),
@@ -1238,6 +1238,65 @@ fn a_v4_index_migrates_to_the_materialised_tree() {
         (all.files_total, all.bytes_total, all.bytes_orphan),
         (2, 7, 7)
     );
+}
+
+#[test]
+fn a_v5_index_migrates_to_an_empty_persisted_verify_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    drop(PoolStore::open(&db).unwrap());
+    // Take the file back to what a v5 build wrote: no verify queue.
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch("DROP TABLE verify_queue; PRAGMA user_version = 5;")
+            .unwrap();
+    }
+
+    let store = PoolStore::open(&db).unwrap();
+    assert_eq!(user_version(&db), 6);
+    assert!(store.verify_queue().unwrap().is_empty());
+}
+
+#[test]
+fn the_verify_queue_survives_a_reopen_in_order() {
+    use std::os::unix::ffi::OsStrExt;
+
+    use torrentd_pool::VerifyQueueRow;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    let row = |ih: &str, profile: &str| VerifyQueueRow {
+        infohash: ih.to_owned(),
+        profile: profile.to_owned(),
+        torrent_path: PathBuf::from(format!("/lib/{ih}.torrent")),
+        save_path: PathBuf::from("/pool/root"),
+        owner_recorded: true,
+        trackers: vec![],
+    };
+    let first = VerifyQueueRow {
+        // A path that is not UTF-8 comes back byte for byte.
+        save_path: PathBuf::from(std::ffi::OsStr::from_bytes(b"/pool/r\xffoot")),
+        trackers: vec![
+            vec!["https://a.example/announce".to_owned()],
+            vec!["udp://b.example:80".to_owned()],
+        ],
+        owner_recorded: false,
+        ..row("aa", "acct_a")
+    };
+    {
+        let store = PoolStore::open(&db).unwrap();
+        store.enqueue_verify(&first).unwrap();
+        store.enqueue_verify(&row("bb", "acct_b")).unwrap();
+        store.enqueue_verify(&row("cc", "acct_a")).unwrap();
+        // Queued again: keeps its place, takes the new values.
+        store.enqueue_verify(&row("bb", "acct_c")).unwrap();
+        store.dequeue_verify("cc").unwrap();
+        // Forgetting what is not there is not an error.
+        store.dequeue_verify("dd").unwrap();
+    }
+
+    let store = PoolStore::open(&db).unwrap();
+    assert_eq!(store.verify_queue().unwrap(), [first, row("bb", "acct_c")]);
 }
 
 #[test]
@@ -2580,7 +2639,7 @@ fn an_ordinary_v3_index_is_opened_without_touching_it() {
 
     PoolStore::open(&db).expect("a second open is an ordinary v3 open");
 
-    assert_eq!(user_version(&db), 5);
+    assert_eq!(user_version(&db), 6);
     assert_eq!(torrent_indexes(&db), before, "nothing may be rebuilt here");
     assert!(
         !backup.exists(),
@@ -2748,7 +2807,7 @@ fn a_real_backup_already_at_the_path_is_replaced_by_a_fresh_copy_once_the_migrat
 
     PoolStore::open(&db).expect("the migration runs");
 
-    assert_eq!(user_version(&db), 5, "the migration really ran");
+    assert_eq!(user_version(&db), 6, "the migration really ran");
     assert_eq!(
         user_version(&backup),
         2,

@@ -38,13 +38,44 @@ use crate::model::PoolError;
 use crate::model::PoolFile;
 use crate::model::PoolTorrent;
 use crate::model::TorrentFileRow;
+use crate::model::VerifyQueueRow;
 
 /// Bumped whenever the schema changes; `migrate` walks forward from whatever
 /// the file reports. A file from the future is refused rather than guessed at.
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 /// The version [`PoolStore::migrate_v4`] brings a file to.
 const V4: i64 = 4;
+
+/// The version [`PoolStore::migrate_v5`] brings a file to.
+const V5: i64 = 5;
+
+/// v6 keeps the daemon's verify queue, so a restart re-drives it.
+///
+/// An adoption claims its info-hash in the assignment registry before it
+/// queues the torrent, and the queue admits a bounded number at a time. Held
+/// only in memory, a crash with items still waiting left each one's claim
+/// with nothing behind it: no scan loaded the torrent, and adopting it again
+/// was refused. A row is written when an item is queued and removed when the
+/// queue adds it to a session or drops it.
+///
+/// `seq` is the queue order. The paths are the bytes of the `OsStr`, so a
+/// path that is not UTF-8 comes back as it went in. `trackers` is a JSON
+/// array of tiers. There is no foreign key to `torrent`: a rescan that drops
+/// the library row must not take the queued item, and the claim behind it,
+/// with it.
+const SCHEMA_V6: &str = r#"
+CREATE TABLE IF NOT EXISTS verify_queue (
+    seq            INTEGER PRIMARY KEY,
+    infohash       TEXT    NOT NULL UNIQUE,
+    profile        TEXT    NOT NULL,
+    torrent_path   BLOB    NOT NULL,
+    save_path      BLOB    NOT NULL,
+    owner_recorded INTEGER NOT NULL,
+    trackers       TEXT    NOT NULL,
+    enqueued_at    INTEGER NOT NULL
+);
+"#;
 
 /// Rows the scan writes to the staging table per statement batch.
 ///
@@ -288,6 +319,7 @@ impl PoolStore {
         store.migrate()?;
         store.migrate_v4()?;
         store.migrate_v5()?;
+        store.migrate_v6()?;
         Ok(store)
     }
 
@@ -686,14 +718,99 @@ impl PoolStore {
         let found: i64 = self
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if found >= SCHEMA_VERSION {
+        if found >= V5 {
             return Ok(());
         }
-        self.step(found, SCHEMA_VERSION, |st| {
+        self.step(found, V5, |st| {
             st.conn.execute_batch(SCHEMA_V5)?;
             st.conn.execute_batch(SCHEMA_V5_DERIVED)?;
             st.rebuild_all_rollups()
         })
+    }
+
+    /// Step a v5 file to v6: the persisted verify queue, empty.
+    fn migrate_v6(&mut self) -> Result<(), PoolError> {
+        let found: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if found >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        self.step(found, SCHEMA_VERSION, |st| {
+            Ok(st.conn.execute_batch(SCHEMA_V6)?)
+        })
+    }
+
+    // -- verify queue ------------------------------------------------------
+
+    /// Record an adoption the verify queue now holds, at the back of the
+    /// queue. An info-hash already recorded keeps its place and takes the new
+    /// row's values.
+    pub fn enqueue_verify(&self, row: &VerifyQueueRow) -> Result<(), PoolError> {
+        use std::os::unix::ffi::OsStrExt;
+        let trackers = serde_json::to_string(&row.trackers)
+            .map_err(|e| PoolError::Io(std::io::Error::other(e)))?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.conn.execute(
+            "INSERT INTO verify_queue
+                 (infohash, profile, torrent_path, save_path, owner_recorded, trackers, enqueued_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(infohash) DO UPDATE SET
+                 profile = excluded.profile,
+                 torrent_path = excluded.torrent_path,
+                 save_path = excluded.save_path,
+                 owner_recorded = excluded.owner_recorded,
+                 trackers = excluded.trackers",
+            params![
+                row.infohash,
+                row.profile,
+                row.torrent_path.as_os_str().as_bytes(),
+                row.save_path.as_os_str().as_bytes(),
+                row.owner_recorded,
+                trackers,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forget a queued adoption: the queue added it to a session or dropped
+    /// it. Forgetting one that is not recorded is not an error.
+    pub fn dequeue_verify(&self, infohash: &str) -> Result<(), PoolError> {
+        self.conn.execute(
+            "DELETE FROM verify_queue WHERE infohash = ?1",
+            params![infohash],
+        )?;
+        Ok(())
+    }
+
+    /// Every queued adoption, in queue order.
+    pub fn verify_queue(&self) -> Result<Vec<VerifyQueueRow>, PoolError> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut st = self.conn.prepare(
+            "SELECT infohash, profile, torrent_path, save_path, owner_recorded, trackers
+             FROM verify_queue ORDER BY seq",
+        )?;
+        let rows = st.query_map([], |r| {
+            let torrent_path: Vec<u8> = r.get(2)?;
+            let save_path: Vec<u8> = r.get(3)?;
+            let trackers: String = r.get(5)?;
+            let trackers = serde_json::from_str(&trackers).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, e.into())
+            })?;
+            Ok(VerifyQueueRow {
+                infohash: r.get(0)?,
+                profile: r.get(1)?,
+                torrent_path: PathBuf::from(std::ffi::OsStr::from_bytes(&torrent_path)),
+                save_path: PathBuf::from(std::ffi::OsStr::from_bytes(&save_path)),
+                owner_recorded: r.get(4)?,
+                trackers,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
     /// The index generation: bumped by every match, so anything bound to it

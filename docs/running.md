@@ -611,6 +611,11 @@ transaction as the version write, so it needs no rescan; on an index of
 millions of files it adds seconds to that first start. It is additive and
 takes no copy, but a build that knows only version 4 refuses the result.
 
+Schema version 6 adds the `verify_queue` table, which keeps the adoptions
+waiting for verification so a restart queues them again. It starts empty, is
+additive and takes no copy, but a build that knows only version 5 refuses the
+result.
+
 **If the migration fails, that copy is not the remedy.** It is taken
 immediately before the steps that failed, so it is a copy of the index as it
 stands — same version, same columns, same tables — and restoring it puts you
