@@ -8,10 +8,13 @@
 //!   `applying` with a known last-completed step, which startup re-drives.
 //! * **Adopted payload moves through libtorrent.** `move_storage` keeps the
 //!   session's view of where the data lives consistent with reality; moving the
-//!   files underneath a seeding torrent does not.
-//! * **A cross-device move is a copy, a verify, and only then an unlink.** The
-//!   source is never removed until the destination is known good, so an
-//!   interruption at any point leaves the payload intact somewhere.
+//!   files underneath a seeding torrent does not. The step succeeds only once
+//!   libtorrent reports the move done; across devices that move is
+//!   libtorrent's own copy, which torrentd does not verify.
+//! * **torrentd never moves a directory across devices itself.** An
+//!   unadopted directory is moved with a `rename`, and an `EXDEV` refuses the
+//!   step rather than copying, so the payload is never half in two places
+//!   because of a move torrentd made.
 
 use std::path::Path;
 use std::sync::Arc;

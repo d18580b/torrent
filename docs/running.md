@@ -1072,7 +1072,7 @@ takes the unit as shipped, which grants no capability and bounds the set to
 empty.
 
 **Signals:** `SIGHUP` reloads log level, rate limits and connection limits.
-`SIGTERM` drains resume data (30s budget), persists session state, brings
+`SIGTERM` drains resume data (`shutdown_drain_secs`, default 60s), persists session state, brings
 tunnels down, and exits.
 
 `POST /v1/config/reload` does what `SIGHUP` does, over HTTP, for a caller that
