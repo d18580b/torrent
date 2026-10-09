@@ -79,7 +79,7 @@ services:
       - ./torrentd.toml:/etc/torrentd/torrentd.toml:ro
       # The state directory itself, not only the two stores inside it. The
       # daemon keeps its state beside resume_dir: the assignment registry
-      # (profile_assignments.json), the pool index (pool.db), each profile's
+      # (registry.db), the pool index (pool.db), each profile's
       # DHT state (session_state-<id>.dat), last_shutdown.json and the
       # single-instance lock. Mounting only resume/ and torrents/ left those in
       # the container layer, so a rebuild or `compose up --force-recreate` lost
@@ -93,8 +93,13 @@ services:
       - torrentd-torrents:/var/lib/torrentd/torrents
       # Only needed by a `network = "vpn"` profile.
       # - /etc/wireguard:/etc/wireguard:ro
-      # Operator places the actual data here; torrentd reads only.
-      - /data/torrents:/data/torrents:ro
+      # The payload directory. Read-write: it is the sample config's
+      # default_save_path, so every download lands here, and with
+      # [pool] allow_mutations on and it listed in roots, plan applies move
+      # files inside it and delete_files moves them to <root>/.torrentd-trash.
+      # Mounted :ro, each of those fails with EROFS. deploy/torrentd.service grants the same path
+      # in ReadWritePaths.
+      - /data/torrents:/data/torrents
 
   # torrentd does not terminate TLS, by design: an HTTP server's TLS
   # configuration is a thing to get wrong, and there is a mature one right

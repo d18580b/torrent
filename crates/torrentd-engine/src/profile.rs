@@ -541,9 +541,11 @@ impl ProfileConfig {
 
     /// The only directory a WireGuard `vpn_config` may live in.
     ///
-    /// `wg-quick`'s own default, and the only one it will resolve a bare
-    /// interface name against at teardown. torrentd never sets
-    /// `WG_CONFIG_DIR`, so this is not configurable here either.
+    /// `wg-quick`'s own default: `wg-quick up <iface>` and `wg-quick@<iface>`
+    /// read `/etc/wireguard/<iface>.conf`, which is how root raises a link
+    /// before the daemon starts for the daemon to adopt. The daemon never runs
+    /// `wg-quick` itself; pinning the profile's config to this one path keeps
+    /// it the same file root raises that interface from.
     pub const WG_CONFIG_DIR: &'static str = "/etc/wireguard";
 
     /// Whether this profile's traffic leaves through a tunnel.
@@ -762,10 +764,10 @@ pub enum ProfileConfigError {
     },
     #[error(
         "profile {profile:?}: a wireguard vpn_config must be {dir}/{iface}.conf, not \
-         {vpn_config:?}. `wg-quick up <path>` names the interface after the file, and \
-         `wg-quick down <iface>` resolves that bare name only against {dir} (or \
-         $WG_CONFIG_DIR, which torrentd does not set) — so a config under any other name, or \
-         in any other directory, brings up a tunnel that can never be torn down"
+         {vpn_config:?}. That is the file `wg-quick up {iface}` and `wg-quick@{iface}` read \
+         when root raises the link before the daemon starts, and the daemon adopts such a \
+         link only when its key matches the profile's config — so the profile has to name \
+         that same file"
     )]
     InterfaceConfigMismatch {
         profile: String,
@@ -1055,21 +1057,16 @@ impl ProfileConfig {
                             vpn_interface.clone(),
                         ));
                     }
-                    // `wg-quick up <path>` names the interface after the file,
-                    // and `wg-quick down <iface>` looks the file back up from
-                    // the name — resolving a bare name *only* against
-                    // `WG_CONFIG_DIR`, default `/etc/wireguard`. A profile
-                    // whose two fields disagree brings a tunnel up under one
-                    // name, waits 30s for an address on another, fails, and
-                    // could never be torn down if it somehow succeeded. So
-                    // does a profile whose config lives anywhere else, even
-                    // with a matching stem: `wg-quick down` dies looking for
-                    // the file before it ever reaches `del_if`, and that
-                    // surviving tunnel is the defect this validation exists to
-                    // make unreachable. `bring_down` is handed only the
-                    // interface name (`VpnManager::bring_down(&self, iface:
-                    // &str)`), so the directory has to be pinned here rather
-                    // than threaded through.
+                    // The daemon never runs `wg-quick`: it names the link
+                    // `vpn_interface` itself and removes it by that name, so
+                    // neither needs the file. The pin is for the link root
+                    // raises before the daemon starts — `wg-quick up <iface>`
+                    // or `wg-quick@<iface>`, which read
+                    // `/etc/wireguard/<iface>.conf` — and which the daemon
+                    // adopts only when its key matches this profile's
+                    // `vpn_config`. Naming exactly that file keeps the config
+                    // root raises from and the one the daemon compares against
+                    // the same file, rather than two copies that can drift.
                     if *vpn_type == VpnType::Wireguard {
                         let stem = vpn_config
                             .file_stem()
@@ -1375,11 +1372,9 @@ mod tests {
 
     #[test]
     fn a_wireguard_config_outside_etc_wireguard_is_refused() {
-        // The stem matches here; only the directory does not. `wg-quick up`
-        // takes the full path and brings the tunnel up regardless, but
-        // `wg-quick down wg-a` resolves the bare name against /etc/wireguard,
-        // finds nothing, and dies before `del_if` — so the tunnel survives
-        // graceful shutdown and every restart.
+        // The stem matches here; only the directory does not. Root's
+        // `wg-quick up wg-a` reads /etc/wireguard/wg-a.conf, so this profile
+        // would compare an adopted link's key against a different file.
         let s = with_vpn(cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"), |n| {
             if let ProfileNetwork::Vpn { vpn_config, .. } = n {
                 *vpn_config = PathBuf::from("/etc/torrentd/wg-a.conf");
@@ -1393,8 +1388,8 @@ mod tests {
 
     #[test]
     fn a_wireguard_config_with_no_parent_directory_is_refused() {
-        // `file_stem()` alone accepts a bare relative name; `wg-quick down`
-        // still has only /etc/wireguard to look in.
+        // `file_stem()` alone accepts a bare relative name; the file root
+        // raises the link from is still /etc/wireguard/wg-a.conf.
         let s = with_vpn(cfg("acct_a", 6881, "wg-a", "-AA1000-", "qB/5.0"), |n| {
             if let ProfileNetwork::Vpn { vpn_config, .. } = n {
                 *vpn_config = PathBuf::from("wg-a.conf");

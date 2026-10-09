@@ -242,7 +242,7 @@ Every profile takes `id` plus `network`, and then:
 
 | `network = "vpn"` | |
 | --- | --- |
-| `vpn_type`, `vpn_config`, `vpn_interface` | **required**. `vpn_interface` must equal `vpn_config`'s file stem — wg-quick derives one from the other in both directions. |
+| `vpn_type`, `vpn_config`, `vpn_interface` | **required**. For WireGuard, `vpn_config` must be `/etc/wireguard/<vpn_interface>.conf`, the file `wg-quick` reads for that interface (§5). |
 | `listen_port` | required for `port_forward = "static"` (the default); omitted for `"natpmp"` |
 | `port_forward`, `port_forward_gateway` | default `static`, and `10.2.0.1` |
 | `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client, so the two must name the same client: `"-qB5030-"` with `"qBittorrent/5.0.3"`, not a prefix of one client beside another's user agent. Nothing checks the pairing. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters — in the same form as the top-level key it overrides, and never libtorrent's own `-LT` code. |
@@ -692,17 +692,18 @@ rather than erroring. `/healthz`'s path is unchanged; its response keys
 **A WireGuard profile's `vpn_config` must be `/etc/wireguard/<vpn_interface>.conf`
 — exactly that directory, and a file name matching the interface.** This is
 refused at startup, and by `--check-config`, rather than discovered later.
-`wg-quick up <path>` names the interface after the file, and `wg-quick down
-<iface>` resolves that bare name only against `/etc/wireguard`; a config with
-a different stem, or in any other directory, brings up a tunnel that no
-shutdown or restart can ever take down. OpenVPN profiles are unaffected —
+The daemon never runs `wg-quick` (§11.6): it names the link `vpn_interface`
+itself and removes it by that name. The rule is for a link root raises before
+the daemon starts — `wg-quick up <iface>` or `wg-quick@<iface>`, both of which
+read `/etc/wireguard/<iface>.conf` — which the daemon adopts only when its key
+matches the profile's `vpn_config`. Pinning `vpn_config` to that path keeps the
+file root raises from and the file the daemon checks the key against the same
+file. OpenVPN profiles are unaffected —
 torrentd passes `--dev` explicitly, so their config's name carries no meaning.
 
 **Upgrading:** this rule is new, and it is a hard refusal, so a daemon that
 has been running for months with a WireGuard config somewhere else will not
-start after the upgrade. That is deliberate — such a tunnel comes up and can
-never be torn down, which is the defect the rule exists to make unreachable —
-and it is catchable before the running daemon stops: `--check-config` refuses
+start after the upgrade. That is deliberate, and it is catchable before the running daemon stops: `--check-config` refuses
 the same config, so run it before restarting onto the upgrade. A daemon started
 on it anyway exits `78`, which `deploy/torrentd.service` leaves stopped rather
 than restarting. Move the file to `/etc/wireguard/<vpn_interface>.conf` and
@@ -1072,7 +1073,7 @@ takes the unit as shipped, which grants no capability and bounds the set to
 empty.
 
 **Signals:** `SIGHUP` reloads log level, rate limits and connection limits.
-`SIGTERM` drains resume data (30s budget), persists session state, brings
+`SIGTERM` drains resume data (`shutdown_drain_secs`, default 60s), persists session state, brings
 tunnels down, and exits.
 
 `POST /v1/config/reload` does what `SIGHUP` does, over HTTP, for a caller that
@@ -1815,12 +1816,12 @@ run it by hand instead, start the service again afterwards:
 | Container reports unhealthy forever | Stale image without `curl`; rebuild. |
 | `/healthz` 503 `alert_loop_stalled` | The alert loop stopped advancing. A panic there exits the process non-zero so systemd restarts it; if the unit is still up, look for a wedge rather than a panic. |
 | `/healthz` 503 `all_profiles_fenced` | Every live profile is fenced — its tunnel is down — so the daemon is seeding nothing; `profiles_failed` counts any that never came up at boot. Check `GET /v1/profiles`, which lists both kinds, bring the tunnels back, then restart — fenced profiles do not resume themselves by design. |
-| Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
+| Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). It must be the file root's `wg-quick up <iface>` reads, so a link raised before the daemon starts is checked against the same key. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
 | A WireGuard profile fails with "hooks are not run" or "Table = … is not supported" | The daemon raises every link with `ip` and `wg`, as root too, and runs no `wg-quick` hooks and honours no named table (§11.6). Either raise the link as root before the daemon starts — it is adopted by its key — or move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
 | Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port`, and an `ip saddr` line pairing each tunnel's `ip -4 addr show <iface>` address with that interface; a link re-raised by hand after the daemon started has a new port, and may have a new address. Restart the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
-| One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it will not `wg-quick down` something it cannot vouch for, because that would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
+| One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it leaves the link standing and does not tear it down, because it cannot vouch for it and removing it would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced. An operator restart is required by design. |
 | Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
 | Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `GET /v1/profiles`, then `POST /v1/profiles/<id>/resume-all`. |

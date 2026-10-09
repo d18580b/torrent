@@ -653,7 +653,7 @@ fn refusal(
                 vpn_iface = %iface,
                 tunnel_ip = %ip,
                 adoption_ground = ground.as_str(),
-                "wg-quick up refused; adopting the existing tunnel left by an \
+                "bring-up refused; adopting the existing tunnel left by an \
                  unclean shutdown",
             );
             Ok(ip)
@@ -843,7 +843,7 @@ impl WireguardManager {
             warn!(
                 target: "torrentd::vpn::wireguard",
                 vpn_iface = %iface,
-                "wg-quick down left the interface standing; keeping this boot's \
+                "teardown left the interface standing; keeping this boot's \
                  raised-interface record so a later start can still adopt it",
             );
             return;
@@ -1528,8 +1528,7 @@ mod tests {
             .expect("a temporary directory accepts a write");
         let mgr = WireguardManager::with_raised(raised.clone());
 
-        // `wg-quick down` ran and the link is still there — the failing
-        // `PreDown` hook, and the missing `.conf`.
+        // The teardown ran and the link is still there.
         mgr.drop_record_if_gone("wg-a", |_| true);
         assert!(
             raised.recorded("wg-a", Some(LIVE_KEY)),

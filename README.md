@@ -298,8 +298,15 @@ a `vpn` profile's isolation is layered:
   into it. The choice is persisted in the state
   directory and applied at boot before any torrent is loaded.
 - **Kill switch** (opt-in) — a fail-closed nftables table confining the
-  daemon's egress to loopback and its tunnel interfaces, so a dropped tunnel
-  fails closed at the kernel regardless of socket binds or poll timing. It is
+  daemon's egress to loopback and to each profile's own tunnel from that
+  tunnel's address, so while the table stands a dropped tunnel fails closed at
+  the kernel regardless of socket binds or poll timing, and one profile's
+  traffic cannot leave by another's tunnel. A table flushed or replaced by
+  another tool is caught on the next 30s check, which fences every `vpn`
+  profile until it is intact again; until then the source binding is the only
+  guard. It does not put DNS through the tunnel: tracker lookups go to the
+  host's resolver, which must be on loopback and is visible upstream unless
+  the resolver itself is routed through a tunnel. It is
   refused beside a `network = "host"` profile, whose egress it would drop, and
   beside an OpenVPN profile, whose own connection to the provider it would
   drop. Running as its own user, the daemon raises WireGuard links with `ip`
