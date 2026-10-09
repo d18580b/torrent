@@ -11,8 +11,8 @@
 //!   torrent was complete, and every file is still in the index at the size the
 //!   torrent declares. Payload rewritten in place at the same size is caught
 //!   separately by the drift pass an adopt runs over its selection first,
-//!   which marks the torrent `Drifted` and so
-//!   refuses it here. Given both, its piece state is as good as a verification
+//!   which marks the torrent `Drifted` and so sends it down the verify path
+//!   instead. Given both, its piece state is as good as a verification
 //!   we would have performed ourselves, so the torrent is added in seed mode
 //!   and seeds immediately.
 //! * **Verify path** — anything else. The torrent is added *without* seed mode,
@@ -228,8 +228,8 @@ fn relayout_of(torrent: &crate::model::PoolTorrent) -> Option<crate::fastresume:
 /// Note what that second condition does *not* cover: it compares the torrent
 /// against the index, so it only rules out payload that changed size. Payload
 /// rewritten in place at the same size is caught by [`crate::drift`], which
-/// stats the live filesystem and marks the torrent `Drifted` — and `Drifted` is
-/// refused above. The guarantee is therefore only as fresh as the last drift
+/// stats the live filesystem and marks the torrent `Drifted` — and a `Drifted`
+/// torrent is always verified, never fast-pathed, by [`plan`]. The guarantee is therefore only as fresh as the last drift
 /// pass, which is why `POST /v1/pool/adoptions` runs
 /// [`crate::drift::detect_before_adopt`] over its selection before planning
 /// any of it. A caller of this planner that skips that pass trusts whatever
