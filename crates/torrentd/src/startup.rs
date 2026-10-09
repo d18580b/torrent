@@ -933,6 +933,17 @@ pub async fn boot(
     // it paused.
     let mut scan_fence = ScanFence::default();
 
+    // Managed pool. Opened before the alert loop so a bad index path fails
+    // startup rather than surfacing as a 500 on the first API call, and
+    // before the resume scan, which falls back to its library for a
+    // torrent's `.torrent`.
+    let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
+    if let Some(pool) = pool.as_ref() {
+        pool.set_metrics(metrics.clone());
+        pool.set_state(Arc::clone(&state));
+        pool.set_torrent_store(Arc::clone(&torrent_store));
+    }
+
     // Resume scan: load every saved resume file per profile. The shim
     // already deduplicates duplicate adds so a future torrent dir scan
     // won't double-add.
@@ -950,6 +961,7 @@ pub async fn boot(
         let entries = scan.entries;
         let count = entries.len();
         let mut missing_metadata = 0usize;
+        let mut from_library = 0usize;
         let mut added_from_resume = 0usize;
         let engine = source
             .engine_for(&profile)
@@ -1004,6 +1016,31 @@ pub async fn boot(
                     None
                 }
             };
+            // A torrent the pool adopted before adoption wrote its `.torrent`
+            // to the store has none there; the library's copy the pool index
+            // names is the same metadata. Written back to the store, so the
+            // repair happens once and the library may move on.
+            let torrent = match (torrent, pool.as_ref()) {
+                (None, Some(pool)) => {
+                    let found = pool.library_torrent(&ih);
+                    if let Some(bytes) = &found {
+                        from_library += 1;
+                        if let Err(e) = torrent_store.write(&profile, &ih, bytes) {
+                            warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
+                                  "could not copy the pool library's .torrent into the torrent store");
+                            // Counted as the adoption's own write is: this
+                            // completes it, and a store that keeps refusing
+                            // repeats the repair at every boot.
+                            metrics.inc_counter(
+                                "torrent_file_persist_errors_total",
+                                &[("profile_id", profile.as_str()), ("source", "api")],
+                            );
+                        }
+                    }
+                    found
+                }
+                (torrent, _) => torrent,
+            };
             if torrent.is_none() {
                 missing_metadata += 1;
             }
@@ -1057,6 +1094,13 @@ pub async fn boot(
                     load_failures.entry(profile.clone()).or_default().resume_add += 1;
                 }
             }
+        }
+        if from_library > 0 {
+            info!(
+                profile_id = %profile,
+                torrent_count = from_library,
+                "resume entries with no .torrent in the torrent store took it from the pool library",
+            );
         }
         if missing_metadata > 0 {
             // Not fatal — libtorrent can still fetch metadata from peers where
@@ -1244,14 +1288,6 @@ pub async fn boot(
         .map(|(ih, _)| ih)
         .filter(|ih| !loaded.contains(ih))
         .collect();
-
-    // Managed pool. Opened before the alert loop so a bad index path fails
-    // startup rather than surfacing as a 500 on the first API call.
-    let pool = crate::pool_service::PoolService::open(&cfg).context("open pool index")?;
-    if let Some(pool) = pool.as_ref() {
-        pool.set_metrics(metrics.clone());
-        pool.set_state(Arc::clone(&state));
-    }
 
     // Two artefacts persist a torrent→profile mapping, and nothing reconciled
     // them: the assignment registry, which the resume scan above writes and

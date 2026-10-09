@@ -22,6 +22,7 @@ use torrentd_engine::ProfileStatus;
 use torrentd_engine::StateMap;
 use torrentd_engine::TorrentFlags;
 use torrentd_engine::TorrentPhase;
+use torrentd_engine::TorrentStore;
 use torrentd_engine::TrackerRefusal;
 use torrentd_pool::adopt::AdoptPlan;
 use torrentd_pool::AdoptionState;
@@ -72,6 +73,11 @@ pub struct PoolService {
     /// `torrentd pool …`, which runs no session. A scan keeps every torrent
     /// in it in the index even after its `.torrent` leaves the library.
     loaded: std::sync::OnceLock<Arc<StateMap>>,
+    /// Where the sessions' `.torrent` files are kept, per profile. Set once
+    /// by the daemon; absent for `torrentd pool …`, which adds nothing.
+    /// Every adoption writes its `.torrent` here, because the resume scan
+    /// re-attaches metadata from this store alone.
+    torrents: std::sync::OnceLock<Arc<dyn TorrentStore>>,
 }
 
 impl std::fmt::Debug for PoolService {
@@ -127,7 +133,97 @@ impl PoolService {
             allow_mutations: pool_cfg.allow_mutations,
             metrics: std::sync::OnceLock::new(),
             loaded: std::sync::OnceLock::new(),
+            torrents: std::sync::OnceLock::new(),
         })))
+    }
+
+    /// The sessions' torrent store, which adoption writes each adopted
+    /// torrent's `.torrent` into. The daemon sets this once after opening; a
+    /// second call is ignored.
+    pub fn set_torrent_store(&self, torrents: Arc<dyn TorrentStore>) {
+        let _ = self.torrents.set(torrents);
+    }
+
+    /// Persist an adopted torrent's `.torrent` for `profile`, as
+    /// `POST /v1/torrents` does for an add, once its session holds it.
+    ///
+    /// The resume scan attaches metadata only from the torrent store: resume
+    /// data is saved without the info dict, so an adopted torrent whose
+    /// `.torrent` is not there comes back from a restart with no metadata,
+    /// and on a private profile it never seeds again. A failed write is
+    /// logged and counted where the API add path counts its own, under
+    /// `source="api"`: adoption is a request on the same API.
+    fn persist_torrent(&self, profile: &ProfileId, infohash: &str, bytes: &[u8]) {
+        let Some(store) = self.torrents.get() else {
+            return;
+        };
+        let Some(ih) = libtorrent_safe::InfoHash::from_hex(infohash) else {
+            return;
+        };
+        if let Err(e) = off_worker(|| store.write(profile, &ih, bytes)) {
+            warn!(
+                target: "torrentd::pool",
+                profile_id = %profile,
+                infohash = %infohash,
+                error.cause = %e,
+                "failed to persist an adopted torrent's .torrent file; a restart will look \
+                 for it in the pool library instead",
+            );
+            self.count(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile.as_str()), ("source", "api")],
+            );
+        }
+    }
+
+    /// The library's `.torrent` for `ih`, read from the path the pool index
+    /// records, when it is still there and still describes `ih`.
+    ///
+    /// The resume scan's fallback for a torrent the torrent store holds no
+    /// `.torrent` for: adoptions before the store was written to left every
+    /// adopted torrent in that state. A file whose info-hash no longer
+    /// matches — replaced in the library since the index was written — is
+    /// not this torrent's metadata, and is not returned.
+    pub fn library_torrent(&self, ih: &libtorrent_safe::InfoHash) -> Option<Vec<u8>> {
+        let hex = ih.to_hex();
+        let path = match self.with_reader(|s| torrentd_pool::adopt::torrent_path(s, &hex)) {
+            Ok(Some(path)) => path,
+            Ok(None) => return None,
+            Err(e) => {
+                warn!(
+                    target: "torrentd::pool",
+                    infohash = %hex,
+                    error.cause = %e,
+                    "could not read the pool index for a torrent's library .torrent",
+                );
+                return None;
+            }
+        };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    target: "torrentd::pool",
+                    infohash = %hex,
+                    path = %path.display(),
+                    error.cause = %e,
+                    "the pool index names a library .torrent that cannot be read",
+                );
+                return None;
+            }
+        };
+        match libtorrent_safe::info_hash_from_torrent(&bytes) {
+            Ok(found) if found == *ih => Some(bytes),
+            _ => {
+                warn!(
+                    target: "torrentd::pool",
+                    infohash = %hex,
+                    path = %path.display(),
+                    "the library .torrent the pool index names no longer describes this torrent",
+                );
+                None
+            }
+        }
     }
 
     /// The sessions' state map, so a scan knows what is loaded. The daemon
@@ -532,7 +628,7 @@ pub async fn run_verify_queue(
             };
             let params = verify_add_params(
                 profile_cfg,
-                bytes,
+                bytes.clone(),
                 item.save_path.to_string_lossy().into_owned(),
                 item.trackers.clone(),
             );
@@ -555,6 +651,9 @@ pub async fn run_verify_queue(
                         handle,
                         metrics.as_ref(),
                     );
+                    // The bytes the session was given, so a restart re-adds
+                    // the torrent with its metadata.
+                    pool.persist_torrent(&item.profile, &item.infohash, &bytes);
                     q.in_flight.lock().push(item.infohash.clone());
                     info!(
                         target: "torrentd::pool",
@@ -1018,7 +1117,7 @@ pub fn execute_adopt(
             let params = adoption_resume_params(
                 profile_cfg,
                 resume,
-                torrent,
+                torrent.clone(),
                 save_path.to_string_lossy().into_owned(),
             );
             match torrentd_engine::check_trackers(profile_cfg, &params) {
@@ -1059,6 +1158,11 @@ pub fn execute_adopt(
                         handle,
                         metrics,
                     );
+                    // Unreadable, there is nothing to keep; the resume scan
+                    // looks in the library for it instead.
+                    if let Some(bytes) = &torrent {
+                        pool.persist_torrent(&profile, infohash, bytes);
+                    }
                 }
                 Err(e) => {
                     // Resume data another client wrote can be truncated, from
@@ -1638,6 +1742,68 @@ mod tests {
         assert_eq!(engine.calls().len(), 1, "{:?}", engine.calls());
         let item = pool.verify_queue().pending.lock().pop_front().unwrap();
         assert_eq!(item.trackers, want);
+    }
+
+    /// A fast-path adopt writes the `.torrent` it handed the session to the
+    /// profile's torrent store, which the resume scan re-attaches metadata
+    /// from; and the library's copy is offered as the scan's fallback only
+    /// while it still describes the torrent.
+    #[test]
+    fn a_fast_path_adopt_persists_its_torrent_and_the_library_backs_it() {
+        use torrentd_engine::AlertSource;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::TorrentEngine;
+        use torrentd_engine::TorrentStore;
+
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let store = std::sync::Arc::new(torrentd_engine::MemoryTorrentStore::new());
+        pool.set_torrent_store(store.clone());
+        std::fs::write(dir.path().join("pool/a"), b"x").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), &bare).unwrap();
+        // One piece had: the fast path.
+        std::fs::write(dir.path().join("library/t.fastresume"), b"d6:pieces1:\x01e").unwrap();
+        pool.scan().unwrap();
+        let ih = pool.with_store(|s| s.torrents().unwrap())[0]
+            .infohash
+            .clone();
+        let hash = InfoHash::from_hex(&ih).unwrap();
+
+        let engine = std::sync::Arc::new(MockEngine::new());
+        let source: std::sync::Arc<dyn AlertSource> =
+            std::sync::Arc::new(torrentd_engine::ProfileSource::new(vec![(
+                ProfileId::new("p"),
+                std::sync::Arc::clone(&engine) as std::sync::Arc<dyn TorrentEngine>,
+            )]));
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        let adopted =
+            super::execute_adopt(&pool, &source, &profiles, &ih, ProfileId::new("p"), false)
+                .unwrap_or_else(|e| panic!("{}", e.reason));
+        assert_eq!(adopted, "fast_path");
+        assert_eq!(
+            store.read(&ProfileId::new("p"), &hash).unwrap().as_deref(),
+            Some(bare.as_slice()),
+        );
+
+        assert_eq!(
+            pool.library_torrent(&hash).as_deref(),
+            Some(bare.as_slice())
+        );
+        // Replaced in the library by another torrent since the index was
+        // written: not this one's metadata.
+        let mut other = b"d4:infod6:lengthi1e4:name1:b12:piece lengthi16384e6:pieces20:".to_vec();
+        other.extend_from_slice(&[0u8; 20]);
+        other.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), other).unwrap();
+        assert_eq!(pool.library_torrent(&hash), None);
+        assert_eq!(pool.library_torrent(&InfoHash([0x77; 20])), None);
     }
 
     /// An owner record the enqueue did not write, or that names another
