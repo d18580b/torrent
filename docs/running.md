@@ -1267,9 +1267,9 @@ leave by the tunnel device), and the `health` line is what the monitor's
 judgement — the same function, on the address, route and handshake just
 observed — would decide about the profile. The `kill_switch_ruleset` line
 dry-runs the exact script boot hands to `nft -f`, rendered by the same
-function, over the tunnel addresses and listen ports it can read; a tunnel
-that is not up has neither to read, and the line says which tunnel's accept
-or exemption it had to leave out.
+function, over the tunnel addresses, listen ports and peer endpoints it can
+read; a tunnel that is not up has none of them to read, and the line says
+which tunnel's accept or exemption it had to leave out.
 `--egress` asserts that the route to its destination leaves by the tunnel
 (`egress_route`) before it trusts a reply: a round trip that went out of the
 physical interface proves nothing about the tunnel, so it is not attempted.
@@ -1488,17 +1488,39 @@ On a scratch pool, not your real one.
    **The tunnel's own transport is exempted.** WireGuard encrypts a packet in
    place, so the encrypted UDP datagram to the provider still belongs to the
    daemon's socket and leaves by the physical interface — exactly what the
-   drop is for. The ruleset therefore accepts each tunnel's listen port as a
-   UDP *source* port for the daemon's uid, read with `wg show <iface>
-   listen-port` when the switch is installed; the table shows it as
-   `meta skuid <uid> udp sport { <port>, … } accept`. While the link is up,
-   nothing else the daemon opens can hold that port, because the WireGuard
-   socket binds it on every address first; once the link is gone the port is
-   free, and the exemption, installed once at boot, is not (drill 8). A
-   tunnel whose listen port cannot be read fails the
-   install, and the daemon does not start. (Handshakes carry no socket and
-   pass either way, so a tunnel without the exemption handshakes and then
-   carries nothing — a `latest-handshake` alone does not show it working.)
+   drop is for. The ruleset therefore accepts, for the daemon's uid, UDP from
+   each tunnel's listen port to each of its peer endpoints, read with
+   `wg show <iface> listen-port` and `wg show <iface> endpoints`; the table
+   shows it as `meta skuid <uid> ip daddr <endpoint> udp sport <port>
+   udp dport <endpoint port> accept` (`ip6 daddr` for an IPv6 endpoint).
+   While the link is up, nothing else the daemon opens can hold that port,
+   because the WireGuard socket binds it on every address first. Once the
+   link is gone the port is free, and a socket that then holds it reaches
+   the provider's endpoint and nothing else (drill 8). A tunnel whose listen
+   port or endpoint cannot be read fails the install, and the daemon does
+   not start. (Handshakes carry no socket and pass either way, so a tunnel
+   without the exemption handshakes and then carries nothing — a
+   `latest-handshake` alone does not show it working.)
+
+   **The exemption follows the link.** Every 30 s the daemon checks the
+   table is still in force, and before each check it reads each tunnel's
+   listen port and endpoints again. A link re-raised on another port — a
+   config with no `ListenPort` gets one the kernel picks — or to another
+   endpoint gets the ruleset installed again with the live values, logged
+   as `a tunnel's transport changed since the kill switch was installed`, so
+   the tunnel carries again within one check rather than after a restart. A
+   reinstall that does not take is a lost table, and fences every vpn
+   profile as one does. A link that cannot be read (down) keeps the
+   exemption last read.
+
+   **A tunnel's address never leaves by another interface, whoever sends
+   it.** Ahead of every uid rule, `ip saddr <tunnel address> oifname != {
+   "lo", "<iface>" } drop` drops any packet carrying a tunnel's address out
+   of any interface but that tunnel and loopback. The uid rules cannot judge
+   a TCP reset or an ICMP error, which the kernel builds with no socket of
+   the daemon's attached; with a tunnel's `from <address>` rule lost, its
+   answer to a probe of the tunnel address arriving on the physical link
+   used to leave by that link from the tunnel address (drill 8).
 
    What that leaves:
 
@@ -1593,8 +1615,9 @@ On a scratch pool, not your real one.
    no announce is. To keep them inside the tunnels, configure the resolver
    itself: §5, "Tracker lookups through a tunnel".
 
-   To check a running deployment: `nft list table inet torrentd_ks` shows the
-   `udp sport` line with the port `wg show <iface> listen-port` prints, and
+   To check a running deployment: `nft list table inet torrentd_ks` shows a
+   `udp sport` line with the port `wg show <iface> listen-port` prints, to
+   the endpoint `wg show <iface> endpoints` prints, and
    `ip -s link show <iface>` shows transmitted *and* received packets growing.
    The same sequence runs as a test, unprivileged, in a private network
    namespace (ignored by default):
@@ -1681,24 +1704,28 @@ On a scratch pool, not your real one.
    restores the rule, sets the profile online, and tries again (`ATTEMPTS`,
    default 4), and it exits 3 if no attempt lands.
 
-   Results, run on Linux 7.2 against this branch's head
-   (`udp-transport` and `listener-replies` still exit 1, on the gaps #136
-   tracks):
+   Results, run on Linux 7.2 against this branch's head (every drill exits
+   0):
 
    - **The transport exemption holds while the link is up.** A UDP socket
      of the daemon's uid cannot bind the tunnel's listen port: on the
      wildcard address, the tunnel address or the physical address, IPv4 or
      IPv6, with `SO_REUSEADDR` or `SO_REUSEPORT`, every bind fails with
      `EADDRINUSE`. The tunnel carries the uid's traffic under the ruleset.
-   - **Gap: it does not hold once the link is gone.** The ruleset is
-     installed once, at boot. With the link taken down (`wg-quick down` on
-     an adopted link), a socket bound to the freed port, or an unbound one
-     the kernel hands it as an ephemeral port (a resolver query, say),
-     leaves by the physical interface, unencrypted. A link re-raised
-     without a `ListenPort` gets a new port, and the ruleset drops its
-     encrypted traffic. Handshakes still complete, so the tunnel carries
-     nothing while every health check passes. Both last until the daemon
-     restarts.
+   - **And once the link is gone.** With the link taken down (`wg-quick
+     down` on an adopted link), a socket bound to the freed port, and an
+     unbound one the kernel hands it as an ephemeral port (a resolver query,
+     say), are refused with `EPERM`, and nothing reaches the physical link:
+     the exemption reaches only the provider's endpoint. Before #136 it was
+     a source port alone, and both left by the physical interface,
+     unencrypted (`udp 192.0.2.1 51821 -> 192.0.2.2 7` and `-> :53`).
+   - **A link re-raised on another port carries again at the next check.**
+     Re-raised without a `ListenPort`, the link gets a port the kernel picks
+     (`33979` in the run recorded here), and under the ruleset read before
+     it carries nothing: handshakes complete, so every health check passes.
+     Installed again with the live port, as the watch's next check does, it
+     carries. Before #136 the ruleset was read once, at boot, and the tunnel
+     carried nothing until the daemon restarted.
    - **The daemon's listeners do not answer on the physical link.** A SYN to
      a wildcard listener (an `http_listen` off loopback) at the host's
      physical address gets no SYN-ACK. With the tunnel routed, every reply
@@ -1711,12 +1738,14 @@ On a scratch pool, not your real one.
      one, from the physical address. No `meta skuid` rule matches them: the
      kernel builds them with no socket of the daemon's attached. They name
      only the host, which the prober already addressed. Recorded, not a gap.
-   - **Gap: with the tunnel's source rule lost, the kernel's replies carry
-     the tunnel address out of the physical interface.** This is the state
+   - **With the tunnel's source rule lost, nothing carrying the tunnel
+     address leaves by the physical link.** This is the state
      `route-fence.sh` makes, before the next poll fences the profile. The
-     listener's SYN-ACK is still dropped. The reset and the
-     port-unreachable leave by the physical link from the tunnel address,
-     which ties that address to the host.
+     listener's SYN-ACK is dropped by the uid rules, and the kernel's reset
+     and port-unreachable by the address fence; the prober's connect and
+     datagram time out. Before #136 the reset and the port-unreachable left
+     by the physical link from the tunnel address (`tcp 10.200.0.1:9 -> RA`,
+     `icmp 10.200.0.1 -> type 3`), which tied that address to the host.
    - **IPv6 does not leave.** With a global IPv6 address and default route
      on the physical link, and a tunnel with only an IPv4 address, nothing
      the uid sends over IPv6 reaches the link: a datagram, unbound or bound
@@ -1819,7 +1848,7 @@ run it by hand instead, start the service again afterwards:
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). It must be the file root's `wg-quick up <iface>` reads, so a link raised before the daemon starts is checked against the same key. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
 | A WireGuard profile fails with "hooks are not run" or "Table = … is not supported" | The daemon raises every link with `ip` and `wg`, as root too, and runs no `wg-quick` hooks and honours no named table (§11.6). Either raise the link as root before the daemon starts — it is adopted by its key — or move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
-| Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port`, and an `ip saddr` line pairing each tunnel's `ip -4 addr show <iface>` address with that interface; a link re-raised by hand after the daemon started has a new port, and may have a new address. Restart the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
+| Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port` to its `wg show <iface> endpoints`, and an `ip saddr` line pairing each tunnel's `ip -4 addr show <iface>` address with that interface. A link re-raised on a new port or endpoint gets them within 30 s (the log says `a tunnel's transport changed`); a link re-raised with a new address does not, and needs a restart of the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it leaves the link standing and does not tear it down, because it cannot vouch for it and removing it would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced. An operator restart is required by design. |
