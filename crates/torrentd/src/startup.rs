@@ -515,6 +515,10 @@ pub struct DaemonHandle {
     alert_loop: torrentd_engine::AlertLoopHandle,
     /// Registry entries no startup scan loaded; see `AppState::unloaded_at_boot`.
     unloaded_at_boot: std::collections::HashSet<libtorrent_safe::InfoHash>,
+    /// Registry entries no startup scan loaded because they were waiting for
+    /// verification, and that the verify queue holds again. Not in
+    /// `unloaded_at_boot`: the queue adds them.
+    requeued_at_boot: std::collections::HashSet<libtorrent_safe::InfoHash>,
     /// Held until `run_until_signal` returns, after the shutdown has taken
     /// down the kill switch and the tunnels: released any earlier, a new start
     /// could install its own and have this daemon's teardown remove them.
@@ -1274,13 +1278,32 @@ pub async fn boot(
         }
     }
 
+    // Adoptions a restart caught waiting for verification: their claims are
+    // in the registry, no scan loads them, and the verify queue adds them
+    // once it runs. Queued again here, they are accounted for rather than
+    // reported unloaded.
+    let requeued_at_boot: std::collections::HashSet<libtorrent_safe::InfoHash> = pool
+        .as_ref()
+        .map(|pool| pool.restore_verify_queue(&registry, &loaded))
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let mut requeued_by_profile: std::collections::HashMap<ProfileId, usize> =
+        std::collections::HashMap::new();
+    for ih in &requeued_at_boot {
+        if let Some(profile) = registry.lookup(ih) {
+            *requeued_by_profile.entry(profile).or_default() += 1;
+        }
+    }
+
     // Warn where the registry claims torrents for a profile that the scans
     // did not load — files left at an old, un-partitioned root, say — naming
     // the directory searched, since an override pointing elsewhere is the
     // remedy. A warning: the payload may have been deleted on purpose.
     for profile in source.profiles() {
         let claimed = registry.for_profile(&profile).len();
-        let loaded = loaded_by_profile.get(&profile).copied().unwrap_or(0);
+        let loaded = loaded_by_profile.get(&profile).copied().unwrap_or(0)
+            + requeued_by_profile.get(&profile).copied().unwrap_or(0);
         if claimed > loaded {
             warn!(
                 profile_id = %profile,
@@ -1317,7 +1340,7 @@ pub async fn boot(
         .entries()
         .into_iter()
         .map(|(ih, _)| ih)
-        .filter(|ih| !loaded.contains(ih))
+        .filter(|ih| !loaded.contains(ih) && !requeued_at_boot.contains(ih))
         .collect();
 
     // Two artefacts persist a torrent→profile mapping, and nothing reconciled
@@ -1433,6 +1456,7 @@ pub async fn boot(
         log_handle,
         alert_loop,
         unloaded_at_boot,
+        requeued_at_boot,
         instance_lock,
     })
 }
@@ -2119,6 +2143,7 @@ impl DaemonHandle {
             log_handle,
             alert_loop,
             unloaded_at_boot,
+            requeued_at_boot,
             // Bound, not `_`: it has to live to the end of this function,
             // past the teardown. See the field.
             instance_lock: _instance_lock,
@@ -2164,12 +2189,14 @@ impl DaemonHandle {
         // apply, and stopped between steps the same way.
         if let Some(pool) = pool.clone() {
             // What the boot handed to sessions: the re-drive waits for every
-            // one to reach the state map before acting on what is loaded.
+            // one to reach the state map before acting on what is loaded. A
+            // requeued adoption is not one: the queue adds it when its turn
+            // comes, which can be hours away.
             let loaded: Vec<_> = registry
                 .entries()
                 .into_iter()
                 .map(|(ih, _)| ih)
-                .filter(|ih| !unloaded_at_boot.contains(ih))
+                .filter(|ih| !unloaded_at_boot.contains(ih) && !requeued_at_boot.contains(ih))
                 .collect();
             crate::pool_apply::spawn_resume_unfinished(
                 pool,

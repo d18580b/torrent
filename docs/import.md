@@ -65,8 +65,9 @@ and `ProtectHome=yes` ([`deploy/torrentd.service`](../deploy/torrentd.service)).
   error. Two sibling directories are two roots; a parent and its child are
   one root, the parent.
 - **`[pool]` is not reloadable.** Any change to it, `max_concurrent_verify`
-  included, needs a restart, which drops the verify queue (§7) and, today,
-  the metadata of every torrent already adopted (§8). Settle `[pool]` before
+  included, needs a restart. The verify queue picks up again after it (§7),
+  but the restart, today, drops the metadata of every torrent already
+  adopted (§8). Settle `[pool]` before
   the first adopt.
 
 Run every CLI command below as `torrentd`, with `sudo -u torrentd`. A `pool
@@ -293,12 +294,11 @@ before the first adopt (§2: changing it needs a restart).
 - **A fenced or offline profile** holds the queue: nothing is admitted for it
   until it is back (`verify held: profile is off the network`).
 
-**The queue lives in memory.** A restart or crash drops every torrent still
-waiting in it, and leaves its registry claim behind with nothing to load, so
-adopting it again is refused with `info-hash already loaded in profile …`.
-Do not restart while `torrentd_pool_verify_queue_depth` is above 0. If one
-happens, [After a crash](operations.md#after-a-crash) lists those torrents
-and clears them.
+**The queue survives a restart.** It is kept in `pool.db`, and the boot
+queues every torrent still waiting in it again, in order, so
+`torrentd_pool_verify_queue_depth` goes on draining after a restart or crash.
+[After a crash](operations.md#after-a-crash) covers the rare claim a crash
+can still leave with nothing behind it.
 
 ## 8. Afterwards
 
