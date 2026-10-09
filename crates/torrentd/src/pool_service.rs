@@ -1744,6 +1744,68 @@ mod tests {
         assert_eq!(item.trackers, want);
     }
 
+    /// A fast-path adopt writes the `.torrent` it handed the session to the
+    /// profile's torrent store, which the resume scan re-attaches metadata
+    /// from; and the library's copy is offered as the scan's fallback only
+    /// while it still describes the torrent.
+    #[test]
+    fn a_fast_path_adopt_persists_its_torrent_and_the_library_backs_it() {
+        use torrentd_engine::AlertSource;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::TorrentEngine;
+        use torrentd_engine::TorrentStore;
+
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let store = std::sync::Arc::new(torrentd_engine::MemoryTorrentStore::new());
+        pool.set_torrent_store(store.clone());
+        std::fs::write(dir.path().join("pool/a"), b"x").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), &bare).unwrap();
+        // One piece had: the fast path.
+        std::fs::write(dir.path().join("library/t.fastresume"), b"d6:pieces1:\x01e").unwrap();
+        pool.scan().unwrap();
+        let ih = pool.with_store(|s| s.torrents().unwrap())[0]
+            .infohash
+            .clone();
+        let hash = InfoHash::from_hex(&ih).unwrap();
+
+        let engine = std::sync::Arc::new(MockEngine::new());
+        let source: std::sync::Arc<dyn AlertSource> =
+            std::sync::Arc::new(torrentd_engine::ProfileSource::new(vec![(
+                ProfileId::new("p"),
+                std::sync::Arc::clone(&engine) as std::sync::Arc<dyn TorrentEngine>,
+            )]));
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        let adopted =
+            super::execute_adopt(&pool, &source, &profiles, &ih, ProfileId::new("p"), false)
+                .unwrap_or_else(|e| panic!("{}", e.reason));
+        assert_eq!(adopted, "fast_path");
+        assert_eq!(
+            store.read(&ProfileId::new("p"), &hash).unwrap().as_deref(),
+            Some(bare.as_slice()),
+        );
+
+        assert_eq!(
+            pool.library_torrent(&hash).as_deref(),
+            Some(bare.as_slice())
+        );
+        // Replaced in the library by another torrent since the index was
+        // written: not this one's metadata.
+        let mut other = b"d4:infod6:lengthi1e4:name1:b12:piece lengthi16384e6:pieces20:".to_vec();
+        other.extend_from_slice(&[0u8; 20]);
+        other.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), other).unwrap();
+        assert_eq!(pool.library_torrent(&hash), None);
+        assert_eq!(pool.library_torrent(&InfoHash([0x77; 20])), None);
+    }
+
     /// An owner record the enqueue did not write, or that names another
     /// profile by the time of the drop, is not the drop's to clear.
     #[test]

@@ -1422,3 +1422,145 @@ fn a_million_file_scan_leaves_the_daemon_responsive() {
     listening.store(false, std::sync::atomic::Ordering::Relaxed);
     listener.join().unwrap();
 }
+
+/// Poll `GET /v1/torrents/{ih}` until its session reports a name, returning
+/// it, or `None` once `within` has passed. A torrent with no metadata has
+/// none.
+fn session_name(addr: &str, ih: &str, within: Duration) -> Option<String> {
+    let deadline = Instant::now() + within;
+    loop {
+        let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+        if code == 200 {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            if let Some(name) = v["session"]["name"].as_str() {
+                return Some(name.to_owned());
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Issue #108's acceptance: a torrent the pool adopts keeps its metadata
+/// across a restart.
+///
+/// The resume scan attaches metadata from the torrent store alone, and
+/// adoption never wrote there, so an adopted torrent came back with none —
+/// and on a private profile never seeded again. The adoption now writes its
+/// `.torrent` to the store; and a torrent adopted before it did, with no
+/// `.torrent` in the store, is re-attached from the library's copy, which
+/// the boot writes back.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn an_adopted_torrent_keeps_its_metadata_across_a_restart() {
+    use sha1::Digest;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let root = p.join("pool");
+    let library = p.join("library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    // A one-byte payload and a `.torrent` whose piece hash it matches, so the
+    // verify the adoption runs passes.
+    std::fs::write(root.join("a"), b"x").unwrap();
+    let mut torrent = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+    torrent.extend_from_slice(&sha1::Sha1::digest(b"x"));
+    torrent.extend_from_slice(b"ee");
+    std::fs::write(library.join("t.torrent"), &torrent).unwrap();
+    let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+        .unwrap()
+        .to_hex();
+
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\n",
+        root.display(),
+        library.display()
+    ));
+    std::fs::write(&cfg, text).unwrap();
+    let stored = p
+        .join("torrents")
+        .join(PROFILE)
+        .join(format!("{ih}.torrent"));
+    // Killed if an assertion below panics, rather than left running with the
+    // test harness's output pipes open.
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        let child = KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_torrentd"))
+                .arg("--config")
+                .arg(&cfg)
+                .spawn()
+                .expect("spawn daemon"),
+        );
+        wait_healthy(addr);
+        child
+    };
+    let stop = |mut child: KillOnDrop| {
+        sigterm(&child.0);
+        assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    };
+
+    let child = spawn();
+    let (code, body) = http(addr, "POST", "/v1/pool/scan", None);
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/pool/adoptions",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"selector\":{{\"kind\":\"infohashes\",\
+             \"infohashes\":[\"{ih}\"]}}}}"
+        )),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains(&ih), "{body}");
+    // The verify queue admits it within a tick or two.
+    assert_eq!(
+        session_name(addr, &ih, Duration::from_secs(30)).as_deref(),
+        Some("a"),
+        "the adopted torrent never loaded",
+    );
+    assert_eq!(
+        std::fs::read(&stored).ok().as_deref(),
+        Some(torrent.as_slice()),
+        "the adoption did not write its .torrent to the torrent store",
+    );
+    stop(child);
+
+    // Restarted, it loads from its resume data with its metadata.
+    let child = spawn();
+    assert_eq!(
+        session_name(addr, &ih, Duration::from_secs(10)).as_deref(),
+        Some("a"),
+        "the adopted torrent came back from a restart without its metadata",
+    );
+    stop(child);
+
+    // Adopted before the store was written to: no `.torrent` there. The boot
+    // takes the library's, and keeps it.
+    std::fs::remove_file(&stored).unwrap();
+    let child = spawn();
+    assert_eq!(
+        session_name(addr, &ih, Duration::from_secs(10)).as_deref(),
+        Some("a"),
+        "the resume scan did not fall back to the pool library's .torrent",
+    );
+    assert_eq!(
+        std::fs::read(&stored).ok().as_deref(),
+        Some(torrent.as_slice()),
+        "the boot did not write the library's .torrent back to the store",
+    );
+    stop(child);
+}
