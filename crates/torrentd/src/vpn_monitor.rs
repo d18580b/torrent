@@ -364,6 +364,7 @@ fn fence(
     entry.update_health(|h| {
         h.status = ProfileStatus::VpnDown;
         h.tunnel_ip = current;
+        h.paused_for_vpn = 0;
     });
     atomic::fence(atomic::Ordering::SeqCst);
     let labels = [("profile_id", profile_id.as_str())];
@@ -386,7 +387,18 @@ fn fence(
             }
         }
     }
-    entry.update_health(|h| h.paused_for_vpn = paused);
+    // Added, not assigned: the boot scans' fence (`startup::ScanFence`) acts
+    // as soon as it sees the mark above, which may be before this walk ends,
+    // and adds what it paused to the same count. Both writers set the gauge
+    // from the sum under the health lock, so the last write is the full sum.
+    entry.update_health(|h| {
+        h.paused_for_vpn += paused;
+        metrics.set_gauge(
+            "profile_torrents_paused_vpn_down",
+            h.paused_for_vpn as f64,
+            &labels,
+        );
+    });
     paused
 }
 
@@ -643,7 +655,6 @@ async fn run_with(
                     ("reason", reason.as_str()),
                 ],
             );
-            metrics.set_gauge("profile_torrents_paused_vpn_down", paused as f64, &labels);
             error!(
                 target: "torrentd::vpn_monitor",
                 profile_id = %profile_id,
