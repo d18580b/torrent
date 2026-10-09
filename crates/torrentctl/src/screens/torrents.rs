@@ -517,7 +517,7 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                     format!("reannounce sent for {short}; its trackers show the outcome")
                 }
                 Action::Remove => format!("removed {short}; its payload stays on disk"),
-                Action::RemoveFiles => format!("removed {short} and deleted its files"),
+                Action::RemoveFiles => format!("removed {short} and moved its files to the trash"),
                 Action::PauseAll | Action::ResumeAll => String::new(),
             };
             if matches!(action, Action::Remove | Action::RemoveFiles)
@@ -1284,8 +1284,11 @@ fn perform(api: &Api, action: Action, hash: String) -> Effect {
             Action::Reannounce => crate::api::call(client.reannounce_torrent(h)).await,
             Action::Remove => crate::api::call(client.delete_torrent(h, None)).await,
             Action::RemoveFiles => {
+                // The typed confirmation the operator gave is what the
+                // daemon's `confirm` stands for: name the torrent again.
                 let params = crate::api::generated::DeleteTorrentParams {
                     delete_files: Some(true),
+                    confirm: Some(h.clone()),
                 };
                 crate::api::call(client.delete_torrent(h, params)).await
             }

@@ -1920,7 +1920,7 @@
           "torrents"
         ],
         "summary": "Remove a torrent.",
-        "description": "Removes it from its session and clears its assignment, so the infohash can\nbe added again. `delete_files=true` also deletes the payload, and needs\n`[pool] allow_mutations`. A torrent whose profile has no running session,\nor that the boot left unloaded, is cleared from the daemon's records\nalone (`delete_files` is refused there: nothing can reach the payload). A\ntorrent still being added is `409 torrent-adding`; retry once it lists a\nphase other than `unknown`.",
+        "description": "Removes it from its session and clears its assignment, so the infohash can\nbe added again. `delete_files=true` also moves the payload into the trash\nof the managed root it lies in, never unlinking it, and needs `[pool]\nallow_mutations` and `confirm` repeating the infohash. It is refused,\nchanging nothing, unless every file is under a managed root, claimed by\nthis torrent alone in the pool index, and unchanged since the scan that\nindexed it. A torrent whose profile has no running session, or that the\nboot left unloaded, is cleared from the daemon's records alone\n(`delete_files` is refused there: nothing can reach the payload). A\ntorrent still being added is `409 torrent-adding`; retry once it lists a\nphase other than `unknown`.",
         "operationId": "delete_torrent",
         "parameters": [
           {
@@ -1935,11 +1935,23 @@
           {
             "name": "delete_files",
             "in": "query",
-            "description": "Also delete the payload from disk. Needs `[pool] allow_mutations`;\n`false` when absent.",
+            "description": "Also move the payload into the trash of the managed root it lies in\n(`<root>/.torrentd-trash/torrent-<infohash>-<unix seconds>/`). Needs\n`[pool] allow_mutations` and `confirm`; `false` when absent.",
             "required": false,
             "schema": {
               "type": [
                 "boolean",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "confirm",
+            "in": "query",
+            "description": "With `delete_files=true`: this torrent's infohash, repeated, to confirm\nthat its payload is the one to delete. Ignored otherwise.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
                 "null"
               ]
             }
@@ -2081,6 +2093,28 @@
               }
             }
           },
+          "422": {
+            "description": "The delete is not confirmed",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#delete-unconfirmed"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
           "404": {
             "description": "Torrent not found",
             "content": {
@@ -2104,7 +2138,7 @@
             }
           },
           "409": {
-            "description": "The torrent is still being added; The payload is shared; The profile is unavailable",
+            "description": "The torrent is still being added; The payload is shared; The payload cannot be trashed; The profile is unavailable",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2140,6 +2174,22 @@
                         }
                       ],
                       "title": "The payload is shared"
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#payload-untrashable"
+                            }
+                          }
+                        }
+                      ],
+                      "title": "The payload cannot be trashed"
                     },
                     {
                       "allOf": [
