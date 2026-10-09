@@ -18,6 +18,11 @@ branch on it; none of them raises on a network error.
   capture IFACE FILE
       writes `ready`, then one line per IP packet arriving on IFACE:
       `<proto> <src> <sport> <dst> <dport> [<tcp flags> | <icmp type>]`
+  natpmp-gateway ADDR FILE [FIRST_PORT] [HOLD_ATTEMPTS]
+      a NAT-PMP gateway on ADDR:5351 that moves every renewal to a new port
+      and holds it on the wire; see natpmp_gateway
+  fence-race DAEMON_LOG GATEWAY_LOG SKIP
+      whether a fence landed inside a renewal, and what followed; see fence_race
 """
 
 import errno
@@ -142,7 +147,10 @@ def capture(iface, path):
     with open(path, "a", buffering=1) as out:
         out.write("ready\n")
         while True:
-            frame, addr = s.recvfrom(65535)
+            try:
+                frame, addr = s.recvfrom(65535)
+            except OSError:
+                return  # the link went with the namespace
             if addr[2] == socket.PACKET_OUTGOING:
                 continue
             ethertype = struct.unpack("!H", frame[12:14])[0]
@@ -165,6 +173,117 @@ def capture(iface, path):
             out.write(("%s %s %d %s %d %s" % (name, src, sport, dst, dport, extra)).rstrip() + "\n")
 
 
+def natpmp_gateway(addr, log, first_port="40000", hold_attempts="5"):
+    """A NAT-PMP gateway (RFC 6886) that changes the port on every renewal,
+    and answers each renewal only at its client's `hold_attempts`th attempt.
+
+    The first mapping exchange (the daemon's bring-up) is answered at once.
+    After that every TCP mapping request is answered with a port it has not
+    handed out before, so each renewal is a port change; and each request,
+    TCP and UDP, is answered only when it has arrived `hold_attempts` times,
+    which holds a renewal on the wire for most of the client's retransmit
+    budget. The UDP answer repeats the TCP port. A delete (lifetime 0) is
+    answered at once.
+
+    `log` gets one line per renewal, in seconds since the epoch:
+    `exchange <begin> <end> <port>`, from the first sight of its TCP request
+    to the answer to its UDP one.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind((addr, 5351))
+    epoch_base = time.time()
+    port = int(first_port)
+    hold = int(hold_attempts)
+    exchanges = 0
+    seen = {}
+    begin = None
+    with open(log, "a", buffering=1) as out:
+        out.write("ready\n")
+        while True:
+            msg, peer = s.recvfrom(64)
+            if len(msg) < 12 or msg[0] != 0 or msg[1] not in (1, 2):
+                continue
+            op = msg[1]
+            internal = struct.unpack("!H", msg[4:6])[0]
+            lifetime = struct.unpack("!I", msg[8:12])[0]
+            if lifetime == 0:
+                mapped = 0
+            else:
+                key = (op, msg)
+                seen[key] = seen.get(key, 0) + 1
+                if op == 2 and seen[key] == 1 and exchanges > 0:
+                    begin = time.time()
+                if exchanges > 0 and seen[key] < hold:
+                    continue
+                del seen[key]
+                if op == 2:
+                    if exchanges > 0:
+                        port += 1
+                    tcp_port = port
+                mapped = port
+            epoch = int(time.time() - epoch_base) + 1
+            s.sendto(
+                struct.pack("!BBHIHHI", 0, 128 + op, 0, epoch, internal, mapped, lifetime and 4),
+                peer,
+            )
+            if op == 1 and lifetime:
+                if exchanges > 0 and begin is not None:
+                    out.write("exchange %.3f %.3f %d\n" % (begin, time.time(), tcp_port))
+                exchanges += 1
+
+
+FENCE = "VPN tunnel unhealthy"
+REBOUND = "NAT-PMP port changed; rebound live session"
+HELD = "NAT-PMP renewed with a new port after the profile was fenced"
+REANNOUNCED = "reannounced the profile's torrents after the port change"
+
+
+def fence_race(daemon_log, gateway_log, skip):
+    """Judge one fence from the daemon's JSON log (from line `skip` on) and
+    the gateway's exchanges: whether it landed inside a renewal's exchange,
+    and what the renewal did after it.
+
+    Prints `<hit|miss> <rebound|held|none> fence=<t> [exchange=<begin>-<end>]`,
+    or `nofence`.
+    """
+    from datetime import datetime
+    import json
+
+    events = []
+    with open(daemon_log) as f:
+        for i, line in enumerate(f):
+            if i < int(skip):
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            t = datetime.fromisoformat(e["timestamp"].replace("Z", "+00:00")).timestamp()
+            events.append((t, e.get("message", "")))
+    fenced = [t for t, m in events if m.startswith(FENCE)]
+    if not fenced:
+        return "nofence"
+    t_f = fenced[0]
+    exchanges = []
+    with open(gateway_log) as f:
+        for line in f:
+            parts = line.split()
+            if parts and parts[0] == "exchange":
+                exchanges.append((float(parts[1]), float(parts[2])))
+    hit = [(b, e) for b, e in exchanges if b < t_f < e]
+    after = [m for t, m in events if t > t_f]
+    if any(m.startswith(REBOUND) or m.startswith(REANNOUNCED) for m in after):
+        did = "rebound"
+    elif any(m.startswith(HELD) for m in after):
+        did = "held"
+    else:
+        did = "none"
+    verdict = "%s %s fence=%.3f" % ("hit" if hit else "miss", did, t_f)
+    if hit:
+        verdict += " exchange=%.3f-%.3f" % hit[0]
+    return verdict
+
+
 COMMANDS = {
     "bind-udp": bind_udp,
     "send-udp": send_udp,
@@ -172,6 +291,8 @@ COMMANDS = {
     "probe-udp": probe_udp,
     "listen-tcp": listen_tcp,
     "capture": capture,
+    "natpmp-gateway": natpmp_gateway,
+    "fence-race": fence_race,
 }
 
 if __name__ == "__main__":

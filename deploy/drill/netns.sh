@@ -79,6 +79,9 @@ drill_enter() {
 # which this one owns, entered with nsenter.
 peer_pid=
 in_peer() { nsenter -t "$peer_pid" -n -- "$@"; }
+# `in_peer` for a process left running: started directly, so the drill's
+# cleanup can kill it.
+in_peer_bg() { nsenter -t "$peer_pid" -n -- "$@" & }
 
 drill_cleanup() {
   local pids
@@ -112,10 +115,6 @@ drill_topology() {
   in_peer ip addr add "$PEER_V4/24" dev "$PEER_IF"
   in_peer ip -6 addr add "$PEER_V6/64" dev "$PEER_IF" nodad
   in_peer ip link set "$PEER_IF" up
-  # The peer answers for the tunnel's far end too, and routes the tunnel's
-  # address back through the host's physical interface: what a LAN neighbour
-  # probing the host's addresses can do.
-  in_peer ip route add "$WG_ADDR/32" via "$HOST_V4"
 
   wg_keys
   in_peer ip link add "$WG_PEER_IF" type wireguard
@@ -123,7 +122,8 @@ drill_topology() {
     peer "$host_pub" allowed-ips "$WG_ADDR/32"
   in_peer ip addr add "$WG_PEER_ADDR/24" dev "$WG_PEER_IF"
   in_peer ip link set "$WG_PEER_IF" up
-  wg_raise "$WG_PORT"
+  # `no-tunnel` leaves wg-drill for the daemon to raise from a config.
+  [[ ${1:-} == no-tunnel ]] || wg_raise "$WG_PORT"
 }
 
 # Keys for both ends, in a private directory under the mount namespace's
@@ -223,7 +223,9 @@ capture_pid=
 capture_start() {
   capture_file=$work/capture.$RANDOM
   : >"$capture_file"
-  in_peer "${PROBE[@]}" capture "$PEER_IF" "$capture_file" &
+  # nsenter itself, not `in_peer`: a function sent to the background runs in
+  # a subshell, and $! would name the subshell rather than the capture.
+  nsenter -t "$peer_pid" -n -- "${PROBE[@]}" capture "$PEER_IF" "$capture_file" &
   capture_pid=$!
   # The socket is bound once the file says so.
   for _ in $(seq 50); do

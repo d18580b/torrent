@@ -30,7 +30,7 @@ drill_enter "$@"
 drill_topology
 
 tunnel_carries 10 || fail_setup "the tunnel does not carry even without a ruleset"
-in_peer "${PROBE[@]}" listen-tcp :: 80 >/dev/null &
+in_peer_bg "${PROBE[@]}" listen-tcp :: 80 >/dev/null
 sleep 0.5
 peer_ll=$(in_peer ip -6 -o addr show dev "$PEER_IF" scope link | awk '{print $4}' | cut -d/ -f1)
 [[ -n $peer_ll ]] || fail_setup "the peer's link has no link-local address"

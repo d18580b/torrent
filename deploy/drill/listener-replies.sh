@@ -34,6 +34,9 @@ set -euo pipefail
 source "$(dirname "$0")/netns.sh"
 drill_enter "$@"
 drill_topology
+# The peer routes the tunnel's address through the host's physical link, as
+# a neighbour on that link probing the host's addresses can.
+in_peer ip route add "$WG_ADDR/32" via "$HOST_V4"
 
 tunnel_carries 10 || fail_setup "the tunnel does not carry even without a ruleset"
 ks_install "$(wg_listen_port)"
