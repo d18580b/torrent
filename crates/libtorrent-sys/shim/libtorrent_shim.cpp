@@ -929,6 +929,29 @@ extern "C" int lt_session_save_state(lt_session* s,
 
 extern "C" void lt_buf_free(uint8_t* buf) { std::free(buf); }
 
+extern "C" int lt_session_pause(lt_session* s) {
+    if (!s) return LT_ERR;
+    LT_SHIM_TRY
+    s->ses.pause();
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
+extern "C" int lt_session_resume(lt_session* s) {
+    if (!s) return LT_ERR;
+    LT_SHIM_TRY
+    s->ses.resume();
+    return LT_OK;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
+extern "C" int lt_session_is_paused(lt_session* s) {
+    if (!s) return LT_ERR;
+    LT_SHIM_TRY
+    return s->ses.is_paused() ? 1 : 0;
+    LT_SHIM_CATCH(nullptr, 0, LT_ERR)
+}
+
 // -------------------------------------------------------------------------
 // Public API: torrent management
 // -------------------------------------------------------------------------

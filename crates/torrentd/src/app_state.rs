@@ -81,6 +81,9 @@ pub struct AppState {
     /// The fingerprint every `/v1/events` stream shares, and the cap on how
     /// many are open.
     pub events: Arc<crate::http::v1::server::EventFeed>,
+    /// How setting a fenced profile online probes its tunnel before it lifts
+    /// the fence: the host's own probes outside tests.
+    pub tunnel_probe: crate::vpn_monitor::Prober,
 }
 
 /// Blocking work a request (or boot) started that must not be cut off
@@ -190,6 +193,12 @@ impl AppState {
             .unwrap_or(false)
     }
 
+    /// Whether the operator holds this profile offline, by its own state or
+    /// by offline-all.
+    pub fn profile_offline(&self, profile_id: &ProfileId) -> bool {
+        self.profiles.held_offline(profile_id)
+    }
+
     /// The configuration of a live profile, or `None` if no such profile is
     /// configured.
     pub fn profile_config(&self, profile_id: &ProfileId) -> Option<&ProfileConfig> {
@@ -285,6 +294,13 @@ pub(crate) fn build_test_state_with_sessions(
         shutdown: tokio::sync::broadcast::channel(4).0,
         work: Arc::default(),
         events: Arc::default(),
+        // No test reaches a real tunnel: every probe answers "no address",
+        // which is unhealthy. A test that lifts a fence sets its own.
+        tunnel_probe: Arc::new(|_, _| crate::vpn_monitor::TunnelProbes {
+            ip: None,
+            route: None,
+            handshake: None,
+        }),
     }
 }
 

@@ -146,12 +146,15 @@ fn adoption(dry_run: bool) -> types::AdoptionResult {
 fn profiles() -> Vec<types::Profile> {
     testing::from_json(json!([
         {"profile_id": "acct_a", "status": "active", "tunnel_ip": "10.2.0.2", "torrent_count": 900,
+         "desired_state": "online", "effective_state": "online",
          "listen_port": 51413, "port_forward": "natpmp", "forwarded_port": 51413,
          "user_agent": null, "failure_reason": null},
         {"profile_id": "acct_b", "status": "vpn_down", "tunnel_ip": "10.3.0.2", "torrent_count": 3,
+         "desired_state": "online", "effective_state": "offline",
          "listen_port": 51414, "port_forward": "static", "forwarded_port": null,
          "user_agent": null, "failure_reason": null},
         {"profile_id": "acct_c", "status": "active", "tunnel_ip": null, "torrent_count": 0,
+         "desired_state": "online", "effective_state": "online",
          "listen_port": null, "port_forward": "static", "forwarded_port": null,
          "user_agent": null, "failure_reason": null},
     ]))

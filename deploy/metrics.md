@@ -52,6 +52,7 @@ hold.
 | `torrentd_profile_assignment_registry_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Loads and adds refused because the assignment registry disagreed or could not be written. |
 | `torrentd_profile_fence_pause_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents the VPN monitor failed to pause while fencing the profile. |
 | `torrentd_profile_boot_failed` | gauge | `profile_id` | each profile | from boot: always | 1 if the profile got no session at boot (tunnel, port forward, or session construction failed). |
+| `torrentd_profile_offline` | gauge | `profile_id` | each profile | from boot: always | 1 while the operator holds the profile offline, by its own state or by offline-all. |
 | `torrentd_boot_torrent_load_failures` | gauge | `profile_id`; `source`: `resume_add`, `torrent_read`, `torrent_dir_add`, `resume_file`, `torrent_file` | each profile | from boot: always | Torrents the boot scans could not load: a resume add that failed, a .torrent that could not be read, a torrent-dir add that failed, or a resume or torrent-dir file the scan could not read and skipped. |
 | `torrentd_profile_unloaded_registry_torrents` | gauge | `profile_id` | each profile | from boot: live profiles | Torrents the assignment registry claims for the profile that no boot scan loaded. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |

@@ -751,7 +751,12 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
 
 /// `400`, `415`, `413` and `408` for an operation with a JSON body, the
 /// `408` arriving at the operation's `deadline`.
-async fn body_framework_rejections(h: &Harness, method: &str, path: &str, deadline: Duration) {
+pub(super) async fn body_framework_rejections(
+    h: &Harness,
+    method: &str,
+    path: &str,
+    deadline: Duration,
+) {
     let token = h.tokens.write.clone();
     let resp = h
         .send_with(

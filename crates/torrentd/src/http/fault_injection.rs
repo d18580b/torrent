@@ -182,6 +182,15 @@ impl TorrentEngine for FaultEngine {
     fn session_state(&self) -> Result<Vec<u8>, EngineError> {
         self.inner.session_state()
     }
+    fn pause_session(&self) -> Result<(), EngineError> {
+        self.inner.pause_session()
+    }
+    fn resume_session(&self) -> Result<(), EngineError> {
+        self.inner.resume_session()
+    }
+    fn session_paused(&self) -> Result<bool, EngineError> {
+        self.inner.session_paused()
+    }
     fn torrent_details(&self, h: TorrentHandle) -> Result<TorrentDetails, EngineError> {
         self.inner.torrent_details(h)
     }

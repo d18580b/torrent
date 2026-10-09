@@ -5,6 +5,16 @@ amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.
 // keeping a single source of truth (mise tasks) is the whole point. hk's job
 // here is orchestration — stashing so fixes run against the staged snapshot,
 // and re-staging the files its fix commands touch.
+//
+// Every step that builds runs with GIT_DIR and GIT_WORK_TREE unset. git
+// exports both to its hooks, and in a linked worktree GIT_DIR is absolute, so
+// every `git -C <dir>` libtorrent-sys's build script runs answers for the
+// superproject: an uninitialised vendor submodule reads as a repository whose
+// HEAD is the superproject's commit, the native cache key changes with every
+// commit, and the build demands the submodules it would otherwise not need.
+// In the main checkout git exports the relative `.git`, which happens to
+// resolve correctly, which is why it showed only in worktrees.
+local nogit = "env -u GIT_DIR -u GIT_WORK_TREE "
 local rust = new Mapping<String, Step> {
   ["fmt"] {
     glob = "**/*.rs"
@@ -13,8 +23,8 @@ local rust = new Mapping<String, Step> {
   }
   ["clippy"] {
     glob = "**/*.rs"
-    check = "mise run lint"
-    fix = "mise run lint-fix"
+    check = nogit + "mise run lint"
+    fix = nogit + "mise run lint-fix"
   }
 }
 
@@ -49,10 +59,10 @@ hooks {
       }
       ["clippy"] {
         glob = "**/*.rs"
-        check = "mise run lint"
+        check = nogit + "mise run lint"
       }
       ["test"] {
-        check = "mise run test"
+        check = nogit + "mise run test"
       }
     }
   }

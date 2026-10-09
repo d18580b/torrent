@@ -296,8 +296,48 @@ fn probe_tunnel(iface: &str, is_wg: bool) -> TunnelProbes {
     }
 }
 
-/// How [`run_with`] probes a tunnel: [`probe_tunnel`] outside tests.
-type Prober = Arc<dyn Fn(&str, bool) -> TunnelProbes + Send + Sync>;
+/// How [`run_with`] and [`recovery_check`] probe a tunnel: [`probe_tunnel`]
+/// outside tests.
+pub(crate) type Prober = Arc<dyn Fn(&str, bool) -> TunnelProbes + Send + Sync>;
+
+/// The host's own probes, as a [`Prober`].
+pub(crate) fn host_prober() -> Prober {
+    Arc::new(probe_tunnel)
+}
+
+/// Whether a fenced profile's tunnel is healthy enough to lift the fence,
+/// asked when the operator sets the profile online. Blocking: it shells out.
+///
+/// The same verdict as the monitor's ([`evaluate`]) on the address and the
+/// route: the interface must hold the very address the session is bound to
+/// (`ProfileEntry::session_ip`, which a fence does not overwrite), since the
+/// session's sockets cannot follow a new one, and a packet from it must leave
+/// by the tunnel.
+///
+/// The handshake is not asked. WireGuard handshakes only when it has a packet
+/// to send, and a fenced profile sends none, so its handshake is stale by
+/// construction and would keep every fence up for good. The monitor measures
+/// it again from its next poll, once the profile carries traffic, and fences
+/// the profile again if no handshake follows.
+///
+/// A host profile has no tunnel and is never fenced; it passes.
+pub(crate) fn recovery_check(
+    entry: &crate::profile_registry::ProfileEntry,
+    probe: &Prober,
+) -> Result<(), DownReason> {
+    let Some(iface) = entry.config.vpn_interface() else {
+        return Ok(());
+    };
+    let probes = probe(iface, entry.config.vpn_type() == Some(VpnType::Wireguard));
+    let observation = Observation {
+        current: probes.ip,
+        expected: entry.session_ip,
+        route: probes.route.and_then(Result::ok),
+        handshake: Handshake::NoSignal,
+        unanswered_for: Duration::ZERO,
+    };
+    evaluate(&observation, Duration::MAX)
+}
 
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
@@ -312,7 +352,7 @@ pub async fn run(
         metrics,
         handshake_max_age,
         shutdown,
-        Arc::new(probe_tunnel),
+        host_prober(),
     )
     .await;
 }
@@ -346,9 +386,15 @@ async fn run_with(
         for e in profiles.iter() {
             let profile_id = e.id().clone();
             let health = e.health();
-            // Once a profile is down it stays down until the operator restarts
-            // the daemon — no auto-recovery.
+            // Once a profile is down it stays down until the operator sets it
+            // online and its tunnel passes `recovery_check` — no
+            // auto-recovery.
             if health.status == ProfileStatus::VpnDown {
+                // A fence that is lifted later starts the no-handshake clock
+                // afresh, rather than from a poll before the fence: that
+                // would read as the whole fenced span without a handshake and
+                // fence the profile again on the first poll after it.
+                unanswered_since.remove(&profile_id);
                 continue;
             }
 
@@ -438,7 +484,22 @@ async fn run_with(
                     Handshake::Age(age)
                 }
             };
-            let carrying = profile_carries_traffic(&state, &profile_id);
+            // A profile the operator holds offline has its whole session
+            // paused, so nothing in it sends, whatever its torrents' phases,
+            // and a WireGuard tunnel with nothing to send does not handshake:
+            // its handshake, never made or aging, says nothing about the
+            // tunnel. Judged on the address and the route alone, as
+            // `recovery_check` judges a fenced one; otherwise a static-port
+            // tunnel with no keepalive is fenced `handshake_stale` some
+            // minutes after going offline, and setting it online then lifts
+            // the fence by resuming every torrent in it.
+            let held_offline = profiles.held_offline(&profile_id);
+            let handshake = if held_offline {
+                Handshake::NoSignal
+            } else {
+                handshake
+            };
+            let carrying = !held_offline && profile_carries_traffic(&state, &profile_id);
             let unanswered_for = unanswered_clock(
                 &mut unanswered_since,
                 &profile_id,
@@ -489,6 +550,10 @@ async fn run_with(
                 hh.tunnel_ip = current;
                 hh.paused_for_vpn = paused;
             });
+            // The clock goes with the fence, not with the next poll: a fence
+            // lifted before that poll would otherwise keep the clock from
+            // before it and be fenced `no_handshake` on the first poll after.
+            unanswered_since.remove(&profile_id);
 
             metrics.set_gauge("profile_vpn_tunnel_up", 0.0, &labels);
             // Only an actual IP change increments the IP-change counter. It
@@ -793,6 +858,18 @@ mod tests {
         probe: Prober,
         polls: u32,
     ) -> (ProfileStatus, String) {
+        poll_acct_a_held(state, max_age, probe, polls, false).await
+    }
+
+    /// [`poll_acct_a`], with `acct_a` held offline by the operator when
+    /// `offline` is set.
+    async fn poll_acct_a_held(
+        state: StateMap,
+        max_age: Duration,
+        probe: Prober,
+        polls: u32,
+        offline: bool,
+    ) -> (ProfileStatus, String) {
         use crate::profile_registry::test_entry;
 
         let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
@@ -800,6 +877,19 @@ mod tests {
             ProfileStatus::Active,
         )]));
         let metrics = Arc::new(PromSink::new());
+        if offline {
+            profiles
+                .change_states(
+                    |r| {
+                        r.set(
+                            &torrentd_engine::ProfileId::new("acct_a"),
+                            torrentd_engine::DesiredState::Offline,
+                        )
+                    },
+                    &*metrics,
+                )
+                .unwrap();
+        }
         let (tx, rx) = broadcast::channel(1);
         let task = tokio::spawn(run_with(
             profiles.clone(),
@@ -889,6 +979,89 @@ mod tests {
             ProfileStatus::Active,
             "a fully paused profile sends nothing to be answered: {exported}"
         );
+    }
+
+    /// A profile the operator holds offline has its session paused and sends
+    /// nothing, whatever its torrents' phases, so its tunnel's handshake —
+    /// never made, or aging — fences it on no rule while the address and
+    /// route hold.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_loop_does_not_fence_an_offline_profile_on_its_handshake() {
+        let max_age = Duration::from_secs(60);
+        let seeding = || {
+            let s = StateMap::new();
+            loaded(&s, 1, "acct_a", TorrentPhase::Seeding);
+            s
+        };
+
+        let never = scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None));
+        let (status, exported) = poll_acct_a_held(seeding(), max_age, never, 8, true).await;
+        assert_eq!(
+            status,
+            ProfileStatus::Active,
+            "no traffic, so no clock: {exported}"
+        );
+
+        let stale = scripted(
+            Some(Ok(RouteProbe::ViaTunnel)),
+            Ok(Some(Duration::from_secs(600))),
+        );
+        let (status, exported) = poll_acct_a_held(seeding(), max_age, stale, 8, true).await;
+        assert_eq!(
+            status,
+            ProfileStatus::Active,
+            "an aging handshake is no fault while nothing sends: {exported}"
+        );
+
+        // The route still fences an offline profile.
+        let elsewhere = scripted(
+            Some(Ok(RouteProbe::Elsewhere("leaves by eth0".into()))),
+            Ok(None),
+        );
+        let (status, exported) = poll_acct_a_held(seeding(), max_age, elsewhere, 1, true).await;
+        assert_eq!(status, ProfileStatus::VpnDown, "{exported}");
+        assert!(fenced_once_for(&exported, "route_mismatch"), "{exported}");
+    }
+
+    /// A fence lifted before the monitor's next poll starts the no-handshake
+    /// clock afresh: the fence drops it, not the poll that would have seen
+    /// the profile `vpn_down`.
+    #[tokio::test(start_paused = true)]
+    async fn a_fence_lifted_before_the_next_poll_restarts_the_no_handshake_clock() {
+        use crate::profile_registry::test_entry;
+
+        let max_age = Duration::from_secs(60);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
+            "acct_a",
+            ProfileStatus::Active,
+        )]));
+        let metrics = Arc::new(PromSink::new());
+        let (tx, rx) = broadcast::channel(1);
+        let task = tokio::spawn(run_with(
+            profiles.clone(),
+            Arc::new(state),
+            metrics.clone(),
+            max_age,
+            rx,
+            scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None)),
+        ));
+        let entry = profiles.iter().next().unwrap();
+
+        // Fenced `no_handshake` at the fourth poll, as above.
+        tokio::time::sleep(POLL_INTERVAL * 4 + Duration::from_secs(1)).await;
+        assert_eq!(entry.health().status, ProfileStatus::VpnDown);
+
+        // Lifted before the fifth poll; the clock restarts there, so the
+        // fifth and sixth polls (0s, 30s unanswered) leave it up.
+        entry.update_health(|h| h.status = ProfileStatus::Active);
+        tokio::time::sleep(POLL_INTERVAL * 2).await;
+        tx.send(ShutdownReason::Test).unwrap();
+        task.await.unwrap();
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        assert_eq!(entry.health().status, ProfileStatus::Active, "{exported}");
+        assert!(fenced_once_for(&exported, "no_handshake"), "{exported}");
     }
 
     #[test]
@@ -1021,6 +1194,66 @@ mod tests {
         assert!(
             !exported.contains("profile_id=\"public\""),
             "got:\n{exported}",
+        );
+    }
+
+    fn answering(
+        ip: Option<IpAddr>,
+        route: Option<RouteProbe>,
+        handshake: Option<Duration>,
+    ) -> Prober {
+        Arc::new(move |_, _| TunnelProbes {
+            ip,
+            route: route.clone().map(Ok),
+            handshake: Some(Ok(handshake)),
+        })
+    }
+
+    /// Lifting a fence asks for the address the session is bound to and a
+    /// route through the tunnel, and nothing about the handshake, which a
+    /// fenced profile has had no traffic to refresh.
+    #[test]
+    fn the_recovery_check_wants_the_bound_address_routed_by_the_tunnel() {
+        // `test_vpn_entry` binds its session to 10.2.0.2.
+        let entry = crate::profile_registry::test_vpn_entry("acct_a", ProfileStatus::VpnDown);
+        let stale = Some(Duration::from_secs(86_400));
+        assert_eq!(
+            recovery_check(
+                &entry,
+                &answering(ip(2), Some(RouteProbe::ViaTunnel), stale)
+            ),
+            Ok(()),
+            "a stale handshake does not hold the fence",
+        );
+        assert_eq!(
+            recovery_check(&entry, &answering(ip(2), Some(RouteProbe::ViaTunnel), None)),
+            Ok(()),
+            "nor does a handshake that never happened",
+        );
+        assert_eq!(
+            recovery_check(
+                &entry,
+                &answering(ip(9), Some(RouteProbe::ViaTunnel), stale)
+            ),
+            Err(DownReason::IpLostOrChanged),
+            "the session cannot follow a new address",
+        );
+        assert_eq!(
+            recovery_check(&entry, &answering(None, None, stale)),
+            Err(DownReason::IpLostOrChanged),
+        );
+        assert_eq!(
+            recovery_check(
+                &entry,
+                &answering(ip(2), Some(RouteProbe::Elsewhere("eth0".into())), stale),
+            ),
+            Err(DownReason::RouteMismatch),
+        );
+        let host = crate::profile_registry::test_host_entry("public");
+        assert_eq!(
+            recovery_check(&host, &answering(None, None, None)),
+            Ok(()),
+            "a host profile has no tunnel to check",
         );
     }
 }

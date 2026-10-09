@@ -8,7 +8,7 @@ document, `application/problem+json`:
   "type": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable",
   "title": "The profile is unavailable",
   "status": 409,
-  "detail": "profile vpn_down; restart daemon to resume",
+  "detail": "profile vpn_down: the VPN monitor fenced it after its tunnel failed. Once the tunnel is back, set the profile online to lift the fence.",
   "profile_status": "vpn_down"
 }
 ```
@@ -154,8 +154,13 @@ member says why:
 - **`failed`**: the profile never came up at boot, so its torrents are not
   loaded.
 - **`vpn_down`**: the VPN monitor fenced the profile after its tunnel failed.
-  It stays fenced until the daemon restarts, and nothing may un-quarantine it
-  before then.
+  It stays fenced until the operator sets it online
+  (`PATCH /v1/profiles/{profile_id}` with `{"state": "online"}`) and its
+  tunnel passes the check that request runs; nothing else un-quarantines it.
+  That request answers this problem too, when the tunnel still fails.
+- **`offline`**: the operator set the profile offline, or every profile with
+  `POST /v1/profiles/offline-all`. Adds, adoptions and resumes are refused
+  until it is set online.
 
 ## `torrent-exists`
 

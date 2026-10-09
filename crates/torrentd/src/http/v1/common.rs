@@ -94,8 +94,12 @@ pub enum ProfileUnavailableReason {
     /// The profile never came up at boot; its torrents are not loaded.
     Failed,
     /// The VPN monitor fenced the profile after its tunnel failed. It stays
-    /// fenced until the daemon restarts.
+    /// fenced until the operator sets it online and its tunnel checks
+    /// healthy.
     VpnDown,
+    /// The operator set the profile offline, or every profile offline with
+    /// offline-all.
+    Offline,
 }
 
 impl ProfileUnavailableReason {
@@ -103,6 +107,7 @@ impl ProfileUnavailableReason {
         match self {
             Self::Failed => "failed",
             Self::VpnDown => "vpn_down",
+            Self::Offline => "offline",
         }
     }
 }
@@ -130,7 +135,18 @@ impl ProfileProblem {
     pub fn vpn_down() -> Self {
         Self::Unavailable {
             reason: ProfileUnavailableReason::VpnDown,
-            detail: "profile vpn_down; restart daemon to resume".to_owned(),
+            detail: "profile vpn_down: the VPN monitor fenced it after its tunnel failed. Once \
+                     the tunnel is back, set the profile online to lift the fence."
+                .to_owned(),
+        }
+    }
+
+    pub fn offline() -> Self {
+        Self::Unavailable {
+            reason: ProfileUnavailableReason::Offline,
+            detail: "profile offline: it is held off the network by its own state or by \
+                     offline-all. Set it online first."
+                .to_owned(),
         }
     }
 }
@@ -176,11 +192,15 @@ pub fn engine_for(
     })
 }
 
-/// As [`engine_for`], also refusing a profile the VPN monitor fenced.
+/// As [`engine_for`], also refusing a profile the VPN monitor fenced or the
+/// operator set offline.
 ///
-/// For every request that would put a fenced profile's torrents back on the
-/// network — resume, recheck, reannounce, add, adopt — which must wait for the
-/// operator's restart.
+/// For every request that would put a profile's torrents on the network —
+/// resume, recheck, reannounce, add, adopt — which must wait for the operator
+/// to set it online. An add is refused rather than held paused: the session
+/// pause would hold it, but an add that answers `201` into a profile that
+/// cannot seed it reads as success. A fence is named before offline, since
+/// setting a fenced profile online is what lifts it.
 pub fn unfenced_engine(
     s: &AppState,
     profile_id: &ProfileId,
@@ -188,6 +208,9 @@ pub fn unfenced_engine(
     let engine = engine_for(s, profile_id)?;
     if s.profile_vpn_down(profile_id) {
         return Err(ProfileProblem::vpn_down());
+    }
+    if s.profile_offline(profile_id) {
+        return Err(ProfileProblem::offline());
     }
     Ok(engine)
 }

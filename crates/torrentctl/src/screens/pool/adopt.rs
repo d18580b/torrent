@@ -172,11 +172,12 @@ pub fn update(dialog: &mut Option<Dialog>, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effec
             result: Ok(profiles),
             ..
         } => {
-            // Only a running profile can take torrents.
+            // Only a profile on the network can take torrents: the daemon
+            // refuses an adoption into a fenced or offline one.
             d.profiles = Some(
                 profiles
                     .into_iter()
-                    .filter(|p| p.status == types::ProfileStatus::Active)
+                    .filter(|p| p.effective_state == types::ProfileState::Online)
                     .map(|p| p.profile_id)
                     .collect(),
             );

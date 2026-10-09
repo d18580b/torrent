@@ -1,6 +1,8 @@
 //! `profiles`, and the daemon-wide `torrents/pause-all` and
 //! `torrents/resume-all` that iterate them.
 
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use serde_json::json;
@@ -309,6 +311,269 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
     }
 
     h.assert_conformance();
+    states(cov).await;
+}
+
+/// A tunnel probe whose answer the test sets: healthy reports the address
+/// [`live`] binds every session to, routed by the tunnel; unhealthy reports
+/// no address at all.
+fn switchable_probe(healthy: &Arc<AtomicBool>) -> crate::vpn_monitor::Prober {
+    let healthy = Arc::clone(healthy);
+    Arc::new(move |_, _| {
+        if healthy.load(Ordering::SeqCst) {
+            crate::vpn_monitor::TunnelProbes {
+                ip: Some("10.2.0.2".parse().unwrap()),
+                route: Some(Ok(crate::vpn::route::RouteProbe::ViaTunnel)),
+                handshake: None,
+            }
+        } else {
+            crate::vpn_monitor::TunnelProbes {
+                ip: None,
+                route: None,
+                handshake: None,
+            }
+        }
+    })
+}
+
+fn profile_of<'a>(list: &'a Value, id: &str) -> &'a Value {
+    list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["profile_id"] == id)
+        .unwrap()
+}
+
+/// Setting profiles online and offline, one at a time and all at once, and
+/// lifting a fence by setting a fenced profile online.
+async fn states(cov: &Arc<Coverage>) {
+    let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+    let (b, eng_b) = live("acct_b", ProfileStatus::VpnDown);
+    let healthy = Arc::new(AtomicBool::new(false));
+    let h = Harness::authed(cov, |s| {
+        install(s, vec![a, b], vec![test_failed_profile("acct_c", REASON)]);
+        s.tunnel_probe = switchable_probe(&healthy);
+    });
+    let hb = load(&h.state, 2, "acct_b");
+    let set = |id: &str, state: &str| {
+        let path = format!("/v1/profiles/{id}");
+        let body = json!({ "state": state });
+        let token = h.tokens.write.clone();
+        let h = &h;
+        async move { h.send("PATCH", &path, Some(&token), Some(body)).await }
+    };
+
+    // Everything starts online.
+    let list: Value = h.read("/v1/profiles").await.json();
+    assert_eq!(list["offline_all"], false);
+    assert_eq!(profile_of(&list, "acct_a")["desired_state"], "online");
+    assert_eq!(profile_of(&list, "acct_a")["effective_state"], "online");
+    assert_eq!(
+        profile_of(&list, "acct_b")["effective_state"],
+        "offline",
+        "a fenced profile is off the network whatever it is set to",
+    );
+    assert_eq!(profile_of(&list, "acct_c")["effective_state"], "offline");
+
+    // One profile offline: its session pauses, and nothing more may reach
+    // the network through it.
+    let resp = set("acct_a", "offline").await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    let detail: Value = resp.json();
+    assert_eq!(detail["desired_state"], "offline");
+    assert_eq!(detail["effective_state"], "offline");
+    assert_eq!(detail["status"], "active");
+    assert!(eng_a.session_paused().unwrap());
+    let metrics = String::from_utf8(h.state.metrics.render()).unwrap();
+    assert!(
+        metrics.contains(r#"torrentd_profile_offline{profile_id="acct_a"} 1"#),
+        "{metrics}"
+    );
+    let resp = h
+        .send(
+            "POST",
+            "/v1/torrents",
+            Some(&h.tokens.write.clone()),
+            Some(json!({
+                "profile_id": "acct_a",
+                "source": {
+                    "kind": "magnet",
+                    "uri": "magnet:?xt=urn:btih:0909090909090909090909090909090909090909",
+                },
+            })),
+        )
+        .await;
+    assert_problem(&resp, 409, "profile-unavailable");
+    assert_eq!(resp.json::<Value>()["profile_status"], "offline");
+    assert_eq!(
+        calls(&eng_a, |c| matches!(c, RecordedCall::AddTorrent(_))),
+        0,
+        "an add into an offline profile never reaches its session",
+    );
+    let resp = h.write("POST", "/v1/profiles/acct_a/resume-all").await;
+    assert_problem(&resp, 409, "profile-unavailable");
+    assert_eq!(resp.json::<Value>()["profile_status"], "offline");
+
+    // The daemon-wide resume skips it by name rather than refusing, and
+    // resumes none of its torrents.
+    load(&h.state, 3, "acct_a");
+    let resp = h.write("POST", "/v1/torrents/resume-all").await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    let out: Value = resp.json();
+    assert_eq!(out["torrent_count"], 0);
+    let skipped: Vec<(&str, &str)> = out["skipped_profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["profile_id"].as_str().unwrap(),
+                p["reason"].as_str().unwrap(),
+            )
+        })
+        .collect();
+    assert!(skipped.contains(&("acct_a", "offline")), "{skipped:?}");
+    assert_eq!(
+        calls(&eng_a, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
+        0,
+        "a bulk resume never reaches an offline profile's session",
+    );
+
+    // Online again.
+    let detail: Value = set("acct_a", "online").await.json();
+    assert_eq!(detail["effective_state"], "online");
+    assert!(!eng_a.session_paused().unwrap());
+
+    // offline-all over one profile already offline on its own; online-all
+    // gives back exactly that.
+    set("acct_a", "offline")
+        .await
+        .assert_status(kynos::http::StatusCode::OK);
+    set("acct_a", "online")
+        .await
+        .assert_status(kynos::http::StatusCode::OK);
+    set("acct_c", "offline")
+        .await
+        .assert_status(kynos::http::StatusCode::OK);
+    let resp = h.write("POST", "/v1/profiles/offline-all").await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    let list: Value = resp.json();
+    assert_eq!(list["offline_all"], true);
+    assert_eq!(profile_of(&list, "acct_a")["desired_state"], "online");
+    assert_eq!(profile_of(&list, "acct_a")["effective_state"], "offline");
+    assert!(eng_a.session_paused().unwrap() && eng_b.session_paused().unwrap());
+    let resp = h.write("POST", "/v1/profiles/online-all").await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    let list: Value = resp.json();
+    assert_eq!(list["offline_all"], false);
+    assert_eq!(profile_of(&list, "acct_a")["effective_state"], "online");
+    assert_eq!(
+        profile_of(&list, "acct_c")["desired_state"],
+        "offline",
+        "a profile's own state outlives offline-all and online-all",
+    );
+    assert!(!eng_a.session_paused().unwrap());
+
+    // A fenced profile set online while its tunnel is still down stays
+    // fenced, and its state does not change.
+    let resp = set("acct_b", "online").await;
+    assert_problem(&resp, 409, "profile-unavailable");
+    let body: Value = resp.json();
+    assert_eq!(body["profile_status"], "vpn_down");
+    assert!(
+        body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("ip_lost_or_changed"),
+        "{body}"
+    );
+    assert_eq!(
+        calls(&eng_b, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
+        0
+    );
+    let detail: Value = h.read("/v1/profiles/acct_b").await.json();
+    assert_eq!(detail["status"], "vpn_down");
+
+    // Once the tunnel checks healthy, the same request lifts the fence
+    // without a restart.
+    healthy.store(true, Ordering::SeqCst);
+    let resp = set("acct_b", "online").await;
+    resp.assert_status(kynos::http::StatusCode::OK);
+    let detail: Value = resp.json();
+    assert_eq!(detail["status"], "active");
+    assert_eq!(detail["effective_state"], "online");
+    assert_eq!(detail["paused_for_vpn"], 0);
+    assert_eq!(
+        calls(
+            &eng_b,
+            |c| matches!(c, RecordedCall::ResumeTorrent(x) if *x == hb)
+        ),
+        1,
+        "the torrents the fence paused are resumed",
+    );
+
+    // An id no profile declares, and one that is not UTF-8.
+    assert_problem(&set("typo", "offline").await, 404, "profile-not-found");
+    let resp = set("%FF", "offline").await;
+    assert_eq!(resp.status().as_u16(), 400, "{}", resp.text());
+    // A state that is not one.
+    let resp = set("acct_a", "sideways").await;
+    assert_eq!(resp.status().as_u16(), 422, "{}", resp.text());
+    let resp = h
+        .send(
+            "PATCH",
+            "/v1/profiles/acct_a",
+            Some(&h.tokens.write.clone()),
+            Some(json!({"state": "online", "extra": 1})),
+        )
+        .await;
+    assert_eq!(resp.status().as_u16(), 422, "unknown fields are refused");
+    super::torrents::body_framework_rejections(
+        &h,
+        "PATCH",
+        "/v1/profiles/acct_a",
+        crate::http::v1::REQUEST_DEADLINE,
+    )
+    .await;
+
+    // A session that refuses the change. The record has changed by then;
+    // the 500 says the session did not follow it.
+    eng_a.inject_error("pause_session", EngineError::Shutdown);
+    assert_problem(&set("acct_a", "offline").await, 500, "internal");
+    eng_a.inject_error("pause_session", EngineError::Shutdown);
+    assert_problem(
+        &h.write("POST", "/v1/profiles/offline-all").await,
+        500,
+        "internal",
+    );
+    // acct_a stays offline on its own state; acct_b is the one online-all
+    // resumes.
+    eng_b.inject_error("resume_session", EngineError::Shutdown);
+    assert_problem(
+        &h.write("POST", "/v1/profiles/online-all").await,
+        500,
+        "internal",
+    );
+
+    // Credentials.
+    for (method, path, body) in [
+        (
+            "PATCH",
+            "/v1/profiles/acct_a",
+            Some(json!({"state": "online"})),
+        ),
+        ("POST", "/v1/profiles/offline-all", None),
+        ("POST", "/v1/profiles/online-all", None),
+    ] {
+        let resp = h.send(method, path, None, body.clone()).await;
+        assert_eq!(resp.status().as_u16(), 401, "{method} {path}");
+        let resp = h
+            .send(method, path, Some(&h.tokens.read.clone()), body)
+            .await;
+        assert_problem(&resp, 403, "insufficient-scope");
+    }
+    h.assert_conformance();
 }
 
 #[tokio::test]
@@ -351,6 +616,36 @@ async fn bulk_operations_count_what_the_engine_refused() {
         );
     }
     h.assert_conformance();
+}
+
+#[tokio::test]
+async fn a_session_that_refuses_to_pause_is_reported_on_the_network() {
+    let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+    let h = Harness::authed(&Coverage::new(), |s| install(s, vec![a], vec![]));
+    eng_a.inject_error(
+        "pause_session",
+        EngineError::MockInjected {
+            op: "pause_session",
+            message: "boom".into(),
+        },
+    );
+
+    let resp = h
+        .send(
+            "PATCH",
+            "/v1/profiles/acct_a",
+            Some(&h.tokens.write.clone()),
+            Some(json!({ "state": "offline" })),
+        )
+        .await;
+    assert_problem(&resp, 500, "internal");
+    assert!(!eng_a.session_paused().unwrap());
+
+    // The record keeps the change, and the session that refused it is still
+    // running: GET says both, rather than calling the profile offline.
+    let list: Value = h.read("/v1/profiles").await.json();
+    assert_eq!(profile_of(&list, "acct_a")["desired_state"], "offline");
+    assert_eq!(profile_of(&list, "acct_a")["effective_state"], "online");
 }
 
 #[tokio::test]
