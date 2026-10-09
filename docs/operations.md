@@ -105,7 +105,9 @@ What stays behind:
   label it), so it can be adopted again, into this profile or another. It
   keeps its claims while its `.torrent` remains in `library_dir`. Once the
   `.torrent` leaves and a rescan drops it, its payload is offered as
-  orphaned like any other unclaimed file. A rescan also demotes an `adopted`
+  orphaned like any other unclaimed file. The exception is a torrent the
+  delete leaves `drifted`: a rescan never drops a `drifted` torrent, so its
+  files stay claimed and are never offered as orphaned. A rescan also demotes an `adopted`
   torrent that no session holds and no profile owns, which clears one a
   delete before this fix left behind.
 - **The payload,** which you remove by archiving it (next section), or by hand
@@ -134,7 +136,11 @@ Until #112 is fixed, choose by where the payload lies:
 - **Under a managed root, adopted or not.** Use a plain `DELETE`. Then
   remove its `.torrent` from `library_dir` if it is there, rescan, and plan
   `delete_orphans` over its directory. The files go to the trash and stay
-  recoverable.
+  recoverable. The exception is a torrent with drift on it, which the delete
+  leaves `drifted` rather than `matched`: a rescan keeps a `drifted` torrent
+  in the index even once its `.torrent` has left `library_dir`, so its files
+  stay claimed and `delete_orphans` never offers them. After the delete,
+  `GET /v1/pool/torrents?state=drifted` lists it; remove its files by hand.
 - **Outside every managed root.** No plan reaches it. The choice is
   `delete_files=true` or removing the files by hand.
 
