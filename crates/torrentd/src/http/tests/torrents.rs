@@ -1396,6 +1396,46 @@ async fn an_add_dropped_mid_call_still_releases_the_claim_when_the_add_fails() {
 }
 
 #[tokio::test]
+async fn an_add_whose_profile_is_fenced_mid_add_pauses_the_torrent() {
+    // The add passed the fence check, then the VPN monitor fenced the profile
+    // while `add_torrent` ran. The torrent is in the session but not yet in
+    // the state map the fence walked, so the add itself has to pause it.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p)
+    });
+    let engine = engine.unwrap();
+    let held = engine.hold_next("add_torrent");
+    let entered = tokio::task::spawn_blocking(move || {
+        held.wait_entered();
+        held
+    });
+    let req = h.write_json("POST", "/v1/torrents", magnet("p"));
+    let fence_mid_add = async {
+        let held = entered.await.unwrap();
+        h.state
+            .profiles
+            .resolve(&ProfileId::new("p"))
+            .active()
+            .unwrap()
+            .update_health(|hh| hh.status = ProfileStatus::VpnDown);
+        held.release();
+    };
+    let (resp, ()) = tokio::join!(req, fence_mid_add);
+    resp.assert_status(StatusCode::CREATED);
+    // The mock derives the handle's infohash from the magnet's first 20 bytes.
+    let mut synthetic = [0u8; 20];
+    synthetic.copy_from_slice(&MAGNET.as_bytes()[..20]);
+    let th = handle(&engine, InfoHash(synthetic));
+    assert!(
+        called(&engine, &RecordedCall::PauseTorrent(th)),
+        "{:?}",
+        engine.calls()
+    );
+}
+
+#[tokio::test]
 async fn a_delete_dropped_mid_call_still_clears_the_assignment() {
     // The torrent leaves its session whatever happens to the request; were
     // the assignment cleared only after the await, it would stay on a torrent
