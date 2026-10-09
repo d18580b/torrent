@@ -404,14 +404,22 @@ impl Config {
             // definition — and `delete_orphans` over the root would erase the
             // torrent library, the resume store, or the index itself.
             // Session-state files are per profile and live in state_dir,
-            // which resume_dir's parent already covers.
-            let state: [(&str, &Path); 5] = [
-                ("resume_dir", &self.resume_dir),
-                ("torrent_dir", &self.torrent_dir),
-                ("[pool] library_dir", &pool.library_dir),
-                ("[pool] db_path", &self.pool_db_path()),
-                ("registry_path", &self.registry_path()),
+            // which resume_dir's parent already covers. A profile's own
+            // resume_dir / torrent_dir override can point anywhere, so each
+            // profile's effective store directories are checked too.
+            let mut state: Vec<(String, PathBuf)> = vec![
+                ("resume_dir".into(), self.resume_dir.clone()),
+                ("torrent_dir".into(), self.torrent_dir.clone()),
+                ("[pool] library_dir".into(), pool.library_dir.clone()),
+                ("[pool] db_path".into(), self.pool_db_path()),
+                ("registry_path".into(), self.registry_path()),
             ];
+            for p in &self.profile {
+                let (resume, torrent) = self.effective_store_dirs(p);
+                let id = p.id.as_str();
+                state.push((format!("[[profile]] id = \"{id}\" resume_dir"), resume));
+                state.push((format!("[[profile]] id = \"{id}\" torrent_dir"), torrent));
+            }
             for (name, path) in state {
                 let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
                 for root in &resolved {
@@ -2875,6 +2883,81 @@ library_dir = "{d}/library"
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("resume_dir"), "got: {msg}");
         assert!(msg.contains("inside the managed root"), "got: {msg}");
+    }
+
+    /// A config whose top-level state is outside the root `dir/pool`, with
+    /// one profile carrying `override_line` (a store-directory override).
+    fn profile_override_under_pool(dir: &Path, override_line: &str) -> String {
+        let root = dir.join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        format!(
+            r#"
+default_save_path = "{r}"
+resume_dir = "{d}/resume"
+torrent_dir = "{d}/torrents"
+http_listen = "127.0.0.1:8080"
+allow_unauthenticated = true
+
+[[profile]]
+id = "public"
+network = "host"
+listen_interfaces = "0.0.0.0:6881"
+{override_line}
+
+[pool]
+roots = ["{r}"]
+library_dir = "{d}/library"
+"#,
+            r = root.display(),
+            d = dir.display(),
+        )
+    }
+
+    #[test]
+    fn profile_resume_dir_inside_a_managed_root_is_rejected() {
+        // The top-level stores are outside the root, but a profile's own
+        // resume_dir override is not: its resume files would be orphans.
+        let dir = tempdir().unwrap();
+        let line = format!(
+            "resume_dir = \"{}/pool/.acct_b/resume\"",
+            dir.path().display()
+        );
+        let p = write_cfg(dir.path(), &profile_override_under_pool(dir.path(), &line));
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(
+            msg.contains("[[profile]] id = \"public\" resume_dir"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("inside the managed root"), "got: {msg}");
+    }
+
+    #[test]
+    fn profile_torrent_dir_inside_a_managed_root_is_rejected() {
+        let dir = tempdir().unwrap();
+        let line = format!(
+            "torrent_dir = \"{}/pool/.acct_b/torrents\"",
+            dir.path().display()
+        );
+        let p = write_cfg(dir.path(), &profile_override_under_pool(dir.path(), &line));
+        let msg = format!("{:#}", Config::load(&p).unwrap_err());
+        assert!(
+            msg.contains("[[profile]] id = \"public\" torrent_dir"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("inside the managed root"), "got: {msg}");
+    }
+
+    #[test]
+    fn profile_store_dirs_outside_every_managed_root_are_accepted() {
+        // The control for the two tests above: the same config, with the
+        // overrides pointing outside the root, loads.
+        let dir = tempdir().unwrap();
+        let line = format!(
+            "resume_dir = \"{d}/acct_b/resume\"\ntorrent_dir = \"{d}/acct_b/torrents\"",
+            d = dir.path().display()
+        );
+        let p = write_cfg(dir.path(), &profile_override_under_pool(dir.path(), &line));
+        Config::load(&p).expect("profile stores outside the root are allowed");
     }
 
     #[test]
