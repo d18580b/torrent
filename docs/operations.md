@@ -22,6 +22,7 @@ The small state files are described in full in
 | `resume/<profile>/<infohash>.resume` (`resume_dir`, or a profile's own `resume_dir`) | libtorrent resume data: save path, piece state, and settings. | Where each torrent's payload lives. A torrent whose `.torrent` survives is re-added at `default_save_path` and hashed there. | Nothing. Pool torrents can be re-adopted after a rescan. |
 | `torrents/<profile>/<infohash>.torrent` (`torrent_dir`, or a profile's own `torrent_dir`) | The metainfo of every torrent the profile holds. | Metadata. A resume entry with no `.torrent` relies on peers to supply it, which a private tracker's torrent usually cannot. | Nothing, except the copy in `library_dir` for pool torrents. |
 | `session_state-<profile>.dat` | That profile's DHT routing table. | A few minutes of DHT bootstrap. | The session, on its own. |
+| `profile_state.json` | The operator's online/offline choices: the profiles set offline through `PATCH /v1/profiles/{id}`, and whether `offline_all` is on. Rewritten whole before each change takes effect, and read at boot before any torrent is loaded. | Every profile comes up online at the next boot, including one you held offline. A file that exists but cannot be parsed holds every profile offline instead, until `POST /v1/profiles/online-all` rewrites it. | Nothing. Each `PATCH` or `offline-all`/`online-all` writes it again. |
 | `last_shutdown.json` | The last exit's unsaved-resume count and kill-switch-removal result. The next boot exports it as the `torrentd_last_shutdown_*` gauges, then deletes it. | One boot's report. | Every graceful exit writes a new one. |
 | `torrentd.lock` | The single-instance lock, holding the running daemon's pid. | Nothing while the daemon is stopped. | Every start. |
 | `wireguard-<iface>.raised` | A note that this boot of this host raised the WireGuard link standing under that name, with the public key it carried. | For every profile: shutdown leaves the daemon's own link standing instead of removing it, because teardown removes only a link this record names by the key it carries. A config that carries its private key is still adopted by that key at the next start. For a keyless config (`PostUp = wg set %i private-key …`) the record is the only ground for adoption, so a restart finds the link still standing, after an unclean exit or after that shutdown, and cannot adopt it: that profile stays dark until you remove the link by hand and restart. | Every WireGuard bring-up. |
@@ -487,9 +488,22 @@ src=/backup/torrentd/2026-10-01
 sudo rsync -a "$src/registry.db" "$src/pool.db" "$src/resume" "$src/torrents" /var/lib/torrentd/
 # An offline backup may also hold registry.db-wal or pool.db-wal and -shm.
 # Restore those with their databases, never on their own.
+# The online/offline choices: the current ones, else the backup's.
+for f in /var/lib/torrentd.before-restore/profile_state.json "$src/profile_state.json"; do
+  if sudo test -f "$f"; then sudo cp "$f" /var/lib/torrentd/; break; fi
+done
 sudo chown -R torrentd:torrentd /var/lib/torrentd
 sudo systemctl start torrentd
 ```
+
+A restore keeps `profile_state.json`. It records which profiles you hold
+offline now, not anything the databases depend on, so the copy from the
+state directory being replaced wins over the backup's. The backup's is the
+fallback, and only an offline backup holds one: the online method copies the
+databases and stores alone. With neither, every profile boots online,
+including one you meant to keep off the network. To hold one offline from the
+first boot, write the file before starting, for example
+`{"offline_all": false, "offline": ["acct_b"]}`, owned by `torrentd`.
 
 Leave out the rest of the state directory, even when an offline backup holds
 it. `wireguard-*.raised`, `openvpn-*.pid` and `openvpn-*.table` describe
@@ -577,6 +591,10 @@ one.
 
 Then run the checks in [Planned restart](#planned-restart) and `running.md`
 §9, and `torrentd vpn check --profile <id>` for each `vpn` profile.
+
+`profile_state.json` is copied with the rest of the state directory, so a
+profile held offline on the old host, or `offline_all`, stays offline on the
+new one until you set it online.
 
 **What does not carry over.**
 
