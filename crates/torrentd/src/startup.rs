@@ -1028,6 +1028,13 @@ pub async fn boot(
                         if let Err(e) = torrent_store.write(&profile, &ih, bytes) {
                             warn!(profile_id = %profile, infohash = %ih, error.cause = %e,
                                   "could not copy the pool library's .torrent into the torrent store");
+                            // Counted as the adoption's own write is: this
+                            // completes it, and a store that keeps refusing
+                            // repeats the repair at every boot.
+                            metrics.inc_counter(
+                                "torrent_file_persist_errors_total",
+                                &[("profile_id", profile.as_str()), ("source", "api")],
+                            );
                         }
                     }
                     found
