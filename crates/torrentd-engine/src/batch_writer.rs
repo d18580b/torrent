@@ -15,7 +15,9 @@
 //! 2. flushes each filesystem once with `syncfs(2)`, so every temp file's data
 //!    is on disk before any rename can expose it;
 //! 3. renames every temp file over its target;
-//! 4. `fsync`s each directory once, so the renames are durable.
+//! 4. `fsync`s each directory once, so the renames are durable. This step is
+//!    best effort: a failure is logged once per directory, and does not fail
+//!    the writes (see `sync_dir`).
 //!
 //! The atomicity is the per-file protocol's: a crash at any point leaves each
 //! target either whole-old or whole-new. What changes is that the flushes are
@@ -50,12 +52,14 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
 use libtorrent_safe::InfoHash;
 use parking_lot::Condvar;
 use parking_lot::Mutex;
+use tracing::debug;
 use tracing::warn;
 
 use crate::profile::ProfileId;
@@ -346,11 +350,9 @@ fn run_batch(shared: &Shared) {
         }
     }
     for dir in &dirs {
-        // Best effort, as the per-file protocol always was: a filesystem
-        // that cannot fsync a directory is rare on Linux.
-        if let Ok(d) = fs::File::open(dir) {
-            let _ = d.sync_all();
-        }
+        // Best effort, as the per-file protocol always was: the data is
+        // already on disk, and only the new name may not be. See `sync_dir`.
+        sync_dir(dir);
     }
 
     // Done with these, success or not; a write queued for the same path
@@ -379,7 +381,8 @@ fn syncfs(f: &fs::File) -> io::Result<()> {
 }
 
 /// Replace `path` with `data` durably: temp file → `fsync` → `rename` →
-/// `fsync(dir)`. A crash at any point leaves the previous file intact.
+/// `fsync(dir)`. A crash at any point leaves the previous file intact. The
+/// directory `fsync` is best effort; see `sync_dir`.
 pub fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
     write_atomic_via(path, &tmp_for(path), data)
 }
@@ -398,12 +401,63 @@ fn write_atomic_via(path: &Path, tmp: &Path, data: &[u8]) -> io::Result<()> {
         f.sync_all()?;
     }
     fs::rename(tmp, path)?;
-    // Best effort: a filesystem that cannot fsync a directory is rare on
-    // Linux, and the file itself is already durable.
-    if let Ok(d) = fs::File::open(dir) {
-        let _ = d.sync_all();
-    }
+    // Best effort: the file itself is already durable. See `sync_dir`.
+    sync_dir(dir);
     Ok(())
+}
+
+/// Directories whose last `fsync` failed. See [`sync_dir`].
+fn dir_sync_failures() -> &'static Mutex<HashSet<PathBuf>> {
+    static FAILED: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    FAILED.get_or_init(Mutex::default)
+}
+
+/// `fsync` `dir`, so a rename into it survives a power loss.
+///
+/// Best effort: a failure does not fail the write. The renamed file's data is
+/// already on disk, and a filesystem that refuses to fsync a directory refuses
+/// it every time, so failing the write would fail every write there. What a
+/// failure risks is the rename: a power loss can revert the name to the
+/// previous file, or to none. That is logged, once per directory until it next
+/// syncs, so a rename that may not be durable no longer looks like one that is.
+fn sync_dir(dir: &Path) {
+    let r = fs::File::open(dir).and_then(|d| d.sync_all());
+    note_dir_sync(dir_sync_failures(), dir, &r);
+}
+
+/// Record the outcome of syncing `dir` in `failed`: warn on a failure the first
+/// time since `dir` last synced, and only note it at debug after that. Returns
+/// whether it warned.
+fn note_dir_sync(failed: &Mutex<HashSet<PathBuf>>, dir: &Path, r: &io::Result<()>) -> bool {
+    match r {
+        Ok(()) => {
+            let mut failed = failed.lock();
+            if !failed.is_empty() {
+                failed.remove(dir);
+            }
+            false
+        }
+        Err(e) => {
+            let first = failed.lock().insert(dir.to_path_buf());
+            if first {
+                warn!(
+                    target: "torrentd_engine::batch_writer",
+                    dir = %dir.display(),
+                    error.cause = %e,
+                    "directory fsync failed; renames into it may not survive a power loss \
+                     (logged once until the directory syncs again)",
+                );
+            } else {
+                debug!(
+                    target: "torrentd_engine::batch_writer",
+                    dir = %dir.display(),
+                    error.cause = %e,
+                    "directory fsync failed again",
+                );
+            }
+            first
+        }
+    }
 }
 
 /// Remove `path`; a missing file is not an error.
@@ -544,6 +598,30 @@ mod tests {
             w.enqueue(path.clone(), &ProfileId::new("p"), &ih(1), b"late");
         }
         assert_eq!(fs::read(&path).unwrap(), b"late");
+    }
+
+    #[test]
+    fn a_failed_dir_sync_warns_once_until_the_directory_syncs_again() {
+        let failed = Mutex::default();
+        let a = Path::new("/state/a");
+        let b = Path::new("/state/b");
+        let eio = || Err(io::Error::from_raw_os_error(libc::EIO));
+        assert!(note_dir_sync(&failed, a, &eio()), "the first failure warns");
+        assert!(!note_dir_sync(&failed, a, &eio()), "a repeat does not");
+        assert!(note_dir_sync(&failed, b, &eio()), "each directory warns");
+        assert!(!note_dir_sync(&failed, a, &Ok(())));
+        assert!(
+            note_dir_sync(&failed, a, &eio()),
+            "a directory that synced warns on its next failure",
+        );
+    }
+
+    #[test]
+    fn a_dir_sync_that_cannot_open_the_directory_is_noted_not_raised() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        sync_dir(&missing);
+        assert!(dir_sync_failures().lock().contains(&missing));
     }
 
     #[test]

@@ -1370,7 +1370,12 @@ On a scratch pool, not your real one.
 1. **Restart with resume data.** Start, add torrents, `systemctl restart`.
    They should come back seeding without re-hashing, and unpaused.
 2. **`kill -9`.** Resume files are written temp → fsync → rename → fsync-dir, so
-   the previous file survives a partial write. Each torrent's first resume
+   the previous file survives a partial write. The fsync-dir step is best
+   effort: on a filesystem that refuses to fsync a directory the write still
+   succeeds, and the daemon logs `directory fsync failed` once per directory,
+   until it next syncs. A `kill -9` does not depend on that step; a power loss
+   does, and can revert such a directory's renamed files to their previous
+   version or remove them. Each torrent's first resume
    file is written as soon as the session adds it; after that, changes are
    saved by the 30-minute sweep. On restart every torrent the session had
    added should come back, with nothing lost beyond its state at the last
