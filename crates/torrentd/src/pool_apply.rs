@@ -410,6 +410,9 @@ fn move_torrent(
     // resume path then never retried it because the step said done.
     let moved_to = await_storage_move(state, &hash, dst)?;
     record_new_base(pool, &infohash, Path::new(&moved_to));
+    // The save path recorded beside the `.torrent` is where the boot scan
+    // re-adds a torrent whose resume file is lost; it follows the payload.
+    pool.record_save_path(&st.profile_id, &infohash, &moved_to);
     Ok(())
 }
 

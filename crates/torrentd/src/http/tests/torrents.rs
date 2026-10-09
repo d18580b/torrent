@@ -791,6 +791,24 @@ async fn adding(h: &Harness, e: &Engines, dir: &Path) {
     body["save_path"] = json!(dir.join("payload"));
     let resp = h.write_json("POST", "/v1/torrents", body).await;
     resp.assert_status(StatusCode::CREATED);
+    let from_disk = InfoHash::from_hex(resp.json::<Value>()["infohash"].as_str().unwrap()).unwrap();
+
+    // Each add records the save path it was given beside its `.torrent`, so
+    // the startup scan can re-add it there if its resume file is lost: the
+    // one the caller named, or `default_save_path` when it named none. A
+    // magnet's is recorded before its `.torrent` arrives with the metadata.
+    let p = ProfileId::new("p");
+    let recorded = |ih: &InfoHash| h.state.torrents.read_save_path(&p, ih).unwrap();
+    let default = dir.to_string_lossy().into_owned();
+    assert_eq!(
+        recorded(&from_disk),
+        Some(dir.join("payload").to_string_lossy().into_owned())
+    );
+    assert_eq!(recorded(&added).as_ref(), Some(&default));
+    assert_eq!(
+        recorded(&InfoHash::from_hex(MAGNET_HEX).unwrap()).as_ref(),
+        Some(&default)
+    );
 
     // Every add the API made — the magnet, the metainfo and the server path —
     // kept its torrent in upload mode with no flag that could lift it.
@@ -1556,10 +1574,11 @@ async fn a_torrent_file_that_cannot_be_persisted_is_counted_and_the_add_still_su
     h.write_json("POST", "/v1/torrents", metainfo("p", &torrent_bytes('a')))
         .await
         .assert_status(StatusCode::CREATED);
+    // Two files could not be written: the save path, then the `.torrent`.
     let text = String::from_utf8(h.state.metrics.render()).unwrap();
     assert!(
         text.contains(
-            "torrentd_torrent_file_persist_errors_total{profile_id=\"p\",source=\"api\"} 1"
+            "torrentd_torrent_file_persist_errors_total{profile_id=\"p\",source=\"api\"} 2"
         ),
         "{text}"
     );

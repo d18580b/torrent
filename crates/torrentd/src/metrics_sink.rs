@@ -144,7 +144,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "session_alerts_total" Counter Profile ("kind": torrentd_engine::handlers::warning::SESSION_KINDS) Zero =>
         "Port-mapping and UDP socket errors, rejected fast-resume data, and performance warnings.";
     "torrent_file_persist_errors_total" Counter Profile ("source": &["metadata", "api"]) Zero =>
-        ".torrent files that could not be written: magnet metadata, or an API add.";
+        ".torrent files, or the save paths recorded beside them, that could not be written: \
+         magnet metadata, or an API add.";
     "profile_assignment_registry_errors_total" Counter Profile Zero =>
         "Loads and adds refused because the assignment registry disagreed or could not be \
          written.";
@@ -165,6 +166,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
          the scan could not read and skipped.";
     "profile_unloaded_registry_torrents" Gauge Profile Owner("live profiles") =>
         "Torrents the assignment registry claims for the profile that no boot scan loaded.";
+    "boot_save_path_fallbacks_total" Counter Profile Zero =>
+        "Torrents the boot torrent-dir scan placed at default_save_path because no usable \
+         save path was recorded beside their .torrent.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";

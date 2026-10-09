@@ -784,6 +784,8 @@ pub async fn add_torrent(
         );
     };
 
+    // Recorded beside the `.torrent` once the add succeeds.
+    let recorded_save_path = save_path.clone();
     // What the session will be handed, built before the guard so the guard
     // reads exactly that.
     let (params, torrent_bytes) = match source {
@@ -852,6 +854,7 @@ pub async fn add_torrent(
             infohash,
             &owner,
             torrent_bytes,
+            &recorded_save_path,
         )
     })
     .await
@@ -887,8 +890,8 @@ pub async fn add_torrent(
 }
 
 /// Hand `params` to the session, then settle the claim on `infohash` either
-/// way: release it when the add failed, persist the `.torrent` when it
-/// succeeded.
+/// way: release it when the add failed, persist the `.torrent` and the
+/// `save_path` it was added at when it succeeded.
 ///
 /// Blocking, and called from inside the blocking task so that it completes
 /// when the request that started it is dropped mid-add.
@@ -899,6 +902,7 @@ fn add_and_settle(
     infohash: InfoHash,
     profile_id: &ProfileId,
     torrent_bytes: Option<Vec<u8>>,
+    save_path: &str,
 ) -> Result<torrentd_engine::TorrentHandle, EngineError> {
     let handle = match engine.add_torrent(params) {
         Ok(handle) => handle,
@@ -923,7 +927,22 @@ fn add_and_settle(
     crate::vpn_monitor::hold_if_fenced(&s.profiles, profile_id, engine, handle, &*s.metrics);
 
     // Persist the .torrent so the startup inventory scan can recover it if
-    // resume data is ever lost.
+    // resume data is ever lost, and the save path first, so that scan never
+    // finds the one without the other and re-adds the torrent at
+    // `default_save_path`. A magnet's is written too: its `.torrent` arrives
+    // with its metadata, and the scan reads this beside it.
+    if let Err(e) = s.torrents.write_save_path(profile_id, &infohash, save_path) {
+        warn!(
+            infohash = %infohash,
+            error.cause = %e,
+            "failed to persist the torrent's save path; if its resume file is lost, a restart \
+             reloads it at default_save_path",
+        );
+        s.metrics.inc_counter(
+            "torrent_file_persist_errors_total",
+            &[("profile_id", profile_id.as_str()), ("source", "api")],
+        );
+    }
     if let Some(bytes) = torrent_bytes {
         if let Err(e) = s.torrents.write(profile_id, &infohash, &bytes) {
             warn!(
