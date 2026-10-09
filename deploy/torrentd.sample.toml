@@ -223,10 +223,10 @@ dht               = true
 # decoded, so they did not reach the wire as the prefix they spelled.
 #
 # A wireguard profile's `vpn_config` must be
-# /etc/wireguard/<vpn_interface>.conf — wg-quick derives the interface from the
-# file name on the way up and resolves the name back to that directory on the
-# way down, so anything else brings up a tunnel that can never be torn down.
-# Refused at startup.
+# /etc/wireguard/<vpn_interface>.conf — the file root's `wg-quick up <iface>`
+# reads, so a link raised before the daemon starts is adopted against the same
+# key. The daemon itself never runs wg-quick. Anything else is refused at
+# startup.
 #
 # The eight rules this is built on, and why each exists, are documented on the
 # `torrentd-engine::profile` module.
