@@ -1571,6 +1571,69 @@ mod tests {
         assert!(e.reason.contains("no tracker"), "{}", e.reason);
     }
 
+    /// `execute_adopt` hands the verify queue the `.fastresume` the scan
+    /// paired, both from a verify plan and when the fast path's add is
+    /// rejected and falls back to verifying, so either announces to its
+    /// trackers.
+    #[test]
+    fn an_adopt_that_verifies_carries_the_paired_fastresumes_trackers() {
+        use torrentd_engine::AlertSource;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::TorrentEngine;
+
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        std::fs::write(dir.path().join("pool/a"), b"x").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), bare).unwrap();
+        // `pieces` is the bitfield the fast path trusts: one piece had, or not.
+        let resume = |had: u8| {
+            let mut b = b"d6:pieces1:".to_vec();
+            b.push(had);
+            b.extend_from_slice(b"8:trackersll39:http://tracker.allowed.example/announceeee");
+            std::fs::write(dir.path().join("library/t.fastresume"), b).unwrap();
+        };
+        let want = vec![vec!["http://tracker.allowed.example/announce".to_owned()]];
+        resume(0);
+        pool.scan().unwrap();
+        let ih = pool.with_store(|s| s.torrents().unwrap())[0]
+            .infohash
+            .clone();
+
+        let engine = std::sync::Arc::new(MockEngine::new());
+        let source: std::sync::Arc<dyn AlertSource> =
+            std::sync::Arc::new(torrentd_engine::ProfileSource::new(vec![(
+                ProfileId::new("p"),
+                std::sync::Arc::clone(&engine) as std::sync::Arc<dyn TorrentEngine>,
+            )]));
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        let adopt = || {
+            super::execute_adopt(&pool, &source, &profiles, &ih, ProfileId::new("p"), false)
+                .unwrap_or_else(|e| panic!("{}", e.reason))
+        };
+
+        // Incomplete: planned as a verify.
+        assert_eq!(adopt(), "queued_for_verification");
+        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        assert_eq!(item.trackers, want);
+        assert!(engine.calls().is_empty(), "{:?}", engine.calls());
+
+        // Complete: the fast path adds, the add is rejected, and it falls
+        // back to verifying.
+        resume(1);
+        engine.inject_error("add_torrent", torrentd_engine::EngineError::Shutdown);
+        assert_eq!(adopt(), "queued_for_verification");
+        assert_eq!(engine.calls().len(), 1, "{:?}", engine.calls());
+        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        assert_eq!(item.trackers, want);
+    }
+
     /// An owner record the enqueue did not write, or that names another
     /// profile by the time of the drop, is not the drop's to clear.
     #[test]
