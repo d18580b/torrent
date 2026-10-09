@@ -125,7 +125,14 @@ enable_lsd = false
 # nftables table (`torrentd_ks`) confining the daemon's own egress to loopback
 # and its vpn profiles' tunnel interfaces — so if a tunnel drops, the kernel
 # drops the traffic regardless of libtorrent's socket bind or the 30s monitor.
-# Also forces tracker DNS through the tunnel. Removed cleanly on SIGTERM.
+# Removed cleanly on SIGTERM.
+#
+# It does NOT put tracker DNS through the tunnel. Lookups go to the host's
+# resolver, which asks upstream from the host's own address, so the host's
+# upstream resolver sees every tracker hostname the daemon looks up. Under the
+# switch only a resolver on loopback is reachable (systemd-resolved's
+# 127.0.0.53). To keep lookups inside a tunnel, configure the resolver itself:
+# docs/running.md, "Tracker lookups through a tunnel".
 #
 # Requires `nft`, CAP_NET_ADMIN, at least one `network = "vpn"` profile, no
 # `network = "host"` profile (the ruleset would drop its egress while it
