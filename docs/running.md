@@ -1322,6 +1322,10 @@ curl --interface wg-acct-a -s https://api.ipify.org; echo
 
 ## 10. Migrating a pool from another client
 
+The full runbook, per client (qBittorrent, Deluge, Transmission, rTorrent),
+with what each refusal means and what to keep afterwards, is
+[`import.md`](import.md). The short version follows.
+
 Point `library_dir` at the other client's state directory and scan. The
 walkthrough — what qBittorrent's `BT_backup` holds, which sidecar hints are
 read, and why you copy it somewhere scratch first — sits beside the key it
