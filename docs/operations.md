@@ -24,7 +24,9 @@ The small state files are described in full in
 | `session_state-<profile>.dat` | That profile's DHT routing table. | A few minutes of DHT bootstrap. | The session, on its own. |
 | `last_shutdown.json` | The last exit's unsaved-resume count and kill-switch-removal result. The next boot exports it as the `torrentd_last_shutdown_*` gauges, then deletes it. | One boot's report. | Every graceful exit writes a new one. |
 | `torrentd.lock` | The single-instance lock, holding the running daemon's pid. | Nothing while the daemon is stopped. | Every start. |
-| `wireguard-<iface>.raised`, `openvpn-<iface>.pid`, `openvpn-<iface>.table` | Records of tunnels raised on this boot of this host. | At most one tunnel adoption after an unclean exit. | Every bring-up. |
+| `wireguard-<iface>.raised` | A note that this boot of this host raised the WireGuard link standing under that name, with the public key it carried. | After an unclean exit, the restart cannot adopt the tunnel still standing, so that profile stays dark until you remove the link by hand and restart. | Every WireGuard bring-up. |
+| `openvpn-<iface>.pid` | The pid of that profile's `openvpn` process. It is the teardown's only handle on it. | The `openvpn` process keeps running past the next shutdown, and you must stop it by hand. | Every OpenVPN bring-up. |
+| `openvpn-<iface>.table` | The routing table that profile's source-address `ip rule` entries point at. | If that `openvpn` process dies on its own, its `ip rule` entries stay behind, and you must delete them by hand. | Every OpenVPN bring-up. |
 
 The plan journal is the one record here that a rescan cannot reconstruct.
 Losing it loses the trail of what each delete plan moved where, and with it the
@@ -44,7 +46,8 @@ daemon keeps writing:
 
 ```bash
 dest=/backup/torrentd/$(date +%F)
-sudo -u torrentd install -d -m0750 "$dest"
+# Create it as root and hand it to torrentd, which cannot write to /backup.
+sudo install -d -o torrentd -g torrentd -m0750 "$dest"
 sudo -u torrentd sqlite3 /var/lib/torrentd/registry.db ".backup '$dest/registry.db'"
 sudo -u torrentd sqlite3 /var/lib/torrentd/pool.db     ".backup '$dest/pool.db'"
 # The stores after the databases.
@@ -235,12 +238,17 @@ step 3, and expect the index caveat above.
 **Network state.** Boot only cleans up the tunnels its config still names. If
 the daemon's last exit was not graceful, the retired profile's tunnel link and
 its `ip rule` entries stay up, and no later boot tears them down (#105). This
-covers a `kill -9`, an OOM kill, a panic abort, or a `last_shutdown.json` that
-reported `kill_switch_removal_failed`. Remove them by hand. For a WireGuard
+covers a `kill -9`, an OOM kill, or a panic abort. Remove them by hand. For a WireGuard
 profile, `ip link delete <iface>`. For OpenVPN, stop the leftover `openvpn`
 process, then delete the rules whose table the profile's
 `openvpn-<iface>.table` record names. In both cases, delete the leftover
 record files.
+
+A `last_shutdown.json` that reported `kill_switch_removal_failed` is a
+different case. The exit was graceful and its tunnels were already down; only
+the removal of the nftables kill-switch table failed. Remove that table by
+hand: `sudo nft delete table inet torrentd_ks`. A boot with
+`network_kill_switch = true` replaces it on its own.
 
 ### Housekeeping
 
