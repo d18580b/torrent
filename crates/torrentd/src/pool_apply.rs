@@ -1862,6 +1862,131 @@ mod tests {
         );
     }
 
+    /// Index `rel` under the root and record `infohash` claiming it.
+    fn claimed(pool: &PoolService, dir: &Path, infohash: &str, rel: &str) {
+        pool.with_store_mut(|st| {
+            st.upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: infohash.to_owned(),
+                    infohash_v1: None,
+                    infohash_v2: None,
+                    name: "T".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: dir.join("t.torrent"),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: vec![],
+                    profile: None,
+                },
+                0,
+            )?;
+            st.replace_claims(infohash, &[(pool.roots()[0].0, rel.to_owned())])
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_torrents_payload_goes_to_the_trash_once_every_file_is_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let f = write(&root, "T/a.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+
+        // A listed file never written is skipped, not refused.
+        let files = ["T/a.bin".to_owned(), "T/never.bin".to_owned()];
+        let payload = torrent_payload(&pool, &ih, &root, &files).unwrap();
+        assert_eq!(payload.file_count(), 1);
+        let out = trash_torrent_payload(&payload, "torrent-x-1");
+        assert!(out.failed.is_none(), "{:?}", out.failed);
+        assert_eq!(out.moved, 1);
+        assert_eq!(out.trash, vec![root.join(".torrentd-trash/torrent-x-1")]);
+        assert!(!f.exists());
+        assert_eq!(
+            std::fs::read(root.join(".torrentd-trash/torrent-x-1/T/a.bin")).unwrap(),
+            vec![7u8; 16]
+        );
+    }
+
+    #[test]
+    fn a_torrents_payload_is_refused_unless_every_file_is_proven() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let claimed_file = write(&root, "T/a.bin", 16);
+        let unclaimed = write(&root, "T/b.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        let refusal = |save: &Path, files: &[&str]| {
+            let files: Vec<String> = files.iter().map(|f| (*f).to_owned()).collect();
+            torrent_payload(&pool, &ih, save, &files).unwrap_err()
+        };
+
+        // Outside every root: there is no trash to go to.
+        let outside = dir.path().join("data");
+        write(&outside, "T/a.bin", 16);
+        let e = refusal(&outside, &["T/a.bin"]);
+        assert!(e.contains("outside every managed root"), "{e}");
+
+        // Indexed, but the index does not say it is this torrent's.
+        let e = refusal(&root, &["T/a.bin", "T/b.bin"]);
+        assert!(e.contains("does not record this torrent claiming"), "{e}");
+
+        // On disk, never scanned.
+        write(&root, "T/new.bin", 16);
+        let e = refusal(&root, &["T/new.bin"]);
+        assert!(e.contains("not in the index"), "{e}");
+
+        // Rewritten since the scan.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&claimed_file, vec![9u8; 48]).unwrap();
+        let e = refusal(&root, &["T/a.bin"]);
+        assert!(e.contains("changed since the scan"), "{e}");
+
+        assert!(claimed_file.exists() && unclaimed.exists());
+        assert!(!root.join(".torrentd-trash").exists());
+    }
+
+    #[test]
+    fn a_file_that_changes_after_the_proof_stops_the_move_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let a = write(&root, "T/a.bin", 16);
+        let b = write(&root, "T/b.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        pool.with_store_mut(|st| {
+            st.replace_claims(
+                &ih,
+                &[
+                    (pool.roots()[0].0, "T/a.bin".to_owned()),
+                    (pool.roots()[0].0, "T/b.bin".to_owned()),
+                ],
+            )
+        })
+        .unwrap();
+
+        let files = ["T/a.bin".to_owned(), "T/b.bin".to_owned()];
+        let payload = torrent_payload(&pool, &ih, &root, &files).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&b, vec![9u8; 48]).unwrap();
+
+        let out = trash_torrent_payload(&payload, "torrent-x-1");
+        assert_eq!(out.moved, 1);
+        let (path, why) = out.failed.unwrap();
+        assert_eq!(path, b);
+        assert!(why.contains("changed since the scan"), "{why}");
+        assert!(!a.exists());
+        assert_eq!(std::fs::read(&b).unwrap(), vec![9u8; 48], "never unlinked");
+    }
+
     #[test]
     fn deleting_refuses_to_follow_a_directory_swapped_for_a_symlink() {
         let dir = tempfile::tempdir().unwrap();
