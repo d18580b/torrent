@@ -3829,6 +3829,617 @@
             ]
           }
         ]
+      },
+      "patch": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Set one profile online or offline.",
+        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says. The setting is written to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the fence's pauses are undone and the\nVPN monitor watches the profile again, handshake included; if it fails,\n`409` and nothing changes. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
+        "operationId": "set_profile_state",
+        "parameters": [
+          {
+            "name": "profile_id",
+            "in": "path",
+            "description": "The profile's id, as its `[[profile]]` table names it.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetProfileState"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#insufficient-scope"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad Request",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Media Type",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Entity",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "OK",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The identifier this request is correlated by",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Profile not found",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-not-found"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The profile is unavailable",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#profile-unavailable"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "408": {
+            "description": "the handler did not finish within the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "the request body exceeds the configured limit",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/profiles/offline-all": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Take every profile offline.",
+        "description": "The same session pause a single profile's `offline` uses, applied to every\nprofile, and recorded as its own switch: each profile's `desired_state` is\nleft as it was, so `online-all` restores exactly the states that stood\nbefore. Persisted like them, and in force from boot while set. Adds,\nadoptions and resumes into any profile are refused until it is cleared.",
+        "operationId": "set_offline_all",
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#insufficient-scope"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "OK",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The identifier this request is correlated by",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileList"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          }
+        ]
+      }
+    },
+    "/v1/profiles/online-all": {
+      "post": {
+        "tags": [
+          "profiles"
+        ],
+        "summary": "Clear offline-all.",
+        "description": "Each profile returns to its own `desired_state`: one set offline on its\nown stays offline. A fenced (`vpn_down`) profile stays fenced; setting it\nonline with `PATCH /v1/profiles/{profile_id}` is what checks its tunnel\nand lifts the fence.",
+        "operationId": "set_online_all",
+        "responses": {
+          "401": {
+            "description": "Unauthorized",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "The challenge the client must answer, per RFC 9110 section 11.6.1.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                },
+                "example": "Bearer"
+              }
+            },
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "about:blank"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "about:blank"
+                            }
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "allOf": [
+                        {
+                          "$ref": "#/components/schemas/Problem"
+                        },
+                        {
+                          "properties": {
+                            "type": {
+                              "type": "string",
+                              "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#insufficient-scope"
+                            }
+                          }
+                        }
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "OK",
+            "headers": {
+              "X-Request-Id": {
+                "description": "The identifier this request is correlated by",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "Cache-Control": {
+                "description": "`no-store`: every response describes live daemon state, and most of\nit is only readable with a credential.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "X-Content-Type-Options": {
+                "description": "Always `nosniff`.",
+                "required": true,
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProfileList"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal error",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "allOf": [
+                    {
+                      "$ref": "#/components/schemas/Problem"
+                    },
+                    {
+                      "properties": {
+                        "type": {
+                          "type": "string",
+                          "const": "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#internal"
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer": [
+              "write"
+            ]
+          }
+        ]
       }
     },
     "/v1/profiles/{profile_id}/pause-all": {
@@ -4038,7 +4649,7 @@
           "profiles"
         ],
         "summary": "Resume every torrent in one profile.",
-        "description": "Refused with `409 profile-unavailable` for a profile that never came up\n(nothing of it is loaded) and for a fenced (`vpn_down`) one: its torrents\nwere paused because the tunnel is gone, and they stay paused until the\noperator restarts the daemon. `failed_count` counts torrents the engine\nrefused.",
+        "description": "Refused with `409 profile-unavailable` for a profile that never came up\n(nothing of it is loaded), for a fenced (`vpn_down`) one, whose torrents\nwere paused because the tunnel is gone and stay paused until the profile\nis set online and its tunnel checks healthy, and for an `offline` one.\n`failed_count` counts torrents the engine refused.",
         "operationId": "resume_profile",
         "parameters": [
           {
@@ -4362,8 +4973,8 @@
         "tags": [
           "torrents"
         ],
-        "summary": "Resume every torrent in every profile that is not fenced.",
-        "description": "A fenced (`vpn_down`) profile is skipped and listed in `skipped_profiles`,\nnot refused wholesale: one account's dead tunnel must not stop the others\nresuming, and resuming it is exactly what the profile's own resume-all\nrefuses. Profiles that never came up are listed too.",
+        "summary": "Resume every torrent in every profile that is not fenced or offline.",
+        "description": "A fenced (`vpn_down`) or `offline` profile is skipped and listed in\n`skipped_profiles`, not refused wholesale: one account's dead tunnel must\nnot stop the others resuming, and resuming it is exactly what the\nprofile's own resume-all refuses. Profiles that never came up are listed\ntoo.",
         "operationId": "resume_all_torrents",
         "responses": {
           "401": {
@@ -9637,6 +10248,14 @@
         ],
         "description": "Whether a profile has a session, and whether its tunnel is up."
       },
+      "ProfileState": {
+        "type": "string",
+        "enum": [
+          "online",
+          "offline"
+        ],
+        "description": "Whether a profile is on the network."
+      },
       "PortForwardMode": {
         "type": "string",
         "enum": [
@@ -9654,6 +10273,14 @@
           "status": {
             "$ref": "#/components/schemas/ProfileStatus",
             "description": "Whether the profile has a session, and whether its tunnel is up."
+          },
+          "desired_state": {
+            "$ref": "#/components/schemas/ProfileState",
+            "description": "The profile's own online/offline setting, persisted across restarts.\n`offline_all` holds every profile offline without changing it."
+          },
+          "effective_state": {
+            "$ref": "#/components/schemas/ProfileState",
+            "description": "Whether the profile is on the network now: `online` only when it has\na session, its `status` is `active`, and its session is not paused.\nRead from the session, so it differs from what `desired_state` and\n`offline_all` ask for only when a session refused the pause or resume\nthat applies them (the change that hit it answered `500`)."
           },
           "tunnel_ip": {
             "type": [
@@ -9712,6 +10339,8 @@
         "required": [
           "profile_id",
           "status",
+          "desired_state",
+          "effective_state",
           "torrent_count",
           "port_forward"
         ],
@@ -9725,11 +10354,16 @@
             },
             "type": "array",
             "description": "Live profiles in the order their `[[profile]]` tables appear in the\nconfig file, then the profiles that failed to come up, in config order\namong themselves. The first entry is only `active` when at least one\nprofile came up: pick a default by filtering on `status`, not by\ntaking the first."
+          },
+          "offline_all": {
+            "type": "boolean",
+            "description": "Whether `POST /v1/profiles/offline-all` holds every profile offline.\nEach profile's own `desired_state` stands beneath it, and is what\n`online-all` restores."
           }
         },
         "type": "object",
         "required": [
-          "items"
+          "items",
+          "offline_all"
         ],
         "description": "Every configured profile."
       },
@@ -9777,7 +10411,8 @@
         "type": "string",
         "enum": [
           "failed",
-          "vpn_down"
+          "vpn_down",
+          "offline"
         ],
         "description": "A profile's state, as far as a request needing it is concerned."
       },
@@ -10587,6 +11222,20 @@
           "priority"
         ],
         "description": "A file's download priority."
+      },
+      "SetProfileState": {
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/ProfileState",
+            "description": "`offline` holds the profile off the network; `online` puts it back."
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state"
+        ],
+        "description": "The state to set a profile to."
       },
       "AdoptSelector": {
         "oneOf": [

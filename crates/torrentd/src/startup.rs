@@ -685,6 +685,27 @@ pub async fn boot(
         }
     }
 
+    // The operator's online/offline choices, read before any session exists:
+    // a profile left offline has its session paused as it is built, before
+    // the scans below give it a torrent.
+    let desired_states = {
+        let path = cfg.profile_state_path();
+        let (states, loaded) =
+            tokio::task::spawn_blocking(move || crate::profile_state::DesiredStates::load(path))
+                .await
+                .context("read the profiles' online/offline states")?;
+        if let crate::profile_state::Loaded::Unreadable(why) = &loaded {
+            error!(
+                path = %cfg.profile_state_path().display(),
+                error.cause = %why,
+                "the profiles' online/offline states could not be read; every profile is held \
+                 offline as if by offline-all, until POST /v1/profiles/online-all rewrites the \
+                 file",
+            );
+        }
+        states
+    };
+
     // One libtorrent session per configured profile. There is no other shape:
     // a deployment with one profile is this with n = 1, not a mode of its own.
     // The NAT-PMP client is stateless — each `map` opens a fresh socket — so
@@ -695,6 +716,7 @@ pub async fn boot(
         &vpn::NatpmpForwarder::for_startup(),
         &*metrics,
         &mut boot_shutdown,
+        &desired_states.current(),
         boot_engine,
     )
     .await?;
@@ -733,8 +755,12 @@ pub async fn boot(
     // holds the sessions, so a failed boot has to close them itself before
     // its tunnels go.
     cleanup.note_sessions(source_entries.iter().map(|(_, e)| Arc::clone(e)));
-    let profile_registry =
-        Arc::new(ProfileRegistry::new(profile_entries).with_failed(failed_profiles));
+    let profile_registry = Arc::new(
+        ProfileRegistry::new(profile_entries)
+            .with_failed(failed_profiles)
+            .with_states(desired_states),
+    );
+    profile_registry.export_offline(&*metrics);
     let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(source_entries));
     // Port-forward renewal monitor: keeps NAT-PMP leases alive, rebinds the
     // session if the forwarded port changes, and reannounces. Started as soon
@@ -1372,6 +1398,9 @@ fn boot_engine(
 /// leases of the profiles already built are renewed, bounding a lease's age
 /// at boot to one profile's bring-up.
 ///
+/// A profile `desired` holds offline has its session paused as soon as it is
+/// built, before anything can give it a torrent.
+///
 /// `Err` only for a shutdown asked for between two profiles' bring-ups.
 async fn build_profiles<F, E>(
     cfg: &Config,
@@ -1379,6 +1408,7 @@ async fn build_profiles<F, E>(
     forwarder: &dyn PortForwarder,
     metrics: &dyn MetricsSink,
     boot_shutdown: &mut broadcast::Receiver<ShutdownReason>,
+    desired: &crate::profile_state::Record,
     mut make_engine: F,
 ) -> anyhow::Result<(Vec<ProfileEntry>, Vec<FailedProfile>)>
 where
@@ -1421,6 +1451,7 @@ where
                 tunnels: &tunnel_owner,
                 ports: &ports_taken_at_boot(cfg, &profile_entries, &p.id),
             },
+            desired.holds_offline(&p.id),
             &mut make_engine,
         )
         .await
@@ -1475,6 +1506,7 @@ fn ports_taken_at_boot(
 /// the boot around it goes on to succeed. A tunnel that came up for a profile
 /// that succeeded stays tracked by `cleanup`, whose drop guard owns it until
 /// `boot` disarms it.
+#[allow(clippy::too_many_arguments)]
 async fn build_profile<F, E>(
     p: &ProfileConfig,
     mut settings: torrentd_engine::Settings,
@@ -1482,6 +1514,7 @@ async fn build_profile<F, E>(
     cleanup: &mut BootCleanup,
     forwarder: &dyn PortForwarder,
     held: Held<'_>,
+    held_offline: bool,
     make_engine: &mut F,
 ) -> Result<ProfileEntry, Box<FailedProfile>>
 where
@@ -1557,9 +1590,14 @@ where
             dht,
         } => {
             settings.listen_interfaces = Some(listen_interfaces.clone());
-            settings.enable_dht = Some(*dht);
+            // A paused session still runs its DHT node, so a profile left
+            // offline starts with it stopped; setting it online starts it
+            // (`ProfileRegistry::change_states`).
+            settings.enable_dht = Some(*dht && !held_offline);
             // DHT keeps a routing table worth restoring; without DHT there
-            // is nothing in session state worth the file.
+            // is nothing in session state worth the file. Restored while
+            // offline too: the node starts from it once the profile is set
+            // online.
             if *dht {
                 session_state = load_session_state(session_state_path);
                 if let Some(bytes) = &session_state {
@@ -1695,6 +1733,28 @@ where
 
     match make_engine(&settings, session_state) {
         Ok(engine) => {
+            // Before the session is handed to anything: the boot scans add
+            // this profile's torrents next, and a profile the operator left
+            // offline must not have one of them on the network for any part
+            // of the boot. A session that cannot be held offline gets no
+            // torrents at all.
+            if held_offline {
+                if let Err(e) = engine.pause_session() {
+                    error!(
+                        profile_id = %p.id,
+                        error.cause = %e,
+                        "could not hold an offline profile's session paused; profile disabled",
+                    );
+                    engine.close();
+                    if let Some(iface) = p.vpn_interface() {
+                        tear_down_or_warn!(iface);
+                    }
+                    fail_profile!(format!(
+                        "the profile is set offline and its session could not be paused: {e}"
+                    ));
+                }
+                info!(profile_id = %p.id, "profile is set offline; its session starts paused");
+            }
             info!(
                 profile_id = %p.id,
                 network = if p.is_vpn() { "vpn" } else { "host" },
@@ -1852,6 +1912,7 @@ impl DaemonHandle {
             shutdown: shutdown_tx.clone(),
             work: Arc::clone(&work),
             events: Arc::default(),
+            tunnel_probe: crate::vpn_monitor::host_prober(),
         };
 
         // The trust set the process runs with, once: effective blocks, and
@@ -1987,8 +2048,14 @@ impl DaemonHandle {
         // Persist DHT routing tables for the next start. Only a host profile
         // with DHT enabled has one; a tunnelled profile runs with DHT off by
         // construction and has nothing to save. The sessions are still alive
-        // here — `teardown_network` below closes them.
-        for p in cfg.profile.iter().filter(|p| p.dht_enabled()) {
+        // here — `teardown_network` below closes them. A profile held
+        // offline has its DHT node stopped and nothing to save; the file
+        // from before keeps the last table it had.
+        for p in cfg
+            .profile
+            .iter()
+            .filter(|p| p.dht_enabled() && !profile_registry.held_offline(&p.id))
+        {
             let Some(engine) = source.engine_for(&p.id) else {
                 continue;
             };
@@ -3503,6 +3570,7 @@ mod profile_construction_tests {
             forwarder,
             &torrentd_engine::NoopSink,
             &mut boot_shutdown,
+            &crate::profile_state::Record::default(),
             move |settings: &Settings, state: Option<Vec<u8>>| {
                 let n = calls;
                 calls += 1;
@@ -3931,6 +3999,7 @@ mod profile_construction_tests {
             &MockForwarder::new(),
             &torrentd_engine::NoopSink,
             &mut boot_shutdown,
+            &crate::profile_state::Record::default(),
             |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
                 panic!("no session is built after a shutdown was asked for")
             },
@@ -3941,6 +4010,143 @@ mod profile_construction_tests {
         assert!(
             vpn.bring_up_calls().is_empty(),
             "no tunnel is raised after the shutdown",
+        );
+    }
+
+    /// A profile left offline, read back from the state file a crash left,
+    /// has its session paused before the session takes any other call, so no
+    /// boot scan can give it a torrent that runs. The others are untouched.
+    #[tokio::test]
+    async fn a_profile_left_offline_boots_with_its_session_paused_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[host("public", false), host("acct_b", false)]);
+        // What a previous run wrote before it was killed.
+        let (states, _) = crate::profile_state::DesiredStates::load(cfg.profile_state_path());
+        states
+            .change(
+                |r| {
+                    r.set(
+                        &ProfileId::new("acct_b"),
+                        torrentd_engine::DesiredState::Offline,
+                    )
+                },
+                |_| (),
+            )
+            .unwrap();
+        drop(states);
+        let (states, loaded) = crate::profile_state::DesiredStates::load(cfg.profile_state_path());
+        assert_eq!(loaded, crate::profile_state::Loaded::Read);
+
+        let mut cleanup = BootCleanup::new(cfg.state_dir());
+        let (_tx, mut boot_shutdown) = broadcast::channel(8);
+        let engines: Arc<std::sync::Mutex<Vec<Arc<MockEngine>>>> = Arc::default();
+        let made = Arc::clone(&engines);
+        let (up, failed) = build_profiles(
+            &cfg,
+            &mut cleanup,
+            &MockForwarder::new(),
+            &torrentd_engine::NoopSink,
+            &mut boot_shutdown,
+            &states.current(),
+            move |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
+                let engine = Arc::new(MockEngine::new());
+                made.lock().unwrap().push(Arc::clone(&engine));
+                Ok(engine)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(failed.is_empty());
+        assert_eq!(up.len(), 2);
+        let engines = engines.lock().unwrap();
+        let (public, acct_b) = (&engines[0], &engines[1]);
+        assert!(
+            matches!(
+                acct_b.calls().first(),
+                Some(torrentd_engine::RecordedCall::PauseSession)
+            ),
+            "the offline profile's first call is the pause: {:?}",
+            acct_b.calls(),
+        );
+        assert!(acct_b.session_paused().unwrap());
+        assert!(!public.session_paused().unwrap());
+        assert!(public.calls().is_empty(), "{:?}", public.calls());
+    }
+
+    /// The session pause leaves the DHT node running, so a host profile with
+    /// DHT left offline starts with it stopped, its saved routing table still
+    /// handed to the session for when it is set online.
+    #[tokio::test]
+    async fn a_dht_profile_left_offline_boots_with_its_dht_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[host("acct_b", true)]);
+        std::fs::create_dir_all(cfg.state_dir()).unwrap();
+        std::fs::write(cfg.session_state_path(&ProfileId::new("acct_b")), b"table").unwrap();
+        let record = crate::profile_state::Record {
+            offline_all: true,
+            ..Default::default()
+        };
+        let mut cleanup = BootCleanup::new(cfg.state_dir());
+        let (_tx, mut boot_shutdown) = broadcast::channel(8);
+        let built: Built = Arc::default();
+        let seen = Arc::clone(&built);
+        let (up, failed) = build_profiles(
+            &cfg,
+            &mut cleanup,
+            &MockForwarder::new(),
+            &torrentd_engine::NoopSink,
+            &mut boot_shutdown,
+            &record,
+            move |settings: &Settings,
+                  state: Option<Vec<u8>>|
+                  -> Result<Arc<dyn TorrentEngine>, String> {
+                seen.lock().unwrap().push((settings.clone(), state));
+                Ok(Arc::new(MockEngine::new()))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(failed.is_empty());
+        assert_eq!(up.len(), 1);
+        let built = built.lock().unwrap();
+        let (settings, state) = &built[0];
+        assert_eq!(settings.enable_dht, Some(false));
+        assert_eq!(state.as_deref(), Some(&b"table"[..]));
+    }
+
+    /// A session that cannot be held offline gets no torrents: the profile
+    /// is failed rather than run unpaused.
+    #[tokio::test]
+    async fn an_offline_profile_whose_session_will_not_pause_is_failed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[host("acct_b", false)]);
+        let record = crate::profile_state::Record {
+            offline_all: true,
+            ..Default::default()
+        };
+        let mut cleanup = BootCleanup::new(cfg.state_dir());
+        let (_tx, mut boot_shutdown) = broadcast::channel(8);
+        let (up, failed) = build_profiles(
+            &cfg,
+            &mut cleanup,
+            &MockForwarder::new(),
+            &torrentd_engine::NoopSink,
+            &mut boot_shutdown,
+            &record,
+            |_: &Settings, _: Option<Vec<u8>>| -> Result<Arc<dyn TorrentEngine>, String> {
+                let engine = MockEngine::new();
+                engine.inject_error("pause_session", torrentd_engine::EngineError::Shutdown);
+                Ok(Arc::new(engine))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(up.is_empty());
+        assert_eq!(failed.len(), 1);
+        assert!(
+            failed[0].reason.contains("could not be paused"),
+            "{}",
+            failed[0].reason
         );
     }
 

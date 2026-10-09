@@ -185,6 +185,40 @@ impl Session {
         Ok(v)
     }
 
+    /// Pause the whole session: no announce, no peer, no incoming connection,
+    /// for every torrent it holds and every torrent added while it stays
+    /// paused. Each torrent's own paused flag is untouched, so
+    /// [`Session::resume`] puts back exactly what was running. Queued in
+    /// order with every other call, so a pause before an add covers it.
+    pub fn pause(&self) -> Result<()> {
+        let rc = unsafe { ffi::lt_session_pause(self.ptr) };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::Shim("session pause failed".to_owned()))
+        }
+    }
+
+    /// Undo [`Session::pause`].
+    pub fn resume(&self) -> Result<()> {
+        let rc = unsafe { ffi::lt_session_resume(self.ptr) };
+        if rc == ffi::LT_OK as i32 {
+            Ok(())
+        } else {
+            Err(Error::Shim("session resume failed".to_owned()))
+        }
+    }
+
+    /// Whether the session is paused, as of every pause or resume issued
+    /// before this call.
+    pub fn is_paused(&self) -> Result<bool> {
+        match unsafe { ffi::lt_session_is_paused(self.ptr) } {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(Error::Shim("session pause state unreadable".to_owned())),
+        }
+    }
+
     /// Add a torrent. Returns the stable `TorrentHandle` (or an error).
     pub fn add_torrent(&self, params: AddParams) -> Result<TorrentHandle> {
         let mut err = ErrBuf::new();

@@ -9,10 +9,16 @@ use std::net::IpAddr;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use torrentd_engine::EngineError;
+use torrentd_engine::MetricsSink;
 use torrentd_engine::ProfileConfig;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
+use torrentd_engine::Settings;
 use torrentd_engine::TorrentEngine;
+
+use crate::profile_state::DesiredStates;
+use crate::profile_state::Record;
 
 /// Mutable per-profile health, updated by the VPN monitor and read by `/profiles`.
 #[derive(Clone, Debug)]
@@ -37,6 +43,12 @@ pub struct ProfileHealth {
 pub struct ProfileEntry {
     pub config: ProfileConfig,
     pub engine: Arc<dyn TorrentEngine>,
+    /// The tunnel address the session was built on and is bound to. Unlike
+    /// `ProfileHealth::tunnel_ip`, which a fence overwrites with whatever the
+    /// interface held then, this never changes: lifting a fence needs the
+    /// tunnel back on exactly this address, since the session's sockets
+    /// cannot move.
+    pub session_ip: Option<IpAddr>,
     health: Mutex<ProfileHealth>,
 }
 
@@ -52,6 +64,7 @@ impl ProfileEntry {
         Self {
             config,
             engine,
+            session_ip: tunnel_ip,
             health: Mutex::new(ProfileHealth {
                 status: ProfileStatus::Active,
                 tunnel_ip,
@@ -99,6 +112,20 @@ pub struct ProfileRegistry {
     /// These carry no engine because none was ever constructed, which is the
     /// whole point of the rule.
     failed: Vec<FailedProfile>,
+    /// The operator's online/offline choice for each profile, persisted.
+    states: DesiredStates,
+}
+
+/// Why a change of the profiles' online/offline states did not fully apply.
+#[derive(Debug, thiserror::Error)]
+pub enum StateChangeError {
+    /// The record could not be written, so nothing changed.
+    #[error("the profiles' online/offline states could not be written: {0}")]
+    Persist(#[from] std::io::Error),
+    /// The record changed, and these sessions refused the pause or resume
+    /// that applies it.
+    #[error("{} session(s) did not take the change", .0.len())]
+    Apply(Vec<(ProfileId, EngineError)>),
 }
 
 /// A profile that could not be brought up.
@@ -226,12 +253,115 @@ impl ProfileRegistry {
         Self {
             entries,
             failed: Vec::new(),
+            states: DesiredStates::in_memory(),
         }
     }
 
     pub fn with_failed(mut self, failed: Vec<FailedProfile>) -> Self {
         self.failed = failed;
         self
+    }
+
+    /// The persisted online/offline states. The sessions are expected to
+    /// match them already: boot pauses each offline profile's session as it
+    /// builds it.
+    pub fn with_states(mut self, states: DesiredStates) -> Self {
+        self.states = states;
+        self
+    }
+
+    /// The online/offline states as they stand.
+    pub fn states(&self) -> Record {
+        self.states.current()
+    }
+
+    /// Whether the operator holds `id` offline, by its own state or by
+    /// offline-all.
+    pub fn held_offline(&self, id: &ProfileId) -> bool {
+        self.states.holds_offline(id)
+    }
+
+    /// Set `torrentd_profile_offline` for every configured profile, live or
+    /// failed, from `record`.
+    fn export_record(&self, record: &Record, metrics: &dyn MetricsSink) {
+        let ids = self
+            .entries
+            .iter()
+            .map(|e| e.id())
+            .chain(self.failed.iter().map(|f| &f.config.id));
+        for id in ids {
+            metrics.set_gauge(
+                "profile_offline",
+                if record.holds_offline(id) { 1.0 } else { 0.0 },
+                &[("profile_id", id.as_str())],
+            );
+        }
+    }
+
+    /// Set `torrentd_profile_offline` from the states as they stand.
+    pub fn export_offline(&self, metrics: &dyn MetricsSink) {
+        self.export_record(&self.states.current(), metrics);
+    }
+
+    /// Pause each live session `record` holds offline and resume each one it
+    /// does not, returning the sessions that refused.
+    ///
+    /// A paused session still runs its DHT node, so a host profile with DHT
+    /// has it stopped while offline and started again when online. Setting
+    /// an unchanged value is a no-op in libtorrent.
+    fn apply_record(&self, record: &Record) -> Vec<(ProfileId, EngineError)> {
+        let dht = |on: bool| Settings {
+            enable_dht: Some(on),
+            ..Settings::default()
+        };
+        let mut refused = Vec::new();
+        for e in &self.entries {
+            let has_dht = e.config.dht_enabled();
+            let outcome = if record.holds_offline(e.id()) {
+                e.engine.pause_session().and_then(|()| {
+                    if has_dht {
+                        e.engine.apply_settings(&dht(false))
+                    } else {
+                        Ok(())
+                    }
+                })
+            } else {
+                e.engine.resume_session().and_then(|()| {
+                    if has_dht {
+                        e.engine.apply_settings(&dht(true))
+                    } else {
+                        Ok(())
+                    }
+                })
+            };
+            if let Err(err) = outcome {
+                refused.push((e.id().clone(), err));
+            }
+        }
+        refused
+    }
+
+    /// Change the online/offline record with `edit`, durably, then apply it
+    /// to every live session and export it.
+    ///
+    /// Blocking: it writes and fsyncs the record and makes one engine call
+    /// per profile. A failed write changes nothing. Changes are serialised,
+    /// so the sessions end each one in the state the record says.
+    pub fn change_states(
+        &self,
+        edit: impl FnOnce(&mut Record),
+        metrics: &dyn MetricsSink,
+    ) -> Result<(), StateChangeError> {
+        let refused = self.states.change(edit, |record| {
+            let refused = self.apply_record(record);
+            self.export_record(record, metrics);
+            refused
+        })?;
+        if refused.is_empty() {
+            Ok(())
+        } else {
+            Err(StateChangeError::Apply(refused))
+        }
     }
 
     /// Profiles that never got a session, in config order.
@@ -403,5 +533,58 @@ mod tests {
         assert!(r.resolve(&ProfileId::new("public")).active().is_some());
         assert!(r.resolve(&ProfileId::new("acct_a")).active().is_none());
         assert!(r.resolve(&ProfileId::new("typo")).active().is_none());
+    }
+
+    /// The session pause leaves libtorrent's DHT node running, so a host
+    /// profile with DHT has it stopped while offline and started again when
+    /// online; one without DHT is never sent the setting.
+    #[test]
+    fn a_host_profile_with_dht_has_it_stopped_while_offline() {
+        use torrentd_engine::DesiredState;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::ProfileNetwork;
+        use torrentd_engine::RecordedCall;
+
+        let entry = |id: &str, dht: bool| {
+            let mut e = test_host_entry(id);
+            e.config.network = ProfileNetwork::Host {
+                listen_interfaces: "0.0.0.0:6881".to_string(),
+                dht,
+            };
+            let mock = Arc::new(MockEngine::new());
+            e.engine = mock.clone();
+            (e, mock)
+        };
+        let (with, with_mock) = entry("with", true);
+        let (without, without_mock) = entry("without", false);
+        let r = ProfileRegistry::new(vec![with, without]);
+        let metrics = crate::metrics_sink::PromSink::new();
+        let dht_settings = |mock: &MockEngine| -> Vec<Option<bool>> {
+            mock.calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    RecordedCall::ApplySettings(s) => Some(s.enable_dht),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        r.change_states(|rec| rec.offline_all = true, &metrics)
+            .unwrap();
+        assert_eq!(dht_settings(&with_mock), vec![Some(false)]);
+        assert!(with_mock.session_paused().unwrap());
+
+        r.change_states(|rec| rec.offline_all = false, &metrics)
+            .unwrap();
+        assert_eq!(dht_settings(&with_mock), vec![Some(false), Some(true)]);
+        assert!(!with_mock.session_paused().unwrap());
+
+        r.change_states(
+            |rec| rec.set(&ProfileId::new("without"), DesiredState::Offline),
+            &metrics,
+        )
+        .unwrap();
+        assert!(without_mock.session_paused().unwrap());
+        assert!(dht_settings(&without_mock).is_empty());
     }
 }

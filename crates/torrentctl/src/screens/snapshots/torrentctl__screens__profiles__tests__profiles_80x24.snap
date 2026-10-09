@@ -6,15 +6,17 @@ expression: screen
 │    profile          status     torrents tunnel          listen forward       │
 │    acct_a           ● active        900 10.2.0.2             — natpmp :51413 │
 │▶ ! acct_b           ✖ vpn_down      334 10.3.0.2         51414 static        │
-│    host             ● active          1 host              6881 static        │
+│    host             ‖ offline         1 host              6881 static        │
 │  ! acct_c           ✖ failed         12 —                    — natpmp —      │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭ acct_b ──────────────────────────────────────────────────────────────────────╮
-│✖ FENCED — restart the daemon to resume                                       │
-│Its tunnel failed after it came up, so the VPN monitor paused its torrents. It│
-│stays fenced until the daemon restarts; nothing lifts it before then.         │
+│✖ FENCED — once the tunnel is back, r checks it and brings the profile online │
+│Its tunnel failed after it came up, so the VPN monitor paused its torrents.   │
+│Bringing it online re-checks the tunnel and lifts the fence only if the check │
+│passes; no restart is needed.                                                 │
 │                                                                              │
 │         status  ✖ vpn_down                                                   │
+│         set to  online                                                       │
 │       torrents  334                                                          │
 │      tunnel ip  10.3.0.2                                                     │
 │  vpn interface  wg-b                                                         │
@@ -23,6 +25,4 @@ expression: screen
 │ forward health  ● ok                                                         │
 │ paused for vpn  334                                                          │
 │     user agent  default                                                      │
-│       trackers  tracker.example.org                                          │
-│                                                                              │
 ╰──────────────────────────────────────────────────────────────────────────────╯

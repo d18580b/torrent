@@ -182,6 +182,22 @@ int         lt_session_save_state(lt_session* s,
 /* Free a buffer handed out by the shim (save_state, alert payloads). */
 void        lt_buf_free(uint8_t* buf);
 
+/* Pause or resume the whole session (`lt::session::pause()` / `resume()`).
+ *
+ * A paused session aborts its tracker announces, disconnects every peer,
+ * refuses incoming connections, and holds every torrent paused, including a
+ * torrent added while it is paused. It is independent of each torrent's own
+ * paused flag: resuming the session restores each torrent to what that flag
+ * says, and resuming one torrent while the session is paused leaves it
+ * paused. Both are queued to the session's thread in call order, so a pause
+ * issued before an add takes effect before it. Idempotent. LT_OK / LT_ERR. */
+int         lt_session_pause(lt_session* s);
+int         lt_session_resume(lt_session* s);
+
+/* 1 if the session is paused, 0 if not, LT_ERR on a null session. Blocks on
+ * the session's thread, so it reflects every pause or resume issued before. */
+int         lt_session_is_paused(lt_session* s);
+
 /* ------------------------------------------------------------------ */
 /* Torrent management                                                  */
 /* ------------------------------------------------------------------ */

@@ -470,17 +470,20 @@ pub async fn run_verify_queue(
             // but the queue drains over minutes or hours and the tunnel can
             // drop in between. Admitting then would add torrents to a fenced
             // profile — the one thing fencing exists to prevent. Put it back and
-            // wait for the operator.
-            if profiles
+            // wait for the operator. A profile the operator set offline is
+            // held the same way: adoptions into it are refused, and what was
+            // queued before it went offline waits for it to come back.
+            let fenced = profiles
                 .resolve(&item.profile)
                 .active()
-                .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
-            {
+                .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
+            if fenced || profiles.held_offline(&item.profile) {
                 warn!(
                     target: "torrentd::pool",
                     profile_id = %item.profile,
                     infohash = %item.infohash,
-                    "verify held: profile is fenced (vpn_down)",
+                    reason = if fenced { "vpn_down" } else { "offline" },
+                    "verify held: profile is off the network",
                 );
                 q.pending.lock().push_back(item);
                 break;

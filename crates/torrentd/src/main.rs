@@ -30,6 +30,7 @@ mod pool_cmd;
 mod pool_service;
 mod port_forward_monitor;
 mod profile_registry;
+mod profile_state;
 mod reload;
 mod sd_notify;
 mod signals;

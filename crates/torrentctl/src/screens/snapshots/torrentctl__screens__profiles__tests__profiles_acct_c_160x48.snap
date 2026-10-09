@@ -6,7 +6,7 @@ expression: screen
 │    profile              status     torrents tunnel          listen forward        user agent                                                                 │
 │    acct_a               ● active        900 10.2.0.2             — natpmp :51413  qBittorrent/4.6.2                                                          │
 │  ! acct_b               ✖ vpn_down      334 10.3.0.2         51414 static         default                                                                    │
-│    host                 ● active          1 host              6881 static         default                                                                    │
+│    host                 ‖ offline         1 host              6881 static         default                                                                    │
 │▶ ! acct_c               ✖ failed         12 —                    — natpmp —       default                                                                    │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ acct_c ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
@@ -14,15 +14,15 @@ expression: screen
 │Its session was never built at boot: its 12 torrents are stranded, not loaded. Fix the cause and restart the daemon.                                          │
 │                                                                                                                                                              │
 │         status  ✖ failed                       allowed trackers                                                                                              │
-│       torrents  12                             any (no allow-list)                                                                                           │
-│      tunnel ip  —                                                                                                                                            │
-│  vpn interface  wg-c                           actions                                                                                                       │
-│    listen port  —                              p     ✖ pause all 12 torrents — refused: never came up                                                        │
-│   port forward  natpmp —                       r     ✖ resume all 12 torrents — refused: never came up                                                       │
-│ forward health  ✖ not ok                       Enter show its torrents                                                                                       │
+│         set to  online                         any (no allow-list)                                                                                           │
+│       torrents  12                                                                                                                                           │
+│      tunnel ip  —                              actions                                                                                                       │
+│  vpn interface  wg-c                           p     take offline                                                                                            │
+│    listen port  —                              r     bring online                                                                                            │
+│   port forward  natpmp —                       Enter show its torrents                                                                                       │
+│ forward health  ✖ not ok                                                                                                                                     │
 │ paused for vpn  0                                                                                                                                            │
 │     user agent  default                                                                                                                                      │
-│                                                                                                                                                              │
 │                                                                                                                                                              │
 │                                                                                                                                                              │
 │                                                                                                                                                              │

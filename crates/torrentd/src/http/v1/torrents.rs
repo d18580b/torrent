@@ -627,9 +627,9 @@ torrent_error! {
         #[error("unknown profile_id")]
         #[problem(status = 404, title = "Profile not found")]
         ProfileNotFound,
-        /// The profile failed to come up, or the VPN monitor fenced it: a
-        /// torrent added there would land paused and make the profile look
-        /// healthy.
+        /// The profile failed to come up, the VPN monitor fenced it, or the
+        /// operator set it offline: a torrent added there would land paused
+        /// and make the profile look healthy.
         #[error("{detail}")]
         #[problem(status = 409, title = "The profile is unavailable")]
         ProfileUnavailable {
@@ -712,8 +712,8 @@ pub async fn add_torrent(
     };
 
     let profile_id = ProfileId::new(profile_id);
-    // Refuses a fenced profile too: a torrent added there would land paused
-    // and mislead the operator into thinking the profile is healthy.
+    // Refuses a fenced or offline profile too: a torrent added there would
+    // land paused and mislead the operator into thinking it is seeding.
     let engine = unfenced_engine(&s, &profile_id)?;
 
     // An unconstrained save_path points libtorrent at any directory the daemon
@@ -1337,12 +1337,12 @@ fn loaded(s: &AppState, ih: InfoHash) -> Result<(TorrentState, Arc<dyn TorrentEn
 }
 
 /// As [`loaded`], also refusing a torrent whose profile the VPN monitor
-/// fenced.
+/// fenced or the operator set offline.
 ///
 /// For resume, recheck and reannounce, which each act on a torrent the fence
 /// paused: an announce with the tunnel down has nowhere safe to go, and a
-/// recheck is a step towards resuming, which must wait for the operator's
-/// restart.
+/// recheck is a step towards resuming, which must wait for the operator to
+/// set the profile online.
 fn loaded_unfenced(
     s: &AppState,
     ih: InfoHash,
@@ -1476,8 +1476,9 @@ torrent_error! {
         #[error("no loaded torrent with this infohash")]
         #[problem(status = 404, title = "Torrent not found")]
         TorrentNotFound,
-        /// The VPN monitor fenced the torrent's profile; nothing may put its
-        /// torrents back on the network before the daemon restarts.
+        /// The VPN monitor fenced the torrent's profile, or the operator set
+        /// it offline; nothing may put its torrents back on the network until
+        /// the profile is set online.
         #[error("{detail}")]
         #[problem(status = 409, title = "The profile is unavailable")]
         ProfileUnavailable {

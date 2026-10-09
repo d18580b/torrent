@@ -18,7 +18,7 @@ expression: screen
 ╭ profiles ────────────────────────────────────────────────────────────────────╮
 │profile          status       torrents  tunnel                                │
 │acct_a           ● active     900       10.2.0.2         forwarded :51413     │
-│acct_b           ✖ vpn_down   334       10.3.0.2         fenced: restart the d│
+│acct_b           ✖ vpn_down   334       10.3.0.2         fenced: bring online │
 │acct_c           ✖ failed     0         —                never came up: wg-c d│
 │                                                                              │
 │                                                                              │
