@@ -419,8 +419,10 @@ Address = 10.2.0.2/32
 Table = off
 PostUp = ip -4 route add 0.0.0.0/0 dev %i table 51821
 PostUp = ip -4 rule add from 10.2.0.2 lookup 51821
-# The provider's in-tunnel resolver, reached by the tunnel.
-PostUp = ip -4 route add 10.2.0.1/32 dev %i
+# The provider's in-tunnel resolver, reached by the tunnel. The metric is
+# this link's table number, so the route stays unique per link when another
+# account's provider uses the same resolver address (see "Several tunnels").
+PostUp = ip -4 route add 10.2.0.1/32 dev %i metric 51821
 PostUp = resolvectl dns %i 10.2.0.1
 # This profile's allowed_tracker_domains, each with a leading "~".
 PostUp = resolvectl domain %i '~tracker-a.example'
@@ -482,6 +484,16 @@ resolver:
   tunnel links. It does not outrank a longer domain, but it takes every name
   no link routes, the host's own lookups included, and sends each one to every
   link that carries it.
+- Providers often give every account the **same** resolver address (two
+  Mullvad accounts both use `10.64.0.1`, for example). The host route to it
+  lives in the main table, and without the `metric` a second
+  `ip route add 10.64.0.1/32 dev …` fails with "File exists": `wg-quick`
+  then removes the link, and the `Requires=` drop-in stops the daemon from
+  starting. Give each link's resolver route its own metric (its table number,
+  as above) so the routes coexist. resolved sends a link's queries on that
+  link, and the kernel then takes the route through that link whatever its
+  metric. Confirm it per link with `tcpdump -ni <link> port 53` while you run
+  each account's `resolvectl query`.
 
 **What it does not cover.** A name outside every link's routing domains, a
 DHT bootstrap node for example, still goes to the host's resolvers. While a
