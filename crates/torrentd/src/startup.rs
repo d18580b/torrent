@@ -787,7 +787,8 @@ pub async fn boot(
 
     // Network-layer kill switch (defence-in-depth; multi-profile + opt-in).
     // Installed once, after every profile's tunnel is up, so the ruleset covers all
-    // tunnel interfaces. Fail-closed: if the operator asked for it and it can't
+    // tunnel interfaces, each accepted only from the address its own link holds
+    // — the one that profile's sessions were just bound to. Fail-closed: if the operator asked for it and it can't
     // be installed, abort rather than seed without the backstop.
     let mut kill_switch_active = false;
     // Seed the gauge at zero so `kill_switch_active == 0` is a series that

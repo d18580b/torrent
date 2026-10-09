@@ -2195,7 +2195,8 @@ Endpoint = 203.0.113.7:51820 # the exit
         );
 
         // Negative control: the ruleset as it was before the exemption.
-        killswitch::apply(&killswitch::render_ruleset(uid, &[iface.to_string()]).unwrap())
+        let paired = killswitch::Tunnel::new(iface, std::net::Ipv4Addr::new(10, 200, 0, 1));
+        killswitch::apply(&killswitch::render_ruleset(uid, &[paired]).unwrap())
             .expect("install the unexempted ruleset");
         let before = delivered();
         send_into_tunnel();

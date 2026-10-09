@@ -11,6 +11,19 @@
 //! interface. If a tunnel disappears its `oifname` is gone and the packets are
 //! dropped by the kernel — no dependency on the source-bind or the 30s poll.
 //!
+//! **Each profile is held to its own tunnel.** A tunnel is accepted only for
+//! the address its profile's sessions are bound to: one rule per profile,
+//! `meta skuid <uid> ip saddr <tunnel address> oifname "<its interface>"
+//! accept`, with the address read off the live link when the ruleset is
+//! installed ([`Tunnel`]). A shared `oifname { every tunnel }` set let any
+//! socket the daemon owns leave by any profile's tunnel, so a packet from
+//! profile A's address that the routing table sent out of profile B's tunnel
+//! — A's per-source `ip rule` lost or shadowed — was accepted, and A's
+//! trackers saw B's exit address until the next health poll. Now it falls
+//! through to the drop. Only IPv4 is paired: the tunnel address every session
+//! binds to is the link's first IPv4 address, and the daemon's IPv6 egress by
+//! a tunnel, which nothing binds to, is dropped.
+//!
 //! **It does not put DNS through the tunnel.** The ruleset matches sockets the
 //! daemon's uid owns. A tracker hostname is resolved by libc, and on a host
 //! with a local stub resolver — `systemd-resolved` on `127.0.0.53`, `dnsmasq`,
@@ -19,8 +32,8 @@
 //! interface its configuration picks, usually the physical one. Only a host
 //! whose `/etc/resolv.conf` names a remote resolver directly has the daemon's
 //! own socket send the query, and then the query is dropped unless it would
-//! leave by a tunnel. Which tracker hostnames the daemon looks up is therefore
-//! visible to the host's upstream resolver unless the resolver itself is
+//! leave by a tunnel from that tunnel's address. Which tracker hostnames the
+//! daemon looks up is therefore visible to the host's upstream resolver unless the resolver itself is
 //! pointed through a tunnel; see `docs/running.md`, "Kill switch".
 //!
 //! Opt-in (`network_kill_switch = true`); needs `CAP_NET_ADMIN` (the packaged
@@ -68,7 +81,7 @@
 //! request to `http_listen` — the API, a Prometheus scrape of
 //! `/metrics` — that arrives on a physical interface is accepted and its reply
 //! dropped: the client sees a connection that opens and then hangs. Over
-//! loopback, or through a tunnel interface, it works. That is the ruleset
+//! loopback, or to a tunnel's own address through that tunnel, it works. That is the ruleset
 //! doing what it is for, and it is kept: accepting replies by conntrack
 //! direction would let any of the daemon's listening sockets that accepts a
 //! connection on the bare interface talk over it, which makes the guarantee
@@ -77,6 +90,7 @@
 //! same host (loopback), or scrape from inside the tunnel.
 
 use std::io;
+use std::net::Ipv4Addr;
 
 use torrentd_engine::profile::ProfileConfig;
 use tracing::info;
@@ -86,27 +100,70 @@ use super::exec;
 /// nftables table this module owns. Torn down on graceful shutdown.
 pub const TABLE: &str = "torrentd_ks";
 
+/// One profile's tunnel as the ruleset pairs it: the interface, and the
+/// address on it that the profile's sessions are bound to.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Tunnel {
+    pub iface: String,
+    pub addr: Ipv4Addr,
+}
+
+impl Tunnel {
+    pub fn new(iface: impl Into<String>, addr: Ipv4Addr) -> Self {
+        Self {
+            iface: iface.into(),
+            addr,
+        }
+    }
+}
+
+/// Refuse, with `InvalidInput` naming it, the first interface name
+/// [`ProfileConfig::is_valid_interface_name`] rejects.
+///
+/// Each name is written between literal quotes, and nftables has no escape
+/// for a `"` inside one, so a name carrying a quote, brace or newline would
+/// produce a ruleset `nft` rejects with a syntax error in a file the operator
+/// never wrote. Config validation refuses such a name first; this keeps the
+/// renderer from emitting an unparseable ruleset for any caller that did not.
+/// Separate from the renderer so `vpn check` refuses a name whose link it
+/// could not read an address off, and so leaves out of the ruleset.
+pub(crate) fn check_interface_names<'a>(
+    ifaces: impl IntoIterator<Item = &'a str>,
+) -> io::Result<()> {
+    match ifaces
+        .into_iter()
+        .find(|i| !ProfileConfig::is_valid_interface_name(i))
+    {
+        None => Ok(()),
+        Some(bad) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "vpn_interface {bad:?} cannot be written into the kill-switch ruleset: an \
+                 interface name must be 1-15 characters of [A-Za-z0-9_=+.-], and not \".\", \
+                 \"..\", \"all\" or \"interfaces\"",
+            ),
+        )),
+    }
+}
+
 /// Render the fail-closed nftables ruleset confining uid `uid`'s egress to
-/// loopback + `tunnels`. Pure (no I/O) so it can be asserted byte-for-byte in
-/// tests. Interface names are de-duplicated and sorted so the output is
-/// deterministic regardless of profile ordering.
+/// loopback, and to each of `tunnels`' interfaces from that tunnel's own
+/// address. Pure (no I/O) so it can be asserted byte-for-byte in tests.
+/// Tunnels are de-duplicated and sorted so the output is deterministic
+/// regardless of profile ordering.
 ///
 /// The chain policy stays `accept` (we must not touch other uids' traffic); we
-/// only `drop` packets owned by `uid` that don't egress loopback or a tunnel.
+/// only `drop` packets owned by `uid` that don't egress loopback, or a tunnel
+/// from its own address. A packet from one tunnel's address leaving by
+/// another tunnel's interface matches no accept and is dropped.
 ///
-/// Refuses, with `InvalidInput` naming it, any interface name
-/// [`ProfileConfig::is_valid_interface_name`] rejects. Each name is written
-/// between literal quotes, and nftables has no escape for a `"` inside one, so
-/// a name carrying a quote, brace or newline would produce a ruleset `nft`
-/// rejects with a syntax error in a file the operator never wrote. Config
-/// validation refuses such a name first; this keeps the renderer from emitting
-/// an unparseable ruleset for any caller that did not.
+/// Refuses an interface name it cannot quote; see [`check_interface_names`].
 ///
 /// Test-only since the kill switch and `vpn check` both render through
 /// [`install_script`]: without the transport exemption this is the negative
 /// control the live tests install, not a ruleset anything ships.
 #[cfg(test)]
-pub fn render_ruleset(uid: u32, tunnels: &[String]) -> io::Result<String> {
+pub fn render_ruleset(uid: u32, tunnels: &[Tunnel]) -> io::Result<String> {
     render_ruleset_with_transport(uid, tunnels, &[])
 }
 
@@ -117,41 +174,24 @@ pub fn render_ruleset(uid: u32, tunnels: &[String]) -> io::Result<String> {
 /// This is the ruleset `enable` installs. Without it no WireGuard link
 /// carries the daemon's traffic: the encrypted UDP to the provider leaves by
 /// the physical interface still attached to the daemon's sending socket, so
-/// it matches `meta skuid <uid>` and the final `drop` takes it. Ports are de-duplicated and sorted, like the
-/// interface names, so the output is deterministic.
+/// it matches `meta skuid <uid>` and the final `drop` takes it. Ports are
+/// de-duplicated and sorted, like the tunnels, so the output is deterministic.
 pub fn render_ruleset_with_transport(
     uid: u32,
-    tunnels: &[String],
+    tunnels: &[Tunnel],
     transport_ports: &[u16],
 ) -> io::Result<String> {
-    if let Some(bad) = tunnels
-        .iter()
-        .find(|i| !ProfileConfig::is_valid_interface_name(i))
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!(
-                "vpn_interface {bad:?} cannot be written into the kill-switch ruleset: an \
-                 interface name must be 1-15 characters of [A-Za-z0-9_=+.-], and not \".\", \
-                 \"..\", \"all\" or \"interfaces\"",
-            ),
-        ));
-    }
-    let mut ifaces: Vec<&str> = tunnels.iter().map(String::as_str).collect();
-    ifaces.sort_unstable();
-    ifaces.dedup();
+    check_interface_names(tunnels.iter().map(|t| t.iface.as_str()))?;
+    let mut pairs: Vec<&Tunnel> = tunnels.iter().collect();
+    pairs.sort_unstable();
+    pairs.dedup();
 
     let mut chain = String::new();
     chain.push_str("\t\ttype filter hook output priority 0; policy accept;\n");
     chain.push_str(&format!("\t\tmeta skuid {uid} oifname \"lo\" accept\n"));
-    if !ifaces.is_empty() {
-        let set = ifaces
-            .iter()
-            .map(|i| format!("\"{i}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
+    for Tunnel { iface, addr } in pairs {
         chain.push_str(&format!(
-            "\t\tmeta skuid {uid} oifname {{ {set} }} accept\n"
+            "\t\tmeta skuid {uid} ip saddr {addr} oifname \"{iface}\" accept\n"
         ));
     }
     let mut ports = transport_ports.to_vec();
@@ -189,7 +229,7 @@ pub fn render_ruleset_with_transport(
 /// A replace is needed at all because `nft -f` *merges* a table definition
 /// into an existing table: loaded over a stale one, the old run's tunnel
 /// interfaces would still be accepted.
-pub fn install_script(uid: u32, tunnels: &[String], transport_ports: &[u16]) -> io::Result<String> {
+pub fn install_script(uid: u32, tunnels: &[Tunnel], transport_ports: &[u16]) -> io::Result<String> {
     let table = render_ruleset_with_transport(uid, tunnels, transport_ports)?;
     Ok(format!(
         "add table inet {TABLE}\ndelete table inet {TABLE}\n{table}"
@@ -255,14 +295,21 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
 }
 
 /// Install the kill switch for the current process's uid, confining egress to
-/// loopback + `tunnels`, with each tunnel's own transport exempted (see
+/// loopback and to each of `tunnels` from the address its link holds, with
+/// each tunnel's own transport exempted (see
 /// [`render_ruleset_with_transport`]). Returns the uid the ruleset was written
 /// for. Replaces any stale table left by a previous unclean exit in the same
 /// transaction ([`install_script`]).
 ///
 /// Refuses uid 0 outright — see [`refusal_for_uid`].
 pub fn enable(tunnels: &[String]) -> io::Result<u32> {
-    enable_for_uid(current_uid()?, tunnels, listen_port, apply)
+    enable_for_uid(
+        current_uid()?,
+        tunnels,
+        super::ip_lookup::first_ipv4,
+        listen_port,
+        apply,
+    )
 }
 
 /// The UDP port the WireGuard link `iface` listens on, from
@@ -314,33 +361,55 @@ fn parse_listen_port(iface: &str, text: &str) -> io::Result<u16> {
 /// the two no kill switch was in force; a load that then failed left none for
 /// the rest of the run.
 ///
-/// `transport_port` is the other host probe, handed in for the same reason:
-/// the exemption it feeds is the difference between a WireGuard link the
-/// daemon raised carrying traffic and carrying none.
+/// `tunnel_addr` and `transport_port` are the other host probes, handed in
+/// for the same reason: the pairing the first feeds is what keeps one
+/// profile's traffic out of another's tunnel, and the exemption the second
+/// feeds is the difference between a WireGuard link the daemon raised
+/// carrying traffic and carrying none. `tunnel_addr` reads the address every
+/// session of the profile is bound to — the link's first IPv4 address, which
+/// is what bring-up hands the session.
 pub(crate) fn enable_for_uid(
     uid: u32,
     tunnels: &[String],
+    tunnel_addr: impl Fn(&str) -> io::Result<Ipv4Addr>,
     transport_port: impl Fn(&str) -> io::Result<u16>,
     apply: impl Fn(&str) -> io::Result<()>,
 ) -> io::Result<u32> {
     if let Some(refusal) = refusal_for_uid(uid) {
         return Err(refusal);
     }
-    // Every port is read before anything is handed to nft. A tunnel whose
-    // transport cannot be exempted is a tunnel the ruleset would silence, so
-    // it fails the install — and leaves a previous run's kill switch armed.
+    // Every address and port is read before anything is handed to nft. A
+    // tunnel with no address to pair it with, or whose transport cannot be
+    // exempted, is a tunnel the ruleset would silence, so it fails the
+    // install — and leaves a previous run's kill switch armed.
+    let paired = tunnels
+        .iter()
+        .map(|iface| {
+            tunnel_addr(iface)
+                .map(|addr| Tunnel::new(iface.as_str(), addr))
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!(
+                            "the kill switch pairs {iface} with its tunnel address, and none \
+                             could be read: {e}"
+                        ),
+                    )
+                })
+        })
+        .collect::<io::Result<Vec<Tunnel>>>()?;
     let ports = tunnels
         .iter()
         .map(|iface| transport_port(iface))
         .collect::<io::Result<Vec<u16>>>()?;
     // A name the ruleset cannot carry fails here, before nft, so a previous
     // run's kill switch stays armed.
-    let script = install_script(uid, tunnels, &ports)?;
+    let script = install_script(uid, &paired, &ports)?;
     apply(&script)?;
     info!(
         target: "torrentd::vpn::killswitch",
         uid,
-        tunnels = ?tunnels,
+        tunnels = ?paired,
         transport_ports = ?ports,
         "network kill switch installed (nftables, fail-closed)",
     );
@@ -491,12 +560,87 @@ pub(crate) fn check(script: &str) -> io::Result<std::process::Output> {
 mod tests {
     use super::*;
 
+    const ADDR_A: Ipv4Addr = Ipv4Addr::new(10, 2, 0, 2);
+    const ADDR_B: Ipv4Addr = Ipv4Addr::new(10, 64, 0, 7);
+
+    /// The address scripted for each test tunnel: `wg-a` holds `ADDR_A`,
+    /// every other link `ADDR_B`.
+    fn addr_of(iface: &str) -> io::Result<Ipv4Addr> {
+        Ok(if iface == "wg-a" { ADDR_A } else { ADDR_B })
+    }
+
+    fn tunnel(iface: &str) -> Tunnel {
+        Tunnel::new(iface, addr_of(iface).unwrap())
+    }
+
+    /// What the rendered chain does with one packet of `uid`'s, read the way
+    /// nftables reads it: the first rule whose every match holds decides, and
+    /// a packet no rule decides takes the chain's `accept` policy.
+    ///
+    /// Reads only the shapes this module renders — `meta skuid`, `ip saddr`,
+    /// `oifname` (one name or a set), `udp sport` (a set) — and panics on
+    /// anything else, so a new kind of match cannot be silently ignored here.
+    ///
+    /// `udp_sport` is `None` for a packet that is not UDP, which no
+    /// `udp sport` match holds for.
+    fn verdict(
+        ruleset: &str,
+        uid: u32,
+        saddr: Ipv4Addr,
+        oif: &str,
+        udp_sport: Option<u16>,
+    ) -> &'static str {
+        const MATCHES: [&str; 4] = ["meta skuid ", "ip saddr ", "oifname ", "udp sport "];
+        for line in ruleset.lines().map(str::trim) {
+            if !line.starts_with("meta skuid ") {
+                continue;
+            }
+            let (mut rest, verdict) = if let Some(m) = line.strip_suffix(" accept") {
+                (m, "accept")
+            } else if let Some(m) = line.strip_suffix(" counter drop") {
+                (m, "drop")
+            } else {
+                panic!("unread verdict in {line:?}");
+            };
+            let mut holds = true;
+            while !rest.is_empty() {
+                let (key, r) = MATCHES
+                    .iter()
+                    .find_map(|k| rest.strip_prefix(k).map(|r| (*k, r)))
+                    .unwrap_or_else(|| panic!("unread match {rest:?} in {line:?}"));
+                let end = if r.starts_with('{') {
+                    r.find('}').expect("a closed set") + 1
+                } else {
+                    r.find(' ').unwrap_or(r.len())
+                };
+                let values: Vec<&str> = r[..end]
+                    .trim_matches(['{', '}', ' '])
+                    .split(", ")
+                    .map(|v| v.trim_matches('"'))
+                    .collect();
+                let packet = match key {
+                    "meta skuid " => Some(uid.to_string()),
+                    "ip saddr " => Some(saddr.to_string()),
+                    "oifname " => Some(oif.to_string()),
+                    _ => udp_sport.map(|p| p.to_string()),
+                };
+                holds &= packet.is_some_and(|p| values.contains(&p.as_str()));
+                rest = r[end..].trim_start();
+            }
+            if holds {
+                return verdict;
+            }
+        }
+        "accept"
+    }
+
     #[test]
     fn enable_refuses_to_install_a_ruleset_as_root() {
         let called = std::cell::Cell::new(false);
         let e = enable_for_uid(
             0,
             &["wg-a".to_string()],
+            addr_of,
             |_| Ok(51820),
             |_| {
                 called.set(true);
@@ -529,6 +673,7 @@ mod tests {
         let uid = enable_for_uid(
             998,
             &["wg-b".to_string(), "wg-a".to_string()],
+            addr_of,
             |iface| Ok(if iface == "wg-a" { 51820 } else { 40001 }),
             |script| {
                 calls.borrow_mut().push(script.to_string());
@@ -547,7 +692,8 @@ table inet torrentd_ks {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
 \t\tmeta skuid 998 oifname \"lo\" accept
-\t\tmeta skuid 998 oifname { \"wg-a\", \"wg-b\" } accept
+\t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-a\" accept
+\t\tmeta skuid 998 ip saddr 10.64.0.7 oifname \"wg-b\" accept
 \t\tmeta skuid 998 udp sport { 40001, 51820 } accept
 \t\tmeta skuid 998 counter drop
 \t}
@@ -569,6 +715,7 @@ table inet torrentd_ks {
         let e = enable_for_uid(
             998,
             &["wg-a".to_string()],
+            addr_of,
             |_| Err(io::Error::other("wg show wg-a listen-port exited 1")),
             |_| {
                 applied.set(true);
@@ -578,6 +725,82 @@ table inet torrentd_ks {
         .expect_err("a port that will not read is not an absent exemption");
         assert!(e.to_string().contains("listen-port"), "got {e}");
         assert!(!applied.get(), "nothing is handed to nft");
+    }
+
+    /// A tunnel whose address will not read stops the install the same way:
+    /// with no address to pair its interface with, the ruleset could only
+    /// silence it, or accept its interface for every address — the shared
+    /// accept this pairing replaced.
+    #[test]
+    fn a_tunnel_address_that_will_not_read_stops_the_install_before_nft() {
+        let applied = std::cell::Cell::new(false);
+        let e = enable_for_uid(
+            998,
+            &["wg-a".to_string(), "wg-b".to_string()],
+            |iface| {
+                if iface == "wg-b" {
+                    Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "no IPv4 address on wg-b",
+                    ))
+                } else {
+                    addr_of(iface)
+                }
+            },
+            |_| Ok(51820),
+            |_| {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("a tunnel with no address is not installed unpaired");
+        assert!(
+            e.to_string().contains("wg-b") && e.to_string().contains("tunnel address"),
+            "got {e}"
+        );
+        assert!(!applied.get(), "nothing is handed to nft");
+    }
+
+    /// The scenario in #101: profile A's per-source rule is lost, so a packet
+    /// from A's tunnel address routes out of B's tunnel. Each profile's
+    /// address is accepted on its own interface only, so that packet matches
+    /// no accept and the drop takes it — where the shared
+    /// `oifname { "wg-a", "wg-b" }` accept let it out with B's exit address.
+    #[test]
+    fn a_profiles_address_on_another_profiles_tunnel_falls_through_to_the_drop() {
+        let rs = render_ruleset_with_transport(998, &[tunnel("wg-a"), tunnel("wg-b")], &[51820])
+            .unwrap();
+
+        assert_eq!(verdict(&rs, 998, ADDR_A, "wg-a", None), "accept");
+        assert_eq!(verdict(&rs, 998, ADDR_B, "wg-b", None), "accept");
+        assert_eq!(
+            verdict(&rs, 998, ADDR_A, "wg-b", None),
+            "drop",
+            "A's address on B's tunnel is dropped:\n{rs}"
+        );
+        assert_eq!(
+            verdict(&rs, 998, ADDR_B, "wg-a", Some(6881)),
+            "drop",
+            "and B's on A's, UDP included:\n{rs}"
+        );
+        assert_eq!(
+            verdict(&rs, 998, Ipv4Addr::new(192, 168, 1, 20), "wg-a", None),
+            "drop",
+            "an address no profile holds is dropped on every tunnel:\n{rs}"
+        );
+        assert_eq!(
+            verdict(&rs, 1000, ADDR_A, "wg-b", None),
+            "accept",
+            "another uid's traffic is not this ruleset's to judge"
+        );
+
+        // The control: the shared accept this replaced let A out of B's tunnel.
+        let shared = "\
+\t\tmeta skuid 998 oifname \"lo\" accept
+\t\tmeta skuid 998 oifname { \"wg-a\", \"wg-b\" } accept
+\t\tmeta skuid 998 counter drop
+";
+        assert_eq!(verdict(shared, 998, ADDR_A, "wg-b", None), "accept");
     }
 
     #[test]
@@ -596,7 +819,7 @@ table inet torrentd_ks {
     fn ruleset_exempts_each_tunnels_transport_ahead_of_the_drop() {
         let rs = render_ruleset_with_transport(
             998,
-            &["wg-a".to_string(), "wg-b".to_string()],
+            &[tunnel("wg-a"), tunnel("wg-b")],
             &[51820, 40001, 51820],
         )
         .unwrap();
@@ -605,7 +828,8 @@ table inet torrentd_ks {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
 \t\tmeta skuid 998 oifname \"lo\" accept
-\t\tmeta skuid 998 oifname { \"wg-a\", \"wg-b\" } accept
+\t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-a\" accept
+\t\tmeta skuid 998 ip saddr 10.64.0.7 oifname \"wg-b\" accept
 \t\tmeta skuid 998 udp sport { 40001, 51820 } accept
 \t\tmeta skuid 998 counter drop
 \t}
@@ -622,6 +846,7 @@ table inet torrentd_ks {
         let e = enable_for_uid(
             998,
             &[],
+            |_| unreachable!("no tunnels, no addresses"),
             |_| unreachable!("no tunnels, no ports"),
             |_| {
                 Err(io::Error::other(
@@ -707,9 +932,8 @@ table inet torrentd_ks {
     #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
     fn disable_against_real_nft() {
         disable().expect("no table yet: success, in any locale");
-        apply(&install_script(998, &["wg0".to_string()], &[]).unwrap())
-            .expect("install onto no table");
-        apply(&install_script(998, &["wg1".to_string()], &[51820]).unwrap())
+        apply(&install_script(998, &[tunnel("wg0")], &[]).unwrap()).expect("install onto no table");
+        apply(&install_script(998, &[tunnel("wg1")], &[51820]).unwrap())
             .expect("and replace a standing one in the same transaction");
         let listed = exec::run_ok("nft", &["list", "table", "inet", TABLE], None, exec::QUICK)
             .expect("list the table");
@@ -735,13 +959,14 @@ table inet torrentd_ks {
 
     #[test]
     fn ruleset_confines_uid_to_lo_and_tunnels() {
-        let rs = render_ruleset(998, &["wg-b".to_string(), "wg-a".to_string()]).unwrap();
+        let rs = render_ruleset(998, &[tunnel("wg-b"), tunnel("wg-a")]).unwrap();
         let expected = "\
 table inet torrentd_ks {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
 \t\tmeta skuid 998 oifname \"lo\" accept
-\t\tmeta skuid 998 oifname { \"wg-a\", \"wg-b\" } accept
+\t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-a\" accept
+\t\tmeta skuid 998 ip saddr 10.64.0.7 oifname \"wg-b\" accept
 \t\tmeta skuid 998 counter drop
 \t}
 }
@@ -751,7 +976,7 @@ table inet torrentd_ks {
 
     #[test]
     fn ruleset_dedups_shared_interface() {
-        let rs = render_ruleset(1000, &["wg0".to_string(), "wg0".to_string()]).unwrap();
+        let rs = render_ruleset(1000, &[tunnel("wg0"), tunnel("wg0")]).unwrap();
         assert_eq!(rs.matches("wg0").count(), 1);
         // Still fails closed: lo accept, one tunnel accept, then drop.
         assert!(rs.contains("meta skuid 1000 counter drop"));
@@ -760,7 +985,7 @@ table inet torrentd_ks {
     #[test]
     fn ruleset_with_no_tunnels_allows_only_loopback() {
         let rs = render_ruleset(1000, &[]).unwrap();
-        assert!(!rs.contains("oifname {"));
+        assert!(!rs.contains("saddr"));
         assert!(rs.contains("oifname \"lo\" accept"));
         assert!(rs.contains("counter drop"));
     }
@@ -771,7 +996,7 @@ table inet torrentd_ks {
     #[test]
     fn ruleset_refuses_a_name_it_cannot_quote() {
         for bad in ["wg\"x", "wg}x", "wg\nx", ""] {
-            let e = render_ruleset(2000, &["lo".to_string(), bad.to_string()])
+            let e = render_ruleset(2000, &[tunnel("lo"), Tunnel::new(bad, ADDR_A)])
                 .expect_err("an unquotable name is refused, not rendered");
             assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
             assert!(e.to_string().contains(&format!("{bad:?}")), "got {e}");
@@ -786,6 +1011,7 @@ table inet torrentd_ks {
         enable_for_uid(
             998,
             &["wg\"x".to_string()],
+            addr_of,
             |_| Ok(51820),
             |_| {
                 applied.set(true);

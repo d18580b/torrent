@@ -1145,8 +1145,9 @@ leave by the tunnel device), and the `health` line is what the monitor's
 judgement — the same function, on the address, route and handshake just
 observed — would decide about the profile. The `kill_switch_ruleset` line
 dry-runs the exact script boot hands to `nft -f`, rendered by the same
-function, over the listen ports it can read; a tunnel that is not up has no
-port to read, and the line says which exemption it had to leave out.
+function, over the tunnel addresses and listen ports it can read; a tunnel
+that is not up has neither to read, and the line says which tunnel's accept
+or exemption it had to leave out.
 `--egress` asserts that the route to its destination leaves by the tunnel
 (`egress_route`) before it trusts a reply: a round trip that went out of the
 physical interface proves nothing about the tunnel, so it is not attempted.
@@ -1315,7 +1316,17 @@ On a scratch pool, not your real one.
    poll whose handshake probe could not run leaves the clock where it was.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
-   interfaces for the daemon's uid. Setting it with no `vpn` profile, or
+   interfaces for the daemon's uid, one line per profile pairing its tunnel
+   address with its own interface:
+   `meta skuid <uid> ip saddr <tunnel address> oifname "<iface>" accept`.
+   The address is read off the live link (its first IPv4 address, the one
+   every session is bound to) when the switch is installed, and a tunnel with
+   none fails the install. So a packet from one profile's address that the
+   routing table sends out of another profile's tunnel — its per-source
+   `ip rule` lost or shadowed by another tool — is dropped rather than
+   leaving with the other account's exit address. IPv6 is not paired: the
+   daemon's IPv6 egress by a tunnel, which no session binds to, is dropped.
+   Setting it with no `vpn` profile, or
    beside any `host` profile, is a startup error, not a warning: the ruleset
    matches the daemon's uid and cannot tell a host profile's traffic from a
    leak, so that profile would send nothing while reporting itself healthy.
@@ -1569,7 +1580,7 @@ run it by hand instead, start the service again afterwards:
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). `wg-quick down` could never find it, so the config is refused rather than left to strand a tunnel. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
 | A WireGuard profile fails with "hooks are not run" or "Table = … is not supported" | The daemon raises every link with `ip` and `wg`, as root too, and runs no `wg-quick` hooks and honours no named table (§11.6). Either raise the link as root before the daemon starts — it is adopted by its key — or move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
-| Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port`; a link re-raised by hand after the daemon started has a new port. Restart the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
+| Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port`, and an `ip saddr` line pairing each tunnel's `ip -4 addr show <iface>` address with that interface; a link re-raised by hand after the daemon started has a new port, and may have a new address. Restart the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it will not `wg-quick down` something it cannot vouch for, because that would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced. An operator restart is required by design. |
