@@ -273,6 +273,10 @@ pub enum RebindFailure {
     ListenFailed(String),
     /// No listen outcome for the new endpoint arrived within the bound.
     TimedOut,
+    /// The profile was fenced while the gateway was answering, so the
+    /// session was left alone: a fenced profile is not moved onto a new port
+    /// or reannounced.
+    Fenced,
 }
 
 impl std::fmt::Display for RebindFailure {
@@ -282,6 +286,7 @@ impl std::fmt::Display for RebindFailure {
             RebindFailure::Apply => f.write_str("the session refused the new listen interface"),
             RebindFailure::ListenFailed(msg) => write!(f, "listen failed: {msg}"),
             RebindFailure::TimedOut => f.write_str("no listen outcome for the new port in time"),
+            RebindFailure::Fenced => f.write_str("the profile was fenced during the renewal"),
         }
     }
 }
@@ -422,9 +427,9 @@ fn parse_listen_endpoint(s: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(host.parse().ok()?, port.parse().ok()?))
 }
 
-/// What a rebind needs besides the engine: where to bind, and where to learn
-/// whether the bind took.
-#[derive(Clone, Copy, Debug)]
+/// What a rebind needs besides the engine: where to bind, where to learn
+/// whether the bind took, and whether the profile may still be rebound.
+#[derive(Clone, Copy)]
 pub struct RebindTarget<'a> {
     /// The profile's VPN tunnel address, which the session listens on.
     pub tunnel_ip: IpAddr,
@@ -434,6 +439,22 @@ pub struct RebindTarget<'a> {
     /// Bound on the wait for a listen outcome; [`LISTEN_CONFIRM_TIMEOUT`]
     /// outside tests.
     pub timeout: Duration,
+    /// Whether the profile has been fenced. Asked once the gateway has
+    /// answered with a new port and before the session is touched: the
+    /// exchange can take the best part of eight seconds, and a fence that
+    /// lands in it must not be followed by a rebind.
+    pub fenced: &'a dyn Fn() -> bool,
+}
+
+impl std::fmt::Debug for RebindTarget<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RebindTarget")
+            .field("tunnel_ip", &self.tunnel_ip)
+            .field("profile", &self.profile)
+            .field("listen", &self.listen)
+            .field("timeout", &self.timeout)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What the reannounce after a rebind did.
@@ -473,7 +494,8 @@ pub struct Reannounce {
 /// `listen_interfaces` changes, so a retry that re-applied the endpoint
 /// already set would never produce an outcome to wait for. A rebind is not
 /// attempted at all while nothing publishes listen outcomes
-/// ([`ListenEvents::is_attached`]).
+/// ([`ListenEvents::is_attached`]), nor once the profile has been fenced
+/// ([`RebindTarget::fenced`], [`RebindFailure::Fenced`]).
 ///
 /// `port_taken` says whether another profile already listens on a port; a new
 /// port it claims is not bound ([`RenewOutcome::PortTaken`]). Gateways assign
@@ -531,6 +553,9 @@ pub fn renew_and_rebind(
                 new: port,
                 reason,
             };
+            if (target.fenced)() {
+                return failed(RebindFailure::Fenced);
+            }
             if !target.listen.is_attached() {
                 return failed(RebindFailure::Unobserved);
             }
@@ -721,7 +746,13 @@ mod tests {
             profile,
             listen,
             timeout: Duration::from_secs(5),
+            fenced: &never_fenced,
         }
+    }
+
+    /// A profile that stays live through the renewal.
+    fn never_fenced() -> bool {
+        false
     }
 
     /// Stand in for the alert loop: once `eng` is asked to rebind, publish
@@ -1064,6 +1095,38 @@ mod tests {
             RenewOutcome::RebindFailed {
                 reason: RebindFailure::Unobserved,
                 ..
+            }
+        ));
+        assert!(applied_binds(&eng).is_empty(), "the session is left alone");
+    }
+
+    /// A fence that lands while the gateway is answering is seen before the
+    /// session is touched. The fence was read only before the exchange, so a
+    /// new port could be bound on a profile fenced during it.
+    #[test]
+    fn no_rebind_is_attempted_once_the_profile_is_fenced() {
+        let fwd = MockForwarder::with_ports([40001]);
+        let eng = MockEngine::new();
+        let (p, listen) = (ProfileId::new("p"), attached());
+        let fenced = || true;
+        let out = renew_and_rebind(
+            &fwd,
+            &eng,
+            &req(),
+            6881,
+            0,
+            RebindTarget {
+                fenced: &fenced,
+                ..target(&p, &listen)
+            },
+            port_free,
+        );
+        assert!(matches!(
+            out,
+            RenewOutcome::RebindFailed {
+                previous: 6881,
+                new: 40001,
+                reason: RebindFailure::Fenced,
             }
         ));
         assert!(applied_binds(&eng).is_empty(), "the session is left alone");
