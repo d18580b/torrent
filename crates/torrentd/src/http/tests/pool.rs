@@ -1010,6 +1010,92 @@ async fn a_delete_clears_the_pool_index_owner_it_set() {
     }
 }
 
+/// Issue #111's acceptance: a torrent adopted into one profile, deleted
+/// without its files, adopts into another. The delete used to leave the
+/// index's `adopted` verdict behind, and adoption refuses `adopted` outright.
+#[tokio::test]
+async fn a_deleted_adoption_adopts_again_into_another_profile() {
+    const TRACKER: &str = "http://tracker.example/announce";
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let library = dir.path().join("library");
+    std::fs::create_dir_all(&library).unwrap();
+    let source = metainfo(TRACKER);
+    std::fs::write(library.join(format!("{IH_A}.torrent")), &source).unwrap();
+    let resume = library.join(format!("{IH_A}.fastresume"));
+    std::fs::write(&resume, fastresume(&source, None)).unwrap();
+    let mut row = torrent(dir.path(), IH_A, 96, 2);
+    row.fastresume_path = Some(resume);
+    index.with_store_mut(|st| st.upsert_torrent(&row, 0).unwrap());
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let reg = Arc::new(ProfileRegistry::new(vec![
+            test_entry("p", ProfileStatus::Active),
+            test_entry("q", ProfileStatus::Active),
+        ]));
+        *s = crate::app_state::build_test_state_with_sessions(Some(reg), &["p", "q"]);
+        s.pool = Some(pool);
+    });
+    let w = h.tokens.write.clone();
+    let just_a = json!({"kind": "infohashes", "infohashes": [IH_A]});
+    let adopt_into = |profile: &'static str| {
+        let (w, just_a, h) = (w.clone(), just_a.clone(), &h);
+        async move {
+            let resp = h
+                .send(
+                    "POST",
+                    "/v1/pool/adoptions",
+                    Some(&w),
+                    adopt(profile, false, just_a),
+                )
+                .await;
+            resp.assert_status(StatusCode::OK);
+            resp.json::<Value>()
+        }
+    };
+    let state = || index.with_store(|st| st.adoption_state(IH_A).unwrap());
+    let owner = || index.with_store(|st| st.profile_of(IH_A).unwrap());
+
+    let r = adopt_into("p").await;
+    assert_eq!(r["fast_path"], json!([IH_A]), "{r}");
+    assert_eq!(state(), Some(AdoptionState::Adopted));
+    assert_eq!(owner().as_deref(), Some("p"));
+
+    // The session reports it, as its add alert would.
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    h.state.state.insert(
+        hash,
+        torrentd_engine::TorrentState::newly_added(
+            torrentd_engine::TorrentHandle {
+                id: 1,
+                infohash: hash,
+            },
+            torrentd_engine::ProfileId::new("p"),
+            std::time::Instant::now(),
+        ),
+    );
+    h.write("DELETE", &format!("/v1/torrents/{IH_A}"))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(state(), Some(AdoptionState::Matched));
+    assert_eq!(owner(), None);
+    assert_eq!(
+        index.with_store(|st| st.adoption_base(IH_A).unwrap()),
+        Some((root_id, "movies".to_owned())),
+    );
+    // And the session drops it, as its removal alert would.
+    h.state.state.remove(&hash);
+
+    let r = adopt_into("q").await;
+    assert_eq!(r["fast_path"], json!([IH_A]), "{r}");
+    assert_eq!(state(), Some(AdoptionState::Adopted));
+    assert_eq!(owner().as_deref(), Some("q"));
+    assert_eq!(
+        h.state.registry.lookup(&hash),
+        Some(torrentd_engine::ProfileId::new("q"))
+    );
+}
+
 async fn verification(cov: &Arc<Coverage>) {
     let dir = tempfile::tempdir().unwrap();
     let (pool, _) = fixture(dir.path(), false);
