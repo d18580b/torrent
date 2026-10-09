@@ -26,6 +26,7 @@
 //! single-instance lock, since everything it would remove is that daemon's.
 
 use std::io;
+use std::path::Path;
 
 use anyhow::Context;
 use tracing::info;
@@ -41,16 +42,32 @@ const CAP_NET_ADMIN: u32 = 12;
 /// Run the cleanup. `Err` names every step that failed, after every step has
 /// been tried.
 pub fn cleanup(cfg: &Config) -> anyhow::Result<()> {
+    let net_admin = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| holds_net_admin(&status));
+    let state_dir = cfg.state_dir();
+    cleanup_with(net_admin, &cfg.instance_lock_path(), || {
+        run_steps(
+            || vpn::release_recorded_wireguard(&state_dir, |_| false),
+            vpn::killswitch::nft_available(),
+            vpn::killswitch::remove_table,
+        )
+    })
+}
+
+/// [`cleanup`] with the host calls handed in: `net_admin` is what
+/// [`holds_net_admin`] read, and `steps` is [`run_steps`] over the real host.
+fn cleanup_with(
+    net_admin: Option<bool>,
+    lock_path: &Path,
+    steps: impl FnOnce() -> Vec<String>,
+) -> anyhow::Result<()> {
     // Without CAP_NET_ADMIN there is nothing to do and nothing that could be
     // done. The unit runs this with the daemon's own capabilities, so a daemon
     // without it — every host-only deployment of the packaged unit — could not
     // have raised a link or installed a table either, and `nft list tables`
     // would fail on every stop.
-    if std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| holds_net_admin(&status))
-        == Some(false)
-    {
+    if net_admin == Some(false) {
         info!(
             "net-cleanup: this process does not hold CAP_NET_ADMIN, and a daemon run without it \
              raises no tunnel and installs no kill switch; nothing to remove",
@@ -58,16 +75,11 @@ pub fn cleanup(cfg: &Config) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let _lock = InstanceLock::acquire(&cfg.instance_lock_path()).context(
+    let _lock = InstanceLock::acquire(lock_path).context(
         "net-cleanup refuses while a daemon runs: everything it would remove is that daemon's",
     )?;
 
-    let state_dir = cfg.state_dir();
-    let failures = run_steps(
-        || vpn::release_recorded_wireguard(&state_dir, |_| false),
-        vpn::killswitch::nft_available(),
-        vpn::killswitch::remove_table,
-    );
+    let failures = steps();
     if failures.is_empty() {
         info!("net-cleanup: done");
         return Ok(());
@@ -203,5 +215,55 @@ mod tests {
         );
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("wg-a"));
+    }
+
+    /// Without CAP_NET_ADMIN it returns before the lock and before any step,
+    /// and succeeds.
+    #[test]
+    fn without_cap_net_admin_nothing_runs_and_it_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("state").join("torrentd.lock");
+        cleanup_with(Some(false), &lock, || panic!("no step runs without it")).unwrap();
+        assert!(!lock.exists(), "the lock is not even taken");
+    }
+
+    /// While a daemon holds the state directory's lock it refuses, and runs
+    /// no step.
+    #[test]
+    fn a_held_instance_lock_refuses_before_any_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("torrentd.lock");
+        let _daemon = InstanceLock::acquire(&lock).unwrap();
+        let err = cleanup_with(Some(true), &lock, || {
+            panic!("no step runs under a live daemon")
+        })
+        .expect_err("a held lock refuses");
+        assert!(
+            format!("{err:#}").contains("refuses while a daemon runs"),
+            "got: {err:#}"
+        );
+    }
+
+    /// Every failure is named in the `Err` that `main` exits 1 on; no failure
+    /// is `Ok`. An unread capability set does not skip the cleanup.
+    #[test]
+    fn failed_steps_fail_the_run_naming_each() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("torrentd.lock");
+        let err = cleanup_with(Some(true), &lock, || {
+            vec!["step one broke".to_string(), "step two broke".to_string()]
+        })
+        .expect_err("a failed step fails the run");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("could not remove everything"), "got: {msg}");
+        assert!(msg.contains("step one broke; step two broke"), "got: {msg}");
+
+        let ran = std::cell::Cell::new(false);
+        cleanup_with(None, &lock, || {
+            ran.set(true);
+            vec![]
+        })
+        .unwrap();
+        assert!(ran.get(), "an unreadable CapEff still runs the steps");
     }
 }
