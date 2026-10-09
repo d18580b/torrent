@@ -245,30 +245,109 @@ impl RaisedInterfaces {
     /// records; an unreadable one is an error. `exists` is a parameter so the
     /// rule is testable.
     fn sweep_with(&self, exists: impl Fn(&str) -> bool) -> std::io::Result<Vec<String>> {
+        let mut dropped = Vec::new();
+        for iface in self.interfaces()? {
+            if exists(&iface) {
+                continue;
+            }
+            if std::fs::remove_file(self.path(&iface)).is_ok() {
+                dropped.push(iface);
+            }
+        }
+        Ok(dropped)
+    }
+
+    /// Every interface a record names, whatever the record holds, sorted. A
+    /// missing state directory is no records; an unreadable one is an error.
+    fn interfaces(&self) -> std::io::Result<Vec<String>> {
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(e) => return Err(e),
         };
-        let mut dropped = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            let Some(iface) = name
-                .strip_prefix("wireguard-")
-                .and_then(|r| r.strip_suffix(".raised"))
-            else {
-                continue;
-            };
-            if iface.is_empty() || exists(iface) {
-                continue;
-            }
-            if std::fs::remove_file(entry.path()).is_ok() {
-                dropped.push(iface.to_string());
-            }
-        }
-        Ok(dropped)
+        let mut ifaces: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let iface = name
+                    .to_str()?
+                    .strip_prefix("wireguard-")?
+                    .strip_suffix(".raised")?;
+                (!iface.is_empty()).then(|| iface.to_string())
+            })
+            .collect();
+        ifaces.sort_unstable();
+        Ok(ifaces)
     }
+}
+
+/// What [`release_recorded`] did with one recorded interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Released {
+    /// The record vouched for the link standing under its name, and the link
+    /// and its rules were removed.
+    Removed,
+    /// The record vouched for the link and the teardown left it standing. The
+    /// record is kept, as [`WireguardManager::bring_down`] keeps it.
+    LeftStanding,
+    /// A link stands under the name and the record does not vouch for it: a
+    /// key that differs or will not read, or a record from an earlier boot of
+    /// the host. The link is left alone and the spent record dropped.
+    NotOurs,
+    /// No link stands under the name. The record is dropped.
+    Gone,
+}
+
+/// Tear down every link a raised-interface record under `state_dir` vouches
+/// for, except those `keep` names, and report each recorded interface it
+/// looked at.
+///
+/// The record is the only proof that a link is one a daemon raised, so a
+/// link is removed only where [`WireguardManager::bring_down`] would remove
+/// it: the record names it by this boot of the host and the key it carries.
+/// That is what lets this run where nothing in the configuration names the
+/// link any more. A boot calls it for the profiles its configuration no
+/// longer declares (`keep` is every configured tunnel interface, which
+/// adoption and bring-up answer for), and `torrentd net-cleanup` for all of
+/// them once the daemon has exited.
+pub fn release_recorded(
+    state_dir: &Path,
+    keep: impl Fn(&str) -> bool,
+) -> std::io::Result<Vec<(String, Released)>> {
+    let mgr = WireguardManager::new(state_dir.to_path_buf());
+    let released = mgr
+        .raised
+        .interfaces()?
+        .into_iter()
+        .filter(|iface| !keep(iface))
+        .map(|iface| {
+            let outcome =
+                mgr.release_with(&iface, link_standing, interface_public_key, native::down);
+            match outcome {
+                Released::Removed => warn!(
+                    target: "torrentd::vpn::wireguard",
+                    vpn_iface = %iface,
+                    "removed a WireGuard link, and its routing rules, that a run which did not \
+                     exit cleanly raised and no configured profile takes over",
+                ),
+                Released::LeftStanding => error!(
+                    target: "torrentd::vpn::wireguard",
+                    vpn_iface = %iface,
+                    "a WireGuard link an earlier run raised is still standing after its \
+                     teardown; remove it with `ip link delete dev {iface}`",
+                ),
+                Released::NotOurs => info!(
+                    target: "torrentd::vpn::wireguard",
+                    vpn_iface = %iface,
+                    "the raised-interface record does not name the link standing under this \
+                     name; leaving the link alone and dropping the record",
+                ),
+                Released::Gone => {}
+            }
+            (iface, outcome)
+        })
+        .collect();
+    Ok(released)
 }
 
 /// Drop every raised-interface record under `state_dir` whose interface is not
@@ -721,6 +800,36 @@ impl WireguardManager {
     /// own link is left standing too, and the next start adopts it by its key.
     fn native_teardown_permitted(&self, iface: &str, live_key: Option<&str>) -> bool {
         self.raised.recorded(iface, live_key)
+    }
+
+    /// [`release_recorded`]'s decision for one recorded interface, with the
+    /// host calls handed in so a test can drive every branch: whether a link
+    /// stands, the key it carries, and the native teardown.
+    fn release_with(
+        &self,
+        iface: &str,
+        exists: impl Fn(&str) -> bool,
+        live_key: impl Fn(&str) -> Option<String>,
+        down: impl FnOnce(&str),
+    ) -> Released {
+        if !exists(iface) {
+            self.raised.forget(iface);
+            return Released::Gone;
+        }
+        if !self.native_teardown_permitted(iface, live_key(iface).as_deref()) {
+            // The same rule as adoption: a record that does not name the link
+            // standing now is spent, or a later process could claim a
+            // stranger's link on it.
+            self.raised.forget(iface);
+            return Released::NotOurs;
+        }
+        down(iface);
+        if exists(iface) {
+            self.drop_record_if_gone(iface, exists);
+            return Released::LeftStanding;
+        }
+        self.raised.forget(iface);
+        Released::Removed
     }
     /// Drop the raised-interface record, but only once the link is actually
     /// gone.
@@ -1494,6 +1603,129 @@ mod tests {
 
         // A state directory that does not exist yet is not an error to sweep.
         sweep_raised_records(&at_boot.path().join("not-created-yet"));
+    }
+
+    /// The scenario in #105: an earlier run raised `wg-old` and died, and the
+    /// profile was then removed from the config. The record still names the
+    /// link by this boot and its key, so the link and its rules go, and the
+    /// record with them.
+    #[test]
+    fn a_link_the_record_vouches_for_is_released_and_its_record_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let raised = raised_in(dir.path(), "one-boot");
+        raised.record("wg-old", Some(LIVE_KEY)).unwrap();
+        let mgr = WireguardManager::with_raised(raised.clone());
+
+        let standing = std::cell::Cell::new(true);
+        let downed = std::cell::RefCell::new(Vec::<String>::new());
+        let outcome = mgr.release_with(
+            "wg-old",
+            |_| standing.get(),
+            |_| Some(LIVE_KEY.to_string()),
+            |iface| {
+                downed.borrow_mut().push(iface.to_string());
+                standing.set(false);
+            },
+        );
+        assert_eq!(outcome, Released::Removed);
+        assert_eq!(*downed.borrow(), ["wg-old"], "the native teardown ran");
+        assert!(
+            !raised.path("wg-old").exists(),
+            "and the record went with it"
+        );
+    }
+
+    /// A record that does not name the link standing now (a stranger took
+    /// the name, or the key will not read) never tears it down. The record is
+    /// spent either way, as adoption spends it.
+    #[test]
+    fn a_link_the_record_does_not_vouch_for_is_left_alone() {
+        for live in [Some(STRANGER_KEY.to_string()), None] {
+            let dir = tempfile::tempdir().unwrap();
+            let raised = raised_in(dir.path(), "one-boot");
+            raised.record("wg-old", Some(LIVE_KEY)).unwrap();
+            let mgr = WireguardManager::with_raised(raised.clone());
+
+            let outcome = mgr.release_with(
+                "wg-old",
+                |_| true,
+                |_| live.clone(),
+                |_| panic!("a link the record does not vouch for is not torn down ({live:?})"),
+            );
+            assert_eq!(outcome, Released::NotOurs, "{live:?}");
+            assert!(!raised.path("wg-old").exists(), "{live:?}");
+        }
+
+        // A record from an earlier boot of the host vouches for nothing.
+        let dir = tempfile::tempdir().unwrap();
+        raised_in(dir.path(), "an-earlier-boot")
+            .record("wg-old", Some(LIVE_KEY))
+            .unwrap();
+        let mgr = WireguardManager::with_raised(raised_in(dir.path(), "this-boot"));
+        let outcome = mgr.release_with(
+            "wg-old",
+            |_| true,
+            |_| Some(LIVE_KEY.to_string()),
+            |_| panic!("not this boot's link"),
+        );
+        assert_eq!(outcome, Released::NotOurs);
+    }
+
+    /// A teardown that left the link standing keeps the record, as
+    /// `bring_down` does, and a record whose link is gone is dropped without
+    /// a teardown.
+    #[test]
+    fn a_release_that_leaves_the_link_keeps_the_record_and_a_gone_link_drops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let raised = raised_in(dir.path(), "one-boot");
+        raised.record("wg-stuck", Some(LIVE_KEY)).unwrap();
+        raised.record("wg-gone", Some(LIVE_KEY)).unwrap();
+        let mgr = WireguardManager::with_raised(raised.clone());
+
+        let outcome =
+            mgr.release_with("wg-stuck", |_| true, |_| Some(LIVE_KEY.to_string()), |_| {});
+        assert_eq!(outcome, Released::LeftStanding);
+        assert!(raised.recorded("wg-stuck", Some(LIVE_KEY)));
+
+        let outcome = mgr.release_with(
+            "wg-gone",
+            |_| false,
+            |_| panic!("no link, so no key to read"),
+            |_| panic!("no link, so nothing to tear down"),
+        );
+        assert_eq!(outcome, Released::Gone);
+        assert!(!raised.path("wg-gone").exists());
+    }
+
+    /// `release_recorded` looks only at interfaces `keep` does not name, and
+    /// only at this module's records in the directory it shares.
+    #[test]
+    fn release_recorded_skips_what_keep_names_and_files_that_are_not_records() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "wireguard-torrentd-nx-a.raised",
+            "wireguard-torrentd-nx-b.raised",
+            "wireguard-.raised",
+            "openvpn-tun0.pid",
+        ] {
+            std::fs::write(dir.path().join(name), "any-boot\n").unwrap();
+        }
+        let released =
+            release_recorded(dir.path(), |iface| iface == "torrentd-nx-b").expect("readable");
+        assert_eq!(
+            released,
+            [("torrentd-nx-a".to_string(), Released::Gone)],
+            "the kept interface is not looked at, and neither is a file that is not a record",
+        );
+        assert!(dir.path().join("wireguard-torrentd-nx-b.raised").exists());
+        assert!(dir.path().join("openvpn-tun0.pid").exists());
+
+        assert!(
+            release_recorded(&dir.path().join("never-created"), |_| false)
+                .unwrap()
+                .is_empty(),
+            "no state directory is no records",
+        );
     }
 
     /// An unreadable state directory is **reported**, not read as "no

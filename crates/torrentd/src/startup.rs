@@ -571,6 +571,32 @@ pub async fn boot(
             .context("raised-interface record sweep")?;
     }
 
+    // A WireGuard link an earlier run raised for a profile this config no
+    // longer declares: nothing would adopt it or ever take it down, and its
+    // per-source rules stay in the routing policy with it. A configured
+    // profile's link is left to adoption and bring-up, as before.
+    {
+        let state_dir = run_dir.clone();
+        let configured: HashSet<String> = cfg
+            .profile
+            .iter()
+            .filter_map(|p| p.vpn_interface().map(str::to_string))
+            .collect();
+        let released = tokio::task::spawn_blocking(move || {
+            crate::vpn::release_recorded_wireguard(&state_dir, |iface| configured.contains(iface))
+        })
+        .await
+        .context("unconfigured WireGuard link teardown")?;
+        if let Err(e) = released {
+            error!(
+                path = %run_dir.display(),
+                error.cause = %e,
+                "could not read the state directory for WireGuard links raised by an earlier \
+                 run; a link no configured profile names is left standing",
+            );
+        }
+    }
+
     // A kill-switch table an unclean exit left behind keeps dropping this
     // uid's non-tunnel egress, and a boot with the kill switch on replaces it
     // in the same transaction as its install. With it off nothing else would
