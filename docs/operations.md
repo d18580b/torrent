@@ -423,33 +423,53 @@ all:
 
 ### Recovering a fenced profile
 
-A profile the VPN monitor fenced (`vpn_down`) stays fenced. The monitor no
-longer probes it, `resume-all` refuses it, and adds into it answer `409
-profile-unavailable`. Nothing lifts the fence except restarting the daemon
-(#100). Before restarting:
+A profile the VPN monitor fenced (`vpn_down`) stays fenced. The fence paused
+every torrent in it, the monitor no longer probes it, `resume-all` refuses
+it, and adds into it answer `409 profile-unavailable`. Setting the profile
+online lifts the fence without a restart, and the other profiles stay on the
+network throughout.
 
 1. Find out why its tunnel failed. The reason is on
    `torrentd_profile_vpn_fenced_total` and in the `VPN tunnel unhealthy` log
-   line. Fix the cause first, whether that is the provider, the endpoint or
-   the config. A tunnel that fails again at the next boot leaves the profile
-   `failed`, with nothing loaded, while the other profiles come up without it.
-2. Choose when to restart. As
-   [Planned restart](#planned-restart) describes, a restart takes **every**
-   profile off the network for the length of the stop and the boot. Healthy
-   profiles' tunnels are raised again too, and their NAT-PMP ports may
-   change.
+   line. Fix the cause, whether that is the provider, the endpoint, the
+   `ip rule` entries or the config, and bring the tunnel back up on the
+   address the profile's session is bound to.
+2. Set the profile online, from `torrentctl`'s Profiles screen or:
 
-After the restart, the fenced profile's torrents come back **paused**. The
-fence's pause was saved in their resume data, and the boot does not clear a
-saved pause, because it cannot tell an operator's pause from the fence's.
-Resume them:
+   ```bash
+   curl -sX PATCH localhost:8080/v1/profiles/acct_b \
+        -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+        -d '{"state": "online"}'
+   ```
 
-```bash
-curl -sX POST localhost:8080/v1/profiles/acct_b/resume-all -H "Authorization: Bearer $TOKEN"
-```
+   The request re-runs two checks first: the tunnel interface holds the
+   session's address, and a packet from that address routes by the tunnel.
+   The handshake is not checked, because a fenced profile sends nothing. If
+   either check fails, the answer is `409 profile-unavailable` naming the
+   check, and the profile stays fenced with its state unchanged. Fix that
+   and send the request again. If both pass, the fence is lifted, every
+   torrent in the profile is resumed, and the monitor watches the profile
+   again from its next poll, handshake included. A handshake that never
+   follows fences it again.
 
-This also resumes any torrent in that profile you had paused on purpose.
-Pause those again afterwards.
+Lifting the fence resumes **every** torrent in the profile, including any you
+had paused on purpose before the fence, because the fence did not record which
+ones it paused. Pause those again afterwards. While `offline_all` is on, the
+lifted profile stays offline, its session paused, until
+`POST /v1/profiles/online-all`.
+
+The session's address cannot change under it. A tunnel that comes back on a
+different address fails the first check for good, and only a restart, which
+binds a new session to the new address, brings that profile back. As
+[Planned restart](#planned-restart) describes, a restart takes **every**
+profile off the network for the length of the stop and the boot, and a
+tunnel that fails again at that boot leaves the profile `failed`, with
+nothing loaded. After such a restart the fenced profile's torrents come back
+**paused**: the fence's pause was saved in their resume data, and the boot
+does not clear a saved pause, because it cannot tell an operator's pause from
+the fence's. Resume them with
+`POST /v1/profiles/acct_b/resume-all`, which also resumes any torrent you
+had paused on purpose.
 
 ### Restoring from backup
 
