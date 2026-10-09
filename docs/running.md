@@ -382,6 +382,115 @@ the daemon's own state), `library_dir` (required), `db_path`
 moving and deleting files inside your roots; the index, matching, adoption and
 reporting are all read-only without it.
 
+### Tracker lookups through a tunnel
+
+A `vpn` profile's announces leave by its tunnel, but **the tracker hostnames
+it looks up do not**, with or without `network_kill_switch`. The daemon
+resolves names with the host's resolver. Under the kill switch only a resolver
+on loopback is reachable (§11.6), and a local resolver forwards the query
+under its own uid by whatever interface its configuration picks, usually the
+physical one. So the host's upstream resolver, typically the ISP's, sees every
+tracker hostname the daemon looks up, even though no announce reaches it.
+
+The supported way to keep those lookups inside a tunnel is to configure
+**`systemd-resolved`** (the host's resolver, through its stub on `127.0.0.53`
+or `nss-resolve`) with a DNS server on each tunnel link and that profile's
+tracker domains as **routing domains** on the link. A lookup for a name under
+a link's routing domain goes only to that link's DNS servers, over that link.
+Every other name the host looks up keeps using the host's resolvers.
+
+resolved forgets a link's settings when the link is removed, and the daemon
+applies no `DNS` line to a link it raises itself and runs no hooks (§11.6).
+It also adds torrents, which announce at once, before it reports ready, so
+nothing run after it starts would be in place for the first lookups. So raise
+each link **as root with `wg-quick` before the daemon starts**, and set the
+DNS in the config's hooks. The daemon adopts a link standing under the
+profile's interface name when its key matches the profile's config, and
+leaves it standing at shutdown (§11.6). A Proton profile, with
+`allowed_tracker_domains = ["tracker-a.example"]`:
+
+```ini
+# /etc/wireguard/wg-acct-a.conf
+[Interface]
+PrivateKey = …
+Address = 10.2.0.2/32
+# No host-wide route: only traffic from the tunnel address uses the tunnel,
+# which is the routing the daemon would install itself.
+Table = off
+PostUp = ip -4 route add 0.0.0.0/0 dev %i table 51821
+PostUp = ip -4 rule add from 10.2.0.2 lookup 51821
+# The provider's in-tunnel resolver, reached by the tunnel.
+PostUp = ip -4 route add 10.2.0.1/32 dev %i
+PostUp = resolvectl dns %i 10.2.0.1
+# This profile's allowed_tracker_domains, each with a leading "~".
+PostUp = resolvectl domain %i '~tracker-a.example'
+# Never a default route for the host's other lookups.
+PostUp = resolvectl default-route %i false
+PreDown = ip -4 rule del from 10.2.0.2 lookup 51821
+
+[Peer]
+PublicKey = …
+AllowedIPs = 0.0.0.0/0
+Endpoint = …
+```
+
+Leave out the `DNS` line: `wg-quick` would hand it to `resolvconf`, which
+makes the link the route for **every** name the host looks up. Raise the link
+from its unit, and make the daemon wait for it with a drop-in
+(`systemctl edit torrentd`):
+
+```ini
+[Unit]
+Requires=wg-quick@wg-acct-a.service
+After=wg-quick@wg-acct-a.service
+```
+
+```bash
+sudo systemctl enable --now wg-quick@wg-acct-a
+```
+
+The daemon still reads the config, to match the key, so keep it readable by
+its group as in §11.6, step 2. If the link is not standing when the daemon
+starts, the daemon tries to raise it itself, refuses the config's hooks, and
+reports the profile failed rather than running it without the DNS settings.
+
+**Check it** before trusting it:
+
+```bash
+resolvectl status wg-acct-a          # Current DNS Server: 10.2.0.1,
+                                     # DNS Domain: ~tracker-a.example,
+                                     # Default Route: no
+resolvectl flush-caches
+resolvectl query tracker.tracker-a.example   # each answer ends "-- link: wg-acct-a"
+sudo tcpdump -ni eth0 port 53        # started first, in another shell, on the
+                                     # physical interface: nothing during the query
+```
+
+**Several tunnels.** The daemon is one process with one resolver, so which
+tunnel a lookup leaves by is decided by the name, not by the profile that
+asked. Give each profile's link its own profile's `allowed_tracker_domains`
+as routing domains, with its own table number and its own provider's
+resolver:
+
+- A profile only takes torrents whose trackers are all on its list (§5,
+  "Account isolation"), so its lookups fall under its own link's domains, and
+  each provider sees only its own account's tracker hostnames.
+- A domain on **two** profiles' lists is routed to both links: resolved sends
+  the query to every link that ties for the best match, so both providers see
+  it. Keep the lists disjoint where that matters.
+- Keep the routing domain `~.` (what `wg-quick`'s `DNS` line sets) off the
+  tunnel links. It does not outrank a longer domain, but it takes every name
+  no link routes, the host's own lookups included, and sends each one to every
+  link that carries it.
+
+**What it does not cover.** A name outside every link's routing domains, a
+DHT bootstrap node for example, still goes to the host's resolvers. While a
+link stands, a tunnel that has stopped carrying traffic makes its lookups time
+out rather than leak. A link that is **removed** takes its settings with it,
+and from then its tracker names fall back to the host's resolvers; the VPN
+monitor pauses that profile on the next poll (§11.5), so it stops announcing,
+but a lookup inside that window leaves by the host's resolver.
+
 ### Upgrading from a pre-profiles deployment
 
 Several things changed at once, and most of them will stop an upgraded daemon
@@ -1431,7 +1540,8 @@ On a scratch pool, not your real one.
    `127.0.0.53` works, and a `/etc/resolv.conf` naming a remote server leaves
    every tracker hostname unresolvable. The resolver then asks upstream from
    the host's own address, so tracker hostnames are visible there even though
-   no announce is.
+   no announce is. To keep them inside the tunnels, configure the resolver
+   itself: §5, "Tracker lookups through a tunnel".
 
    To check a running deployment: `nft list table inet torrentd_ks` shows the
    `udp sport` line with the port `wg show <iface> listen-port` prints, and
