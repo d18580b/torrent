@@ -485,9 +485,21 @@ async fn run_with(
                 }
             };
             // A profile the operator holds offline has its whole session
-            // paused, so nothing in it sends, whatever its torrents' phases.
-            let carrying =
-                !profiles.held_offline(&profile_id) && profile_carries_traffic(&state, &profile_id);
+            // paused, so nothing in it sends, whatever its torrents' phases,
+            // and a WireGuard tunnel with nothing to send does not handshake:
+            // its handshake, never made or aging, says nothing about the
+            // tunnel. Judged on the address and the route alone, as
+            // `recovery_check` judges a fenced one; otherwise a static-port
+            // tunnel with no keepalive is fenced `handshake_stale` some
+            // minutes after going offline, and setting it online then lifts
+            // the fence by resuming every torrent in it.
+            let held_offline = profiles.held_offline(&profile_id);
+            let handshake = if held_offline {
+                Handshake::NoSignal
+            } else {
+                handshake
+            };
+            let carrying = !held_offline && profile_carries_traffic(&state, &profile_id);
             let unanswered_for = unanswered_clock(
                 &mut unanswered_since,
                 &profile_id,
@@ -842,6 +854,18 @@ mod tests {
         probe: Prober,
         polls: u32,
     ) -> (ProfileStatus, String) {
+        poll_acct_a_held(state, max_age, probe, polls, false).await
+    }
+
+    /// [`poll_acct_a`], with `acct_a` held offline by the operator when
+    /// `offline` is set.
+    async fn poll_acct_a_held(
+        state: StateMap,
+        max_age: Duration,
+        probe: Prober,
+        polls: u32,
+        offline: bool,
+    ) -> (ProfileStatus, String) {
         use crate::profile_registry::test_entry;
 
         let profiles = Arc::new(ProfileRegistry::new(vec![test_entry(
@@ -849,6 +873,19 @@ mod tests {
             ProfileStatus::Active,
         )]));
         let metrics = Arc::new(PromSink::new());
+        if offline {
+            profiles
+                .change_states(
+                    |r| {
+                        r.set(
+                            &torrentd_engine::ProfileId::new("acct_a"),
+                            torrentd_engine::DesiredState::Offline,
+                        )
+                    },
+                    &*metrics,
+                )
+                .unwrap();
+        }
         let (tx, rx) = broadcast::channel(1);
         let task = tokio::spawn(run_with(
             profiles.clone(),
@@ -938,6 +975,48 @@ mod tests {
             ProfileStatus::Active,
             "a fully paused profile sends nothing to be answered: {exported}"
         );
+    }
+
+    /// A profile the operator holds offline has its session paused and sends
+    /// nothing, whatever its torrents' phases, so its tunnel's handshake —
+    /// never made, or aging — fences it on no rule while the address and
+    /// route hold.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_loop_does_not_fence_an_offline_profile_on_its_handshake() {
+        let max_age = Duration::from_secs(60);
+        let seeding = || {
+            let s = StateMap::new();
+            loaded(&s, 1, "acct_a", TorrentPhase::Seeding);
+            s
+        };
+
+        let never = scripted(Some(Ok(RouteProbe::ViaTunnel)), Ok(None));
+        let (status, exported) = poll_acct_a_held(seeding(), max_age, never, 8, true).await;
+        assert_eq!(
+            status,
+            ProfileStatus::Active,
+            "no traffic, so no clock: {exported}"
+        );
+
+        let stale = scripted(
+            Some(Ok(RouteProbe::ViaTunnel)),
+            Ok(Some(Duration::from_secs(600))),
+        );
+        let (status, exported) = poll_acct_a_held(seeding(), max_age, stale, 8, true).await;
+        assert_eq!(
+            status,
+            ProfileStatus::Active,
+            "an aging handshake is no fault while nothing sends: {exported}"
+        );
+
+        // The route still fences an offline profile.
+        let elsewhere = scripted(
+            Some(Ok(RouteProbe::Elsewhere("leaves by eth0".into()))),
+            Ok(None),
+        );
+        let (status, exported) = poll_acct_a_held(seeding(), max_age, elsewhere, 1, true).await;
+        assert_eq!(status, ProfileStatus::VpnDown, "{exported}");
+        assert!(fenced_once_for(&exported, "route_mismatch"), "{exported}");
     }
 
     #[test]
