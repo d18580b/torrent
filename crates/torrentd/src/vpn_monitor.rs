@@ -414,7 +414,8 @@ fn fence(
 /// and one whose tunnel no longer passes [`recovery_check`] stays fenced for
 /// the operator, as any fence on a failing tunnel does. Only the torrents that
 /// were not paused when it fenced are resumed, so a torrent the operator had
-/// paused stays paused.
+/// paused stays paused. A profile set online and then fenced again resumes
+/// what was running at that latest fence.
 pub(crate) struct KillSwitchFence {
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -465,7 +466,9 @@ impl vpn::killswitch::Fence for KillSwitchFence {
                 })
                 .collect();
             let paused = fence(e, &self.state, health.tunnel_ip, self.metrics.as_ref());
-            fenced.entry(e.id().clone()).or_default().extend(running);
+            // Not fenced now, so any earlier record is one the operator's lift
+            // already undid: what is running now replaces it.
+            fenced.insert(e.id().clone(), running);
             error!(
                 target: "torrentd::vpn_monitor",
                 profile_id = %e.id(),
@@ -1616,6 +1619,46 @@ mod tests {
         assert_eq!(pauses(&engine).len(), 2, "fenced once");
         fence.lift();
         assert_eq!(resumes(&engine), [handle(1)], "and lifted once");
+    }
+
+    /// A profile the operator set online while fenced is theirs: the lift
+    /// leaves it alone. Fenced again while still not in force, it is the kill
+    /// switch's once more, and the lift resumes what was running then, once.
+    #[test]
+    fn the_kill_switch_fence_yields_a_profile_set_online_and_refences_it() {
+        use vpn::killswitch::Fence;
+        let set_online = |fence: &KillSwitchFence| {
+            fence
+                .profiles
+                .iter()
+                .next()
+                .unwrap()
+                .update_health(|h| h.status = ProfileStatus::Active);
+        };
+
+        let (fence, engine) = kill_switch_fence(ProfileStatus::Active, true);
+        fence.fence_all();
+        set_online(&fence);
+        fence.lift();
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert!(
+            resumes(&engine).is_empty(),
+            "the operator's lift resumed it already; the kill switch's lift does nothing",
+        );
+
+        let (fence, engine) = kill_switch_fence(ProfileStatus::Active, true);
+        fence.fence_all();
+        set_online(&fence);
+        fence.fence_all();
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown, "fenced again");
+        assert_eq!(pauses(&engine).len(), 4, "every torrent, each time");
+        fence.lift();
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            resumes(&engine),
+            [handle(1)],
+            "what was running at the latest fence, resumed once",
+        );
     }
 
     /// Back in force, the kill switch lifts its fence only from a profile
