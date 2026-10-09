@@ -240,7 +240,9 @@ impl Config {
     }
 
     /// Load for `net-cleanup`, which validates nothing: it reads only
-    /// [`Config::state_dir`], and it runs as the unit's `ExecStopPost=`
+    /// [`Config::state_dir`] and the profiles' tunnel interface names, which
+    /// it compares against the OpenVPN records it finds, and it runs as the
+    /// unit's `ExecStopPost=`
     /// after the daemon is gone. A config edited while the daemon ran into
     /// one any validation refuses must still let it remove that daemon's kill
     /// switch and tunnels. Only a file that does not parse refuses.

@@ -23,6 +23,7 @@ pub use ip_lookup::first_ipv4;
 pub use ip_lookup::link_standing;
 pub use natpmp::NatpmpForwarder;
 pub use openvpn::OpenvpnManager;
+pub use openvpn::Released as ReleasedOpenvpn;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnType;
 pub use wireguard::latest_handshake_age as wireguard_handshake_age;
