@@ -224,6 +224,42 @@ has:
   `DELETE /v1/torrents/{infohash}?delete_files=true` answer `403`
   [`mutations-disabled`](problems.md#mutations-disabled).
 
+## Deleting a torrent's payload
+
+`DELETE /v1/torrents/{infohash}?delete_files=true&confirm={infohash}` removes
+the torrent and moves its payload into the trash. It is the one request that
+takes payload off its path without a plan, so it carries a plan's guards
+itself:
+
+- **`confirm` repeats the infohash.** Without it, or with another torrent's,
+  the answer is `422`
+  [`delete-unconfirmed`](problems.md#delete-unconfirmed). Setting
+  `delete_files` alone never reaches the files.
+- **Every file is proven first.** Each file the torrent lists that exists
+  must lie under a managed root, be claimed by this torrent in the pool index
+  and by no other torrent, and still match the index's record of its size,
+  mtime, inode and device. Any file that fails is `409`
+  [`payload-untrashable`](problems.md#payload-untrashable) or
+  [`payload-shared`](problems.md#payload-shared), and nothing changes: the
+  torrent keeps seeding. A torrent the matcher has not placed, or whose
+  payload lies outside every managed root (under `default_save_path`, say),
+  is refused this way; remove it without `delete_files` and handle its files
+  by hand.
+- **The files go to the trash, never away.** The torrent leaves its session
+  without libtorrent deleting anything, then each file is checked against the
+  index again and moved to
+  `<root>/.torrentd-trash/torrent-{infohash}-{unix seconds}/`, keeping its
+  path below the root. Moving it back restores it; a rescan never indexes
+  the trash. Emptying the trash is left to the operator.
+
+If a move fails partway, the answer is `500` [`internal`](problems.md#internal):
+the torrent is out of its session and its assignment cleared, the files moved
+so far are in the trash, and the rest are where they were. `detail` says which
+file stopped it.
+
+Deleting payload through a `delete_orphans` plan is the other route, for files
+no torrent claims.
+
 The alert drill's `fault-injection` build adds `POST /v1/faults`, tagged
 `testing`. No deployment runs that build, and the committed document does not
 include it.

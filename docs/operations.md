@@ -113,36 +113,31 @@ What stays behind:
 - **The payload,** which you remove by archiving it (next section), or by hand
   where it lies outside every managed root.
 
-`delete_files=true` deletes the payload as well. It needs `[pool]
-allow_mutations`, and it is refused when the pool index shows another torrent
-claiming any of the same files. Beyond that it has none of a delete plan's
-guards (#112):
+`delete_files=true&confirm=$IH` moves the payload to the trash as well:
 
-- the files are unlinked by libtorrent at once, not moved to the trash;
-- there is no confirm token, so one request is the whole review;
-- nothing re-checks the files against what the index recorded at the moment of
-  deletion;
-- for a torrent outside the pool roots, such as one under `default_save_path`,
-  the co-claimant check has nothing to look at.
+```bash
+curl -sX DELETE "localhost:8080/v1/torrents/$IH?delete_files=true&confirm=$IH" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+It needs `[pool] allow_mutations` and `confirm` repeating the info-hash. It is
+refused, changing nothing, unless every file of the torrent lies under a
+managed root, is claimed by this torrent and no other in the pool index, and
+still matches what the scan recorded; rescan first if the torrent was added
+since. The torrent then leaves its session with its files untouched, and each
+file is moved to `<root>/.torrentd-trash/torrent-<info-hash>-<unix seconds>/`
+under its own path. Move a file back to restore it. Emptying the trash is up
+to you.
 
 It is refused for a torrent with no running session (`profile-unavailable`),
-because only the session can reach the payload.
+because only the session knows where the payload is.
 
 With `delete_files=true`, an adopted torrent's index entry reads `missing`
 until a rescan, since its payload is gone.
 
-Until #112 is fixed, choose by where the payload lies:
-
-- **Under a managed root, adopted or not.** Use a plain `DELETE`. Then
-  remove its `.torrent` from `library_dir` if it is there, rescan, and plan
-  `delete_orphans` over its directory. The files go to the trash and stay
-  recoverable. The exception is a torrent with drift on it, which the delete
-  leaves `drifted` rather than `matched`: a rescan keeps a `drifted` torrent
-  in the index even once its `.torrent` has left `library_dir`, so its files
-  stay claimed and `delete_orphans` never offers them. After the delete,
-  `GET /v1/pool/torrents?state=drifted` lists it; remove its files by hand.
-- **Outside every managed root.** No plan reaches it. The choice is
-  `delete_files=true` or removing the files by hand.
+A payload outside every managed root, such as one under `default_save_path`,
+has no trash, so `delete_files` refuses it (`payload-untrashable`). Remove the
+torrent with a plain `DELETE` and the files by hand.
 
 ### Archiving payload
 
