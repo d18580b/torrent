@@ -358,7 +358,7 @@ tests:
           - exp_labels:
               severity: warning
             exp_annotations:
-              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, or its output could not be read), so it cannot confirm the kill switch is installed"
+              summary: "The daemon's kill switch check could not run (nft could not list the nftables tables or the kill switch's table as JSON, its output could not be read, or the check task itself panicked or was cancelled), so it cannot confirm the kill switch is installed"
 
   - interval: 1m
     input_series:
