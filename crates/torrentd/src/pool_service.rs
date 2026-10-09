@@ -335,6 +335,23 @@ impl PoolService {
             .map(|(_, p)| p.clone())
     }
 
+    /// Stat the payload of the torrents an adopt is about to plan, marking any
+    /// that changed since the last scan `drifted`.
+    ///
+    /// Run before every adopt, dry run included: the fast path trusts the
+    /// previous client's completion claim only as far as the index is fresh,
+    /// and a dry run that skipped this would report `fast_path` for a torrent
+    /// the real adopt sends to verification. See
+    /// [`torrentd_pool::drift::detect_before_adopt`].
+    pub fn check_drift_before_adopt(
+        &self,
+        infohashes: &[String],
+    ) -> Result<torrentd_pool::drift::DriftReport, torrentd_pool::PoolError> {
+        self.with_store_mut(|st| {
+            torrentd_pool::drift::detect_before_adopt(st, infohashes, |id| self.root_path_of(id))
+        })
+    }
+
     pub fn verify_queue(&self) -> &VerifyQueue {
         &self.verify
     }
@@ -1877,6 +1894,64 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    /// Payload rewritten in place at the same size after the scan still
+    /// matches the index's sizes, so the fast path would trust the previous
+    /// client's "complete" for it. The drift pass every adopt runs first is
+    /// what sends it to verification instead.
+    #[test]
+    fn the_drift_pass_before_an_adopt_takes_rewritten_payload_off_the_fast_path() {
+        use torrentd_engine::AlertSource;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::TorrentEngine;
+
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        std::fs::write(dir.path().join("pool/a"), b"x").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), &bare).unwrap();
+        std::fs::write(dir.path().join("library/t.fastresume"), b"d6:pieces1:\x01e").unwrap();
+        pool.scan().unwrap();
+        let ih = pool.with_store(|s| s.torrents().unwrap())[0]
+            .infohash
+            .clone();
+
+        let engine = std::sync::Arc::new(MockEngine::new());
+        let source: std::sync::Arc<dyn AlertSource> =
+            std::sync::Arc::new(torrentd_engine::ProfileSource::new(vec![(
+                ProfileId::new("p"),
+                std::sync::Arc::clone(&engine) as std::sync::Arc<dyn TorrentEngine>,
+            )]));
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        let dry_run = || {
+            super::execute_adopt(&pool, &source, &profiles, &ih, ProfileId::new("p"), true)
+                .unwrap_or_else(|e| panic!("{}", e.reason))
+        };
+
+        // Untouched since the scan: the pass finds nothing and the fast path
+        // stands.
+        let report = pool
+            .check_drift_before_adopt(std::slice::from_ref(&ih))
+            .unwrap();
+        assert!(report.drifted.is_empty(), "{report:?}");
+        assert_eq!(dry_run(), "fast_path");
+
+        // Same size, new bytes: invisible to the index until the pass runs.
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(dir.path().join("pool/a"), b"y").unwrap();
+        assert_eq!(dry_run(), "fast_path");
+        let report = pool
+            .check_drift_before_adopt(std::slice::from_ref(&ih))
+            .unwrap();
+        assert_eq!(report.drifted, vec![ih.clone()]);
+        assert_eq!(dry_run(), "queued_for_verification");
     }
 
     /// An owner record the enqueue did not write, or that names another

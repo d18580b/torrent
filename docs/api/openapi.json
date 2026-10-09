@@ -8555,7 +8555,7 @@
           "pool"
         ],
         "summary": "Adopt existing payload.",
-        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and changes\nnothing.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.",
+        "description": "Hands library torrents whose payload the pool matched to one profile's\nsession. Each is claimed in the daemon's assignment registry first, so a\ntorrent another profile already holds is refused rather than announced from\na second account. A torrent whose previous client left trustworthy resume\ndata seeds at once (`fast_path`); any other is hashed by libtorrent before\nit seeds (`queued_for_verification`). Torrents that are not `matched` are\nrefused, each with the reason. `dry_run` reports all of this and adopts\nnothing.\n\nEvery adoption, dry run included, first runs the drift check over the\nselected `matched` and `shared` torrents: any whose files changed since the\nlast scan is marked `drifted` in the index, as `POST /v1/pool/drift-check`\nwould mark it, and is queued for verification rather than trusted on its\nresume data.\n\nNot gated on `[pool] allow_mutations`: adoption records an existing file's\nownership and moves nothing on disk.",
         "operationId": "adopt_pool_torrents",
         "requestBody": {
           "content": {
@@ -11352,7 +11352,7 @@
           },
           "dry_run": {
             "type": "boolean",
-            "description": "Report what would happen and change nothing."
+            "description": "Report what would happen and adopt nothing. The drift check every\nadoption runs first still marks changed payload `drifted`."
           },
           "selector": {
             "$ref": "#/components/schemas/AdoptSelector",

@@ -24,7 +24,7 @@ expression: screen
 │                                     │  what  3 marked torrents                                                         │                                     │
 │                                     │  into  acct_a                                                                    │                                     │
 │                                     │                                                                                  │                                     │
-│                                     │  Preview — a dry run, nothing has changed yet:                                   │                                     │
+│                                     │  Preview — a dry run, nothing has been adopted yet:                              │                                     │
 │                                     │    ●     2 seed at once (fast path)                 010101010101 030303030303    │                                     │
 │                                     │    ◐     1 hashed before seeding: 14.0 GiB to read  050505050505                 │                                     │
 │                                     │    ✖     1 refused                                                               │                                     │
