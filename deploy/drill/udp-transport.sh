@@ -2,10 +2,12 @@
 # UDP transport drill: can anything but the tunnel's own transport leave by
 # the physical interface through the kill switch's `udp sport` exemption?
 #
-# The exemption accepts the tunnel's WireGuard listen port as a UDP source
-# port for the daemon's uid on any interface, on the argument that no socket
-# the daemon opens can hold that port (docs/running.md §11.6). This drill
-# tests the argument, in a private namespace (see netns.sh), with no daemon:
+# The exemption accepts a UDP datagram of the daemon's uid from the tunnel's
+# WireGuard listen port to its peer's endpoint, on any interface, on the
+# argument that no socket the daemon opens can hold that port while the link
+# is up, and that once the link is gone a socket holding it reaches only the
+# provider (docs/running.md §11.6). This drill tests the argument, in a
+# private namespace (see netns.sh), with no daemon:
 #
 #   bind     while the link is up, a UDP socket of the daemon's uid binding
 #            the listen port the ways libtorrent's listen and uTP sockets do
@@ -18,7 +20,10 @@
 #            it to (a resolver query, say), must not leave by the physical
 #            interface;
 #   reraise  re-raised on a port the kernel picks, as `wg-quick up` does for
-#            a config with no ListenPort, the tunnel must still carry.
+#            a config with no ListenPort, the tunnel must carry again once
+#            the kill switch's watch has re-read the port and installed the
+#            ruleset with it, as its next check does (`killswitch::refresh`).
+#            Until then it carries nothing; that is recorded, not failed.
 #
 #   deploy/drill/udp-transport.sh
 #
@@ -54,7 +59,8 @@ else
   result gap carries "the tunnel carries nothing under the ruleset"
 fi
 
-# stale: the link goes, the ruleset stays (it is installed once, at boot).
+# stale: the link goes, the ruleset stays (the watch keeps the exemption it
+# last read while the link cannot be read).
 wg_lower
 capture_start
 bound=$("${PROBE[@]}" send-udp 0.0.0.0 "$port" "$PEER_V4" 7)
@@ -71,16 +77,22 @@ else
     "bound: $bound; ephemeral: $ephemeral; on the wire: $(echo $leaked)"
 fi
 
-# reraise: back on a port the kernel picks, under the ruleset boot installed.
+# reraise: back on a port the kernel picks. Under the ruleset read before,
+# then under the one the watch's next check installs from the live port.
 wg_raise 0
 new_port=$(wg_listen_port)
 if tunnel_carries 5; then
-  result ok reraise "re-raised on $new_port, the tunnel carries"
-elif [[ $new_port != "$port" ]]; then
-  result gap reraise "re-raised on $new_port, the tunnel carries nothing: the ruleset" \
-    "still exempts $port until the daemon restarts"
+  result info reraise-before "re-raised on $new_port, the tunnel carries before the watch reinstalls"
 else
-  result gap reraise "re-raised on the same port $port, the tunnel carries nothing"
+  result info reraise-before "re-raised on $new_port, the tunnel carries nothing until the" \
+    "watch's next check: the ruleset still exempts $port"
+fi
+ks_install "$new_port"
+if tunnel_carries 5; then
+  result ok reraise "re-raised on $new_port and the ruleset reinstalled with it, the tunnel carries"
+else
+  result gap reraise "re-raised on $new_port and the ruleset reinstalled with it, the tunnel" \
+    "carries nothing"
 fi
 
 drill_exit
