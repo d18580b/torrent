@@ -96,10 +96,9 @@ body:
 
         **Redact before you paste, and know where this is going.** Take out the
         tracker announce URLs — the passkey in one identifies your account on
-        that tracker — and any API token. This tracker is **not** confidential
-        from other people with access to this repository; `SECURITY.md` says so
-        under *Reporting a vulnerability*, and that is the audience a pasted
-        passkey reaches.
+        that tracker — and any API token. This tracker is **public**: anything
+        you paste here is readable by anyone, the moment you submit it
+        (`SECURITY.md` says so under *Reporting a vulnerability*).
 
         A line looks like this:
 

@@ -11,29 +11,38 @@ If you are running something else, say which commit in your report.
 
 ## Reporting a vulnerability
 
-Open an issue in this repository with a `security:` prefix in the title:
+**Report privately.** Use the repository's **Security** tab, then **Report a
+vulnerability**
+([direct link](https://github.com/d18580b/torrent/security/advisories/new)).
+That opens a draft security advisory that only you, the repository's
+administrators and the people they add to it can see.
 
-```
-security: <one line, no exploit detail>
-```
-
-- Keep exploit detail out of the **title**. Put it in the body.
 - Say which commit you tested, how you configured the daemon (the `[auth]`,
-  `[pool]` and `[[slot]]` sections matter most), and what an attacker gets.
+  `[pool]` and `[[profile]]` sections matter most), and what an attacker gets.
 - Do not attach a working proof of concept up front. Say that you have one;
   attach it if asked.
 
-**Be clear about what this channel is.** This repository is private and
-non-forkable, so its issue tracker is closed to the public — a report filed
-here is not a public disclosure. It is **not** confidential from other people
-with access to this repository. If your finding needs to stay unseen by
-collaborators, this repository has no channel for that today.
+**Be clear about what this repository is.** It is public, and anyone can fork
+it. Its issue tracker is public too: an issue filed here is a public
+disclosure, readable by anyone, the moment you file it. Never put an
+undisclosed vulnerability in an issue, a pull request, a discussion or a
+commit message.
+
+**A public issue is for findings that are already public or low-risk** — an
+upstream advisory that already has a CVE, or a hardening gap that gives an
+attacker nothing on its own. For those, open an issue with a `security:`
+prefix in the title:
+
+```
+security: <one line>
+```
+
+If you are unsure which channel a finding belongs in, use the private one.
 
 **Nobody is named as the security contact.** This repository records no
-security owner, no rotation and no `CODEOWNERS` file, so a report filed in the
-tracker is read by whoever has access to the repository — the same people the
-paragraph above says it is not confidential from. Nothing here establishes
-that any particular person is watching.
+security owner, no rotation and no `CODEOWNERS` file. A private report reaches
+the repository's administrators. Nothing here establishes that any particular
+person is watching.
 
 **No response time is promised.** Nothing here supports one. Reports are read
 and handled on a best-effort basis, with no committed acknowledgement or fix
@@ -60,12 +69,12 @@ behaviour it only points at.
   Anything that leaks egress past it, or that turns `CAP_NET_ADMIN` into a
   wider capability than the table it installs, is in scope.
 
-- **Per-slot isolation** — described in
+- **Per-profile isolation** — described in
   [`README.md`](README.md), § *Security posture*.
   This exists to stop cross-contamination between private tracker accounts.
-  Anything that makes one slot announce from another's address, that defeats
-  the source binding or the fencing, or that lets one info-hash live in two
-  slots at once, is in scope. Note that `allowed_tracker_domains` is
+  Anything that makes one profile announce from another's address, that
+  defeats the source binding or the fencing, or that lets one info-hash live
+  in two profiles at once, is in scope. Note that `allowed_tracker_domains` is
   documented as a misconfiguration guard, not an egress control.
 
 - **`[pool] allow_mutations`** — described in
