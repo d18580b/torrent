@@ -52,6 +52,10 @@ pub enum AdoptPlan {
     Verify {
         torrent_path: PathBuf,
         save_path: PathBuf,
+        /// The previous client's `.fastresume`, where it left one: not
+        /// trusted for completion here, but its `trackers` are what the
+        /// torrent announced to, which the `.torrent` may not carry.
+        resume_path: Option<PathBuf>,
     },
     Refuse {
         reason: &'static str,
@@ -187,6 +191,7 @@ pub fn plan(
         _ => AdoptPlan::Verify {
             torrent_path: torrent.source_path.clone(),
             save_path,
+            resume_path: torrent.fastresume_path.clone(),
         },
     })
 }

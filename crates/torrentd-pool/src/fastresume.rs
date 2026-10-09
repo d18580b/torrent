@@ -39,7 +39,8 @@ pub struct ResumeHints {
     /// libtorrent's `trackers`: the announce URLs by tier, as the previous
     /// client last had them. qBittorrent 4.4 and later keep a torrent's
     /// trackers here and may write its `.torrent` without any. Empty URLs,
-    /// URLs that are not UTF-8 and tiers left empty are dropped.
+    /// URLs that are not UTF-8 or hold a NUL, and tiers left empty are
+    /// dropped.
     pub trackers: Vec<Vec<String>>,
 }
 
@@ -204,7 +205,8 @@ pub fn parse_hints(bytes: &[u8]) -> ResumeHints {
             .map(|tier| {
                 tier.iter()
                     .filter_map(|u| String::from_utf8(u.clone()).ok())
-                    .filter(|u| !u.is_empty())
+                    // A NUL cannot cross to libtorrent as a C string.
+                    .filter(|u| !u.is_empty() && !u.contains('\0'))
                     .collect::<Vec<_>>()
             })
             .filter(|tier| !tier.is_empty())
@@ -556,9 +558,11 @@ mod tests {
         );
         assert_eq!(h.save_path.as_deref(), Some("/p"));
 
-        // A URL that is not UTF-8 is dropped; its tier's others stay.
+        // A URL that is not UTF-8, or holds a NUL, is dropped; its tier's
+        // others stay.
         let mut tier = b"l".to_vec();
         tier.extend_from_slice(&bbytes(&[0xff, 0xfe]));
+        tier.extend_from_slice(&bstr("https://t.example/\0a"));
         tier.extend_from_slice(&bstr("https://t.example/a"));
         tier.push(b'e');
         let mut list = b"l".to_vec();
