@@ -281,4 +281,97 @@ mod tests {
         assert_eq!(state.resume_saves_in_flight(), 0);
         assert_eq!(state.pending_resume_count(), 0);
     }
+
+    /// Add a torrent to a mock session, let `fenced_after_add` decide whether
+    /// the profile is fenced before its `add_torrent_alert` is handled, then
+    /// handle it. Returns the handle and the engine's recorded calls.
+    fn add_then_handle_alert(
+        fenced_after_add: bool,
+    ) -> (TorrentHandle, Vec<crate::mock::RecordedCall>) {
+        use std::sync::atomic::AtomicBool;
+
+        use libtorrent_safe::AddParams;
+        use libtorrent_safe::TorrentFlags;
+
+        use crate::alert_loop::ProfileFenced;
+
+        let profile = ProfileId::new("p");
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = NoopSink;
+        let clock = MockClock::new();
+        let mock = Arc::new(MockEngine::new());
+        let engine: Arc<dyn TorrentEngine> = mock.clone();
+        let fenced = Arc::new(AtomicBool::new(false));
+        let profile_fenced: ProfileFenced = {
+            let fenced = fenced.clone();
+            Arc::new(move |_: &ProfileId| fenced.load(Ordering::SeqCst))
+        };
+
+        let th = engine
+            .add_torrent(AddParams::Magnet {
+                uri: "magnet:?xt=urn:btih:".to_string() + &"ab".repeat(20),
+                save_path: "/data".to_string(),
+                flags: TorrentFlags::empty(),
+            })
+            .unwrap();
+        // The fence walks the state map now, which does not hold the torrent:
+        // its alert is still queued.
+        assert!(!state.contains(&th.infohash));
+        fenced.store(fenced_after_add, Ordering::SeqCst);
+
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: Some(&profile_fenced),
+            profile_id: profile,
+            span: tracing::info_span!("test"),
+        };
+        handle(
+            &Alert::AddTorrent {
+                hdr: AlertHeader {
+                    kind: AlertKind::AddTorrent,
+                    infohash: Some(th.infohash),
+                    handle: Some(th),
+                    timestamp_us: 0,
+                },
+                error_code: 0,
+                message: None,
+            },
+            &mut ctx,
+        );
+        assert!(state.contains(&th.infohash));
+        (th, mock.calls())
+    }
+
+    #[test]
+    fn a_torrent_whose_profile_is_fenced_before_its_add_alert_lands_is_paused() {
+        use crate::mock::RecordedCall;
+
+        let (th, calls) = add_then_handle_alert(true);
+        assert!(
+            calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PauseTorrent(h) if *h == th)),
+            "the fence missed it, so the add handler must pause it: {calls:?}",
+        );
+    }
+
+    #[test]
+    fn a_torrent_added_to_an_unfenced_profile_is_not_paused() {
+        use crate::mock::RecordedCall;
+
+        let (_, calls) = add_then_handle_alert(false);
+        assert!(
+            !calls
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PauseTorrent(_))),
+            "{calls:?}",
+        );
+    }
 }
