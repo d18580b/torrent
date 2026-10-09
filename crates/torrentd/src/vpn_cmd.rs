@@ -278,9 +278,10 @@ pub trait CheckHost {
     /// lacks the capability to read with the same error.
     fn wireguard_device(&self, iface: &str) -> Option<bool>;
 
-    /// The UDP port the WireGuard link `iface` listens on — the probe
-    /// `killswitch::enable` reads each tunnel's transport exemption from.
-    fn listen_port(&self, iface: &str) -> std::io::Result<u16>;
+    /// The WireGuard link `iface`'s listen port and peer endpoints — the
+    /// probe `killswitch::enable` reads each tunnel's transport exemption
+    /// from.
+    fn transport(&self, iface: &str) -> std::io::Result<vpn::killswitch::Transport>;
 
     /// Where the kernel would route a packet from `src` to `dest`, judged
     /// against `iface` — the health monitor's route probe.
@@ -371,8 +372,8 @@ impl CheckHost for RealHost {
         link_type_is_wireguard(&String::from_utf8_lossy(&out.stdout))
     }
 
-    fn listen_port(&self, iface: &str) -> std::io::Result<u16> {
-        vpn::killswitch::listen_port(iface)
+    fn transport(&self, iface: &str) -> std::io::Result<vpn::killswitch::Transport> {
+        vpn::killswitch::transport(iface)
     }
 
     fn route_probe(
@@ -760,7 +761,7 @@ fn host_checks(
                     .collect();
                 // The script boot hands to `nft -f` — `killswitch::install_script`,
                 // the same renderer `killswitch::enable` calls — over the
-                // tunnel addresses and listen ports that can be read now.
+                // tunnel addresses and transports that can be read now.
                 // Boot reads each one off the live link and refuses to
                 // install without it; a link that is not up yet has neither
                 // to read, so what is missing is named rather than guessed at.
@@ -792,8 +793,8 @@ struct Unread {
     /// Tunnels with no address to pair their interface with, which the
     /// dry-run therefore carries no accept for.
     addresses: Vec<String>,
-    /// Tunnels with no listen port, whose transport the dry-run therefore
-    /// does not exempt.
+    /// Tunnels with no listen port or peer endpoint, whose transport the
+    /// dry-run therefore does not exempt.
     ports: Vec<String>,
 }
 
@@ -821,19 +822,19 @@ fn boot_install_script(
         return (Err(e), unread);
     }
     let mut paired = Vec::new();
-    let mut ports = Vec::new();
+    let mut transports = Vec::new();
     for iface in tunnels {
         match host.first_ipv4(iface) {
             Ok(addr) => paired.push(vpn::killswitch::Tunnel::new(iface.as_str(), addr)),
             Err(_) => unread.addresses.push(iface.clone()),
         }
-        match host.listen_port(iface) {
-            Ok(p) => ports.push(p),
+        match host.transport(iface) {
+            Ok(t) => transports.push(t),
             Err(_) => unread.ports.push(iface.clone()),
         }
     }
     (
-        vpn::killswitch::install_script(uid, &paired, &ports),
+        vpn::killswitch::install_script(uid, &paired, &transports),
         unread,
     )
 }
@@ -857,7 +858,8 @@ fn note_unread(mut verdict: Check, unread: &Unread) -> Check {
     }
     if !unread.ports.is_empty() {
         verdict.detail.push_str(&format!(
-            "\nno listen port could be read for {} (not up?), so this dry-run carries no \
+            "\nno listen port and peer endpoint could be read for {} (not up?), so this \
+             dry-run carries no \
              transport exemption for it; boot reads each one off the live link and refuses \
              to install the kill switch without it",
             unread.ports.join(", "),
@@ -1507,6 +1509,12 @@ mod tests {
 
     use super::*;
 
+    /// The transport [`FakeHost`] reports for a link listening on `port`: one
+    /// peer, at a documentation address.
+    fn fake_transport(port: u16) -> vpn::killswitch::Transport {
+        vpn::killswitch::Transport::new(port, ["198.51.100.1:51820".parse().unwrap()])
+    }
+
     /// A `CheckHost` with no host behind it: every answer is scripted, and the
     /// tunnel manager and NAT-PMP client are the engine's recording doubles,
     /// so what the checks *did* to them is assertable.
@@ -1572,7 +1580,8 @@ mod tests {
             }
         }
 
-        /// Script the listen port `iface`'s link reports.
+        /// Script the listen port `iface`'s link reports; its peer endpoint
+        /// is [`fake_transport`]'s.
         fn with_listen_port(mut self, iface: &str, port: u16) -> Self {
             self.ports.push((iface.to_string(), port));
             self
@@ -1750,12 +1759,12 @@ mod tests {
                 .map(|(_, v)| *v)
         }
 
-        fn listen_port(&self, iface: &str) -> std::io::Result<u16> {
-            self.record(format!("listen_port {iface}"));
+        fn transport(&self, iface: &str) -> std::io::Result<vpn::killswitch::Transport> {
+            self.record(format!("transport {iface}"));
             self.ports
                 .iter()
                 .find(|(i, _)| i == iface)
-                .map(|(_, p)| *p)
+                .map(|(_, p)| fake_transport(*p))
                 .ok_or_else(|| std::io::Error::other(format!("{iface} is not up")))
         }
 
@@ -3553,10 +3562,10 @@ user_agent           = "Transmission/4.0.5"
                 })
             },
             |iface| {
-                Ok(match iface {
+                Ok(fake_transport(match iface {
                     "wg-acct-a" => 51820,
                     _ => 40001,
-                })
+                }))
             },
             |script| {
                 *installed.borrow_mut() = script.to_string();
