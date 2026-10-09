@@ -224,6 +224,10 @@ has:
   `DELETE /v1/torrents/{infohash}?delete_files=true` answer `403`
   [`mutations-disabled`](problems.md#mutations-disabled).
 
+The alert drill's `fault-injection` build adds `POST /v1/faults`, tagged
+`testing`. No deployment runs that build, and the committed document does not
+include it.
+
 ## Deleting a torrent's payload
 
 `DELETE /v1/torrents/{infohash}?delete_files=true&confirm={infohash}` removes
@@ -259,10 +263,6 @@ file stopped it.
 
 Deleting payload through a `delete_orphans` plan is the other route, for files
 no torrent claims.
-
-The alert drill's `fault-injection` build adds `POST /v1/faults`, tagged
-`testing`. No deployment runs that build, and the committed document does not
-include it.
 
 ## Not in v1
 
