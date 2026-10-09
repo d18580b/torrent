@@ -1400,7 +1400,9 @@ impl ScanFence {
         }
         fenced.paused = fenced.handles.len();
         // The monitor set the count from the state map as it fenced; what
-        // the scans held is added to it.
+        // the scans held is added to it. The monitor sets its gauge before it
+        // marks the profile `VpnDown`, and this runs only once that mark is
+        // seen, so the gauge written here is the last one.
         entry.update_health(|hh| hh.paused_for_vpn += paused);
         metrics.set_gauge(
             "profile_torrents_paused_vpn_down",
