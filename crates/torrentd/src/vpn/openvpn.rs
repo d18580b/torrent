@@ -813,6 +813,13 @@ mod tests {
         // Reap the shell once it exits, so `live_pid` sees it gone rather
         // than a zombie the test process still holds.
         let reaper = thread::spawn(move || child.wait());
+        // `spawn` returns once execve has closed the child's close-on-exec
+        // pipe, which is before the kernel records the new image's
+        // arguments: /proc/<pid>/cmdline can read empty for a moment after.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while m.live_pid("tun-gone").is_none() && std::time::Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(
             m.live_pid("tun-gone").is_some(),
             "the stand-in reads as live"
