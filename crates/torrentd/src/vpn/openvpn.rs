@@ -82,6 +82,7 @@ use std::time::Instant;
 use torrentd_engine::VpnError;
 use torrentd_engine::VpnManager;
 use torrentd_engine::VpnTunnel;
+use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -469,6 +470,122 @@ impl OpenvpnManager {
             );
         }
     }
+
+    /// Every interface an `openvpn-<iface>.pid` or `openvpn-<iface>.table`
+    /// record under the state directory names, whatever the record holds,
+    /// each once and sorted. A missing state directory is no records; an
+    /// unreadable one is an error.
+    ///
+    /// The file names are this module's ([`Self::pid_file`],
+    /// [`Self::table_file`]), so this is where they are parsed back.
+    pub fn recorded_interfaces(&self) -> std::io::Result<Vec<String>> {
+        let entries = match std::fs::read_dir(&self.run_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        let mut ifaces: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let rest = name.to_str()?.strip_prefix("openvpn-")?;
+                let iface = rest
+                    .strip_suffix(".pid")
+                    .or_else(|| rest.strip_suffix(".table"))?;
+                (!iface.is_empty()).then(|| iface.to_string())
+            })
+            .collect();
+        ifaces.sort_unstable();
+        ifaces.dedup();
+        Ok(ifaces)
+    }
+
+    /// Run [`VpnManager::bring_down`]'s teardown for every interface a record
+    /// names, except those `keep` names, then drop the records the teardown
+    /// leaves; report what happened to each interface it looked at.
+    ///
+    /// A boot calls it with `keep` naming every configured tunnel interface,
+    /// before any bring-up: a configured OpenVPN profile's records are its
+    /// own bring-up's to consume ([`Self::route_tunnel`]), and a WireGuard
+    /// link under a recorded name owns the table that name's ifindex maps to.
+    /// What is left is a profile the configuration retired after an exit
+    /// that skipped the teardown. Nothing else would ever stop its openvpn,
+    /// remove its rules, or delete its records.
+    ///
+    /// The teardown is the same one: a pid is signalled only once it is
+    /// verified as a live openvpn on that interface ([`Self::live_pid`]), and
+    /// a recorded table is believed only on the boot of the host that wrote
+    /// it ([`Self::recorded_table`]). Where an openvpn is left running, its
+    /// pid file stays as the next teardown's handle on it.
+    pub fn release_recorded(
+        &self,
+        keep: impl Fn(&str) -> bool,
+    ) -> std::io::Result<Vec<(String, Released)>> {
+        let released = self
+            .recorded_interfaces()?
+            .into_iter()
+            .filter(|iface| !keep(iface))
+            .map(|iface| {
+                let outcome = self.release(&iface);
+                match outcome {
+                    Released::Stopped => warn!(
+                        target: "torrentd::vpn::openvpn",
+                        vpn_iface = %iface,
+                        "stopped an openvpn, and removed its routing rules, that a run which \
+                         did not exit cleanly started and no configured profile names",
+                    ),
+                    Released::LeftRunning => error!(
+                        target: "torrentd::vpn::openvpn",
+                        vpn_iface = %iface,
+                        pid_file = %self.pid_file(&iface).display(),
+                        "an openvpn an earlier run started for a profile no longer configured \
+                         is still running after its teardown; stop the process the pid file \
+                         names by hand",
+                    ),
+                    Released::NotRunning => info!(
+                        target: "torrentd::vpn::openvpn",
+                        vpn_iface = %iface,
+                        "dropped the records of an OpenVPN profile no longer configured, and \
+                         removed the routing rules a table recorded on this boot names",
+                    ),
+                }
+                (iface, outcome)
+            })
+            .collect();
+        Ok(released)
+    }
+
+    /// [`Self::release_recorded`] for one interface.
+    ///
+    /// Unlike [`Self::stop`], a stale pid file is deleted too: no bring-up of
+    /// a retired profile will overwrite it.
+    fn release(&self, iface: &str) -> Released {
+        let was_running = self.live_pid(iface).is_some();
+        self.stop(iface);
+        if self.live_pid(iface).is_some() {
+            return Released::LeftRunning;
+        }
+        let _ = std::fs::remove_file(self.pid_file(iface));
+        if was_running {
+            Released::Stopped
+        } else {
+            Released::NotRunning
+        }
+    }
+}
+
+/// What [`OpenvpnManager::release_recorded`] did with one recorded interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Released {
+    /// A live openvpn on the interface was stopped, and its rules and
+    /// records removed.
+    Stopped,
+    /// An openvpn on the interface is still running after the teardown. Its
+    /// pid file is kept; the recorded table's rules and record are gone.
+    LeftRunning,
+    /// No live openvpn ran the interface. The rules a table recorded on this
+    /// boot names were removed, and the records dropped.
+    NotRunning,
 }
 
 #[cfg(test)]
@@ -612,6 +729,106 @@ mod tests {
             t.elapsed() < TERM_GRACE,
             "teardown must not spend the grace period on a tunnel that is down",
         );
+    }
+
+    /// Both record kinds name an interface, each interface is reported once,
+    /// and nothing else in the state directory is read as a record.
+    #[test]
+    fn recorded_interfaces_are_read_back_from_both_record_kinds() {
+        let (d, m) = mgr();
+        for name in [
+            "openvpn-tun0.pid",
+            "openvpn-tun0.table",
+            "openvpn-tun1.table",
+            "openvpn-tun2.pid",
+            "openvpn-.pid",
+            "openvpn-tun3.log",
+            "wireguard-wg0.raised",
+            "torrentd.lock",
+        ] {
+            std::fs::write(d.path().join(name), "").unwrap();
+        }
+        assert_eq!(
+            m.recorded_interfaces().unwrap(),
+            vec!["tun0", "tun1", "tun2"],
+        );
+
+        let gone = OpenvpnManager::with_boot_id(d.path().join("missing"), Some(BOOT));
+        assert!(gone.recorded_interfaces().unwrap().is_empty());
+    }
+
+    /// A retired profile's records go, its recorded table's rules with them,
+    /// and a configured profile's are left to its own bring-up. The stale pid
+    /// file is deleted here, where `bring_down` leaves it: no bring-up of a
+    /// retired profile will ever overwrite it. Drop the `keep` filter or the
+    /// pid-file removal from `release` and this fails.
+    #[test]
+    fn a_retired_profiles_records_are_released_and_a_configured_ones_kept() {
+        let (_d, m) = mgr();
+        let table = route::TABLE_BASE.wrapping_add(0xFFFE);
+        for iface in ["tun-old", "tun-live"] {
+            std::fs::write(m.table_file(iface), format!("{BOOT}\n{table}\n")).unwrap();
+            // Far above the default pid_max: no openvpn to signal.
+            std::fs::write(m.pid_file(iface), "4294967294").unwrap();
+        }
+        // A pid recycled by a process that is not openvpn is never signalled.
+        std::fs::write(m.pid_file("tun-pid"), format!("{}\n", std::process::id())).unwrap();
+        // A record from an earlier boot: no rule is removed, the record goes.
+        std::fs::write(m.table_file("tun-boot"), format!("boot-b\n{table}\n")).unwrap();
+
+        let released = m.release_recorded(|iface| iface == "tun-live").unwrap();
+        assert_eq!(
+            released,
+            vec![
+                ("tun-boot".to_string(), Released::NotRunning),
+                ("tun-old".to_string(), Released::NotRunning),
+                ("tun-pid".to_string(), Released::NotRunning),
+            ],
+        );
+        for iface in ["tun-old", "tun-pid", "tun-boot"] {
+            assert!(!m.table_file(iface).exists(), "{iface}'s table record");
+            assert!(!m.pid_file(iface).exists(), "{iface}'s pid record");
+        }
+        assert!(m.table_file("tun-live").exists(), "a configured profile's");
+        assert!(m.pid_file("tun-live").exists(), "a configured profile's");
+        assert_eq!(m.recorded_interfaces().unwrap(), vec!["tun-live"]);
+    }
+
+    /// A retired profile's openvpn that is still running is stopped, and its
+    /// records go with it. The stand-in is a shell run under the name
+    /// `openvpn` with the interface among its arguments, which is all
+    /// `live_pid` verifies.
+    #[test]
+    fn a_retired_profiles_running_openvpn_is_stopped() {
+        let (d, m) = mgr();
+        let fake = d.path().join("openvpn");
+        std::os::unix::fs::symlink("/bin/sh", &fake).unwrap();
+        // `; :` keeps the shell from exec'ing into `sleep`, which would drop
+        // the interface from the command line.
+        let mut child = std::process::Command::new(&fake)
+            .args(["-c", "sleep 30; :", "tun-gone"])
+            .spawn()
+            .unwrap();
+        std::fs::write(m.pid_file("tun-gone"), format!("{}\n", child.id())).unwrap();
+        // Reap the shell once it exits, so `live_pid` sees it gone rather
+        // than a zombie the test process still holds.
+        let reaper = thread::spawn(move || child.wait());
+        // `spawn` returns once execve has closed the child's close-on-exec
+        // pipe, which is before the kernel records the new image's
+        // arguments: /proc/<pid>/cmdline can read empty for a moment after.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while m.live_pid("tun-gone").is_none() && std::time::Instant::now() < deadline {
+            thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            m.live_pid("tun-gone").is_some(),
+            "the stand-in reads as live"
+        );
+
+        let released = m.release_recorded(|_| false).unwrap();
+        assert_eq!(released, vec![("tun-gone".to_string(), Released::Stopped)]);
+        assert!(!m.pid_file("tun-gone").exists());
+        reaper.join().unwrap().unwrap();
     }
 
     #[test]

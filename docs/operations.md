@@ -248,13 +248,16 @@ and every WireGuard link the daemon raised, with its rules. Run it by hand
 unclean exit outside that unit; it refuses while a daemon is running. Each
 boot also removes a WireGuard link a raised-interface record vouches for once
 no configured profile names it, and with `network_kill_switch = false` removes
-a leftover kill-switch table.
+a leftover kill-switch table. For a retired OpenVPN profile, whose interface
+no configured profile names, each boot runs the same teardown a shutdown
+would: it stops the `openvpn` process the profile's `openvpn-<iface>.pid`
+record names, once `/proc` shows it is an `openvpn` on that interface; it
+removes the rules whose table the `openvpn-<iface>.table` record names, if that
+record was written since the host last booted; and it deletes both records.
+`net-cleanup` does not do this.
 
 A link the daemon adopted rather than raised is left standing, as a graceful
-shutdown leaves it: remove it with `ip link delete <iface>`. A retired OpenVPN
-profile is not cleaned up either. Stop its leftover `openvpn` process, delete
-the rules whose table the profile's `openvpn-<iface>.table` record names, and
-delete the record files.
+shutdown leaves it: remove it with `ip link delete <iface>`.
 
 A `last_shutdown.json` that reported `kill_switch_removal_failed` is a
 different case. The exit was graceful and its tunnels were already down; only
@@ -348,8 +351,8 @@ kill, a panic abort, or a power cut. `Restart=on-failure` starts the daemon
 again after 5 s. Work through these in order once it is up.
 
 **Network state (#105).** Nothing ran the teardown, so the kill-switch table,
-the WireGuard links and their `ip rule` entries are still in place. The boot
-cleans up only what its config still names:
+the tunnels and their `ip rule` entries are still in place. The boot cleans up
+what it has a record of:
 
 - A WireGuard link for a profile that is still configured is adopted, by the
   private key in its config or, for a keyless config, by its
@@ -368,8 +371,11 @@ cleans up only what its config still names:
   sudo nft delete table inet torrentd_ks
   ```
 
-- The links and rules of a profile no longer in the config stay up. Remove
-  them as [Retiring a profile](#retiring-a-profile) describes.
+- A profile no longer in the config is taken down: a WireGuard link its
+  `wireguard-<iface>.raised` record vouches for, and an OpenVPN profile's
+  `openvpn` process, the rules of a table recorded since the host booted, and
+  its records. Anything else stays up. Remove it as
+  [Retiring a profile](#retiring-a-profile) describes.
 
 **Adoptions (#109).** The verify queue lives in memory only, and an adoption
 writes its registry claim before the add. Each torrent's first resume save is
