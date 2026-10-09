@@ -634,8 +634,9 @@ fn ask_apply(state: &mut State, ctx: &Ctx<'_>) -> Vec<Effect> {
             Confirm::new(
                 title,
                 format!(
-                    "This deletes {deletes} files from disk and cannot be undone. The daemon waits \
-                     until every step has run."
+                    "This moves {deletes} files to the pool's trash; they can be restored from \
+                     .torrentd-trash/{}. The daemon waits until every step has run.",
+                    plan.id
                 ),
             )
             .typed(token.clone())
