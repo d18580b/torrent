@@ -92,7 +92,7 @@ hold.
 | `torrentd_config_reload_failures_total` | counter | `stage`: `load`, `log_level`, `apply_settings` | daemon | from boot, at 0 | Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed. |
 | `torrentd_kill_switch_active` | gauge | — | daemon | from boot: always | 1 while the daemon holds the nftables kill switch installed. |
 | `torrentd_kill_switch_table_present` | gauge | — | daemon | from boot: kill switch on | 1 if the kill switch's nftables table was present and matched the rendered ruleset at the last check; 0 if it was missing or had drifted. |
-| `torrentd_kill_switch_probe_errors_total` | counter | — | daemon | from boot, at 0 | Runtime kill-switch checks that could not list the nftables tables. |
+| `torrentd_kill_switch_probe_errors_total` | counter | — | daemon | from boot, at 0 | Runtime kill-switch checks that could not run: nft could not list the nftables tables or the kill switch's table as JSON, or its output could not be read. |
 | `torrentd_last_shutdown_unsaved_resumes` | gauge | — | daemon | from boot: always | Resume saves the previous run's shutdown drain left unsaved; 0 if unknown. |
 | `torrentd_last_shutdown_kill_switch_removal_failed` | gauge | — | daemon | from boot: always | 1 if the previous run could not remove the kill switch on its way out. |
 | `torrentd_pool_plan_failures_total` | counter | `kind`: `step_failed`, `index_diverged`, `resume_failed` | daemon | from boot, at 0 | Pool plans that stopped: a step failed, the index stopped accounting for what is loaded, or re-driving an interrupted plan failed. |
