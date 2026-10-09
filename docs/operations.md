@@ -243,7 +243,8 @@ step 3, and expect the index caveat above.
 daemon's own teardown, and its tunnel links, their `ip rule` entries and the
 kill-switch table stay up. The packaged unit's `ExecStopPost=` runs
 `torrentd net-cleanup` after every exit, which removes the kill-switch table
-and every WireGuard link the daemon raised, with its rules. Run it by hand
+and every WireGuard link the daemon raised, with its rules, and runs the
+retired-OpenVPN-profile teardown described below. Run it by hand
 (`sudo torrentd --config /etc/torrentd/torrentd.toml net-cleanup`) after an
 unclean exit outside that unit; it refuses while a daemon is running. Each
 boot also removes a WireGuard link a raised-interface record vouches for once
@@ -254,7 +255,9 @@ would: it stops the `openvpn` process the profile's `openvpn-<iface>.pid`
 record names, once `/proc` shows it is an `openvpn` on that interface; it
 removes the rules whose table the `openvpn-<iface>.table` record names, if that
 record was written since the host last booted; and it deletes both records.
-`net-cleanup` does not do this.
+`net-cleanup` runs the same teardown for the same profiles, and fails naming
+the interface if an `openvpn` is still running after it. A configured OpenVPN
+profile's records are left to its next bring-up.
 
 A link the daemon adopted rather than raised is left standing, as a graceful
 shutdown leaves it: remove it with `ip link delete <iface>`.

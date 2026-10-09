@@ -14,17 +14,22 @@
 //! - every WireGuard link a raised-interface record vouches for (raised on
 //!   this boot of the host, carrying the key the record names), with its
 //!   per-source rules. A link the daemon adopted, which it never raised, is
-//!   left standing, as shutdown leaves it.
+//!   left standing, as shutdown leaves it;
+//! - for every OpenVPN interface an `openvpn-<iface>.pid` or `.table` record
+//!   names and no configured profile does, the teardown a boot runs for a
+//!   retired profile: its verified `openvpn` is stopped, the rules of a table
+//!   recorded since the host booted are removed, and the records deleted.
 //!
-//! OpenVPN is not touched. Under the unit, systemd kills every process left in
-//! the service's cgroup before it runs `ExecStopPost=`, so the `openvpn`
-//! processes and their links are already gone, and the next bring-up of the
-//! profile clears the rules its recorded table names.
+//! A configured OpenVPN profile's records are left to its next bring-up, which
+//! clears the rules its recorded table names. Under the unit, systemd kills
+//! every process left in the service's cgroup before it runs `ExecStopPost=`,
+//! so its `openvpn` process and link are already gone.
 //!
 //! Idempotent: a second run, or a run after a graceful shutdown, finds nothing
 //! and succeeds. It refuses while a daemon holds the state directory's
 //! single-instance lock, since everything it would remove is that daemon's.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::Path;
 
@@ -34,6 +39,7 @@ use tracing::info;
 use crate::config::Config;
 use crate::startup::InstanceLock;
 use crate::vpn;
+use crate::vpn::ReleasedOpenvpn;
 use crate::vpn::ReleasedWireguard;
 
 /// `CAP_NET_ADMIN`'s bit in the capability sets (`linux/capability.h`).
@@ -46,9 +52,20 @@ pub fn cleanup(cfg: &Config) -> anyhow::Result<()> {
         .ok()
         .and_then(|status| holds_net_admin(&status));
     let state_dir = cfg.state_dir();
+    // Every tunnel interface this config names, as the boot computes it: an
+    // OpenVPN record under any other name is a retired profile's.
+    let configured: HashSet<&str> = cfg
+        .profile
+        .iter()
+        .filter_map(|p| p.vpn_interface())
+        .collect();
     cleanup_with(net_admin, &cfg.instance_lock_path(), || {
         run_steps(
             || vpn::release_recorded_wireguard(&state_dir, |_| false),
+            || {
+                vpn::OpenvpnManager::new(state_dir.clone())
+                    .release_recorded(|iface| configured.contains(iface))
+            },
             vpn::killswitch::nft_available(),
             vpn::killswitch::remove_table,
         )
@@ -96,6 +113,7 @@ fn cleanup_with(
 /// did; the failures are returned, one line each.
 fn run_steps(
     release_wireguard: impl FnOnce() -> io::Result<Vec<(String, ReleasedWireguard)>>,
+    release_openvpn: impl FnOnce() -> io::Result<Vec<(String, ReleasedOpenvpn)>>,
     nft_available: bool,
     remove_kill_switch: impl FnOnce() -> io::Result<bool>,
 ) -> Vec<String> {
@@ -113,6 +131,21 @@ fn run_steps(
         }
         Err(e) => failures.push(format!(
             "could not read the state directory for raised-interface records: {e}"
+        )),
+    }
+
+    match release_openvpn() {
+        Ok(released) => {
+            for (iface, outcome) in released {
+                if outcome == ReleasedOpenvpn::LeftRunning {
+                    failures.push(format!(
+                        "openvpn on {iface} is still running after its teardown"
+                    ));
+                }
+            }
+        }
+        Err(e) => failures.push(format!(
+            "could not read the state directory for OpenVPN records: {e}"
         )),
     }
 
@@ -178,6 +211,12 @@ mod tests {
                     ("wg-c".to_string(), ReleasedWireguard::Gone),
                 ])
             },
+            || {
+                Ok(vec![
+                    ("tun-a".to_string(), ReleasedOpenvpn::Stopped),
+                    ("tun-b".to_string(), ReleasedOpenvpn::NotRunning),
+                ])
+            },
             true,
             || {
                 removed.set(true);
@@ -188,7 +227,7 @@ mod tests {
         assert!(removed.get(), "the kill switch is removed");
 
         // Idempotent: nothing left, nothing to report.
-        assert!(run_steps(|| Ok(vec![]), true, || Ok(false)).is_empty());
+        assert!(run_steps(|| Ok(vec![]), || Ok(vec![]), true, || Ok(false)).is_empty());
     }
 
     /// A failed step does not stop the next one, and each failure is named.
@@ -197,6 +236,7 @@ mod tests {
         let removed = std::cell::Cell::new(false);
         let failures = run_steps(
             || Err(io::Error::other("permission denied")),
+            || Err(io::Error::other("permission denied")),
             true,
             || {
                 removed.set(true);
@@ -204,17 +244,44 @@ mod tests {
             },
         );
         assert!(removed.get(), "the kill switch is still tried");
-        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert_eq!(failures.len(), 3, "{failures:?}");
         assert!(failures[0].contains("raised-interface records"));
-        assert!(failures[1].contains("nft delete table inet torrentd_ks"));
+        assert!(failures[1].contains("OpenVPN records"));
+        assert!(failures[2].contains("nft delete table inet torrentd_ks"));
 
         let failures = run_steps(
             || Ok(vec![("wg-a".to_string(), ReleasedWireguard::LeftStanding)]),
+            || Ok(vec![]),
             false,
             || panic!("no nft, so no table to ask about"),
         );
         assert_eq!(failures.len(), 1, "{failures:?}");
         assert!(failures[0].contains("wg-a"));
+    }
+
+    /// The issue in #156: a retired OpenVPN profile's records are released,
+    /// and an openvpn left running after its teardown fails the run, naming
+    /// the interface, the way a WireGuard link left standing does. The
+    /// OpenVPN step runs even where the WireGuard step failed.
+    #[test]
+    fn an_openvpn_left_running_is_a_failure() {
+        let failures = run_steps(
+            || Err(io::Error::other("permission denied")),
+            || {
+                Ok(vec![
+                    ("tun-a".to_string(), ReleasedOpenvpn::LeftRunning),
+                    ("tun-b".to_string(), ReleasedOpenvpn::Stopped),
+                ])
+            },
+            false,
+            || panic!("no nft, so no table to ask about"),
+        );
+        assert_eq!(failures.len(), 2, "{failures:?}");
+        assert!(failures[0].contains("raised-interface records"));
+        assert!(
+            failures[1].contains("tun-a") && failures[1].contains("still running"),
+            "{failures:?}"
+        );
     }
 
     /// Without CAP_NET_ADMIN it returns before the lock and before any step,
