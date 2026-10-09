@@ -4,6 +4,7 @@ use std::sync::atomic::fence;
 use std::sync::atomic::Ordering;
 
 use libtorrent_safe::Alert;
+use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::TorrentHandle;
 use tracing::error;
 use tracing::info;
@@ -47,6 +48,14 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 TorrentState::newly_added(handle, ctx.profile_id.clone(), now),
             );
             hold_if_fenced(handle, ctx);
+            // Make the add durable now rather than at the next 30-minute sweep
+            // or the shutdown drain: until a resume file exists, a crash
+            // leaves the registry claiming a torrent no session reloads.
+            // Unconditional, because an `ONLY_IF_MODIFIED` save depends on
+            // libtorrent's modified bit, which says nothing about whether
+            // this torrent has a file on disk yet.
+            ctx.state
+                .queue_resume_save(handle.infohash, ResumeFlags::empty());
             info!(
                 target: "torrentd_engine::handler::add",
                 infohash = %handle.infohash,
@@ -283,6 +292,84 @@ mod tests {
         );
 
         assert_eq!(state.resume_saves_in_flight(), 0);
+        assert_eq!(state.pending_resume_count(), 0);
+    }
+
+    fn add_alert(ih: InfoHash, handle: Option<TorrentHandle>, error_code: i32) -> Alert {
+        Alert::AddTorrent {
+            hdr: AlertHeader {
+                kind: AlertKind::AddTorrent,
+                infohash: Some(ih),
+                handle,
+                timestamp_us: 0,
+            },
+            error_code,
+            message: (error_code != 0).then(|| "refused".to_string()),
+        }
+    }
+
+    #[test]
+    fn an_added_torrent_gets_an_unconditional_resume_save_at_once() {
+        let ih = InfoHash([0x79; 20]);
+        let profile = ProfileId::new("p");
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = NoopSink;
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let th = TorrentHandle {
+            id: 1,
+            infohash: ih,
+        };
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: profile,
+            span: tracing::info_span!("test"),
+        };
+
+        handle(&add_alert(ih, Some(th), 0), &mut ctx);
+
+        // Queued for the dispatcher, not left for the 30-minute sweep, and
+        // without `ONLY_IF_MODIFIED`: nothing is on disk for it yet.
+        assert_eq!(state.pending_resume_count(), 1);
+        assert_eq!(
+            state.dispatch_resume_saves(8),
+            vec![(ih, ResumeFlags::empty())],
+        );
+    }
+
+    #[test]
+    fn a_failed_add_queues_no_resume_save() {
+        let ih = InfoHash([0x7A; 20]);
+        let profile = ProfileId::new("p");
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = NoopSink;
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: profile,
+            span: tracing::info_span!("test"),
+        };
+
+        handle(&add_alert(ih, None, 1), &mut ctx);
+
+        assert!(!state.contains(&ih));
         assert_eq!(state.pending_resume_count(), 0);
     }
 
