@@ -359,7 +359,7 @@
       "id": 25,
       "type": "stat",
       "title": "Kill switch",
-      "description": "Whether the daemon holds the nftables kill switch installed. Off is the default; TorrentdKillSwitchOff notes it when every profile is vpn-backed, and TorrentdKillSwitchGone fires if an installed table disappears.",
+      "description": "Whether the daemon holds the nftables kill switch installed. Off is the default; TorrentdKillSwitchOff notes it when every profile is vpn-backed, and TorrentdKillSwitchGone fires if an installed table disappears or no longer matches the rendered ruleset.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 6, "x": 18, "y": 52 },
       "fieldConfig": {
@@ -404,7 +404,7 @@
       "id": 28,
       "type": "timeseries",
       "title": "Kill switch table",
-      "description": "Installed is the daemon's own record that it holds the nftables kill switch; present is what the last `nft list tables` found. Installed without present is TorrentdKillSwitchGone: egress is no longer confined to the tunnels. Probe errors are checks that could not list the tables at all (TorrentdKillSwitchUnverifiable). Present is exported only with the kill switch on.",
+      "description": "Installed is the daemon's own record that it holds the nftables kill switch; present is whether the last check found the table and found it matching the rendered ruleset. Installed without present is TorrentdKillSwitchGone: egress may no longer be confined to the tunnels. Probe errors are checks that could not list the tables at all (TorrentdKillSwitchUnverifiable). Present is exported only with the kill switch on.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 68 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },

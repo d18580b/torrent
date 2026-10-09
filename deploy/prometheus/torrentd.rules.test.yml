@@ -345,7 +345,7 @@ tests:
           - exp_labels:
               severity: critical
             exp_annotations:
-              summary: "The nftables kill switch table disappeared; the daemon's egress is no longer confined to the tunnels"
+              summary: "The nftables kill switch table is missing or no longer matches the rendered ruleset; the daemon's egress may no longer be confined to the tunnels"
 
   - interval: 1m
     input_series:

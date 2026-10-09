@@ -233,9 +233,30 @@ pub fn render_ruleset_with_transport(
 /// interfaces would still be accepted.
 pub fn install_script(uid: u32, tunnels: &[Tunnel], transport_ports: &[u16]) -> io::Result<String> {
     let table = render_ruleset_with_transport(uid, tunnels, transport_ports)?;
-    Ok(format!(
-        "add table inet {TABLE}\ndelete table inet {TABLE}\n{table}"
-    ))
+    Ok(replace_script(&table))
+}
+
+/// `table`, preceded by the two lines that make `nft -f` replace a standing
+/// table of this name with it in one transaction; see [`install_script`].
+fn replace_script(table: &str) -> String {
+    format!("add table inet {TABLE}\ndelete table inet {TABLE}\n{table}")
+}
+
+/// The kill switch as `enable` installed it: the uid it confines, and the
+/// table it rendered, which [`verify`] compares the live one with and
+/// [`watch`] installs again when they differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub uid: u32,
+    table: String,
+}
+
+impl Installed {
+    /// The script that installs this table again, replacing whatever stands
+    /// in its place, as one transaction.
+    fn script(&self) -> String {
+        replace_script(&self.table)
+    }
 }
 
 /// Effective uid of this process, read from `/proc/self/status` (Linux-only,
@@ -299,12 +320,13 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
 /// Install the kill switch for the current process's uid, confining egress to
 /// loopback and to each of `tunnels` from the address its link holds, with
 /// each tunnel's own transport exempted (see
-/// [`render_ruleset_with_transport`]). Returns the uid the ruleset was written
-/// for. Replaces any stale table left by a previous unclean exit in the same
+/// [`render_ruleset_with_transport`]). Returns what was installed: the uid the
+/// ruleset was written for, and the table, for [`verify`] and [`watch`].
+/// Replaces any stale table left by a previous unclean exit in the same
 /// transaction ([`install_script`]).
 ///
 /// Refuses uid 0 outright — see [`refusal_for_uid`].
-pub fn enable(tunnels: &[String]) -> io::Result<u32> {
+pub fn enable(tunnels: &[String]) -> io::Result<Installed> {
     enable_for_uid(
         current_uid()?,
         tunnels,
@@ -376,7 +398,7 @@ pub(crate) fn enable_for_uid(
     tunnel_addr: impl Fn(&str) -> io::Result<Ipv4Addr>,
     transport_port: impl Fn(&str) -> io::Result<u16>,
     apply: impl Fn(&str) -> io::Result<()>,
-) -> io::Result<u32> {
+) -> io::Result<Installed> {
     if let Some(refusal) = refusal_for_uid(uid) {
         return Err(refusal);
     }
@@ -406,8 +428,11 @@ pub(crate) fn enable_for_uid(
         .collect::<io::Result<Vec<u16>>>()?;
     // A name the ruleset cannot carry fails here, before nft, so a previous
     // run's kill switch stays armed.
-    let script = install_script(uid, &paired, &ports)?;
-    apply(&script)?;
+    let installed = Installed {
+        uid,
+        table: render_ruleset_with_transport(uid, &paired, &ports)?,
+    };
+    apply(&installed.script())?;
     info!(
         target: "torrentd::vpn::killswitch",
         uid,
@@ -415,7 +440,7 @@ pub(crate) fn enable_for_uid(
         transport_ports = ?ports,
         "network kill switch installed (nftables, fail-closed)",
     );
-    Ok(uid)
+    Ok(installed)
 }
 
 /// Remove the kill-switch table.
@@ -462,56 +487,331 @@ pub(crate) fn disable_with(
     delete().map(|()| true)
 }
 
+/// What [`verify`] found in place of the table `enable` installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    /// The live table is the rendered one, rule for rule.
+    Intact,
+    /// No table of this name is listed.
+    Absent,
+    /// The table is listed and is not the one rendered: a chain or rule
+    /// flushed, replaced or added. Says where it first differs.
+    Drifted(String),
+}
+
+/// Compare the live kill-switch table with the one `installed` rendered.
+///
+/// The table's name being listed is not enough: `nft flush chain` or a
+/// firewall manager replacing the table's contents leaves the name standing
+/// with nothing in it. So the live table is listed as JSON
+/// (`nft -j list table`), read back into the text [`render_ruleset_with_transport`]
+/// writes, and compared with it. Whether the table exists at all is asked of
+/// `nft list tables` first, as [`remove_table`] asks it: a listing of a
+/// missing table fails with a localised message, and that failure is kept for
+/// what it is — a check that could not run.
+pub(crate) fn verify(installed: &Installed) -> io::Result<Verdict> {
+    verify_with(installed, list_tables, list_table_json)
+}
+
+/// [`verify`], with both `nft` calls handed in.
+pub(crate) fn verify_with(
+    installed: &Installed,
+    list: impl Fn() -> io::Result<String>,
+    list_json: impl Fn() -> io::Result<String>,
+) -> io::Result<Verdict> {
+    if !table_listed(&list()?) {
+        return Ok(Verdict::Absent);
+    }
+    let json: serde_json::Value = serde_json::from_str(&list_json()?).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("nft -j list table printed something that is not JSON: {e}"),
+        )
+    })?;
+    let live = match live_table(&json) {
+        Ok(live) => live,
+        Err(why) => return Ok(Verdict::Drifted(why)),
+    };
+    if live == installed.table {
+        return Ok(Verdict::Intact);
+    }
+    let (want, got) = (installed.table.lines(), live.lines());
+    let mut want = want.map(str::trim);
+    let mut got = got.map(str::trim);
+    let why = loop {
+        match (want.next(), got.next()) {
+            (Some(w), Some(g)) if w == g => continue,
+            (w, g) => {
+                break format!(
+                    "installed {:?}, live {:?}",
+                    w.unwrap_or("<nothing>"),
+                    g.unwrap_or("<nothing>"),
+                )
+            }
+        }
+    };
+    Ok(Verdict::Drifted(why))
+}
+
+/// `nft -j list table inet TABLE`, read back into the text
+/// [`render_ruleset_with_transport`] writes, or why it cannot be: an object or
+/// expression of a kind this module never installs is not this module's
+/// table.
+///
+/// Counters are read without their values, and a one-port `udp sport` set,
+/// which nft stores as a single value, is read as the set it was written as.
+fn live_table(json: &serde_json::Value) -> Result<String, String> {
+    use serde_json::Value;
+    let items = json
+        .get("nftables")
+        .and_then(Value::as_array)
+        .ok_or("the listing has no nftables array")?;
+    // Each chain's header line, if it is a base chain, and its rules.
+    let mut chains: Vec<(String, Option<String>, Vec<String>)> = Vec::new();
+    for item in items {
+        let Some((kind, body)) = item
+            .as_object()
+            .filter(|o| o.len() == 1)
+            .and_then(|o| o.iter().next())
+        else {
+            return Err(format!("an unread entry {item}"));
+        };
+        match kind.as_str() {
+            "metainfo" | "table" => {}
+            "chain" => {
+                let name = body["name"].as_str().ok_or("a chain with no name")?;
+                let header = match (
+                    body["type"].as_str(),
+                    body["hook"].as_str(),
+                    scalar(&body["prio"]),
+                    body["policy"].as_str(),
+                ) {
+                    (Some(t), Some(hook), Some(prio), Some(policy)) => Some(format!(
+                        "type {t} hook {hook} priority {prio}; policy {policy};"
+                    )),
+                    _ => None,
+                };
+                chains.push((name.to_string(), header, Vec::new()));
+            }
+            "rule" => {
+                let chain = body["chain"].as_str().ok_or("a rule with no chain")?;
+                let line = rule_line(&body["expr"])?;
+                chains
+                    .iter_mut()
+                    .find(|(name, ..)| name == chain)
+                    .ok_or_else(|| format!("a rule in chain {chain:?}, which is not listed"))?
+                    .2
+                    .push(line);
+            }
+            other => {
+                return Err(format!(
+                    "the table holds a {other}, which the kill switch never installs"
+                ))
+            }
+        }
+    }
+    let mut out = format!("table inet {TABLE} {{\n");
+    for (name, header, rules) in chains {
+        out.push_str(&format!("\tchain {name} {{\n"));
+        for line in header.iter().chain(&rules) {
+            out.push_str(&format!("\t\t{line}\n"));
+        }
+        out.push_str("\t}\n");
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+/// A number or a string from the listing, as the ruleset text writes it.
+fn scalar(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// One rule's `expr` array, as the line [`render_ruleset_with_transport`]
+/// writes for it. Reads only the matches and verdicts that function renders.
+fn rule_line(exprs: &serde_json::Value) -> Result<String, String> {
+    let exprs = exprs.as_array().ok_or("a rule with no expressions")?;
+    let unread =
+        |e: &serde_json::Value| format!("an expression the kill switch never installs: {e}");
+    let mut words = Vec::with_capacity(exprs.len());
+    for e in exprs {
+        if let Some(m) = e.get("match") {
+            if m["op"] != "==" {
+                return Err(unread(e));
+            }
+            let (left, right) = (&m["left"], &m["right"]);
+            let key = match (
+                left.pointer("/meta/key").and_then(|k| k.as_str()),
+                left.pointer("/payload/protocol").and_then(|p| p.as_str()),
+                left.pointer("/payload/field").and_then(|f| f.as_str()),
+            ) {
+                (Some("skuid"), ..) => "meta skuid",
+                (Some("oifname"), ..) => "oifname",
+                (None, Some("ip"), Some("saddr")) => "ip saddr",
+                (None, Some("udp"), Some("sport")) => "udp sport",
+                _ => return Err(unread(e)),
+            };
+            let value = match key {
+                "oifname" => right.as_str().map(|s| format!("\"{s}\"")),
+                "udp sport" => match right.pointer("/set").and_then(|s| s.as_array()) {
+                    Some(set) => set
+                        .iter()
+                        .map(scalar)
+                        .collect::<Option<Vec<_>>>()
+                        .map(|ports| format!("{{ {} }}", ports.join(", "))),
+                    None => scalar(right).map(|port| format!("{{ {port} }}")),
+                },
+                _ => scalar(right),
+            }
+            .ok_or_else(|| unread(e))?;
+            words.push(format!("{key} {value}"));
+        } else if e.get("counter").is_some() {
+            words.push("counter".to_string());
+        } else if e.get("accept").is_some() {
+            words.push("accept".to_string());
+        } else if e.get("drop").is_some() {
+            words.push("drop".to_string());
+        } else {
+            return Err(unread(e));
+        }
+    }
+    Ok(words.join(" "))
+}
+
+/// `nft -j list table inet TABLE`, returning its stdout.
+fn list_table_json() -> io::Result<String> {
+    let out = exec::run_ok(
+        "nft",
+        &["-j", "list", "table", "inet", TABLE],
+        None,
+        exec::QUICK,
+    )?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// What [`watch`] does to the vpn profiles while the kill switch is not in
+/// force as installed. Implemented over the profile registry by
+/// `vpn_monitor::KillSwitchFence`; a trait so the watch's decisions are
+/// reachable by a test with no sessions.
+pub(crate) trait Fence: Send + Sync {
+    /// Fence every vpn profile that is not fenced already, as the VPN monitor
+    /// fences one whose tunnel is down.
+    fn fence_all(&self);
+    /// Lift what [`Fence::fence_all`] fenced: called only once the ruleset
+    /// has been verified intact again.
+    fn lift(&self);
+}
+
 /// How often [`watch`] checks the table is still installed.
 const WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Where the watch stands between checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Watch {
+    /// The last check found the table as installed.
+    #[default]
+    Intact,
+    /// A check found it gone or changed: every vpn profile was fenced, and the
+    /// one reinstall this loss gets was tried and did not check intact.
+    Lost,
+}
+
 /// Check, for as long as the daemon runs, that the kill switch this boot
-/// installed is still there.
+/// installed is still in force exactly as installed.
 ///
-/// Installation is verified once; nothing after it noticed a table removed
-/// underneath the daemon — a firewall service reloading its ruleset with
-/// `nft flush ruleset` does exactly that — and the backstop was gone while
-/// `kill_switch_active` still read 1. Each check sets
-/// `kill_switch_table_present`; a check that cannot list the tables counts in
-/// `kill_switch_probe_errors_total` and leaves the gauge as it was, since not
-/// knowing is not the same as absent.
+/// Installation is verified once, at boot. After that a firewall service
+/// reloading its ruleset (`nft flush ruleset`), or an operator flushing the
+/// chain while debugging, removes the backstop underneath the daemon. Only
+/// the table's name used to be checked, so a flushed chain read as present,
+/// and a removed table was only logged while every profile kept seeding.
+///
+/// Each check compares the live table with the rendered one ([`verify`]) and
+/// sets `kill_switch_table_present` to whether it matched. A table gone or
+/// changed fences every vpn profile, then the table is installed again once,
+/// in one transaction, and checked again; only a reinstall that checks intact
+/// lifts the fence. While it is not intact the check repeats each interval,
+/// fencing again any profile set online meanwhile; a later check that finds it
+/// intact — restored by the operator — lifts the fence then. A check that
+/// cannot run counts in `kill_switch_probe_errors_total` and changes nothing,
+/// since not knowing is not the same as absent.
 ///
 /// Only spawned when the kill switch is active.
-pub async fn watch(
+pub(crate) async fn watch(
+    installed: Installed,
+    fence: std::sync::Arc<dyn Fence>,
     metrics: std::sync::Arc<crate::metrics_sink::PromSink>,
     mut shutdown: tokio::sync::broadcast::Receiver<torrentd_engine::ShutdownReason>,
 ) {
     use torrentd_engine::MetricsSink;
-    // Installed moments ago by `enable`, which checked it.
+    // Installed moments ago by `enable`, and verified by the boot.
     metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
+    let installed = std::sync::Arc::new(installed);
+    let mut state = Watch::default();
     loop {
         tokio::select! {
             _ = tokio::time::sleep(WATCH_INTERVAL) => {}
             _ = shutdown.recv() => return,
         }
-        let listed = tokio::task::spawn_blocking(list_tables).await;
-        record_check(
-            &*metrics,
-            listed.unwrap_or_else(|e| Err(io::Error::other(e))),
-        );
+        // Blocking throughout: the checks and the reinstall shell out to nft,
+        // and fencing pauses torrents under each session's lock.
+        let ticked = tokio::task::spawn_blocking({
+            let (installed, fence, metrics) = (installed.clone(), fence.clone(), metrics.clone());
+            move || {
+                tick(
+                    state,
+                    || verify(&installed),
+                    || apply(&installed.script()),
+                    &*fence,
+                    &*metrics,
+                )
+            }
+        })
+        .await;
+        match ticked {
+            Ok(next) => state = next,
+            Err(e) => {
+                metrics.inc_counter("kill_switch_probe_errors_total", &[]);
+                tracing::warn!(
+                    target: "torrentd::vpn::killswitch",
+                    table = TABLE,
+                    error.cause = %e,
+                    "the network kill switch check failed to run",
+                );
+            }
+        }
     }
 }
 
-/// Turn one `nft list tables` outcome into the watch's metrics and log.
-fn record_check(metrics: &dyn torrentd_engine::MetricsSink, listed: io::Result<String>) {
-    match listed {
-        Ok(listing) if table_listed(&listing) => {
+/// One check of [`watch`]'s, from where the last one left it: verify, fence
+/// and reinstall on a loss, lift on a verified recovery. Returns where it
+/// leaves the watch.
+fn tick(
+    state: Watch,
+    verify: impl Fn() -> io::Result<Verdict>,
+    reinstall: impl Fn() -> io::Result<()>,
+    fence: &dyn Fence,
+    metrics: &dyn torrentd_engine::MetricsSink,
+) -> Watch {
+    let why = match verify() {
+        Ok(Verdict::Intact) => {
             metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
+            if state != Watch::Intact {
+                tracing::warn!(
+                    target: "torrentd::vpn::killswitch",
+                    table = TABLE,
+                    "the network kill switch is in force as installed again; lifting the fence \
+                     it put on the vpn profiles",
+                );
+                fence.lift();
+            }
+            return Watch::Intact;
         }
-        Ok(_) => {
-            metrics.set_gauge("kill_switch_table_present", 0.0, &[]);
-            tracing::error!(
-                target: "torrentd::vpn::killswitch",
-                table = TABLE,
-                "the network kill switch's nftables table is gone; the daemon's egress is no \
-                 longer confined to the tunnels. Restart the daemon to reinstall it",
-            );
-        }
+        Ok(Verdict::Absent) => "the table is gone".to_string(),
+        Ok(Verdict::Drifted(why)) => why,
         Err(e) => {
             metrics.inc_counter("kill_switch_probe_errors_total", &[]);
             tracing::warn!(
@@ -520,6 +820,51 @@ fn record_check(metrics: &dyn torrentd_engine::MetricsSink, listed: io::Result<S
                 error.cause = %e,
                 "could not check the network kill switch is still installed",
             );
+            return state;
+        }
+    };
+    metrics.set_gauge("kill_switch_table_present", 0.0, &[]);
+    tracing::error!(
+        target: "torrentd::vpn::killswitch",
+        table = TABLE,
+        drift = %why,
+        "the network kill switch is not in force as installed, so the daemon's egress is no \
+         longer confined to the tunnels; fencing every vpn profile",
+    );
+    fence.fence_all();
+    if state == Watch::Lost {
+        return Watch::Lost;
+    }
+    match reinstall().and_then(|()| verify()) {
+        Ok(Verdict::Intact) => {
+            metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
+            tracing::warn!(
+                target: "torrentd::vpn::killswitch",
+                table = TABLE,
+                "reinstalled the network kill switch and verified it; lifting the fence",
+            );
+            fence.lift();
+            Watch::Intact
+        }
+        Ok(verdict) => {
+            tracing::error!(
+                target: "torrentd::vpn::killswitch",
+                table = TABLE,
+                verdict = ?verdict,
+                "reinstalled the network kill switch, and it still does not check as installed; \
+                 the vpn profiles stay fenced. Restart the daemon to reinstall it",
+            );
+            Watch::Lost
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "torrentd::vpn::killswitch",
+                table = TABLE,
+                error.cause = %e,
+                "could not reinstall the network kill switch; the vpn profiles stay fenced. \
+                 Restart the daemon to reinstall it",
+            );
+            Watch::Lost
         }
     }
 }
@@ -694,7 +1039,8 @@ mod tests {
                 Ok(())
             },
         )
-        .expect("the supported shape — User=torrentd with CAP_NET_ADMIN — is not refused");
+        .expect("the supported shape — User=torrentd with CAP_NET_ADMIN — is not refused")
+        .uid;
 
         assert_eq!(uid, 998, "the uid the ruleset was written for is returned");
         let calls = calls.borrow();
@@ -1056,28 +1402,299 @@ table inet torrentd_ks {
         })
     }
 
+    /// What `enable` installs for uid 998 over `wg-a` with two transport
+    /// ports: the table [`LIVE`] is nft's listing of.
+    fn installed() -> Installed {
+        Installed {
+            uid: 998,
+            table: render_ruleset_with_transport(998, &[tunnel("wg-a")], &[51820, 40001]).unwrap(),
+        }
+    }
+
+    const META: &str = r#"{"metainfo": {"version": "1.1.6", "release_name": "Commodore Bullmoose #7", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "torrentd_ks", "handle": 1}}, {"chain": {"family": "inet", "table": "torrentd_ks", "name": "output", "handle": 1, "type": "filter", "hook": "output", "prio": 0, "policy": "accept"}}"#;
+    const LO: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 2, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "lo"}}, {"accept": null}]}}"#;
+    const WG_A: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 3, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "10.2.0.2"}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg-a"}}, {"accept": null}]}}"#;
+    const PORTS: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 5, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": {"set": [40001, 51820]}}}, {"accept": null}]}}"#;
+    const DROP: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 6, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"counter": {"packets": 12, "bytes": 960}}, {"drop": null}]}}"#;
+
+    /// `nft -j list table` as nftables 1.1.6 printed it for [`installed`]'s
+    /// table, entries in the order given.
+    fn listing(entries: &[&str]) -> String {
+        format!(r#"{{"nftables": [{}]}}"#, entries.join(", "))
+    }
+
+    fn verify_listing(json: String) -> io::Result<Verdict> {
+        verify_with(
+            &installed(),
+            || Ok(format!("table ip filter\ntable inet {TABLE}\n")),
+            move || Ok(json.clone()),
+        )
+    }
+
     #[test]
-    fn the_watch_reads_a_listed_table_as_present() {
-        let metrics = torrentd_engine::RecordingSink::new();
-        record_check(
-            &metrics,
-            Ok(format!("table inet filter\ntable inet {TABLE}\n")),
+    fn the_table_as_installed_verifies_intact() {
+        assert_eq!(
+            verify_listing(listing(&[META, LO, WG_A, PORTS, DROP])).unwrap(),
+            Verdict::Intact,
+            "counter values and rule handles are not drift",
         );
+    }
+
+    /// The scenario in #102: the chain flushed, the table still listed. Its
+    /// name alone read as present, and `kill_switch_table_present` stayed 1.
+    #[test]
+    fn a_flushed_chain_is_drift_though_the_table_is_listed() {
+        let verdict = verify_listing(listing(&[META])).unwrap();
+        let Verdict::Drifted(why) = verdict else {
+            panic!("a flushed chain is drift; got {verdict:?}");
+        };
+        assert!(
+            why.starts_with("installed \"meta skuid 998 oifname \\\"lo\\\" accept\""),
+            "says which rule is missing; got {why}",
+        );
+    }
+
+    #[test]
+    fn a_missing_table_is_absent_and_its_contents_are_not_asked() {
+        let verdict = verify_with(
+            &installed(),
+            || Ok("table ip filter\n".to_string()),
+            || panic!("no table to list"),
+        )
+        .unwrap();
+        assert_eq!(verdict, Verdict::Absent);
+    }
+
+    /// Anything else in the table is not the table installed: a rule
+    /// replaced, one added, a chain policy changed, a set this module never
+    /// writes.
+    #[test]
+    fn a_changed_or_extended_table_is_drift() {
+        let accept_all = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 7, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"accept": null}]}}"#;
+        let other_addr = WG_A.replace("10.2.0.2", "10.9.9.9");
+        let drop_policy = META.replace(r#""policy": "accept""#, r#""policy": "drop""#);
+        let set = r#"{"set": {"family": "inet", "name": "s", "table": "torrentd_ks", "type": "ipv4_addr", "handle": 4}}"#;
+        let unread = DROP.replace(r#"{"drop": null}"#, r#"{"jump": {"target": "x"}}"#);
+        for (label, json) in [
+            (
+                "an accept ahead of the drop",
+                listing(&[META, LO, accept_all, WG_A, PORTS, DROP]),
+            ),
+            (
+                "a tunnel address replaced",
+                listing(&[META, LO, &other_addr, PORTS, DROP]),
+            ),
+            (
+                "the policy changed",
+                listing(&[&drop_policy, LO, WG_A, PORTS, DROP]),
+            ),
+            ("a set", listing(&[META, set, LO, WG_A, PORTS, DROP])),
+            (
+                "an unread verdict",
+                listing(&[META, LO, WG_A, PORTS, &unread]),
+            ),
+        ] {
+            assert!(
+                matches!(verify_listing(json).unwrap(), Verdict::Drifted(_)),
+                "{label} is drift",
+            );
+        }
+    }
+
+    /// nft stores a one-element set as the single value; it is read back as
+    /// the set the renderer writes.
+    #[test]
+    fn a_one_port_set_reads_back_as_rendered() {
+        let one = Installed {
+            uid: 998,
+            table: render_ruleset_with_transport(998, &[tunnel("wg-a")], &[51820]).unwrap(),
+        };
+        let port = PORTS.replace(r#"{"set": [40001, 51820]}"#, "51820");
+        let json = listing(&[META, LO, WG_A, &port, DROP]);
+        let verdict = verify_with(
+            &one,
+            || Ok(format!("table inet {TABLE}\n")),
+            move || Ok(json.clone()),
+        )
+        .unwrap();
+        assert_eq!(verdict, Verdict::Intact);
+    }
+
+    /// A check that cannot run is an error, not a verdict: not knowing is
+    /// neither absent nor drifted.
+    #[test]
+    fn a_check_that_cannot_run_is_an_error() {
+        verify_with(
+            &installed(),
+            || Err(io::Error::other("nft: permission denied")),
+            || panic!("not reached"),
+        )
+        .expect_err("a failed listing");
+        verify_listing("Error: busy".to_string()).expect_err("output that is not JSON");
+    }
+
+    /// What the watch asked of the profiles, in order.
+    #[derive(Default)]
+    struct Recorded(std::sync::Mutex<Vec<&'static str>>);
+
+    impl Fence for Recorded {
+        fn fence_all(&self) {
+            self.0.lock().unwrap().push("fence");
+        }
+        fn lift(&self) {
+            self.0.lock().unwrap().push("lift");
+        }
+    }
+
+    impl Recorded {
+        fn take(&self) -> Vec<&'static str> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    /// Verdicts handed out in order, one per call.
+    fn verdicts(v: Vec<io::Result<Verdict>>) -> impl Fn() -> io::Result<Verdict> {
+        let v = std::cell::RefCell::new(std::collections::VecDeque::from(v));
+        move || v.borrow_mut().pop_front().expect("no more checks scripted")
+    }
+
+    fn drifted() -> io::Result<Verdict> {
+        Ok(Verdict::Drifted("installed x, live <nothing>".into()))
+    }
+
+    #[test]
+    fn an_intact_table_fences_nothing_and_reads_present() {
+        let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+        let next = tick(
+            Watch::Intact,
+            verdicts(vec![Ok(Verdict::Intact)]),
+            || panic!("nothing to reinstall"),
+            &fence,
+            &metrics,
+        );
+        assert_eq!(next, Watch::Intact);
+        assert_eq!(fence.take(), Vec::<&str>::new());
         assert_eq!(gauge(&metrics), Some(1.0));
     }
 
+    /// A flushed chain and a missing table each fence every vpn profile
+    /// before anything else, and the fence comes off only once the one
+    /// reinstall checks intact.
     #[test]
-    fn the_watch_reads_a_flushed_ruleset_as_absent() {
-        let metrics = torrentd_engine::RecordingSink::new();
-        record_check(&metrics, Ok("table inet filter\n".to_string()));
-        assert_eq!(gauge(&metrics), Some(0.0));
+    fn a_lost_table_fences_then_lifts_only_on_a_verified_reinstall() {
+        for (label, lost) in [("flushed", drifted()), ("missing", Ok(Verdict::Absent))] {
+            let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+            let reinstalled = std::cell::Cell::new(0);
+            let next = tick(
+                Watch::Intact,
+                verdicts(vec![lost, Ok(Verdict::Intact)]),
+                || {
+                    reinstalled.set(reinstalled.get() + 1);
+                    Ok(())
+                },
+                &fence,
+                &metrics,
+            );
+            assert_eq!(next, Watch::Intact, "{label}");
+            assert_eq!(fence.take(), ["fence", "lift"], "{label}");
+            assert_eq!(reinstalled.get(), 1, "{label}: one reinstall");
+            assert_eq!(gauge(&metrics), Some(1.0), "{label}");
+            assert!(
+                metrics.calls().iter().any(|c| matches!(
+                    c,
+                    torrentd_engine::metrics::MetricCall::SetGauge { name, value, .. }
+                        if name == "kill_switch_table_present" && *value == 0.0
+                )),
+                "{label}: the loss is read as absent first",
+            );
+        }
+    }
+
+    /// A reinstall that fails, or that does not check intact, leaves every
+    /// profile fenced. Later checks fence again — a profile set online
+    /// meanwhile is fenced once more — without a second reinstall, and the
+    /// fence comes off at the first check that finds the table intact.
+    #[test]
+    fn a_reinstall_that_does_not_verify_keeps_the_fence() {
+        for (label, after) in [
+            ("refused", Err(io::Error::other("nft -f - exited 1"))),
+            ("still drifted", Ok(())),
+        ] {
+            let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+            let after = std::cell::RefCell::new(Some(after));
+            let reinstall = || after.borrow_mut().take().expect("one reinstall per loss");
+            let check = verdicts(vec![Ok(Verdict::Absent), drifted()]);
+            let next = tick(Watch::Intact, &check, reinstall, &fence, &metrics);
+            assert_eq!(next, Watch::Lost, "{label}");
+            assert_eq!(gauge(&metrics), Some(0.0), "{label}");
+            assert_eq!(fence.take(), ["fence"], "{label}: fenced, not lifted");
+
+            let next = tick(
+                next,
+                verdicts(vec![Ok(Verdict::Absent)]),
+                reinstall,
+                &fence,
+                &metrics,
+            );
+            assert_eq!(next, Watch::Lost, "{label}");
+            assert_eq!(
+                fence.take(),
+                ["fence"],
+                "{label}: fenced again, no reinstall"
+            );
+
+            let next = tick(
+                next,
+                verdicts(vec![Ok(Verdict::Intact)]),
+                reinstall,
+                &fence,
+                &metrics,
+            );
+            assert_eq!(next, Watch::Intact, "{label}");
+            assert_eq!(fence.take(), ["lift"], "{label}: lifted once found intact");
+            assert_eq!(gauge(&metrics), Some(1.0), "{label}");
+        }
     }
 
     #[test]
-    fn a_failed_listing_is_counted_and_is_not_read_as_absent() {
-        let metrics = torrentd_engine::RecordingSink::new();
-        record_check(&metrics, Err(io::Error::other("nft: permission denied")));
-        assert_eq!(gauge(&metrics), None, "not knowing is not absent");
-        assert_eq!(metrics.count_for("kill_switch_probe_errors_total"), 1);
+    fn a_check_that_cannot_run_is_counted_and_changes_nothing() {
+        for state in [Watch::Intact, Watch::Lost] {
+            let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+            let next = tick(
+                state,
+                verdicts(vec![Err(io::Error::other("nft: permission denied"))]),
+                || panic!("nothing is reinstalled on a check that did not run"),
+                &fence,
+                &metrics,
+            );
+            assert_eq!(next, state);
+            assert_eq!(gauge(&metrics), None, "not knowing is not absent");
+            assert_eq!(fence.take(), Vec::<&str>::new());
+            assert_eq!(metrics.count_for("kill_switch_probe_errors_total"), 1);
+        }
+    }
+
+    /// `verify` against a real `nft`: intact as installed, drift once the
+    /// chain is flushed, absent once the table is deleted. Run it as
+    /// [`disable_against_real_nft`] says; run together, the two share the one
+    /// table and need `--test-threads=1`.
+    #[test]
+    #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
+    fn verify_against_real_nft() {
+        let installed = installed();
+        apply(&installed.script()).expect("install");
+        assert_eq!(verify(&installed).unwrap(), Verdict::Intact);
+        exec::run_ok(
+            "nft",
+            &["flush", "chain", "inet", TABLE, "output"],
+            None,
+            exec::CHANGE,
+        )
+        .expect("flush the chain");
+        assert!(matches!(verify(&installed).unwrap(), Verdict::Drifted(_)));
+        apply(&installed.script()).expect("reinstall");
+        assert_eq!(verify(&installed).unwrap(), Verdict::Intact);
+        disable().expect("remove");
+        assert_eq!(verify(&installed).unwrap(), Verdict::Absent);
     }
 }

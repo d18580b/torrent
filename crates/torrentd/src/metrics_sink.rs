@@ -236,7 +236,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
     // kill switch
     "kill_switch_active" Gauge Daemon Owner("always") => "1 while the daemon holds the nftables kill switch installed.";
     "kill_switch_table_present" Gauge Daemon Owner("kill switch on") =>
-        "1 if the kill switch's nftables table was present at the last check.";
+        "1 if the kill switch's nftables table was present and matched the rendered ruleset at \
+         the last check; 0 if it was missing or had drifted.";
     "kill_switch_probe_errors_total" Counter Daemon Zero =>
         "Runtime kill-switch checks that could not list the nftables tables.";
     // the previous run's shutdown

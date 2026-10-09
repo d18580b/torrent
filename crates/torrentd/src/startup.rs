@@ -508,9 +508,9 @@ pub struct DaemonHandle {
     pool: Option<Arc<crate::pool_service::PoolService>>,
     registry: Arc<AssignmentRegistry>,
     profile_registry: Arc<ProfileRegistry>,
-    /// Whether the nftables kill switch was installed and must be torn down on
-    /// graceful shutdown.
-    kill_switch_active: bool,
+    /// The nftables kill switch, where it was installed: watched while the
+    /// daemon runs, and torn down on graceful shutdown.
+    kill_switch: Option<crate::vpn::killswitch::Installed>,
     log_handle: crate::tracing_init::LogReloadHandle,
     alert_loop: torrentd_engine::AlertLoopHandle,
     /// Registry entries no startup scan loaded; see `AppState::unloaded_at_boot`.
@@ -857,7 +857,7 @@ pub async fn boot(
     // run only after it is installed, so nothing is announced or seeded in
     // that window. Installing it before the sessions would need every
     // tunnel's transport port, which is known only once its link is up.
-    let mut kill_switch_active = false;
+    let mut kill_switch = None;
     // Seed the gauge at zero so `kill_switch_active == 0` is a series that
     // exists and can be alerted on. Registered lazily on first emission, it
     // was previously only ever set to 1 — so on a daemon running without the
@@ -880,12 +880,29 @@ pub async fn boot(
                  above, or unset network_kill_switch.",
             );
         }
-        let uid = vpn::killswitch::enable(&tunnels)
+        let installed = vpn::killswitch::enable(&tunnels)
             .context("install nftables kill switch (network_kill_switch=true)")?;
-        kill_switch_active = true;
         cleanup.note_kill_switch();
+        // Read back as the watch will read it. A table this host's nft lists
+        // in a shape the check does not read as the one rendered would read
+        // as drift at the watch's first check, and fence every profile for
+        // the rest of the run; it fails the boot here instead, where it says
+        // why, and the guard above removes the table.
+        match vpn::killswitch::verify(&installed)
+            .context("verify the installed nftables kill switch (network_kill_switch=true)")?
+        {
+            vpn::killswitch::Verdict::Intact => {}
+            verdict => anyhow::bail!(
+                "the nftables kill switch was installed and does not read back as the ruleset \
+                 rendered ({verdict:?}), so its runtime check could not tell it from a flushed \
+                 one. Report this with `nft -j list table inet {}`, or unset \
+                 network_kill_switch.",
+                vpn::killswitch::TABLE,
+            ),
+        }
         metrics.set_gauge("kill_switch_active", 1.0, &[]);
-        info!(uid, tunnels = ?tunnels, "network kill switch active");
+        info!(uid = installed.uid, tunnels = ?tunnels, "network kill switch active");
+        kill_switch = Some(installed);
     }
 
     /// The two store directories a profile's sessions actually read, from the
@@ -1345,7 +1362,7 @@ pub async fn boot(
         pool,
         registry,
         profile_registry,
-        kill_switch_active,
+        kill_switch,
         log_handle,
         alert_loop,
         unloaded_at_boot,
@@ -1995,7 +2012,7 @@ impl DaemonHandle {
             pool,
             registry,
             profile_registry,
-            kill_switch_active,
+            kill_switch,
             log_handle,
             alert_loop,
             unloaded_at_boot,
@@ -2010,12 +2027,25 @@ impl DaemonHandle {
         // The kill switch was checked once, at install. Anything that flushes
         // the ruleset afterwards — an `nft flush ruleset` from a firewall
         // reload, another service replacing the tables — removed the backstop
-        // with nothing noticing.
-        if kill_switch_active {
+        // with nothing noticing. The watch compares it with what was rendered,
+        // and fences every vpn profile while it is not in force.
+        let kill_switch_active = kill_switch.is_some();
+        if let Some(installed) = kill_switch {
+            let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+                profile_registry.clone(),
+                state.clone(),
+                metrics.clone(),
+                crate::vpn_monitor::host_prober(),
+            ));
             spawn_supervised(
                 "kill_switch_watch",
                 metrics.clone(),
-                crate::vpn::killswitch::watch(metrics.clone(), shutdown_tx.subscribe()),
+                crate::vpn::killswitch::watch(
+                    installed,
+                    fence,
+                    metrics.clone(),
+                    shutdown_tx.subscribe(),
+                ),
             );
         }
 
