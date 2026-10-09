@@ -402,6 +402,129 @@ fn fence(
     paused
 }
 
+/// The kill-switch watch's fence ([`vpn::killswitch::watch`]): while the
+/// nftables backstop is not in force as installed, every vpn profile is fenced
+/// exactly as this monitor fences one whose tunnel is down — marked `vpn_down`,
+/// every torrent paused, adds held — since each is then seeding with nothing
+/// but the source bind between it and the bare interface.
+///
+/// The watch lifts it only once the ruleset checks intact again. Lifting
+/// undoes only this fence: a profile the monitor had fenced already is not
+/// touched, a profile set online by the operator meanwhile is left as it is,
+/// and one whose tunnel no longer passes [`recovery_check`] stays fenced for
+/// the operator, as any fence on a failing tunnel does. Only the torrents that
+/// were not paused when it fenced are resumed, so a torrent the operator had
+/// paused stays paused.
+pub(crate) struct KillSwitchFence {
+    profiles: Arc<ProfileRegistry>,
+    state: Arc<StateMap>,
+    metrics: Arc<PromSink>,
+    probe: Prober,
+    /// The profiles this fence marked `vpn_down`, each with the torrents it
+    /// found running and paused.
+    fenced: parking_lot::Mutex<std::collections::HashMap<ProfileId, Vec<TorrentHandle>>>,
+}
+
+impl KillSwitchFence {
+    pub(crate) fn new(
+        profiles: Arc<ProfileRegistry>,
+        state: Arc<StateMap>,
+        metrics: Arc<PromSink>,
+        probe: Prober,
+    ) -> Self {
+        Self {
+            profiles,
+            state,
+            metrics,
+            probe,
+            fenced: Default::default(),
+        }
+    }
+}
+
+impl vpn::killswitch::Fence for KillSwitchFence {
+    fn fence_all(&self) {
+        let mut fenced = self.fenced.lock();
+        for e in self
+            .profiles
+            .iter()
+            .filter(|e| e.config.vpn_interface().is_some())
+        {
+            let health = e.health();
+            if health.status == ProfileStatus::VpnDown {
+                continue;
+            }
+            let running: Vec<TorrentHandle> = self
+                .state
+                .handles_for_profile(e.id())
+                .into_iter()
+                .filter(|h| {
+                    self.state
+                        .get(&h.infohash)
+                        .is_some_and(|s| s.phase != TorrentPhase::Paused)
+                })
+                .collect();
+            let paused = fence(e, &self.state, health.tunnel_ip, self.metrics.as_ref());
+            fenced.entry(e.id().clone()).or_default().extend(running);
+            error!(
+                target: "torrentd::vpn_monitor",
+                profile_id = %e.id(),
+                torrent_count = paused,
+                "network kill switch not in force; paused all profile torrents until it is",
+            );
+        }
+    }
+
+    fn lift(&self) {
+        let fenced = std::mem::take(&mut *self.fenced.lock());
+        for (profile_id, handles) in fenced {
+            let resolved = self.profiles.resolve(&profile_id);
+            let Some(entry) = resolved
+                .active()
+                .filter(|e| e.health().status == ProfileStatus::VpnDown)
+            else {
+                continue;
+            };
+            if let Err(reason) = recovery_check(entry, &self.probe) {
+                warn!(
+                    target: "torrentd::vpn_monitor",
+                    profile_id = %profile_id,
+                    reason = reason.as_str(),
+                    "network kill switch back in force, but this profile's tunnel fails the \
+                     health check; it stays fenced until it is set online",
+                );
+                continue;
+            }
+            let labels = [("profile_id", profile_id.as_str())];
+            entry.update_health(|h| {
+                h.status = ProfileStatus::Active;
+                h.paused_for_vpn = 0;
+                self.metrics
+                    .set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
+            });
+            let mut resumed = 0u64;
+            for h in handles {
+                match entry.engine.resume_torrent(h) {
+                    Ok(()) => resumed += 1,
+                    Err(err) => error!(
+                        target: "torrentd::vpn_monitor",
+                        profile_id = %profile_id,
+                        infohash = %h.infohash,
+                        error.cause = %err,
+                        "could not resume a torrent while lifting the kill-switch fence",
+                    ),
+                }
+            }
+            info!(
+                target: "torrentd::vpn_monitor",
+                profile_id = %profile_id,
+                torrent_count = resumed,
+                "network kill switch back in force; lifted the profile's fence",
+            );
+        }
+    }
+}
+
 /// Pause `handle`, which the caller has just added to `profile_id`'s session,
 /// if the VPN monitor fenced the profile since the caller last checked.
 ///
@@ -1396,6 +1519,115 @@ mod tests {
         let health = entry.health();
         assert_eq!(health.paused_for_vpn, 1);
         assert_eq!(health.tunnel_ip, ip(9));
+    }
+
+    fn resumes(engine: &torrentd_engine::MockEngine) -> Vec<TorrentHandle> {
+        engine
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                torrentd_engine::RecordedCall::ResumeTorrent(h) => Some(h),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn handle(id: u64) -> TorrentHandle {
+        TorrentHandle {
+            id,
+            infohash: torrentd_engine::InfoHash([id as u8; 20]),
+        }
+    }
+
+    /// The kill-switch watch's fence over one vpn profile, `acct_a`, holding
+    /// a seeding torrent and one the operator paused, with its tunnel healthy
+    /// or not.
+    fn kill_switch_fence(
+        status: ProfileStatus,
+        tunnel_healthy: bool,
+    ) -> (KillSwitchFence, Arc<torrentd_engine::MockEngine>) {
+        let (entry, engine) = mock_entry(status);
+        let state = StateMap::new();
+        loaded(&state, 1, "acct_a", TorrentPhase::Seeding);
+        loaded(&state, 2, "acct_a", TorrentPhase::Paused);
+        let route = if tunnel_healthy {
+            RouteProbe::ViaTunnel
+        } else {
+            RouteProbe::Elsewhere("eth0".into())
+        };
+        let fence = KillSwitchFence::new(
+            Arc::new(ProfileRegistry::new(vec![entry])),
+            Arc::new(state),
+            Arc::new(PromSink::new()),
+            answering(ip(2), Some(route), None),
+        );
+        (fence, engine)
+    }
+
+    fn status_of(fence: &KillSwitchFence) -> ProfileStatus {
+        fence.profiles.iter().next().unwrap().health().status
+    }
+
+    /// The kill switch's fence is the monitor's: the profile is marked
+    /// `vpn_down` and every torrent in it paused. Lifted once the ruleset is
+    /// verified, it resumes only the torrent it found running.
+    #[test]
+    fn the_kill_switch_fence_pauses_every_torrent_and_lifts_what_it_paused() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence(ProfileStatus::Active, true);
+        fence.fence_all();
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
+        let mut paused: Vec<u64> = pauses(&engine).iter().map(|h| h.id).collect();
+        paused.sort_unstable();
+        assert_eq!(
+            paused,
+            [1, 2],
+            "every torrent, as the monitor's fence pauses"
+        );
+        assert!(
+            resumes(&engine).is_empty(),
+            "nothing resumes until it is lifted"
+        );
+
+        fence.lift();
+        assert_eq!(status_of(&fence), ProfileStatus::Active);
+        assert_eq!(
+            resumes(&engine),
+            [handle(1)],
+            "the torrent the operator had paused stays paused",
+        );
+    }
+
+    /// A profile fenced again while it is still fenced is not fenced twice,
+    /// and a profile the monitor had fenced already is not the kill switch's
+    /// to lift.
+    #[test]
+    fn the_kill_switch_fence_leaves_a_profile_the_monitor_fenced() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence(ProfileStatus::VpnDown, true);
+        fence.fence_all();
+        fence.lift();
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
+        assert!(pauses(&engine).is_empty() && resumes(&engine).is_empty());
+
+        let (fence, engine) = kill_switch_fence(ProfileStatus::Active, true);
+        fence.fence_all();
+        fence.fence_all();
+        assert_eq!(pauses(&engine).len(), 2, "fenced once");
+        fence.lift();
+        assert_eq!(resumes(&engine), [handle(1)], "and lifted once");
+    }
+
+    /// Back in force, the kill switch lifts its fence only from a profile
+    /// whose tunnel passes the same check the operator's lift asks for.
+    #[test]
+    fn the_kill_switch_fence_stays_on_a_profile_whose_tunnel_fails() {
+        use vpn::killswitch::Fence;
+        let (fence, engine) = kill_switch_fence(ProfileStatus::Active, false);
+        fence.fence_all();
+        fence.lift();
+        assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
+        assert!(resumes(&engine).is_empty());
     }
 
     /// An add re-checks the fence after `add_torrent` and pauses what it just

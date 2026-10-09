@@ -2438,7 +2438,7 @@ Endpoint = 203.0.113.7:51820 # the exit
         );
 
         let installed = killswitch::enable(&[iface.to_string()]).expect("enable");
-        assert_eq!(installed, uid);
+        assert_eq!(installed.uid, uid);
         let before = delivered();
         send_into_tunnel();
         assert!(
