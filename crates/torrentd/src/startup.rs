@@ -1149,7 +1149,9 @@ pub async fn boot(
             // The account-isolation guard, before the claim: a `.torrent`
             // dropped into this profile's directory is held to its
             // allow-list like one posted to the API.
-            let params = torrent_dir_scan_params(profile_cfg, bytes, scan_save_path.clone());
+            let save_path =
+                torrent_dir_save_path(&*metrics, &*torrent_store, &profile, &ih, &scan_save_path);
+            let params = torrent_dir_scan_params(profile_cfg, bytes, save_path);
             if let Err(refusal) =
                 boot_scan_guard(&*metrics, profile_cfg, &ih, &params, "torrent_dir")
             {
@@ -1576,6 +1578,42 @@ fn boot_scan_guard(
         );
     }
     Err(refusal)
+}
+
+/// Where the boot torrent-dir scan re-adds a `.torrent` no resume data
+/// covered: the save path recorded beside it when it was added, or `default`
+/// when there is none to use.
+///
+/// The fallback is reported, never silent: the payload of a torrent added
+/// elsewhere is not at `default`, and since downloading is forbidden the
+/// torrent sits there with no data. A `.torrent` from before save paths were
+/// recorded, or one dropped into the directory by hand, has none.
+fn torrent_dir_save_path(
+    metrics: &dyn MetricsSink,
+    store: &dyn TorrentStore,
+    profile: &ProfileId,
+    ih: &libtorrent_safe::InfoHash,
+    default: &str,
+) -> String {
+    let problem = match store.read_save_path(profile, ih) {
+        Ok(Some(p)) if std::path::Path::new(&p).is_absolute() => return p,
+        Ok(Some(p)) => format!("the recorded save path {p:?} is not absolute"),
+        Ok(None) => "no save path was recorded beside its .torrent".to_owned(),
+        Err(e) => format!("its recorded save path could not be read: {e}"),
+    };
+    warn!(
+        profile_id = %profile,
+        infohash = %ih,
+        default_save_path = %default,
+        problem = %problem,
+        "torrent-dir scan: re-adding a torrent with no resume file at default_save_path; \
+         if its payload is elsewhere it will find no data there",
+    );
+    metrics.inc_counter(
+        "boot_save_path_fallbacks_total",
+        &[("profile_id", profile.as_str())],
+    );
+    default.to_owned()
 }
 
 /// What the boot torrent-dir scan hands a session for a `.torrent` no resume
@@ -2939,6 +2977,48 @@ mod shutdown_report_tests {
                 ("profile_id".to_string(), "p".to_string()),
                 ("source".to_string(), "metadata".to_string()),
             ]],
+        );
+    }
+
+    /// The torrent-dir scan re-adds a `.torrent` whose resume file is gone at
+    /// the save path recorded beside it, and falls back to
+    /// `default_save_path` only when there is no usable one, warning and
+    /// counting each time.
+    #[test]
+    fn the_torrent_dir_scan_uses_the_recorded_save_path_and_reports_a_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = ProfileId::new("p");
+        let store = FsTorrentStore::new(dir.path().join("torrents"));
+        let sink = torrentd_engine::RecordingSink::new();
+
+        // Recorded at add: used, and nothing is reported.
+        let recorded = libtorrent_safe::InfoHash([0x31; 20]);
+        store
+            .write_save_path(&p, &recorded, "/data/torrents/movies/X")
+            .unwrap();
+        assert_eq!(
+            torrent_dir_save_path(&sink, &store, &p, &recorded, "/data/torrents"),
+            "/data/torrents/movies/X",
+        );
+        assert!(counted(&sink, "boot_save_path_fallbacks_total").is_empty());
+
+        // Missing, relative, or unreadable: default_save_path, each counted.
+        let missing = libtorrent_safe::InfoHash([0x32; 20]);
+        let relative = libtorrent_safe::InfoHash([0x33; 20]);
+        store.write_save_path(&p, &relative, "movies/X").unwrap();
+        let garbled = libtorrent_safe::InfoHash([0x34; 20]);
+        store.write_save_path(&p, &garbled, "").unwrap();
+        std::fs::write(store.save_path_path_for(&p, &garbled), [0xff, 0xfe]).unwrap();
+        for ih in [missing, relative, garbled] {
+            assert_eq!(
+                torrent_dir_save_path(&sink, &store, &p, &ih, "/data/torrents"),
+                "/data/torrents",
+                "{ih}",
+            );
+        }
+        assert_eq!(
+            counted(&sink, "boot_save_path_fallbacks_total"),
+            vec![vec![("profile_id".to_string(), p.as_str().to_string())]; 3],
         );
     }
 
