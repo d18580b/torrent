@@ -1462,9 +1462,11 @@ On a scratch pool, not your real one.
    drop is for. The ruleset therefore accepts each tunnel's listen port as a
    UDP *source* port for the daemon's uid, read with `wg show <iface>
    listen-port` when the switch is installed; the table shows it as
-   `meta skuid <uid> udp sport { <port>, … } accept`. Nothing else the daemon
-   opens can hold that port, because the WireGuard socket binds it on every
-   address first. A tunnel whose listen port cannot be read fails the
+   `meta skuid <uid> udp sport { <port>, … } accept`. While the link is up,
+   nothing else the daemon opens can hold that port, because the WireGuard
+   socket binds it on every address first; once the link is gone the port is
+   free, and the exemption, installed once at boot, is not (drill 8). A
+   tunnel whose listen port cannot be read fails the
    install, and the daemon does not start. (Handshakes carry no socket and
    pass either way, so a tunnel without the exemption handshakes and then
    carries nothing — a `latest-handshake` alone does not show it working.)
@@ -1612,12 +1614,98 @@ On a scratch pool, not your real one.
    This drill has not yet been run against a live Proton gateway from this
    repository: the renewal, rebind and reannounce are tested against a fake
    NAT-PMP gateway and a mock session. Record the result here when it has.
+   A fence that lands during a renewal is drill 8's `natpmp-fence.sh`.
 
    The ruleset also confines the daemon's **replies**: a request to
    `http_listen` that arrives on a physical interface — an API call, a Prometheus scrape of `/metrics` — connects and then hangs, because
    the response leaves from a socket the daemon's uid owns. Over loopback, or
    through a tunnel, it works. With the kill switch on, reach the API through
    a reverse proxy on the same host (§6a) or scrape from inside the tunnel.
+8. **The kill switch's edges, and a fence during a renewal.** Four scripted
+   drills, each in a private user, network and mount namespace that it
+   creates and that disappears when it exits. None needs root, and none
+   changes the host. Each needs `ip`, `nft`, `wg`, `unshare`, `nsenter` and
+   `python3`, and a kernel that allows unprivileged user namespaces.
+   `deploy/drill/netns.sh` builds the topology they share: a physical link
+   to a peer namespace, with IPv4 and global IPv6 and the default routes, and
+   a WireGuard tunnel routed the way the daemon routes the links it raises.
+   Inside the namespace the drill is uid 0, so the kill switch it installs,
+   the ruleset `killswitch::render_ruleset_with_transport` renders, matches
+   every socket there. Each drill exits 0 when it finds no gap, 1 when it
+   finds one, and prints a line per check: `gap` fails the drill, while `ok`
+   and `info` do not.
+
+   ```bash
+   deploy/drill/udp-transport.sh
+   deploy/drill/listener-replies.sh
+   deploy/drill/ipv6-egress.sh
+   cargo build -p torrentd && deploy/drill/natpmp-fence.sh target/debug/torrentd
+   ```
+
+   `natpmp-fence.sh` runs the real daemon, which raises the tunnel itself
+   from a config under `/etc/wireguard`. The drill mounts a private tmpfs
+   over that directory, so the directory has to exist. Its NAT-PMP gateway
+   moves every renewal to a new port and answers only at the client's last
+   retransmit, so a renewal spends most of its time on the wire. The drill
+   fences the profile as `route-fence.sh` does and waits for the next poll.
+   It judges only a fence that lands inside a renewal: after a miss it
+   restores the rule, sets the profile online, and tries again (`ATTEMPTS`,
+   default 4), and it exits 3 if no attempt lands.
+
+   Results, run on Linux 7.2 against this branch's head
+   (`udp-transport` and `listener-replies` still exit 1, on the gaps #136
+   tracks):
+
+   - **The transport exemption holds while the link is up.** A UDP socket
+     of the daemon's uid cannot bind the tunnel's listen port: on the
+     wildcard address, the tunnel address or the physical address, IPv4 or
+     IPv6, with `SO_REUSEADDR` or `SO_REUSEPORT`, every bind fails with
+     `EADDRINUSE`. The tunnel carries the uid's traffic under the ruleset.
+   - **Gap: it does not hold once the link is gone.** The ruleset is
+     installed once, at boot. With the link taken down (`wg-quick down` on
+     an adopted link), a socket bound to the freed port, or an unbound one
+     the kernel hands it as an ephemeral port (a resolver query, say),
+     leaves by the physical interface, unencrypted. A link re-raised
+     without a `ListenPort` gets a new port, and the ruleset drops its
+     encrypted traffic. Handshakes still complete, so the tunnel carries
+     nothing while every health check passes. Both last until the daemon
+     restarts.
+   - **The daemon's listeners do not answer on the physical link.** A SYN to
+     a wildcard listener (an `http_listen` off loopback) at the host's
+     physical address gets no SYN-ACK. With the tunnel routed, every reply
+     to a probe of the tunnel address across the physical link goes into
+     the tunnel, from a listener or from the kernel. That includes a
+     listener's SYN-ACK, a reset for a closed port, and an ICMP
+     port-unreachable.
+   - **The kernel answers probes of the host's own address**, with a reset
+     for a closed TCP port and an ICMP port-unreachable for a closed UDP
+     one, from the physical address. No `meta skuid` rule matches them: the
+     kernel builds them with no socket of the daemon's attached. They name
+     only the host, which the prober already addressed. Recorded, not a gap.
+   - **Gap: with the tunnel's source rule lost, the kernel's replies carry
+     the tunnel address out of the physical interface.** This is the state
+     `route-fence.sh` makes, before the next poll fences the profile. The
+     listener's SYN-ACK is still dropped. The reset and the
+     port-unreachable leave by the physical link from the tunnel address,
+     which ties that address to the host.
+   - **IPv6 does not leave.** With a global IPv6 address and default route
+     on the physical link, and a tunnel with only an IPv4 address, nothing
+     the uid sends over IPv6 reaches the link: a datagram, unbound or bound
+     to the global address (`EPERM`), a TCP connect (it times out), or a
+     datagram to the peer's link-local address (`EPERM`). With no ruleset,
+     each reached the peer. A WireGuard link has no IPv6 link-local address
+     to send into the tunnel from.
+   - **A fence during a renewal stops the rebind and the reannounce.**
+     Against the daemon on this branch the fence landed inside a renewal on
+     the wire, and the renewal logged `NAT-PMP renewed with a new port after
+     the profile was fenced; not rebinding the session or reannouncing` and
+     rebound nothing (exit 0). Against `master` at `ee25dbf`, which read the
+     profile's status only before the exchange, the same drill saw the
+     renewal rebind the fenced profile and reannounce its torrents (exit 1).
+     The status is now checked once the gateway has answered, before the
+     session is touched, and again before each reannounce batch. A fence
+     that lands while the batches are going out stops the batches still
+     to come.
 
 ## 12. Capturing a log
 
