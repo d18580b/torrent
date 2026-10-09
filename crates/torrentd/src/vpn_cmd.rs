@@ -223,7 +223,8 @@ pub trait CheckHost {
     /// is still somebody else's outage.
     fn interface_exists(&self, iface: &str) -> bool;
 
-    /// The address the daemon would bind every socket in this profile to.
+    /// The address the daemon would bind every socket in this profile to,
+    /// and the one `killswitch::enable` pairs the profile's interface with.
     fn first_ipv4(&self, iface: &str) -> std::io::Result<Ipv4Addr>;
 
     /// The tunnel manager for a profile's VPN type.
@@ -759,10 +760,10 @@ fn host_checks(
                     .collect();
                 // The script boot hands to `nft -f` — `killswitch::install_script`,
                 // the same renderer `killswitch::enable` calls — over the
-                // listen ports that can be read now. Boot reads each one off
-                // the live link and refuses to install without it; a link
-                // that is not up yet has no port to read, so its exemption is
-                // named as missing rather than guessed at.
+                // tunnel addresses and listen ports that can be read now.
+                // Boot reads each one off the live link and refuses to
+                // install without it; a link that is not up yet has neither
+                // to read, so what is missing is named rather than guessed at.
                 let (ruleset, unread) = boot_install_script(uid, &tunnels, host);
                 // A name the renderer refuses is the same boot abort as a
                 // ruleset `nft` rejects, reported before any `nft` runs.
@@ -775,7 +776,7 @@ fn host_checks(
                     ),
                     Err(e) => Check::fail("kill_switch_ruleset", e.to_string()),
                 };
-                note_unread_ports(verdict, &unread)
+                note_unread(verdict, &unread)
             }
         });
     } else {
@@ -785,47 +786,81 @@ fn host_checks(
     out
 }
 
-/// The kill-switch script boot would install for `uid` over `tunnels`, with
-/// the transport exemption for every tunnel whose listen port `host` can read,
-/// and the tunnels whose port it could not.
+/// What [`boot_install_script`] could not read off the live links.
+#[derive(Debug, Default)]
+struct Unread {
+    /// Tunnels with no address to pair their interface with, which the
+    /// dry-run therefore carries no accept for.
+    addresses: Vec<String>,
+    /// Tunnels with no listen port, whose transport the dry-run therefore
+    /// does not exempt.
+    ports: Vec<String>,
+}
+
+/// The kill-switch script boot would install for `uid` over `tunnels`: each
+/// tunnel whose address `host` can read accepted from that address on its
+/// own interface, the transport exemption for every tunnel whose listen port
+/// `host` can read, and the tunnels it could read neither for.
 ///
 /// Rendered by [`vpn::killswitch::install_script`], which is what
-/// `killswitch::enable` renders with: for the same uid, tunnels and ports the
-/// two are the same bytes. They used to differ — this command dry-ran the bare
-/// table with no transport exemption and no replace, which is not the script
-/// boot installs.
+/// `killswitch::enable` renders with: for the same uid, tunnels, addresses
+/// and ports the two are the same bytes. They used to differ — this command
+/// dry-ran the bare table with no transport exemption and no replace, which
+/// is not the script boot installs.
+///
+/// Every interface name is checked as the renderer would check it, including
+/// a tunnel left out for want of an address: a name `nft` cannot parse fails
+/// boot whether or not its link is up.
 fn boot_install_script(
     uid: u32,
     tunnels: &[String],
     host: &dyn CheckHost,
-) -> (std::io::Result<String>, Vec<String>) {
+) -> (std::io::Result<String>, Unread) {
+    let mut unread = Unread::default();
+    if let Err(e) = vpn::killswitch::check_interface_names(tunnels.iter().map(String::as_str)) {
+        return (Err(e), unread);
+    }
+    let mut paired = Vec::new();
     let mut ports = Vec::new();
-    let mut unread = Vec::new();
     for iface in tunnels {
+        match host.first_ipv4(iface) {
+            Ok(addr) => paired.push(vpn::killswitch::Tunnel::new(iface.as_str(), addr)),
+            Err(_) => unread.addresses.push(iface.clone()),
+        }
         match host.listen_port(iface) {
             Ok(p) => ports.push(p),
-            Err(_) => unread.push(iface.clone()),
+            Err(_) => unread.ports.push(iface.clone()),
         }
     }
     (
-        vpn::killswitch::install_script(uid, tunnels, &ports),
+        vpn::killswitch::install_script(uid, &paired, &ports),
         unread,
     )
 }
 
-/// Say which transport exemptions the dry-run could not include.
+/// Say which tunnel addresses and transport exemptions the dry-run could not
+/// include.
 ///
 /// Not a verdict of its own: the ruleset's syntax and its acceptance by this
-/// kernel do not depend on a port number, so the dry-run still establishes
-/// what it establishes. What boot would do differently is stated: it reads
-/// the port off the live link and refuses the install if it cannot.
-fn note_unread_ports(mut verdict: Check, unread: &[String]) -> Check {
-    if !unread.is_empty() {
+/// kernel do not depend on an address or a port number, so the dry-run still
+/// establishes what it establishes. What boot would do differently is
+/// stated: it reads both off the live link and refuses the install if it
+/// cannot.
+fn note_unread(mut verdict: Check, unread: &Unread) -> Check {
+    if !unread.addresses.is_empty() {
+        verdict.detail.push_str(&format!(
+            "\nno tunnel address could be read for {} (not up?), so this dry-run accepts \
+             nothing on it; boot pairs each tunnel's interface with the address read off \
+             the live link and refuses to install the kill switch without it",
+            unread.addresses.join(", "),
+        ));
+    }
+    if !unread.ports.is_empty() {
         verdict.detail.push_str(&format!(
             "\nno listen port could be read for {} (not up?), so this dry-run carries no \
              transport exemption for it; boot reads each one off the live link and refuses \
              to install the kill switch without it",
-            unread.join(", "),
+            unread.ports.join(", "),
         ));
     }
     verdict
@@ -2340,7 +2375,9 @@ torrent_dir          = "/tmp/torrentd-test/torrents/acct_b"
         let cfg = cfg_with_two_profiles();
         let rejected = "/dev/stdin:5:39-39: Error: syntax error, unexpected string";
 
-        let host = FakeHost::new().with_nft([(0, "")]);
+        let host = FakeHost::new()
+            .with_nft([(0, "")])
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
         host_checks(&cfg, Some(2000), Some("acct_a"), &host);
         let nft_calls: Vec<String> = host
             .events()
@@ -2886,7 +2923,9 @@ user_agent           = "Transmission/4.0.5"
 
         // Only an excluded profile's name is refused: it is not in the scoped
         // ruleset at all.
-        let host = FakeHost::new().with_nft([(0, "")]);
+        let host = FakeHost::new()
+            .with_nft([(0, "")])
+            .with_addrs([("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2)))]);
         let checks = host_checks(&cfg, Some(2000), Some("acct_a"), &host);
         let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
         assert_ne!(c.verdict, Verdict::Fail, "detail: {}", c.detail);
@@ -3479,11 +3518,15 @@ user_agent           = "Transmission/4.0.5"
     }
 
     /// The script `vpn check` dry-runs is byte-for-byte the one
-    /// `killswitch::enable` installs for the same uid, tunnels and ports.
+    /// `killswitch::enable` installs for the same uid, tunnels, addresses and
+    /// ports — each profile's address paired with its own interface.
     #[test]
     fn the_kill_switch_ruleset_renders_identically_in_vpn_check_and_at_boot() {
         let cfg = cfg_with_two_profiles();
+        let addr_a = Ipv4Addr::new(10, 2, 0, 2);
+        let addr_b = Ipv4Addr::new(10, 64, 0, 7);
         let host = FakeHost::new()
+            .with_addrs([("wg-acct-a", Some(addr_a)), ("wg-acct-b", Some(addr_b))])
             .with_listen_port("wg-acct-a", 51820)
             .with_listen_port("wg-acct-b", 40001);
         host_checks(&cfg, Some(998), None, &host);
@@ -3505,6 +3548,12 @@ user_agent           = "Transmission/4.0.5"
             &tunnels,
             |iface| {
                 Ok(match iface {
+                    "wg-acct-a" => addr_a,
+                    _ => addr_b,
+                })
+            },
+            |iface| {
+                Ok(match iface {
                     "wg-acct-a" => 51820,
                     _ => 40001,
                 })
@@ -3516,6 +3565,46 @@ user_agent           = "Transmission/4.0.5"
         )
         .expect("the boot path installs");
         assert_eq!(dry_run[0], *installed.borrow());
+        assert!(
+            dry_run[0].contains("ip saddr 10.2.0.2 oifname \"wg-acct-a\" accept")
+                && dry_run[0].contains("ip saddr 10.64.0.7 oifname \"wg-acct-b\" accept"),
+            "each profile is accepted on its own tunnel alone: {}",
+            dry_run[0],
+        );
+    }
+
+    /// A link with no address to read is left out of the dry-run, and the
+    /// check says so rather than accepting its interface for every address.
+    #[test]
+    fn a_tunnel_with_no_address_is_named_and_left_out_of_the_dry_run() {
+        let cfg = cfg_with_two_profiles();
+        let host = FakeHost::new()
+            .with_nft([(0, "")])
+            .with_addrs([
+                ("wg-acct-a", Some(Ipv4Addr::new(10, 2, 0, 2))),
+                ("wg-acct-b", None),
+            ])
+            .with_listen_port("wg-acct-a", 51820)
+            .with_listen_port("wg-acct-b", 40001);
+        let checks = host_checks(&cfg, Some(998), None, &host);
+        let dry_run: Vec<String> = host
+            .events()
+            .into_iter()
+            .filter_map(|e| e.strip_prefix("nft_check ").map(str::to_string))
+            .collect();
+        assert_eq!(dry_run.len(), 1, "{dry_run:?}");
+        assert!(
+            dry_run[0].contains("oifname \"wg-acct-a\"") && !dry_run[0].contains("wg-acct-b"),
+            "{}",
+            dry_run[0]
+        );
+        let c = find(&checks, "kill_switch_ruleset").expect("the ruleset check is reported");
+        assert!(
+            c.detail
+                .contains("no tunnel address could be read for wg-acct-b"),
+            "detail: {}",
+            c.detail
+        );
     }
 
     /// The route the monitor probes is reported, and a route that leaves by
