@@ -153,13 +153,35 @@ impl PoolService {
     /// and on a private profile it never seeds again. A failed write is
     /// logged and counted where the API add path counts its own, under
     /// `source="api"`: adoption is a request on the same API.
-    fn persist_torrent(&self, profile: &ProfileId, infohash: &str, bytes: &[u8]) {
+    ///
+    /// `save_path`, the library path the session was handed, is recorded
+    /// beside the `.torrent` first, as the API add records its own: the
+    /// torrent-dir scan re-adds a torrent whose resume file is lost there,
+    /// and without it at `default_save_path`, away from its payload. Written
+    /// before the `.torrent`, the scan never finds the one without the other.
+    /// A failed write is counted as the `.torrent` write's is.
+    fn persist_torrent(&self, profile: &ProfileId, infohash: &str, bytes: &[u8], save_path: &str) {
         let Some(store) = self.torrents.get() else {
             return;
         };
         let Some(ih) = libtorrent_safe::InfoHash::from_hex(infohash) else {
             return;
         };
+        if let Err(e) = off_worker(|| store.write_save_path(profile, &ih, save_path)) {
+            warn!(
+                target: "torrentd::pool",
+                profile_id = %profile,
+                infohash = %infohash,
+                save_path = %save_path,
+                error.cause = %e,
+                "failed to record an adopted torrent's save path; if its resume file is \
+                 lost, a restart re-adds it at default_save_path",
+            );
+            self.count(
+                "torrent_file_persist_errors_total",
+                &[("profile_id", profile.as_str()), ("source", "api")],
+            );
+        }
         if let Err(e) = off_worker(|| store.write(profile, &ih, bytes)) {
             warn!(
                 target: "torrentd::pool",
@@ -701,8 +723,14 @@ pub async fn run_verify_queue(
                         metrics.as_ref(),
                     );
                     // The bytes the session was given, so a restart re-adds
-                    // the torrent with its metadata.
-                    pool.persist_torrent(&item.profile, &item.infohash, &bytes);
+                    // the torrent with its metadata, at the path it was
+                    // given.
+                    pool.persist_torrent(
+                        &item.profile,
+                        &item.infohash,
+                        &bytes,
+                        &item.save_path.to_string_lossy(),
+                    );
                     q.in_flight.lock().push(item.infohash.clone());
                     info!(
                         target: "torrentd::pool",
@@ -1210,7 +1238,12 @@ pub fn execute_adopt(
                     // Unreadable, there is nothing to keep; the resume scan
                     // looks in the library for it instead.
                     if let Some(bytes) = &torrent {
-                        pool.persist_torrent(&profile, infohash, bytes);
+                        pool.persist_torrent(
+                            &profile,
+                            infohash,
+                            bytes,
+                            &save_path.to_string_lossy(),
+                        );
                     }
                 }
                 Err(e) => {
@@ -1840,6 +1873,30 @@ mod tests {
             store.read(&ProfileId::new("p"), &hash).unwrap().as_deref(),
             Some(bare.as_slice()),
         );
+        // Beside it, the library path the session was handed, which the
+        // torrent-dir scan re-adds it at if its resume file is lost.
+        let handed = engine
+            .calls()
+            .into_iter()
+            .find_map(|c| match c {
+                torrentd_engine::RecordedCall::AddTorrent(
+                    torrentd_engine::mock::AddParamsSummary::Resume { save_path, .. },
+                ) => save_path,
+                _ => None,
+            })
+            .expect("the fast path adds from resume data at a save path");
+        assert_eq!(
+            handed,
+            dir.path().join("pool").to_string_lossy(),
+            "the adopt hands the session the library root's path",
+        );
+        assert_eq!(
+            store
+                .read_save_path(&ProfileId::new("p"), &hash)
+                .unwrap()
+                .as_deref(),
+            Some(handed.as_str()),
+        );
 
         assert_eq!(
             pool.library_torrent(&hash).as_deref(),
@@ -1853,6 +1910,33 @@ mod tests {
         std::fs::write(dir.path().join("library/t.torrent"), other).unwrap();
         assert_eq!(pool.library_torrent(&hash), None);
         assert_eq!(pool.library_torrent(&InfoHash([0x77; 20])), None);
+    }
+
+    /// Persisting an adopted torrent writes its save path, then its
+    /// `.torrent`; a store that refuses both counts each failure.
+    #[test]
+    fn persisting_an_adopted_torrent_counts_each_failed_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let p = ProfileId::new("p");
+        let hash = InfoHash([0x5b; 20]);
+
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let metrics = std::sync::Arc::new(crate::metrics_sink::PromSink::new());
+        pool.set_metrics(metrics.clone());
+        // A torrent store whose base is a regular file: every write fails.
+        std::fs::write(dir.path().join("blocker"), b"not a directory").unwrap();
+        pool.set_torrent_store(std::sync::Arc::new(torrentd_engine::FsTorrentStore::new(
+            dir.path().join("blocker"),
+        )));
+        pool.persist_torrent(&p, &hash.to_hex(), b"d4:infode", "/pool/lib");
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(
+            text.contains(
+                "torrentd_torrent_file_persist_errors_total{profile_id=\"p\",source=\"api\"} 2"
+            ),
+            "{text}"
+        );
     }
 
     /// A relocation rewrites the save path recorded beside the `.torrent`,
