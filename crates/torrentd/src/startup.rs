@@ -107,8 +107,11 @@ const POOL_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
 /// the same state refuses before it can replace the running daemon's kill
 /// switch or tear down its tunnels. The kernel releases it however the
 /// process ends, so a crash leaves no stale lock.
+///
+/// `torrentd net-cleanup` takes it too, so it refuses to tear down a running
+/// daemon's tunnels and kill switch.
 #[derive(Debug)]
-struct InstanceLock {
+pub(crate) struct InstanceLock {
     /// Never read. Holding the open file is the lock.
     _file: std::fs::File,
 }
@@ -116,7 +119,7 @@ struct InstanceLock {
 impl InstanceLock {
     /// Lock `path`, creating it and its directory where missing, or refuse
     /// naming the process that holds it.
-    fn acquire(path: &std::path::Path) -> anyhow::Result<Self> {
+    pub(crate) fn acquire(path: &std::path::Path) -> anyhow::Result<Self> {
         use std::io::Read;
         use std::io::Seek;
         use std::io::Write;
@@ -569,6 +572,47 @@ pub async fn boot(
         tokio::task::spawn_blocking(move || crate::vpn::sweep_raised_records(&sweep_dir))
             .await
             .context("raised-interface record sweep")?;
+    }
+
+    // A WireGuard link an earlier run raised for a profile this config no
+    // longer declares: nothing would adopt it or ever take it down, and its
+    // per-source rules stay in the routing policy with it. A configured
+    // profile's link is left to adoption and bring-up, as before.
+    {
+        let state_dir = run_dir.clone();
+        let configured: HashSet<String> = cfg
+            .profile
+            .iter()
+            .filter_map(|p| p.vpn_interface().map(str::to_string))
+            .collect();
+        let released = tokio::task::spawn_blocking(move || {
+            crate::vpn::release_recorded_wireguard(&state_dir, |iface| configured.contains(iface))
+        })
+        .await
+        .context("unconfigured WireGuard link teardown")?;
+        if let Err(e) = released {
+            error!(
+                path = %run_dir.display(),
+                error.cause = %e,
+                "could not read the state directory for WireGuard links raised by an earlier \
+                 run; a link no configured profile names is left standing",
+            );
+        }
+    }
+
+    // A kill-switch table an unclean exit left behind keeps dropping this
+    // uid's non-tunnel egress, and a boot with the kill switch on replaces it
+    // in the same transaction as its install. With it off nothing else would
+    // remove it, so it goes here, before any session opens a socket.
+    if !cfg.network_kill_switch {
+        tokio::task::spawn_blocking(|| {
+            remove_stale_kill_switch(
+                crate::vpn::killswitch::nft_available(),
+                crate::vpn::killswitch::remove_table,
+            )
+        })
+        .await
+        .context("stale kill-switch table check")?;
     }
 
     let mut cleanup = BootCleanup::new(run_dir.clone());
@@ -2592,6 +2636,63 @@ fn finish_boot_kill_switch_removal(run_dir: &std::path::Path, outcome: std::io::
     }
 }
 
+/// What a boot with `network_kill_switch = false` found of an earlier run's
+/// kill-switch table. See [`remove_stale_kill_switch`].
+#[derive(Debug, PartialEq, Eq)]
+enum StaleKillSwitch {
+    /// `nft` is not installed, so no table can exist and none was asked for.
+    NoNft,
+    /// No table was there.
+    Absent,
+    /// A table was there and is gone.
+    Removed,
+    /// The tables could not be listed, or the one listed would not delete.
+    Failed,
+}
+
+/// Remove a kill-switch table this boot did not install and will not use.
+///
+/// The table outlives an unclean exit (`kill -9`, an OOM kill, a panic
+/// abort), and with the kill switch now off it keeps dropping every packet
+/// the daemon's uid sends outside a tunnel: tracker requests time out and
+/// host profiles go dark with nothing in the log to say why. Neither outcome
+/// stops the boot. The operator asked for no kill switch, and a table that
+/// could not be removed is reported with the command that removes it.
+///
+/// A listing that fails is logged at `info` rather than `warn`: without
+/// `CAP_NET_ADMIN`, which a host-only deployment does not hold, it fails on
+/// every boot, and such a daemon could not have installed a table either.
+fn remove_stale_kill_switch(
+    nft_available: bool,
+    remove: impl FnOnce() -> std::io::Result<bool>,
+) -> StaleKillSwitch {
+    if !nft_available {
+        return StaleKillSwitch::NoNft;
+    }
+    match remove() {
+        Ok(false) => StaleKillSwitch::Absent,
+        Ok(true) => {
+            warn!(
+                table = crate::vpn::killswitch::TABLE,
+                "removed a stale network kill-switch table left by an earlier run that did not \
+                 exit cleanly; with network_kill_switch = false it would have dropped this \
+                 daemon's traffic outside the tunnels",
+            );
+            StaleKillSwitch::Removed
+        }
+        Err(e) => {
+            info!(
+                table = crate::vpn::killswitch::TABLE,
+                error.cause = %e,
+                "could not check for, or remove, a network kill-switch table left by an earlier \
+                 run. If one is installed it drops this daemon's traffic outside the tunnels; \
+                 remove it with `nft delete table inet torrentd_ks`",
+            );
+            StaleKillSwitch::Failed
+        }
+    }
+}
+
 /// Export the previous run's [`ShutdownReport`] and warn about what it holds.
 fn export_shutdown_report(metrics: &PromSink, report: &ShutdownReport) {
     if report.unsaved_resumes > 0 {
@@ -2604,7 +2705,7 @@ fn export_shutdown_report(metrics: &PromSink, report: &ShutdownReport) {
     if report.kill_switch_removal_failed {
         warn!(
             "the previous run could not remove the network kill switch on its way out; a boot \
-             with network_kill_switch replaces it, otherwise remove it with \
+             with network_kill_switch replaces it and one without removes it, or remove it with \
              `nft delete table inet torrentd_ks`",
         );
     }
@@ -2908,6 +3009,29 @@ mod shutdown_report_tests {
         assert!(
             !shutdown_report_path(dir.path()).exists(),
             "a removal that worked writes no report"
+        );
+    }
+
+    /// The scenario in #105: an unclean exit left the table, and the operator
+    /// turned the kill switch off. The boot removes it and says so, and
+    /// neither a failure nor a host without `nft` stops the boot.
+    #[test]
+    fn a_boot_with_the_kill_switch_off_removes_a_stale_table() {
+        assert_eq!(
+            remove_stale_kill_switch(true, || Ok(true)),
+            StaleKillSwitch::Removed
+        );
+        assert_eq!(
+            remove_stale_kill_switch(true, || Ok(false)),
+            StaleKillSwitch::Absent
+        );
+        assert_eq!(
+            remove_stale_kill_switch(true, || failed().map(|()| true)),
+            StaleKillSwitch::Failed
+        );
+        assert_eq!(
+            remove_stale_kill_switch(false, || panic!("no nft, so nothing is asked of it")),
+            StaleKillSwitch::NoNft
         );
     }
 }

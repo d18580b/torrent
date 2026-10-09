@@ -239,6 +239,15 @@ impl Config {
         Ok(cfg)
     }
 
+    /// Load for `net-cleanup`, which validates nothing: it reads only
+    /// [`Config::state_dir`], and it runs as the unit's `ExecStopPost=`
+    /// after the daemon is gone. A config edited while the daemon ran into
+    /// one any validation refuses must still let it remove that daemon's kill
+    /// switch and tunnels. Only a file that does not parse refuses.
+    pub fn load_for_net_cleanup(path: &Path) -> anyhow::Result<Self> {
+        Self::parse(path)
+    }
+
     fn parse(path: &Path) -> anyhow::Result<Self> {
         let bytes = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&bytes).with_context(|| format!("parse {}", path.display()))

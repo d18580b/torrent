@@ -25,6 +25,7 @@ mod cli;
 mod config;
 mod http;
 mod metrics_sink;
+mod net_cmd;
 mod pool_apply;
 mod pool_cmd;
 mod pool_service;
@@ -193,6 +194,7 @@ fn subcommand_name(command: &Command) -> &'static str {
         },
         Command::HashPassword => "hash-password",
         Command::NewToken { .. } => "new-token",
+        Command::NetCleanup => "net-cleanup",
         Command::Openapi { .. } => "openapi",
     }
 }
@@ -284,6 +286,14 @@ fn is_exempt_operator_tool(command: &Command) -> bool {
         // Derive a hash, mint a token, print it. Neither reads nor writes
         // anything outside this process.
         Command::HashPassword | Command::NewToken { .. } | Command::Openapi { .. } => true,
+        // Changes host network state, and is exempt anyway: the rule exists
+        // so a config the daemon refuses cannot be used to *raise* anything,
+        // and this only removes what the daemon itself recorded raising or
+        // installed. It runs as the unit's `ExecStopPost=`, and a config edited
+        // into a refused one while the daemon ran must not leave a dead
+        // daemon's kill switch and tunnels standing. `load_config` goes
+        // further for it and skips every validation, not only the posture.
+        Command::NetCleanup => true,
         Command::Vpn { cmd } => match cmd {
             // The one arm that changes host network state. Everything else
             // `vpn check` does is reading interfaces, `wg` state and sysctls.
@@ -316,14 +326,18 @@ fn refuse_config(e: &anyhow::Error) -> ! {
 /// session and binds nothing, and holding it to a check about serving is what
 /// made `hash-password` unreachable from the very configs the refusal sends an
 /// operator to it to fix. `vpn check --bring-up` is excluded from that, per
-/// [`is_exempt_operator_tool`].
+/// [`is_exempt_operator_tool`]. `net-cleanup` gets no validation at all: it
+/// reads only the state directory, and must run from any config that parses.
 fn load_config(cli: &Cli) -> anyhow::Result<config::Config> {
     let Some(path) = cli.config.as_deref() else {
         anyhow::bail!("--config <PATH> is required");
     };
     let is_operator_tool =
         cli.command.as_ref().is_some_and(is_exempt_operator_tool) && !cli.check_config;
-    let loaded = if is_operator_tool {
+    let is_net_cleanup = matches!(cli.command, Some(Command::NetCleanup)) && !cli.check_config;
+    let loaded = if is_net_cleanup {
+        config::Config::load_for_net_cleanup(path)
+    } else if is_operator_tool {
         config::Config::load_for_operator_tool(path)
     } else {
         config::Config::load(path)
@@ -448,6 +462,7 @@ fn main() -> anyhow::Result<()> {
             },
             Command::HashPassword => hash_password_cmd(),
             Command::NewToken { name, scopes } => new_token_cmd(&name, &scopes),
+            Command::NetCleanup => net_cmd::cleanup(&cfg),
             Command::Openapi { .. } => unreachable!("`openapi` returns before the config loads"),
         };
     }
@@ -549,6 +564,52 @@ mod tests {
                 "{argv:?} must load: it serves nothing",
             );
         }
+    }
+
+    #[test]
+    fn net_cleanup_runs_from_a_config_the_daemon_refuses() {
+        // The property: the unit's `ExecStopPost=` cleanup removes a dead
+        // daemon's kill switch and tunnels even where the config was edited
+        // into one the daemon would refuse while it ran. It raises nothing,
+        // so the posture check does not stand in front of it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = non_loopback_without_auth(dir.path());
+        let cli = Cli::parse_from(["torrentd", "--config", p.to_str().unwrap(), "net-cleanup"]);
+        assert!(load_config(&cli).is_ok());
+
+        // Not only the posture: a config any validation refuses still loads,
+        // and still names the daemon's state directory. A hash-password run
+        // against the same file is refused, so the file is one validation
+        // rejects.
+        let p = dir.path().join("refused.toml");
+        std::fs::write(
+            &p,
+            "default_save_path = \"/data/torrents\"\n\
+             resume_dir = \"/srv/torrentd/resume\"\n\
+             torrent_dir = \"/srv/torrentd/torrents\"\n\
+             allow_unauthenticated = true\n\
+             shutdown_drain_secs = 0\n\
+             \n\
+             [[profile]]\n\
+             id = \"public\"\n\
+             network = \"host\"\n\
+             listen_interfaces = \"0.0.0.0:6881\"\n",
+        )
+        .unwrap();
+        let path = p.to_str().unwrap();
+        let cli = Cli::parse_from(["torrentd", "--config", path, "hash-password"]);
+        let msg = format!(
+            "{:#}",
+            load_config(&cli).expect_err("validation refuses it")
+        );
+        assert!(msg.contains("shutdown_drain_secs"), "got: {msg}");
+        let cli = Cli::parse_from(["torrentd", "--config", path, "net-cleanup"]);
+        let cfg = load_config(&cli).expect("net-cleanup validates nothing");
+        assert_eq!(cfg.state_dir(), std::path::Path::new("/srv/torrentd"));
+
+        let cli = Cli::parse_from(["torrentd", "-c", "x", "--check-config", "net-cleanup"]);
+        let msg = check_config_with_subcommand(&cli).expect("two validations in one invocation");
+        assert!(msg.contains("net-cleanup"), "got: {msg}");
     }
 
     #[test]

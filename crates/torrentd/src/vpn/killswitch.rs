@@ -97,7 +97,9 @@ use tracing::info;
 
 use super::exec;
 
-/// nftables table this module owns. Torn down on graceful shutdown.
+/// nftables table this module owns. Torn down on graceful shutdown, by a boot
+/// with the kill switch off, and by `torrentd net-cleanup` (the packaged unit's
+/// `ExecStopPost=`).
 pub const TABLE: &str = "torrentd_ks";
 
 /// One profile's tunnel as the ruleset pairs it: the interface, and the
@@ -418,11 +420,13 @@ pub(crate) fn enable_for_uid(
 
 /// Remove the kill-switch table.
 ///
-/// A missing table is success — shutdown must never fail on it, and the
-/// startup pre-clear runs against a table that usually is not there. Any other
-/// failure is reported: `nft` merges into an existing table rather than
-/// replacing it, so a stale table that failed to delete would silently survive
-/// alongside the new rules.
+/// A missing table is success. Shutdown must never fail on it, and the other
+/// callers usually find no table: the failed-boot guard, a boot with
+/// `network_kill_switch = false` clearing what an unclean exit left
+/// ([`remove_table`]), and `torrentd net-cleanup`. A boot with the kill switch
+/// on does not call this: [`install_script`] replaces a stale table in the
+/// same transaction as the install. Any other failure is reported, because a
+/// table that failed to delete keeps confining the daemon's uid.
 ///
 /// Whether the table exists is asked directly, with `nft list tables`, rather
 /// than inferred from the text of a failed delete. That text is `strerror`
@@ -433,19 +437,29 @@ pub(crate) fn enable_for_uid(
 /// and so still reports — on the errors that matter, such as a missing
 /// `CAP_NET_ADMIN`.
 pub fn disable() -> io::Result<()> {
+    remove_table().map(|_| ())
+}
+
+/// [`disable`], saying whether there was a table to remove: `true` when one
+/// was listed and deleted, `false` when none was there.
+///
+/// For the callers to whom a table is news. A boot with the kill switch off
+/// and `torrentd net-cleanup` find one only where an earlier run exited
+/// without removing it, and say so.
+pub fn remove_table() -> io::Result<bool> {
     disable_with(list_tables, delete_table)
 }
 
-/// `disable`, with both `nft` calls handed in so the decision between them is
-/// reachable by a test on a host without `nft` or `CAP_NET_ADMIN`.
+/// [`remove_table`], with both `nft` calls handed in so the decision between
+/// them is reachable by a test on a host without `nft` or `CAP_NET_ADMIN`.
 pub(crate) fn disable_with(
     list: impl Fn() -> io::Result<String>,
     delete: impl Fn() -> io::Result<()>,
-) -> io::Result<()> {
+) -> io::Result<bool> {
     if !table_listed(&list()?) {
-        return Ok(());
+        return Ok(false);
     }
-    delete()
+    delete().map(|()| true)
 }
 
 /// How often [`watch`] checks the table is still installed.
@@ -865,7 +879,7 @@ table inet torrentd_ks {
     #[test]
     fn disable_succeeds_without_deleting_when_the_table_is_absent() {
         let deleted = std::cell::Cell::new(false);
-        disable_with(
+        let removed = disable_with(
             || Ok("table ip filter\ntable inet other\n".to_string()),
             || {
                 deleted.set(true);
@@ -876,15 +890,17 @@ table inet torrentd_ks {
         )
         .expect("an absent table is success");
         assert!(!deleted.get(), "nothing to delete, so no delete is run");
+        assert!(!removed, "and no table is reported removed");
 
-        disable_with(|| Ok(String::new()), || panic!("no tables at all"))
+        let removed = disable_with(|| Ok(String::new()), || panic!("no tables at all"))
             .expect("an empty listing is an absent table");
+        assert!(!removed);
     }
 
     #[test]
     fn disable_deletes_a_listed_table_and_reports_its_failure() {
         let deleted = std::cell::Cell::new(false);
-        disable_with(
+        let removed = disable_with(
             || Ok(format!("table ip filter\ntable inet {TABLE}\n")),
             || {
                 deleted.set(true);
@@ -893,6 +909,10 @@ table inet torrentd_ks {
         )
         .expect("a delete that succeeded");
         assert!(deleted.get(), "a listed table is deleted");
+        assert!(
+            removed,
+            "and reported removed, so a caller can say it found one"
+        );
 
         let e = disable_with(
             || Ok(format!("table inet {TABLE}\n")),
@@ -1003,7 +1023,7 @@ table inet torrentd_ks {
         }
     }
 
-    /// And `enable` refuses it before the pre-clear, so a previous run's kill
+    /// And `enable` refuses it before anything reaches nft, so a previous run's kill
     /// switch stays armed rather than being deleted and never replaced.
     #[test]
     fn enable_refuses_an_unquotable_name_before_nft() {
