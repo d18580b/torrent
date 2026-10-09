@@ -16,8 +16,8 @@
 //!    is on disk before any rename can expose it;
 //! 3. renames every temp file over its target;
 //! 4. `fsync`s each directory once, so the renames are durable. This step is
-//!    best effort: a failure is logged once per directory, and does not fail
-//!    the writes (see `sync_dir`).
+//!    best effort: a failure is logged once per directory, counted every
+//!    time, and does not fail the writes (see `sync_dir`).
 //!
 //! The atomicity is the per-file protocol's: a crash at any point leaves each
 //! target either whole-old or whole-new. What changes is that the flushes are
@@ -50,6 +50,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -412,6 +413,18 @@ fn dir_sync_failures() -> &'static Mutex<HashSet<PathBuf>> {
     FAILED.get_or_init(Mutex::default)
 }
 
+/// Every directory `fsync` that has failed in this process. See [`sync_dir`].
+static DIR_FSYNC_ERRORS: AtomicU64 = AtomicU64::new(0);
+
+/// How many directory `fsync`s have failed in this process, every one of them
+/// rather than only those [`sync_dir`] logged. Process-wide, because the
+/// writes that sync a directory ([`write_atomic`] and every [`BatchWriter`])
+/// hold no metrics sink; the exporter reads it at scrape time as
+/// `dir_fsync_errors_total`.
+pub fn dir_fsync_errors() -> u64 {
+    DIR_FSYNC_ERRORS.load(Ordering::Relaxed)
+}
+
 /// `fsync` `dir`, so a rename into it survives a power loss.
 ///
 /// Best effort: a failure does not fail the write. The renamed file's data is
@@ -420,8 +433,12 @@ fn dir_sync_failures() -> &'static Mutex<HashSet<PathBuf>> {
 /// failure risks is the rename: a power loss can revert the name to the
 /// previous file, or to none. That is logged, once per directory until it next
 /// syncs, so a rename that may not be durable no longer looks like one that is.
+/// Every failure, logged or not, is counted in [`dir_fsync_errors`].
 fn sync_dir(dir: &Path) {
     let r = fs::File::open(dir).and_then(|d| d.sync_all());
+    if r.is_err() {
+        DIR_FSYNC_ERRORS.fetch_add(1, Ordering::Relaxed);
+    }
     note_dir_sync(dir_sync_failures(), dir, &r);
 }
 
@@ -622,6 +639,17 @@ mod tests {
         let missing = dir.path().join("gone");
         sync_dir(&missing);
         assert!(dir_sync_failures().lock().contains(&missing));
+    }
+
+    #[test]
+    fn every_failed_dir_sync_is_counted_not_only_the_logged_one() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("gone");
+        // Other tests may fail a sync concurrently; the count only grows.
+        let before = dir_fsync_errors();
+        sync_dir(&missing);
+        sync_dir(&missing);
+        assert!(dir_fsync_errors() >= before + 2, "the repeat counts too");
     }
 
     #[test]
