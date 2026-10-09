@@ -266,3 +266,322 @@ hand: `sudo nft delete table inet torrentd_ks`. A boot with
   files are checkpointed back as the daemon runs. A `-wal` that keeps growing
   means a reader is holding a snapshot open, such as a long `sqlite3` session
   against the live file.
+
+## Restart, recover, migrate
+
+### Planned restart
+
+```bash
+sudo systemctl restart torrentd
+```
+
+A stop runs four stages, each with its own bound:
+
+1. **The HTTP drain,** 10 s. A client still connected after that is cut off,
+   and the exit is still `0`.
+2. **Pool work,** up to 20 s. An apply stops at its next step boundary and
+   stays `applying`, and the next boot re-drives it from that step. A scan or
+   drift check still running at the bound is cut off: run it again after the
+   boot.
+3. **The resume drain,** `shutdown_drain_secs` (default 60). It saves resume
+   data for every torrent whose state changed since its last save.
+4. **Teardown.** The sessions close, the tunnels go down, and the kill switch
+   is removed last.
+
+That is about 95 s at the defaults. The shipped unit's `TimeoutStopSec=120s`
+covers it. While it drains, the daemon asks systemd for more time
+(`EXTEND_TIMEOUT_USEC`), capped at the stages' sum, so a larger
+`shutdown_drain_secs` is covered too. Raise `TimeoutStopSec` along with it
+anyway, so the stop stays bounded where those extensions do not arrive.
+
+A restart takes every profile off the network, not just one. Every torrent
+stops seeding for the length of the stop and the boot. Every `vpn` profile's
+tunnel is torn down and raised again, taking up to 30 s each. A
+`port_forward = "natpmp"` profile negotiates its port again, and the gateway
+may hand out a different one.
+
+Once it is back, read what the previous exit left behind:
+
+```bash
+curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8080/metrics \
+  | grep -E '^torrentd_(last_shutdown_|profile_unloaded_registry_torrents|boot_torrent_load_failures)'
+```
+
+- **`torrentd_last_shutdown_unsaved_resumes` above 0.** The resume drain ran
+  out of time with that many saves outstanding. Those torrents came back from
+  older resume data, or with none (see [After a crash](#after-a-crash)). Raise
+  `shutdown_drain_secs`.
+- **`torrentd_last_shutdown_kill_switch_removal_failed` is 1.** The tunnels
+  went down, but the nftables table stayed. A boot with
+  `network_kill_switch = true` replaces it. With the kill switch off, remove
+  it by hand as [Retiring a profile](#retiring-a-profile) describes.
+- **`torrentd_profile_unloaded_registry_torrents` above 0.** The registry
+  claims torrents that no boot scan loaded. See
+  [After a crash](#after-a-crash).
+
+Both `last_shutdown_*` gauges read 0 when the previous run wrote no report,
+which is exactly what a crash leaves. A 0 does not prove the last exit was
+graceful. `journalctl -u torrentd -b -1` (or without `-b -1` if the host did
+not reboot) shows how it ended.
+
+Adopted torrents come back with no metadata after any restart (#108), because
+adoption never writes their `.torrent` into the profile's `torrent_dir`. They
+sit in `awaiting_metadata`, and on a private profile they stay there. The boot
+warns `resume entries with no .torrent on disk`.
+
+### After a crash
+
+A crash here is any exit that skipped the stop sequence: `kill -9`, an OOM
+kill, a panic abort, or a power cut. `Restart=on-failure` starts the daemon
+again after 5 s. Work through these in order once it is up.
+
+**Network state (#105).** Nothing ran the teardown, so the kill-switch table,
+the WireGuard links and their `ip rule` entries are still in place. The boot
+cleans up only what its config still names:
+
+- A WireGuard link for a profile that is still configured is adopted, by the
+  private key in its config or, for a keyless config, by its
+  `wireguard-<iface>.raised` record. After a host reboot the links are gone
+  anyway.
+- An OpenVPN profile's bring-up clears the rules its `openvpn-<iface>.table`
+  record names, as long as the host has not rebooted.
+- The `torrentd_ks` table is replaced when `network_kill_switch = true`. When
+  it is `false`, for instance because you turned it off to debug, nothing
+  removes it. The stale table goes on dropping every packet the daemon's uid
+  sends outside the tunnels, and trackers time out with no other sign. Check
+  for it, and remove it:
+
+  ```bash
+  sudo nft list table inet torrentd_ks
+  sudo nft delete table inet torrentd_ks
+  ```
+
+- The links and rules of a profile no longer in the config stay up. Remove
+  them as [Retiring a profile](#retiring-a-profile) describes.
+
+**Adoptions (#109).** The verify queue lives in memory only, and an adoption
+writes its registry claim before the add. No resume data is saved at the add
+itself. A crash before a torrent's first save leaves a claim with nothing
+behind it, so no scan loads the torrent, and adopting it again is refused with
+`info-hash already loaded in profile …`. The boot counts these per profile in
+`torrentd_profile_unloaded_registry_torrents`. List them: the registry lists
+them, and their phase is `unknown` because no session holds them.
+
+```bash
+# Repeat with ?cursor= while next_cursor is set.
+curl -s "localhost:8080/v1/torrents?profile_id=acct_a&phase=unknown&limit=1000" \
+     -H "Authorization: Bearer $TOKEN" | jq -r '.items[].infohash' > unloaded.txt
+```
+
+Run this once the boot has finished. A torrent still being added also reads
+`unknown` until its first state update arrives. Then clear each claim with a
+plain `DELETE` (no `delete_files`), and adopt the torrent again
+(`POST /v1/pool/adoptions`):
+
+```bash
+while read -r ih; do
+  curl -sfX DELETE "localhost:8080/v1/torrents/$ih" -H "Authorization: Bearer $TOKEN" \
+    || echo "failed: $ih"
+done < unloaded.txt
+```
+
+A torrent that was still waiting in the verify queue adopts again normally. A
+fast-path adoption had already recorded `adopted` in the pool index before
+the crash. Adopting it again is refused as `already adopted` (#111), and
+editing `pool.db` with the daemon stopped is the only way past that.
+
+**Plans.** The boot re-drives every plan left `applying`. It first waits up
+to 10 minutes for every torrent it loaded to reach the state map. Check that
+none is left:
+
+```bash
+curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer $TOKEN"
+```
+
+- A plan stopped between steps resumes from its next step and ends
+  `applied`, or `failed` at a step that fails.
+- A plan killed inside a step cannot be resumed. Whether that step happened is
+  unknown, so the boot parks it as `failed` with that step still
+  `in_progress`. The journal line `resume failed` names the step and its path,
+  and applying it again fails the same way. Look at that path, rescan,
+  discard the plan, and build a new one.
+- With `[pool] allow_mutations` off, nothing is re-driven. The plan stays
+  `applying` until a boot that allows mutations.
+
+**Resume data (#109, #110).** Resume data is saved every 30 minutes and by
+the shutdown drain. A crash loses whatever changed since the last save, such
+as a pause. A torrent added within that window may have no resume file at
+all:
+
+- **Added through `POST /v1/torrents`.** The boot finds only its `.torrent`
+  and re-adds it at `default_save_path`, whatever `save_path` it was added
+  with (#110). Nothing reports the move. If its payload is elsewhere, the
+  torrent finds nothing at `default_save_path` and never seeds. `DELETE` it
+  without `delete_files`, then add it again with its `save_path`.
+- **Adopted.** It has neither a resume file nor a `.torrent` in the stores,
+  so it is one of the unloaded claims above.
+
+### Recovering a fenced profile
+
+A profile the VPN monitor fenced (`vpn_down`) stays fenced. The monitor no
+longer probes it, `resume-all` refuses it, and adds into it answer `409
+profile-unavailable`. Nothing lifts the fence except restarting the daemon
+(#100). Before restarting:
+
+1. Find out why its tunnel failed. The reason is on
+   `torrentd_profile_vpn_fenced_total` and in the `VPN tunnel unhealthy` log
+   line. Fix the cause first, whether that is the provider, the endpoint or
+   the config. A tunnel that fails again at the next boot leaves the profile
+   `failed`, with nothing loaded, while the other profiles come up without it.
+2. Choose when to restart. As
+   [Planned restart](#planned-restart) describes, a restart takes **every**
+   profile off the network for the length of the stop and the boot. Healthy
+   profiles' tunnels are raised again too, and their NAT-PMP ports may
+   change.
+
+After the restart, the fenced profile's torrents come back **paused**. The
+fence's pause was saved in their resume data, and the boot does not clear a
+saved pause, because it cannot tell an operator's pause from the fence's.
+Resume them:
+
+```bash
+curl -sX POST localhost:8080/v1/profiles/acct_b/resume-all -H "Authorization: Bearer $TOKEN"
+```
+
+This also resumes any torrent in that profile you had paused on purpose.
+Pause those again afterwards.
+
+### Restoring from backup
+
+Restore one backup set, taken as [Backing up](#backing-up) describes. Mixing
+a `registry.db` from one set with a `pool.db` or stores from another leaves
+claims, index rows and store files that disagree.
+
+```bash
+sudo systemctl stop torrentd
+# Keep what was there until the restore is known good.
+sudo mv /var/lib/torrentd /var/lib/torrentd.before-restore
+sudo install -d -o torrentd -g torrentd -m0750 /var/lib/torrentd
+
+src=/backup/torrentd/2026-10-01
+sudo rsync -a "$src/registry.db" "$src/pool.db" "$src/resume" "$src/torrents" /var/lib/torrentd/
+# An offline backup may also hold registry.db-wal or pool.db-wal and -shm.
+# Restore those with their databases, never on their own.
+sudo chown -R torrentd:torrentd /var/lib/torrentd
+sudo systemctl start torrentd
+```
+
+Leave out the rest of the state directory, even when an offline backup holds
+it. `wireguard-*.raised`, `openvpn-*.pid` and `openvpn-*.table` describe
+tunnels of a run that is gone. `torrentd.lock` and `last_shutdown.json`
+describe that run's process and its exit. `session_state-*.dat` is optional.
+
+Once it is up:
+
+1. **Read the boot's reconciliation.** Check
+   `torrentd_profile_unloaded_registry_torrents`,
+   `torrentd_boot_torrent_load_failures` and
+   `torrentd_pool_index_profile_disagreements`, and the boot warnings that
+   go with them. With the copy order of [Backing up](#backing-up), unloaded
+   claims should be 0. Clear any there are as in
+   [After a crash](#after-a-crash).
+2. **Rescan.** The index describes the disk as it was when the backup was
+   taken. Run `POST /v1/pool/scan` before any plan or drift check.
+3. **Read the plans.** A plan applied after the backup appears in its
+   earlier state. A plan the backup shows as `applying` was re-driven at
+   boot. Each step re-checks its file against the index before it acts, so a
+   step whose file is already gone or changed fails instead of acting twice.
+   Expect such a plan to end `failed`, then read it and discard it. A trash
+   directory left by a plan the backup never recorded has no plan to tie it
+   to. Its contents are what that plan deleted.
+
+What changed after the backup is lost. A torrent added since then is gone
+from the stores, while its payload stays on disk, so add or adopt it again. A
+torrent removed since then comes back.
+
+### Moving to a new host
+
+Paths are the thing to keep. `pool.db` stores absolute paths: each root's
+path, each torrent's `source_path`, `fastresume_path` and
+`declared_save_path`. It also stores every indexed file's
+`(size, mtime, inode, device)`. Each torrent's resume data names its absolute
+`save_path`.
+
+**Before you start.** Install the new host as `running.md` §§1-4 and 7
+describe: packages, binary, the `torrentd` user and sysctls. Create the
+`torrentd` user **before** copying anything, so `rsync -a` run as root
+maps ownership onto it by name. Keep its old uid if anything outside the
+daemon refers to it by number, such as an NFS export, a backup job or a
+host firewall rule.
+
+**Copy.**
+
+1. Stop the daemon on the old host, and disable it there:
+   `sudo systemctl disable --now torrentd`. Two daemons seeding the same
+   accounts from two hosts announce each passkey twice.
+2. Copy, with the daemon stopped so the databases are consistent:
+
+   ```bash
+   # The state directory, without the records bound to the old host's boot.
+   sudo rsync -aH --exclude='wireguard-*.raised' --exclude='openvpn-*' \
+        --exclude=torrentd.lock /var/lib/torrentd/ new:/var/lib/torrentd/
+   # Payload: every [pool] root, library_dir and default_save_path.
+   sudo rsync -aH /data/torrents/ new:/data/torrents/
+   # Configuration: the daemon's, and each vpn profile's tunnel config.
+   sudo rsync -a /etc/torrentd/ new:/etc/torrentd/
+   sudo rsync -a /etc/wireguard/ new:/etc/wireguard/
+   # The installed unit, with its ReadWritePaths and capability lines.
+   sudo rsync -a /etc/systemd/system/torrentd.service new:/etc/systemd/system/
+   ```
+
+   `-a` keeps mtimes, permissions and ownership. `-H` keeps hard links, so a
+   payload shared between torrents is not copied twice. Copy an OpenVPN
+   profile's config from wherever its `vpn_config` points.
+
+**Rescan before anything compares.** Inode and device numbers never survive a
+copy, so every claimed file now differs from its index row. A drift check
+(`torrentd pool check` or `POST /v1/pool/drift-check`) run now marks every
+claimed torrent `drifted`. Only a verification clears that, so the whole
+library would have to be re-hashed. Run a scan first, which records the new
+numbers:
+
+```bash
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool scan
+sudo systemctl daemon-reload
+sudo systemctl enable --now torrentd
+```
+
+If a drift check already ran, the drifted torrents need
+`POST /v1/pool/verifications` with their info-hashes, which re-hashes each
+one.
+
+Then run the checks in [Planned restart](#planned-restart) and `running.md`
+§9, and `torrentd vpn check --profile <id>` for each `vpn` profile.
+
+**What does not carry over.**
+
+- `wireguard-<iface>.raised` and `openvpn-<iface>.table` hold the old host's
+  boot ID and are never believed on the new one. That is why they are
+  excluded above. Each tunnel is raised fresh.
+- `session_state-<profile>.dat` is optional. Without it, the DHT spends a few
+  minutes bootstrapping.
+- NAT-PMP ports are negotiated at each bring-up. A `natpmp` profile gets
+  whatever port the gateway hands out, and announces it.
+
+**If a path has to change.** Mount the disks at the old paths if you can, for
+example with a bind mount, and list them in `ReadWritePaths`. Nothing
+re-points stored paths. If a path changes anyway:
+
+- **A `[pool] roots` entry.** The next scan drops the old root from the
+  index, with every claim under it. It indexes the new path as a new root and
+  matches torrents against it, and `adopted` torrents stay `adopted`. Their
+  resume data still names the old `save_path`, though, so each one loads
+  there, finds no files, and does not seed. Plans in the journal name the old
+  paths too, and their steps fail.
+- **`default_save_path`.** The same applies to the resume data of every
+  torrent saved under it.
+- **`library_dir`.** A rescan re-reads the library and records each torrent's
+  new `source_path`.
+- **The state directory.** Point `resume_dir`, `torrent_dir`,
+  `registry_path` and `[pool] db_path` at the new place, and update
+  `ReadWritePaths`. The files under it hold no path to themselves.
