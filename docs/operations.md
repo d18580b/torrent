@@ -235,20 +235,28 @@ IN (…)"` statement that clears its claims. Run it with the daemon stopped. Tha
 clears the claims and nothing else. Remove the store directories yourself as in
 step 3, and expect the index caveat above.
 
-**Network state.** Boot only cleans up the tunnels its config still names. If
-the daemon's last exit was not graceful, the retired profile's tunnel link and
-its `ip rule` entries stay up, and no later boot tears them down (#105). This
-covers a `kill -9`, an OOM kill, or a panic abort. Remove them by hand. For a WireGuard
-profile, `ip link delete <iface>`. For OpenVPN, stop the leftover `openvpn`
-process, then delete the rules whose table the profile's
-`openvpn-<iface>.table` record names. In both cases, delete the leftover
-record files.
+**Network state.** A `kill -9`, an OOM kill or a panic abort skips the
+daemon's own teardown, and its tunnel links, their `ip rule` entries and the
+kill-switch table stay up. The packaged unit's `ExecStopPost=` runs
+`torrentd net-cleanup` after every exit, which removes the kill-switch table
+and every WireGuard link the daemon raised, with its rules. Run it by hand
+(`sudo torrentd --config /etc/torrentd/torrentd.toml net-cleanup`) after an
+unclean exit outside that unit; it refuses while a daemon is running. Each
+boot also removes a WireGuard link a raised-interface record vouches for once
+no configured profile names it, and with `network_kill_switch = false` removes
+a leftover kill-switch table.
+
+A link the daemon adopted rather than raised is left standing, as a graceful
+shutdown leaves it: remove it with `ip link delete <iface>`. A retired OpenVPN
+profile is not cleaned up either. Stop its leftover `openvpn` process, delete
+the rules whose table the profile's `openvpn-<iface>.table` record names, and
+delete the record files.
 
 A `last_shutdown.json` that reported `kill_switch_removal_failed` is a
 different case. The exit was graceful and its tunnels were already down; only
-the removal of the nftables kill-switch table failed. Remove that table by
-hand: `sudo nft delete table inet torrentd_ks`. A boot with
-`network_kill_switch = true` replaces it on its own.
+the removal of the nftables kill-switch table failed. The next boot replaces
+the table with `network_kill_switch = true` and removes it with the kill switch
+off. To remove it now: `sudo nft delete table inet torrentd_ks`.
 
 ### Housekeeping
 

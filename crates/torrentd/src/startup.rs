@@ -107,8 +107,11 @@ const POOL_WORK_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
 /// the same state refuses before it can replace the running daemon's kill
 /// switch or tear down its tunnels. The kernel releases it however the
 /// process ends, so a crash leaves no stale lock.
+///
+/// `torrentd net-cleanup` takes it too, so it refuses to tear down a running
+/// daemon's tunnels and kill switch.
 #[derive(Debug)]
-struct InstanceLock {
+pub(crate) struct InstanceLock {
     /// Never read. Holding the open file is the lock.
     _file: std::fs::File,
 }
@@ -116,7 +119,7 @@ struct InstanceLock {
 impl InstanceLock {
     /// Lock `path`, creating it and its directory where missing, or refuse
     /// naming the process that holds it.
-    fn acquire(path: &std::path::Path) -> anyhow::Result<Self> {
+    pub(crate) fn acquire(path: &std::path::Path) -> anyhow::Result<Self> {
         use std::io::Read;
         use std::io::Seek;
         use std::io::Write;
@@ -2699,7 +2702,7 @@ fn export_shutdown_report(metrics: &PromSink, report: &ShutdownReport) {
     if report.kill_switch_removal_failed {
         warn!(
             "the previous run could not remove the network kill switch on its way out; a boot \
-             with network_kill_switch replaces it, otherwise remove it with \
+             with network_kill_switch replaces it and one without removes it, or remove it with \
              `nft delete table inet torrentd_ks`",
         );
     }

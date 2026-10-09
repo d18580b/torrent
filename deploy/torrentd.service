@@ -12,6 +12,14 @@ Type=notify
 # from an ExecStartPre would be restarted every RestartSec regardless.
 ExecStart=/usr/bin/torrentd --config /etc/torrentd/torrentd.toml
 ExecReload=/bin/kill -HUP $MAINPID
+# After every exit of the daemon, clean or not, remove the network state a
+# `kill -9`, an OOM kill or a panic abort leaves behind: the kill-switch table
+# and the WireGuard links the daemon raised, with their `ip rule`s. After a
+# graceful stop it finds nothing. It runs with the capabilities set below, so
+# without CAP_NET_ADMIN it does nothing. The `-` keeps a cleanup that could not
+# remove everything out of the unit's result: it is logged to the journal, and
+# never decides whether the unit restarts.
+ExecStopPost=-/usr/bin/torrentd --config /etc/torrentd/torrentd.toml net-cleanup
 KillSignal=SIGTERM
 Restart=on-failure
 RestartSec=5s

@@ -65,6 +65,20 @@ pub enum Command {
         #[command(subcommand)]
         cmd: VpnCmd,
     },
+    /// Remove the network state a daemon that did not exit cleanly left
+    /// behind: the `torrentd_ks` kill-switch table, and every WireGuard link a
+    /// raised-interface record in the state directory vouches for, with its
+    /// `ip rule`s.
+    ///
+    /// The packaged unit runs it as `ExecStopPost=`, after every exit of the
+    /// daemon. It removes only what the daemon put there, by the rules a
+    /// graceful shutdown uses: a link the daemon adopted rather than raised
+    /// is left standing. Idempotent, and succeeds when there is nothing to
+    /// remove. It refuses while a daemon holds the state directory, and does
+    /// nothing without `CAP_NET_ADMIN`, which a daemon needs to raise a link or
+    /// install a table at all. Exits 1 when anything it found would not go.
+    #[command(verbatim_doc_comment)]
+    NetCleanup,
     /// Print the HTTP API's OpenAPI 3.2 document.
     ///
     /// The document is derived from the handlers this binary serves, so it is

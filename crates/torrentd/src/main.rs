@@ -25,6 +25,7 @@ mod cli;
 mod config;
 mod http;
 mod metrics_sink;
+mod net_cmd;
 mod pool_apply;
 mod pool_cmd;
 mod pool_service;
@@ -193,6 +194,7 @@ fn subcommand_name(command: &Command) -> &'static str {
         },
         Command::HashPassword => "hash-password",
         Command::NewToken { .. } => "new-token",
+        Command::NetCleanup => "net-cleanup",
         Command::Openapi { .. } => "openapi",
     }
 }
@@ -284,6 +286,13 @@ fn is_exempt_operator_tool(command: &Command) -> bool {
         // Derive a hash, mint a token, print it. Neither reads nor writes
         // anything outside this process.
         Command::HashPassword | Command::NewToken { .. } | Command::Openapi { .. } => true,
+        // Changes host network state, and is exempt anyway: the rule exists
+        // so a config the daemon refuses cannot be used to *raise* anything,
+        // and this only removes what the daemon itself recorded raising or
+        // installed. It runs as the unit's `ExecStopPost=`, and a config edited
+        // into a refused one while the daemon ran must not leave a dead
+        // daemon's kill switch and tunnels standing.
+        Command::NetCleanup => true,
         Command::Vpn { cmd } => match cmd {
             // The one arm that changes host network state. Everything else
             // `vpn check` does is reading interfaces, `wg` state and sysctls.
@@ -448,6 +457,7 @@ fn main() -> anyhow::Result<()> {
             },
             Command::HashPassword => hash_password_cmd(),
             Command::NewToken { name, scopes } => new_token_cmd(&name, &scopes),
+            Command::NetCleanup => net_cmd::cleanup(&cfg),
             Command::Openapi { .. } => unreachable!("`openapi` returns before the config loads"),
         };
     }
@@ -549,6 +559,22 @@ mod tests {
                 "{argv:?} must load: it serves nothing",
             );
         }
+    }
+
+    #[test]
+    fn net_cleanup_runs_from_a_config_the_daemon_refuses() {
+        // The property: the unit's `ExecStopPost=` cleanup removes a dead
+        // daemon's kill switch and tunnels even where the config was edited
+        // into one the daemon would refuse while it ran. It raises nothing,
+        // so the posture check does not stand in front of it.
+        let dir = tempfile::tempdir().unwrap();
+        let p = non_loopback_without_auth(dir.path());
+        let cli = Cli::parse_from(["torrentd", "--config", p.to_str().unwrap(), "net-cleanup"]);
+        assert!(load_config(&cli).is_ok());
+
+        let cli = Cli::parse_from(["torrentd", "-c", "x", "--check-config", "net-cleanup"]);
+        let msg = check_config_with_subcommand(&cli).expect("two validations in one invocation");
+        assert!(msg.contains("net-cleanup"), "got: {msg}");
     }
 
     #[test]
