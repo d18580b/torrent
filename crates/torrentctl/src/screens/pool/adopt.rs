@@ -375,7 +375,7 @@ pub fn view(d: &Dialog, ctx: &Ctx<'_>, frame: &mut Frame, area: Rect) {
             let heading = match &d.stage {
                 Stage::Done(_) => Span::styled("  Done:", theme.fg(Tone::Good)),
                 _ => Span::styled(
-                    "  Preview — a dry run, nothing has changed yet:",
+                    "  Preview — a dry run, nothing has been adopted yet:",
                     theme.title(),
                 ),
             };
