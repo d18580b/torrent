@@ -377,14 +377,22 @@ what it has a record of:
   its records. Anything else stays up. Remove it as
   [Retiring a profile](#retiring-a-profile) describes.
 
-**Adoptions (#109).** The verify queue lives in memory only, and an adoption
-writes its registry claim before the add. Each torrent's first resume save is
-queued as soon as the session adds it, but a torrent still waiting in the
-verify queue was never added, and one killed in the moments before its first
-save landed has no resume file yet. Either leaves a claim with nothing behind
-it, so no scan loads the torrent, and adopting it again is refused with
-`info-hash already loaded in profile …`. The boot counts these per profile in
-`torrentd_profile_unloaded_registry_torrents`. List them: the registry lists
+**Adoptions (#109, #139).** An adoption writes its registry claim before the
+add. The verify queue is kept in `pool.db`, and the boot queues again every
+adoption that was still waiting in it, in its old order, once the scans have
+run: the boot logs `queued the adoptions left waiting for verification
+again`, and nothing needs clearing. `torrentd_pool_verify_queue_depth` shows
+them draining. An entry the scans loaded was added before the crash and is
+forgotten. An entry whose claim no longer names its profile is dropped.
+
+A torrent the session had added comes back from the `.torrent` and save path
+the add recorded, even with no resume file. What is left is a crash in the
+instant between an adoption's claim and that record, or its queue entry.
+That leaves a claim with nothing behind it, so no scan loads the torrent, and
+adopting it again is refused with `info-hash already loaded in profile …`.
+The boot counts these per profile in
+`torrentd_profile_unloaded_registry_torrents`, which does not count the
+adoptions it queued again. Where it is above 0, list them: the registry lists
 them, and their phase is `unknown` because no session holds them.
 
 ```bash
@@ -394,7 +402,9 @@ curl -s "localhost:8080/v1/torrents?profile_id=acct_a&phase=unknown&limit=1000" 
 ```
 
 Run this once the boot has finished. A torrent still being added also reads
-`unknown` until its first state update arrives. Then clear each claim with a
+`unknown` until its first state update arrives, and so does an adoption the
+boot queued again, until the queue adds it. The `DELETE` below refuses both
+with 409 and prints `failed:`; leave those. Then clear each claim with a
 plain `DELETE` (no `delete_files`), and adopt the torrent again
 (`POST /v1/pool/adoptions`):
 
@@ -405,9 +415,8 @@ while read -r ih; do
 done < unloaded.txt
 ```
 
-A torrent that was still waiting in the verify queue adopts again normally,
-and so does a fast-path adoption that had already recorded `adopted` in the
-pool index before the crash: the `DELETE` resets that state.
+A fast-path adoption that had already recorded `adopted` in the pool index
+before the crash adopts again normally: the `DELETE` resets that state.
 
 **Plans.** The boot re-drives every plan left `applying`. It first waits up
 to 10 minutes for every torrent it loaded to reach the state map. Check that

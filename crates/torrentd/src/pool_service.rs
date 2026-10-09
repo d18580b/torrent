@@ -27,6 +27,7 @@ use torrentd_engine::TrackerRefusal;
 use torrentd_pool::adopt::AdoptPlan;
 use torrentd_pool::AdoptionState;
 use torrentd_pool::PoolStore;
+use torrentd_pool::VerifyQueueRow;
 use tracing::info;
 use tracing::warn;
 
@@ -378,6 +379,89 @@ impl PoolService {
         &self.verify
     }
 
+    /// Forget `infohash`'s entry in the persisted verify queue: the queue
+    /// added it to a session or dropped it.
+    fn forget_queued(&self, infohash: &str) {
+        if let Err(e) = self.with_store(|s| s.dequeue_verify(infohash)) {
+            self.note_store_error("dequeue_verify", &e);
+        }
+    }
+
+    /// Queue again every adoption `pool.db` holds as waiting for
+    /// verification, once the boot scans have run. Returns the info-hashes
+    /// queued.
+    ///
+    /// An adoption claims its info-hash in the registry before it queues the
+    /// torrent, so a crash with items still waiting used to leave each claim
+    /// with nothing behind it. An entry is queued again only while its claim
+    /// still names its profile and no scan loaded it:
+    ///
+    /// - one `loaded` names was added to a session before the crash, and is
+    ///   back from its `.torrent`; its entry is forgotten.
+    /// - one whose claim is gone, or names another profile, is dropped as the
+    ///   worker drops an item: its owner record goes too, while it still
+    ///   names the entry's profile, and a claim someone else holds is left
+    ///   alone.
+    pub fn restore_verify_queue(
+        &self,
+        registry: &AssignmentRegistry,
+        loaded: &std::collections::HashSet<libtorrent_safe::InfoHash>,
+    ) -> Vec<libtorrent_safe::InfoHash> {
+        let rows = match self.with_store(|s| s.verify_queue()) {
+            Ok(rows) => rows,
+            Err(e) => {
+                warn!(
+                    target: "torrentd::pool",
+                    op = "verify_queue",
+                    error.cause = %e,
+                    "could not read the persisted verify queue; the adoptions it held keep \
+                     their registry claims with nothing to load them",
+                );
+                return Vec::new();
+            }
+        };
+        let mut queued = Vec::new();
+        for row in rows {
+            let item = PendingVerify::from_row(row);
+            let Some(ih) = libtorrent_safe::InfoHash::from_hex(&item.infohash) else {
+                self.forget_queued(&item.infohash);
+                continue;
+            };
+            if loaded.contains(&ih) {
+                info!(
+                    target: "torrentd::pool",
+                    infohash = %item.infohash,
+                    profile_id = %item.profile,
+                    "a queued adoption was added before the restart and is loaded; \
+                     forgetting its queue entry",
+                );
+                self.forget_queued(&item.infohash);
+                continue;
+            }
+            if registry.lookup(&ih).as_ref() != Some(&item.profile) {
+                warn!(
+                    target: "torrentd::pool",
+                    infohash = %item.infohash,
+                    profile_id = %item.profile,
+                    "a queued adoption's registry claim no longer names its profile; \
+                     dropping it",
+                );
+                release_dropped_claim(self, registry, &item);
+                continue;
+            }
+            queued.push(ih);
+            self.verify.enqueue(item);
+        }
+        if !queued.is_empty() {
+            info!(
+                target: "torrentd::pool",
+                count = queued.len(),
+                "queued the adoptions left waiting for verification again",
+            );
+        }
+        queued
+    }
+
     /// Full re-index: walk every root, read the library, re-match.
     ///
     /// The whole sequence is one transaction. A reader concurrent with a scan
@@ -506,6 +590,31 @@ pub struct PendingVerify {
     /// at the enqueue; the add announces to these in place of the
     /// `.torrent`'s. Empty keeps the `.torrent`'s.
     pub trackers: Vec<Vec<String>>,
+}
+
+impl PendingVerify {
+    /// The row `pool.db` keeps for this item while it waits.
+    fn to_row(&self) -> VerifyQueueRow {
+        VerifyQueueRow {
+            infohash: self.infohash.clone(),
+            profile: self.profile.as_str().to_owned(),
+            torrent_path: self.torrent_path.clone(),
+            save_path: self.save_path.clone(),
+            owner_recorded: self.owner_recorded,
+            trackers: self.trackers.clone(),
+        }
+    }
+
+    fn from_row(row: VerifyQueueRow) -> Self {
+        Self {
+            infohash: row.infohash,
+            torrent_path: row.torrent_path,
+            save_path: row.save_path,
+            profile: ProfileId::new(row.profile),
+            owner_recorded: row.owner_recorded,
+            trackers: row.trackers,
+        }
+    }
 }
 
 impl VerifyQueue {
@@ -731,6 +840,9 @@ pub async fn run_verify_queue(
                         &bytes,
                         &item.save_path.to_string_lossy(),
                     );
+                    // A session holds it now, and a restart loads it from
+                    // the `.torrent` just written.
+                    pool.forget_queued(&item.infohash);
                     q.in_flight.lock().push(item.infohash.clone());
                     info!(
                         target: "torrentd::pool",
@@ -809,7 +921,11 @@ fn verify_guard(
 /// names the item's profile. Left behind, it made adoption into any other
 /// profile refuse the torrent, and `DELETE` could not clear it: with no
 /// registry entry it answers not found.
+///
+/// Its entry in the persisted verify queue goes in every case, so a restart
+/// does not queue it again.
 fn release_dropped_claim(pool: &PoolService, registry: &AssignmentRegistry, item: &PendingVerify) {
+    pool.forget_queued(&item.infohash);
     if item.owner_recorded {
         let cleared = pool.with_store(|s| match s.profile_of(&item.infohash) {
             Ok(Some(owner)) if owner == item.profile.as_str() => {
@@ -1354,14 +1470,21 @@ fn enqueue_verify(
         pool.note_store_error("set_profile", &e);
         false
     });
-    pool.verify_queue().enqueue(PendingVerify {
+    let item = PendingVerify {
         infohash: infohash.to_string(),
         torrent_path,
         save_path,
         profile,
         owner_recorded,
         trackers,
-    });
+    };
+    // Kept in `pool.db` too, so a restart queues it again rather than leave
+    // the adoption's claim with nothing to load it. A failed write still
+    // queues it: it is lost only if the daemon stops before the queue adds it.
+    if let Err(e) = pool.with_store(|s| s.enqueue_verify(&item.to_row())) {
+        pool.note_store_error("enqueue_verify", &e);
+    }
+    pool.verify_queue().enqueue(item);
     Ok("queued_for_verification")
 }
 
@@ -1700,6 +1823,82 @@ mod tests {
         super::release_dropped_claim(&pool, &reg, &item);
         assert_eq!(owner_of(&pool, ih), None);
         assert_eq!(reg.lookup(&ih), None);
+    }
+
+    /// An adoption claims its info-hash before it is queued, so the queue is
+    /// kept in `pool.db` and a restart queues again what was still waiting:
+    /// held in memory only, a crash left each claim with nothing to load it.
+    /// What the queue added or dropped before the restart is not queued
+    /// again, nor is an entry whose torrent a scan loaded, nor one whose
+    /// claim no longer names its profile.
+    #[test]
+    fn a_restart_queues_again_the_adoptions_still_waiting() {
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let waiting = InfoHash([0x61; 20]);
+        let loaded = InfoHash([0x62; 20]);
+        let reassigned = InfoHash([0x63; 20]);
+        let dropped = InfoHash([0x64; 20]);
+        let admitted = InfoHash([0x65; 20]);
+        let pool = pool_with(dir.path(), reassigned, None);
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        let trackers = vec![vec!["http://tracker.example/announce".to_owned()]];
+        let resume = dir.path().join("t.fastresume");
+        std::fs::write(
+            &resume,
+            "d8:trackersll31:http://tracker.example/announceeee",
+        )
+        .unwrap();
+        for ih in [waiting, loaded, reassigned, dropped, admitted] {
+            reg.assign(ih, ProfileId::new("p")).unwrap();
+            super::enqueue_verify(
+                &pool,
+                &profiles,
+                &ih.to_hex(),
+                dir.path().join("t.torrent"),
+                dir.path().join("payload"),
+                Some(&resume),
+                ProfileId::new("p"),
+                false,
+            )
+            .unwrap();
+        }
+        assert_eq!(owner_of(&pool, reassigned).as_deref(), Some("p"));
+        // Before the crash the worker dropped one and added another.
+        super::release_dropped_claim(&pool, &reg, &pending(dropped, "p"));
+        pool.forget_queued(&admitted.to_hex());
+        // Since then, `reassigned`'s claim went to another profile.
+        reg.remove(&reassigned).unwrap();
+        reg.assign(reassigned, ProfileId::new("other")).unwrap();
+        drop(pool);
+
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let scanned: std::collections::HashSet<_> = [loaded, admitted].into();
+        assert_eq!(pool.restore_verify_queue(&reg, &scanned), [waiting]);
+
+        let item = pool.verify_queue().pending.lock().pop_front().unwrap();
+        assert!(pool.verify_queue().pending.lock().is_empty());
+        assert_eq!(item.infohash, waiting.to_hex());
+        assert_eq!(item.profile, ProfileId::new("p"));
+        assert_eq!(item.torrent_path, dir.path().join("t.torrent"));
+        assert_eq!(item.save_path, dir.path().join("payload"));
+        assert_eq!(item.trackers, trackers);
+        // The reassigned entry was dropped as the worker drops one: its owner
+        // record goes, and the other profile's claim stays.
+        assert_eq!(owner_of(&pool, reassigned), None);
+        assert_eq!(reg.lookup(&reassigned), Some(ProfileId::new("other")));
+        // Only the waiting adoption is still kept, so a second restart before
+        // the queue adds it queues it again.
+        let kept: Vec<_> = pool
+            .with_store(|s| s.verify_queue().unwrap())
+            .into_iter()
+            .map(|r| r.infohash)
+            .collect();
+        assert_eq!(kept, [waiting.to_hex()]);
     }
 
     /// The enqueue reads the `.fastresume`'s trackers into the item, so the

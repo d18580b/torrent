@@ -611,6 +611,11 @@ transaction as the version write, so it needs no rescan; on an index of
 millions of files it adds seconds to that first start. It is additive and
 takes no copy, but a build that knows only version 4 refuses the result.
 
+Schema version 6 adds the `verify_queue` table, which keeps the adoptions
+waiting for verification so a restart queues them again. It starts empty, is
+additive and takes no copy, but a build that knows only version 5 refuses the
+result.
+
 **If the migration fails, that copy is not the remedy.** It is taken
 immediately before the steps that failed, so it is a copy of the index as it
 stands — same version, same columns, same tables — and restoring it puts you
@@ -1398,9 +1403,10 @@ On a scratch pool, not your real one.
    file is written as soon as the session adds it; after that, changes are
    saved by the 30-minute sweep. On restart every torrent the session had
    added should come back, with nothing lost beyond its state at the last
-   sweep. A torrent killed before its first save landed has no resume file,
-   and an adoption still waiting in the verify queue was never added at all:
-   [After a crash](operations.md#after-a-crash) covers both.
+   sweep. An adoption still waiting in the verify queue was never added; the
+   queue is kept in `pool.db`, and the boot queues it again, so
+   `torrentd_pool_verify_queue_depth` picks up where it was and the adoption
+   is not counted in `torrentd_profile_unloaded_registry_torrents`.
 3. **A delete is refused against a stale index.** Add a torrent through the API
    with a `save_path` inside a managed root, then try a `delete_orphans` plan
    over that path. It must refuse, naming the info-hash: claims are written

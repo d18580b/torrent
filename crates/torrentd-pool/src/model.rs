@@ -246,6 +246,25 @@ impl TorrentFileRow {
     }
 }
 
+/// An adoption waiting in the daemon's verify queue, as `pool.db` keeps it so
+/// a restart can queue it again.
+///
+/// The adoption writes its registry claim before it queues the torrent, and
+/// nothing loads a queued torrent until the queue admits it: a queue held
+/// only in memory left every claim it held behind a crash with nothing to
+/// load it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifyQueueRow {
+    pub infohash: String,
+    pub profile: String,
+    pub torrent_path: std::path::PathBuf,
+    pub save_path: std::path::PathBuf,
+    /// Whether the enqueue wrote `profile` as the index's owner record.
+    pub owner_recorded: bool,
+    /// The previous client's trackers, by tier. Empty keeps the `.torrent`'s.
+    pub trackers: Vec<Vec<String>>,
+}
+
 /// Byte accounting for one directory subtree — what makes the pool legible at
 /// petabyte scale, where a file listing is useless but "this subtree is 8 TB
 /// and none of it is protected" is not.
