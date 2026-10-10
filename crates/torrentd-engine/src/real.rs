@@ -217,3 +217,115 @@ impl TorrentEngine for RealEngine {
         Ok(self.session()?.torrent_trackers(h)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use libtorrent_safe::TorrentFlags;
+
+    use super::*;
+
+    /// The most files a torrent the shim admits may have.
+    const FILES: u32 = 250_000;
+
+    /// A `.torrent` of `FILES` one-byte files under one root, in one piece.
+    /// The piece hash is filler: the torrent is added paused and never
+    /// checked, so nothing reads it.
+    fn many_file_torrent() -> Vec<u8> {
+        let mut out = b"d4:infod5:filesl".to_vec();
+        for i in 0..FILES {
+            out.extend_from_slice(format!("d6:lengthi1e4:pathl6:{i:06}ee").as_bytes());
+        }
+        out.extend_from_slice(b"e4:name4:many");
+        out.extend_from_slice(format!("12:piece lengthi{}e", 1u64 << 24).as_bytes());
+        out.extend_from_slice(b"6:pieces20:");
+        out.extend_from_slice(&[0xab; 20]);
+        out.extend_from_slice(b"ee");
+        out
+    }
+
+    fn local_settings() -> Settings {
+        let mut s = Settings::server_seed_overrides();
+        s.enable_dht = Some(false);
+        s.enable_lsd = Some(false);
+        s.enable_upnp = Some(false);
+        s.enable_natpmp = Some(false);
+        s.listen_interfaces = Some("127.0.0.1:0".into());
+        s
+    }
+
+    /// Many parallel listers paging a 250,000-file torrent, as parallel
+    /// `GET /v1/torrents/{ih}/files` requests do, leave the alert loop's
+    /// `pop_alerts` + `post_updates` the session lock between pages. Copying
+    /// the whole list per page held the lock ~90 ms a call, and 32 listers
+    /// stretched one loop iteration to seconds.
+    #[test]
+    fn parallel_file_pages_do_not_starve_the_alert_loop() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let engine = Arc::new(RealEngine::new(&local_settings()).expect("session"));
+        let h = engine
+            .add_torrent(AddParams::File {
+                bytes: many_file_torrent(),
+                save_path: dir.path().to_string_lossy().into_owned(),
+                flags: TorrentFlags::PAUSED | TorrentFlags::UPLOAD_MODE,
+                trackers: Vec::new(),
+            })
+            .expect("add");
+        let last = engine
+            .torrent_files_page(h, FILES - 1, 100)
+            .expect("page")
+            .expect("metadata");
+        assert_eq!(last.total, FILES);
+        assert_eq!(last.files.len(), 1);
+        assert_eq!(last.files[0].index, FILES - 1);
+        assert_eq!(last.files[0].path, format!("many/{:06}", FILES - 1));
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let pages = Arc::new(AtomicU64::new(0));
+        let listers: Vec<_> = (0..32u32)
+            .map(|n| {
+                let (engine, stop, pages) = (engine.clone(), stop.clone(), pages.clone());
+                std::thread::spawn(move || {
+                    let mut start = n * 7_919 % FILES;
+                    while !stop.load(Ordering::Relaxed) {
+                        let page = engine
+                            .torrent_files_page(h, start, 100)
+                            .expect("page")
+                            .expect("metadata");
+                        assert!(page.files.len() <= 100);
+                        pages.fetch_add(1, Ordering::Relaxed);
+                        start = (start + 100) % FILES;
+                    }
+                })
+            })
+            .collect();
+
+        let mut worst = Duration::ZERO;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            let t = Instant::now();
+            drop(engine.pop_alerts());
+            engine.post_updates();
+            worst = worst.max(t.elapsed());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        for l in listers {
+            l.join().expect("lister");
+        }
+        assert!(
+            pages.load(Ordering::Relaxed) > 32,
+            "the listers made progress"
+        );
+        assert!(
+            worst < Duration::from_secs(1),
+            "an alert-loop iteration waited {worst:?} behind the listers"
+        );
+    }
+}
