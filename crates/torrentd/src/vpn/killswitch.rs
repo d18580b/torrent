@@ -1689,6 +1689,28 @@ table inet torrentd_ks {
         assert_eq!(verdict(&rs, pkt(998, ADDR_B, "wg-b")), "accept");
     }
 
+    /// A link whose IPv6 addresses cannot be read is paired with none, which
+    /// drops its IPv6 traffic, and the reason is logged. The name is one no
+    /// tool may be handed, so the read fails before anything is run.
+    #[test]
+    fn a_failed_ipv6_read_pairs_no_address_and_says_why() {
+        let log = crate::tracing_init::Buf::default();
+        let (_handle, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        assert_eq!(tunnel_ipv6("-wg-a"), Vec::<Ipv6Addr>::new());
+
+        let log = log.text();
+        assert!(
+            log.contains("\"level\":\"WARN\"")
+                && log.contains("could not read the tunnel's IPv6 addresses")
+                && log.contains("-wg-a")
+                && log.contains("cannot be passed to a tool"),
+            "{log}"
+        );
+    }
+
     /// `enable` pairs what the IPv6 probe reads for each link, and a link it
     /// reads none for gets no IPv6 rule.
     #[test]
