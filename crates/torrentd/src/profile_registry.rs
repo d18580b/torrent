@@ -1157,4 +1157,122 @@ mod tests {
             .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
         assert!(pacing.started.lock().is_empty());
     }
+
+    /// A DHT start that fails after the session resumed still starts the
+    /// pace: the torrents the set-online paused are not left paused and held,
+    /// where a retry would not reach them because the session runs.
+    #[test]
+    fn a_failed_dht_start_still_paces_what_the_set_online_paused() {
+        use torrentd_engine::DesiredState;
+        use torrentd_engine::EngineError;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::ProfileNetwork;
+
+        let mut e = test_host_entry("p");
+        e.config.network = ProfileNetwork::Host {
+            listen_interfaces: "0.0.0.0:6881".to_string(),
+            dht: true,
+        };
+        let mock = Arc::new(MockEngine::new());
+        e.engine = mock.clone();
+        let r = ProfileRegistry::new(vec![e]);
+        let metrics = crate::metrics_sink::PromSink::new();
+        let id = ProfileId::new("p");
+        let pacing = Fixed {
+            torrents: vec![(handle(1), true)],
+            started: Mutex::new(Vec::new()),
+        };
+        r.change_states(|rec| rec.set(&id, DesiredState::Offline), &metrics, &pacing)
+            .unwrap();
+        mock.inject_error(
+            "apply_settings",
+            EngineError::MockInjected {
+                op: "apply_settings",
+                message: "boom".into(),
+            },
+        );
+        let err = r
+            .change_states(|rec| rec.set(&id, DesiredState::Online), &metrics, &pacing)
+            .unwrap_err();
+        assert!(
+            matches!(&err, StateChangeError::Apply(v) if matches!(v[..], [(_, Refusal::Engine(_))])),
+            "{err}"
+        );
+        assert!(!mock.session_paused().unwrap());
+        assert_eq!(*pacing.started.lock(), vec![vec![handle(1)]]);
+    }
+
+    /// A session whose paused state cannot be read is paced as if it were
+    /// paused, rather than resumed bare with every torrent at once.
+    #[test]
+    fn an_unreadable_session_state_is_paced_as_paused() {
+        use torrentd_engine::DesiredState;
+        use torrentd_engine::EngineError;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+
+        let mut e = test_host_entry("p");
+        let mock = Arc::new(MockEngine::new());
+        e.engine = mock.clone();
+        let r = ProfileRegistry::new(vec![e]);
+        let metrics = crate::metrics_sink::PromSink::new();
+        let id = ProfileId::new("p");
+        let pacing = Fixed {
+            torrents: vec![(handle(1), true), (handle(2), false)],
+            started: Mutex::new(Vec::new()),
+        };
+        r.change_states(|rec| rec.set(&id, DesiredState::Offline), &metrics, &pacing)
+            .unwrap();
+        mock.inject_error(
+            "session_paused",
+            EngineError::MockInjected {
+                op: "session_paused",
+                message: "boom".into(),
+            },
+        );
+        r.change_states(|rec| rec.set(&id, DesiredState::Online), &metrics, &pacing)
+            .unwrap();
+        let calls = mock.calls();
+        let paused = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::PauseTorrent(x) if *x == handle(1)))
+            .unwrap();
+        let resumed = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::ResumeSession))
+            .unwrap();
+        assert!(paused < resumed);
+        assert_eq!(*pacing.started.lock(), vec![vec![handle(1)]]);
+        assert_eq!(r.holds().held(&id), HashSet::from([handle(1).infohash]));
+    }
+
+    /// A run that ends releases what it reached only while it is still the
+    /// profile's: one a set-offline took back, or a newer run replaced,
+    /// leaves the holds to whatever stopped it, which may have held those
+    /// same torrents again.
+    #[test]
+    fn only_a_run_still_current_releases_what_it_reached() {
+        let r = ProfileRegistry::new(vec![test_host_entry("p")]);
+        let id = ProfileId::new("p");
+        let entry = r.resolve(&id).active().unwrap();
+        let both = HashSet::from([handle(1).infohash, handle(2).infohash]);
+        r.holds()
+            .hold(&id, [handle(1).infohash, handle(2).infohash])
+            .unwrap();
+
+        let taken = entry.begin_resume(vec![handle(1)]);
+        entry.take_resume();
+        entry.end_resume(&taken, &[handle(1)]);
+        assert_eq!(r.holds().held(&id), both, "taken back: nothing released");
+
+        let replaced = entry.begin_resume(vec![handle(1)]);
+        let newer = entry.begin_resume(vec![handle(1), handle(2)]);
+        entry.end_resume(&replaced, &[handle(1)]);
+        assert_eq!(r.holds().held(&id), both, "replaced: nothing released");
+        assert!(entry.is_resuming(), "and the newer run is still recorded");
+
+        entry.end_resume(&newer, &[handle(1)]);
+        assert_eq!(r.holds().held(&id), HashSet::from([handle(2).infohash]));
+        assert!(!entry.is_resuming());
+    }
 }

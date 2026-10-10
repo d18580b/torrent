@@ -1140,6 +1140,102 @@ async fn setting_a_profile_online_starts_its_torrents_a_batch_per_pace() {
     }
 }
 
+/// A torrent whose paced resume the session refuses is still paused by the
+/// pace, so it stays held for the next boot, while the rest are released as
+/// they run.
+#[tokio::test(start_paused = true)]
+async fn a_torrent_the_session_refuses_to_resume_stays_held() {
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let id = ProfileId::new("acct_a");
+    let (h, eng, _) = paced_profile(5);
+    for state in ["offline", "online"] {
+        if state == "online" {
+            // The first resume_torrent after this is the pace's first.
+            eng.inject_error(
+                "resume_torrent",
+                EngineError::MockInjected {
+                    op: "resume_torrent",
+                    message: "boom".into(),
+                },
+            );
+        }
+        let token = h.tokens.write.clone();
+        h.send(
+            "PATCH",
+            "/v1/profiles/acct_a",
+            Some(&token),
+            Some(json!({ "state": state })),
+        )
+        .await
+        .assert_status(kynos::http::StatusCode::OK);
+    }
+    tokio::time::sleep(2 * REANNOUNCE_PACE).await;
+    let entry = h.state.profiles.resolve(&id).active().unwrap();
+    assert!(!entry.is_resuming(), "the pace ended");
+    let refused = eng
+        .calls()
+        .into_iter()
+        .find_map(|c| match c {
+            RecordedCall::ResumeTorrent(x) => Some(x),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        calls(&eng, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
+        4,
+        "every one that was running was asked for",
+    );
+    assert_eq!(
+        h.state.profiles.holds().held(&id),
+        std::collections::HashSet::from([refused.infohash]),
+        "only the refused one is still held",
+    );
+}
+
+/// A run a set-offline stopped notices it only at its next batch. A
+/// set-online before then holds and pauses again the torrents that run
+/// reached, and the stopped run must not release them when it notices:
+/// a restart before the new run reaches them would load them paused.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_run_does_not_release_what_a_newer_set_online_holds() {
+    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
+    let running = usize::from(n) - 1;
+    let id = ProfileId::new("acct_a");
+    let (h, _eng, _) = paced_profile(n);
+    let set = |state: &str| {
+        let token = h.tokens.write.clone();
+        let body = json!({ "state": state });
+        let h = &h;
+        async move {
+            h.send("PATCH", "/v1/profiles/acct_a", Some(&token), Some(body))
+                .await
+                .assert_status(kynos::http::StatusCode::OK);
+        }
+    };
+
+    set("offline").await;
+    set("online").await;
+    tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+    // The first run has resumed its first batch; stop it and start another
+    // before it wakes for its second.
+    set("offline").await;
+    set("online").await;
+    // The first run wakes, sees it was stopped, and ends; the second has not
+    // yet reached its second batch.
+    tokio::time::sleep(REANNOUNCE_PACE * 3 / 4).await;
+    assert_eq!(
+        h.state.profiles.holds().held(&id).len(),
+        running,
+        "the newer run's holds stand until it reaches them",
+    );
+    tokio::time::sleep(3 * REANNOUNCE_PACE).await;
+    assert!(h.state.profiles.holds().held(&id).is_empty());
+}
+
 /// A profile set offline while its torrents are being started stops that
 /// there, and what it had not reached stays held; set online again, those
 /// start with the rest, still a batch per pace.
@@ -1174,8 +1270,8 @@ async fn setting_a_profile_offline_mid_pace_stops_it_and_holds_the_rest() {
     assert_eq!(resumed(), REANNOUNCE_BATCH, "nothing after the offline");
     assert_eq!(
         h.state.profiles.holds().held(&id).len(),
-        running - REANNOUNCE_BATCH,
-        "what it had not reached stays held",
+        running,
+        "what it had not reached stays held, and the stopped run releases nothing",
     );
 
     let before = starts(&eng, &handles, &[mine]);

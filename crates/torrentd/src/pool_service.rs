@@ -3847,6 +3847,36 @@ mod tests {
         assert!(q.tracks_recheck(&ok.to_hex()));
     }
 
+    /// A re-hash whose torrent a paced set-online holds paused until its
+    /// batch waits for it rather than being dropped as paused, and starts
+    /// once the pace has resumed and released the torrent.
+    #[test]
+    fn a_rehash_waits_while_a_paced_set_online_holds_its_torrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let held = InfoHash([0xD6; 20]);
+        let id = ProfileId::new("p");
+        w.load(held, 1, "p", TorrentPhase::Paused);
+        w.profiles.holds().hold(&id, [held]).unwrap();
+        let q = pool.verify_queue();
+        q.enqueue_recheck(held.to_hex(), true);
+
+        w.tick(&pool);
+        assert!(w.rechecked().is_empty());
+        assert_eq!(q.depth(), 1, "held by the pace: it waits");
+        assert!(q.tracks_recheck(&held.to_hex()));
+
+        // Its batch comes: resumed, then released.
+        let mut st = w.state.get(&held).unwrap();
+        st.phase = TorrentPhase::Seeding;
+        w.state.insert(held, st);
+        w.profiles.holds().release(&id, [held]).unwrap();
+        w.tick(&pool);
+        assert_eq!(w.rechecked(), [held]);
+    }
+
     /// A re-hash paused while it checks holds its slot, so with
     /// `max_concurrent_verify = 1` the next waits for it: a pause and resume
     /// cannot put a second check beside it.
