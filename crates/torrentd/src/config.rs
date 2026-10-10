@@ -1039,6 +1039,7 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
             resume_dir,
             torrent_dir,
             allowed_tracker_domains,
+            allowed_tracker_urls,
             upload_rate_limit,
         } = a;
         let ProfileConfig {
@@ -1049,6 +1050,7 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
             resume_dir: b_resume_dir,
             torrent_dir: b_torrent_dir,
             allowed_tracker_domains: b_allowed_tracker_domains,
+            allowed_tracker_urls: b_allowed_tracker_urls,
             upload_rate_limit: b_upload_rate_limit,
         } = b;
         // Compared whole: which tunnel, which port, whether DHT runs.
@@ -1071,6 +1073,12 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
         field(
             "allowed_tracker_domains",
             allowed_tracker_domains != b_allowed_tracker_domains,
+            NonIdentity,
+        );
+        // Named, never shown: each entry holds a passkey.
+        field(
+            "allowed_tracker_urls",
+            allowed_tracker_urls != b_allowed_tracker_urls,
             NonIdentity,
         );
     }
@@ -1485,6 +1493,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -1505,6 +1514,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -2249,6 +2259,7 @@ listen_interfaces = "eth0:6882"
             resume_dir,
             torrent_dir,
             allowed_tracker_domains,
+            allowed_tracker_urls,
             upload_rate_limit,
         } = base;
         let with = |edit: &dyn Fn(&mut ProfileConfig)| {
@@ -2266,6 +2277,7 @@ listen_interfaces = "eth0:6882"
         let new_resume_dir = Some(PathBuf::from("/var/lib/torrentd/resume-public"));
         let new_torrent_dir = Some(PathBuf::from("/var/lib/torrentd/torrents-public"));
         let new_domains = vec!["tracker.example.com".to_string()];
+        let new_urls = vec!["https://tracker.example.com/PASS/".to_string()];
         let new_rate = Some(100_000);
         assert_ne!(network, &new_network);
         assert_ne!(peer_fingerprint, &new_fingerprint);
@@ -2273,6 +2285,7 @@ listen_interfaces = "eth0:6882"
         assert_ne!(resume_dir, &new_resume_dir);
         assert_ne!(torrent_dir, &new_torrent_dir);
         assert_ne!(allowed_tracker_domains, &new_domains);
+        assert_ne!(allowed_tracker_urls, &new_urls);
         assert_ne!(upload_rate_limit, &new_rate);
 
         use ProfileChangeKind::Identity;
@@ -2307,6 +2320,11 @@ listen_interfaces = "eth0:6882"
                 "allowed_tracker_domains",
                 NonIdentity,
                 with(&|p| p.allowed_tracker_domains = new_domains.clone()),
+            ),
+            (
+                "allowed_tracker_urls",
+                NonIdentity,
+                with(&|p| p.allowed_tracker_urls = new_urls.clone()),
             ),
             (
                 "upload_rate_limit",
@@ -3465,6 +3483,7 @@ library_dir = "{d}/library"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         };
         let msg = format!("{:#}", c.validate_http_listen_port().unwrap_err());

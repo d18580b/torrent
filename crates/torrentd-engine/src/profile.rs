@@ -97,11 +97,18 @@
 //!    renewal that moves onto one is not bound (`port_forward::renew_and_rebind`).
 //!
 //! `allowed_tracker_domains` is *not* in this list, but it is required on
-//! every `vpn` profile. It is the account-isolation guard: a profile that
-//! sets it takes only a torrent whose every tracker is on it, on every add
-//! path (`policy::check_trackers`), so one account's torrent and its passkey
-//! are never announced from another account's session. It is not an egress
-//! control. Beside it, two load-time rules: a host profile may not listen on
+//! every `vpn` profile. It is the tracker guard: a profile that sets it takes
+//! only a torrent whose every tracker is on it, on every add path
+//! (`policy::check_trackers`). It compares the tracker's host and nothing
+//! else, so it keeps apart accounts on *different* trackers, and cannot tell
+//! two accounts on one tracker apart: their announce URLs differ only in the
+//! passkey, in the path or query. That is what `allowed_tracker_urls` binds —
+//! announce-URL prefixes carrying the account's passkey, which every tracker
+//! must also fall under — and two profiles whose domain lists overlap are
+//! refused at load unless both set it, with prefixes that do not overlap
+//! (`ProfileConfig::validate_set`). Together they keep one account's torrent
+//! and its passkey from being announced from another account's session.
+//! Neither is an egress control. Beside them, two load-time rules: a host profile may not listen on
 //! the unspecified address while a `vpn` profile exists, since libtorrent
 //! expands it to the tunnels' addresses too; and no profile may wear
 //! libtorrent's own `-LT` peer-id code.
@@ -250,6 +257,15 @@ pub struct ProfileConfig {
     pub resume_dir: Option<PathBuf>,
     pub torrent_dir: Option<PathBuf>,
     pub allowed_tracker_domains: Vec<String>,
+    /// The account binding: announce-URL prefixes, each carrying this
+    /// account's passkey, that every tracker the profile announces to must
+    /// fall under, beside being on `allowed_tracker_domains`. Empty unless
+    /// written; required on two profiles whose domain lists overlap, since
+    /// the host alone cannot tell two accounts on one tracker apart.
+    ///
+    /// Each entry holds a passkey, so it is never reported by the API nor
+    /// named in an error: refusals cite the entry's index.
+    pub allowed_tracker_urls: Vec<String>,
     /// Per-profile upload cap in bytes/sec, overriding the daemon-wide key.
     ///
     /// `Option`, not a plain `u32`, because `0` means *unlimited* — the
@@ -338,6 +354,8 @@ struct RawProfile {
     torrent_dir: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_tracker_domains: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    allowed_tracker_urls: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     upload_rate_limit: Option<u32>,
 }
@@ -451,6 +469,7 @@ impl TryFrom<RawProfile> for ProfileConfig {
             resume_dir: r.resume_dir,
             torrent_dir: r.torrent_dir,
             allowed_tracker_domains: r.allowed_tracker_domains,
+            allowed_tracker_urls: r.allowed_tracker_urls,
             upload_rate_limit: r.upload_rate_limit,
         })
     }
@@ -483,6 +502,7 @@ impl ProfileConfig {
             resume_dir: c.resume_dir.clone(),
             torrent_dir: c.torrent_dir.clone(),
             allowed_tracker_domains: c.allowed_tracker_domains.clone(),
+            allowed_tracker_urls: c.allowed_tracker_urls.clone(),
             upload_rate_limit: c.upload_rate_limit,
         };
         match &c.network {
@@ -733,12 +753,12 @@ pub enum ProfileConfigError {
         field: &'static str,
     },
     /// A3: a tunnelled profile is an account, and the allow-list is what
-    /// keeps another account's torrent — and its passkey — out of it.
+    /// keeps another tracker's torrent — and its passkey — out of it.
     #[error(
         "profile {0:?} is a vpn profile and must set allowed_tracker_domains: the domains of \
          the trackers this account belongs to, such as [\"tracker.example.com\"]. Every \
-         torrent the profile takes must announce only to those, which is what stops one \
-         account's torrent, and its passkey, from being announced from another"
+         torrent the profile takes must announce only to those, which is what stops a torrent \
+         of another tracker's account, and its passkey, from being announced from this one"
     )]
     MissingTrackerDomains(String),
     #[error(
@@ -746,6 +766,54 @@ pub enum ProfileConfigError {
          entry must be non-empty and contain no ',' or whitespace"
     )]
     BadTrackerDomain { profile: String, domain: String },
+    /// An `allowed_tracker_urls` entry that is not an announce-URL prefix.
+    /// Named by index, never by value: the value holds a passkey.
+    #[error(
+        "profile {profile:?}: allowed_tracker_urls[{index}] is not an announce-URL prefix: write \
+         it as scheme://host[:port]/path, copied from the start of the account's announce URL \
+         (such as \"https://tracker.example.com/<passkey>/\"), with no whitespace, and no '@', \
+         '?' or '#' before the path"
+    )]
+    BadTrackerUrl { profile: String, index: usize },
+    /// An `allowed_tracker_urls` entry whose host no domain on the profile's
+    /// own `allowed_tracker_domains` admits, so no tracker could pass both.
+    #[error(
+        "profile {profile:?}: allowed_tracker_urls[{index}] names a host outside the profile's \
+         allowed_tracker_domains, so no tracker could satisfy both. Every announce URL must be \
+         on the domain list and under one of the URL prefixes"
+    )]
+    TrackerUrlOffDomains { profile: String, index: usize },
+    /// Two profiles admit trackers on one domain, and the host is all
+    /// either guard compares.
+    #[error(
+        "profiles {a:?} and {b:?} both admit trackers on {domain:?} ({a:?} lists {a_domain:?}, \
+         {b:?} lists {b_domain:?}). allowed_tracker_domains compares only the tracker's host, so \
+         a torrent of one account on that tracker would pass the other's guard and announce its \
+         passkey from the other's session. Set allowed_tracker_urls on both profiles to the \
+         announce-URL prefix carrying each account's own passkey, or give them domain lists \
+         that do not overlap"
+    )]
+    OverlappingTrackerDomains {
+        a: String,
+        b: String,
+        domain: String,
+        a_domain: String,
+        b_domain: String,
+    },
+    /// Two profiles whose domains overlap bind URL prefixes that overlap
+    /// too, so some announce URL falls under both accounts.
+    #[error(
+        "profiles {a:?} and {b:?} admit overlapping tracker domains, and \
+         {a:?}.allowed_tracker_urls[{a_index}] and {b:?}.allowed_tracker_urls[{b_index}] overlap: \
+         one is a prefix of the other, so an announce URL under it passes both profiles' guards. \
+         Each account's prefixes must carry its own passkey"
+    )]
+    OverlappingTrackerUrls {
+        a: String,
+        a_index: usize,
+        b: String,
+        b_index: usize,
+    },
     /// D12: an unspecified listen address beside a tunnel.
     #[error(
         "profile {profile:?}: listen_interfaces {listen_interfaces:?} binds the unspecified \
@@ -1115,9 +1183,10 @@ impl ProfileConfig {
                     }
                     // A tunnelled profile is an account, and the allow-list
                     // is the guard every add path runs
-                    // (`policy::check_trackers`) to keep another account's
-                    // torrent out of it. Optional, it was the guard nobody
-                    // had switched on.
+                    // (`policy::check_trackers`) to keep another tracker's
+                    // torrent out of it; another account on the same tracker
+                    // is `validate_tracker_separation`'s. Optional, it was the
+                    // guard nobody had switched on.
                     if p.allowed_tracker_domains.is_empty() {
                         return Err(ProfileConfigError::MissingTrackerDomains(
                             p.id.as_str().to_string(),
@@ -1139,6 +1208,29 @@ impl ProfileConfig {
                     profile: p.id.as_str().to_string(),
                     domain: bad.clone(),
                 });
+            }
+
+            // The account binding's shape, and that each prefix sits on the
+            // profile's own domains: the guard requires both of every
+            // tracker, so a prefix off the list could admit nothing, and an
+            // empty list (a profile not checked at all) binds nothing.
+            for (index, prefix) in p.allowed_tracker_urls.iter().enumerate() {
+                let Some(host) = Self::tracker_url_host(prefix) else {
+                    return Err(ProfileConfigError::BadTrackerUrl {
+                        profile: p.id.as_str().to_string(),
+                        index,
+                    });
+                };
+                if !p
+                    .allowed_tracker_domains
+                    .iter()
+                    .any(|d| Self::host_matches_domain(&host, &Self::canonical_host(d)))
+                {
+                    return Err(ProfileConfigError::TrackerUrlOffDomains {
+                        profile: p.id.as_str().to_string(),
+                        index,
+                    });
+                }
             }
 
             // A profile's own limit is range-checked the way the top-level
@@ -1214,7 +1306,147 @@ impl ProfileConfig {
                 }
             }
         }
+
+        Self::validate_tracker_separation(profiles)
+    }
+
+    /// No announce URL may pass two profiles' tracker guards.
+    ///
+    /// `allowed_tracker_domains` compares only a tracker's host, and two
+    /// accounts on one private tracker announce to the same host with
+    /// different passkeys. So where two profiles' domain lists overlap — an
+    /// entry equal to, or a parent domain of, one on the other's list — both
+    /// must bind their accounts with `allowed_tracker_urls`, and no prefix of
+    /// one may overlap a prefix of the other. Without this, a torrent added to
+    /// the wrong profile announces one account's passkey from the other's
+    /// session, which the tracker reads as one person holding both.
+    ///
+    /// Every profile that sets a list is compared, whatever its posture: a
+    /// host profile that sets one is an account too, and announcing its
+    /// passkey from a tunnel ties the two as surely.
+    fn validate_tracker_separation(profiles: &[ProfileConfig]) -> Result<(), ProfileConfigError> {
+        let listed: Vec<&ProfileConfig> = profiles
+            .iter()
+            .filter(|p| !p.allowed_tracker_domains.is_empty())
+            .collect();
+        for (i, a) in listed.iter().enumerate() {
+            for b in &listed[i + 1..] {
+                let Some((a_domain, b_domain, domain)) = Self::overlapping_domain(a, b) else {
+                    continue;
+                };
+                if a.allowed_tracker_urls.is_empty() || b.allowed_tracker_urls.is_empty() {
+                    return Err(ProfileConfigError::OverlappingTrackerDomains {
+                        a: a.id.as_str().to_string(),
+                        b: b.id.as_str().to_string(),
+                        domain,
+                        a_domain,
+                        b_domain,
+                    });
+                }
+                for (a_index, pa) in a.allowed_tracker_urls.iter().enumerate() {
+                    for (b_index, pb) in b.allowed_tracker_urls.iter().enumerate() {
+                        // Sound and complete for the shim's rule: any URL
+                        // under both prefixes has the shorter as a prefix of
+                        // the longer, at the same boundary.
+                        if libtorrent_safe::announce_url_has_prefix(pa, pb)
+                            || libtorrent_safe::announce_url_has_prefix(pb, pa)
+                        {
+                            return Err(ProfileConfigError::OverlappingTrackerUrls {
+                                a: a.id.as_str().to_string(),
+                                a_index,
+                                b: b.id.as_str().to_string(),
+                                b_index,
+                            });
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// The first pair of entries, one from each profile's
+    /// `allowed_tracker_domains`, that admit a common host — `(a's entry, b's
+    /// entry, the narrower of the two)` — or `None` when the lists are
+    /// disjoint.
+    fn overlapping_domain(
+        a: &ProfileConfig,
+        b: &ProfileConfig,
+    ) -> Option<(String, String, String)> {
+        for da in &a.allowed_tracker_domains {
+            let ca = Self::canonical_host(da);
+            for db in &b.allowed_tracker_domains {
+                let cb = Self::canonical_host(db);
+                if Self::host_matches_domain(&ca, &cb) {
+                    return Some((da.clone(), db.clone(), ca));
+                }
+                if Self::host_matches_domain(&cb, &ca) {
+                    return Some((da.clone(), db.clone(), cb));
+                }
+            }
+        }
+        None
+    }
+
+    /// A host or domain in the one spelling the tracker guard compares:
+    /// without surrounding spaces or tabs, without a trailing root dot, and
+    /// ASCII-lowercase. The shim's `canonical_host`, which the add-time
+    /// check runs, spells it the same way.
+    fn canonical_host(s: &str) -> String {
+        s.trim_matches([' ', '\t'])
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+    }
+
+    /// Both canonical. `host` is `domain` or a subdomain of it — the shim's
+    /// `host_matches_domain`.
+    fn host_matches_domain(host: &str, domain: &str) -> bool {
+        !domain.is_empty()
+            && (host == domain
+                || host
+                    .strip_suffix(domain)
+                    .is_some_and(|label| label.len() > 1 && label.ends_with('.')))
+    }
+
+    /// The canonical host of an `allowed_tracker_urls` entry, or `None` when
+    /// the entry is not `scheme://authority/...` with a host, an optional
+    /// numeric port, and no userinfo, query or fragment before the path.
+    ///
+    /// Stricter than the shim's matching rule, which matches nothing for a
+    /// prefix of the wrong shape; refusing it here says so at load.
+    fn tracker_url_host(prefix: &str) -> Option<String> {
+        if prefix.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return None;
+        }
+        let (scheme, rest) = prefix.split_once("://")?;
+        let mut sc = scheme.chars();
+        if !sc.next()?.is_ascii_alphabetic()
+            || !sc.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+        {
+            return None;
+        }
+        let (authority, _) = rest.split_once('/')?;
+        if authority.contains(['@', '?', '#']) {
+            return None;
+        }
+        let (host, port) = match authority.strip_prefix('[') {
+            Some(v6) => {
+                let (host, tail) = v6.split_once(']')?;
+                match tail {
+                    "" => (host, None),
+                    t => (host, Some(t.strip_prefix(':')?)),
+                }
+            }
+            None => match authority.split_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (authority, None),
+            },
+        };
+        if port.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+            return None;
+        }
+        let host = Self::canonical_host(host);
+        (!host.is_empty()).then_some(host)
     }
 
     /// Whether any entry of a libtorrent `listen_interfaces` string binds the
@@ -1310,7 +1542,10 @@ mod tests {
             user_agent: Some(ua.to_string()),
             resume_dir: Some(PathBuf::from(format!("/var/lib/torrentd/resume/{id}"))),
             torrent_dir: Some(PathBuf::from(format!("/var/lib/torrentd/torrents/{id}"))),
-            allowed_tracker_domains: vec!["tracker.example.com".to_string()],
+            // A tracker of its own, so that two of these are two accounts
+            // on different trackers unless a test says otherwise.
+            allowed_tracker_domains: vec![format!("tracker-{id}.example.com")],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -1328,6 +1563,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -1830,6 +2066,175 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    /// Two accounts on one tracker: `acct_a` and `acct_b`, both listing
+    /// `domain_a` / `domain_b`, which the caller makes overlap.
+    fn same_tracker(domain_a: &str, domain_b: &str) -> [ProfileConfig; 2] {
+        let mut a = cfg("acct_a", 6881, "wg0", "-qB5030-", "qBittorrent/5.0.3");
+        let mut b = cfg("acct_b", 6882, "wg1", "-DE211s-", "Deluge/2.1.1");
+        a.allowed_tracker_domains = vec![domain_a.into()];
+        b.allowed_tracker_domains = vec![domain_b.into()];
+        [a, b]
+    }
+
+    /// The scenario of issue 166: the host is all the domain guard compares,
+    /// so two profiles whose lists overlap — the same entry, a parent domain
+    /// of the other's, or one spelled differently — are refused at load
+    /// unless both bind their accounts.
+    #[test]
+    fn overlapping_tracker_domains_are_refused_without_an_account_binding() {
+        for (da, db, narrower) in [
+            (
+                "tracker.example.com",
+                "tracker.example.com",
+                "tracker.example.com",
+            ),
+            ("tracker.example.com", "example.com", "tracker.example.com"),
+            (
+                "example.com",
+                "announce.tracker.example.com",
+                "announce.tracker.example.com",
+            ),
+            (
+                "Tracker.Example.COM.",
+                "tracker.example.com",
+                "tracker.example.com",
+            ),
+        ] {
+            let set = same_tracker(da, db);
+            match ProfileConfig::validate_set(&set) {
+                Err(ProfileConfigError::OverlappingTrackerDomains {
+                    a,
+                    b,
+                    domain,
+                    a_domain,
+                    b_domain,
+                }) => {
+                    assert_eq!((a.as_str(), b.as_str()), ("acct_a", "acct_b"));
+                    assert_eq!(domain, narrower, "{da:?} {db:?}");
+                    assert_eq!((a_domain.as_str(), b_domain.as_str()), (da, db));
+                }
+                other => panic!("{da:?} beside {db:?} must be refused, got {other:?}"),
+            }
+            // One binding is not enough: the other account's torrent still
+            // passes the unbound profile.
+            let [mut a, b] = same_tracker(da, db);
+            a.allowed_tracker_urls = vec!["https://tracker.example.com/PASS-A/".into()];
+            assert!(matches!(
+                ProfileConfig::validate_set(&[a, b]),
+                Err(ProfileConfigError::OverlappingTrackerDomains { .. })
+            ));
+        }
+        // A label boundary is not crossed: `eviltracker.example.com` is not
+        // under `tracker.example.com`.
+        ProfileConfig::validate_set(&same_tracker(
+            "tracker.example.com",
+            "eviltracker.example.com",
+        ))
+        .unwrap();
+        // A host profile with a list is an account too.
+        let [a, _] = same_tracker("tracker.example.com", "unused.example");
+        let mut h = host("public", "eth0:6899", false);
+        h.allowed_tracker_domains = vec!["example.com".into()];
+        assert!(matches!(
+            ProfileConfig::validate_set(&[a.clone(), h]),
+            Err(ProfileConfigError::OverlappingTrackerDomains { .. })
+        ));
+        // A host profile with no list is not checked, and overlaps nothing.
+        ProfileConfig::validate_set(&[a, host("public", "eth0:6899", false)]).unwrap();
+    }
+
+    #[test]
+    fn overlapping_domains_are_accepted_with_disjoint_account_bindings() {
+        let [mut a, mut b] = same_tracker("tracker.example.com", "tracker.example.com");
+        a.allowed_tracker_urls = vec!["https://tracker.example.com/announce?passkey=aaaa".into()];
+        b.allowed_tracker_urls = vec![
+            "https://tracker.example.com/announce?passkey=aaaab".into(),
+            "udp://tracker.example.com:6969/bbbb/".into(),
+        ];
+        ProfileConfig::validate_set(&[a.clone(), b.clone()]).unwrap();
+
+        // A prefix one account's announce URLs fall under, and the other's
+        // too, binds nothing.
+        for overlapping in [
+            "https://tracker.example.com/announce?passkey=aaaa",
+            "https://TRACKER.example.com/announce?passkey=aaaa&x=1",
+            "https://tracker.example.com/",
+            "https://tracker.example.com/announce?",
+        ] {
+            let mut b = b.clone();
+            b.allowed_tracker_urls.push(overlapping.into());
+            match ProfileConfig::validate_set(&[a.clone(), b]) {
+                Err(ProfileConfigError::OverlappingTrackerUrls {
+                    a,
+                    a_index,
+                    b,
+                    b_index,
+                }) => {
+                    assert_eq!((a.as_str(), a_index), ("acct_a", 0));
+                    assert_eq!((b.as_str(), b_index), ("acct_b", 2));
+                }
+                other => panic!("{overlapping:?} must be refused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_account_binding_must_be_a_prefix_on_the_profiles_own_domains() {
+        let mut p = cfg("acct_a", 6881, "wg0", "-qB5030-", "qBittorrent/5.0.3");
+        p.allowed_tracker_domains = vec!["tracker.example.com".into()];
+        for good in [
+            "https://tracker.example.com/PASS/",
+            "udp://announce.tracker.example.com:6969/PASS/announce",
+            "http://Tracker.Example.com./announce.php?passkey=PASS",
+        ] {
+            p.allowed_tracker_urls = vec![good.into()];
+            ProfileConfig::validate_set(&[p.clone()])
+                .unwrap_or_else(|e| panic!("{good:?} must be accepted, got {e}"));
+        }
+        for bad in [
+            "",
+            "tracker.example.com/PASS/",
+            "https://tracker.example.com",
+            "https:///PASS/",
+            "https://user@tracker.example.com/PASS/",
+            "https://tracker.example.com?x/PASS/",
+            "https://tracker.example.com:/PASS/",
+            "https://tracker.example.com:x/PASS/",
+            "https://tracker.example.com/PA SS/",
+            "1http://tracker.example.com/PASS/",
+        ] {
+            p.allowed_tracker_urls = vec!["https://tracker.example.com/OK/".into(), bad.into()];
+            match ProfileConfig::validate_set(&[p.clone()]) {
+                Err(e @ ProfileConfigError::BadTrackerUrl { index: 1, .. }) => {
+                    // Named by index: the value holds a passkey.
+                    assert!(!e.to_string().contains("PASS"), "{e}");
+                }
+                other => panic!("{bad:?} must be refused as BadTrackerUrl, got {other:?}"),
+            }
+        }
+        for off in [
+            "https://other.example.com/PASS/",
+            "https://eviltracker.example.com/PASS/",
+            "https://example.com/PASS/",
+        ] {
+            p.allowed_tracker_urls = vec![off.into()];
+            assert!(
+                matches!(
+                    ProfileConfig::validate_set(&[p.clone()]),
+                    Err(ProfileConfigError::TrackerUrlOffDomains { index: 0, .. })
+                ),
+                "{off:?}"
+            );
+        }
+        // A binding with no domain list binds nothing the guard reads.
+        let mut h = host("public", "eth0:6881", false);
+        h.allowed_tracker_urls = vec!["https://tracker.example.com/PASS/".into()];
+        assert!(matches!(
+            ProfileConfig::validate_set(&[h]),
+            Err(ProfileConfigError::TrackerUrlOffDomains { .. })
+        ));
     }
 
     #[test]

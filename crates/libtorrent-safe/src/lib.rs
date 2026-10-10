@@ -29,6 +29,7 @@ pub use metadata::TorrentMeta;
 pub use metadata::TorrentMetaFile;
 pub use resume::ResumeData;
 pub use session::add_trackers_allowed;
+pub use session::announce_url_has_prefix;
 pub use session::info_hash_from_magnet;
 pub use session::info_hash_from_torrent;
 pub use session::session_stats_metric_index;

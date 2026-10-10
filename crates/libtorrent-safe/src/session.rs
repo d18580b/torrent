@@ -676,15 +676,31 @@ pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
 /// a magnet's `tr=` parameters, or — for resume data — its own `trackers`
 /// list, which replaces the attached `.torrent`'s.
 ///
+/// `url_prefixes`, when not empty, is the account binding: every tracker must
+/// also be announced under one of these announce-URL prefixes, as
+/// [`announce_url_has_prefix`] reads one.
+///
 /// [`TrackerVerdict::NotAllowed`] when any tracker is outside `domains` or has
 /// no host libtorrent can read, and when `domains` is empty;
+/// [`TrackerVerdict::AccountMismatch`] when every host is on `domains` but a
+/// tracker is under none of `url_prefixes`;
 /// [`TrackerVerdict::NoTrackers`] when there is no tracker at all. An `Err` is
 /// a source the shim cannot parse, which the add would refuse too.
-pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<TrackerVerdict> {
+pub fn add_trackers_allowed(
+    params: &AddParams,
+    domains: &[String],
+    url_prefixes: &[String],
+) -> Result<TrackerVerdict> {
     if domains.is_empty() {
         return Ok(TrackerVerdict::NotAllowed);
     }
     let csv_c = c_string(domains.join(","), "allowed_tracker_domains")?;
+    let prefixes_c = url_prefixes
+        .iter()
+        .map(|p| c_string(p.as_str(), "allowed_tracker_urls"))
+        .collect::<Result<Vec<_>>>()?;
+    let prefix_ptrs: Vec<*const std::os::raw::c_char> =
+        prefixes_c.iter().map(|c| c.as_ptr()).collect();
     let buf = |b: Option<&Vec<u8>>| match b {
         Some(b) if !b.is_empty() => (b.as_ptr(), b.len()),
         _ => (std::ptr::null(), 0),
@@ -729,6 +745,12 @@ pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<Tr
             resume.0,
             resume.1,
             csv_c.as_ptr(),
+            if prefix_ptrs.is_empty() {
+                std::ptr::null()
+            } else {
+                prefix_ptrs.as_ptr()
+            },
+            prefix_ptrs.len(),
             err.ptr(),
             err.len() as i32,
         )
@@ -737,8 +759,25 @@ pub fn add_trackers_allowed(params: &AddParams, domains: &[String]) -> Result<Tr
         1 => Ok(TrackerVerdict::Allowed),
         0 => Ok(TrackerVerdict::NotAllowed),
         rc if rc == ffi::LT_NO_TRACKERS as i32 => Ok(TrackerVerdict::NoTrackers),
+        rc if rc == ffi::LT_TRACKER_ACCOUNT_MISMATCH as i32 => Ok(TrackerVerdict::AccountMismatch),
         _ => Err(Error::Shim(err.into_string())),
     }
+}
+
+/// Whether announce URL `url` falls under the announce-URL prefix `prefix`,
+/// the rule [`add_trackers_allowed`] applies to its `url_prefixes`.
+///
+/// `prefix` is `scheme://authority/...`. Its scheme and authority must equal
+/// the URL's, compared case-insensitively; the rest must be a byte-exact
+/// prefix of the URL's that ends at a boundary — the prefix ends in `/`, `?`
+/// or `&`, or the URL ends there or goes on with one of `/?&#;` — so
+/// `?passkey=a` does not admit `?passkey=ab`. A prefix of any other shape, or
+/// either argument holding a NUL, matches nothing.
+pub fn announce_url_has_prefix(url: &str, prefix: &str) -> bool {
+    let (Ok(url), Ok(prefix)) = (CString::new(url), CString::new(prefix)) else {
+        return false;
+    };
+    unsafe { ffi::lt_announce_url_has_prefix(url.as_ptr(), prefix.as_ptr()) == 1 }
 }
 
 /// What [`add_trackers_allowed`] found.
@@ -748,6 +787,10 @@ pub enum TrackerVerdict {
     Allowed,
     /// A tracker is outside the domains, or has no host libtorrent can read.
     NotAllowed,
+    /// Every tracker's host is on the domains, but one is announced under
+    /// none of the account's URL prefixes: another account on the same
+    /// tracker.
+    AccountMismatch,
     /// The add would announce to no tracker at all.
     NoTrackers,
 }

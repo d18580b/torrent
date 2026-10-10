@@ -1543,7 +1543,8 @@ fn retire_rechecks(pool: &PoolService, source: &dyn AlertSource, state: &StateMa
 /// Hold the bytes the verify worker is about to add to the account-isolation
 /// guard.
 ///
-/// A refusal is logged, and a `NotAllowed` or `NoTrackers` one is counted in
+/// A refusal is logged, and a guard refusal (`NotAllowed`, `ForeignAccount`
+/// or `NoTrackers`) is counted in
 /// `profile_assignment_registry_errors_total`, where `POST /v1/torrents`, both
 /// boot scans and the adoption's enqueue count theirs. Bytes whose trackers
 /// cannot be read are a failed verify, not an isolation refusal.
@@ -1562,7 +1563,7 @@ fn verify_guard(
         profile_id = %item.profile,
         infohash = %item.infohash,
         error.cause = %refusal,
-        "verify dropped: refused by the profile's allowed_tracker_domains",
+        "verify dropped: refused by the profile's tracker guard",
     );
     if refusal.is_guard_refusal() {
         metrics.inc_counter(
@@ -1894,6 +1895,9 @@ impl From<String> for AdoptRefusal {
 fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
     let reason = match e {
         TrackerRefusal::NoTrackers => format!("refused: {e}"),
+        TrackerRefusal::ForeignAccount => {
+            format!("refused by the profile's allowed_tracker_urls: {e}")
+        }
         _ => format!("refused by the profile's allowed_tracker_domains: {e}"),
     };
     AdoptRefusal {
@@ -1995,7 +1999,11 @@ pub fn execute_adopt(
             );
             match torrentd_engine::check_trackers(profile_cfg, &params) {
                 Ok(()) => {}
-                Err(e @ (TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers)) => {
+                Err(
+                    e @ (TrackerRefusal::NotAllowed
+                    | TrackerRefusal::ForeignAccount
+                    | TrackerRefusal::NoTrackers),
+                ) => {
                     return Err(tracker_refusal(&e));
                 }
                 Err(TrackerRefusal::Unreadable(e)) if files_renamed => {
@@ -2213,6 +2221,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         };
         let engine = MockEngine::new();

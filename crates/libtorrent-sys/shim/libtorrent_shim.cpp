@@ -1193,7 +1193,55 @@ bool tracker_url_allowed(const std::string& url, const std::vector<std::string>&
     return false;
 }
 
+char ascii_lower(char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+}
+
+// Whether `url` is announced under the announce-URL prefix `prefix`: the
+// account binding a profile's `allowed_tracker_urls` states, since a private
+// tracker puts the account's passkey in the path or query that the host
+// check above never reads.
+//
+// `prefix` is `scheme://authority/...`. Its scheme and authority are compared
+// case-insensitively and must equal the URL's exactly, which the `/` closing
+// the authority enforces: a URL with userinfo, another port or a longer host
+// differs before it. Everything after is compared byte for byte, and must end
+// at a boundary, so `?passkey=a` does not admit `?passkey=ab`: either the
+// prefix itself ends in `/`, `?` or `&`, or the URL ends with it or goes on
+// with one of `/?&#;`. A prefix of any other shape matches nothing.
+bool announce_url_has_prefix(const std::string& url, const std::string& prefix) {
+    auto const sep = prefix.find("://");
+    if (sep == std::string::npos || sep == 0) return false;
+    auto const path = prefix.find('/', sep + 3);
+    if (path == std::string::npos || path == sep + 3) return false;
+    if (url.size() < prefix.size()) return false;
+    for (std::size_t i = 0; i < path; ++i) {
+        if (ascii_lower(url[i]) != ascii_lower(prefix[i])) return false;
+    }
+    if (url.compare(path, prefix.size() - path, prefix, path, std::string::npos) != 0)
+        return false;
+    if (url.size() == prefix.size()) return true;
+    auto const is_one_of = [](char c, const char* set) {
+        return std::strchr(set, c) != nullptr;
+    };
+    return is_one_of(prefix.back(), "/?&") || is_one_of(url[prefix.size()], "/?&#;");
+}
+
+bool tracker_url_bound(const std::string& url, const std::vector<std::string>& prefixes) {
+    for (auto const& p : prefixes) {
+        if (announce_url_has_prefix(url, p)) return true;
+    }
+    return false;
+}
+
 }  // namespace
+
+extern "C" int lt_announce_url_has_prefix(const char* url, const char* prefix) {
+    if (!url || !prefix) return 0;
+    LT_SHIM_TRY
+    return announce_url_has_prefix(url, prefix) ? 1 : 0;
+    LT_SHIM_CATCH(nullptr, 0, 0)
+}
 
 extern "C" int lt_torrent_metadata(const uint8_t* data, size_t len,
                                    struct lt_torrent_meta* out,
@@ -1309,9 +1357,13 @@ extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
                                        const int* tracker_tiers, size_t num_trackers,
                                        const uint8_t* resume_buf, size_t resume_len,
                                        const char* domains_csv,
+                                       const char* const* url_prefixes, size_t num_prefixes,
                                        char* err_out, int err_len)
 {
-    if (!domains_csv) { set_err(err_out, err_len, "null arg"); return LT_ERR; }
+    if (!domains_csv || (num_prefixes > 0 && !url_prefixes)) {
+        set_err(err_out, err_len, "null arg");
+        return LT_ERR;
+    }
     LT_SHIM_TRY
     std::vector<std::string> domains;
     {
@@ -1366,6 +1418,18 @@ extern "C" int lt_add_trackers_allowed(const char* magnet_uri,
     if (urls.empty()) return LT_NO_TRACKERS;
     for (auto const& url : urls) {
         if (!tracker_url_allowed(url, domains)) return 0;
+    }
+    // Every host is allowed; with an account binding, every URL must also be
+    // announced under one of its prefixes. Checked second, so a foreign
+    // tracker is reported as one even where it also misses the binding.
+    if (num_prefixes > 0) {
+        std::vector<std::string> prefixes;
+        for (size_t i = 0; i < num_prefixes; ++i) {
+            if (url_prefixes[i] && *url_prefixes[i]) prefixes.emplace_back(url_prefixes[i]);
+        }
+        for (auto const& url : urls) {
+            if (!tracker_url_bound(url, prefixes)) return LT_TRACKER_ACCOUNT_MISMATCH;
+        }
     }
     return 1;
     LT_SHIM_CATCH(err_out, err_len, LT_ERR)

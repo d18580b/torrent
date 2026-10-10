@@ -2065,7 +2065,8 @@ impl ScanFence {
 /// Run the account-isolation guard (`torrentd_engine::check_trackers`) on one
 /// boot-scan add, before anything is claimed or loaded.
 ///
-/// A torrent outside the profile's `allowed_tracker_domains` is logged and
+/// A torrent outside the profile's `allowed_tracker_domains`, or under none of
+/// its `allowed_tracker_urls`, is logged and
 /// counted where an API refusal is, in
 /// `profile_assignment_registry_errors_total`. One whose trackers cannot be
 /// read is logged only: the add would fail on the same bytes, and the caller
@@ -2086,7 +2087,7 @@ fn boot_scan_guard(
         infohash = %ih,
         scan,
         error.cause = %refusal,
-        "boot scan: torrent refused by the profile's allowed_tracker_domains; not loaded",
+        "boot scan: torrent refused by the profile's tracker guard; not loaded",
     );
     if refusal.is_guard_refusal() {
         metrics.inc_counter(
