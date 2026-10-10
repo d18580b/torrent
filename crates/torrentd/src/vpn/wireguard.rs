@@ -1053,8 +1053,10 @@ mod native {
 
     /// Whether `value` is a key `wg` accepts: 44 characters of base64, the
     /// last of them `=`, decoding to 32 bytes. Whitespace inside it is
-    /// ignored, as `wg` strips it. The bits the last character leaves over
-    /// are not checked, because `wg` does not check them either.
+    /// ignored, as `wg` strips it. The 43rd character carries two bits past
+    /// the 32 bytes, and `wg`'s `key_from_base64` refuses a key where they
+    /// are not zero, so that character must be one of the sixteen whose low
+    /// two bits are clear.
     fn is_wg_key(value: &str) -> bool {
         let key: Vec<u8> = value.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
         key.len() == 44
@@ -1062,11 +1064,20 @@ mod native {
             && key[..43]
                 .iter()
                 .all(|&b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+            && b"AEIMQUYcgkosw048".contains(&key[42])
+    }
+
+    /// `s` with every whitespace character removed, as wireguard-tools'
+    /// `config_read_line` removes it from a line before reading it.
+    fn squeezed(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
     }
 
     /// Split a config the way `wg-quick`'s `parse_options` does: `#` starts a
     /// comment, keys match case-insensitively, and the `wg-quick` keys are
-    /// taken only inside `[Interface]`.
+    /// taken only inside `[Interface]`. Section headers and key names match
+    /// with all whitespace removed, as `wg` matches them, so `[ Peer ]` and
+    /// `Private Key` are read as `[Peer]` and `PrivateKey`.
     ///
     /// What is left for `wg setconf` is checked here too, because `wg`
     /// reports a line it cannot read by echoing it on stderr, private key
@@ -1089,7 +1100,7 @@ mod native {
                 continue;
             }
             let Some((key, value)) = stripped.split_once('=') else {
-                section = match stripped.trim().to_ascii_lowercase().as_str() {
+                section = match squeezed(stripped).to_ascii_lowercase().as_str() {
                     "[interface]" => Section::Interface,
                     "[peer]" => Section::Peer,
                     _ => {
@@ -1103,7 +1114,10 @@ mod native {
                 p.wg_conf.push('\n');
                 continue;
             };
-            let (key, value) = (key.trim(), value.trim());
+            // `wg` reads `Private Key` as `PrivateKey`, so inner whitespace
+            // goes before the key is matched.
+            let (key, value) = (squeezed(key), value.trim());
+            let key = key.as_str();
             let lower = key.to_ascii_lowercase();
             let known = match section {
                 Section::None => {
@@ -2230,6 +2244,15 @@ PublicKey = x
             (format!("privatekey = {KEY}x"), "line 3: privatekey"),
             (format!("PrivateKey = {KEY};"), "line 3: PrivateKey"),
             (format!("PrivateKey = {}", &KEY[..43]), "line 3: PrivateKey"),
+            // `wg` refuses a key whose last character leaves bits set past
+            // the 32 bytes: `...rD3BEQ=` reads, `...rD3BER=` does not.
+            (
+                format!("PrivateKey = {}R=", &KEY[..42]),
+                "line 3: PrivateKey",
+            ),
+            // `wg` reads `Private Key` as `PrivateKey`, so its value is held
+            // to the same check.
+            (format!("Private Key = \"{KEY}\""), "line 3: PrivateKey"),
             ("PrivateKey =".to_string(), "line 3: PrivateKey"),
             (format!("PrivteKey = {KEY}"), "line 3: PrivteKey"),
             (format!("PrivateKey: {KEY}"), "line 3"),
@@ -2258,13 +2281,15 @@ PublicKey = x
         );
 
         // What `wg` does accept still parses: a preshared key, the other keys
-        // it reads, whitespace inside the value, and sections in any case.
+        // it reads, whitespace inside the value, the key name and the
+        // section header, and sections in any case.
         let full = PROVIDER_CONF
-            .replace("[Interface]", "[interface]")
+            .replace("[Interface]", "[ interface ]")
+            .replace("[Peer]", "[ Pe er ]")
             .replace(
                 &format!("PrivateKey = {KEY}"),
                 &format!(
-                    "PrivateKey = {} {}\nListenPort = 51820\nFwMark = 0x1",
+                    "Private Key = {} {}\nListen Port = 51820\nFwMark = 0x1",
                     &KEY[..20],
                     &KEY[20..]
                 ),
