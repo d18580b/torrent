@@ -1534,7 +1534,7 @@ On a scratch pool, not your real one.
    above the longest silence you expect, at the cost of detecting a dead
    tunnel that much later.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
-   torrentd_ks` should show egress confined to loopback and the tunnel
+   torrentd_ks_<uid>` (`<uid>` is the daemon's, `id -u torrentd`) should show egress confined to loopback and the tunnel
    interfaces for the daemon's uid, one line per tunnel address pairing it
    with its own interface:
    `meta skuid <uid> ip saddr <tunnel address> oifname "<iface>" accept`.
@@ -1557,6 +1557,21 @@ On a scratch pool, not your real one.
    as root**: `meta skuid 0` would drop every root-owned socket on the host —
    the package manager, the NTP client, sshd's replies. The daemon refuses to
    install it rather than take the host off the network.
+
+   **Two daemons in one network namespace need separate uids.** The layout
+   above — a WireGuard daemon with the switch, and a host-profile or OpenVPN
+   daemon without it — is two units, each with its own `User=`. The table is
+   named for the uid it confines, `torrentd_ks_<uid>`, and every daemon
+   removes only its own uid's: at a boot with the switch off, at shutdown,
+   and in `net-cleanup` (run by root, `net-cleanup` acts for the owner of the
+   state directory). So the daemon without the switch leaves the other's
+   table standing however often it boots, restarts or stops. Two daemons
+   under one uid share one table, and the ruleset could not tell their
+   traffic apart anyway: one's boot or stop removes the other's switch, and
+   two with the switch on replace each other's install every 30 s. Give each
+   daemon its own user. A table an earlier release left under the shared
+   name `torrentd_ks` is removed by the daemon whose uid its rules confine,
+   and by no other.
 
    **The tunnel's own transport is exempted.** WireGuard encrypts a packet in
    place, so the encrypted UDP datagram to the provider still belongs to the
@@ -1684,7 +1699,7 @@ On a scratch pool, not your real one.
    re-installed behind the monitor's back.
 
    The ruleset is installed as **one `nft -f` transaction** that replaces
-   whatever `torrentd_ks` table is standing, so there is no instant between
+   whatever `torrentd_ks_<uid>` table is standing for the daemon's uid, so there is no instant between
    the old ruleset and the new one with neither in force, and an install that
    fails leaves the previous one armed.
 
@@ -1697,7 +1712,7 @@ On a scratch pool, not your real one.
    no announce is. To keep them inside the tunnels, configure the resolver
    itself: §5, "Tracker lookups through a tunnel".
 
-   To check a running deployment: `nft list table inet torrentd_ks` shows a
+   To check a running deployment: `nft list table inet torrentd_ks_<uid>` shows a
    `udp sport` line with the port `wg show <iface> listen-port` prints, to
    the endpoint `wg show <iface> endpoints` prints, and
    `ip -s link show <iface>` shows transmitted *and* received packets growing.
@@ -1914,8 +1929,9 @@ reproduction itself.
 kill switch, a tunnel or a state file — so it shows nothing of the running
 daemon's behaviour; the journal above is where that is. The lock is per state
 directory: a copy pointed at a different `resume_dir` is not stopped by it,
-and with `network_kill_switch` it would still replace the one `inet
-torrentd_ks` table the host has (§11, drill 6). If you stop the service to
+and with `network_kill_switch` it would still replace the running daemon's
+`inet torrentd_ks_<uid>` table, which is the same table for the same user
+(§11, drill 6). If you stop the service to
 run it by hand instead, start the service again afterwards:
 `Restart=on-failure` does not bring back a unit that was stopped.
 
@@ -1930,7 +1946,7 @@ run it by hand instead, start the service again afterwards:
 | Daemon refuses to start, "vpn_config must be /etc/wireguard/…" | A WireGuard profile's `vpn_config` is under the wrong name or the wrong directory (§5). It must be the file root's `wg-quick up <iface>` reads, so a link raised before the daemon starts is checked against the same key. Catchable before a restart with `--check-config`. |
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
 | A WireGuard profile fails with "hooks are not run" or "Table = … is not supported" | The daemon raises every link with `ip` and `wg`, as root too, and runs no `wg-quick` hooks and honours no named table (§11.6). Either raise the link as root before the daemon starts — it is adopted by its key — or move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
-| Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port` to its `wg show <iface> endpoints`, and an `ip saddr` line pairing each tunnel's `ip -4 addr show <iface>` address with that interface. A link re-raised on a new port or endpoint gets them within 30 s (the log says `a tunnel's transport changed`); a link re-raised with a new address does not, and needs a restart of the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
+| Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks_<uid>` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port` to its `wg show <iface> endpoints`, and an `ip saddr` line pairing each tunnel's `ip -4 addr show <iface>` address with that interface. A link re-raised on a new port or endpoint gets them within 30 s (the log says `a tunnel's transport changed`); a link re-raised with a new address does not, and needs a restart of the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it leaves the link standing and does not tear it down, because it cannot vouch for it and removing it would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced. An operator restart is required by design. |
