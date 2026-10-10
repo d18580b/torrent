@@ -59,6 +59,7 @@ use tracing::Span;
 
 use crate::clock::Clock;
 use crate::engine::TorrentEngine;
+use crate::handlers::listen::ListenFailures;
 use crate::handlers::HandlerCtx;
 use crate::handlers::{self};
 use crate::metrics::MetricsSink;
@@ -457,6 +458,10 @@ fn run(
     let mut last_post_updates = clock.now();
     let mut last_post_stats = clock.now();
     let mut last_resume_save = clock.now();
+    // Which of each profile's listen sockets are failed. Kept here rather
+    // than derived from the last listen alert: a profile's sockets each
+    // report on their own.
+    let mut listen_failures = ListenFailures::default();
 
     loop {
         // 0) Liveness stamp. Written at the top of every iteration so a loop
@@ -476,6 +481,7 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                &mut listen_failures,
             );
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
@@ -574,6 +580,7 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                &mut listen_failures,
             );
         }
         if let Some(why) = fatal {
@@ -592,6 +599,7 @@ fn run(
                 &metrics,
                 &clock,
                 hooks.profile_fenced.as_ref(),
+                &mut listen_failures,
             );
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
@@ -700,6 +708,7 @@ fn dispatch_alert(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    listen_failures: &mut ListenFailures,
 ) {
     let Some(engine) = source.engine_for(&profile) else {
         warn!(
@@ -740,7 +749,7 @@ fn dispatch_alert(
             handlers::error::handle(&alert, &mut ctx)
         }
         Alert::ListenFailed { .. } | Alert::ListenSucceeded { .. } => {
-            handlers::listen::handle(&alert, &mut ctx)
+            handlers::listen::handle(&alert, &mut ctx, listen_failures)
         }
         Alert::AlertsDropped { .. } => handlers::dropped::handle(&alert, &mut ctx),
         Alert::TorrentLog { .. } | Alert::Log { .. } => handlers::log_msg::handle(&alert, &mut ctx),
@@ -1037,6 +1046,7 @@ fn run_shutdown(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    listen_failures: &mut ListenFailures,
 ) -> u64 {
     let started = clock.now();
     let started_count = state.len();
@@ -1054,6 +1064,7 @@ fn run_shutdown(
         metrics,
         clock,
         profile_fenced,
+        listen_failures,
     ) && clock.now() < stop_at
     {}
 
@@ -1099,6 +1110,7 @@ fn run_shutdown(
             metrics,
             clock,
             profile_fenced,
+            listen_failures,
         );
         if state.pending_resume_count() == 0 {
             break;
@@ -1143,6 +1155,7 @@ fn run_shutdown(
 }
 
 /// Dispatch one `source.drain()`; true when it returned any alert.
+#[allow(clippy::too_many_arguments)]
 fn drain_once(
     source: &Arc<dyn AlertSource>,
     state: &Arc<StateMap>,
@@ -1151,6 +1164,7 @@ fn drain_once(
     metrics: &Arc<dyn MetricsSink>,
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
+    listen_failures: &mut ListenFailures,
 ) -> bool {
     let alerts = source.drain();
     let drained = !alerts.is_empty();
@@ -1165,6 +1179,7 @@ fn drain_once(
             metrics,
             clock,
             profile_fenced,
+            listen_failures,
         );
     }
     drained
@@ -1804,6 +1819,59 @@ mod tests {
         handle.join().expect("loop thread panicked");
     }
 
+    /// The loop keeps which listen sockets are failed across drains: a
+    /// success on another endpoint, in a later drain than the failure,
+    /// leaves `listen_failure_active` at 1.
+    #[test]
+    fn a_listen_failure_outlives_another_socket_coming_up_in_a_later_drain() {
+        let engine = Arc::new(MockEngine::new());
+        let metrics = Arc::new(RecordingSink::new());
+        let gauge = {
+            let metrics = metrics.clone();
+            move || -> Vec<f64> {
+                metrics
+                    .calls()
+                    .into_iter()
+                    .filter_map(|c| match c {
+                        MetricCall::SetGauge { name, value, .. }
+                            if name == "listen_failure_active" =>
+                        {
+                            Some(value)
+                        }
+                        _ => None,
+                    })
+                    .collect()
+            }
+        };
+        engine.push_alert(listen_failed_alert());
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine.clone())),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            metrics.clone(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .fatal_listen_failure(false)
+        .spawn();
+        assert!(wait_for(|| gauge() == vec![1.0]));
+
+        engine.push_alert(Alert::ListenSucceeded {
+            hdr: AlertHeader {
+                kind: AlertKind::ListenSucceeded,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            endpoint: ":::6881".into(),
+        });
+        assert!(wait_for(|| gauge().len() == 2));
+        assert_eq!(gauge(), vec![1.0, 1.0], "the IPv4 socket is still failed");
+
+        assert!(handle.signal_shutdown(ShutdownReason::Test));
+        handle.join().expect("loop thread panicked");
+    }
+
     #[test]
     fn listen_outcomes_are_published_for_a_rebind_to_wait_on() {
         use crate::port_forward::ListenConfirmation;
@@ -2371,6 +2439,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            &mut ListenFailures::default(),
         );
 
         assert_eq!(state.len(), 1);
@@ -2415,6 +2484,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            &mut ListenFailures::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2445,6 +2515,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            &mut ListenFailures::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 1);
@@ -2487,6 +2558,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            &mut ListenFailures::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2535,6 +2607,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            &mut ListenFailures::default(),
         );
         (
             unsaved,
@@ -2667,6 +2740,7 @@ mod tests {
                 &metrics,
                 &clock,
                 None,
+                &mut ListenFailures::default(),
             )
         };
 
@@ -2735,6 +2809,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            &mut ListenFailures::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2769,6 +2844,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            &mut ListenFailures::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 1);
@@ -2830,6 +2906,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            &mut ListenFailures::default(),
         );
 
         assert_eq!(unsaved, 0, "every save settles inside the deadline");
@@ -2871,6 +2948,7 @@ mod tests {
             &metrics,
             &clock,
             None,
+            &mut ListenFailures::default(),
         );
 
         assert_eq!(unsaved, 0);

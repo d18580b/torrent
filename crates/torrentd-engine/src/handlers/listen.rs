@@ -16,11 +16,20 @@
 //! This handler only logs and records metrics. Nothing in the daemon reads
 //! those metrics back; they are exported for scraping and alerting.
 //!
+//! A profile can hold several listen sockets (`0.0.0.0:6881,[::]:6881`), and
+//! libtorrent reports each on its own: every `listen_failed_alert` while it
+//! opens them, then a `listen_succeeded_alert` for each that opened. So
+//! `listen_failure_active` is not the last alert's outcome, which would read 0
+//! whenever any socket opened: [`ListenFailures`] keeps, per profile, the
+//! endpoints whose socket failed, and the gauge is 1 while any is held.
+//!
 //! [`sockets_at`] is what the alert loop's `listen_device_check` hook asks
 //! when a `ListenSucceeded` arrives: which device the kernel holds each of
 //! this process's sockets on that endpoint to. The alert does not say, and
 //! libtorrent's own device binding is best effort.
 
+use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::io;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -33,6 +42,61 @@ use tracing::error;
 use tracing::info;
 
 use crate::handlers::HandlerCtx;
+use crate::profile::ProfileId;
+
+/// Each profile's listen endpoints whose socket failed and has not come up
+/// since, which is what `listen_failure_active` reads. Owned by the alert
+/// loop, which hands it to every listen alert it dispatches.
+///
+/// Endpoints are the alerts' own `address:port` text, which the shim prints
+/// the same way for a failure and a success. A failure is forgotten when a
+/// socket comes up on the same address, at any port: a NAT-PMP rebind moves
+/// the session to another port, and libtorrent closes the old socket without
+/// reporting it, so the old port's failure would otherwise be held forever.
+/// A failure with no address of its own (libtorrent reports an unparsable
+/// `listen_interfaces` entry, or interfaces it could not list, at
+/// `0.0.0.0:0`) is held until a socket comes up on `0.0.0.0`. One on an
+/// address the session stops listening on (a tunnel whose address changed)
+/// is held until the daemon restarts.
+#[derive(Debug, Default)]
+pub struct ListenFailures {
+    failed: HashMap<ProfileId, BTreeSet<String>>,
+}
+
+impl ListenFailures {
+    /// Record `endpoint`'s socket as failed. Returns whether any of
+    /// `profile`'s sockets is failed, which is now always.
+    fn failed(&mut self, profile: &ProfileId, endpoint: &str) -> bool {
+        self.failed
+            .entry(profile.clone())
+            .or_default()
+            .insert(endpoint.to_owned());
+        true
+    }
+
+    /// Record `endpoint`'s socket as up, forgetting every failure on its
+    /// address. Returns whether any of `profile`'s sockets is still failed.
+    fn succeeded(&mut self, profile: &ProfileId, endpoint: &str) -> bool {
+        let Some(failed) = self.failed.get_mut(profile) else {
+            return false;
+        };
+        let address = address_of(endpoint);
+        failed.retain(|f| address_of(f) != address);
+        let any = !failed.is_empty();
+        if !any {
+            self.failed.remove(profile);
+        }
+        any
+    }
+}
+
+/// The address part of an alert's `address:port`. IPv6 addresses are
+/// printed unbracketed (`:::6881`), so the port is after the last colon.
+fn address_of(endpoint: &str) -> &str {
+    endpoint
+        .rsplit_once(':')
+        .map_or(endpoint, |(address, _)| address)
+}
 
 /// One of this process's sockets bound to a given endpoint.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -165,7 +229,9 @@ fn bound_device(fd: libc::c_int) -> Option<String> {
     (!name.is_empty()).then(|| String::from_utf8_lossy(name).into_owned())
 }
 
-pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
+/// `failures` is the loop's record of which of each profile's sockets are
+/// failed; this alert updates it before the gauge is set from it.
+pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>, failures: &mut ListenFailures) {
     match alert {
         Alert::ListenFailed {
             error_code,
@@ -190,15 +256,12 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 "listen_failures_total",
                 &[("profile_id", ctx.profile_id.as_str())],
             );
-            // Exported for alerting: 1 while this profile's listen socket is
-            // failed, back to 0 on `ListenSucceeded`. Nothing reads it back;
-            // the fatal exit is decided by the alert loop's
+            // Exported for alerting: 1 while any of this profile's listen
+            // sockets is failed (see `ListenFailures`). Nothing reads it
+            // back; the fatal exit is decided by the alert loop's
             // `fatal_listen_failure` hook on this same `ListenFailed` alert.
-            ctx.metrics.set_gauge(
-                "listen_failure_active",
-                1.0,
-                &[("profile_id", ctx.profile_id.as_str())],
-            );
+            let active = failures.failed(&ctx.profile_id, endpoint);
+            set_failure_active(ctx, active);
         }
         Alert::ListenSucceeded { endpoint, .. } => {
             let _enter = ctx.span.enter();
@@ -207,22 +270,173 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 endpoint = %endpoint,
                 "listen socket up",
             );
-            ctx.metrics.set_gauge(
-                "listen_failure_active",
-                0.0,
-                &[("profile_id", ctx.profile_id.as_str())],
-            );
+            let active = failures.succeeded(&ctx.profile_id, endpoint);
+            set_failure_active(ctx, active);
         }
         _ => unreachable!("listen::handle called with non-listen alert"),
     }
+}
+
+fn set_failure_active(ctx: &HandlerCtx<'_>, active: bool) {
+    ctx.metrics.set_gauge(
+        "listen_failure_active",
+        if active { 1.0 } else { 0.0 },
+        &[("profile_id", ctx.profile_id.as_str())],
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::TcpListener;
     use std::net::UdpSocket;
+    use std::sync::Arc;
+
+    use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::AlertKind;
 
     use super::*;
+    use crate::clock::MockClock;
+    use crate::engine::TorrentEngine;
+    use crate::metrics::MetricCall;
+    use crate::metrics::RecordingSink;
+    use crate::mock::MockEngine;
+    use crate::resume_store::MemoryResumeStore;
+    use crate::state::StateMap;
+    use crate::torrent_store::MemoryTorrentStore;
+
+    fn hdr(kind: AlertKind) -> AlertHeader {
+        AlertHeader {
+            kind,
+            infohash: None,
+            handle: None,
+            timestamp_us: 0,
+        }
+    }
+
+    fn failed(endpoint: &str) -> Alert {
+        Alert::ListenFailed {
+            hdr: hdr(AlertKind::ListenFailed),
+            error_code: 98,
+            operation: "sock_bind".into(),
+            endpoint: endpoint.into(),
+            iface: "0.0.0.0".into(),
+            message: "Address already in use".into(),
+        }
+    }
+
+    fn succeeded(endpoint: &str) -> Alert {
+        Alert::ListenSucceeded {
+            hdr: hdr(AlertKind::ListenSucceeded),
+            endpoint: endpoint.into(),
+        }
+    }
+
+    /// Dispatch `alerts` in order, each to its profile, and return the last
+    /// `listen_failure_active` each profile was set to.
+    fn gauge_after(alerts: &[(&str, Alert)]) -> HashMap<String, f64> {
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let clock = MockClock::new();
+        let metrics = RecordingSink::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let mut failures = ListenFailures::default();
+        for (profile, alert) in alerts {
+            let mut ctx = HandlerCtx {
+                state: &state,
+                resume: &resume,
+                torrents: &torrents,
+                metrics: &metrics,
+                clock: &clock,
+                engine: &engine,
+                profile_fenced: None,
+                profile_id: ProfileId::new(*profile),
+                span: tracing::info_span!("test"),
+            };
+            handle(alert, &mut ctx, &mut failures);
+        }
+        let mut last = HashMap::new();
+        for call in metrics.calls() {
+            if let MetricCall::SetGauge {
+                name,
+                value,
+                labels,
+            } = call
+            {
+                if name == "listen_failure_active" {
+                    assert_eq!(labels[0].0, "profile_id");
+                    last.insert(labels[0].1.clone(), value);
+                }
+            }
+        }
+        last
+    }
+
+    /// The issue's scenario: libtorrent reports the IPv4 socket's failure
+    /// while it opens the sockets, then the IPv6 socket that did open. The
+    /// profile still accepts no IPv4 peer, so the gauge stays at 1.
+    #[test]
+    fn a_failure_on_one_endpoint_then_a_success_on_another_leaves_the_gauge_at_1() {
+        let gauge = gauge_after(&[("a", failed("0.0.0.0:6881")), ("a", succeeded(":::6881"))]);
+        assert_eq!(gauge["a"], 1.0);
+    }
+
+    #[test]
+    fn the_gauge_returns_to_0_once_the_failed_endpoint_comes_up() {
+        let gauge = gauge_after(&[
+            ("a", failed("0.0.0.0:6881")),
+            ("a", succeeded(":::6881")),
+            ("a", succeeded("0.0.0.0:6881")),
+        ]);
+        assert_eq!(gauge["a"], 0.0);
+    }
+
+    #[test]
+    fn every_failed_endpoint_must_come_up_before_the_gauge_returns_to_0() {
+        let gauge = gauge_after(&[
+            ("a", failed("0.0.0.0:6881")),
+            ("a", failed(":::6881")),
+            ("a", succeeded("0.0.0.0:6881")),
+        ]);
+        assert_eq!(gauge["a"], 1.0, "the IPv6 socket is still failed");
+        let gauge = gauge_after(&[
+            ("a", failed("0.0.0.0:6881")),
+            ("a", failed(":::6881")),
+            ("a", succeeded("0.0.0.0:6881")),
+            ("a", succeeded(":::6881")),
+        ]);
+        assert_eq!(gauge["a"], 0.0);
+    }
+
+    /// A NAT-PMP rebind moves the session's socket on an address to another
+    /// port, and libtorrent closes the old one without a word; a socket up
+    /// on that address clears the old port's failure.
+    #[test]
+    fn a_socket_up_on_the_same_address_at_another_port_clears_its_failure() {
+        let gauge = gauge_after(&[
+            ("a", failed("10.2.0.2:6881")),
+            ("a", succeeded("10.2.0.2:51413")),
+        ]);
+        assert_eq!(gauge["a"], 0.0);
+    }
+
+    #[test]
+    fn one_profile_s_failure_is_not_another_s() {
+        let gauge = gauge_after(&[
+            ("a", failed("0.0.0.0:6881")),
+            ("b", succeeded("0.0.0.0:6882")),
+            ("b", succeeded("0.0.0.0:6881")),
+        ]);
+        assert_eq!(gauge["a"], 1.0);
+        assert_eq!(gauge["b"], 0.0);
+    }
+
+    #[test]
+    fn the_address_of_an_endpoint_is_everything_before_its_port() {
+        assert_eq!(address_of("0.0.0.0:6881"), "0.0.0.0");
+        assert_eq!(address_of(":::6881"), "::");
+        assert_eq!(address_of("fe80::1%3:6881"), "fe80::1%3");
+    }
 
     /// Both kinds of socket on one endpoint are found, each for what it is,
     /// and a socket bound to no device says so. Binding one to a device
