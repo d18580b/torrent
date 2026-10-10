@@ -785,8 +785,11 @@ impl TorrentPayload {
     /// alone, so a torrent added through `POST /v1/torrents` with a
     /// `save_path` over the same files claims nothing, and trashing them
     /// would leave it serving nothing. Each path is compared both as the
-    /// sessions spell it and resolved, so a `save_path` reaching the same
-    /// directory through a symlink is still caught. A torrent whose metadata
+    /// sessions spell it and resolved, and each of `other`'s files is
+    /// resolved on its own full path, so a `save_path` reaching the same
+    /// directory through a symlink, a symlinked directory below it, and a
+    /// file that is itself a symlink to the payload are all caught. A
+    /// torrent whose metadata
     /// has not arrived yet could write any file under its `save_path`, so
     /// every payload file under it counts as shared.
     pub fn shared_with(&self, other: &LiveTorrent) -> Option<&std::path::Path> {
@@ -799,9 +802,20 @@ impl TorrentPayload {
         let hit: Box<dyn Fn(&PayloadFile) -> bool> = match &other.files {
             None => Box::new(|f| forms(f).any(|p| bases.iter().any(|b| p.starts_with(b)))),
             Some(files) => {
+                // Each of its files as spelled under either base, and with
+                // every symlink on its own path resolved: a cross-seed whose
+                // files are symlinks to the payload, or that reaches it
+                // through a symlinked directory below its save path, is
+                // caught by the resolved form only.
                 let theirs: std::collections::HashSet<std::path::PathBuf> = files
                     .iter()
-                    .flat_map(|rel| bases.iter().map(move |b| b.join(rel)))
+                    .flat_map(|rel| {
+                        let joined = other.save_path.join(rel);
+                        bases
+                            .iter()
+                            .map(move |b| b.join(rel))
+                            .chain(std::fs::canonicalize(joined).ok())
+                    })
                     .collect();
                 Box::new(move |f| forms(f).any(|p| theirs.contains(p)))
             }
@@ -2222,6 +2236,24 @@ mod tests {
         std::os::unix::fs::symlink(&root, &link).unwrap();
         assert_eq!(
             payload.shared_with(&live(&link, Some(&["T/a.bin"]))),
+            Some(a.as_path())
+        );
+        // A cross-seed whose file is itself a symlink to the payload, in a
+        // save path of its own that no symlink leads to.
+        let xseed = dir.path().join("xseed");
+        std::fs::create_dir_all(xseed.join("T")).unwrap();
+        std::os::unix::fs::symlink(&a, xseed.join("T/a.bin")).unwrap();
+        assert_eq!(
+            payload.shared_with(&live(&xseed, Some(&["T/a.bin"]))),
+            Some(a.as_path())
+        );
+        // A cross-seed reaching it through a symlinked directory below its
+        // save path.
+        let below = dir.path().join("below");
+        std::fs::create_dir_all(&below).unwrap();
+        std::os::unix::fs::symlink(root.join("T"), below.join("T")).unwrap();
+        assert_eq!(
+            payload.shared_with(&live(&below, Some(&["T/a.bin"]))),
             Some(a.as_path())
         );
         // No metadata yet: it could write anything under its save path.
