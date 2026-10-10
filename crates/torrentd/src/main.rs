@@ -398,16 +398,8 @@ fn check_config_as(
 ) -> anyhow::Result<()> {
     if cfg.network_kill_switch {
         let uid = uid().context("read this process's uid for the kill switch")?;
-        // The uid judged is this process's, not the unit's `User=`: under
-        // `sudo torrentd --check-config` that is root even where the daemon
-        // runs as `torrentd`. Say so, and name the invocation that judges the
-        // daemon's own account.
         if let Some(refusal) = startup::kill_switch_uid_refusal(uid) {
-            return Err(refusal.context(
-                "this process runs as uid 0, and the uid judged is the invoking process's, \
-                 not the unit's User=; to pre-flight the daemon's own account, run the check \
-                 as that user: `sudo -u torrentd torrentd --config <path> --check-config`",
-            ));
+            return Err(refusal);
         }
     }
     // The kill switch shells out to `nft`; fail the pre-flight check now
@@ -416,6 +408,28 @@ fn check_config_as(
         anyhow::bail!("network_kill_switch = true but the `nft` binary is not available");
     }
     Ok(())
+}
+
+/// `--check-config`'s reading of a [`check_config`] failure. The uid the
+/// kill switch judges is the invoking process's, not the unit's `User=`:
+/// under `sudo torrentd --check-config` that is root even where the daemon
+/// runs as `torrentd`. So the flag's uid refusal says so, and names the
+/// invocation that judges the daemon's own account. The daemon's pre-flight
+/// does not add this: there the uid judged *is* the daemon's, and the remedy
+/// is to stop running it as root, which the refusal itself already says.
+fn explain_invoking_uid(e: anyhow::Error) -> anyhow::Error {
+    let uid_refusal = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(vpn::killswitch::is_uid_refusal)
+    });
+    if !uid_refusal {
+        return e;
+    }
+    e.context(
+        "this process runs as uid 0, and the uid judged is the invoking process's, \
+         not the unit's User=; to pre-flight the daemon's own account, run the check \
+         as that user: `sudo -u torrentd torrentd --config <path> --check-config`",
+    )
 }
 
 fn main() -> anyhow::Result<()> {
@@ -451,7 +465,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     if cli.check_config {
-        if let Err(e) = check_config(&cfg) {
+        if let Err(e) = check_config(&cfg).map_err(explain_invoking_uid) {
             refuse_config(&e);
         }
         eprintln!("config OK");
@@ -834,11 +848,22 @@ http_listen = "127.0.0.1:8080"
         let e = check_config_as(&cfg, || Ok(0)).expect_err("uid 0 is refused");
         assert!(startup::is_config_refusal(&e), "got: {e:#}");
         assert!(format!("{e:#}").contains("non-root user"), "got: {e:#}");
+        // The daemon's pre-flight is judged as the daemon itself, so its
+        // refusal does not send a root daemon to re-run a pre-flight.
+        assert!(!format!("{e:#}").contains("sudo -u torrentd"), "got: {e:#}");
+
         // `sudo torrentd --check-config` is judged as root, not as the unit's
-        // `User=`; the message says which uid it judged and how to judge the
-        // daemon's.
+        // `User=`; the flag's message says which uid it judged and how to
+        // judge the daemon's, and stays a refusal.
+        let e = explain_invoking_uid(e);
+        assert!(startup::is_config_refusal(&e), "got: {e:#}");
+        assert!(format!("{e:#}").contains("non-root user"), "got: {e:#}");
         assert!(format!("{e:#}").contains("invoking process"), "got: {e:#}");
         assert!(format!("{e:#}").contains("sudo -u torrentd"), "got: {e:#}");
+
+        // Any other pre-flight failure is left as it was.
+        let other = explain_invoking_uid(anyhow::anyhow!("no nft"));
+        assert_eq!(format!("{other:#}"), "no nft");
 
         // With the kill switch off the uid is never read.
         let off = cfg_from(&format!(
