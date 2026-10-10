@@ -1090,27 +1090,36 @@ The daemon sets none of these itself.
   its open requests and serves again on the same socket after a backoff of
   1 s doubling to 30 s, logging each time; the daemon does not restart. The
   HTTP API draws on the same table and holds at most 256 connections; the
-  next waits in the listen backlog. It closes an HTTP/1 connection whose
+  next waits in the listen backlog. An HTTP/2 connection carries at most 16
+  requests at once. It closes an HTTP/1 connection whose
   request head takes more than 10 seconds, closes an HTTP/2 connection that
   stops answering pings for 30 seconds, and answers `408` to a request whose
   body has not arrived and been answered within 30 seconds (300 for
-  `POST /v1/torrents`; adopting, creating a plan and applying one have no
-  deadline). A `408` does not undo what the request already
-  started: an add may still complete (a retry then gets `409`
-  `torrent-exists`; re-read the torrent), and a pool verification's
-  rechecks may still start. **Three idle cases are not bounded:** a connection
-  that sends no byte at all (or stops partway through the HTTP/2 preface), an
-  HTTP/2 connection that answers pings but sends no request, and a request to
-  adopt, create a plan or apply one whose body stops arriving. The last needs
-  no token: a body sent without `Content-Length` is read whole before the
-  token is checked. 256 such sockets
-  hold every API connection, and `/healthz` and `/metrics` stop answering
-  until they close. The default loopback bind keeps them out of reach of
+  `POST /v1/torrents`). Adopting, creating a plan and applying one may run
+  for minutes, so for them the 30 seconds bound only the body's arrival,
+  and the work itself has no deadline. A `408` does not undo what the
+  request already started: an add may still complete (a retry then gets
+  `409` `torrent-exists`; re-read the torrent), and a pool verification's
+  rechecks may still start. Every operation that takes a body checks the
+  token from the request head, before it reads a byte of the body, except
+  `POST /v1/sessions`, which takes none: a request without a valid `write`
+  credential is answered `401` or `403` at once, so it can neither hold a
+  connection until the deadline nor make the daemon buffer its body. A body
+  sent without `Content-Length` (chunked, or HTTP/2 without the header) is
+  held in memory as it arrives, up to the operation's limit — 64 KiB, or
+  96 MiB for `POST /v1/torrents` — so only a credential holder can make the
+  daemon spend that. **Two idle cases are not bounded:** a connection that
+  sends no byte at all (or stops partway through the HTTP/2 preface), and an
+  HTTP/2 connection that answers pings but sends no request. 256 such
+  sockets hold every API connection, and `/healthz` and `/metrics` stop
+  answering until they close. The default loopback bind keeps them out of reach of
   anyone who cannot already run code on the host; a non-loopback
   `http_listen` belongs behind the proxy of §6 with its own client idle
-  timeouts (nginx `client_header_timeout` and `client_body_timeout`, Caddy
-  `timeouts.read_header` and `timeouts.read_body`), which close such a
-  connection before it reaches the daemon.
+  timeouts (nginx `client_header_timeout`, Caddy `timeouts.read_header` and
+  `timeouts.idle`, as `deploy/Caddyfile` sets them), which close such a
+  connection before it reaches the daemon. The proxy needs no body timeout
+  of its own, since the daemon bounds every body; `deploy/Caddyfile` says
+  why it sets none, and caps a body at the daemon's own 96 MiB.
 - **`net.ipv4.conf.all.rp_filter = 2`** for `vpn` profiles. Sockets are source-bound
   to a tunnel IP, and strict reverse-path filtering drops the replies. The
   compose file sets it; the systemd unit does not, so set it yourself on

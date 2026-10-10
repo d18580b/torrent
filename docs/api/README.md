@@ -173,11 +173,13 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
   `409` [`torrent-exists`](problems.md#torrent-exists) (re-read the torrent
   rather than adding it again), and a `POST /v1/pool/verifications` may still
   queue its rechecks.
-  Three pool operations have no deadline and answer only once their work is
-  done: `POST /v1/pool/plans/{plan_id}/apply`, which waits for every step of
-  a plan, and `POST /v1/pool/adoptions` and `POST /v1/pool/plans`, which wait
-  for a running scan to release the pool index and, for an adoption, take as
-  long as its selection does. None of the three answers `408`. The server
+  Three pool operations put no deadline on their work and answer only once it
+  is done: `POST /v1/pool/plans/{plan_id}/apply`, which waits for every step
+  of a plan, and `POST /v1/pool/adoptions` and `POST /v1/pool/plans`, which
+  wait for a running scan to release the pool index and, for an adoption,
+  take as long as its selection does. Their 30 seconds bound only the body's
+  arrival, so they answer `408` only to a body that stalls, before any work
+  starts. The server
   also closes an HTTP/1 connection whose request
   head takes more than 10 seconds to arrive, closes an HTTP/2 connection that
   leaves a ping unanswered for 10 seconds (pings go every 20), and holds at

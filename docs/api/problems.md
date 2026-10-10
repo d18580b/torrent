@@ -43,7 +43,7 @@ says everything there is to say:
 | `403` | A daemon without `[auth]` refused a request a browser sent on another site's behalf: a `Host` that is not loopback or in `allowed_hosts`, or a state change whose `Sec-Fetch-Site`, `Origin` or `Content-Type` marks it cross-site. See [the README](README.md#authentication). |
 | `404` | No route matches the path. |
 | `405` | The route exists, but not for this method. |
-| `408` | An operation that takes a body did not receive it and answer within its deadline (30 seconds, or 300 for `POST /v1/torrents`). Effects already started are not undone: an add may still complete, and a pool verification's rechecks may still start. Adopting (`POST /v1/pool/adoptions`), creating a plan (`POST /v1/pool/plans`) and applying one have no deadline, and never answer `408`. |
+| `408` | An operation that takes a body did not receive it and answer within its deadline (30 seconds, or 300 for `POST /v1/torrents`). Effects already started are not undone: an add may still complete, and a pool verification's rechecks may still start. Adopting (`POST /v1/pool/adoptions`), creating a plan (`POST /v1/pool/plans`) and applying one put no deadline on their work: their 30 seconds bound only the body's arrival, so their `408` means the body stalled and nothing was started. |
 | `413` | The request body is over the operation's limit (64 KiB, or 96 MiB for `POST /v1/torrents`). |
 | `415` | A body whose `Content-Type` is not `application/json`. |
 | `422` | A JSON body of the wrong shape: a missing field, an unknown field, or a value of the wrong type. |

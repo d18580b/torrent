@@ -238,8 +238,9 @@ Then run it for real with `"dry_run": false`, in batches you can watch: one
 subtree at a time, or 1000 info-hashes at most. The response lists the same
 buckets for what happened. Every target is claimed and added inside the
 request, so a large subtree holds the request open while it runs, and so does
-a scan in progress, which it waits for. The request has no deadline: it
-answers when the last target is adopted or refused, whatever that takes.
+a scan in progress, which it waits for. The work has no deadline: the
+request answers when the last target is adopted or refused, whatever that
+takes.
 A queued torrent is hashed after the request answers, so its hashing adds
 nothing to the wait.
 
