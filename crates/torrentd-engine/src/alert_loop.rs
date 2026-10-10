@@ -2648,6 +2648,48 @@ mod tests {
     }
 
     #[test]
+    fn the_fatal_shutdown_publishes_what_its_own_drains_lost() {
+        // The drain that carries the fatal listen failure publishes 1. The
+        // count then rises to 4 in `on_fatal`, after that publish and before
+        // the shutdown drains, so only the publish after the fatal path's
+        // `run_shutdown` can count the 3.
+        let engine = Arc::new(MockEngine::new());
+        engine.push_alert(listen_failed_alert());
+        engine.set_alert_translate_errors(1);
+        let recording = Arc::new(RecordingSink::new());
+        let (_tx, rx) = bounded::<ShutdownReason>(1);
+        let listen_failed = Arc::new(AtomicBool::new(false));
+        run(
+            rx,
+            Arc::new(single_profile_source(engine.clone())),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            recording.clone(),
+            Arc::new(MockClock::new()),
+            LoopHooks {
+                heartbeat: Arc::new(AtomicU64::new(0)),
+                listen_failed: listen_failed.clone(),
+                fatal_listen_failure: true,
+                on_fatal: Some({
+                    let engine = engine.clone();
+                    Arc::new(move |_| engine.set_alert_translate_errors(4)) as FatalCallback
+                }),
+                profile_fenced: None,
+                unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
+                listen_events: None,
+                listen_device_check: None,
+                shutdown_deadline: Duration::from_millis(1),
+            },
+        );
+        assert!(listen_failed.load(Ordering::Relaxed), "took the fatal path");
+        assert_eq!(
+            translate_error_adds(&recording),
+            [("p".to_string(), 1), ("p".to_string(), 3)],
+        );
+    }
+
+    #[test]
     fn dispatch_add_torrent_inserts_into_state() {
         let engine = Arc::new(MockEngine::new());
         let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
