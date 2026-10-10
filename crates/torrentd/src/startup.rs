@@ -4848,6 +4848,266 @@ mod tests {
         );
         running.abort();
     }
+
+    /// One vpn profile on a `MockEngine`, and the kill-switch fence over it,
+    /// whose lift finds the tunnel healthy once `hook` returns.
+    struct KillSwitchScan {
+        engine: Arc<torrentd_engine::MockEngine>,
+        profiles: Arc<ProfileRegistry>,
+        metrics: Arc<PromSink>,
+        fence: Arc<crate::vpn_monitor::KillSwitchFence>,
+        a: ProfileId,
+    }
+
+    impl KillSwitchScan {
+        fn new(hook: impl Fn() + Send + Sync + 'static) -> Self {
+            let bound = IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 2));
+            let engine = Arc::new(torrentd_engine::MockEngine::new());
+            let dyn_engine: Arc<dyn TorrentEngine> = engine.clone();
+            let entry = ProfileEntry::new(
+                crate::profile_registry::test_vpn_entry("acct_a", ProfileStatus::Active).config,
+                dyn_engine,
+                Some(bound),
+                None,
+                0,
+            );
+            let profiles = Arc::new(ProfileRegistry::new(vec![entry]));
+            let metrics = Arc::new(PromSink::new());
+            let probe: crate::vpn_monitor::Prober = Arc::new(move |_, _| {
+                hook();
+                crate::vpn_monitor::TunnelProbes {
+                    ip: Ok(Some(bound)),
+                    route: Some(Ok(crate::vpn::route::RouteProbe::ViaTunnel)),
+                    handshake: Some(Ok(None)),
+                }
+            });
+            let fence = Arc::new(crate::vpn_monitor::KillSwitchFence::new(
+                profiles.clone(),
+                Arc::new(StateMap::new()),
+                metrics.clone(),
+                probe,
+            ));
+            Self {
+                engine,
+                profiles,
+                metrics,
+                fence,
+                a: ProfileId::new("acct_a"),
+            }
+        }
+
+        fn handle(&self, n: u8) -> torrentd_engine::TorrentHandle {
+            self.engine
+                .register_handle(libtorrent_safe::InfoHash([n; 20]))
+        }
+
+        fn calls(
+            &self,
+            want: fn(&torrentd_engine::RecordedCall) -> Option<torrentd_engine::TorrentHandle>,
+        ) -> Vec<torrentd_engine::TorrentHandle> {
+            self.engine.calls().iter().filter_map(want).collect()
+        }
+
+        fn pauses(&self) -> Vec<torrentd_engine::TorrentHandle> {
+            self.calls(|c| match c {
+                torrentd_engine::RecordedCall::PauseTorrent(h) => Some(*h),
+                _ => None,
+            })
+        }
+
+        fn resumes(&self) -> Vec<torrentd_engine::TorrentHandle> {
+            self.calls(|c| match c {
+                torrentd_engine::RecordedCall::ResumeTorrent(h) => Some(*h),
+                _ => None,
+            })
+        }
+
+        fn status(&self) -> ProfileStatus {
+            self.profiles
+                .resolve(&self.a)
+                .active()
+                .unwrap()
+                .health()
+                .status
+        }
+
+        /// Until every paced resume the lifts started has ended.
+        async fn settle(&self) {
+            for _ in 0..100_000 {
+                if !self.profiles.iter().any(|e| e.is_resuming()) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("a paced resume never ended");
+        }
+    }
+
+    /// The kill-switch watch lifts its fence and fences again with no scan
+    /// call in between, so the scans never see the profile lifted: the new
+    /// fence still has them pause everything they added, which the lift had
+    /// resumed, and the next lift resumes it once more.
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_switch_fence_after_a_lift_the_scans_never_saw_pauses_all_of_it_again() {
+        use crate::vpn::killswitch::Fence as _;
+
+        let t = KillSwitchScan::new(|| {});
+        let mut scan = ScanFence::new(Some(t.fence.clone()));
+        let hs = [t.handle(1), t.handle(2), t.handle(3)];
+
+        t.fence.fence_all();
+        for h in hs {
+            scan.added(&t.profiles, &t.metrics, &t.a, h);
+        }
+        assert_eq!(t.pauses(), hs);
+        t.fence.lift();
+        t.settle().await;
+        assert_eq!(t.resumes(), hs);
+
+        t.fence.fence_all();
+        assert_eq!(t.status(), ProfileStatus::VpnDown);
+        scan.enforce_all(&t.profiles, &t.metrics);
+        assert_eq!(
+            t.pauses()[3..],
+            hs,
+            "the lifted torrents are paused under the new fence"
+        );
+
+        t.fence.lift();
+        t.settle().await;
+        assert_eq!(t.resumes()[3..], hs);
+    }
+
+    /// A fence that stops a lift before its paced resume reaches anything
+    /// takes back every torrent that lift was to resume, and the scans,
+    /// seeing a new fence, pause and record the same torrents again. The next
+    /// lift resumes each of them once.
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_switch_lift_resumes_once_what_an_unfinished_lift_and_the_scans_both_recorded() {
+        use crate::vpn::killswitch::Fence as _;
+
+        let t = KillSwitchScan::new(|| {});
+        let mut scan = ScanFence::new(Some(t.fence.clone()));
+        let hs = [t.handle(1), t.handle(2), t.handle(3)];
+
+        t.fence.fence_all();
+        for h in hs {
+            scan.added(&t.profiles, &t.metrics, &t.a, h);
+        }
+        // Lifted and fenced again before the lift's resume task first runs.
+        t.fence.lift();
+        t.fence.fence_all();
+        scan.enforce_all(&t.profiles, &t.metrics);
+        assert_eq!(t.pauses()[3..], hs, "the scans pause them again");
+
+        t.fence.lift();
+        t.settle().await;
+        assert_eq!(t.status(), ProfileStatus::Active);
+        assert_eq!(t.resumes(), hs, "each resumed once");
+    }
+
+    /// A scan that reaches the kill-switch fence while its lift is running
+    /// waits for the lift, rather than finding the record already taken and
+    /// the profile not yet marked: that would pause its torrent with nothing
+    /// to resume it. Here it finds the profile lifted, and its torrent runs.
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_that_reaches_the_kill_switch_fence_mid_lift_waits_for_the_lift() {
+        use crate::vpn::killswitch::Fence as _;
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // The lift's tunnel probe, the first time: inside the lift, before it
+        // marks the profile lifted.
+        let first = parking_lot::Mutex::new(Some((entered_tx, release_rx)));
+        let t = KillSwitchScan::new(move || {
+            if let Some((entered, release)) = first.lock().take() {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+        });
+        let mut scan = ScanFence::new(Some(t.fence.clone()));
+        let (h1, h2) = (t.handle(1), t.handle(2));
+        t.fence.fence_all();
+        scan.added(&t.profiles, &t.metrics, &t.a, h1);
+        assert_eq!(t.pauses(), [h1]);
+
+        let rt = tokio::runtime::Handle::current();
+        let lifting = std::thread::spawn({
+            let fence = t.fence.clone();
+            move || {
+                let _rt = rt.enter();
+                crate::vpn::killswitch::Fence::lift(fence.as_ref());
+            }
+        });
+        entered_rx.recv().unwrap();
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+        let adding = std::thread::spawn({
+            let (profiles, metrics, a) = (t.profiles.clone(), t.metrics.clone(), t.a.clone());
+            move || {
+                reached_tx.send(()).unwrap();
+                scan.added(&profiles, &metrics, &a, h2);
+            }
+        });
+        reached_rx.recv().unwrap();
+        // Long enough for the add to reach the fence's lock. Were the lock
+        // not held across the lift, the add would be done by now.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(!adding.is_finished(), "the add waits for the lift");
+
+        release_tx.send(()).unwrap();
+        lifting.join().unwrap();
+        adding.join().unwrap();
+        t.settle().await;
+        assert_eq!(t.status(), ProfileStatus::Active);
+        assert_eq!(t.pauses(), [h1], "an add to a lifted profile runs");
+        assert_eq!(t.resumes(), [h1]);
+    }
+
+    /// A supervised task stopped through the handle `spawn_supervised`
+    /// returns is logged as stopped, not as a panic, and `task_up` goes to 0.
+    #[tokio::test]
+    async fn a_stopped_supervised_task_is_logged_as_stopped_not_as_a_panic() {
+        let log = crate::tracing_init::Buf::default();
+        let (_handle, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let metrics = Arc::new(PromSink::new());
+        let up = || {
+            String::from_utf8(metrics.render())
+                .unwrap()
+                .lines()
+                .find(|l| {
+                    !l.starts_with('#')
+                        && l.contains("task_up{")
+                        && l.contains("task=\"kill_switch_watch\"")
+                })
+                .map(str::to_owned)
+        };
+
+        let stop = spawn_supervised(
+            "kill_switch_watch",
+            metrics.clone(),
+            std::future::pending::<()>(),
+        );
+        let line = up().expect("task_up is exported");
+        assert!(line.ends_with(" 1"), "{line}");
+        stop.abort();
+        for _ in 0..1_000 {
+            if up().is_some_and(|l| l.ends_with(" 0")) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let line = up().expect("task_up is exported");
+        assert!(line.ends_with(" 0"), "{line}");
+        let text = log.text();
+        assert!(
+            text.contains("background task stopped")
+                && !text.contains("panicked")
+                && !text.contains("\"level\":\"ERROR\""),
+            "{text}"
+        );
+    }
 }
 
 /// `build_profiles`, driven end to end with `MockVpn`, `MockForwarder` and
