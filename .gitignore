@@ -47,6 +47,9 @@ session_state-*.dat
 # Environment
 .env
 .env.local
+# The operator's config deploy/compose.yaml mounts: it holds the argon2 hash
+# and any tokens. The committed examples are the *.sample.toml files.
+/deploy/torrentd.toml
 
 # Coverage
 *.profraw

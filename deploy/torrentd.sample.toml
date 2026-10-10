@@ -337,9 +337,13 @@ dht               = true
 # only reads, but there is no reason to have the other client's live state
 # directory open at all.
 #
-#   torrentd --config /etc/torrentd/torrentd.toml pool scan
-#   torrentd --config /etc/torrentd/torrentd.toml pool status
-#   torrentd --config /etc/torrentd/torrentd.toml pool orphans
+#   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool scan
+#   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool status
+#   sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool orphans
+#
+# Run them as the daemon's user: run as root, `pool scan` creates `pool.db`
+# (and `registry.db`, with `import_legacy_registry` set) owned by root, which
+# the daemon cannot write, and the next start fails.
 #
 # The index schema moves forward one way. The first open on this build
 # migrates the torrent→account column from `slot` to `profile`, and a build
@@ -352,8 +356,11 @@ dht               = true
 # space equal to the size of `pool.db`. If it cannot be written the migration
 # stops, names the backup path and the reason, and leaves the index as it was.
 # Nothing deletes it afterwards and nothing ages it out: remove it yourself
-# once you would not go back. An existing copy at that path is kept as it is and
-# no new one is taken — but only where it really is one: it has to be a pool
+# once you would not go back. Where a copy is already at that path, a fresh one
+# is taken beside it as `<db_path>.pre-v3.bak.new`, which needs that free space
+# again; once the migration commits it replaces the old copy, and if the
+# migration fails it is discarded and the old copy stays. That holds only where
+# what is at that path really is a copy: it has to be a pool
 # index, at a schema version this build understands, and not this same `pool.db`
 # reached through a symlink. Anything else stops the migration instead, because
 # keeping it would run the one-way rename with no rollback at all.

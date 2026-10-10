@@ -72,13 +72,12 @@ and `ProtectHome=yes` ([`deploy/torrentd.service`](../deploy/torrentd.service)).
   branches either (operations.md, "If a path has to change").
 - **`[pool]` is not reloadable.** Any change to it, `max_concurrent_verify`
   included, needs a restart. The verify queue picks up again after it (§7),
-  but the restart, today, drops the metadata of every torrent already
-  adopted (§8). Settle `[pool]` before
-  the first adopt.
+  and adopted torrents come back with their metadata (§8).
 
 Run every CLI command below as `torrentd`, with `sudo -u torrentd`. A `pool
-scan` run as root creates `pool.db` owned by root, which the daemon then
-cannot write. The CLI also runs outside the unit's sandbox, so it can see
+scan` run as root creates `pool.db` owned by root, and, with
+`import_legacy_registry` set, `registry.db` too. The daemon opens both at
+boot, cannot write a root-owned one, and fails to start. The CLI also runs outside the unit's sandbox, so it can see
 paths the daemon cannot (anything under `/home`). Where that matters, scan
 through the daemon instead, with `POST /v1/pool/scan`, which sees exactly what
 the daemon sees.
@@ -335,18 +334,16 @@ can still leave with nothing behind it.
 ## 8. Afterwards
 
 **Keep `library_dir`.** Each torrent's `source_path` in the index points into
-it. The verify queue reads each `.torrent` from it when the torrent's turn
-comes, and adoption does not copy the `.torrent` into the profile's
-`torrent_dir` (#108), so the library is the only copy of an adopted torrent's
-metadata.
+it, and the verify queue reads each `.torrent` from it when the torrent's turn
+comes. Once a torrent is adopted, the profile's `torrent_dir` holds its own
+copy of the `.torrent` and the save path it was adopted at.
 
-**A restart currently strands adopted torrents (#108).** After a restart, an
-adopted torrent has resume data but no `.torrent` in the stores, so it comes
-back in `awaiting_metadata`, and on a private profile it stays there. The
-boot warns `resume entries with no .torrent on disk`. Until #108 is fixed,
-avoid restarting once you have adopted, and do not restart as a test. Once it
-is fixed, restart once after the queue drains, and confirm every adopted
-torrent comes back seeding:
+**A restart keeps adopted torrents.** Adoption writes each torrent's `.torrent`
+into the profile's `torrent_dir`, so it comes back from a restart with its
+metadata, at the path it was adopted at. A torrent adopted by an earlier build
+that did not write it is repaired at boot from the library `.torrent` the
+index names, which is then copied into the store. Restart once after the queue
+drains, and confirm every adopted torrent comes back seeding:
 
 ```bash
 curl -s localhost:8080/v1/pool -H "Authorization: Bearer $TOKEN" \
