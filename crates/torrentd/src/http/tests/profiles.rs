@@ -1191,6 +1191,22 @@ async fn a_torrent_the_session_refuses_to_resume_stays_held() {
         std::collections::HashSet::from([refused.infohash]),
         "only the refused one is still held",
     );
+
+    // The operator resumes it by hand: it runs, so the pace no longer holds
+    // it, and a re-hash the hold kept queued can start.
+    let token = h.tokens.write.clone();
+    h.send(
+        "POST",
+        &format!("/v1/torrents/{}/resume", refused.infohash.to_hex()),
+        Some(&token),
+        None,
+    )
+    .await
+    .assert_status(kynos::http::StatusCode::NO_CONTENT);
+    assert!(
+        h.state.profiles.holds().held(&id).is_empty(),
+        "a hand resume releases the hold",
+    );
 }
 
 /// A run a set-offline stopped notices it only at its next batch. A

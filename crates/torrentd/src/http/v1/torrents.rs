@@ -1909,7 +1909,8 @@ from_lookup!(UnfencedControlError, fenced);
 /// Refused with `409 profile-unavailable` while the torrent's profile is
 /// fenced: un-quarantining a torrent whose tunnel is down would announce it
 /// from the wrong address. A profile fenced while the resume goes out is
-/// refused the same way, and the torrent is paused again.
+/// refused the same way, and the torrent is paused again. A torrent a paced
+/// set-online still held is no longer held once resumed.
 #[kynos::post("/torrents/{infohash}/resume", tag = Torrents)]
 pub async fn resume_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1919,13 +1920,24 @@ pub async fn resume_torrent(
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
     let state = Arc::clone(&s);
     let resumed = blocking(move || {
-        crate::vpn_monitor::resume_unless_fenced(
+        let resumed = crate::vpn_monitor::resume_unless_fenced(
             &state.profiles,
             &st.profile_id,
             engine.as_ref(),
             st.handle,
             &*state.metrics,
-        )
+        )?;
+        // Running now by the operator's hand: a paced set-online that still
+        // held it (one whose paced resume was refused, say) no longer pauses
+        // it, so the hold is released, and a re-hash the hold kept queued
+        // starts ([`crate::profile_state::PacedHolds`]). Released after the
+        // resume, so a failed one leaves the torrent held.
+        if resumed == crate::vpn_monitor::SingleResume::Resumed {
+            if let Some(entry) = state.profiles.resolve(&st.profile_id).active() {
+                entry.release_holds(&[st.handle]);
+            }
+        }
+        Ok::<_, torrentd_engine::EngineError>(resumed)
     })
     .await
     .map_err(|e| UnfencedControlError::Internal {

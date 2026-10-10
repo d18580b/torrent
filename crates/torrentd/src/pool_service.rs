@@ -1278,8 +1278,9 @@ pub(crate) fn force_recheck_marking_checking(
 /// the network is put back, as an adoption is held, because a re-hash puts
 /// the torrent back on the network once it ends. So is one whose torrent a
 /// paced set-online holds paused until its batch comes
-/// ([`crate::profile_state::PacedHolds`]): it is not paused for good. The
-/// hold is logged once per profile per tick: `held_logged` names the profiles
+/// ([`crate::profile_state::PacedHolds`]): it is not paused for good. A
+/// torrent the operator resumes by hand is no longer held, so its re-hash
+/// starts. The hold is logged once per profile per tick: `held_logged` names the profiles
 /// already logged.
 fn admit_recheck(
     q: &VerifyQueue,
@@ -1319,7 +1320,11 @@ fn admit_recheck(
     }
     // A paced set-online pauses each running torrent until its batch, and
     // holds it meanwhile: it is paused by the daemon, not the operator, and
-    // runs again once its batch comes, so its re-hash waits for that.
+    // runs again once its batch comes, so its re-hash waits for that. The
+    // hold is read whatever the phase: right after the set-online the phase
+    // still reads as running until the next state update, since the
+    // session's pause never set the torrent's own flag. One the operator
+    // resumes by hand is released from its hold by that resume.
     if profiles.holds().holds(&st.profile_id, &st.handle.infohash) {
         if held_logged.insert(st.profile_id.clone()) {
             info!(
@@ -3917,6 +3922,34 @@ mod tests {
         w.profiles.holds().release(&id, [held]).unwrap();
         w.tick(&pool);
         assert_eq!(w.rechecked(), [held]);
+    }
+
+    /// Right after a set-online the held torrent's phase still reads as
+    /// running: the session's pause never set its own flag, and the state
+    /// update reporting it paused has not come yet. Its re-hash waits all the
+    /// same, rather than starting on a torrent the pace has just paused.
+    #[test]
+    fn a_rehash_waits_for_a_held_torrent_whose_phase_still_reads_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let held = InfoHash([0xD7; 20]);
+        let id = ProfileId::new("p");
+        w.load(held, 1, "p", TorrentPhase::Seeding);
+        w.profiles.holds().hold(&id, [held]).unwrap();
+        let q = pool.verify_queue();
+        q.enqueue_recheck(held.to_hex(), true);
+
+        let mut logged = std::collections::HashSet::new();
+        assert_eq!(
+            super::admit_recheck(q, &*w.source, &w.state, &w.profiles, &mut logged),
+            super::Admission::Skipped,
+        );
+        assert!(logged.contains(&id), "the hold was logged");
+        assert!(w.rechecked().is_empty(), "no check started");
+        assert_eq!(q.depth(), 1, "held by the pace: it waits");
+        assert_eq!(q.in_flight(), 0, "and holds no slot");
     }
 
     /// A re-hash paused while it checks holds its slot, so with
