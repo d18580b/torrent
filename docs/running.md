@@ -1358,6 +1358,13 @@ curl -s -X POST localhost:8080/v1/torrents \
 on the daemon's host, or `{"kind":"metainfo","data":"<base64 .torrent>"}`;
 `save_path: null` uses `default_save_path`.
 
+A `.torrent` added this way, or found in a profile's `torrent_dir` at boot
+with no resume file beside it, is hashed before it seeds: it shows `checking`
+first, for as long as reading the payload takes. A payload that is absent,
+truncated or still being copied ends `incomplete`, never announced as
+complete, and stays there, since the daemon never downloads. Put the payload
+in place, then `POST /v1/torrents/{infohash}/recheck`.
+
 ### Monitoring: Prometheus alerts and a Grafana dashboard
 
 `deploy/` ships what a Prometheus and a Grafana you already run need; neither

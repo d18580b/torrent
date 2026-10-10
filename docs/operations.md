@@ -572,8 +572,8 @@ resume file at all:
 - **Added through `POST /v1/torrents` or adopted from the pool.** The boot
   finds its `.torrent` and re-adds it at the save path recorded beside it
   (the `save_path` it was added with, or the library path it was adopted
-  at). It is added in seed mode, as `POST /v1/torrents` adds, so its payload
-  is not hashed first. An adoption still waiting in the verify queue is
+  at). It is hashed before it seeds, as `POST /v1/torrents` adds, so it shows
+  `checking` first. An adoption still waiting in the verify queue is
   added by the queue after the scans instead, hashed. One the pool index
   records `drifted` stays unloaded, because its verification failed or its
   files changed: it is one of the unloaded claims above, so `DELETE` it and
