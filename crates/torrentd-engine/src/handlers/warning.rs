@@ -100,6 +100,11 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             // Tracker warnings and scrape failures are routine on a public
             // tracker and would flood the journal at `warn`; the rest are rare
             // and each one means something is misconfigured or overloaded.
+            //
+            // libtorrent builds a tracker alert's message from the announce
+            // URL, passkey and all. The daemon's log formatter holds this
+            // target to host-only redaction (`HOST_ONLY_TARGETS` in
+            // `torrentd::tracing_init`), so keep the two in step.
             if metric == "tracker_alerts_total" {
                 debug!(
                     target: "torrentd_engine::handler::tracker",
