@@ -1516,7 +1516,8 @@ pub enum StepStatus {
     /// Not attempted.
     Pending,
     /// Attempted and not finished. Found on a plan nothing is applying, its
-    /// outcome is unknown: a run died mid-step, or a move's wait was cut off.
+    /// outcome is unknown: a run died inside the batch of up to 64 delete
+    /// steps journalled with it, or a move's wait was cut off.
     /// Nothing marks it resolved, so every apply refuses the plan; a human
     /// inspects `src` (and `dst` for a move), rescans, discards the plan, and
     /// builds a new one.
