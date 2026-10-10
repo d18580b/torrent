@@ -22,6 +22,9 @@
 //! `listen_failure_active` is not the last alert's outcome, which would read 0
 //! whenever any socket opened: [`ListenFailures`] keeps, per profile, the
 //! endpoints whose socket failed, and the gauge is 1 while any is held.
+//! [`recheck`], run on each `session_stats` alert, clears a failure that
+//! belongs to no socket when a reopen kept every socket and so posted no
+//! `listen_succeeded` to clear it.
 //!
 //! [`sockets_at`] is what the alert loop's `listen_device_check` hook asks
 //! when a `ListenSucceeded` arrives: which device the kernel holds each of
@@ -67,9 +70,25 @@ use crate::profile::ProfileId;
 /// socket coming up means a reopen got as far as opening sockets. A failure
 /// on an address the session stops listening on (a tunnel whose address
 /// changed) is held until the daemon restarts.
+///
+/// A reopen that keeps every socket it already holds (an `enum_route`
+/// failure on an IP change, whose wildcards still expand; an `enum_if`
+/// failure on a profile that lists explicit addresses only) posts its port-0
+/// failure and no `listen_succeeded` at all. So each profile's endpoints that
+/// came up are kept too, and on the profile's next `session_stats` alert
+/// ([`recheck`]) a port-0 failure is forgotten when at least one came up and
+/// this process still holds a socket on every one. libtorrent posts that
+/// alert from its network thread after the reopen that posted the failure
+/// has returned, so the reopen has closed whatever it was going to close.
+/// While no port-0 failure is held, that same alert forgets the endpoints
+/// whose sockets have closed since. An endpoint closed between the last
+/// `session_stats` and the failure is not yet forgotten, so it holds the
+/// failure as a reopen that lost it would: the gauge stays at 1 until a
+/// socket comes up, which errs toward reporting a failure.
 #[derive(Debug, Default)]
 pub struct ListenFailures {
     failed: HashMap<ProfileId, BTreeSet<String>>,
+    up: HashMap<ProfileId, BTreeSet<String>>,
 }
 
 impl ListenFailures {
@@ -87,6 +106,10 @@ impl ListenFailures {
     /// address and every failure with no endpoint (port 0). Returns whether
     /// any of `profile`'s sockets is still failed.
     fn succeeded(&mut self, profile: &ProfileId, endpoint: &str) -> bool {
+        self.up
+            .entry(profile.clone())
+            .or_default()
+            .insert(endpoint.to_owned());
         let Some(failed) = self.failed.get_mut(profile) else {
             return false;
         };
@@ -98,6 +121,47 @@ impl ListenFailures {
         }
         any
     }
+
+    /// The check a `session_stats` alert of `profile` runs: forget its
+    /// port-0 failures when it has endpoints that came up and `held` says
+    /// this process still holds a socket on every one, or else, while it
+    /// holds no port-0 failure, forget the endpoints `held` denies. Returns
+    /// whether any of `profile`'s sockets is still failed when it forgot a
+    /// failure, and `None` when it forgot none.
+    fn recheck(&mut self, profile: &ProfileId, held: impl Fn(&str) -> bool) -> Option<bool> {
+        let up = self.up.get_mut(profile);
+        let Some(failed) = self
+            .failed
+            .get_mut(profile)
+            .filter(|f| f.iter().any(|f| has_no_endpoint(f)))
+        else {
+            if let Some(up) = up {
+                up.retain(|e| held(e));
+                if up.is_empty() {
+                    self.up.remove(profile);
+                }
+            }
+            return None;
+        };
+        let kept = up.is_some_and(|up| !up.is_empty() && up.iter().all(|e| held(e)));
+        if !kept {
+            return None;
+        }
+        failed.retain(|f| !has_no_endpoint(f));
+        let any = !failed.is_empty();
+        if !any {
+            self.failed.remove(profile);
+        }
+        Some(any)
+    }
+}
+
+/// Whether this process holds a socket on a listen alert's endpoint. An
+/// endpoint that does not parse, or a read of this process's sockets that
+/// fails, holds none.
+fn socket_held(endpoint: &str) -> bool {
+    crate::port_forward::parse_listen_endpoint(endpoint)
+        .is_some_and(|at| sockets_at(at).is_ok_and(|found| !found.is_empty()))
 }
 
 /// The address part of an alert's `address:port`. IPv6 addresses are
@@ -296,6 +360,31 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>, failures: &mut ListenFail
     }
 }
 
+/// Run on each of the profile's `session_stats` alerts: forget a port-0
+/// failure once every socket the profile reported up is still held, as a
+/// reopen that kept them all posts no `listen_succeeded` to clear it (see
+/// `ListenFailures`), and set the gauge where that changed what it reads.
+pub fn recheck(ctx: &mut HandlerCtx<'_>, failures: &mut ListenFailures) {
+    recheck_with(ctx, failures, socket_held);
+}
+
+fn recheck_with(
+    ctx: &mut HandlerCtx<'_>,
+    failures: &mut ListenFailures,
+    held: impl Fn(&str) -> bool,
+) {
+    let Some(active) = failures.recheck(&ctx.profile_id, held) else {
+        return;
+    };
+    let _enter = ctx.span.enter();
+    info!(
+        target: "torrentd_engine::handler::listen",
+        "every listen socket that came up is still held, so the listen failure that \
+         belonged to no socket is cleared",
+    );
+    set_failure_active(ctx, active);
+}
+
 fn set_failure_active(ctx: &HandlerCtx<'_>, active: bool) {
     ctx.metrics.set_gauge(
         "listen_failure_active",
@@ -350,9 +439,26 @@ mod tests {
         }
     }
 
+    fn stats() -> Alert {
+        Alert::SessionStats {
+            hdr: hdr(AlertKind::SessionStats),
+            counters: Vec::new(),
+            timestamp_ns: 0,
+        }
+    }
+
     /// Dispatch `alerts` in order, each to its profile, and return the last
     /// `listen_failure_active` each profile was set to.
     fn gauge_after(alerts: &[(&str, Alert)]) -> HashMap<String, f64> {
+        gauge_after_held(alerts, |_| false)
+    }
+
+    /// [`gauge_after`], with a `session_stats` alert running the recheck
+    /// against `held` in place of this process's sockets.
+    fn gauge_after_held(
+        alerts: &[(&str, Alert)],
+        held: impl Fn(&str) -> bool + Copy,
+    ) -> HashMap<String, f64> {
         let state = StateMap::new();
         let resume = MemoryResumeStore::new();
         let torrents = MemoryTorrentStore::new();
@@ -372,7 +478,11 @@ mod tests {
                 profile_id: ProfileId::new(*profile),
                 span: tracing::info_span!("test"),
             };
-            handle(alert, &mut ctx, &mut failures);
+            if let Alert::SessionStats { .. } = alert {
+                recheck_with(&mut ctx, &mut failures, held);
+            } else {
+                handle(alert, &mut ctx, &mut failures);
+            }
         }
         let mut last = HashMap::new();
         for call in metrics.calls() {
@@ -473,6 +583,109 @@ mod tests {
             ("a", succeeded("fe80::1%3:6881")),
         ]);
         assert_eq!(gauge["a"], 1.0, "192.168.1.20:6881 is still failed");
+    }
+
+    /// The issue's kept-socket case: a reopen that keeps every socket posts
+    /// its port-0 failure and no `listen_succeeded`; the next
+    /// `session_stats` finds every socket that came up still held.
+    #[test]
+    fn a_failure_with_no_endpoint_clears_when_a_reopen_keeps_every_socket() {
+        let reopen = || {
+            vec![
+                ("a", succeeded("10.2.0.2:6881")),
+                ("a", succeeded("fe80::1%3:6881")),
+                ("a", failed("0.0.0.0:0")),
+            ]
+        };
+        assert_eq!(gauge_after_held(&reopen(), |_| true)["a"], 1.0);
+        let mut then_stats = reopen();
+        then_stats.push(("a", stats()));
+        assert_eq!(gauge_after_held(&then_stats, |_| true)["a"], 0.0);
+    }
+
+    /// A reopen that closed a socket (an `enum_if` failure leaves a wildcard
+    /// nothing to expand to) lost something, so its failure is held.
+    #[test]
+    fn a_failure_with_no_endpoint_is_held_when_a_socket_that_came_up_is_gone() {
+        let gauge = gauge_after_held(
+            &[
+                ("a", succeeded("10.2.0.2:6881")),
+                ("a", succeeded("192.168.1.20:6881")),
+                ("a", failed("0.0.0.0:0")),
+                ("a", stats()),
+                ("a", stats()),
+            ],
+            |e| e == "10.2.0.2:6881",
+        );
+        assert_eq!(gauge["a"], 1.0);
+    }
+
+    /// With no socket ever up there is nothing a reopen could have kept.
+    #[test]
+    fn a_failure_with_no_endpoint_is_held_by_session_stats_before_any_socket_comes_up() {
+        let gauge = gauge_after_held(&[("a", failed("0.0.0.0:0")), ("a", stats())], |_| true);
+        assert_eq!(gauge["a"], 1.0);
+    }
+
+    /// An endpoint whose socket closed while no port-0 failure was held is
+    /// forgotten then, so a later reopen that keeps what is left clears.
+    #[test]
+    fn session_stats_forgets_a_closed_endpoint_while_no_failure_is_held() {
+        let closed = std::cell::Cell::new(false);
+        let held = |e: &str| !(closed.get() && e == "10.2.0.2:6881");
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let clock = MockClock::new();
+        let metrics = RecordingSink::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let mut failures = ListenFailures::default();
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: ProfileId::new("a"),
+            span: tracing::info_span!("test"),
+        };
+        handle(&succeeded("10.2.0.2:6881"), &mut ctx, &mut failures);
+        handle(&succeeded("10.2.0.3:6881"), &mut ctx, &mut failures);
+        closed.set(true);
+        recheck_with(&mut ctx, &mut failures, held);
+        handle(&failed("0.0.0.0:0"), &mut ctx, &mut failures);
+        recheck_with(&mut ctx, &mut failures, held);
+        assert!(failures.failed.is_empty(), "{:?}", failures.failed);
+        assert_eq!(failures.up[&ProfileId::new("a")].len(), 1);
+    }
+
+    /// Only the port-0 failure is the reopen's: a socket's own failure
+    /// still waits for that socket.
+    #[test]
+    fn a_kept_reopen_does_not_clear_a_socket_s_failure() {
+        let gauge = gauge_after_held(
+            &[
+                ("a", succeeded("10.2.0.2:6881")),
+                ("a", failed("10.2.0.3:6881")),
+                ("a", failed("0.0.0.0:0")),
+                ("a", stats()),
+            ],
+            |_| true,
+        );
+        assert_eq!(gauge["a"], 1.0);
+    }
+
+    /// The probe the alert loop uses reads this process's own sockets.
+    #[test]
+    fn a_socket_is_held_while_this_process_has_it_open() {
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = tcp.local_addr().unwrap().to_string();
+        assert!(socket_held(&at));
+        drop(tcp);
+        assert!(!socket_held(&at));
+        assert!(!socket_held("not an endpoint"));
     }
 
     #[test]
