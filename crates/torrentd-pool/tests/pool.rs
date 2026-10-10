@@ -2518,6 +2518,105 @@ fn nothing_is_pruned_from_a_library_that_was_not_read_in_full() {
     assert!(store.torrent(&ihs[0]).unwrap().is_none());
 }
 
+/// Run `f` with `dir` at mode 0o000, restoring its mode afterwards, or skip
+/// `f` where permissions do not bind (running as root) and the directory
+/// still lists.
+fn with_unlistable(dir: &Path, f: impl FnOnce()) {
+    use std::os::unix::fs::PermissionsExt;
+    let original = std::fs::metadata(dir).unwrap().permissions();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let binds = std::fs::read_dir(dir).is_err();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if binds {
+            f();
+        }
+    }));
+    std::fs::set_permissions(dir, original).unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// jwalk reports a directory it cannot list on the directory's own `Ok`
+/// entry, not as an `Err`, so a scan reading only `Err`s indexed an
+/// unreadable subdirectory as an empty one with `errors: 0`.
+#[test]
+fn an_unlistable_subdirectory_is_a_walk_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write_file(root, "a.bin", 1);
+    write_file(root, "locked/b.bin", 1);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    with_unlistable(&root.join("locked"), || {
+        let stats = torrentd_pool::scan_root(&mut store, root).unwrap();
+        assert!(stats.errors >= 1, "{stats:?}");
+        assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+        assert_eq!(stats.files_indexed, 1, "the readable rest is indexed");
+    });
+}
+
+/// A root that cannot be listed, or is gone, is a walk error and keeps the
+/// index it had: committing the empty walk would read every torrent over it
+/// as `missing`.
+#[test]
+fn an_unreadable_root_keeps_its_previous_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    write_file(&root, "a.bin", 1);
+    write_file(&root, "sub/b.bin", 1);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    assert_eq!(store.file_count().unwrap(), 2);
+
+    with_unlistable(&root, || {
+        let stats = torrentd_pool::scan_root(&mut store, &root).unwrap();
+        assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+        assert_eq!(store.file_count().unwrap(), 2, "previous index kept");
+    });
+
+    let moved = dir.path().join("moved");
+    std::fs::rename(&root, &moved).unwrap();
+    let stats = torrentd_pool::scan_root(&mut store, &root).unwrap();
+    assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+    assert_eq!(store.file_count().unwrap(), 2, "previous index kept");
+
+    // Readable again, the root is re-indexed as usual.
+    std::fs::rename(&moved, &root).unwrap();
+    std::fs::remove_file(root.join("a.bin")).unwrap();
+    let stats = torrentd_pool::scan_root(&mut store, &root).unwrap();
+    assert_eq!(stats.errors, 0, "{stats:?}");
+    assert_eq!(store.file_count().unwrap(), 1);
+}
+
+/// The library walk reads the same field: an unlistable subdirectory of
+/// `library_dir` is a walk error, so the torrents under it are not pruned.
+#[test]
+fn an_unlistable_library_subdirectory_is_a_walk_error_and_prunes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("library");
+    let sub = library.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/pad_file.torrent"),
+        sub.join("pad_file.torrent"),
+    )
+    .unwrap();
+    let mut store = PoolStore::open_in_memory().unwrap();
+    torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+    let ih = store.torrents().unwrap()[0].infohash.clone();
+
+    with_unlistable(&sub, || {
+        let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+        assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+        assert!(store.torrent(&ih).unwrap().is_some(), "kept");
+    });
+    with_unlistable(&library, || {
+        let stats = torrentd_pool::scan_library(&mut store, &library, &Default::default()).unwrap();
+        assert!(stats.errors_by_kind.get("walk") >= Some(&1), "{stats:?}");
+        assert!(store.torrent(&ih).unwrap().is_some(), "kept");
+    });
+}
+
 #[test]
 fn a_root_no_longer_configured_leaves_the_index() {
     let dir = tempfile::tempdir().unwrap();

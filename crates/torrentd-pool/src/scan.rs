@@ -29,7 +29,8 @@ pub struct ScanStats {
     /// parse. Surfaced rather than swallowed: a permissions problem on a root
     /// otherwise looks exactly like an empty directory.
     pub errors: u64,
-    /// `errors`, by kind: `walk` (the walk could not read an entry), `stat`,
+    /// `errors`, by kind: `walk` (the walk could not read an entry, or list a
+    /// directory), `stat`,
     /// `path` (not UTF-8), `read` (a `.torrent` that could not be read) and
     /// `parse` (one that is not a torrent, or names no info-hash). A kind that
     /// never happened is absent. The daemon exports each as its own series, so
@@ -57,11 +58,17 @@ impl ScanStats {
 /// The walk streams into a staging table [`STAGE_BATCH`] rows at a time, and
 /// the root's index is swapped for it only once the walk is done: memory is
 /// one batch whatever the root's size, and the index never holds half a walk.
+///
+/// A root that cannot be read at all — missing, or present but not listable
+/// — counts a `walk` error and keeps its previous index: swapping in the
+/// empty walk would read every torrent over it as `missing`, though nothing
+/// on disk is known to have changed.
 pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, PoolError> {
     let root_id = store.upsert_root(root_path)?;
     let mut stats = ScanStats::default();
     store.begin_staging()?;
     let mut files = Vec::with_capacity(STAGE_BATCH);
+    let mut root_unreadable = false;
 
     for entry in jwalk::WalkDir::new(root_path)
         .follow_links(false)
@@ -72,9 +79,14 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
             Err(e) => {
                 warn!(target: "torrentd_pool::scan", root = %root_path.display(), error.cause = %e, "walk error");
                 stats.note_error("walk");
+                root_unreadable |= e.depth() == 0;
                 continue;
             }
         };
+        if let Some(e) = &entry.read_children_error {
+            note_unlistable(&mut stats, &entry.path(), e);
+            root_unreadable |= entry.depth == 0;
+        }
         if !entry.file_type().is_file() {
             continue;
         }
@@ -122,6 +134,17 @@ pub fn scan_root(store: &mut PoolStore, root_path: &Path) -> Result<ScanStats, P
     store.stage_files(&files)?;
     drop(files);
 
+    if root_unreadable {
+        // Empty the staging table rather than leave the failed walk in it.
+        store.begin_staging()?;
+        warn!(
+            target: "torrentd_pool::scan",
+            root = %root_path.display(),
+            error_count = stats.errors,
+            "root could not be read; its previous index is kept",
+        );
+        return Ok(stats);
+    }
     store.swap_staged_root(root_id, now_secs())?;
     info!(
         target: "torrentd_pool::scan",
@@ -175,6 +198,9 @@ pub fn scan_library(
             }
         };
         let path = entry.path();
+        if let Some(e) = &entry.read_children_error {
+            note_unlistable(&mut stats, &path, e);
+        }
         if !entry.file_type().is_file()
             || path.extension().and_then(|e| e.to_str()) != Some("torrent")
         {
@@ -297,6 +323,17 @@ pub fn scan_library(
         "library scan complete",
     );
     Ok(stats)
+}
+
+/// Count a directory the walk could not list as a `walk` error.
+///
+/// jwalk does not yield such a directory as an `Err`: it yields the
+/// directory's own `Ok` entry with the failure in `read_children_error`, and
+/// simply has no children to yield after it. Read only as an `Err`, an
+/// unreadable directory is indistinguishable from an empty one.
+fn note_unlistable(stats: &mut ScanStats, dir: &Path, e: &jwalk::Error) {
+    warn!(target: "torrentd_pool::scan", path = %dir.display(), error.cause = %e, "directory could not be read");
+    stats.note_error("walk");
 }
 
 fn now_secs() -> i64 {
