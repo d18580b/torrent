@@ -978,8 +978,9 @@ pub async fn boot(
     // VPN health monitor, started here for the same reason: the scans below
     // run for minutes on a large pool, and a tunnel that drops during them
     // has to be fenced then, not at the first poll after boot. Its fence
-    // pauses what the state map holds, which the scans do not fill, so the
-    // scans pause what they add to a fenced profile themselves (`ScanFence`).
+    // pauses what the state map holds, which the scans fill only once both
+    // have run, so the scans pause what they add to a fenced profile
+    // themselves (`ScanFence`).
     spawn_supervised(
         "vpn_monitor",
         metrics.clone(),
@@ -1052,7 +1053,8 @@ pub async fn boot(
         // scans below run for minutes on a large pool, and a firewall reload
         // that flushes the ruleset during them has to fence every vpn profile
         // then, not at the first check after boot. Its fence walks the state
-        // map, which the scans do not fill, so the scans record what they
+        // map, which the scans fill only once both have run, so the scans
+        // record what they
         // pause under it themselves (`ScanFence`). A failed boot stops it
         // before its guard removes the table, which it would otherwise
         // install again.
@@ -1855,8 +1857,8 @@ fn resume_scan_params(
 /// monitor's fence reaches them.
 ///
 /// The monitor runs from the moment the profiles are built, but its fence
-/// pauses what the state map holds, and the state map is filled by the alert
-/// loop, which starts only once both scans have run. A profile fenced
+/// pauses what the state map holds, and the scans' torrents go into the state
+/// map only once both scans have run ([`ScanFence::track_all`]). A profile fenced
 /// mid-scan would otherwise be marked down with nothing paused, and every
 /// torrent the scans went on to add to it would seed over whatever route was
 /// left.
