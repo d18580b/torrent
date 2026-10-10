@@ -31,10 +31,15 @@
 //!     `listen_failed` on the port a rebind is moving onto, at any address
 //!     ([`ListenEvents::rebind_in_progress`]) is the rebind's to revert and
 //!     is never fatal; the revert's own failure is.
+//!   - Lost alerts: after every drain, each session's count of alerts the
+//!     shim popped and could not translate is read, and what it rose by is
+//!     added to `alert_translate_errors_total` and warned about. Such an
+//!     alert never reaches a handler, so this is the only trace it leaves.
 //!   - Liveness: every iteration stamps a wall-clock heartbeat that
 //!     `GET /healthz` reads. A wedged or panicked loop makes the daemon
 //!     report unready instead of quietly serving a stale state map.
 
+use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -466,6 +471,8 @@ fn run(
     // How many tracker failures each profile has warned about in its current
     // window, so an outage across every torrent is a bounded number of lines.
     let mut tracker_failures = TrackerFailureLog::default();
+    // What each profile's translation failure count was when last published.
+    let mut translate_errors = TranslateErrors::default();
 
     loop {
         // 0) Liveness stamp. Written at the top of every iteration so a loop
@@ -488,6 +495,9 @@ fn run(
                 &mut listen_failures,
                 &mut tracker_failures,
             );
+            // The shutdown's own drains can lose alerts too, resume answers
+            // among them.
+            translate_errors.publish(&source, &metrics);
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
         }
@@ -589,6 +599,9 @@ fn run(
                 &mut tracker_failures,
             );
         }
+        // After every drain, an empty one included: a pop whose every alert
+        // failed to translate comes back empty.
+        translate_errors.publish(&source, &metrics);
         if let Some(why) = fatal {
             hooks.listen_failed.store(true, Ordering::Relaxed);
             error!(target: "torrentd_engine::alert_loop", "{why}");
@@ -608,6 +621,9 @@ fn run(
                 &mut listen_failures,
                 &mut tracker_failures,
             );
+            // The shutdown's own drains can lose alerts too, resume answers
+            // among them.
+            translate_errors.publish(&source, &metrics);
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
         }
@@ -657,6 +673,51 @@ fn run(
         // 5) Sleep if there's nothing to do.
         if was_empty {
             clock.sleep(POLL_IDLE_INTERVAL);
+        }
+    }
+}
+
+/// Each profile's [`TorrentEngine::alert_translate_errors`] as last
+/// published, so what is added to `alert_translate_errors_total` is the rise
+/// since then.
+///
+/// Starts at 0 for every profile, which is where a session's count starts:
+/// what the boot's backlog lost is published by the first drain, before
+/// anything scrapes, and the `boot_alert_translate_errors` gauge carries it.
+#[derive(Debug, Default)]
+struct TranslateErrors {
+    published: HashMap<ProfileId, u64>,
+}
+
+impl TranslateErrors {
+    /// Add each profile's rise to the counter, and warn about it.
+    fn publish(&mut self, source: &Arc<dyn AlertSource>, metrics: &Arc<dyn MetricsSink>) {
+        for profile in source.profiles() {
+            let Some(engine) = source.engine_for(&profile) else {
+                continue;
+            };
+            let count = engine.alert_translate_errors();
+            let published = self.published.entry(profile.clone()).or_insert(0);
+            // The count is monotonic for a session, so a lower one is a
+            // session other than the one last read, counted from its own 0.
+            let lost = count.checked_sub(*published).unwrap_or(count);
+            *published = count;
+            if lost == 0 {
+                continue;
+            }
+            metrics.add_counter(
+                "alert_translate_errors_total",
+                lost,
+                &[("profile_id", profile.as_str())],
+            );
+            warn!(
+                target: "torrentd_engine::alert_loop",
+                profile_id = %profile,
+                lost,
+                total = count,
+                "libtorrent alerts were dropped because they could not be translated; the \
+                 state map may have missed a torrent's removal or a resume save's answer",
+            );
         }
     }
 }
@@ -2433,6 +2494,157 @@ mod tests {
 
         handle.signal_shutdown(ShutdownReason::Test);
         handle.join().expect("loop thread panicked");
+    }
+
+    /// Counts the `warn` events dispatched to it on the current thread.
+    #[derive(Default)]
+    struct WarnCounter(std::sync::atomic::AtomicUsize);
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// `alert_translate_errors_total`'s additions, by profile, in order.
+    fn translate_error_adds(metrics: &RecordingSink) -> Vec<(String, u64)> {
+        metrics
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                MetricCall::AddCounter {
+                    name,
+                    value,
+                    labels,
+                } if name == "alert_translate_errors_total" => {
+                    assert_eq!(labels.len(), 1);
+                    assert_eq!(labels[0].0, "profile_id");
+                    Some((labels[0].1.clone(), value))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn translate_errors_publish_each_profiles_rise_once_and_warn_with_it() {
+        let a = Arc::new(MockEngine::new());
+        let b = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(ProfileSource::new(vec![
+            (ProfileId::new("a"), a.clone() as Arc<dyn TorrentEngine>),
+            (ProfileId::new("b"), b.clone() as Arc<dyn TorrentEngine>),
+        ]));
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = recording.clone();
+        let mut published = TranslateErrors::default();
+        let warns = Arc::new(WarnCounter::default());
+
+        tracing::subscriber::with_default(Arc::clone(&warns), || {
+            // Nothing lost: nothing published, nothing warned.
+            published.publish(&source, &metrics);
+            a.set_alert_translate_errors(3);
+            published.publish(&source, &metrics);
+            // Unchanged since: the 3 are not published again.
+            published.publish(&source, &metrics);
+            a.set_alert_translate_errors(5);
+            b.set_alert_translate_errors(1);
+            published.publish(&source, &metrics);
+            // A lower count is a session counting from its own 0.
+            b.set_alert_translate_errors(0);
+            published.publish(&source, &metrics);
+            b.set_alert_translate_errors(2);
+            published.publish(&source, &metrics);
+        });
+
+        assert_eq!(
+            translate_error_adds(&recording),
+            [
+                ("a".to_string(), 3),
+                ("a".to_string(), 2),
+                ("b".to_string(), 1),
+                ("b".to_string(), 2),
+            ],
+        );
+        assert_eq!(warns.0.load(Ordering::Relaxed), 4, "one warn per rise");
+    }
+
+    #[test]
+    fn the_running_loop_publishes_a_sessions_translate_errors_as_they_rise() {
+        let engine = Arc::new(MockEngine::new());
+        let recording = Arc::new(RecordingSink::new());
+        let handle = AlertLoopBuilder::new(
+            Arc::new(single_profile_source(engine.clone())),
+            Arc::new(StateMap::new()),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            recording.clone(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .spawn();
+
+        // No alert is queued: an alert the shim could not translate never
+        // reaches the loop, so the drain that lost it comes back empty.
+        engine.set_alert_translate_errors(2);
+        assert!(wait_for(|| recording
+            .count_for("alert_translate_errors_total")
+            == 2));
+        engine.set_alert_translate_errors(7);
+        assert!(wait_for(|| recording
+            .count_for("alert_translate_errors_total")
+            == 7));
+
+        handle.signal_shutdown(ShutdownReason::Test);
+        handle.join().expect("loop thread panicked");
+        assert_eq!(
+            translate_error_adds(&recording),
+            [("p".to_string(), 2), ("p".to_string(), 5)],
+            "the delta since the last publish, labelled by profile",
+        );
+    }
+
+    #[test]
+    fn the_shutdown_publishes_what_its_own_drains_lost() {
+        // The shutdown is signalled before the loop's first iteration, so
+        // only the publish after the shutdown drain can count these.
+        let engine = Arc::new(MockEngine::new());
+        let state = Arc::new(StateMap::new());
+        let recording = Arc::new(RecordingSink::new());
+        let (tx, rx) = bounded(1);
+        tx.send(ShutdownReason::Test).unwrap();
+        engine.set_alert_translate_errors(4);
+        run(
+            rx,
+            Arc::new(single_profile_source(engine.clone())),
+            state,
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            recording.clone(),
+            Arc::new(MockClock::new()),
+            LoopHooks {
+                heartbeat: Arc::new(AtomicU64::new(0)),
+                listen_failed: Arc::new(AtomicBool::new(false)),
+                fatal_listen_failure: false,
+                on_fatal: None,
+                profile_fenced: None,
+                unsaved_at_shutdown: Arc::new(AtomicU64::new(0)),
+                listen_events: None,
+                listen_device_check: None,
+                shutdown_deadline: Duration::from_millis(1),
+            },
+        );
+        assert_eq!(translate_error_adds(&recording), [("p".to_string(), 4)]);
     }
 
     #[test]
