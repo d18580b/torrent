@@ -24,7 +24,12 @@
 //! route via the tunnel in a table of its own, and a rule sending traffic from
 //! the tunnel address to that table. The profile's sockets are bound to that
 //! address and device, so that is all they need, and nothing else on the host
-//! is rerouted.
+//! is rerouted. An IPv6 address on the device — a pushed `ifconfig-ipv6` —
+//! gets a rule and an IPv6 default route of its own too: nothing binds to it,
+//! but without one the kernel's replies from it follow the main table out of
+//! the physical interface. The addresses are read once the IPv4 one appears.
+//! openvpn assigns the IPv6 one straight after it, so a poll landing between
+//! the two misses it and leaves it unrouted until the next bring-up.
 //!
 //! The table is `TABLE_BASE + ifindex`, and the routes in it go with the link,
 //! so the routing holds only as long as the tun device openvpn created at
@@ -115,6 +120,26 @@ fn openvpn_args<'a>(config: &'a str, iface: &'a str, pid_file: &'a str) -> Vec<&
     ]
 }
 
+/// What [`route::install`] is handed for a tunnel holding `addrs`: a source
+/// rule for each address, and a default route via the tunnel in each family
+/// one of them is in.
+///
+/// Every address, not only the IPv4 one the sessions bind to. A pushed
+/// `ifconfig-ipv6` address with no rule of its own follows the main IPv6
+/// table, so the kernel's replies from it — a reset, an ICMP error — leave by
+/// the physical interface and tie the tunnel's address to the host.
+fn source_routing(addrs: &[IpAddr]) -> (Vec<String>, Vec<String>) {
+    let addresses = addrs.iter().map(IpAddr::to_string).collect();
+    let mut prefixes = Vec::new();
+    if addrs.iter().any(IpAddr::is_ipv4) {
+        prefixes.push("0.0.0.0/0".to_string());
+    }
+    if addrs.iter().any(IpAddr::is_ipv6) {
+        prefixes.push("::/0".to_string());
+    }
+    (addresses, prefixes)
+}
+
 /// The tables whose rules teardown removes: the one recorded at bring-up,
 /// and the live link's, each once.
 fn tables_to_clear(recorded: Option<u32>, live: Option<u32>) -> Vec<u32> {
@@ -192,14 +217,15 @@ impl OpenvpnManager {
     }
 
     /// The per-source routing an OpenVPN tunnel gets: everything, via the
-    /// tunnel, for traffic from the tunnel's own address.
+    /// tunnel, for traffic from each of the tunnel's own addresses
+    /// ([`source_routing`]).
     ///
     /// The table is recorded before the first rule goes in, so a partial
     /// install is still found by teardown. A table left recorded by an
     /// earlier run on this boot that never tore down has its rules removed
     /// first; one recorded on an earlier boot is not believed
     /// ([`Self::recorded_table`]) and is overwritten.
-    fn route_tunnel(&self, iface: &str, ip: IpAddr) -> std::io::Result<()> {
+    fn route_tunnel(&self, iface: &str, addrs: &[IpAddr]) -> std::io::Result<()> {
         let table = route::table_for(iface)?;
         if let Some(old) = self.recorded_table(iface).filter(|t| *t != table) {
             route::remove(old);
@@ -208,11 +234,8 @@ impl OpenvpnManager {
             self.table_file(iface),
             format!("{}\n{table}\n", self.boot_id.as_deref().unwrap_or_default()),
         )?;
-        let default = match ip {
-            IpAddr::V4(_) => "0.0.0.0/0",
-            IpAddr::V6(_) => "::/0",
-        };
-        route::install(iface, &[ip.to_string()], &[default.to_string()])
+        let (addresses, prefixes) = source_routing(addrs);
+        route::install(iface, &addresses, &prefixes)
     }
 
     /// Remove the source-address rules this manager installed for `iface`:
@@ -341,29 +364,46 @@ impl VpnManager for OpenvpnManager {
             match super::ip_lookup::first_ipv4(&profile.interface) {
                 Ok(ip) => {
                     let addr = IpAddr::V4(ip);
-                    if let Err(e) = self.route_tunnel(&profile.interface, addr) {
-                        // Without its rule the tunnel address routes by the
-                        // main table: a profile bound to it would send out of
-                        // the physical interface. What this call started is
-                        // this call's to stop.
-                        warn!(
-                            target: "torrentd::vpn::openvpn",
-                            vpn_iface = %profile.interface,
-                            tunnel_ip = %addr,
-                            error.cause = %e,
-                            "could not install the tunnel's source-address routing; \
-                             taking it down",
-                        );
-                        self.stop(&profile.interface);
-                        return Err(VpnError::RoutingFailed {
-                            iface: profile.interface.clone(),
-                            cause: e.to_string(),
+                    // The IPv6 addresses openvpn assigned beside it, which
+                    // get a source rule each; a listing that cannot be read
+                    // is a routing failure like a rule that will not add.
+                    let routed = super::ip_lookup::ipv6_addrs(&profile.interface)
+                        .map(|v6| {
+                            std::iter::once(addr)
+                                .chain(v6.into_iter().map(IpAddr::V6))
+                                .collect::<Vec<_>>()
+                        })
+                        .and_then(|addrs| {
+                            self.route_tunnel(&profile.interface, &addrs)
+                                .map(|()| addrs)
                         });
-                    }
+                    let addrs = match routed {
+                        Ok(addrs) => addrs,
+                        Err(e) => {
+                            // Without its rule the tunnel address routes by the
+                            // main table: a profile bound to it would send out of
+                            // the physical interface. What this call started is
+                            // this call's to stop.
+                            warn!(
+                                target: "torrentd::vpn::openvpn",
+                                vpn_iface = %profile.interface,
+                                tunnel_ip = %addr,
+                                error.cause = %e,
+                                "could not install the tunnel's source-address routing; \
+                                 taking it down",
+                            );
+                            self.stop(&profile.interface);
+                            return Err(VpnError::RoutingFailed {
+                                iface: profile.interface.clone(),
+                                cause: e.to_string(),
+                            });
+                        }
+                    };
                     info!(
                         target: "torrentd::vpn::openvpn",
                         vpn_iface = %profile.interface,
                         tunnel_ip = %addr,
+                        routed = ?addrs,
                         "openvpn tunnel up, routed by source address",
                     );
                     return Ok(addr);
@@ -593,6 +633,26 @@ mod tests {
     use super::*;
 
     const BOOT: &str = "boot-a";
+
+    /// #178: a pushed IPv6 address gets a source rule and an IPv6 default
+    /// route beside the IPv4 ones; it used to get neither.
+    #[test]
+    fn every_tunnel_address_is_source_routed_in_its_own_family() {
+        let v4: IpAddr = "10.8.0.2".parse().unwrap();
+        let v6: IpAddr = "fd7d:1::1000".parse().unwrap();
+        assert_eq!(
+            source_routing(&[v4, v6]),
+            (
+                vec!["10.8.0.2".to_string(), "fd7d:1::1000".to_string()],
+                vec!["0.0.0.0/0".to_string(), "::/0".to_string()],
+            ),
+        );
+        assert_eq!(
+            source_routing(&[v4]),
+            (vec!["10.8.0.2".to_string()], vec!["0.0.0.0/0".to_string()]),
+            "no IPv6 address, no IPv6 route",
+        );
+    }
 
     fn mgr() -> (tempfile::TempDir, OpenvpnManager) {
         let d = tempfile::tempdir().unwrap();
