@@ -316,14 +316,19 @@ pub fn update(state: &mut State, msg: Msg, ctx: &Ctx<'_>) -> Vec<Effect> {
                 .iter()
                 .find(|p| p.profile_id == profile_id)
                 .is_some_and(|p| p.status == types::ProfileStatus::VpnDown);
+            let online = detail.effective_state == types::ProfileState::Online;
             let text = match action {
                 Switch::Offline => format!("{profile_id}: offline"),
-                Switch::Online if was_fenced => {
+                Switch::Online if was_fenced && online => {
                     format!("{profile_id}: tunnel checked healthy; fence lifted, online")
                 }
-                Switch::Online if detail.effective_state == types::ProfileState::Online => {
-                    format!("{profile_id}: online")
-                }
+                // The fence lifted, but something else (offline-all) still
+                // holds the profile off the network.
+                Switch::Online if was_fenced => format!(
+                    "{profile_id}: tunnel checked healthy; fence lifted; still off the network ({})",
+                    still_off(&detail.status)
+                ),
+                Switch::Online if online => format!("{profile_id}: online"),
                 Switch::Online => format!(
                     "{profile_id}: set online, still off the network ({})",
                     still_off(&detail.status)
@@ -1189,6 +1194,31 @@ mod tests {
             assert_eq!(
                 toast.text,
                 "host: set online, still off the network (offline-all is on)"
+            );
+        });
+    }
+
+    #[test]
+    fn a_lifted_fence_under_offline_all_is_toasted_as_still_off_the_network() {
+        let mut state = loaded("acct_b");
+        testing::with_ctx(None, |ctx| {
+            // The list had acct_b fenced; the probe passed and the fence
+            // lifted, but offline-all keeps it off the network.
+            let effects = update(
+                &mut state,
+                Msg::Ran {
+                    action: Switch::Online,
+                    profile_id: "acct_b".into(),
+                    result: Ok(switched("acct_b", "active", "offline")),
+                },
+                ctx,
+            );
+            assert_eq!(effects.len(), 2, "a toast and a refresh");
+            let toast = toast_of(effects.into_iter().next().unwrap());
+            assert_eq!(toast.kind, ToastKind::Success);
+            assert_eq!(
+                toast.text,
+                "acct_b: tunnel checked healthy; fence lifted; still off the network (offline-all is on)"
             );
         });
     }
