@@ -2,8 +2,9 @@
 //!
 //! Matching is `(relative path, size)` against a **candidate base** — the
 //! directory a torrent's relative paths hang off. A torrent a session serves
-//! tries the base it is recorded at first, and keeps it while it is complete:
-//! that is where the session reads from. Candidates otherwise come from three
+//! tries the save path that session reports first, then the base it is
+//! recorded at, and keeps the first that is complete: that is where the
+//! session reads from. Candidates otherwise come from three
 //! places, cheapest first:
 //!
 //! 1. The save path the previous client recorded in its `.fastresume`. On a
@@ -22,6 +23,7 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
+use std::path::PathBuf;
 
 use tracing::info;
 
@@ -86,22 +88,42 @@ pub fn match_all(store: &mut PoolStore) -> Result<MatchStats, PoolError> {
 
 /// [`match_all`], where the caller knows what the sessions serve.
 ///
-/// `loaded` is the hex info-hashes every session holds. An `adopted` torrent
-/// in none of them, and with no owner recorded in the index, is held by
-/// nothing: it is demoted to the verdict its payload earns, so it can be
-/// adopted again. One the index still records an owner for keeps `adopted`:
-/// that profile may be offline, or its session may not have reported the
-/// torrent yet, and the owner record refuses other profiles either way.
+/// `loaded` maps the hex info-hash of every torrent a session holds to the
+/// `save_path` that session holds it at, or `None` where it could not be
+/// read. An `adopted` torrent in none of them, and with no owner recorded in
+/// the index, is held by nothing: it is demoted to the verdict its payload
+/// earns, so it can be adopted again. One the index still records an owner
+/// for keeps `adopted`: that profile may be offline, or its session may not
+/// have reported the torrent yet, and the owner record refuses other profiles
+/// either way.
+///
+/// A loaded torrent's session `save_path`, where it lies under a managed
+/// root, is tried before its recorded base and kept while it is complete:
+/// the session reads from there whatever the index recorded, and the two
+/// disagree after a crash before a resume save or a half-done move.
 pub fn match_all_serving(
     store: &mut PoolStore,
-    loaded: &HashSet<String>,
+    loaded: &HashMap<String, Option<PathBuf>>,
 ) -> Result<MatchStats, PoolError> {
     store.in_transaction(|store| match_all_inner(store, Some(loaded)))
 }
 
+/// `(root_id, base)` of `save_path` under the managed root holding it: the
+/// deepest one, where roots nest. `None` outside every root.
+fn base_under_roots(roots: &[(i64, PathBuf)], save_path: &Path) -> Option<(i64, String)> {
+    roots
+        .iter()
+        .filter_map(|(id, root)| {
+            let rel = save_path.strip_prefix(root).ok()?;
+            Some((root.components().count(), *id, rel))
+        })
+        .max_by_key(|(depth, ..)| *depth)
+        .map(|(_, id, rel)| (id, normalize(&rel.to_string_lossy())))
+}
+
 fn match_all_inner(
     store: &mut PoolStore,
-    loaded: Option<&HashSet<String>>,
+    loaded: Option<&HashMap<String, Option<PathBuf>>>,
 ) -> Result<MatchStats, PoolError> {
     let roots = store.roots()?;
     let torrents = store.torrents()?;
@@ -147,18 +169,34 @@ fn match_all_inner(
         // `torrentd pool scan`, or a boot scan before the sessions report —
         // and one whose profile is offline: `release_owner` clears it once
         // nothing holds the torrent.
+        //
+        // Where the session that holds it reports a save path under a managed
+        // root, that comes first: it is where the session actually reads
+        // from, and it parts from the recorded base after a crash before a
+        // resume save or a half-done move. The recorded base is next.
         let served = prior == Some(AdoptionState::Adopted)
             || t.profile.is_some()
-            || loaded.is_some_and(|l| l.contains(&t.infohash));
+            || loaded.is_some_and(|l| l.contains_key(&t.infohash));
         let recorded = if served {
             store.adoption_base(&t.infohash)?
         } else {
             None
         };
+        let session = loaded
+            .and_then(|l| l.get(&t.infohash))
+            .and_then(Option::as_deref)
+            .and_then(|sp| base_under_roots(&roots, sp));
+        // Where a held torrent that is no longer complete is recorded at.
+        let held_at = session.as_ref().or(recorded.as_ref());
+        let preferred: Vec<(i64, &str)> = session
+            .iter()
+            .chain(recorded.iter())
+            .map(|(r, b)| (*r, b.as_str()))
+            .collect();
         let search = search_placements(
             store,
             &roots,
-            recorded.as_ref().map(|(r, b)| (*r, b.as_str())),
+            &preferred,
             t.declared_save_path.as_deref(),
             &t.name,
             &files,
@@ -173,7 +211,7 @@ fn match_all_inner(
         // then `matched` once they return, and the index would offer it for
         // adoption while a session still serves it. One nothing holds any
         // more is demoted, or adoption would refuse it for good.
-        let held = loaded.is_none_or(|l| l.contains(&t.infohash) || t.profile.is_some());
+        let held = loaded.is_none_or(|l| l.contains_key(&t.infohash) || t.profile.is_some());
         let keep_adopted = prior == Some(AdoptionState::Adopted) && held;
 
         match best {
@@ -215,9 +253,7 @@ fn match_all_inner(
                 let (state, (root_id, base_rel)) = if keep_adopted {
                     (
                         AdoptionState::Adopted,
-                        recorded
-                            .as_ref()
-                            .map_or((p.root_id, p.base_rel.as_str()), |(r, b)| (*r, b.as_str())),
+                        held_at.map_or((p.root_id, p.base_rel.as_str()), |(r, b)| (*r, b.as_str())),
                     )
                 } else {
                     (AdoptionState::Partial, (p.root_id, p.base_rel.as_str()))
@@ -234,15 +270,11 @@ fn match_all_inner(
                 stats.partial += 1;
             }
             None => {
-                // A held `adopted` torrent keeps its verdict and its recorded
-                // base, so the next rescan looks there first once the payload
-                // is back.
+                // A held `adopted` torrent keeps its verdict and the base it
+                // is served from, so the next rescan looks there first once
+                // the payload is back.
                 let (state, base, note) = if keep_adopted {
-                    (
-                        AdoptionState::Adopted,
-                        recorded.as_ref(),
-                        Some(HELD_MISSING_NOTE),
-                    )
+                    (AdoptionState::Adopted, held_at, Some(HELD_MISSING_NOTE))
                 } else {
                     (AdoptionState::Missing, None, None)
                 };
@@ -435,20 +467,20 @@ struct Search {
 
 /// Try every candidate base across every root.
 ///
-/// `preferred`, where given, is tried first and wins whenever it is complete.
-/// Every candidate is tried even after a complete one is found, because a
-/// second complete copy is something a delete plan has to know about: which
+/// `preferred` is tried first, in order, and the first of it that is complete
+/// wins. Every candidate is tried even after a complete one is found, because
+/// a second complete copy is something a delete plan has to know about: which
 /// of two identical copies a session reads from is not in the index.
 fn search_placements(
     store: &PoolStore,
-    roots: &[(i64, std::path::PathBuf)],
-    preferred: Option<(i64, &str)>,
+    roots: &[(i64, PathBuf)],
+    preferred: &[(i64, &str)],
     declared_save_path: Option<&str>,
     torrent_name: &str,
     files: &[TorrentFileRow],
 ) -> Result<Search, PoolError> {
     let mut candidates: Vec<(i64, String)> = Vec::new();
-    if let Some((root_id, base)) = preferred {
+    for &(root_id, base) in preferred {
         // A base recorded against a root no longer configured resolves
         // nothing; leave it out rather than look it up.
         if roots.iter().any(|(id, _)| *id == root_id) {
@@ -513,10 +545,11 @@ pub(crate) fn complete_copies(
     }
     let roots = store.roots()?;
     let recorded = store.adoption_base(&torrent.infohash)?;
+    let preferred: Vec<(i64, &str)> = recorded.iter().map(|(r, b)| (*r, b.as_str())).collect();
     Ok(search_placements(
         store,
         &roots,
-        recorded.as_ref().map(|(r, b)| (*r, b.as_str())),
+        &preferred,
         torrent.declared_save_path.as_deref(),
         &torrent.name,
         files,
