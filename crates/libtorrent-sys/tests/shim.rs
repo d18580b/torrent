@@ -96,25 +96,100 @@ fn save_state_buffer_ownership_roundtrip() {
 }
 
 #[test]
-fn magnet_info_hash_marshals_20_bytes() {
-    let uri = CString::new("magnet:?xt=urn:btih:0101010101010101010101010101010101010101").unwrap();
-    let mut out = [0u8; 20];
+fn magnet_info_hashes_marshal_v1_and_v2() {
     let mut err = [0 as c_char; 512];
-    let rc = unsafe { lt_magnet_info_hash(uri.as_ptr(), out.as_mut_ptr(), err.as_mut_ptr(), 512) };
+
+    let uri = CString::new("magnet:?xt=urn:btih:0101010101010101010101010101010101010101").unwrap();
+    let mut out: lt_info_hashes = unsafe { std::mem::zeroed() };
+    let rc = unsafe { lt_magnet_info_hashes(uri.as_ptr(), &mut out, err.as_mut_ptr(), 512) };
     assert_eq!(rc, LT_OK as i32);
-    assert_eq!(out, [0x01u8; 20]);
+    assert_eq!((out.has_v1, out.has_v2), (1, 0));
+    assert_eq!(out.v1, [0x01u8; 20]);
+    assert_eq!(out.v2, [0u8; 32], "v2 hash must be zeroed");
+
+    // A hybrid magnet names both: btih and a btmh multihash (0x1220 prefix).
+    let uri = CString::new(format!(
+        "magnet:?xt=urn:btih:{}&xt=urn:btmh:1220{}",
+        "02".repeat(20),
+        "03".repeat(32)
+    ))
+    .unwrap();
+    let rc = unsafe { lt_magnet_info_hashes(uri.as_ptr(), &mut out, err.as_mut_ptr(), 512) };
+    assert_eq!(rc, LT_OK as i32);
+    assert_eq!((out.has_v1, out.has_v2), (1, 1));
+    assert_eq!(out.v1, [0x02u8; 20]);
+    assert_eq!(out.v2, [0x03u8; 32]);
 }
 
 #[test]
-fn torrent_info_hash_bad_buffer_errors_cleanly() {
-    let garbage = b"nope";
-    let mut out = [0u8; 20];
+fn torrent_info_hashes_report_both_hashes_of_a_hybrid() {
+    let bytes = vendored_torrent("v2.torrent");
+    let mut out: lt_info_hashes = unsafe { std::mem::zeroed() };
     let mut err = [0 as c_char; 512];
     let rc = unsafe {
-        lt_torrent_info_hash(
+        lt_torrent_info_hashes(bytes.as_ptr(), bytes.len(), &mut out, err.as_mut_ptr(), 512)
+    };
+    assert_eq!(rc, LT_OK as i32);
+    assert_eq!((out.has_v1, out.has_v2), (1, 1), "v2.torrent is a hybrid");
+    assert_eq!(
+        hex_of(&out.v2),
+        "597b180c1a170a585dfc5e85d834d69013ceda174b8f357d5bb1a0ca509faf0a",
+    );
+    assert_ne!(out.v1, [0u8; 20]);
+}
+
+/// A hybrid `.torrent` is keyed by its v1 hash, not libtorrent's
+/// `get_best()` (the truncated v2 one): the key a btih-only magnet for the
+/// same torrent has, and the one it keeps once its metadata arrives.
+#[test]
+fn a_hybrid_file_add_reports_its_v1_hash() {
+    let bytes = vendored_torrent("v2.torrent");
+    let mut hashes: lt_info_hashes = unsafe { std::mem::zeroed() };
+    let mut err = [0 as c_char; 512];
+    let rc = unsafe {
+        lt_torrent_info_hashes(
+            bytes.as_ptr(),
+            bytes.len(),
+            &mut hashes,
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_eq!(rc, LT_OK as i32);
+
+    let s = make_session();
+    let save = CString::new("/tmp").unwrap();
+    let mut ih = [0u8; 20];
+    let h = unsafe {
+        lt_add_torrent_file(
+            s,
+            bytes.as_ptr(),
+            bytes.len(),
+            save.as_ptr(),
+            LT_TF_PAUSED,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+            ih.as_mut_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_ne!(h, 0, "add .torrent failed: {}", c_buf(&err));
+    assert_eq!(ih, hashes.v1, "the add reports the v1 hash");
+    unsafe { lt_session_destroy(s) };
+}
+
+#[test]
+fn torrent_info_hashes_bad_buffer_errors_cleanly() {
+    let garbage = b"nope";
+    let mut out: lt_info_hashes = unsafe { std::mem::zeroed() };
+    let mut err = [0 as c_char; 512];
+    let rc = unsafe {
+        lt_torrent_info_hashes(
             garbage.as_ptr(),
             garbage.len(),
-            out.as_mut_ptr(),
+            &mut out,
             err.as_mut_ptr(),
             512,
         )

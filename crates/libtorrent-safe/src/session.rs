@@ -19,6 +19,7 @@ use crate::error::Error;
 use crate::error::Result;
 use crate::handle::InfoHash;
 use crate::handle::TorrentHandle;
+use crate::metadata::InfoHashes;
 use crate::settings::MoveFlags;
 use crate::settings::ResumeFlags;
 use crate::settings::Settings;
@@ -584,49 +585,60 @@ impl RawFileList {
     }
 }
 
-/// Compute the info-hash of a `.torrent` buffer without adding it to a
-/// session — used to enforce registry uniqueness before any session sees the
-/// torrent.
-pub fn info_hash_from_torrent(bytes: &[u8]) -> Result<InfoHash> {
+/// The info-hashes of a `.torrent` buffer, without adding it to a session —
+/// used to enforce registry uniqueness before any session sees the torrent.
+pub fn info_hashes_from_torrent(bytes: &[u8]) -> Result<InfoHashes> {
     if bytes.is_empty() {
         return Err(Error::InvalidInput("empty .torrent buffer"));
     }
-    let mut out = [0u8; 20];
+    let mut out: ffi::lt_info_hashes = unsafe { std::mem::zeroed() };
     let mut err = ErrBuf::new();
     let rc = unsafe {
-        ffi::lt_torrent_info_hash(
+        ffi::lt_torrent_info_hashes(
             bytes.as_ptr(),
             bytes.len(),
-            out.as_mut_ptr(),
+            &mut out,
             err.ptr(),
             err.len() as i32,
         )
     };
     if rc == ffi::LT_OK as i32 {
-        Ok(InfoHash(out))
+        Ok(InfoHashes::from_raw(&out))
     } else {
         Err(Error::Shim(err.into_string()))
     }
 }
 
-/// Compute the info-hash encoded in a magnet URI without adding it.
-pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
+/// The info-hashes a magnet URI names (`btih`, `btmh`), without adding it.
+pub fn info_hashes_from_magnet(uri: &str) -> Result<InfoHashes> {
     let uri_c = c_string(uri, "magnet uri")?;
-    let mut out = [0u8; 20];
+    let mut out: ffi::lt_info_hashes = unsafe { std::mem::zeroed() };
     let mut err = ErrBuf::new();
     let rc = unsafe {
-        ffi::lt_magnet_info_hash(
-            uri_c.as_ptr(),
-            out.as_mut_ptr(),
-            err.ptr(),
-            err.len() as i32,
-        )
+        ffi::lt_magnet_info_hashes(uri_c.as_ptr(), &mut out, err.ptr(), err.len() as i32)
     };
     if rc == ffi::LT_OK as i32 {
-        Ok(InfoHash(out))
+        Ok(InfoHashes::from_raw(&out))
     } else {
         Err(Error::Shim(err.into_string()))
     }
+}
+
+/// The key ([`InfoHashes::key`]) of a `.torrent` buffer: the hash the session
+/// will report for it once added.
+pub fn info_hash_from_torrent(bytes: &[u8]) -> Result<InfoHash> {
+    key_of(info_hashes_from_torrent(bytes)?)
+}
+
+/// The key ([`InfoHashes::key`]) of the torrent a magnet URI names.
+pub fn info_hash_from_magnet(uri: &str) -> Result<InfoHash> {
+    key_of(info_hashes_from_magnet(uri)?)
+}
+
+fn key_of(hashes: InfoHashes) -> Result<InfoHash> {
+    hashes
+        .key()
+        .ok_or_else(|| Error::Shim("torrent names no info-hash".to_owned()))
 }
 
 /// Whether every tracker `params` would announce to is on `domains`: its host
@@ -903,31 +915,19 @@ mod tests {
         None
     }
 
-    /// A magnet whose torrent is removed after its metadata arrived but before
-    /// the `metadata_received_alert` is popped. Translating that alert used to
-    /// throw (the torrent it names no longer exists), which took every alert
-    /// in the same pop with it: `add_torrent`, `torrent_removed`, and any other
-    /// torrent's alerts in the batch.
-    #[test]
-    fn a_torrent_removed_before_its_metadata_alert_is_popped_loses_no_alerts() {
-        let seed_dir = Scratch::new("seed");
-        let fetch_dir = Scratch::new("fetch");
-        let seed = Session::new(&loopback_settings()).expect("seed session");
-        let fetch = Session::new(&loopback_settings()).expect("fetch session");
-
-        let torrent = single_file_torrent("payload.bin", 64 * 1024, 16 * 1024);
-        let ih = info_hash_from_torrent(&torrent).expect("info hash");
+    /// Add `torrent` to `seed` and return the session's listen port, once the
+    /// torrent's check has finished: a peer that connects while the torrent is
+    /// still checking is turned away, and the fetching side would not retry it
+    /// within a test's deadline.
+    fn serve(seed: &Session, torrent: Vec<u8>, dir: &Scratch) -> u16 {
         seed.add_torrent(AddParams::File {
             bytes: torrent,
-            save_path: seed_dir.path(),
+            save_path: dir.path(),
             flags: TorrentFlags::empty(),
             trackers: Vec::new(),
         })
         .expect("seed add");
 
-        // The listen port, and the seed's check finished: a peer that connects
-        // while the torrent is still checking is turned away, and the fetching
-        // side would not retry it within the test's deadline.
         let (mut port, mut checked) = (None, false);
         wait_for(Duration::from_secs(10), || {
             for a in seed.drain_alerts() {
@@ -946,7 +946,157 @@ mod tests {
             (port.is_some() && checked).then_some(())
         })
         .expect("the seed session reports its listen port and finishes its check");
-        let port = port.expect("listen port");
+        port.expect("listen port")
+    }
+
+    /// libtorrent's own hybrid (v1+v2) test torrent.
+    fn hybrid_torrent() -> Vec<u8> {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/libtorrent/test/test_torrents/v2.torrent");
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// A hybrid torrent added from a btih-only magnet holds only its v1 hash
+    /// until the metadata arrives, and libtorrent then gives it the v2 hash
+    /// too. Every alert must go on naming it by the v1 hash it was added
+    /// under: the daemon keys its state, its resume saves and its removal by
+    /// that hash, and an alert under the truncated v2 one reaches none of them.
+    #[test]
+    fn a_hybrid_torrent_added_by_a_v1_magnet_keeps_its_v1_key_after_its_metadata() {
+        let seed_dir = Scratch::new("hybrid-seed");
+        let fetch_dir = Scratch::new("hybrid-fetch");
+        let seed = Session::new(&loopback_settings()).expect("seed session");
+        let fetch = Session::new(&loopback_settings()).expect("fetch session");
+
+        let torrent = hybrid_torrent();
+        let hashes = info_hashes_from_torrent(&torrent).expect("info hashes");
+        let (v1, v2) = (
+            hashes.v1.expect("hybrid has v1"),
+            hashes.v2.expect("hybrid has v2"),
+        );
+        assert_eq!(hashes.key(), Some(v1), "a hybrid is keyed by v1");
+        assert_eq!(info_hash_from_torrent(&torrent).expect("key"), v1);
+        let port = serve(&seed, torrent, &seed_dir);
+
+        drop(fetch.drain_alerts());
+        let uri = format!("magnet:?xt=urn:btih:{}&x.pe=127.0.0.1:{port}", v1.to_hex());
+        assert_eq!(info_hash_from_magnet(&uri).expect("magnet key"), v1);
+        let h = fetch
+            .add_torrent(AddParams::Magnet {
+                uri,
+                save_path: fetch_dir.path(),
+                flags: TorrentFlags::empty(),
+            })
+            .expect("magnet add");
+        assert_eq!(h.infohash, v1);
+
+        let mut alerts = Vec::new();
+        wait_for(Duration::from_secs(30), || {
+            seed.drain_alerts();
+            alerts.extend(fetch.drain_alerts());
+            alerts
+                .iter()
+                .any(|a| matches!(a, Alert::MetadataReceived { .. }))
+                .then_some(())
+        })
+        .expect("the metadata arrives from the seed session");
+
+        // The scenario is the one under test only if the metadata made the
+        // torrent hybrid.
+        let info_section = alerts
+            .iter()
+            .find_map(|a| match a {
+                Alert::MetadataReceived { info_section, .. } => Some(info_section.clone()),
+                _ => None,
+            })
+            .expect("metadata alert");
+        let mut received = b"d4:info".to_vec();
+        received.extend_from_slice(&info_section);
+        received.push(b'e');
+        assert_eq!(
+            info_hashes_from_torrent(&received).expect("received metadata parses"),
+            InfoHashes {
+                v1: Some(v1),
+                v2: Some(v2)
+            },
+        );
+
+        // A status update and a resume save after the metadata.
+        fetch.post_torrent_updates();
+        fetch
+            .save_resume_data(h, ResumeFlags::empty())
+            .expect("save resume data");
+        let (mut saved, mut updated) = (false, false);
+        wait_for(Duration::from_secs(10), || {
+            for a in fetch.drain_alerts() {
+                match &a {
+                    Alert::SaveResumeData { .. } => saved = true,
+                    Alert::StateUpdate { statuses, .. } => {
+                        updated |= statuses.iter().any(|s| s.handle.id == h.id);
+                    }
+                    _ => {}
+                }
+                alerts.push(a);
+            }
+            (saved && updated).then_some(())
+        })
+        .expect("a resume save and a state update for the torrent");
+
+        fetch.remove_torrent(h, false).expect("remove");
+        wait_for(Duration::from_secs(10), || {
+            alerts.extend(fetch.drain_alerts());
+            alerts
+                .iter()
+                .any(|a| matches!(a, Alert::TorrentRemoved { .. }))
+                .then_some(())
+        })
+        .expect("the removal is reported");
+
+        let mut checked = Vec::new();
+        for a in &alerts {
+            if let Alert::StateUpdate { statuses, .. } = a {
+                for s in statuses.iter().filter(|s| s.handle.id == h.id) {
+                    assert_eq!(s.handle.infohash, v1, "a status view names the v1 key");
+                }
+            }
+            let hdr = a.header();
+            if hdr.handle.as_ref().is_some_and(|x| x.id == h.id)
+                || matches!(a, Alert::TorrentRemoved { .. })
+            {
+                assert_eq!(
+                    hdr.infohash,
+                    Some(v1),
+                    "{:?} names the torrent by its v1 key",
+                    hdr.kind
+                );
+                checked.push(hdr.kind);
+            }
+        }
+        for kind in [
+            AlertKind::AddTorrent,
+            AlertKind::MetadataReceived,
+            AlertKind::SaveResumeData,
+            AlertKind::TorrentRemoved,
+        ] {
+            assert!(checked.contains(&kind), "no {kind:?} alert was checked");
+        }
+    }
+
+    /// A magnet whose torrent is removed after its metadata arrived but before
+    /// the `metadata_received_alert` is popped. Translating that alert used to
+    /// throw (the torrent it names no longer exists), which took every alert
+    /// in the same pop with it: `add_torrent`, `torrent_removed`, and any other
+    /// torrent's alerts in the batch.
+    #[test]
+    fn a_torrent_removed_before_its_metadata_alert_is_popped_loses_no_alerts() {
+        let seed_dir = Scratch::new("seed");
+        let fetch_dir = Scratch::new("fetch");
+        let seed = Session::new(&loopback_settings()).expect("seed session");
+        let fetch = Session::new(&loopback_settings()).expect("fetch session");
+
+        let torrent = single_file_torrent("payload.bin", 64 * 1024, 16 * 1024);
+        let ih = info_hash_from_torrent(&torrent).expect("info hash");
+        let port = serve(&seed, torrent, &seed_dir);
 
         // Anything the fetching session posted before the magnet is not what
         // this test is about.
