@@ -304,9 +304,12 @@ fn lock_path(db: &Path) -> PathBuf {
 ///
 /// `None` where the lock file neither exists nor can be created, in a
 /// directory this process may not write: no process of the same user can
-/// hold a lock there either, so there is nothing to exclude.
+/// hold a lock there either, so there is nothing to exclude. `None` too, with
+/// a warning, where it exists but this process may not even read it: a file
+/// another user left unreadable must not keep the daemon from booting.
 fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolError> {
     use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
     let path = lock_path(db);
     // The lock needs an open file, not a writable one. A `.lock` file another
     // user created (a CLI run as root before the daemon's user) is still
@@ -318,6 +321,20 @@ fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolE
         .truncate(false)
         .open(&path)
     {
+        Ok(file) => {
+            // Readable by every user whatever the umask, so a root CLI run
+            // under umask 077 leaves a file the daemon's user can still
+            // open read-only and lock. Best effort: only the owner may
+            // chmod, and an owner who can open it for writing already can.
+            if let Ok(meta) = file.metadata() {
+                let mode = meta.permissions().mode();
+                if mode & 0o044 != 0o044 {
+                    let _ = file
+                        .set_permissions(std::fs::Permissions::from_mode((mode | 0o044) & 0o7777));
+                }
+            }
+            file
+        }
         Err(e)
             if matches!(
                 e.kind(),
@@ -326,10 +343,20 @@ fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolE
         {
             match std::fs::File::open(&path) {
                 Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "cannot open the pool index lock file even read-only; \
+                         opening the index without the lock that keeps a CLI \
+                         `pool scan` off it",
+                    );
+                    return Ok(None);
+                }
                 other => other?,
             }
         }
-        other => other?,
+        Err(e) => return Err(e.into()),
     };
     let taken = if exclusive {
         file.try_lock()
@@ -2371,5 +2398,73 @@ mod tests {
         drop(scan);
         PoolStore::open(&db).expect("released when the scan's store drops");
         assert!(dir.path().join("pool.db.lock").exists());
+    }
+
+    /// Whether this process can open `path` for writing despite its mode: a
+    /// root or CAP_DAC_OVERRIDE test run, where the permission tests below
+    /// cannot set up the situation they check.
+    fn bypasses_permissions(path: &Path) -> bool {
+        std::fs::OpenOptions::new().write(true).open(path).is_ok()
+    }
+
+    /// A lock file this process may not write (another user's, here 0444) is
+    /// opened read-only and still locks: the scan and any other writer still
+    /// exclude each other through it.
+    #[test]
+    fn a_lock_file_that_cannot_be_written_still_locks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        let lock = dir.path().join("pool.db.lock");
+        drop(PoolStore::open(&db).unwrap());
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if bypasses_permissions(&lock) {
+            return;
+        }
+
+        let daemon = PoolStore::open(&db).expect("a read-only lock file opens");
+        assert!(daemon._hold.is_some(), "and is locked");
+        assert!(matches!(
+            PoolStore::open_exclusive(&db),
+            Err(PoolError::Busy)
+        ));
+        drop(daemon);
+
+        let scan = PoolStore::open_exclusive(&db).expect("alone, the scan opens");
+        assert!(scan._hold.is_some());
+        assert!(matches!(PoolStore::open(&db), Err(PoolError::Busy)));
+        drop(scan);
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "a file this process cannot write is not chmodded",
+        );
+    }
+
+    /// A lock file created under a restrictive umask is made readable by
+    /// every user, so another user's process can still open it to lock; one
+    /// this process cannot read at all opens the index without the lock,
+    /// rather than refusing it.
+    #[test]
+    fn the_lock_file_is_left_readable_and_an_unreadable_one_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        let lock = dir.path().join("pool.db.lock");
+        std::fs::File::create(&lock).unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        drop(PoolStore::open(&db).unwrap());
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o644,
+        );
+
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if bypasses_permissions(&lock) {
+            return;
+        }
+        let store = PoolStore::open(&db).expect("an unreadable lock file does not refuse the open");
+        assert!(store._hold.is_none());
     }
 }
