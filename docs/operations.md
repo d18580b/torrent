@@ -326,9 +326,15 @@ curl -s -H "Authorization: Bearer $METRICS_TOKEN" localhost:8080/metrics \
 ```
 
 - **`torrentd_last_shutdown_unsaved_resumes` above 0.** The resume drain ran
-  out of time with that many saves outstanding. Those torrents came back from
-  older resume data, or with none (see [After a crash](#after-a-crash)). Raise
-  `shutdown_drain_secs`.
+  out of time with that many saves queued or still waiting on libtorrent's
+  answer. Each is a torrent whose state at the stop may not be on disk. One
+  that already had a resume file came back from that file, missing whatever
+  changed since it was written. One that was still waiting on its first save,
+  because it was added shortly before the stop, came back with none (see
+  [After a crash](#after-a-crash)). The drain asks for every torrent, but one
+  unchanged since its last save is answered "not modified" without a write,
+  and most of a large count is torrents that changed, or were added, before
+  the stop. Raise `shutdown_drain_secs`.
 - **`torrentd_last_shutdown_kill_switch_removal_failed` is 1.** The tunnels
   went down, but the nftables table stayed. A boot with
   `network_kill_switch = true` replaces it, and one with the kill switch off
@@ -455,7 +461,8 @@ curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer
   `applying` until a boot that allows mutations.
 
 **Resume data (#109, #110).** A torrent's first resume file is saved as soon
-as the session adds it; after that, resume data is saved every 30 minutes and
+as the session adds it, unless the profile already holds one for it, as it
+does for every torrent the boot loads from its resume file; after that, resume data is saved every 30 minutes and
 by the shutdown drain. A crash loses whatever changed since the last save,
 such as a pause. A torrent killed before its first save landed has no resume
 file at all:

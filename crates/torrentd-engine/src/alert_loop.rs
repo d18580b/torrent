@@ -1005,6 +1005,12 @@ fn run_shutdown(
     // drain outlast its deadline. A save whose answer was lost is re-asked
     // without the flag (see the dropped-alerts handler), because libtorrent
     // cleared its modified bit when it produced the answer nobody received.
+    //
+    // A torrent with a save already queued keeps that one: it is an add's
+    // first save or such a re-ask, and both must stay unconditional. A
+    // torrent the boot loaded from its own resume file has none queued (the
+    // add handler skips it), so the requests here are not crowded out by
+    // saves of files the boot has just read.
     let handles = state.handles();
     info!(
         target: "torrentd_engine::alert_loop",

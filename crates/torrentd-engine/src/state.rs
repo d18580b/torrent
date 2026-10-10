@@ -557,6 +557,11 @@ impl StateMap {
     /// Ask for a resume save of `ih`. Returns `false` when one is already
     /// queued or in flight: libtorrent answers each request with its own alert,
     /// so a second request for the same torrent is a second alert for nothing.
+    ///
+    /// The refused request's flags are dropped with it, and a queued
+    /// unconditional save is never downgraded to `ONLY_IF_MODIFIED`: each one
+    /// queued is a torrent whose modified bit cannot be trusted, either its
+    /// first save (no resume file yet) or a re-ask after a lost answer.
     pub fn queue_resume_save(&self, ih: InfoHash, flags: ResumeFlags) -> bool {
         let mut s = self.saves.lock();
         if s.in_flight.contains_key(&ih) || !s.queued_set.insert(ih) {
@@ -685,6 +690,20 @@ mod tests {
         // In flight counts as asked for, too.
         assert!(!m.queue_resume_save(ih(1), ResumeFlags::empty()));
         assert_eq!(m.pending_resume_count(), 1);
+    }
+
+    #[test]
+    fn a_later_only_if_modified_request_keeps_a_queued_unconditional_save() {
+        // The shutdown drain asks `ONLY_IF_MODIFIED` for every torrent; one
+        // still waiting on its first save has no file for "not modified" to
+        // leave in place.
+        let m = StateMap::new();
+        assert!(m.queue_resume_save(ih(1), ResumeFlags::empty()));
+        assert!(!m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
+        assert_eq!(
+            m.dispatch_resume_saves(10),
+            vec![(ih(1), ResumeFlags::empty())]
+        );
     }
 
     #[test]
