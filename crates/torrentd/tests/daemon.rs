@@ -1268,6 +1268,24 @@ fn the_boot_scans_hold_every_torrent_to_the_profiles_tracker_domains() {
 #[test]
 #[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
 fn a_claimed_torrent_with_no_resume_file_is_re_added_at_its_recorded_save_path() {
+    boot_a_claimed_torrent_with_no_resume_file(false);
+}
+
+/// The other side of #186's re-add: a claimed torrent with no resume file
+/// that the pool index records `drifted` failed its verification and was
+/// paused for it, so the torrent-dir scan leaves it unloaded rather than
+/// re-add it in seed mode, announcing a payload its piece hashes rejected.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_claimed_torrent_the_pool_records_drifted_is_not_re_added_with_no_resume_file() {
+    boot_a_claimed_torrent_with_no_resume_file(true);
+}
+
+/// Add a torrent through the API, stop the daemon, remove its resume file,
+/// and boot again; with `drifted`, also record it `drifted` in `pool.db`
+/// first. Asserts it is re-added at its recorded save path, or with
+/// `drifted` that it is left unloaded.
+fn boot_a_claimed_torrent_with_no_resume_file(drifted: bool) {
     use base64::Engine as _;
 
     let addr = free_http();
@@ -1275,6 +1293,20 @@ fn a_claimed_torrent_with_no_resume_file_is_re_added_at_its_recorded_save_path()
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path();
     let cfg = write_config(p, free_port(), addr);
+    let pool_db = p.join("pool.db");
+    if drifted {
+        let (root, library) = (p.join("root"), p.join("library"));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&library).unwrap();
+        let mut text = std::fs::read_to_string(&cfg).unwrap();
+        text.push_str(&format!(
+            "\n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\ndb_path = \"{}\"\n",
+            root.display(),
+            library.display(),
+            pool_db.display(),
+        ));
+        std::fs::write(&cfg, text).unwrap();
+    }
     // Inside `default_save_path`, as an API add requires, and not it, so a
     // fallback to `default_save_path` shows.
     let recorded = p.join("data").join("elsewhere");
@@ -1340,8 +1372,67 @@ fn a_claimed_torrent_with_no_resume_file_is_re_added_at_its_recorded_save_path()
     if resume.exists() {
         std::fs::remove_file(&resume).unwrap();
     }
+    if drifted {
+        // What a failed verification records (`record_verify_outcome`).
+        let store = torrentd_pool::PoolStore::open(&pool_db).unwrap();
+        store
+            .upsert_torrent(
+                &torrentd_pool::PoolTorrent {
+                    infohash: ih.clone(),
+                    infohash_v1: Some(ih.clone()),
+                    infohash_v2: None,
+                    name: "lost_resume".into(),
+                    total_size: 1,
+                    num_files: 1,
+                    source_path: torrents.join(format!("{ih}.torrent")),
+                    fastresume_path: None,
+                    declared_save_path: None,
+                    category: None,
+                    tags: Vec::new(),
+                    profile: Some(PROFILE.into()),
+                },
+                0,
+            )
+            .unwrap();
+        store
+            .set_adoption(
+                &ih,
+                torrentd_pool::AdoptionState::Drifted,
+                None,
+                None,
+                None,
+                Some(1),
+                Some("verification failed"),
+            )
+            .unwrap();
+    }
 
     let mut child = spawn();
+    if drifted {
+        // The gauge is set once both scans have run.
+        let unloaded =
+            format!("torrentd_profile_unloaded_registry_torrents{{profile_id=\"{PROFILE}\"}} 1");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let (_, metrics) = http(addr, "GET", "/metrics", None);
+            if metrics.lines().any(|l| l == unloaded) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the drifted torrent was not counted unloaded:\n{metrics}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert_eq!(
+            session_name(addr, &ih, Duration::from_secs(2)),
+            None,
+            "a torrent the pool records drifted was re-added",
+        );
+        sigterm(&child.0);
+        assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+        return;
+    }
     assert_eq!(
         session_name(addr, &ih, Duration::from_secs(30)).as_deref(),
         Some("lost_resume"),
