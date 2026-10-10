@@ -24,12 +24,25 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             // that failed its check never reaches a distinct phase — so a
             // reader that waits for one waits forever. The verify queue keys
             // its retirement off this.
+            let mut rechecked = false;
             ctx.state.update(&ih, |st| {
+                rechecked = st.checked_at.is_some();
                 st.checked_at = Some(ctx.clock.now());
                 // `phase` still says what the torrent was before this check;
                 // the report with the verdict has not landed yet.
                 st.phase_since_check = false;
             });
+            // A check after the torrent's first is a re-hash (the API's
+            // recheck, the verify queue's, the disk-error retry's), and its
+            // verdict must not wait for the 30-minute sweep: a crash before
+            // then reloads the old resume file, whose bitfield libtorrent does
+            // not re-hash, and seeds pieces this check just failed. The first
+            // check is the one every add runs, which for a torrent the boot
+            // loaded from its resume file changes nothing worth a rewrite of
+            // every file at every boot.
+            if rechecked {
+                ctx.state.queue_resume_save_now(ih);
+            }
             info!(
                 target: "torrentd_engine::handler::storage",
                 infohash = %ih,
@@ -46,9 +59,15 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             // Record the verdict: a relocation plan cannot otherwise tell a
             // completed move from one that failed, and marking the step done
             // on dispatch reports both as success.
-            ctx.state.update(&ih, |st| {
+            let tracked = ctx.state.update(&ih, |st| {
                 st.storage_move = Some(StorageMove::Moved { path: path.clone() })
             });
+            // The new save path lives only in the session until a resume
+            // file holds it. A crash before then reloads the torrent at the
+            // path its payload just left.
+            if tracked {
+                ctx.state.queue_resume_save_now(ih);
+            }
             info!(
                 target: "torrentd_engine::handler::storage",
                 infohash = %ih,
