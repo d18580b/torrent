@@ -520,6 +520,17 @@ void fill_state_view(lt_torrent_status_view& v, lt_session* s, const lt::torrent
     v.has_error = st.errc ? 1 : 0;
 }
 
+// Which lt_error_category `ec` belongs to, so the Rust side can tell
+// libtorrent's 36 (`errors::timed_out`) from the system category's.
+std::int32_t tracker_error_category(const lt::error_code& ec) {
+    auto const& c = ec.category();
+    if (c == lt::libtorrent_category()) return LT_ERROR_CATEGORY_LIBTORRENT;
+    if (c == lt::http_category()) return LT_ERROR_CATEGORY_HTTP;
+    if (c == boost::system::system_category() || c == boost::system::generic_category())
+        return LT_ERROR_CATEGORY_SYSTEM;
+    return LT_ERROR_CATEGORY_OTHER;
+}
+
 // Translate one libtorrent alert into our union. Returns false if the alert
 // type is not one we surface; the caller drops it silently.
 bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
@@ -695,6 +706,12 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
     if (auto* x = lt::alert_cast<lt::tracker_error_alert>(a)) {
         out.kind = LT_ALERT_TRACKER_ERROR;
         out.payload.tracker_error.error_code = x->error.value();
+        out.payload.tracker_error.error_category = tracker_error_category(x->error);
+        out.payload.tracker_error.aborted =
+            (x->error == boost::asio::error::operation_aborted
+             || x->error == lt::errors::torrent_aborted
+             || x->error == lt::errors::session_is_closing
+             || x->error == lt::errors::destructing_torrent) ? 1 : 0;
         out.payload.tracker_error.times_in_row = x->times_in_row;
         copy_str_truncated(out.payload.tracker_error.tracker_url, LT_PATH_MAX,
                            x->tracker_url());

@@ -154,7 +154,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
         "Resume saves asked for again because an overflow of this profile's alert queue may \
          have dropped their answer.";
     "tracker_alerts_total" Counter Profile ("kind": torrentd_engine::handlers::warning::TRACKER_KINDS) Zero =>
-        "Tracker announce errors, successful announces (reply), tracker warnings, and scrape failures.";
+        "Tracker announce errors, successful announces (reply), tracker warnings, scrape \
+         failures, and announces that failed because the torrent was stopping (stopped): \
+         paused, fenced, removed, or the announce cancelled.";
     "session_alerts_total" Counter Profile ("kind": torrentd_engine::handlers::warning::SESSION_KINDS) Zero =>
         "Port-mapping and UDP socket errors, rejected fast-resume data, and performance warnings.";
     "torrent_file_persist_errors_total" Counter Profile ("source": &["metadata", "api"]) Zero =>

@@ -82,6 +82,41 @@ impl AlertKind {
     }
 }
 
+/// Which error category an error code belongs to, mirroring
+/// `lt_error_category`. A bare code is ambiguous: 36 is libtorrent's
+/// `errors::timed_out`, but `ENAMETOOLONG` in the system category.
+#[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
+pub enum ErrorCategory {
+    /// `lt::libtorrent_category()`: an `lt::errors::error_code_enum` value.
+    Libtorrent,
+    /// The system or generic category: an `errno` value.
+    System,
+    /// `lt::http_category()`: an HTTP status.
+    Http,
+    /// Any other category (asio's netdb or addrinfo, bdecode, socks, ...).
+    Other,
+}
+
+impl ErrorCategory {
+    fn from_raw(raw: i32) -> Self {
+        match raw as u32 {
+            ffi::lt_error_category_LT_ERROR_CATEGORY_LIBTORRENT => ErrorCategory::Libtorrent,
+            ffi::lt_error_category_LT_ERROR_CATEGORY_SYSTEM => ErrorCategory::System,
+            ffi::lt_error_category_LT_ERROR_CATEGORY_HTTP => ErrorCategory::Http,
+            _ => ErrorCategory::Other,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ErrorCategory::Libtorrent => "libtorrent",
+            ErrorCategory::System => "system",
+            ErrorCategory::Http => "http",
+            ErrorCategory::Other => "other",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AlertHeader {
     pub kind: AlertKind,
@@ -203,6 +238,13 @@ pub enum Alert {
     TrackerError {
         hdr: AlertHeader,
         error_code: i32,
+        /// The category `error_code` belongs to.
+        error_category: ErrorCategory,
+        /// The announce was cancelled rather than answered or timed out
+        /// (asio's `operation_aborted`, or libtorrent's `torrent_aborted`,
+        /// `session_is_closing` or `destructing_torrent`): a pause, stop or
+        /// shutdown caused it, not the tracker.
+        aborted: bool,
         times_in_row: i32,
         tracker_url: String,
         message: String,
@@ -499,6 +541,8 @@ impl Alert {
                 Alert::TrackerError {
                     hdr,
                     error_code: p.error_code,
+                    error_category: ErrorCategory::from_raw(p.error_category),
+                    aborted: p.aborted != 0,
                     times_in_row: p.times_in_row,
                     tracker_url: c_str_to_owned(&p.tracker_url),
                     message: c_str_to_owned(&p.message),
@@ -555,4 +599,38 @@ fn c_str_to_owned(buf: &[std::os::raw::c_char]) -> String {
     // buffer. `c""` is a `&'static CStr`; no `unsafe` needed.
     let cstr = CStr::from_bytes_until_nul(bytes).unwrap_or(c"");
     String::from_utf8_lossy(cstr.to_bytes()).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each `lt_error_category` value maps to its own variant, and a value
+    /// the shim does not define maps to `Other` rather than to a known one.
+    #[test]
+    fn error_category_from_raw_maps_each_shim_value() {
+        let cases = [
+            (
+                ffi::lt_error_category_LT_ERROR_CATEGORY_LIBTORRENT,
+                ErrorCategory::Libtorrent,
+            ),
+            (
+                ffi::lt_error_category_LT_ERROR_CATEGORY_SYSTEM,
+                ErrorCategory::System,
+            ),
+            (
+                ffi::lt_error_category_LT_ERROR_CATEGORY_HTTP,
+                ErrorCategory::Http,
+            ),
+            (
+                ffi::lt_error_category_LT_ERROR_CATEGORY_OTHER,
+                ErrorCategory::Other,
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(ErrorCategory::from_raw(raw as i32), want, "{raw}");
+        }
+        assert_eq!(ErrorCategory::from_raw(-1), ErrorCategory::Other);
+        assert_eq!(ErrorCategory::from_raw(i32::MAX), ErrorCategory::Other);
+    }
 }

@@ -716,6 +716,112 @@ fn trackers_report_every_url_with_its_tier() {
     unsafe { lt_session_destroy(s) };
 }
 
+/// A tracker error carries the category its code belongs to: an announce to
+/// a closed loopback port is refused with an `errno`, in the system category,
+/// and was not cancelled.
+#[test]
+fn a_refused_announce_reports_a_system_category_error_not_an_abort() {
+    let s = make_session();
+    let h = add_file(s, &multi_file_tracker_torrent());
+    assert_eq!(unsafe { lt_torrent_resume(s, h) }, LT_OK as i32);
+    assert_eq!(unsafe { lt_torrent_force_reannounce(s, h) }, LT_OK as i32);
+
+    let got = wait_for(s, |u| {
+        if u.kind != lt_alert_kind_LT_ALERT_TRACKER_ERROR {
+            return None;
+        }
+        let e = unsafe { u.payload.tracker_error };
+        Some((e.error_code, e.error_category, e.aborted))
+    });
+    let (code, category, aborted) = got.expect("no tracker_error alert");
+    assert_ne!(code, 0);
+    assert_eq!(
+        category as u32, lt_error_category_LT_ERROR_CATEGORY_SYSTEM,
+        "code {code}"
+    );
+    assert_eq!(aborted, 0, "a refused announce is not a cancelled one");
+    unsafe { lt_session_destroy(s) };
+}
+
+/// Add [`multi_file_tracker_torrent`] with `url` as its only tracker, start
+/// it, and return the first tracker error's code, category and abort flag.
+fn first_tracker_error_announcing_to(url: &str) -> (i32, i32, u8) {
+    let s = make_session();
+    let bytes = multi_file_tracker_torrent();
+    let url = CString::new(url).unwrap();
+    let ptrs = [url.as_ptr()];
+    let tiers = [0i32];
+    let save = CString::new("/tmp").unwrap();
+    let mut ih = [0u8; 20];
+    let mut err = [0 as c_char; 512];
+    let h = unsafe {
+        lt_add_torrent_file(
+            s,
+            bytes.as_ptr(),
+            bytes.len(),
+            save.as_ptr(),
+            LT_TF_PAUSED,
+            ptrs.as_ptr(),
+            tiers.as_ptr(),
+            ptrs.len(),
+            ih.as_mut_ptr(),
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_ne!(h, 0, "add .torrent failed: {}", c_buf(&err));
+    assert_eq!(unsafe { lt_torrent_resume(s, h) }, LT_OK as i32);
+    assert_eq!(unsafe { lt_torrent_force_reannounce(s, h) }, LT_OK as i32);
+    let got = wait_for(s, |u| {
+        if u.kind != lt_alert_kind_LT_ALERT_TRACKER_ERROR {
+            return None;
+        }
+        let e = unsafe { u.payload.tracker_error };
+        Some((e.error_code, e.error_category, e.aborted))
+    });
+    unsafe { lt_session_destroy(s) };
+    got.expect("no tracker_error alert")
+}
+
+/// A tracker URL whose scheme libtorrent has no connection for fails with
+/// `errors::unsupported_url_protocol`, in the libtorrent category.
+#[test]
+fn an_unsupported_tracker_scheme_reports_a_libtorrent_category_error() {
+    let (code, category, aborted) = first_tracker_error_announcing_to("gopher://127.0.0.1:1/");
+    assert_eq!(
+        category as u32, lt_error_category_LT_ERROR_CATEGORY_LIBTORRENT,
+        "code {code}"
+    );
+    assert_ne!(code, 0);
+    assert_eq!(aborted, 0);
+}
+
+/// An HTTP tracker that answers with a non-200 status fails with that status,
+/// in the HTTP category.
+#[test]
+fn an_http_tracker_status_reports_an_http_category_error() {
+    use std::io::Read;
+    use std::io::Write;
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut conn, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = conn.read(&mut buf);
+        let _ = conn.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+    });
+    let (code, category, aborted) =
+        first_tracker_error_announcing_to(&format!("http://127.0.0.1:{port}/announce"));
+    server.join().unwrap();
+    assert_eq!(
+        category as u32, lt_error_category_LT_ERROR_CATEGORY_HTTP,
+        "code {code}"
+    );
+    assert_eq!(code, 404);
+    assert_eq!(aborted, 0);
+}
+
 /// Trackers given with a `.torrent` add replace its announce list, tiers
 /// kept, the way a resume file's `trackers` list does.
 #[test]
