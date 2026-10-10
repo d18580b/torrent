@@ -253,6 +253,7 @@ Every profile takes `id` plus `network`, and then:
 | `port_forward`, `port_forward_gateway` | default `static`, and `10.2.0.1` |
 | `peer_fingerprint`, `user_agent` | **required**, and unique across profiles. These are what a tracker sees as the account's client, so the two must name the same client: `"-qB5030-"` with `"qBittorrent/5.0.3"`, not a prefix of one client beside another's user agent. Nothing checks the pairing. Only the prefix and the strings change: the rest of the peer id, the extension handshake, the announce parameters and the rest of the wire behaviour stay libtorrent's. Name a client built on libtorrent 2.0, in a version that ships on it — qBittorrent, or Deluge (`"-DE211s-"` with `"Deluge/2.1.1 libtorrent/2.0.14.0"`) — never Transmission or rTorrent, whose identity a tracker comparing the wire with the claimed client sees through. `peer_fingerprint` is the peer-id prefix itself — exactly 8 printable ASCII characters — in the same form as the top-level key it overrides, and never libtorrent's own `-LT` code. |
 | `allowed_tracker_domains` | **required**, non-empty: the domains of this account's trackers — see [Account isolation](#account-isolation). |
+| `allowed_tracker_urls` | optional; **required** where another profile's `allowed_tracker_domains` overlaps this one's: announce-URL prefixes carrying this account's passkey — see [Account isolation](#account-isolation). |
 
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
@@ -356,17 +357,20 @@ twice) give both accounts one exit address, and the tracker sees two accounts
 announcing from one IP. The daemons run separately, so neither can see the
 other's config: nothing warns about this across daemons.
 
-Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
-`upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
+Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains`,
+`allowed_tracker_urls` and `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
 `peer_fingerprint`, `user_agent`, `resume_dir` and `torrent_dir` must all
 be unique across profiles.
 
 #### Account isolation
 
-Three rules keep one account's identity off another account's traffic, and a
-configuration that breaks one is refused at load and by `--check-config`:
+Four rules keep one account's identity off another account's traffic, and a
+configuration that breaks one is refused at load, on reload and by
+`--check-config`:
 
-- **`allowed_tracker_domains` is required on every `vpn` profile.** Each entry
+- **`allowed_tracker_domains` is required on every `vpn` profile.** It
+  separates *trackers*, not accounts: it compares only the tracker's host, so
+  it cannot tell two accounts on one tracker apart — the next rule does. Each entry
   is a domain, such as `"tracker.example.com"`, matching that host and its
   subdomains, case-insensitively; an entry that is blank or contains a comma or
   whitespace is refused on any profile. A profile that sets the list takes a
@@ -382,6 +386,29 @@ configuration that breaks one is refused at load and by `--check-config`:
   lists the torrent under `refused`, and a startup scan leaves it unloaded with
   a warning; each counts it in `profile_assignment_registry_errors_total`. A
   host profile may set the list too, and is not checked when it does not.
+- **Two accounts on one tracker each bind their passkey with
+  `allowed_tracker_urls`.** Their announce URLs share a host and differ only in
+  the passkey, in the path or query, so a torrent added to the wrong profile
+  passes the domain list and announces one account's passkey from the other's
+  tunnel. Two profiles whose `allowed_tracker_domains` overlap — the same
+  entry, or one a parent domain of the other's (`example.com` beside
+  `tracker.example.com`) — are therefore refused unless both set
+  `allowed_tracker_urls`, and no prefix of one may overlap a prefix of the
+  other. This compares every profile that sets a domain list, a host profile
+  included. Each entry is the start of the account's announce URL as the
+  tracker hands it out, `scheme://host[:port]/path`, such as
+  `"https://tracker.example.com/<passkey>/"` or
+  `"https://tracker.example.com/announce.php?passkey=<passkey>"`. Its host must
+  be on the profile's own domain list. A profile that sets the list takes a
+  torrent only when **every** announce URL is under one of its entries, beside
+  being on its domains, so a second tracker of the same account needs an entry
+  of its own. The scheme and host compare case-insensitively and must match
+  exactly, port included; the rest compares byte for byte and must end where
+  the entry ends at a `/`, `?` or `&`, so `?passkey=abc` does not admit
+  `?passkey=abcd`. It is checked on the same five add paths, and a refusal
+  says the torrent is under none of the profile's `allowed_tracker_urls`. An
+  entry holds a passkey, so neither `GET /v1/profiles` nor any error repeats
+  one: a refusal of the config names the entry by its index.
 - **A host profile may not listen on `0.0.0.0` or `[::]` beside a `vpn`
   profile.** libtorrent expands the unspecified address to every interface
   that is up, the tunnels included, and announces from each listen socket, so
@@ -412,7 +439,8 @@ even when no session holds it now; `DELETE /v1/torrents/{infohash}` clears the
 index's record along with the assignment.
 
 **Upgrading.** A configuration that loaded before this release can be refused
-by these rules. Add `allowed_tracker_domains` to each `vpn` profile, replace a
+by these rules. Add `allowed_tracker_domains` to each `vpn` profile, add
+`allowed_tracker_urls` to each of two profiles on one tracker, replace a
 host profile's wildcard `listen_interfaces` where `vpn` profiles sit beside it,
 and replace an `-LT` fingerprint with the prefix of the client the profile's
 `user_agent` names. Existing torrents are held to the list at the next start:
@@ -1199,8 +1227,8 @@ changed and cannot be applied without a restart: the Safety Rule 7 warning
 (`profile identity change requires daemon restart`) where the field is an
 identity — the network block, `peer_fingerprint`, `user_agent` — and the
 ordinary non-reloadable-field warning where it is not: `upload_rate_limit`,
-`allowed_tracker_domains`, and the two store directories. The field name is on
-the event either way.
+`allowed_tracker_domains`, `allowed_tracker_urls`, and the two store
+directories. The field name is on the event either way, and never its value.
 
 The store directories are in the second group because nothing a tracker reads
 is not an identity, and no announce or handshake carries where a profile keeps

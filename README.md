@@ -257,9 +257,11 @@ user_agent              = "qBittorrent/5.0.3"  # of the same client
 allowed_tracker_domains = ["tracker.example.com"]  # required on vpn
 ```
 
-> **Config break.** A `vpn` profile without `allowed_tracker_domains`, a host
-> profile listening on `0.0.0.0` or `[::]` beside a `vpn` profile, and any
-> `peer_fingerprint` starting `-LT` are refused at load. See
+> **Config break.** A `vpn` profile without `allowed_tracker_domains`, two
+> profiles whose `allowed_tracker_domains` overlap unless both set
+> `allowed_tracker_urls`, a host profile listening on `0.0.0.0` or `[::]`
+> beside a `vpn` profile, and any `peer_fingerprint` starting `-LT` are
+> refused at load. See
 > [docs/running.md](docs/running.md#account-isolation) for what each means
 > and what to write instead.
 
@@ -355,14 +357,18 @@ operational side of each knob, including what the kill switch costs and what
 it needs, is in [`deploy/torrentd.sample.toml`](deploy/torrentd.sample.toml),
 which is the file an operator actually edits.
 
-`allowed_tracker_domains` is the account-isolation guard, and every `vpn`
-profile must set it. A torrent enters a profile that sets it only when every
-tracker it announces to is on one of those domains, and it announces to at
-least one — on every add path: the API, pool adoption, and the startup reload
-of resume data and `.torrent` files. It keeps one account's torrent, and its
-passkey, from being announced from another account's tunnel; it is not an
-egress control. Public content that wants DHT belongs in a `network = "host"`
-profile.
+`allowed_tracker_domains` is the tracker guard, and every `vpn` profile must
+set it. A torrent enters a profile that sets it only when every tracker it
+announces to is on one of those domains, and it announces to at least one — on
+every add path: the API, pool adoption, and the startup reload of resume data
+and `.torrent` files. It compares only the tracker's host, so it keeps apart
+accounts on different trackers and cannot tell two accounts on one tracker
+apart. For those, `allowed_tracker_urls` binds each profile to announce-URL
+prefixes carrying its own passkey, held on the same add paths, and two
+profiles whose domain lists overlap are refused at load unless both set it.
+Together they keep one account's torrent, and its passkey, from being
+announced from another account's tunnel; neither is an egress control. Public
+content that wants DHT belongs in a `network = "host"` profile.
 
 ## Authentication
 
@@ -461,7 +467,7 @@ session is fatal, so on that shape the alert that fires is the daemon going
 away; and `profile_assignment_registry_errors_total`, which counts the torrents
 a profile's registry refused to take, whether for a duplicate info-hash, a
 resume file found under another profile, or a tracker outside
-`allowed_tracker_domains` — the cross-account contamination profiles exist to
+`allowed_tracker_domains` or `allowed_tracker_urls` — the cross-account contamination profiles exist to
 prevent. `kill_switch_active` is none of these: it is a single unlabelled
 daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 `vpn` profile is configured.
