@@ -82,8 +82,30 @@
 //! against `/proc/<pid>/cmdline` before signalling, so a pid file surviving a
 //! reboot is *detected*, not trusted. A dedicated config key was also
 //! rejected: a new operator-facing key for a file no operator reads.
+//!
+//! # What a profile's `.ovpn` may not do
+//!
+//! An `.ovpn` is executable configuration: `script-security 2` and an `up`
+//! line run a program, `plugin` loads a shared library into openvpn, and
+//! `management` opens a socket that drives it, all as the daemon's uid and
+//! with whatever `CAP_NET_ADMIN` it holds. The WireGuard path refuses the
+//! equivalent `wg-quick` hooks, and this one does too, twice:
+//!
+//! * `openvpn` runs with `--script-security 1` *after* `--config`. Options
+//!   apply in order, so it overrides whatever level the file sets, and no
+//!   hook the file names can run.
+//! * The file is read before `openvpn` is spawned, and by `--check-config`
+//!   ([`config_refusal`]), and a file naming a hook, a plugin, a
+//!   management interface, a nested `config`, a directive that changes
+//!   how openvpn runs its own process, or one that has openvpn write a path
+//!   the file chooses (`log`, `status` and the like) is refused with the
+//!   directive named
+//!   ([`refused_directive`]). The flag alone would let a `plugin` or
+//!   `management` line through, and would leave a hook to fail at runtime
+//!   with a warning rather than at load with the line that names it.
 
 use std::net::IpAddr;
+use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
@@ -106,6 +128,12 @@ fn openvpn_args<'a>(config: &'a str, iface: &'a str, pid_file: &'a str) -> Vec<&
         "--daemon",
         "--config",
         config,
+        // After `--config`, so it overrides any level the file sets: no
+        // `up`, `route-up` or other hook the file names may run a program
+        // as the daemon's uid (see the module docs). Level 1 still lets
+        // openvpn run its own built-in tools.
+        "--script-security",
+        "1",
         // Authoritative, so the OpenVPN profile file cannot disagree with the
         // profile config.
         "--dev",
@@ -123,6 +151,196 @@ fn openvpn_args<'a>(config: &'a str, iface: &'a str, pid_file: &'a str) -> Vec<&
         // table keyed on its ifindex (see the module docs).
         "--persist-tun",
     ]
+}
+
+/// Why `name`, the directive an `.ovpn` line gives, is refused, or `None`
+/// for one the daemon lets openvpn read. `args` are the line's tokens after
+/// the directive.
+///
+/// The `*-verify` directives refused are the three that name a program;
+/// `crl-verify` names a revocation list, which provider bundles carry, and
+/// `verify-x509-name` a certificate name, so neither is refused.
+fn refusal_reason(name: &str, args: &[String]) -> Option<&'static str> {
+    match name {
+        "up"
+        | "down"
+        | "route-up"
+        | "route-pre-down"
+        | "ipchange"
+        | "tls-verify"
+        | "auth-user-pass-verify"
+        | "tls-crypt-v2-verify"
+        | "client-connect"
+        | "client-disconnect"
+        | "learn-address" => Some("runs an external program as the daemon's user"),
+        "iproute" => Some("replaces the `ip` program openvpn runs as the daemon's user"),
+        "plugin" => Some("loads a shared library into openvpn"),
+        "management" => Some("opens a control interface that can drive openvpn"),
+        "script-security" => match args.first().map(String::as_str) {
+            Some("0" | "1") => None,
+            _ => Some("above 1 lets the file run external programs"),
+        },
+        "daemon" | "chroot" | "cd" => {
+            Some("changes how openvpn runs its own process, which is the daemon's to decide")
+        }
+        "config" => Some("includes another file, which this check does not read"),
+        "log"
+        | "log-append"
+        | "status"
+        | "replay-persist"
+        | "ifconfig-pool-persist"
+        | "tls-export-cert" => {
+            Some("makes openvpn create or overwrite a path the file chooses, as the daemon's user")
+        }
+        _ => None,
+    }
+}
+
+/// The tokens of one `.ovpn` line, split the way openvpn's `parse_line`
+/// splits them. A word that starts with `"` or `'` is quoted, and it ends
+/// at its closing quote: `"plugin"/x.so` is the two words `plugin` and
+/// `/x.so`. A quote anywhere else in a word is an ordinary character.
+/// Whitespace (C's `isspace`) ends an unquoted word, a `\` outside single
+/// quotes makes the next character literal, and a `#` or `;` where a word
+/// would start ends the line.
+///
+/// Where openvpn rejects a line instead (an unclosed quote, a `\` before a
+/// character it may not escape), the words read so far are returned all
+/// the same, so such a line is scanned rather than skipped.
+fn tokens(line: &str) -> Vec<String> {
+    #[derive(PartialEq)]
+    enum State {
+        Initial,
+        Unquoted,
+        Quoted,
+        SingleQuoted,
+    }
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut state = State::Initial;
+    let mut backslash = false;
+    for c in line.chars() {
+        if !backslash && c == '\\' && state != State::SingleQuoted {
+            backslash = true;
+            continue;
+        }
+        let mut done = false;
+        let mut keep = None;
+        match state {
+            State::Initial if c == '#' || c == ';' => return out,
+            State::Initial if space(c) => {}
+            State::Initial if !backslash && c == '"' => state = State::Quoted,
+            State::Initial if !backslash && c == '\'' => state = State::SingleQuoted,
+            State::Initial => {
+                keep = Some(c);
+                state = State::Unquoted;
+            }
+            State::Unquoted if !backslash && space(c) => done = true,
+            State::Quoted if !backslash && c == '"' => done = true,
+            State::SingleQuoted if c == '\'' => done = true,
+            State::Unquoted | State::Quoted | State::SingleQuoted => keep = Some(c),
+        }
+        if let Some(c) = keep {
+            cur.push(c);
+        }
+        if done {
+            out.push(std::mem::take(&mut cur));
+            state = State::Initial;
+        }
+        backslash = false;
+    }
+    if state != State::Initial {
+        out.push(cur);
+    }
+    out
+}
+
+/// The first directive in `text`, an `.ovpn`'s contents, that the daemon
+/// refuses, as an error naming its line and the directive. `Ok` when it
+/// names none.
+///
+/// Read the way openvpn reads it: a leading `--` on a directive is dropped,
+/// `setenv opt <directive> …` is that directive, and the body of an inline
+/// `<ca>`, `<key>` or other file block is data, not directives — except a
+/// `<connection>` block, which holds directives and is read like the rest.
+/// A block's end is matched with leading whitespace ignored, so a block
+/// never hides a line openvpn would read as a directive.
+fn refused_directive(text: &str) -> Result<(), String> {
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let mut inline: Option<String> = None;
+    for (i, line) in text.lines().enumerate() {
+        let n = i + 1;
+        if let Some(close) = &inline {
+            if line.trim_start().starts_with(close.as_str()) {
+                inline = None;
+            }
+            continue;
+        }
+        let toks = tokens(line);
+        let Some(first) = toks.first() else {
+            continue;
+        };
+        // openvpn opens a block only on a line that is the tag alone; a tag
+        // with anything after it is read as a directive, and is here too.
+        if let Some(tag) = first
+            .strip_prefix('<')
+            .and_then(|t| t.strip_suffix('>'))
+            .filter(|_| toks.len() == 1)
+        {
+            if tag != "connection" && !tag.starts_with('/') {
+                inline = Some(format!("</{tag}>"));
+            }
+            continue;
+        }
+        let mut words = toks.as_slice();
+        while words.len() >= 2 && words[0].trim_start_matches("--") == "setenv" && words[1] == "opt"
+        {
+            words = &words[2..];
+        }
+        let Some((name, args)) = words.split_first() else {
+            continue;
+        };
+        let name = name.strip_prefix("--").unwrap_or(name);
+        if let Some(reason) = refusal_reason(name, args) {
+            return Err(format!(
+                "line {n}: `{name}` is refused: it {reason}. An .ovpn is executable \
+                 configuration, and the daemon runs openvpn with --script-security 1 and \
+                 none of the hooks, plugins or management interface a profile's file \
+                 names; remove the line"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The refusal of an OpenVPN profile's config file that names a directive
+/// the daemon does not let it run ([`refused_directive`]), naming the file;
+/// `None` when it names none. An error is a file that could not be read.
+///
+/// `bring_up` refuses the profile on either. The pre-flight `--check-config`
+/// and the daemon make refuses the configuration on a refusal only: a file
+/// it cannot read fails that one profile's bring-up, as it did before the
+/// scan, rather than the whole daemon, and a pre-flight run as another user
+/// may not be able to read a file the daemon can.
+///
+/// The file is read as bytes and decoded lossily: every directive is ASCII,
+/// and a comment in another encoding is no reason to refuse it.
+pub fn config_refusal(path: &Path) -> std::io::Result<Option<String>> {
+    let bytes = std::fs::read(path)?;
+    Ok(refused_directive(&String::from_utf8_lossy(&bytes))
+        .err()
+        .map(|e| format!("OpenVPN config {}: {e}", path.display())))
+}
+
+/// [`config_refusal`] as `bring_up` reads it: a file it cannot read is
+/// refused too, with the path named.
+fn check_config_file(path: &Path) -> Result<(), String> {
+    match config_refusal(path) {
+        Ok(None) => Ok(()),
+        Ok(Some(refusal)) => Err(refusal),
+        Err(e) => Err(format!("read OpenVPN config {}: {e}", path.display())),
+    }
 }
 
 /// What [`route::install`] is handed for a tunnel holding `addrs`: a source
@@ -383,6 +601,9 @@ impl OpenvpnManager {
 
 impl VpnManager for OpenvpnManager {
     fn bring_up(&self, profile: &VpnTunnel) -> Result<IpAddr, VpnError> {
+        // Before anything is spawned: a refused file starts no openvpn, so
+        // there is nothing for the caller's teardown to find.
+        check_config_file(&profile.config_path).map_err(VpnError::Spawn)?;
         let pid_file = self.pid_file(&profile.interface);
         if let Some(parent) = pid_file.parent() {
             // A missing state dir would otherwise surface as openvpn exiting
@@ -769,6 +990,178 @@ mod tests {
             args.windows(2).any(|w| w == ["--dev", "tun-a"]),
             "the interface is still pinned: {args:?}"
         );
+    }
+
+    /// #229: openvpn applies options in order, so a `script-security 2` in
+    /// the file beat nothing on the command line and its `up` hook ran as
+    /// the daemon's uid. The override has to come after `--config`; move it
+    /// before, or drop it, and this fails.
+    #[test]
+    fn script_security_1_overrides_whatever_the_file_sets() {
+        let args = openvpn_args("/etc/openvpn/a.conf", "tun-a", "/var/lib/torrentd/p.pid");
+        let config = args.iter().position(|a| *a == "--config").unwrap();
+        let level = args
+            .windows(2)
+            .position(|w| w == ["--script-security", "1"])
+            .unwrap_or_else(|| panic!("no --script-security 1: {args:?}"));
+        assert!(level > config, "it must follow --config: {args:?}");
+        assert_eq!(
+            args.iter().filter(|a| **a == "--script-security").count(),
+            1,
+            "{args:?}"
+        );
+    }
+
+    /// What a provider bundle carries reads clean: comments, inline key
+    /// material, a `crl-verify` and `verify-x509-name` (not programs), and
+    /// a `script-security` no higher than 1.
+    const PROVIDER_OVPN: &str = "\u{feff}client\r\n\
+        dev tun\r\n\
+        proto udp\r\n\
+        remote 203.0.113.7 1194\r\n\
+        # up /etc/openvpn/update-resolv-conf\r\n\
+        ; plugin /usr/lib/openvpn/plugins/openvpn-plugin-down-root.so\r\n\
+        script-security 1\r\n\
+        verify-x509-name server.example name\r\n\
+        remote-cert-tls server\r\n\
+        auth-user-pass /etc/openvpn/acct.auth\r\n\
+        <ca>\r\n\
+        -----BEGIN CERTIFICATE-----\r\n\
+        up\r\n\
+        plugin x\r\n\
+        -----END CERTIFICATE-----\r\n\
+        </ca>\r\n\
+        <crl-verify>\r\n\
+        management 127.0.0.1 7505\r\n\
+        </crl-verify>\r\n\
+        <connection>\r\n\
+        remote 203.0.113.8 1194\r\n\
+        </connection>\r\n";
+
+    #[test]
+    fn a_provider_ovpn_with_no_hook_reads_clean() {
+        refused_directive(PROVIDER_OVPN).unwrap();
+        refused_directive("crl-verify /etc/openvpn/crl.pem\nscript-security 0\n").unwrap();
+    }
+
+    /// Words split the way openvpn's `parse_line` splits them: a quoted
+    /// word ends at its closing quote, a quote inside a word is an
+    /// ordinary character, and `#`/`;` where a word would start ends the
+    /// line.
+    #[test]
+    fn tokens_split_where_openvpn_splits() {
+        assert_eq!(tokens("\"plugin\"/x.so"), ["plugin", "/x.so"]);
+        assert_eq!(tokens("'a b'\"c\" d"), ["a b", "c", "d"]);
+        assert_eq!(tokens("pl\"ugin\" /x"), ["pl\"ugin\"", "/x"]);
+        assert_eq!(tokens("remote h # up /x"), ["remote", "h"]);
+        assert_eq!(tokens("remote h#x"), ["remote", "h#x"]);
+        assert_eq!(tokens("a\\ b \"c\\\"d\" ''"), ["a b", "c\"d", ""]);
+        assert!(tokens("  ; up /x").is_empty());
+    }
+
+    /// Every directive #229 lists, and the spellings openvpn reads as the
+    /// same directive, is refused with its line and its name. Drop one from
+    /// `refusal_reason`, or stop reading a spelling, and this fails.
+    #[test]
+    fn a_hook_plugin_or_management_line_is_refused_with_its_name() {
+        for (line, name) in [
+            ("up \"/bin/sh -c 'id > /tmp/pwned'\"", "up"),
+            ("down /etc/openvpn/down.sh", "down"),
+            ("route-up /x", "route-up"),
+            ("route-pre-down /x", "route-pre-down"),
+            ("ipchange /x", "ipchange"),
+            ("tls-verify /x", "tls-verify"),
+            ("auth-user-pass-verify /x via-env", "auth-user-pass-verify"),
+            ("tls-crypt-v2-verify /x", "tls-crypt-v2-verify"),
+            ("client-connect /x", "client-connect"),
+            ("client-disconnect /x", "client-disconnect"),
+            ("learn-address /x", "learn-address"),
+            ("iproute /tmp/ip", "iproute"),
+            ("plugin /usr/lib/openvpn/evil.so", "plugin"),
+            ("management 0.0.0.0 7505", "management"),
+            ("script-security 2", "script-security"),
+            ("script-security 3 system", "script-security"),
+            ("script-security", "script-security"),
+            ("daemon", "daemon"),
+            ("chroot /var/empty", "chroot"),
+            ("cd /etc/openvpn", "cd"),
+            ("config /etc/openvpn/more.conf", "config"),
+            ("log /var/lib/torrentd/resume/x.fastresume", "log"),
+            ("log-append /var/lib/torrentd/x", "log-append"),
+            ("status /var/lib/torrentd/x 10", "status"),
+            ("replay-persist /var/lib/torrentd/x", "replay-persist"),
+            ("tls-export-cert /var/lib/torrentd", "tls-export-cert"),
+            (
+                "ifconfig-pool-persist /var/lib/torrentd/x",
+                "ifconfig-pool-persist",
+            ),
+            // The spellings openvpn reads as the same directive.
+            ("--up /x", "up"),
+            ("  \"up\" /x", "up"),
+            ("u\\p /x", "up"),
+            // A closing quote ends the word, as openvpn's `parse_line` ends
+            // it, so nothing glued to it hides the directive.
+            ("\"plugin\"/nonexistent/evil.so", "plugin"),
+            ("'plugin'/x.so", "plugin"),
+            ("\"management\"127.0.0.1 7505", "management"),
+            ("setenv opt plugin /x.so", "plugin"),
+            ("--setenv opt setenv opt up /x", "up"),
+        ] {
+            let text = format!("client\ndev tun\n{line}\nremote 203.0.113.7\n");
+            let e = refused_directive(&text).expect_err(line);
+            assert!(
+                e.contains(&format!("`{name}`")),
+                "{line:?} should name {name}: {e}"
+            );
+            assert!(e.contains("line 3"), "{line:?} should name its line: {e}");
+        }
+    }
+
+    /// A `<connection>` block holds directives, and a tag with anything
+    /// after it opens no block, so neither hides a hook from the scan.
+    #[test]
+    fn a_block_hides_no_directive_openvpn_would_read() {
+        let e = refused_directive("<connection>\nremote h\nup /x\n</connection>\n")
+            .expect_err("a connection block is directives");
+        assert!(e.contains("`up`") && e.contains("line 3"), "{e}");
+        let e = refused_directive("<ca> x\nup /x\n</ca>\n").expect_err("no block opened");
+        assert!(e.contains("`up`"), "{e}");
+        // A block's end is found with leading whitespace ignored, so the
+        // scan resumes no later than openvpn does.
+        let e = refused_directive("<ca>\nAAAA\n  </ca>\nplugin /x.so\n").expect_err("after");
+        assert!(e.contains("`plugin`") && e.contains("line 4"), "{e}");
+    }
+
+    /// The refusal is made before anything is spawned, so it holds on a
+    /// host with no `openvpn` and leaves no pid file for teardown to find.
+    /// Remove the check from `bring_up` and this reaches `openvpn` instead.
+    #[test]
+    fn bring_up_refuses_a_hooked_ovpn_before_spawning_openvpn() {
+        let (d, m) = mgr();
+        let ovpn = d.path().join("acct.ovpn");
+        std::fs::write(&ovpn, "client\nscript-security 2\nup /bin/sh\n").unwrap();
+        let profile = VpnTunnel {
+            r#type: torrentd_engine::VpnType::Openvpn,
+            config_path: ovpn.clone(),
+            interface: "tdnx-ovpn".to_string(),
+        };
+        match m.bring_up(&profile) {
+            Err(VpnError::Spawn(msg)) => {
+                assert!(msg.contains("`script-security`"), "{msg}");
+                assert!(msg.contains(&ovpn.display().to_string()), "{msg}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!m.pid_file("tdnx-ovpn").exists());
+
+        let missing = VpnTunnel {
+            config_path: d.path().join("missing.ovpn"),
+            ..profile
+        };
+        match m.bring_up(&missing) {
+            Err(VpnError::Spawn(msg)) => assert!(msg.contains("missing.ovpn"), "{msg}"),
+            other => panic!("expected a read failure, got {other:?}"),
+        }
     }
 
     /// A reconnect keeps the device, and with it the ifindex-keyed table and

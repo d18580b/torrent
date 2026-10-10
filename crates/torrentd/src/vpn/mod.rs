@@ -24,6 +24,7 @@ pub use ip_lookup::link_standing;
 pub use ip_lookup::probe_ipv4;
 pub use ip_lookup::AddrProbeUnavailable;
 pub use natpmp::NatpmpForwarder;
+pub use openvpn::config_refusal as openvpn_config_refusal;
 pub use openvpn::OpenvpnManager;
 pub use openvpn::Released as ReleasedOpenvpn;
 use torrentd_engine::VpnManager;
