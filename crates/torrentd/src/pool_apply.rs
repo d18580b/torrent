@@ -1955,6 +1955,35 @@ mod tests {
         assert!(stray.exists());
     }
 
+    /// The move has already happened when `left_behind` looks, so a file list
+    /// it cannot read is an unknown outcome too, never `failed`: a retry would
+    /// move a payload that already moved.
+    #[test]
+    fn an_unreadable_file_list_after_a_move_is_an_unknown_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pool")).unwrap();
+        let pool = service(dir.path(), true);
+        let ih = "ef".repeat(20);
+        add_and_rematch(&pool, &ih, "T", None, &[("T/a.bin", 100)]);
+        // A size that does not read back as a number, as a corrupt index
+        // would hold: `torrent_files` fails on the row.
+        rusqlite::Connection::open(Config::minimal_for_tests(dir.path(), true).pool_db_path())
+            .unwrap()
+            .execute(
+                "UPDATE torrent_file SET size = 'corrupt' WHERE infohash = ?1",
+                [&ih],
+            )
+            .unwrap();
+
+        match left_behind(&pool, &ih, &dir.path().join("pool/old"), "/dst") {
+            Err(StepFailure::Unknown(e)) => {
+                assert!(e.contains("file list could not be read"), "{e}")
+            }
+            Err(StepFailure::Failed(e)) => panic!("recorded as failed: {e}"),
+            Ok(()) => panic!("an unread file list was taken as nothing left behind"),
+        }
+    }
+
     #[test]
     fn a_storage_move_libtorrent_never_reports_on_is_unknown_not_failed() {
         let state = StateMap::new();
