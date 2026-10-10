@@ -24,6 +24,8 @@
 //!   - the no-download invariant: `UPLOAD_MODE` survives a real session, holds
 //!     for a magnet (which `SEED_MODE` cannot cover at all), and holds through
 //!     the verification failure that drops `SEED_MODE`.
+//!   - a magnet on a DHT-enabled host profile reaches the session with DHT,
+//!     PEX and LSD disabled while it has no metadata.
 //!   - disk-error recovery: an unreadable payload leaves the torrent paused
 //!     with a libtorrent error (not newly in upload mode), and `resume()`
 //!     clears both and seeds, with `UPLOAD_MODE` untouched.
@@ -583,6 +585,81 @@ fn a_magnet_add_carries_upload_mode_without_metadata() {
         "upload_mode is what actually holds for a magnet; flags={flags:?}",
     );
     assert_eq!(last.download_rate, 0);
+}
+
+/// A magnet on a DHT-enabled host profile, before its metadata arrives.
+///
+/// A host profile trusts a torrent's own `private` bit, and a magnet has none
+/// until its metadata is fetched; libtorrent announces a torrent without valid
+/// metadata on the DHT regardless. So the flags the policy composes for a
+/// magnet must reach the session with DHT, PEX and LSD disabled, and stay
+/// there while the torrent has no metadata.
+#[test]
+#[ignore = "real libtorrent + disk; run with --ignored"]
+fn a_magnet_on_a_dht_host_profile_carries_the_discovery_guards() {
+    use torrentd_engine::policy::magnet_flags;
+    use torrentd_engine::ProfileConfig;
+    use torrentd_engine::ProfileId;
+    use torrentd_engine::ProfileNetwork;
+
+    let profile = ProfileConfig {
+        id: ProfileId::new("public"),
+        network: ProfileNetwork::Host {
+            listen_interfaces: "127.0.0.1:0".into(),
+            dht: true,
+        },
+        peer_fingerprint: None,
+        user_agent: None,
+        resume_dir: None,
+        torrent_dir: None,
+        allowed_tracker_domains: vec!["tracker.example".into()],
+        upload_rate_limit: None,
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let s = Session::new(&support::local_seed_settings()).unwrap();
+    let h = s
+        .add_torrent(AddParams::Magnet {
+            uri: "magnet:?xt=urn:btih:0202020202020202020202020202020202020202\
+                  &tr=https%3A%2F%2Ftracker.example%2Fannounce"
+                .into(),
+            save_path: dir.path().to_str().unwrap().to_string(),
+            flags: magnet_flags(&profile),
+        })
+        .unwrap();
+
+    let last = support::settle_status(&s, h, Duration::from_secs(5))
+        .expect("the torrent should report status");
+    assert!(!last.has_metadata, "no peer can have supplied metadata");
+    assert!(
+        TorrentFlags::from_bits_truncate(last.flags).contains(TorrentFlags::UPLOAD_MODE),
+        "flags={:?}",
+        last.flags,
+    );
+
+    // The status view does not report the discovery bits; the resume data
+    // libtorrent writes does, and it is also what carries them across a
+    // restart.
+    s.save_resume_data(h, ResumeFlags::empty()).unwrap();
+    let blob = support::pump_until(&s, Duration::from_secs(15), |a| match a {
+        Alert::SaveResumeData { data, .. } => Some(data.as_bytes().to_vec()),
+        Alert::SaveResumeDataFailed { message, .. } => {
+            panic!("save_resume_data failed: {message}")
+        }
+        _ => None,
+    })
+    .expect("a save_resume_data alert should arrive");
+    let has = |needle: &[u8]| blob.windows(needle.len()).any(|w| w == needle);
+    for key in [
+        &b"11:disable_dhti1e"[..],
+        b"11:disable_pexi1e",
+        b"11:disable_lsdi1e",
+    ] {
+        assert!(
+            has(key),
+            "{} missing from the resume data",
+            String::from_utf8_lossy(key),
+        );
+    }
 }
 
 /// What the disk-error retry actually recovers, on a real session.

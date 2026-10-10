@@ -74,6 +74,7 @@ pub use policy::discovery_guards;
 pub use policy::forbidden;
 pub use policy::resume_flags_clear;
 pub use policy::resume_flags_set;
+pub use policy::resume_flags_set_without_metadata;
 pub use policy::seed_flags;
 pub use policy::verify_flags;
 pub use policy::TrackerRefusal;

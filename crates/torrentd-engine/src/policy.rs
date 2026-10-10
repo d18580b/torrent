@@ -58,23 +58,55 @@ pub fn forbidden() -> TorrentFlags {
 /// Safety Rules 5 and 6: PEX, DHT and LSD are disabled unconditionally on
 /// every torrent in a tunnelled profile, belt-and-braces against the torrent's
 /// own `private` bit being wrong. A host profile keeps them — that posture is
-/// public by definition, and its DHT is whatever it asked for.
+/// public by definition, and its DHT is whatever it asked for — except on a
+/// magnet, whose `private` bit is unknown when it is added: see
+/// [`magnet_flags`].
 ///
 /// This keys off the profile's declared network, not off its *name*. It used
 /// to branch on whether the id happened to be `default`, which a config could
 /// satisfy by accident and thereby seed a tunnelled profile with PEX on.
 pub fn discovery_guards(profile: &ProfileConfig) -> TorrentFlags {
     if profile.is_vpn() {
-        TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
+        discovery_off()
     } else {
         TorrentFlags::empty()
     }
+}
+
+/// DHT, PEX and LSD, each disabled for one torrent.
+fn discovery_off() -> TorrentFlags {
+    TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_LSD
 }
 
 /// Flags for an add whose payload is believed complete, so libtorrent may skip
 /// hashing (`SEED_MODE`) and seed immediately.
 pub fn seed_flags(profile: &ProfileConfig) -> TorrentFlags {
     TorrentFlags::SEED_MODE | no_download() | discovery_guards(profile)
+}
+
+/// Flags for a magnet add, on any profile: [`seed_flags`] with DHT, PEX and
+/// LSD disabled whatever the profile's posture.
+///
+/// A host profile otherwise trusts the torrent's own `private` bit, and a
+/// magnet has none until its metadata arrives. libtorrent announces a torrent
+/// without valid metadata on the DHT regardless (`torrent::should_announce_dht`
+/// checks `priv()` only once `m_torrent_file->is_valid()`), so a private
+/// tracker's magnet on a host profile with `dht = true` would publish its
+/// infohash and the host's address before anything could know it is private:
+/// a BEP 27 breach the tracker can see.
+///
+/// The guard is not lifted when the metadata turns out public: the session
+/// API has no per-torrent flag clear yet. libtorrent keeps the three bits in
+/// the resume data it writes, so they survive a restart that reloads that
+/// resume data, and [`resume_flags_set_without_metadata`] re-asserts them on
+/// one that reloads it still without metadata. A former magnet the boot
+/// torrent-dir scan re-adds from its `.torrent` alone, with no resume file,
+/// gets the profile's own posture instead: by then its `private` bit is known,
+/// and libtorrent honours it. A magnet on a host
+/// profile therefore finds its metadata and its peers through its trackers
+/// only, and a magnet with no `tr=` only from a peer its `x.pe` names.
+pub fn magnet_flags(profile: &ProfileConfig) -> TorrentFlags {
+    seed_flags(profile) | discovery_off()
 }
 
 /// Flags for an add that must be hash-checked before it seeds. Deliberately no
@@ -95,6 +127,19 @@ pub fn verify_flags(profile: &ProfileConfig) -> TorrentFlags {
 /// without it.
 pub fn resume_flags_set(profile: &ProfileConfig) -> TorrentFlags {
     no_download() | discovery_guards(profile)
+}
+
+/// Flags re-asserted when loading resume data with no metadata beside it:
+/// [`resume_flags_set`] with DHT, PEX and LSD disabled whatever the profile's
+/// posture, as [`magnet_flags`] does for a magnet add.
+///
+/// Such a torrent reloads exactly as a magnet does: its `private` bit is
+/// unknown until its metadata arrives, and libtorrent announces it on the DHT
+/// meanwhile. Resume data for a magnet added before [`magnet_flags`] existed
+/// carries no discovery bits, so without this it would reload on a host
+/// profile with DHT on and announce its infohash again.
+pub fn resume_flags_set_without_metadata(profile: &ProfileConfig) -> TorrentFlags {
+    resume_flags_set(profile) | discovery_off()
 }
 
 /// Flags cleared when loading resume data: everything [`forbidden`], which
@@ -265,6 +310,33 @@ mod tests {
         let p = host();
         assert!(!seed_flags(&p).contains(TorrentFlags::DISABLE_DHT));
         assert!(!seed_flags(&p).contains(TorrentFlags::DISABLE_PEX));
+    }
+
+    #[test]
+    fn a_magnet_disables_discovery_on_every_profile() {
+        // A DHT-enabled host profile set up for a private tracker's account:
+        // the magnet's `private` bit is unknown until its metadata arrives.
+        let mut guarded_host = host();
+        guarded_host.allowed_tracker_domains = vec!["tracker.example".into()];
+        for p in [host(), guarded_host, vpn()] {
+            let flags = magnet_flags(&p);
+            assert!(flags.contains(discovery_off()), "{} {flags:?}", p.id);
+            assert!(flags.contains(seed_flags(&p)), "{} {flags:?}", p.id);
+            assert!(!flags.intersects(forbidden()), "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn resume_data_without_metadata_disables_discovery_on_every_profile() {
+        for p in [host(), vpn()] {
+            let flags = resume_flags_set_without_metadata(&p);
+            assert!(flags.contains(discovery_off()), "{} {flags:?}", p.id);
+            assert!(flags.contains(resume_flags_set(&p)), "{} {flags:?}", p.id);
+            assert!(!flags.contains(TorrentFlags::SEED_MODE), "{flags:?}");
+            assert!(!flags.intersects(forbidden()), "{flags:?}");
+        }
+        // Resume data with metadata beside it keeps the host's posture.
+        assert!(!resume_flags_set(&host()).intersects(discovery_off()));
     }
 
     #[test]

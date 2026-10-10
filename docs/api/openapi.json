@@ -11576,7 +11576,7 @@
               "kind",
               "uri"
             ],
-            "description": "A magnet URI. The torrent has no name, size or file list until its\nmetadata arrives from peers."
+            "description": "A magnet URI. The torrent has no name, size or file list until its\nmetadata arrives from peers. Whether it is private is unknown until\nthen too, so a magnet is added with DHT, PEX and LSD disabled on every\nprofile, and keeps them disabled: its metadata and peers come from its\ntrackers, and a magnet with no `tr=` only from a peer its `x.pe`\nnames."
           },
           {
             "properties": {

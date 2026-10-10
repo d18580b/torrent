@@ -244,7 +244,7 @@ Every profile takes `id` plus `network`, and then:
 | `network = "host"` | |
 | --- | --- |
 | `listen_interfaces` | **required**, e.g. `"eth0:6881"` or `"0.0.0.0:6881,[::]:6881"`. The unspecified address is refused when any `vpn` profile is configured — see [Account isolation](#account-isolation). |
-| `dht` | default `false`. DHT is a public announcement of what this host holds, so it is opt-in. |
+| `dht` | default `false`. DHT is a public announcement of what this host holds, so it is opt-in. It never applies to a magnet: see below. |
 
 | `network = "vpn"` | |
 | --- | --- |
@@ -256,6 +256,22 @@ Every profile takes `id` plus `network`, and then:
 
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
+
+A host profile otherwise relies on each torrent's own `private` flag to keep a
+private torrent off DHT, PEX and LSD. A magnet has no flag to read until its
+metadata arrives, and libtorrent announces a torrent without metadata on the
+DHT regardless, so a private tracker's magnet would publish its infohash and the
+host's address before anything knew it was private. A magnet is therefore added
+with DHT, PEX and LSD disabled on every profile, host or `vpn`, and keeps them
+disabled once its metadata arrives, across restarts that reload its resume
+data. A torrent whose resume data reloads with no `.torrent` beside it, as a
+magnet still fetching metadata does, gets the same guard at boot. A former
+magnet re-added at boot from its `.torrent` alone, with no resume file, takes
+the profile's own posture instead: its `private` flag is known by then, and
+libtorrent honours it. Its metadata and its
+peers come from the trackers in its `tr=` parameters; a magnet with none can
+fetch its metadata only from a peer its `x.pe` parameters name. Add a public torrent you want on the DHT as
+a `.torrent` instead.
 
 Each `vpn` profile's tunnel must come up with its own address. A tunnel is
 routed by its address (`from <address> lookup <table>`), so two sharing one — every Proton
