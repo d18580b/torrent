@@ -23,6 +23,7 @@ impl AppCtx {
         let gate = Gate {
             auth: state.auth.clone(),
             metrics: Arc::clone(&state.metrics),
+            allowed_hosts: state.allowed_hosts.clone(),
         };
         Self {
             state: Arc::new(state),

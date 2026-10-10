@@ -14,15 +14,27 @@
 //! run with `allow_unauthenticated` has no credentials at all, and kynos'
 //! derived bearer carrier answers an absent `Authorization` header with a 401
 //! before the authenticator is asked. [`Bearer`]'s carrier instead reports the
-//! absence as [`Presented::Absent`], and [`Gate`] decides: anonymous access
-//! where no `[auth]` is configured, a 401 everywhere else. The document still
-//! describes the bearer requirement, which is the contract for every deployment
-//! that has credentials; `docs/api/README.md` names the exception.
+//! absence as a [`Presented`] with no token, and [`Gate`] decides: anonymous
+//! access where no `[auth]` is configured, a 401 everywhere else. The document
+//! still describes the bearer requirement, which is the contract for every
+//! deployment that has credentials; `docs/api/README.md` names the exception.
+//!
+//! Anonymous access is not access for every browser tab. Loopback is not a
+//! browser boundary: any page the operator visits can send a form to
+//! `127.0.0.1`, and a page whose name rebinds to `127.0.0.1` is same-origin
+//! with the API. So without `[auth]`, [`Gate`] also judges the request head
+//! the carrier recorded as a [`Site`]: a `Host` that is not loopback or an
+//! `allowed_hosts` entry is refused on every operation, and a request that
+//! changes state is refused when `Sec-Fetch-Site` or `Origin` says another
+//! site sent it, or when it carries a body a plain HTML form can send.
 
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use kynos::error::rejection::AuthRejection;
+use kynos::http::HeaderValue;
+use kynos::http::Method;
 use kynos::http::Parts;
 use kynos::security::auth::Scopes;
 use kynos::security::carrier;
@@ -57,11 +69,217 @@ pub const PROBLEM_BASE: &str = problem_base!();
 pub struct Bearer;
 
 /// What the carrier found in the request head.
-pub enum Presented {
-    /// No `Authorization` header at all.
-    Absent,
-    /// A syntactically valid bearer token, not yet checked.
-    Token(carrier::BearerToken),
+pub struct Presented {
+    /// A syntactically valid bearer token, not yet checked, or `None` where
+    /// the request had no `Authorization` header at all.
+    token: Option<carrier::BearerToken>,
+    /// Where the request says it came from, which only the unauthenticated
+    /// posture reads.
+    site: Site,
+}
+
+/// The request-head fields a browser sets and a page cannot forge, as the
+/// carrier found them.
+pub struct Site {
+    /// Anything but `GET`, `HEAD` and `OPTIONS`.
+    changes_state: bool,
+    /// The request's authority: the URI's where it has one (HTTP/2's
+    /// `:authority`, or an absolute-form request line), else `Host`.
+    authority: Option<HeaderValue>,
+    origin: Option<HeaderValue>,
+    fetch_site: Option<HeaderValue>,
+    content_type: Option<HeaderValue>,
+}
+
+impl Site {
+    fn of(parts: &Parts) -> Self {
+        let header = |name: &str| parts.headers.get(name).cloned();
+        let authority = parts
+            .uri
+            .authority()
+            .and_then(|a| HeaderValue::from_str(a.as_str()).ok())
+            .or_else(|| header("host"));
+        Self {
+            changes_state: !matches!(parts.method, Method::GET | Method::HEAD | Method::OPTIONS),
+            authority,
+            origin: header("origin"),
+            fetch_site: header("sec-fetch-site"),
+            content_type: header("content-type"),
+        }
+    }
+
+    /// Why a daemon without `[auth]` refuses this request, if it does.
+    ///
+    /// A request with no `Host` is admitted: every browser sends one, so its
+    /// absence marks a client no page drives. A request that names no site
+    /// and carries no body is admitted for the same reason, which is what
+    /// keeps `curl -X POST` and `torrentctl` working unchanged.
+    fn refusal(&self, allowed: &HostAllowlist) -> Option<&'static str> {
+        let authority = match self.authority.as_ref().map(HeaderValue::to_str) {
+            None => None,
+            Some(Ok(authority)) => Some(authority),
+            Some(Err(_)) => return Some("the request authority is not text"),
+        };
+        let own = match authority {
+            None => None,
+            Some(authority) => {
+                let Some((host, port)) = split_authority(authority) else {
+                    return Some("the request authority does not parse");
+                };
+                if !is_loopback_host(&host) && !allowed.contains(&host) {
+                    return Some(
+                        "the Host is neither loopback nor in allowed_hosts, as a DNS-rebound \
+                         page's would be",
+                    );
+                }
+                Some((host, port))
+            }
+        };
+        if !self.changes_state {
+            return None;
+        }
+        if let Some(site) = &self.fetch_site {
+            if !matches!(site.to_str(), Ok("same-origin" | "none")) {
+                return Some("Sec-Fetch-Site says another site sent this request");
+            }
+        }
+        if let Some(origin) = &self.origin {
+            let Some(own) = own else {
+                return Some("the request names an Origin and no Host to hold it to");
+            };
+            let same = origin
+                .to_str()
+                .ok()
+                .and_then(split_origin)
+                .is_some_and(|(host, port)| {
+                    host == own.0 && own.1.map_or(port.is_default, |p| p == port.number)
+                });
+            if !same {
+                return Some("the Origin is not this daemon's own");
+            }
+        }
+        if let Some(content_type) = &self.content_type {
+            let essence = content_type
+                .to_str()
+                .ok()
+                .and_then(|v| v.split(';').next())
+                .map(str::trim);
+            if !essence.is_some_and(|e| e.eq_ignore_ascii_case("application/json")) {
+                return Some("the body is not application/json, so an HTML form could send it");
+            }
+        }
+        None
+    }
+}
+
+/// A port as an `Origin` states it, or as its scheme implies it.
+struct OriginPort {
+    number: u16,
+    /// Whether the scheme implies it, which is when a `Host` may omit it.
+    is_default: bool,
+}
+
+/// `host[:port]`, the host lowercased and an IPv6 literal's brackets removed.
+fn split_authority(authority: &str) -> Option<(String, Option<u16>)> {
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let (host, after) = rest.split_once(']')?;
+        host.parse::<std::net::Ipv6Addr>().ok()?;
+        let port = match after {
+            "" => None,
+            p => Some(p.strip_prefix(':')?),
+        };
+        (host, port)
+    } else {
+        let (host, port) = match authority.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        };
+        if host.is_empty() || !host.chars().all(is_host_char) {
+            return None;
+        }
+        (host, port)
+    };
+    let port = match port {
+        None => None,
+        Some(p) => Some(p.parse::<u16>().ok()?),
+    };
+    Some((normalize_host(host), port))
+}
+
+/// An `Origin`'s host and port: `scheme://host[:port]`, nothing after it.
+fn split_origin(origin: &str) -> Option<(String, OriginPort)> {
+    let (scheme, authority) = origin.split_once("://")?;
+    let default = match scheme.to_ascii_lowercase().as_str() {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
+    let (host, port) = split_authority(authority)?;
+    Some((
+        host,
+        OriginPort {
+            number: port.unwrap_or(default),
+            is_default: port.is_none_or(|p| p == default),
+        },
+    ))
+}
+
+/// A character a registered name or an IPv4 address is spelled with.
+fn is_host_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')
+}
+
+/// Lowercased, without a trailing root dot: `LocalHost.` is `localhost`.
+fn normalize_host(host: &str) -> String {
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+}
+
+/// `localhost`, or a loopback address, IPv4-mapped IPv6 included.
+fn is_loopback_host(host: &str) -> bool {
+    if host == "localhost" {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v4)) => v4.is_loopback(),
+        Ok(IpAddr::V6(v6)) => v6
+            .to_ipv4_mapped()
+            .map_or(v6.is_loopback(), |v4| v4.is_loopback()),
+        Err(_) => false,
+    }
+}
+
+/// The host names, beyond loopback, a daemon without `[auth]` answers to:
+/// the names a reverse proxy in front of it passes through as `Host`.
+#[derive(Clone, Debug, Default)]
+pub struct HostAllowlist(Vec<String>);
+
+impl HostAllowlist {
+    /// Parse `allowed_hosts`: each entry a host name or IP address, without
+    /// a scheme, port or path. Matching ignores case and a trailing dot.
+    pub fn parse(entries: &[String]) -> Result<Self, String> {
+        let mut hosts = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let bracketless = entry
+                .strip_prefix('[')
+                .and_then(|e| e.strip_suffix(']'))
+                .unwrap_or(entry);
+            let is_ip = bracketless.parse::<IpAddr>().is_ok();
+            let host = normalize_host(bracketless);
+            let well_formed = is_ip || (!host.is_empty() && host.chars().all(is_host_char));
+            if !well_formed {
+                return Err(format!(
+                    "{entry:?} is not a host name or IP address; write the name alone, \
+                     without a scheme, port or path"
+                ));
+            }
+            hosts.push(host);
+        }
+        Ok(Self(hosts))
+    }
+
+    fn contains(&self, host: &str) -> bool {
+        self.0.iter().any(|h| h == host)
+    }
 }
 
 /// Who a request is, once its token checked out.
@@ -131,9 +349,9 @@ impl Carries for Bearer {
     fn present(parts: &Parts) -> Result<Option<Presented>, AuthRejection> {
         // Malformed stays a 401 whatever the deployment: a client that sent a
         // broken credential is not an anonymous one.
-        Ok(Some(match carrier::bearer(parts)? {
-            Some(token) => Presented::Token(token),
-            None => Presented::Absent,
+        Ok(Some(Presented {
+            token: carrier::bearer(parts)?,
+            site: Site::of(parts),
         }))
     }
 }
@@ -167,6 +385,9 @@ impl Scopes for Metrics {
 pub struct Gate {
     pub auth: Option<Auth>,
     pub metrics: Arc<PromSink>,
+    /// `allowed_hosts`: what a daemon without `[auth]` answers to beyond
+    /// loopback. Unread where `[auth]` is configured.
+    pub allowed_hosts: HostAllowlist,
 }
 
 impl<C: Sync> Authenticator<Bearer, C> for Gate {
@@ -178,10 +399,23 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
         let Some(auth) = self.auth.as_ref() else {
             // No `[auth]`: access control belongs to whatever sits in front
             // of the daemon, and the startup posture check has already
-            // confined it to loopback.
+            // confined it to loopback. Loopback keeps out the network, not
+            // the operator's own browser, so a request a page drove from
+            // another site is refused here.
+            if let Some(reason) = presented.site.refusal(&self.allowed_hosts) {
+                warn!(
+                    target: "torrentd::auth",
+                    reason,
+                    host = ?presented.site.authority,
+                    origin = ?presented.site.origin,
+                    sec_fetch_site = ?presented.site.fetch_site,
+                    "refused a request a browser sent from another site",
+                );
+                return Err(AuthRejection::forbidden());
+            }
             return Ok(Caller::Anonymous);
         };
-        let Presented::Token(token) = presented else {
+        let Some(token) = presented.token else {
             return Err(AuthRejection::unauthenticated());
         };
         let token = token.into_inner();

@@ -64,6 +64,14 @@ pub struct Config {
     /// available — but it has to be typed, never arrived at by omission.
     #[serde(default)]
     pub allow_unauthenticated: bool,
+
+    /// Host names, beyond loopback, that a daemon with
+    /// `allow_unauthenticated` answers to: the names a reverse proxy in front
+    /// of it passes through as `Host`. A request naming any other `Host` is
+    /// refused, which is what stops a DNS-rebound page from reading the API.
+    /// Refused beside `[auth]`, where nothing reads it.
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
     #[serde(default = "Config::default_log_level")]
     pub log_level: LogLevel,
 
@@ -270,6 +278,14 @@ impl Config {
                      `allow_unauthenticated` from the config."
                 );
             }
+            if !self.allowed_hosts.is_empty() {
+                anyhow::bail!(
+                    "[auth] is configured and allowed_hosts is set as well. allowed_hosts \
+                     only widens which Host names a daemon without [auth] answers to; a \
+                     daemon with [auth] answers to any, because a page cannot present its \
+                     token. Delete `allowed_hosts` from the config."
+                );
+            }
             return Ok(());
         }
         if !self.allow_unauthenticated {
@@ -333,6 +349,8 @@ impl Config {
         // refusal for operator tools too.
         crate::http::forwarded::TrustedProxies::parse(&self.trusted_proxies)
             .map_err(|e| anyhow::anyhow!("trusted_proxies: {e}"))?;
+        crate::http::security::HostAllowlist::parse(&self.allowed_hosts)
+            .map_err(|e| anyhow::anyhow!("allowed_hosts: {e}"))?;
         // Range-check the numeric overrides. These are handed to libtorrent as
         // ints; a zero connection limit or aio_threads silently produces a
         // daemon that cannot seed, and there is no reason to find that out
@@ -472,6 +490,7 @@ impl Config {
             torrent_dir: new_torrent_dir,
             http_listen: new_http_listen,
             allow_unauthenticated: new_allow_unauthenticated,
+            allowed_hosts: new_allowed_hosts,
             log_level: new_log_level,
             registry_path: new_registry_path,
             connections_limit: new_connections_limit,
@@ -553,6 +572,9 @@ impl Config {
         }
         if old.allow_unauthenticated != *new_allow_unauthenticated {
             d.non_reloadable_changes.push("allow_unauthenticated");
+        }
+        if old.allowed_hosts != *new_allowed_hosts {
+            d.non_reloadable_changes.push("allowed_hosts");
         }
         if old.http_listen != *new_http_listen {
             d.non_reloadable_changes.push("http_listen");
@@ -1165,6 +1187,7 @@ impl Config {
             torrent_dir: dir.join("torrents"),
             http_listen: Self::default_http_listen(),
             allow_unauthenticated: true,
+            allowed_hosts: vec![],
             log_level: Self::default_log_level(),
             registry_path: None,
             connections_limit: None,
@@ -2298,6 +2321,9 @@ upload_rate_limit = 0"#,
             ("trusted_proxies", |c| {
                 c.trusted_proxies = vec!["172.28.0.2".into()]
             }),
+            ("allowed_hosts", |c| {
+                c.allowed_hosts = vec!["torrentd.example.com".into()]
+            }),
             ("registry_path", |c| {
                 c.registry_path = Some("/var/lib/torrentd/assignments.json".into())
             }),
@@ -2480,6 +2506,57 @@ upload_rate_limit = 0"#,
             msg.contains("Delete"),
             "the error names the edit that fixes it; got: {msg}",
         );
+    }
+
+    /// `TOP_LEVEL`, with `allowed_hosts = [<hosts>]` after the opt-out.
+    fn top_level_allowing(hosts: &str) -> String {
+        TOP_LEVEL.replace(
+            "allow_unauthenticated = true\n",
+            &format!("allow_unauthenticated = true\nallowed_hosts = [{hosts}]\n"),
+        )
+    }
+
+    #[test]
+    fn allowed_hosts_takes_bare_names_and_addresses() {
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{}{ONE_HOST_PROFILE}",
+            top_level_allowing(r#""torrentd.example.com", "192.0.2.7", "[2001:db8::1]""#),
+        );
+        let cfg = Config::load(&write_cfg(dir.path(), &body)).unwrap();
+        assert_eq!(cfg.allowed_hosts.len(), 3);
+
+        for entry in [
+            r#""https://torrentd.example.com""#,
+            r#""torrentd.example.com:443""#,
+            r#""torrentd.example.com/v1""#,
+            r#""""#,
+        ] {
+            let msg = refusal(&format!("{}{ONE_HOST_PROFILE}", top_level_allowing(entry)));
+            assert!(msg.contains("allowed_hosts"), "{entry}: got: {msg}");
+        }
+    }
+
+    #[test]
+    fn allowed_hosts_alongside_configured_auth_is_refused() {
+        // Nothing reads it there, and left in place it reads as though the
+        // daemon confined its Host names.
+        let dir = tempdir().unwrap();
+        let body = format!(
+            "{}{ONE_HOST_PROFILE}\n[auth]\npassword_hash = \"{}\"\n",
+            top_level_no_opt_out().replace(
+                "http_listen",
+                "allowed_hosts = [\"torrentd.example.com\"]\nhttp_listen"
+            ),
+            crate::auth::hash_password("hunter2").unwrap(),
+        );
+        assert!(body.contains("allowed_hosts = ["));
+        let msg = format!(
+            "{:#}",
+            Config::load(&write_cfg(dir.path(), &body)).unwrap_err()
+        );
+        assert!(msg.contains("allowed_hosts"), "got: {msg}");
+        assert!(msg.contains("Delete"), "got: {msg}");
     }
 
     #[test]
