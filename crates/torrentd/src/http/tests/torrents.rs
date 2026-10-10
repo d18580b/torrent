@@ -1809,3 +1809,167 @@ async fn a_torrent_outside_the_allow_list_is_counted_as_a_registry_error() {
         "{text}"
     );
 }
+
+/// Hand `alert` to the alert handler as `profile`'s session would.
+fn deliver(h: &Harness, profile: &str, alert: &torrentd_engine::Alert) {
+    let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+    let clock = torrentd_engine::MockClock::new();
+    let mut ctx = torrentd_engine::handlers::HandlerCtx {
+        state: &h.state.state,
+        resume: h.state.resume.as_ref(),
+        torrents: h.state.torrents.as_ref(),
+        metrics: &torrentd_engine::NoopSink,
+        clock: &clock,
+        engine: &engine,
+        profile_fenced: None,
+        profile_id: ProfileId::new(profile),
+        span: tracing::info_span!("test"),
+    };
+    torrentd_engine::handlers::add::handle(alert, &mut ctx);
+}
+
+fn alert_header(
+    kind: torrentd_engine::AlertKind,
+    ih: InfoHash,
+    handle: Option<TorrentHandle>,
+) -> libtorrent_safe::alert::AlertHeader {
+    libtorrent_safe::alert::AlertHeader {
+        kind,
+        infohash: Some(ih),
+        handle,
+        timestamp_us: 0,
+    }
+}
+
+fn removed(ih: InfoHash) -> torrentd_engine::Alert {
+    torrentd_engine::Alert::TorrentRemoved {
+        hdr: alert_header(torrentd_engine::AlertKind::TorrentRemoved, ih, None),
+    }
+}
+
+fn added(h: TorrentHandle) -> torrentd_engine::Alert {
+    torrentd_engine::Alert::AddTorrent {
+        hdr: alert_header(torrentd_engine::AlertKind::AddTorrent, h.infohash, Some(h)),
+        error_code: 0,
+        message: None,
+    }
+}
+
+/// `DELETE` a loaded torrent, then `POST` the same `.torrent` to `to` before
+/// the session's `torrent_removed_alert` for the old one is handled. Returns
+/// the info-hash and the removed torrent's handle.
+async fn delete_then_re_add(h: &Harness, e: &MockEngine, to: &str) -> (InfoHash, TorrentHandle) {
+    let bytes = torrent_bytes('r');
+    let ih = libtorrent_safe::info_hash_from_torrent(&bytes).unwrap();
+    let old = load(&h.state, e, ih, "p", TorrentPhase::Seeding);
+    let p = ProfileId::new("p");
+    h.state.torrents.write(&p, &ih, &bytes).unwrap();
+    h.state.torrents.write_save_path(&p, &ih, "/old").unwrap();
+
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ih)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    h.write_json("POST", "/v1/torrents", metainfo(to, &bytes))
+        .await
+        .assert_status(StatusCode::CREATED);
+    (ih, old)
+}
+
+/// The handle `e` gave the re-added torrent. The mock keys what it hands out
+/// by the `.torrent`'s first 20 bytes, so its id is read back from that and
+/// carried under the real info-hash.
+fn re_added_handle(e: &MockEngine, ih: InfoHash, old: TorrentHandle) -> TorrentHandle {
+    let mut synthetic = [0u8; 20];
+    synthetic.copy_from_slice(&torrent_bytes('r')[..20]);
+    let new = TorrentHandle {
+        id: e.register_handle(InfoHash(synthetic)).id,
+        infohash: ih,
+    };
+    assert_ne!(new.id, old.id, "a distinct torrent");
+    new
+}
+
+#[tokio::test]
+async fn a_torrent_re_added_right_after_delete_keeps_its_files_and_entry() {
+    // The documented recovery for a torrent reloaded at the wrong path,
+    // scripted back to back: the old removal's alert used to delete the new
+    // add's `.torrent` and save path, so the next boot reloaded it with no
+    // metadata.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p)
+    });
+    let engine = engine.unwrap();
+    let (ih, old) = delete_then_re_add(&h, &engine, "p").await;
+    let new = re_added_handle(&engine, ih, old);
+
+    // One session, so its alerts arrive in order: the removal, then the add.
+    deliver(&h, "p", &removed(ih));
+    deliver(&h, "p", &added(new));
+
+    let p = ProfileId::new("p");
+    assert_eq!(
+        h.state.torrents.read(&p, &ih).unwrap(),
+        Some(torrent_bytes('r'))
+    );
+    let save_path = dir.path().to_string_lossy().into_owned();
+    assert_eq!(
+        h.state.torrents.read_save_path(&p, &ih).unwrap(),
+        Some(save_path),
+        "the new add's save path, not the removed torrent's"
+    );
+    let st = h.state.state.get(&ih).expect("the new torrent is tracked");
+    assert_eq!((st.handle, st.profile_id), (new, p));
+    assert_eq!(h.state.registry.lookup(&ih).unwrap().as_str(), "p");
+}
+
+#[tokio::test]
+async fn a_torrent_re_added_to_another_profile_right_after_delete_stays_tracked() {
+    // Two sessions, whose alerts are handled on two loops: the new profile's
+    // `AddTorrent` can be handled before the old one's `TorrentRemoved`, which
+    // used to drop the new entry and leave the torrent untracked.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engines = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        let e = fixture(s, dir.path());
+        let q = Arc::new(MockEngine::new());
+        s.profiles = Arc::new(ProfileRegistry::new(vec![
+            test_entry("p", ProfileStatus::Active),
+            ProfileEntry::new(
+                test_entry("q", ProfileStatus::Active).config,
+                q.clone(),
+                None,
+                None,
+                0,
+            ),
+        ]));
+        s.source = Arc::new(ProfileSource::new(vec![
+            (ProfileId::new("p"), e.p.clone() as Arc<dyn TorrentEngine>),
+            (ProfileId::new("q"), q.clone() as Arc<dyn TorrentEngine>),
+        ]));
+        engines = Some((e.p, q));
+    });
+    let (p_engine, q_engine) = engines.unwrap();
+    let (ih, old) = delete_then_re_add(&h, &p_engine, "q").await;
+    let new = re_added_handle(&q_engine, ih, old);
+
+    deliver(&h, "q", &added(new));
+    deliver(&h, "p", &removed(ih));
+
+    let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+    let st = h
+        .state
+        .state
+        .get(&ih)
+        .expect("q's torrent is still tracked");
+    assert_eq!((st.handle, st.profile_id), (new, q.clone()));
+    assert_eq!(
+        h.state.torrents.read(&q, &ih).unwrap(),
+        Some(torrent_bytes('r'))
+    );
+    assert!(h.state.torrents.read_save_path(&q, &ih).unwrap().is_some());
+    // The removed torrent's own files went with it.
+    assert_eq!(h.state.torrents.read(&p, &ih).unwrap(), None);
+    assert_eq!(h.state.torrents.read_save_path(&p, &ih).unwrap(), None);
+}

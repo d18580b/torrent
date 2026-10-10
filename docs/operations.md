@@ -461,7 +461,9 @@ file at all:
   predates it, the boot re-adds it at `default_save_path` instead, logs a
   warning, and counts it in `torrentd_boot_save_path_fallbacks_total`. If its
   payload is elsewhere, the torrent finds nothing there and never seeds.
-  `DELETE` it without `delete_files`, then add or adopt it again. An adopted
+  `DELETE` it without `delete_files`, then add or adopt it again. The add may
+  follow the `204` at once: the session settles the removal afterwards, and
+  keeps the `.torrent` and save path the new add wrote (#185). An adopted
   torrent whose `.torrent` write failed too has neither file in the stores,
   so it is one of the unloaded claims above.
 
