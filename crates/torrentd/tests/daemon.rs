@@ -1727,3 +1727,148 @@ fn a_restart_while_an_adoption_hashes_still_records_its_verdict() {
         std::thread::sleep(Duration::from_millis(500));
     }
 }
+
+/// Issue #192's acceptance: `delete_files` refuses a payload another loaded
+/// torrent has files at, however that torrent was added.
+///
+/// T1 is adopted from the pool into one profile, so the index records it
+/// claiming the file. T2 — the same file, another infohash, as a cross-seed
+/// tool would add it — goes through `POST /v1/torrents` into a second
+/// profile with a `save_path` over the same directory, and claims nothing.
+/// The co-claimant check reads the index alone, so it used to find nobody
+/// sharing T1's payload and move the file T2 was serving into the trash.
+/// The delete has to be refused, and the file left where T2 reads it; once
+/// T2 is gone, the same delete goes through.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn delete_files_refuses_a_payload_a_torrent_added_over_it_still_serves() {
+    use base64::Engine as _;
+    use sha1::Digest;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let root = p.join("pool");
+    let library = p.join("library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    let file = root.join("a");
+    std::fs::write(&file, b"x").unwrap();
+    // One file, `a`, whose piece hash the payload matches. T2 differs only by
+    // a `source` key in its info dict, which changes the infohash and
+    // nothing about the files.
+    let torrent = |source: &str| {
+        let mut t = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        t.extend_from_slice(&sha1::Sha1::digest(b"x"));
+        if !source.is_empty() {
+            t.extend_from_slice(format!("6:source{}:{source}", source.len()).as_bytes());
+        }
+        t.extend_from_slice(b"ee");
+        t
+    };
+    let (t1, t2) = (torrent(""), torrent("cross-seed"));
+    std::fs::write(library.join("t1.torrent"), &t1).unwrap();
+    let hex = |t: &[u8]| libtorrent_safe::info_hash_from_torrent(t).unwrap().to_hex();
+    let (ih1, ih2) = (hex(&t1), hex(&t2));
+    assert_ne!(ih1, ih2);
+
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[[profile]]\nid = \"cross\"\nnetwork = \"host\"\n\
+         listen_interfaces = \"127.0.0.1:{}\"\n\
+         \n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\nallow_mutations = true\n",
+        free_port(),
+        root.display(),
+        library.display()
+    ));
+    std::fs::write(&cfg, text).unwrap();
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_healthy(addr);
+
+    let (code, body) = http(addr, "POST", "/v1/pool/scan", None);
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/pool/adoptions",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"selector\":{{\"kind\":\"infohashes\",\
+             \"infohashes\":[\"{ih1}\"]}}}}"
+        )),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        session_name(addr, &ih1, Duration::from_secs(30)).as_deref(),
+        Some("a"),
+        "the adopted torrent never loaded",
+    );
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/torrents",
+        Some(&format!(
+            "{{\"profile_id\":\"cross\",\"save_path\":\"{}\",\"source\":{{\"kind\":\
+             \"metainfo\",\"data\":\"{}\"}}}}",
+            root.display(),
+            base64::engine::general_purpose::STANDARD.encode(&t2),
+        )),
+    );
+    assert_eq!(code, 201, "{body}");
+    assert_eq!(
+        session_name(addr, &ih2, Duration::from_secs(30)).as_deref(),
+        Some("a"),
+        "the cross-seed never loaded",
+    );
+
+    let delete_t1 = format!("/v1/torrents/{ih1}?delete_files=true&confirm={ih1}");
+    let (code, body) = http(addr, "DELETE", &delete_t1, None);
+    assert_eq!(code, 409, "{body}");
+    assert!(body.contains("payload-shared"), "{body}");
+    assert!(
+        body.contains(&ih2),
+        "the refusal names the cross-seed: {body}"
+    );
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        b"x",
+        "the cross-seed's file left its place"
+    );
+    assert!(!root.join(".torrentd-trash").exists());
+    assert!(torrent_phase(addr, &ih1).is_some(), "T1 left its session");
+
+    // With the cross-seed gone, nothing else serves the file, and the same
+    // delete moves it to the trash. Its session settles the removal a moment
+    // after the 204, until when the file is still its.
+    let (code, body) = http(addr, "DELETE", &format!("/v1/torrents/{ih2}"), None);
+    assert_eq!(code, 204, "{body}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (code, body) = http(addr, "DELETE", &delete_t1, None);
+        if code == 204 {
+            break;
+        }
+        assert!(
+            code == 409 && Instant::now() < deadline,
+            "the delete with the cross-seed gone: {code} {body}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(!file.exists(), "the payload was not moved to the trash");
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}
