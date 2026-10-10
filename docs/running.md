@@ -661,6 +661,14 @@ waiting for verification so a restart queues them again. It starts empty, is
 additive and takes no copy, but a build that knows only version 5 refuses the
 result.
 
+Schema version 7 rebuilds the `plan` table so a discarded plan's id is never
+handed out again, copying every plan and its steps across under their own
+ids. It takes no copy, and a build that knows only version 6 refuses the
+result. From this version a delete plan files into
+`<root>/.torrentd-trash/<plan id>-<created_at>/` rather than
+`<root>/.torrentd-trash/<plan id>/`; trash an older build filed keeps its old
+name ([The trash](operations.md#archiving-payload)).
+
 **If the migration fails, that copy is not the remedy.** It is taken
 immediately before the steps that failed, so it is a copy of the index as it
 stands — same version, same columns, same tables — and restoring it puts you
