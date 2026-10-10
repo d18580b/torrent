@@ -1285,6 +1285,102 @@ async fn a_shared_payload_delete_is_refused_while_a_scan_holds_the_writer() {
     holder.join().unwrap();
 }
 
+/// The handler's early co-claimant check reads the committed index, which a
+/// running scan can rewrite before it lets go of the writer. A cross-seed
+/// that commits a claim on this torrent's files after that check, and before
+/// the payload is proven on the writer, is refused there rather than having
+/// its files moved to the trash.
+#[tokio::test]
+async fn a_co_claimant_committed_after_the_early_check_is_refused_before_the_trash() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    let index = Arc::clone(&pool);
+    let engine = Arc::new(torrentd_engine::MockEngine::new());
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    let p = torrentd_engine::ProfileId::new("p");
+    let handle = engine.register_handle(hash);
+    engine.set_torrent_details(
+        handle,
+        torrentd_engine::TorrentDetails {
+            save_path: dir
+                .path()
+                .join("pool/movies")
+                .to_string_lossy()
+                .into_owned(),
+            ..torrentd_engine::MockEngine::default_details()
+        },
+    );
+    engine.set_torrent_files(
+        handle,
+        Some(
+            ["a.bin", "b.bin"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, path)| torrentd_engine::TorrentFile {
+                    index: u32::try_from(i).unwrap(),
+                    path: path.into(),
+                    size: 0,
+                    downloaded: 0,
+                    priority: 4,
+                })
+                .collect(),
+        ),
+    );
+    let session = Arc::clone(&engine);
+    let h = Harness::authed(&Coverage::new(), |s| {
+        profiles(s);
+        s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            p.clone(),
+            session as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]));
+        s.pool = Some(pool);
+    });
+    h.state.registry.assign(hash, p.clone()).unwrap();
+    h.state.state.insert(
+        hash,
+        torrentd_engine::TorrentState::newly_added(handle, p, std::time::Instant::now()),
+    );
+
+    // Park the delete just past the early check, commit the cross-seed's
+    // claim as a scan ending then would, and let it go on to the writer.
+    let held = engine.hold_next("torrent_files");
+    let commit = tokio::task::spawn_blocking(move || {
+        held.wait_entered();
+        index.with_store_mut(|st| {
+            st.replace_claims(IH_B, &[(root_id, "movies/a.bin".to_owned())])
+                .unwrap();
+        });
+        held.release();
+    });
+    let resp = h
+        .write(
+            "DELETE",
+            &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
+        )
+        .await;
+    commit.await.unwrap();
+
+    assert_problem(&resp, 409, "payload-shared");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(
+        detail.contains(IH_B) && detail.contains("pool index"),
+        "{detail}"
+    );
+    assert!(dir.path().join("pool/movies/a.bin").exists());
+    assert!(dir.path().join("pool/movies/b.bin").exists());
+    assert_eq!(
+        h.state.registry.lookup(&hash),
+        Some(torrentd_engine::ProfileId::new("p"))
+    );
+    assert!(
+        !engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::RemoveTorrent { .. })),
+        "a refused delete leaves the torrent in its session",
+    );
+}
+
 /// Issue #111's acceptance: a torrent adopted into one profile, deleted
 /// without its files, adopts into another. The delete used to leave the
 /// index's `adopted` verdict behind, and adoption refuses `adopted` outright.
