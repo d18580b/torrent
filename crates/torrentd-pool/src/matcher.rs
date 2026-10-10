@@ -108,17 +108,14 @@ pub fn match_all_serving(
     store.in_transaction(|store| match_all_inner(store, Some(loaded)))
 }
 
-/// `(root_id, base)` of `save_path` under the managed root holding it: the
-/// deepest one, where roots nest. `None` outside every root.
+/// `(root_id, base)` of `save_path` under the managed root holding it, or
+/// `None` outside every root. Configuration refuses nested roots, so at most
+/// one root holds it.
 fn base_under_roots(roots: &[(i64, PathBuf)], save_path: &Path) -> Option<(i64, String)> {
-    roots
-        .iter()
-        .filter_map(|(id, root)| {
-            let rel = save_path.strip_prefix(root).ok()?;
-            Some((root.components().count(), *id, rel))
-        })
-        .max_by_key(|(depth, ..)| *depth)
-        .map(|(_, id, rel)| (id, normalize(&rel.to_string_lossy())))
+    roots.iter().find_map(|(id, root)| {
+        let rel = save_path.strip_prefix(root).ok()?;
+        Some((*id, normalize(&rel.to_string_lossy())))
+    })
 }
 
 fn match_all_inner(
