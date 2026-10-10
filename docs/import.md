@@ -66,7 +66,10 @@ and `ProtectHome=yes` ([`deploy/torrentd.service`](../deploy/torrentd.service)).
   `[pool] roots`. A torrent whose payload is anywhere else reads `missing`.
 - **Roots must not nest.** `[pool] roots must not nest: … and …` is a config
   error. Two sibling directories are two roots; a parent and its child are
-  one root, the parent.
+  one root, the parent. `[pool] roots alias the same files: …` is the same
+  error for two roots that reach one tree through a bind mount; a FUSE union
+  view (unRAID's `/mnt/user`, mergerfs) must not be listed beside its
+  branches either (operations.md, "If a path has to change").
 - **`[pool]` is not reloadable.** Any change to it, `max_concurrent_verify`
   included, needs a restart. The verify queue picks up again after it (§7),
   but the restart, today, drops the metadata of every torrent already

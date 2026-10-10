@@ -677,8 +677,18 @@ new one until you set it online.
   whatever port the gateway hands out, and announces it.
 
 **If a path has to change.** Mount the disks at the old paths if you can, for
-example with a bind mount, and list them in `ReadWritePaths`. Nothing
-re-points stored paths. If a path changes anyway:
+example with a bind mount, and list them in `ReadWritePaths`. List the bind
+mount as a root in place of the directory it shows, never beside it: two roots
+that reach the same files index them twice, and the copy no torrent claims
+reads as an orphan that a delete plan would move into the trash. The daemon
+refuses to start on two roots that alias one tree through a bind mount
+(`[pool] roots alias the same files`). It cannot see through a FUSE union
+view such as unRAID's `/mnt/user` (shfs) or a mergerfs pool, which has its own
+device and inode numbers, so never list a union view beside one of its
+branches (`/mnt/user/media` with `/mnt/disk3/media`): list the view, or the
+branches, not both. A delete step still refuses a file that is a hard link to
+a claimed file, but an alias through a union view can slip past that too.
+Nothing re-points stored paths. If a path changes anyway:
 
 - **A `[pool] roots` entry.** The next scan drops the old root from the
   index, with every claim under it. It indexes the new path as a new root and
