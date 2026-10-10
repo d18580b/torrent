@@ -16,8 +16,9 @@
 # scans and the alert loop's first stretch: whatever those count is already in
 # the first sample, and a zero nobody scraped is no sample. So for each counter
 # a boot moves, the daemon also exports what it had counted at the first
-# scrape as a `torrentd_boot_*` gauge, and the rule fires on that being above
-# zero too (`or torrentd_boot_x > 0`). Such an alert holds for the life of the
+# scrape as a gauge named for it (`boot_registry_errors` for
+# `profile_assignment_registry_errors_total`, and so on), and the rule fires
+# on that being above zero too (`or boot_gauge > 0`). Such an alert holds for the life of the
 # process, as TorrentdBootLoadFailures does; a restart clears it. A series
 # that appears only with its first event is matched on its appearance as well
 # (`or (x unless x offset 15m)`).
