@@ -635,18 +635,25 @@ impl ProfileConfig {
     }
 }
 
-/// Format `ip:port` the way libtorrent's `listen_interfaces` expects.
+/// The `listen_interfaces` entry for a vpn session: the tunnel **device**
+/// and the port, `wg0:6881`.
 ///
-/// `format!("{ip}:{port}")` is correct for IPv4 and produces an unparseable
-/// string for IPv6, where the address has to be bracketed. Nothing can return
-/// a v6 tunnel address today — the interface lookup is IPv4-only — so this is
-/// a latent bug rather than a live one, and it is the kind that surfaces as a
-/// profile silently failing to bind on the day that changes.
-pub fn bind_endpoint(ip: std::net::IpAddr, port: u16) -> String {
-    match ip {
-        std::net::IpAddr::V4(v4) => format!("{v4}:{port}"),
-        std::net::IpAddr::V6(v6) => format!("[{v6}]:{port}"),
-    }
+/// Naming the device, not the tunnel address, is what holds the listen
+/// sockets in the tunnel. libtorrent binds every listen socket to a device
+/// (`SO_BINDTODEVICE`). Given a device name it binds each address that device
+/// holds to that device. Given an address, it picks the first interface whose
+/// network contains the address, and a physical interface whose network
+/// covers the tunnel address (a `10.0.0.0/8` LAN beside Proton's
+/// `10.2.0.2/32`) comes first. A socket bound to a device skips policy
+/// routing, so the listen sockets, which also send uTP and UDP tracker
+/// traffic and whose device HTTP tracker connections reuse, then left by the
+/// LAN with the tunnel's address, and no route probe could see it.
+///
+/// The cost is that the session listens on every address the device holds,
+/// an IPv6 `Address` in a WireGuard config included. Every one of those
+/// sockets is held to the device just the same.
+pub fn bind_endpoint(iface: &str, port: u16) -> String {
+    format!("{iface}:{port}")
 }
 
 #[derive(Debug, Error)]

@@ -2042,14 +2042,19 @@ where
             };
 
             // The listen sockets, which also carry outgoing uTP and UDP
-            // tracker traffic, are named by address: a device endpoint would
-            // listen on every address the device holds. libtorrent's own
-            // device binding of them is best effort.
-            settings.listen_interfaces = Some(torrentd_engine::bind_endpoint(ip, effective_port));
-            // Outgoing TCP is bound to the device (`SO_BINDTODEVICE`, where
-            // permitted), so it leaves by the tunnel even if the source rule
-            // is lost. That narrows the window before `vpn_monitor`'s route
-            // check fences the profile; it does not close it.
+            // tracker traffic and whose device HTTP tracker connections
+            // reuse, are named by the tunnel device. Named by address,
+            // libtorrent bound them to the first interface whose network
+            // holds it, which is a LAN's where that network covers the
+            // tunnel address, and the traffic left by the LAN where no route
+            // probe looks (`bind_endpoint`). The alert loop checks each
+            // socket's device as it comes up (`listen_device_check`).
+            settings.listen_interfaces =
+                Some(torrentd_engine::bind_endpoint(iface, effective_port));
+            // Outgoing TCP is bound to the device too (`SO_BINDTODEVICE`,
+            // where permitted), so it leaves by the tunnel even if the source
+            // rule is lost. That narrows the window before `vpn_monitor`'s
+            // route check fences the profile; it does not close it.
             settings.outgoing_interfaces = Some(iface.to_string());
             // Not configurable, by construction: there is no key on a vpn
             // profile that reaches these.
@@ -4225,7 +4230,7 @@ mod profile_construction_tests {
         assert_eq!(out.up_ids(), vec!["acct_a"]);
         assert_eq!(
             out.built[0].0.listen_interfaces.as_deref(),
-            Some("10.2.0.2:51413"),
+            Some("wg-a:51413"),
         );
         let health = out.up[0].health();
         assert_eq!(health.forwarded_port, Some(51413));
@@ -4361,8 +4366,9 @@ mod profile_construction_tests {
         assert_eq!(settings.enable_natpmp, Some(false));
         assert_eq!(
             settings.listen_interfaces.as_deref(),
-            Some("10.2.0.2:6891"),
-            "bound to the tunnel endpoint",
+            Some("wg-a:6891"),
+            "listening on the tunnel device, not its address: an address is bound to \
+             the first interface whose network holds it, which can be a LAN's",
         );
         assert!(
             !settings

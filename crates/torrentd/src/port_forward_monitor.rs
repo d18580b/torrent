@@ -469,6 +469,11 @@ async fn renew_once(
     let (Some(tunnel_ip), Some(previous_port)) = (health.tunnel_ip, health.forwarded_port) else {
         return Next::retry();
     };
+    // A profile with a tunnel address is a vpn profile, so this is there;
+    // the rebind binds the new port on it.
+    let Some(iface) = e.config.vpn_interface().map(str::to_owned) else {
+        return Next::retry();
+    };
     let previous_epoch = health.forwarded_epoch;
 
     let gw_str = e.config.port_forward_gateway_or_default();
@@ -508,6 +513,7 @@ async fn renew_once(
                 previous_epoch,
                 RebindTarget {
                     tunnel_ip,
+                    iface: &iface,
                     profile: &id,
                     listen: &listen,
                     timeout: LISTEN_CONFIRM_TIMEOUT,
@@ -597,6 +603,9 @@ pub(crate) fn refresh_during_boot(
     let Ok(gateway) = e.config.port_forward_gateway_or_default().parse::<IpAddr>() else {
         return true;
     };
+    let Some(iface) = e.config.vpn_interface() else {
+        return true;
+    };
     let outcome = renew_and_rebind(
         forwarder,
         &*e.engine,
@@ -605,6 +614,7 @@ pub(crate) fn refresh_during_boot(
         health.forwarded_epoch,
         RebindTarget {
             tunnel_ip,
+            iface,
             profile: e.id(),
             // Never attached: the alert loop is not running yet.
             listen: &ListenEvents::new(),
@@ -1159,8 +1169,11 @@ mod tests {
                         _ => None,
                     })
                     .collect();
-                for endpoint in binds.iter().skip(answered) {
-                    listen.publish(&ProfileId::new("acct_a"), endpoint, None);
+                // Each bind names the tunnel device (`wg0:<port>`); the
+                // session answers for the address it listens on there.
+                for bind in binds.iter().skip(answered) {
+                    let (_, port) = bind.rsplit_once(':').expect("a device:port bind");
+                    listen.publish(&ProfileId::new("acct_a"), &format!("{TUNNEL}:{port}"), None);
                 }
                 answered = answered.max(binds.len());
                 if answered < rebinds {
