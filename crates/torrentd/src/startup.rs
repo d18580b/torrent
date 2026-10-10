@@ -2191,11 +2191,21 @@ impl ScanFence {
         // Fenced, but not by the fence those were paused under: the
         // kill-switch watch lifted that one and a fence has landed since,
         // with no call here in between to see the profile lifted. The lift
-        // resumed them, so all of it is paused again. A kill-switch lift that
-        // left the profile fenced for a failing tunnel also drops its record,
-        // and reads the same: what it re-pauses was paused already.
+        // resumed them, so all of it is paused again, and counted again: the
+        // new fence started the count over.
+        //
+        // A record that vanished while the profile stayed fenced is most
+        // likely a kill-switch lift that left it fenced for a failing tunnel.
+        // That lift resumed nothing and left the count standing, so what was
+        // paused already is not counted twice. It is still paused again,
+        // since a lift that did resume it, followed by the monitor's own
+        // fence, leaves no record either and reads the same here.
         let mark = record.as_ref().map(|r| r.mark);
+        let mut counted = fenced.paused;
         if fenced.mark != mark {
+            if mark.is_some() {
+                counted = 0;
+            }
             fenced.mark = mark;
             fenced.paused = 0;
         }
@@ -2204,15 +2214,17 @@ impl ScanFence {
         }
         let labels = [("profile_id", profile.as_str())];
         let mut paused = 0u64;
-        let pending = &fenced.handles[fenced.paused..];
+        let from = fenced.paused;
+        let pending = &fenced.handles[from..];
         // Recorded whether or not the pause takes: one that failed leaves the
         // torrent running, and resuming it on the lift changes nothing.
         if let Some(record) = record {
             record.handles.extend_from_slice(pending);
         }
-        for &h in pending {
+        for (i, &h) in pending.iter().enumerate() {
             match entry.engine.pause_torrent(h) {
-                Ok(()) => paused += 1,
+                Ok(()) if from + i >= counted => paused += 1,
+                Ok(()) => {}
                 // As in the monitor's own fence: a torrent left running on a
                 // fenced profile is the one thing fencing is for.
                 Err(err) => {
@@ -6077,6 +6089,15 @@ mod tests {
 
     impl KillSwitchScan {
         fn new(hook: impl Fn() + Send + Sync + 'static) -> Self {
+            Self::with_tunnel(hook, Arc::new(std::sync::atomic::AtomicBool::new(true)))
+        }
+
+        /// As [`Self::new`], but the lift finds the tunnel healthy only while
+        /// `up` holds: otherwise it has lost its address.
+        fn with_tunnel(
+            hook: impl Fn() + Send + Sync + 'static,
+            up: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
             let bound = IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 2));
             let engine = Arc::new(torrentd_engine::MockEngine::new());
             let dyn_engine: Arc<dyn TorrentEngine> = engine.clone();
@@ -6092,7 +6113,9 @@ mod tests {
             let probe: crate::vpn_monitor::Prober = Arc::new(move |_, _| {
                 hook();
                 crate::vpn_monitor::TunnelProbes {
-                    ip: Ok(Some(bound)),
+                    ip: Ok(up
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        .then_some(bound)),
                     route: Some(Ok(crate::vpn::route::RouteProbe::ViaTunnel)),
                     handshake: Some(Ok(None)),
                 }
@@ -6192,6 +6215,48 @@ mod tests {
         t.fence.lift();
         t.settle().await;
         assert_eq!(t.resumes()[3..], hs);
+    }
+
+    /// A kill-switch lift that leaves the profile fenced for a failing tunnel
+    /// drops its record and resumes nothing. The scans still pause what they
+    /// added again, but count only what they had not paused before.
+    #[tokio::test(start_paused = true)]
+    async fn a_kill_switch_lift_that_leaves_the_profile_fenced_counts_only_new_pauses() {
+        use crate::vpn::killswitch::Fence as _;
+
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t = KillSwitchScan::with_tunnel(|| {}, up);
+        let mut scan = ScanFence::new(Some(t.fence.clone()));
+        let hs = [t.handle(1), t.handle(2), t.handle(3)];
+        let paused_for_vpn = || {
+            t.profiles
+                .resolve(&t.a)
+                .active()
+                .unwrap()
+                .health()
+                .paused_for_vpn
+        };
+
+        t.fence.fence_all();
+        scan.added(&t.profiles, &t.metrics, &t.a, hs[0]);
+        scan.added(&t.profiles, &t.metrics, &t.a, hs[1]);
+        assert_eq!(paused_for_vpn(), 2);
+
+        t.fence.lift();
+        assert_eq!(
+            t.status(),
+            ProfileStatus::VpnDown,
+            "the tunnel is still down"
+        );
+        assert!(t.resumes().is_empty(), "the lift resumed nothing");
+
+        scan.added(&t.profiles, &t.metrics, &t.a, hs[2]);
+        assert_eq!(t.pauses()[2..], hs, "every torrent is paused again");
+        assert_eq!(paused_for_vpn(), 3, "only the new pause is counted");
+
+        scan.enforce_all(&t.profiles, &t.metrics);
+        assert_eq!(t.pauses().len(), 5, "nothing left to pause");
+        assert_eq!(paused_for_vpn(), 3);
     }
 
     /// A fence that stops a lift before its paced resume reaches anything
