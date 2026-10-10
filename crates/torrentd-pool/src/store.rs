@@ -301,7 +301,12 @@ fn lock_path(db: &Path) -> PathBuf {
 /// Take the advisory lock that says which processes hold the index at `db`
 /// for writing, without waiting: [`PoolError::Busy`] when it is held in a
 /// mode that excludes this one.
-fn hold_index(db: &Path, exclusive: bool) -> Result<std::fs::File, PoolError> {
+///
+/// `None` where the lock file neither exists nor can be created, in a
+/// directory this process may not write: no process of the same user can
+/// hold a lock there either, so there is nothing to exclude.
+fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolError> {
+    use std::io::ErrorKind;
     let path = lock_path(db);
     // The lock needs an open file, not a writable one. A `.lock` file another
     // user created (a CLI run as root before the daemon's user) is still
@@ -313,7 +318,17 @@ fn hold_index(db: &Path, exclusive: bool) -> Result<std::fs::File, PoolError> {
         .truncate(false)
         .open(&path)
     {
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => std::fs::File::open(&path)?,
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            match std::fs::File::open(&path) {
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+                other => other?,
+            }
+        }
         other => other?,
     };
     let taken = if exclusive {
@@ -322,7 +337,7 @@ fn hold_index(db: &Path, exclusive: bool) -> Result<std::fs::File, PoolError> {
         file.try_lock_shared()
     };
     match taken {
-        Ok(()) => Ok(file),
+        Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Err(PoolError::Busy),
         Err(std::fs::TryLockError::Error(e)) => Err(PoolError::Io(e)),
     }
@@ -368,7 +383,7 @@ impl PoolStore {
         let hold = hold_index(path, exclusive)?;
         let conn = Connection::open(path)?;
         let mut store = Self::from_conn(conn)?;
-        store._hold = Some(hold);
+        store._hold = hold;
         Ok(store)
     }
 
