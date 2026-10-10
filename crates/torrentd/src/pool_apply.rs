@@ -73,23 +73,174 @@ pub fn apply(
 /// orphan. Owned means loaded, assigned in the registry, or queued for
 /// verification: a torrent whose profile failed at boot is in no session, and
 /// its payload is still its own.
-fn check_index_accounts_for_live_state(pool: &PoolService, state: &StateMap) -> Result<(), String> {
+///
+/// Only an unclaimed torrent that may hold a file in `scope`, the roots the
+/// plan deletes from, refuses. One a session holds whose payload lies outside
+/// them - added through `POST /v1/torrents` with a `save_path` elsewhere, or a
+/// library torrent whose payload is outside every root - can have no file
+/// among the plan's orphans, and no scan would ever give it claims, so it
+/// does not block the plan. One no session can report on still refuses:
+/// where its files are is unknown.
+fn check_index_accounts_for_live_state(
+    pool: &PoolService,
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    scope: &DeleteScope,
+) -> Result<(), String> {
     let owned = pool.owned_infohashes(state)?;
     let unindexed = pool
         .with_store(|st| st.loaded_without_claims(&owned))
         .map_err(|e| e.to_string())?;
-    if !unindexed.is_empty() {
+    let mut blocking = unindexed.iter().filter_map(|ih| {
+        unclaimed_payload_may_reach(source, state, ih, scope).map(|why| (ih, why))
+    });
+    if let Some((first, why)) = blocking.next() {
         return Err(format!(
             "{} torrent(s) the daemon owns (loaded, assigned to a profile, or queued for \
-             verification) have no claims in the index, so it cannot prove what is \
-             unclaimed — the first is {}. Run `pool scan` (or POST /v1/pool/scan) and \
-             rebuild this plan; a torrent whose profile is down keeps refusing until its \
-             profile loads it or it is removed.",
-            unindexed.len(),
-            unindexed[0],
+             verification) have no claims in the index and may hold files under this \
+             plan's root, so it cannot prove what is unclaimed — the first is {first}, \
+             which {why}. A torrent whose library `.torrent` the matcher has not placed \
+             yet: run `pool scan` (or POST /v1/pool/scan) and rebuild this plan. A torrent \
+             added through POST /v1/torrents, which a scan never claims: copy its \
+             `.torrent` into the library and rescan, move its payload out of this root, or \
+             remove it. A torrent no session holds keeps refusing until its profile loads \
+             it or it is removed. A torrent whose payload lies outside this plan's root \
+             never blocks it.",
+            1 + blocking.count(),
         ));
     }
     Ok(())
+}
+
+/// Why the unclaimed torrent `infohash` may hold a file in `scope`, or
+/// `None` where its session shows it holds none.
+fn unclaimed_payload_may_reach(
+    source: &Arc<dyn AlertSource>,
+    state: &StateMap,
+    infohash: &str,
+    scope: &DeleteScope,
+) -> Option<String> {
+    let Some(st) = libtorrent_safe::InfoHash::from_hex(infohash).and_then(|ih| state.get(&ih))
+    else {
+        return Some("no session holds, so where its files lie is unknown".into());
+    };
+    let Some(engine) = source.engine_for(&st.profile_id) else {
+        return Some(format!(
+            "is held by profile {}, which has no session to say where its files lie",
+            st.profile_id,
+        ));
+    };
+    let read = || -> Result<_, torrentd_engine::EngineError> {
+        let save_path = engine.torrent_details(st.handle)?.save_path;
+        let files: Option<Vec<String>> = engine
+            .torrent_files(st.handle)?
+            .map(|fs| fs.into_iter().map(|f| f.path).collect());
+        Ok((save_path, files))
+    };
+    match read() {
+        Err(e) => Some(format!(
+            "could not be read from its session ({e}), so where its files lie is unknown"
+        )),
+        Ok((save_path, files)) => scope
+            .reached_by(Path::new(&save_path), files.as_deref())
+            .then(|| format!("its session holds at {save_path}")),
+    }
+}
+
+/// What a delete plan may remove, as an unclaimed torrent is compared with
+/// it: the roots its steps delete from, and the files they delete.
+struct DeleteScope {
+    /// Each root as configured and, where it resolves, with its symlinks
+    /// resolved.
+    roots: Vec<std::path::PathBuf>,
+    targets: Vec<std::path::PathBuf>,
+    /// `(device, inode)` of each target on disk, read on first use: only a
+    /// plan an unclaimed torrent sits beside pays for the stats.
+    identities: std::cell::OnceCell<std::collections::HashSet<(u64, u64)>>,
+}
+
+impl DeleteScope {
+    /// The scope of `steps`' deletes. Every root where no step lies under
+    /// one, which no plan the planner builds does.
+    fn of(pool: &PoolService, steps: &[PlanStepRow]) -> Self {
+        let targets: Vec<std::path::PathBuf> = steps
+            .iter()
+            .filter(|s| s.op == ops::DELETE_FILE)
+            .map(|s| std::path::PathBuf::from(&s.src))
+            .collect();
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        for target in &targets {
+            if let Some((_, root)) = pool.roots().iter().find(|(_, r)| target.starts_with(r)) {
+                if !roots.contains(root) {
+                    roots.push(root.clone());
+                }
+            }
+        }
+        if roots.is_empty() {
+            roots = pool.roots().iter().map(|(_, r)| r.clone()).collect();
+        }
+        let resolved: Vec<std::path::PathBuf> = roots
+            .iter()
+            .filter_map(|r| std::fs::canonicalize(r).ok())
+            .collect();
+        roots.extend(resolved);
+        Self {
+            roots,
+            targets,
+            identities: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn identities(&self) -> &std::collections::HashSet<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        self.identities.get_or_init(|| {
+            self.targets
+                .iter()
+                .filter_map(|t| std::fs::symlink_metadata(t).ok())
+                .map(|md| (md.dev(), md.ino()))
+                .collect()
+        })
+    }
+
+    /// Whether a torrent saved at `save_path` with `files` (torrent-relative,
+    /// `/`-separated; `None` while its metadata has not arrived) may have a
+    /// file this plan deletes.
+    ///
+    /// Every path is compared both as spelled and with its symlinks resolved,
+    /// so a save path reaching a root through a symlink, or a symlinked
+    /// directory below it, still reaches it; and each of its files on disk is
+    /// compared by `(device, inode)` with the plan's, so a hard link or a bind
+    /// mount of a root reaches it too. A torrent with no metadata yet could
+    /// write anything under its save path, so it reaches a root its save path
+    /// is under or above.
+    fn reached_by(&self, save_path: &Path, files: Option<&[String]>) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let bases: Vec<std::path::PathBuf> = std::iter::once(save_path.to_path_buf())
+            .chain(std::fs::canonicalize(save_path).ok())
+            .collect();
+        let under_a_root = |p: &Path| self.roots.iter().any(|r| p.starts_with(r));
+        let Some(files) = files else {
+            return bases
+                .iter()
+                .any(|b| under_a_root(b) || self.roots.iter().any(|r| r.starts_with(b)));
+        };
+        files.iter().any(|rel| {
+            let joined = save_path.join(rel);
+            // A file not written yet resolves through its parent: a symlinked
+            // directory below the save path leads there all the same.
+            let resolved = std::fs::canonicalize(&joined).ok().or_else(|| {
+                let parent = std::fs::canonicalize(joined.parent()?).ok()?;
+                Some(parent.join(joined.file_name()?))
+            });
+            bases
+                .iter()
+                .map(|b| b.join(rel))
+                .chain(resolved)
+                .any(|p| under_a_root(&p))
+                || std::fs::metadata(&joined)
+                    .is_ok_and(|md| self.identities().contains(&(md.dev(), md.ino())))
+        })
+    }
 }
 
 /// What the between-steps re-check of [`check_index_accounts_for_live_state`]
@@ -157,8 +308,9 @@ fn apply_inner(
     // protected". Derived from live session state, so it is correct on every
     // load path and across a restart.
     let deletes = steps.iter().any(|s| s.op == ops::DELETE_FILE);
+    let scope = DeleteScope::of(pool, &steps);
     if deletes {
-        check_index_accounts_for_live_state(pool, state)?;
+        check_index_accounts_for_live_state(pool, source, state, &scope)?;
     }
 
     // Not claimed during a shutdown: the claim would hand the plan to the next
@@ -220,7 +372,7 @@ fn apply_inner(
             return Ok(out);
         }
         if deletes && step.op == ops::DELETE_FILE && ownership_size(pool, state) != owned_size {
-            if let Err(e) = check_index_accounts_for_live_state(pool, state) {
+            if let Err(e) = check_index_accounts_for_live_state(pool, source, state, &scope) {
                 // Stop, but as a *failed* plan rather than an early return:
                 // the plan is claimed at this point, and returning here would
                 // strand it in `applying` where nothing can apply, resume or
@@ -1631,6 +1783,144 @@ mod tests {
 
         // And the refusal must not have bricked the plan: it was never
         // claimed, so it is still applicable once the index catches up.
+        let status = pool
+            .with_store(|st| st.plan(plan_id))
+            .unwrap()
+            .unwrap()
+            .status;
+        assert_eq!(status, torrentd_pool::model::plan_status::DRAFT);
+    }
+
+    /// A torrent loaded in profile `p`'s mock session, with no claims in the
+    /// index, held at `save_path` with `files` (`None`: no metadata yet).
+    fn unclaimed_loaded(
+        save_path: &Path,
+        files: Option<&[&str]>,
+    ) -> (Arc<dyn AlertSource>, StateMap) {
+        let mock = Arc::new(torrentd_engine::MockEngine::new());
+        let hash = libtorrent_safe::InfoHash([0xee; 20]);
+        let handle = mock.register_handle(hash);
+        mock.set_torrent_details(
+            handle,
+            libtorrent_safe::TorrentDetails {
+                save_path: save_path.to_string_lossy().into_owned(),
+                ..torrentd_engine::MockEngine::default_details()
+            },
+        );
+        mock.set_torrent_files(
+            handle,
+            files.map(|fs| {
+                fs.iter()
+                    .enumerate()
+                    .map(|(i, f)| libtorrent_safe::TorrentFile {
+                        index: i as u32,
+                        path: (*f).to_owned(),
+                        size: 64,
+                        downloaded: 64,
+                        priority: 4,
+                    })
+                    .collect()
+            }),
+        );
+        let engine: Arc<dyn torrentd_engine::TorrentEngine> = mock;
+        let source: Arc<dyn AlertSource> = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            torrentd_engine::ProfileId::new("p"),
+            engine,
+        )]));
+        let state = StateMap::new();
+        state.insert(
+            hash,
+            torrentd_engine::TorrentState::newly_added(
+                handle,
+                torrentd_engine::ProfileId::new("p"),
+                std::time::Instant::now(),
+            ),
+        );
+        (source, state)
+    }
+
+    /// A torrent added through the API and seeding from outside every root
+    /// never gets claims, and no scan changes that. It has no file among a
+    /// root's orphans, so a delete plan over that root applies.
+    #[test]
+    fn an_unclaimed_torrent_outside_every_root_does_not_block_a_delete_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let orphan = write(&root, "junk/old.bin", 64);
+        let elsewhere = dir.path().join("other");
+        let seeding = write(&elsewhere, "T/a.bin", 64);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+
+        let scope = scope_of(&pool, plan_id);
+        for files in [Some(&["T/a.bin"][..]), None] {
+            let (source, state) = unclaimed_loaded(&elsewhere, files);
+            check_index_accounts_for_live_state(&pool, &source, &state, &scope)
+                .unwrap_or_else(|e| panic!("refused with files {files:?}: {e}"));
+        }
+
+        let (source, state) = unclaimed_loaded(&elsewhere, Some(&["T/a.bin"]));
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (1, "applied"), "{out:?}");
+        assert!(!orphan.exists(), "the orphan was not trashed");
+        assert!(
+            seeding.exists(),
+            "the outside torrent's payload was touched"
+        );
+    }
+
+    fn scope_of(pool: &PoolService, plan_id: i64) -> DeleteScope {
+        DeleteScope::of(pool, &pool.with_store(|st| st.plan_steps(plan_id)).unwrap())
+    }
+
+    /// An unclaimed torrent that may hold a file under the plan's root still
+    /// refuses: saved under it, saved above it with no metadata yet, holding a
+    /// file there, reaching it through a symlink, or holding the same file
+    /// through a hard link (as a bind mount of the root would).
+    #[test]
+    fn an_unclaimed_torrent_that_may_reach_the_root_still_blocks_a_delete_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let orphan = write(&root, "junk/old.bin", 64);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        let below = dir.path().join("below");
+        std::fs::create_dir_all(&below).unwrap();
+        std::os::unix::fs::symlink(root.join("junk"), below.join("junk")).unwrap();
+        let aliased = dir.path().join("aliased");
+        std::fs::create_dir_all(&aliased).unwrap();
+        std::fs::hard_link(&orphan, aliased.join("old.bin")).unwrap();
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+
+        let cases: [(&Path, Option<&[&str]>); 6] = [
+            (&root, Some(&["T/a.bin"])),
+            (dir.path(), None),
+            (dir.path(), Some(&["pool/junk/old.bin"])),
+            (&link, Some(&["junk/old.bin"])),
+            (&below, Some(&["junk/old.bin"])),
+            (&aliased, Some(&["old.bin"])),
+        ];
+        for (save_path, files) in cases {
+            let (source, state) = unclaimed_loaded(save_path, files);
+            let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+            assert!(
+                e.contains("no claims in the index") && e.contains(&"ee".repeat(20)),
+                "{save_path:?} {files:?}: {e}"
+            );
+        }
+        // Above the root, but every file it lists is elsewhere.
+        let (source, state) = unclaimed_loaded(dir.path(), Some(&["other/T/a.bin"]));
+        check_index_accounts_for_live_state(&pool, &source, &state, &scope_of(&pool, plan_id))
+            .unwrap();
+
+        assert!(orphan.exists(), "payload was deleted against a stale index");
         let status = pool
             .with_store(|st| st.plan(plan_id))
             .unwrap()
