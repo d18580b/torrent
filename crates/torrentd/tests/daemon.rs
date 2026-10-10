@@ -1581,3 +1581,175 @@ fn an_adopted_torrent_keeps_its_metadata_across_a_restart() {
     );
     stop(child);
 }
+
+/// A spawned daemon, killed if the test panics before stopping it: an
+/// orphaned daemon holds the test's stdout open, and whatever reads it waits.
+struct Running(Child);
+
+impl Running {
+    fn stop(mut self) {
+        sigterm(&self.0);
+        assert!(wait_exit(&mut self.0, Duration::from_secs(30)));
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if matches!(self.0.try_wait(), Ok(None)) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+/// Poll `f` every 200 ms until it returns `Some`, or panic naming `what`.
+fn poll<T>(what: &str, within: Duration, mut f: impl FnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A hybrid torrent added from a btih-only magnet: the metadata it fetches
+/// gives it a v2 hash too, and the daemon must go on knowing it by the v1 one.
+/// Keyed by libtorrent's `get_best()`, every alert after the metadata named
+/// the truncated v2 hash instead: the state stayed `awaiting_metadata`, the
+/// `.torrent` was written under the v2 key, the shutdown drain waited on a
+/// resume save that never settled, and a `DELETE` left the v1 resume file to
+/// bring the torrent back at the next boot.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_hybrid_torrent_added_by_a_v1_magnet_keeps_its_v1_key() {
+    use libtorrent_safe::Alert;
+
+    let torrent = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../vendor/libtorrent/test/test_torrents/v2.torrent"),
+    )
+    .expect("read libtorrent's hybrid test torrent");
+    let hashes = libtorrent_safe::info_hashes_from_torrent(&torrent).unwrap();
+    let v1 = hashes.v1.expect("hybrid has v1").to_hex();
+    let v2 = hashes.v2.expect("hybrid has v2").truncated().to_hex();
+
+    // A second session serves the metadata over loopback, and nothing but the
+    // magnet's `x.pe` points the daemon at it.
+    let seed_dir = tempfile::tempdir().unwrap();
+    let mut settings = libtorrent_safe::Settings::server_seed_overrides();
+    settings.enable_dht = Some(false);
+    settings.enable_lsd = Some(false);
+    settings.enable_upnp = Some(false);
+    settings.enable_natpmp = Some(false);
+    settings.listen_interfaces = Some("127.0.0.1:0".into());
+    let seed = libtorrent_safe::Session::new(&settings).expect("seed session");
+    seed.add_torrent(libtorrent_safe::AddParams::File {
+        bytes: torrent,
+        save_path: seed_dir.path().to_string_lossy().into_owned(),
+        flags: libtorrent_safe::TorrentFlags::empty(),
+        trackers: Vec::new(),
+    })
+    .expect("seed add");
+    let (mut seed_port, mut checked) = (None, false);
+    poll(
+        "the seed's listen port and check",
+        Duration::from_secs(10),
+        || {
+            for a in seed.drain_alerts() {
+                match a {
+                    Alert::ListenSucceeded { endpoint, .. } => {
+                        seed_port = endpoint
+                            .rsplit_once(':')
+                            .and_then(|(_, p)| p.parse::<u16>().ok())
+                            .filter(|p| *p != 0)
+                            .or(seed_port);
+                    }
+                    Alert::TorrentChecked { .. } => checked = true,
+                    _ => {}
+                }
+            }
+            (seed_port.is_some() && checked).then_some(())
+        },
+    );
+    let seed_port = seed_port.unwrap();
+
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let listen_port = free_port();
+    let daemon = Running(spawn_daemon(p, listen_port, addr));
+    wait_healthy(addr);
+
+    let magnet = format!("magnet:?xt=urn:btih:{v1}&x.pe=127.0.0.1:{seed_port}");
+    let (code, body) = http(addr, "POST", "/v1/torrents", Some(&add_magnet(&magnet)));
+    assert_eq!(code, 201, "add: {body}");
+
+    // The metadata arrives, and the state map's entry follows it.
+    let phase = poll(
+        "a phase past awaiting_metadata",
+        Duration::from_secs(30),
+        || {
+            seed.drain_alerts();
+            let (code, body) = http(addr, "GET", &format!("/v1/torrents/{v1}"), None);
+            assert_eq!(code, 200, "the torrent is found under v1: {body}");
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let phase = v["phase"].as_str().unwrap_or_default().to_owned();
+            (!matches!(phase.as_str(), "awaiting_metadata" | "unknown")).then_some(phase)
+        },
+    );
+    let torrents = p.join("torrents").join(PROFILE);
+    poll(
+        "the fetched .torrent under v1",
+        Duration::from_secs(10),
+        || {
+            torrents
+                .join(format!("{v1}.torrent"))
+                .exists()
+                .then_some(())
+        },
+    );
+    assert!(
+        !torrents.join(format!("{v2}.torrent")).exists(),
+        "nothing is written under the truncated v2 hash"
+    );
+    let (code, _) = http(addr, "GET", &format!("/v1/torrents/{v2}"), None);
+    assert_eq!(code, 404, "the torrent has one key; phase was {phase}");
+
+    // A shutdown now drains its resume save: the save it asks for settles.
+    daemon.stop();
+    let report = std::fs::read_to_string(p.join("last_shutdown.json")).expect("shutdown report");
+    assert!(report.contains("\"unsaved_resumes\":0"), "{report}");
+    let resumes = p.join("resume").join(PROFILE);
+    assert!(resumes.join(format!("{v1}.resume")).exists());
+    assert!(!resumes.join(format!("{v2}.resume")).exists());
+
+    // Back from that resume file under the same key, then deleted for good.
+    let daemon = Running(spawn_daemon(p, listen_port, addr));
+    wait_healthy(addr);
+    poll(
+        "the torrent back from its resume file",
+        Duration::from_secs(10),
+        || (http(addr, "GET", &format!("/v1/torrents/{v1}"), None).0 == 200).then_some(()),
+    );
+    let (code, body) = http(addr, "DELETE", &format!("/v1/torrents/{v1}"), None);
+    assert_eq!(code, 204, "delete: {body}");
+    poll("the resume file removed", Duration::from_secs(10), || {
+        (!resumes.join(format!("{v1}.resume")).exists()).then_some(())
+    });
+    daemon.stop();
+    assert!(
+        !resumes.join(format!("{v1}.resume")).exists(),
+        "a deleted torrent's resume file must not survive the shutdown drain"
+    );
+
+    // And it stays deleted across a restart.
+    let daemon = Running(spawn_daemon(p, listen_port, addr));
+    wait_healthy(addr);
+    let (code, body) = http(addr, "GET", "/v1/torrents", None);
+    assert_eq!(code, 200);
+    assert!(!body.contains(&v1), "the deleted torrent came back: {body}");
+    daemon.stop();
+}
