@@ -1098,7 +1098,8 @@ pub(crate) async fn watch(
     // Installed moments ago by `enable`, and verified by the boot.
     metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
     // The uid, and so the table, is fixed for the run; every event a check
-    // logs carries it through this span.
+    // logs carries it through this span. At error level so that no level
+    // filter that lets one of those events through disables the span.
     let table = installed.table_name();
     let installed = std::sync::Arc::new(std::sync::Mutex::new(installed));
     let mut state = Watch::default();
@@ -1111,7 +1112,7 @@ pub(crate) async fn watch(
         // and fencing pauses torrents under each session's lock.
         let ticked = tokio::task::spawn_blocking({
             let (installed, fence, metrics) = (installed.clone(), fence.clone(), metrics.clone());
-            let span = tracing::info_span!("kill_switch_watch", table = %table);
+            let span = tracing::error_span!("kill_switch_watch", table = %table);
             move || {
                 let _span = span.entered();
                 let mut installed = installed.lock().unwrap_or_else(|p| p.into_inner());
