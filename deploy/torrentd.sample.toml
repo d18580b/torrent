@@ -247,6 +247,12 @@ dht               = true
 # what correlates them to a tracker operator, whichever address each announced
 # from.
 #
+# The address a tracker sees is the tunnel's exit, not its own address, and a
+# shared exit correlates two accounts as surely as a shared port: give each
+# vpn profile a WireGuard config for a different server (its `[Peer]`
+# `Endpoint`). Startup warns, naming the profiles, when two configs name the
+# same Endpoint host. See "Account isolation" in docs/running.md.
+#
 # [[profile]]
 # id                       = "account_a"
 # network                  = "vpn"

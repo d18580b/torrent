@@ -263,7 +263,8 @@ naming the other profile, and the rest of the daemon runs. A profile whose
 tunnel's IPv6 addresses cannot be read is disabled the same way, since they
 cannot be checked. Two accounts behind
 a provider that gives every client the same address cannot share one daemon;
-run the second in a daemon of its own, in its own network namespace.
+run the second in a daemon of its own, in its own network namespace, with a
+config for a different server (see [Account isolation](#account-isolation)).
 
 ### ProtonVPN: a forwarded port over NAT-PMP
 
@@ -327,7 +328,11 @@ Metrics, each labelled `profile_id`:
 Several Proton accounts cannot share one daemon: every Proton WireGuard
 config gives the tunnel `10.2.0.2/32`, and the paragraph above says what
 happens to the second profile. Run each extra account in its own daemon and
-network namespace.
+network namespace, and **download each account's config for a different
+server**. Two configs for the same server (the fastest P2P server, picked
+twice) give both accounts one exit address, and the tracker sees two accounts
+announcing from one IP. The daemons run separately, so neither can see the
+other's config: nothing warns about this across daemons.
 
 Either kind may set `resume_dir`, `torrent_dir`, `allowed_tracker_domains` and
 `upload_rate_limit`. `id`, `listen_port`, `vpn_interface`,
@@ -365,6 +370,20 @@ configuration that breaks one is refused at load and by `--check-config`:
 - **No `peer_fingerprint` may start with `-LT`**, top-level or per profile.
   That is libtorrent's own client code, which every unconfigured libtorrent
   session announces (`-LT20E0-` in the version this daemon is built on).
+
+**Each account needs its own exit address.** A tracker sees the public address
+a tunnel leaves from, never the tunnel's own address, so a different tunnel
+address, interface or daemon gives an account no address of its own. Two
+accounts whose WireGuard configs name the same server announce from one IP,
+which is the most direct sign of one person holding both. At startup the daemon
+reads each WireGuard profile's `[Peer]` `Endpoint` and logs a warning naming
+the profiles when two of them name the same host, port aside. It is a warning,
+not a refusal: the host is compared as written and not resolved, so two names
+for one server, or two servers behind one exit, are not caught, and an OpenVPN
+profile's `remote` is not read at all. To compare the exits themselves, ask an
+address-echo service through each tunnel once it is up, e.g. `curl
+--interface <vpn_interface> https://ifconfig.me`, and check no two answers
+match.
 
 Pool adoption also refuses a torrent the pool index assigns to another profile,
 even when no session holds it now; `DELETE /v1/torrents/{infohash}` clears the
