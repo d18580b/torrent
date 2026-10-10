@@ -20,6 +20,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub use ip_lookup::first_ipv4;
+pub use ip_lookup::ipv6_addrs;
 pub use ip_lookup::link_standing;
 pub use natpmp::NatpmpForwarder;
 pub use openvpn::OpenvpnManager;

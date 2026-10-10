@@ -29,7 +29,8 @@
 //! trackers saw B's exit address until the next health poll. Now it falls
 //! through to the drop. Only IPv4 is paired: the tunnel address every session
 //! binds to is the link's first IPv4 address, and the daemon's IPv6 egress by
-//! a tunnel, which nothing binds to, is dropped.
+//! a tunnel, which nothing binds to, is dropped. A tunnel's IPv6 addresses are
+//! fenced all the same; see below.
 //!
 //! **It does not put DNS through the tunnel.** The ruleset matches sockets the
 //! daemon's uid owns. A tracker hostname is resolved by libc, and on a host
@@ -90,7 +91,10 @@
 //! physical link went back out of it from the tunnel address, tying that
 //! address to the host. Tunnels sharing an address (providers that hand
 //! every client the same one) share the rule, each of their interfaces
-//! allowed.
+//! allowed. Every IPv6 address the link holds when the ruleset is installed,
+//! link-local ones aside, gets the same fence as `ip6 saddr <address>
+//! oifname != { … } drop`: nothing binds to it, but the kernel answers a
+//! probe of it all the same.
 //!
 //! - **OpenVPN: never.** The daemon spawns `openvpn` under its own uid, so the
 //!   ruleset drops the client's connection to the provider. `Config::validate`
@@ -127,7 +131,9 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::io;
+use std::net::IpAddr;
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 
 use torrentd_engine::profile::ProfileConfig;
@@ -140,20 +146,33 @@ use super::exec;
 /// `ExecStopPost=`).
 pub const TABLE: &str = "torrentd_ks";
 
-/// One profile's tunnel as the ruleset pairs it: the interface, and the
-/// address on it that the profile's sessions are bound to.
+/// One profile's tunnel as the ruleset pairs it: the interface, the address
+/// on it that the profile's sessions are bound to, and the IPv6 addresses it
+/// also holds, which nothing binds to and the ruleset only fences.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Tunnel {
     pub iface: String,
     pub addr: Ipv4Addr,
+    /// Sorted and de-duplicated; empty for a link with none.
+    pub addrs6: Vec<Ipv6Addr>,
 }
 
 impl Tunnel {
+    /// A tunnel holding `addr` and no IPv6 address.
     pub fn new(iface: impl Into<String>, addr: Ipv4Addr) -> Self {
         Self {
             iface: iface.into(),
             addr,
+            addrs6: Vec::new(),
         }
+    }
+
+    /// This tunnel, holding `addrs6` as well.
+    pub fn with_ipv6(mut self, addrs6: impl IntoIterator<Item = Ipv6Addr>) -> Self {
+        self.addrs6 = addrs6.into_iter().collect();
+        self.addrs6.sort_unstable();
+        self.addrs6.dedup();
+        self
     }
 }
 
@@ -258,21 +277,31 @@ pub fn render_ruleset_with_transport(
     chain.push_str("\t\ttype filter hook output priority 0; policy accept;\n");
     // Interfaces each address may leave by. Sorted as nft lists a set's
     // elements, so the table reads back as rendered.
-    let mut fenced: BTreeMap<Ipv4Addr, BTreeSet<&str>> = BTreeMap::new();
-    for Tunnel { iface, addr } in &pairs {
-        fenced
-            .entry(*addr)
-            .or_insert_with(|| BTreeSet::from(["lo"]))
-            .insert(iface.as_str());
+    // IPv4 addresses sort ahead of IPv6 ones.
+    let mut fenced: BTreeMap<IpAddr, BTreeSet<&str>> = BTreeMap::new();
+    for Tunnel {
+        iface,
+        addr,
+        addrs6,
+    } in &pairs
+    {
+        let addrs = std::iter::once(IpAddr::V4(*addr)).chain(addrs6.iter().map(|a| IpAddr::V6(*a)));
+        for addr in addrs {
+            fenced
+                .entry(addr)
+                .or_insert_with(|| BTreeSet::from(["lo"]))
+                .insert(iface.as_str());
+        }
     }
     for (addr, ifaces) in fenced {
+        let family = if addr.is_ipv4() { "ip" } else { "ip6" };
         chain.push_str(&format!(
-            "\t\tip saddr {addr} oifname != {} drop\n",
+            "\t\t{family} saddr {addr} oifname != {} drop\n",
             name_set(ifaces)
         ));
     }
     chain.push_str(&format!("\t\tmeta skuid {uid} oifname \"lo\" accept\n"));
-    for Tunnel { iface, addr } in pairs {
+    for Tunnel { iface, addr, .. } in pairs {
         chain.push_str(&format!(
             "\t\tmeta skuid {uid} ip saddr {addr} oifname \"{iface}\" accept\n"
         ));
@@ -448,6 +477,7 @@ pub fn enable(tunnels: &[String]) -> io::Result<Installed> {
         current_uid()?,
         tunnels,
         super::ip_lookup::first_ipv4,
+        super::ip_lookup::ipv6_addrs,
         transport,
         apply,
     )
@@ -554,11 +584,13 @@ fn parse_listen_port(iface: &str, text: &str) -> io::Result<u16> {
 /// feeds is the difference between a WireGuard link the daemon raised
 /// carrying traffic and carrying none. `tunnel_addr` reads the address every
 /// session of the profile is bound to — the link's first IPv4 address, which
-/// is what bring-up hands the session.
+/// is what bring-up hands the session. `tunnel_v6` reads the IPv6 addresses
+/// the link also holds, which the ruleset fences like the IPv4 one.
 pub(crate) fn enable_for_uid(
     uid: u32,
     tunnels: &[String],
     tunnel_addr: impl Fn(&str) -> io::Result<Ipv4Addr>,
+    tunnel_v6: impl Fn(&str) -> io::Result<Vec<Ipv6Addr>>,
     transport: impl Fn(&str) -> io::Result<Transport>,
     apply: impl Fn(&str) -> io::Result<()>,
 ) -> io::Result<Installed> {
@@ -568,21 +600,30 @@ pub(crate) fn enable_for_uid(
     // Every address and port is read before anything is handed to nft. A
     // tunnel with no address to pair it with, or whose transport cannot be
     // exempted, is a tunnel the ruleset would silence, so it fails the
-    // install — and leaves a previous run's kill switch armed.
+    // install — and leaves a previous run's kill switch armed. IPv6 addresses
+    // that cannot be read could not be fenced, so they fail it too.
     let paired = tunnels
         .iter()
         .map(|iface| {
-            tunnel_addr(iface)
-                .map(|addr| Tunnel::new(iface.as_str(), addr))
-                .map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!(
-                            "the kill switch pairs {iface} with its tunnel address, and none \
-                             could be read: {e}"
-                        ),
-                    )
-                })
+            let addr = tunnel_addr(iface).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "the kill switch pairs {iface} with its tunnel address, and none \
+                         could be read: {e}"
+                    ),
+                )
+            })?;
+            let addrs6 = tunnel_v6(iface).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "the kill switch fences {iface}'s IPv6 addresses, and they could \
+                         not be read: {e}"
+                    ),
+                )
+            })?;
+            Ok(Tunnel::new(iface.as_str(), addr).with_ipv6(addrs6))
         })
         .collect::<io::Result<Vec<Tunnel>>>()?;
     let transports = tunnels
@@ -810,6 +851,7 @@ fn rule_line(exprs: &serde_json::Value) -> Result<String, String> {
                 (Some("oifname"), ..) => "oifname",
                 (None, Some("ip"), Some("saddr")) => "ip saddr",
                 (None, Some("ip"), Some("daddr")) => "ip daddr",
+                (None, Some("ip6"), Some("saddr")) => "ip6 saddr",
                 (None, Some("ip6"), Some("daddr")) => "ip6 daddr",
                 (None, Some("udp"), Some("sport")) => "udp sport",
                 (None, Some("udp"), Some("dport")) => "udp dport",
@@ -1189,6 +1231,14 @@ mod tests {
         Tunnel::new(iface, addr_of(iface).unwrap())
     }
 
+    /// The IPv6 address the IPv6 tests give `wg-a`.
+    const ADDR_A6: Ipv6Addr = Ipv6Addr::new(0xfd7d, 1, 0, 0, 0, 0, 0, 2);
+
+    /// A link holding no IPv6 address.
+    fn no_v6(_: &str) -> io::Result<Vec<Ipv6Addr>> {
+        Ok(Vec::new())
+    }
+
     /// The provider endpoint every test tunnel's peer has.
     const ENDPOINT: &str = "198.51.100.1:51820";
 
@@ -1203,16 +1253,16 @@ mod tests {
         /// The socket owner's uid, `None` for one the kernel built with no
         /// socket attached: a reset, an ICMP error.
         uid: Option<u32>,
-        saddr: Ipv4Addr,
+        saddr: IpAddr,
         oif: &'a str,
         /// `(sport, daddr, dport)` for a UDP packet.
         udp: Option<(u16, std::net::IpAddr, u16)>,
     }
 
-    fn pkt(uid: u32, saddr: Ipv4Addr, oif: &str) -> Packet<'_> {
+    fn pkt(uid: u32, saddr: impl Into<IpAddr>, oif: &str) -> Packet<'_> {
         Packet {
             uid: Some(uid),
-            saddr,
+            saddr: saddr.into(),
             oif,
             udp: None,
         }
@@ -1234,14 +1284,17 @@ mod tests {
     /// reads it: the first rule whose every match holds decides, and a packet
     /// no rule decides takes the chain's `accept` policy.
     ///
-    /// Reads only the shapes this module renders — `meta skuid`, `ip saddr`,
-    /// `ip daddr`/`ip6 daddr`, `oifname` (one name or a set, `!=` a set),
-    /// `udp sport`/`udp dport` (a set or one value) — and panics on anything
-    /// else, so a new kind of match cannot be silently ignored here.
+    /// Reads only the shapes this module renders — `meta skuid`, `ip
+    /// saddr`/`ip6 saddr`, `ip daddr`/`ip6 daddr`, `oifname` (one name or a
+    /// set, `!=` a set), `udp sport`/`udp dport` (a set or one value) — and
+    /// panics on anything else, so a new kind of match cannot be silently
+    /// ignored here. A match on the other family's address never holds, as in
+    /// an `inet` table.
     fn verdict(ruleset: &str, p: Packet<'_>) -> &'static str {
-        const MATCHES: [&str; 7] = [
+        const MATCHES: [&str; 8] = [
             "meta skuid ",
             "ip saddr ",
+            "ip6 saddr ",
             "ip daddr ",
             "ip6 daddr ",
             "oifname ",
@@ -1249,7 +1302,10 @@ mod tests {
             "udp dport ",
         ];
         for line in ruleset.lines().map(str::trim) {
-            if !(line.starts_with("meta skuid ") || line.starts_with("ip saddr ")) {
+            if !["meta skuid ", "ip saddr ", "ip6 saddr "]
+                .iter()
+                .any(|k| line.starts_with(k))
+            {
                 continue;
             }
             let (mut rest, verdict) = if let Some(m) = line.strip_suffix(" accept") {
@@ -1283,7 +1339,8 @@ mod tests {
                     .collect();
                 let field = match key {
                     "meta skuid " => p.uid.map(|u| u.to_string()),
-                    "ip saddr " => Some(p.saddr.to_string()),
+                    "ip saddr " => Some(p.saddr).filter(IpAddr::is_ipv4).map(|a| a.to_string()),
+                    "ip6 saddr " => Some(p.saddr).filter(IpAddr::is_ipv6).map(|a| a.to_string()),
                     "oifname " => Some(p.oif.to_string()),
                     "udp sport " => p.udp.map(|(s, ..)| s.to_string()),
                     "udp dport " => p.udp.map(|(.., d)| d.to_string()),
@@ -1313,6 +1370,7 @@ mod tests {
             0,
             &["wg-a".to_string()],
             addr_of,
+            no_v6,
             |_| Ok(transport_on(51820)),
             |_| {
                 called.set(true);
@@ -1346,6 +1404,7 @@ mod tests {
             998,
             &["wg-b".to_string(), "wg-a".to_string()],
             addr_of,
+            no_v6,
             |iface| {
                 Ok(if iface == "wg-a" {
                     transport_on(51820)
@@ -1398,6 +1457,7 @@ table inet torrentd_ks {
             998,
             &["wg-a".to_string()],
             addr_of,
+            no_v6,
             |_| Err(io::Error::other("wg show wg-a listen-port exited 1")),
             |_| {
                 applied.set(true);
@@ -1429,6 +1489,7 @@ table inet torrentd_ks {
                     addr_of(iface)
                 }
             },
+            no_v6,
             |_| Ok(transport_on(51820)),
             |_| {
                 applied.set(true);
@@ -1588,6 +1649,123 @@ table inet torrentd_ks {
         assert_eq!(verdict(&rs, pkt(998, ADDR_A, "wg-b")), "accept");
     }
 
+    /// #178: a tunnel's IPv6 address gets the fence its IPv4 one has. A
+    /// kernel reply from it out of the physical link was not judged by any
+    /// rule, since the uid rules match no socketless packet and the fence was
+    /// IPv4 only.
+    #[test]
+    fn a_tunnel_ipv6_address_is_fenced_beside_its_ipv4_one() {
+        let rs = render_ruleset_with_transport(
+            998,
+            &[tunnel("wg-a").with_ipv6([ADDR_A6, ADDR_A6]), tunnel("wg-b")],
+            &[transport_on(51820)],
+        )
+        .unwrap();
+        let expected = "\
+table inet torrentd_ks {
+\tchain output {
+\t\ttype filter hook output priority 0; policy accept;
+\t\tip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\" } drop
+\t\tip saddr 10.64.0.7 oifname != { \"lo\", \"wg-b\" } drop
+\t\tip6 saddr fd7d:1::2 oifname != { \"lo\", \"wg-a\" } drop
+\t\tmeta skuid 998 oifname \"lo\" accept
+\t\tmeta skuid 998 ip saddr 10.2.0.2 oifname \"wg-a\" accept
+\t\tmeta skuid 998 ip saddr 10.64.0.7 oifname \"wg-b\" accept
+\t\tmeta skuid 998 ip daddr 198.51.100.1 udp sport 51820 udp dport 51820 accept
+\t\tmeta skuid 998 counter drop
+\t}
+}
+";
+        assert_eq!(rs, expected);
+        for (label, p) in [
+            ("a kernel reset", pkt(998, ADDR_A6, "eth0").kernel()),
+            ("another uid's socket", pkt(0, ADDR_A6, "eth0")),
+            ("into the other tunnel", pkt(0, ADDR_A6, "wg-b")),
+            ("the daemon's own, by its tunnel", pkt(998, ADDR_A6, "wg-a")),
+        ] {
+            assert_eq!(verdict(&rs, p), "drop", "{label}:\n{rs}");
+        }
+        assert_eq!(verdict(&rs, pkt(998, ADDR_A6, "wg-a").kernel()), "accept");
+        assert_eq!(verdict(&rs, pkt(0, ADDR_A6, "lo")), "accept");
+        assert_eq!(
+            verdict(
+                &rs,
+                pkt(0, "2001:db8::1".parse::<Ipv6Addr>().unwrap(), "eth0").kernel()
+            ),
+            "accept",
+            "the host's own IPv6 address is not the ruleset's to judge"
+        );
+    }
+
+    /// Two tunnels holding the same IPv6 address share its fence, as they
+    /// share an IPv4 one.
+    #[test]
+    fn tunnels_sharing_an_ipv6_address_share_its_fence() {
+        let rs = render_ruleset(
+            998,
+            &[
+                Tunnel::new("wg-b", ADDR_B).with_ipv6([ADDR_A6]),
+                Tunnel::new("wg-a", ADDR_A).with_ipv6([ADDR_A6]),
+            ],
+        )
+        .unwrap();
+        assert_eq!(rs.matches("ip6 saddr").count(), 1, "{rs}");
+        assert!(
+            rs.contains("ip6 saddr fd7d:1::2 oifname != { \"lo\", \"wg-a\", \"wg-b\" } drop"),
+            "{rs}"
+        );
+    }
+
+    /// `enable` reads each link's IPv6 addresses and fences them; one whose
+    /// IPv6 addresses will not read stops the install before nft, as an IPv4
+    /// address that will not read does.
+    #[test]
+    fn enable_fences_the_ipv6_addresses_it_reads_and_stops_on_one_it_cannot() {
+        let script = std::cell::RefCell::new(None::<String>);
+        enable_for_uid(
+            998,
+            &["wg-a".to_string()],
+            addr_of,
+            |iface| {
+                Ok(if iface == "wg-a" {
+                    vec![ADDR_A6]
+                } else {
+                    vec![]
+                })
+            },
+            |_| Ok(transport_on(51820)),
+            |s| {
+                *script.borrow_mut() = Some(s.to_string());
+                Ok(())
+            },
+        )
+        .expect("install");
+        let script = script.take().expect("one nft call");
+        assert!(
+            script.contains("\t\tip6 saddr fd7d:1::2 oifname != { \"lo\", \"wg-a\" } drop\n"),
+            "{script}"
+        );
+
+        let applied = std::cell::Cell::new(false);
+        let e = enable_for_uid(
+            998,
+            &["wg-a".to_string()],
+            addr_of,
+            |_| Err(io::Error::other("ip -o addr show dev wg-a exited 1")),
+            |_| Ok(transport_on(51820)),
+            |_| {
+                applied.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("IPv6 addresses that will not read are not an absent fence");
+        assert!(
+            e.to_string().contains("wg-a") && e.to_string().contains("IPv6"),
+            "got {e}"
+        );
+        assert!(!applied.get(), "nothing is handed to nft");
+    }
+
     #[test]
     fn endpoints_are_read_and_a_link_with_none_is_refused() {
         let out = "a2V5MQ==\t198.51.100.1:51820\nb2V5Mg==\t(none)\nc2V5Mw==\t[2001:db8::7]:4500\n";
@@ -1660,6 +1838,7 @@ table inet torrentd_ks {
             998,
             &[],
             |_| unreachable!("no tunnels, no addresses"),
+            |_| unreachable!("no tunnels, no IPv6 addresses"),
             |_| unreachable!("no tunnels, no ports"),
             |_| {
                 Err(io::Error::other(
@@ -1833,6 +2012,7 @@ table inet torrentd_ks {
             998,
             &["wg\"x".to_string()],
             addr_of,
+            no_v6,
             |_| Ok(transport_on(51820)),
             |_| {
                 applied.set(true);
@@ -1908,6 +2088,37 @@ table inet torrentd_ks {
             Verdict::Intact,
             "counter values and rule handles are not drift",
         );
+    }
+
+    /// The `ip6 saddr` fence reads back: a tunnel holding an IPv6 address
+    /// verifies intact with it, and drifted once it is gone.
+    #[test]
+    fn a_table_with_an_ipv6_fence_verifies_intact_and_its_loss_is_drift() {
+        const FENCE6: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 7, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "saddr"}}, "right": "fd7d:1::2"}}, {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": {"set": ["lo", "wg-a"]}}}, {"drop": null}]}}"#;
+        let installed = Installed::render(
+            998,
+            vec![tunnel("wg-a").with_ipv6([ADDR_A6])],
+            vec![("wg-a".to_string(), two_peer_transport())],
+        )
+        .unwrap();
+        let check = |entries: &[&str]| {
+            let json = listing(entries);
+            verify_with(
+                &installed,
+                || Ok(format!("table inet {TABLE}\n")),
+                move || Ok(json.clone()),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            check(&[META, FENCE, FENCE6, LO, WG_A, PORT_V4, PORT_V6, DROP]),
+            Verdict::Intact,
+        );
+        let verdict = check(&[META, FENCE, LO, WG_A, PORT_V4, PORT_V6, DROP]);
+        let Verdict::Drifted(why) = verdict else {
+            panic!("a lost IPv6 fence is drift; got {verdict:?}");
+        };
+        assert!(why.contains("ip6 saddr fd7d:1::2"), "got {why}");
     }
 
     /// The scenario in #102: the chain flushed, the table still listed. Its
@@ -2331,5 +2542,32 @@ table inet torrentd_ks {
         assert_eq!(verify(&installed).unwrap(), Verdict::Intact);
         disable().expect("remove");
         assert_eq!(verify(&installed).unwrap(), Verdict::Absent);
+    }
+
+    /// #178 against a real `nft`: a tunnel holding an IPv6 address installs
+    /// its `ip6 saddr` fence, the live table verifies intact with it, and a
+    /// table without it is drift. Run it as [`disable_against_real_nft`]
+    /// says, with `--test-threads=1` beside the others.
+    #[test]
+    #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
+    fn an_ipv6_fence_against_real_nft() {
+        let installed = Installed::render(
+            998,
+            vec![tunnel("wg-a").with_ipv6([ADDR_A6])],
+            vec![("wg-a".to_string(), two_peer_transport())],
+        )
+        .unwrap();
+        apply(&installed.script()).expect("install");
+        let listed = exec::run_ok("nft", &["list", "table", "inet", TABLE], None, exec::QUICK)
+            .expect("list the table");
+        let listed = String::from_utf8_lossy(&listed.stdout);
+        assert!(
+            listed.contains("ip6 saddr fd7d:1::2 oifname != { \"lo\", \"wg-a\" } drop"),
+            "the IPv6 fence is installed: {listed}"
+        );
+        assert_eq!(verify(&installed).unwrap(), Verdict::Intact);
+        apply(&self::installed().script()).expect("install the table without it");
+        assert!(matches!(verify(&installed).unwrap(), Verdict::Drifted(_)));
+        disable().expect("remove");
     }
 }
