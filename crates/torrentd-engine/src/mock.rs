@@ -31,6 +31,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -40,6 +41,7 @@ use libtorrent_safe::alert::AlertHeader;
 use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
 use libtorrent_safe::AlertKind;
+use libtorrent_safe::FilePage;
 use libtorrent_safe::InfoHash;
 use libtorrent_safe::MoveFlags;
 use libtorrent_safe::ResumeData;
@@ -95,6 +97,11 @@ pub enum RecordedCall {
     ResumeSession,
     TorrentDetails(TorrentHandle),
     TorrentFiles(TorrentHandle),
+    TorrentFilesPage {
+        handle: TorrentHandle,
+        start: u32,
+        limit: u32,
+    },
     TorrentTrackers(TorrentHandle),
     Close,
 }
@@ -258,6 +265,9 @@ pub struct MockEngine {
     details: DashMap<InfoHash, TorrentDetails>,
     /// infohash → what `torrent_files` returns. Unset: `None` (no metadata).
     files: DashMap<InfoHash, Option<Vec<TorrentFile>>>,
+    /// The most file entries one `torrent_files` or `torrent_files_page`
+    /// call has copied out, which the real session copies under its lock.
+    largest_files_copy: AtomicUsize,
     /// infohash → what `torrent_trackers` returns. Unset: empty.
     trackers: DashMap<InfoHash, Vec<TrackerEntry>>,
     /// Whether `pause_session` is in force.
@@ -288,6 +298,7 @@ impl MockEngine {
             auto_check: AtomicBool::new(false),
             details: DashMap::new(),
             files: DashMap::new(),
+            largest_files_copy: AtomicUsize::new(0),
             trackers: DashMap::new(),
             session_paused: AtomicBool::new(false),
         }
@@ -415,6 +426,13 @@ impl MockEngine {
     /// whose metadata has not arrived.
     pub fn set_torrent_files(&self, h: TorrentHandle, files: Option<Vec<TorrentFile>>) {
         self.files.insert(h.infohash, files);
+    }
+
+    /// The most file entries any one `torrent_files` or `torrent_files_page`
+    /// call has returned so far: what a real session would have copied
+    /// while holding its lock.
+    pub fn largest_files_copy(&self) -> usize {
+        self.largest_files_copy.load(Ordering::SeqCst)
     }
 
     /// What `torrent_trackers(h)` returns from now on.
@@ -665,7 +683,42 @@ impl TorrentEngine for MockEngine {
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
         self.record(RecordedCall::TorrentFiles(h));
         self.check_error("torrent_files")?;
-        Ok(self.files.get(&h.infohash).and_then(|f| f.clone()))
+        let files = self.files.get(&h.infohash).and_then(|f| f.clone());
+        let copied = files.as_ref().map_or(0, Vec::len);
+        self.largest_files_copy.fetch_max(copied, Ordering::SeqCst);
+        Ok(files)
+    }
+
+    /// Pages what `set_torrent_files` preloaded, by position. Shares
+    /// `torrent_files`'s op name for `inject_error`, `inject_panic` and
+    /// `hold_next`: both are the one session query.
+    fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>, EngineError> {
+        self.record(RecordedCall::TorrentFilesPage {
+            handle: h,
+            start,
+            limit,
+        });
+        self.check_error("torrent_files")?;
+        let Some(entry) = self.files.get(&h.infohash) else {
+            return Ok(None);
+        };
+        let Some(all) = entry.as_ref() else {
+            return Ok(None);
+        };
+        let first = (start as usize).min(all.len());
+        let end = first.saturating_add(limit as usize).min(all.len());
+        let files = all[first..end].to_vec();
+        self.largest_files_copy
+            .fetch_max(files.len(), Ordering::SeqCst);
+        Ok(Some(FilePage {
+            total: u32::try_from(all.len()).unwrap_or(u32::MAX),
+            files,
+        }))
     }
 
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
@@ -823,6 +876,48 @@ mod tests {
         // Preloading `None` models metadata that has not arrived.
         m.set_torrent_files(a, None);
         assert_eq!(m.torrent_files(a).unwrap(), None);
+    }
+
+    #[test]
+    fn a_file_page_copies_only_its_slice_and_reports_the_total() {
+        let m = MockEngine::new();
+        let h = m.register_handle(InfoHash([8u8; 20]));
+        assert_eq!(m.torrent_files_page(h, 0, 10).unwrap(), None);
+        let files: Vec<TorrentFile> = (0..25)
+            .map(|i| TorrentFile {
+                index: i,
+                path: format!("d/f{i}"),
+                size: 1,
+                downloaded: 0,
+                priority: 4,
+            })
+            .collect();
+        m.set_torrent_files(h, Some(files.clone()));
+
+        let page = m.torrent_files_page(h, 20, 10).unwrap().unwrap();
+        assert_eq!(page.total, 25);
+        assert_eq!(page.files, files[20..]);
+        let count = m.torrent_files_page(h, 0, 0).unwrap().unwrap();
+        assert_eq!((count.total, count.files.len()), (25, 0));
+        let past = m
+            .torrent_files_page(h, u32::MAX, u32::MAX)
+            .unwrap()
+            .unwrap();
+        assert_eq!((past.total, past.files.len()), (25, 0));
+        assert_eq!(m.largest_files_copy(), 5);
+        assert!(matches!(
+            m.calls()[1],
+            RecordedCall::TorrentFilesPage { handle, start: 20, limit: 10 } if handle == h
+        ));
+        // The whole list is the largest copy once it is read.
+        m.torrent_files(h).unwrap();
+        assert_eq!(m.largest_files_copy(), 25);
+        // Shares `torrent_files`'s injection.
+        m.inject_error("torrent_files", EngineError::Shutdown);
+        assert!(matches!(
+            m.torrent_files_page(h, 0, 1),
+            Err(EngineError::Shutdown)
+        ));
     }
 
     #[test]

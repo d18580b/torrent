@@ -55,6 +55,7 @@ use libtorrent_safe::Settings;
 use libtorrent_safe::TorrentHandle;
 use serde::Deserialize;
 use torrentd_engine::EngineError;
+use torrentd_engine::FilePage;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::MockEngine;
 use torrentd_engine::ProfileId;
@@ -196,6 +197,14 @@ impl TorrentEngine for FaultEngine {
     }
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
         self.inner.torrent_files(h)
+    }
+    fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>, EngineError> {
+        self.inner.torrent_files_page(h, start, limit)
     }
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
         self.inner.torrent_trackers(h)

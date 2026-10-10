@@ -43,6 +43,16 @@ pub struct TorrentFile {
     pub priority: u8,
 }
 
+/// One page of a torrent's files, as `Session::torrent_files_page` reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilePage {
+    /// How many files the whole torrent has.
+    pub total: u32,
+    /// The requested files in index order: at most the requested limit, from
+    /// the requested start on, and empty when the start lies past the end.
+    pub files: Vec<TorrentFile>,
+}
+
 /// One tracker of a torrent in a session.
 ///
 /// libtorrent keeps announce state per (listen endpoint x protocol version);

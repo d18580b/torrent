@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 pub use libtorrent_safe::AddParams;
 pub use libtorrent_safe::Alert;
+pub use libtorrent_safe::FilePage;
 pub use libtorrent_safe::InfoHash;
 pub use libtorrent_safe::MoveFlags;
 pub use libtorrent_safe::ResumeData;
@@ -106,6 +107,19 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     /// The torrent's files in index order, or `None` while its metadata has
     /// not arrived yet.
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError>;
+    /// At most `limit` of the torrent's files from index `start` on, with
+    /// how many it has in all, or `None` while its metadata has not arrived.
+    ///
+    /// A listing pages with this rather than slicing
+    /// [`TorrentEngine::torrent_files`]: only the page is copied out of the
+    /// session, so a page of a 250,000-file torrent holds the session no
+    /// longer than a page of a small one. `limit` 0 reads the count alone.
+    fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>, EngineError>;
     /// The torrent's trackers, tier by tier, with their announce state.
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError>;
     /// Destroy the session now, closing every peer and tracker socket, and
@@ -186,6 +200,14 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
         (**self).torrent_files(h)
+    }
+    fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>, EngineError> {
+        (**self).torrent_files_page(h, start, limit)
     }
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
         (**self).torrent_trackers(h)

@@ -24,6 +24,7 @@ use crate::settings::ResumeFlags;
 use crate::settings::Settings;
 use crate::settings::TorrentFlags;
 use crate::torrent_info::FileListGuard;
+use crate::torrent_info::FilePage;
 use crate::torrent_info::TorrentDetails;
 use crate::torrent_info::TorrentFile;
 use crate::torrent_info::TrackerEntry;
@@ -444,22 +445,46 @@ impl Session {
     /// The torrent's files in index order, or `None` while its metadata has
     /// not arrived yet (a magnet still fetching it).
     pub fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>> {
-        self.torrent_files_raw(h).map(RawFileList::into_files)
+        self.torrent_files_raw(h, 0, usize::MAX)
+            .map(RawFileList::into_files)
     }
 
-    /// The torrent's files as the shim returned them, unconverted.
+    /// At most `limit` of the torrent's files, from index `start` on, and
+    /// how many it has in all; `None` while its metadata has not arrived.
     ///
-    /// Converting is a copy of every path, up to `LT_MAX_TORRENT_FILES` of
-    /// them, and needs nothing from the session. A caller that serialises
-    /// session access behind a lock takes this under the lock and calls
+    /// Only the page is copied out of the session, so listing a large
+    /// torrent page by page costs each page its own size, not the whole list.
+    pub fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>> {
+        self.torrent_files_raw(h, start as usize, limit as usize)
+            .map(RawFileList::into_page)
+    }
+
+    /// At most `limit` of the torrent's files from index `start` on, as the
+    /// shim returned them, unconverted. `limit` `usize::MAX` is the whole list.
+    ///
+    /// Converting is a copy of every path in the page, and needs nothing from
+    /// the session. A caller that serialises session access behind a lock
+    /// takes this under the lock and calls [`RawFileList::into_page`] or
     /// [`RawFileList::into_files`] after releasing it.
-    pub fn torrent_files_raw(&self, h: TorrentHandle) -> Result<RawFileList> {
+    pub fn torrent_files_raw(
+        &self,
+        h: TorrentHandle,
+        start: usize,
+        limit: usize,
+    ) -> Result<RawFileList> {
         let mut list = FileListGuard::new();
         let mut err = ErrBuf::new();
         let rc = unsafe {
             ffi::lt_torrent_files(
                 self.ptr,
                 h.id as ffi::lt_handle,
+                start,
+                limit,
                 &mut list.0,
                 err.ptr(),
                 err.len() as i32,
@@ -564,23 +589,36 @@ impl std::fmt::Debug for RawFileList {
         f.debug_struct("RawFileList")
             .field("has_metadata", &(self.0 .0.has_metadata != 0))
             .field("num_files", &self.0.entries().len())
+            .field("total_files", &self.0 .0.total_files)
+            .field("first_index", &self.0 .0.first_index)
             .finish()
     }
 }
 
 impl RawFileList {
-    /// The files in index order, or `None` while the torrent's metadata has
-    /// not arrived.
+    /// The page's files in index order, or `None` while the torrent's
+    /// metadata has not arrived.
     pub fn into_files(self) -> Option<Vec<TorrentFile>> {
-        if self.0 .0.has_metadata == 0 {
+        self.into_page().map(|p| p.files)
+    }
+
+    /// The page with the torrent's file count, or `None` while the torrent's
+    /// metadata has not arrived.
+    pub fn into_page(self) -> Option<FilePage> {
+        let raw = &self.0 .0;
+        if raw.has_metadata == 0 {
             return None;
         }
-        Some(
-            (0u32..)
+        // Both fit: libtorrent indexes files with an int.
+        let total = u32::try_from(raw.total_files).unwrap_or(u32::MAX);
+        let first = u32::try_from(raw.first_index).unwrap_or(u32::MAX);
+        Some(FilePage {
+            total,
+            files: (first..)
                 .zip(self.0.entries())
                 .map(|(i, f)| TorrentFile::from_raw(i, f))
                 .collect(),
-        )
+        })
     }
 }
 

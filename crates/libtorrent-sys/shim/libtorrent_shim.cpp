@@ -1592,6 +1592,7 @@ extern "C" int lt_torrent_details(lt_session* s, lt_handle h,
 }
 
 extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
+                                std::size_t start, std::size_t limit,
                                 struct lt_torrent_file_list* out,
                                 char* err_out, int err_len)
 {
@@ -1605,28 +1606,36 @@ extern "C" int lt_torrent_files(lt_session* s, lt_handle h,
     if (!ti || !ti->is_valid()) return LT_OK;   // metadata not yet received
 
     lt::file_storage const& fs = ti->files();
-    auto const n = static_cast<std::size_t>(fs.num_files());
+    auto const total = static_cast<std::size_t>(fs.num_files());
+    auto const first = std::min(start, total);
+    auto const n = std::min(limit, total - first);
     // Same bound, for the same reason, as lt_torrent_metadata: each entry
-    // carries a fixed LT_PATH_MAX buffer.
+    // carries a fixed LT_PATH_MAX buffer. Applied to the page, which is all
+    // that is copied.
     if (n > LT_MAX_TORRENT_FILES) {
         set_err(err_out, err_len, "torrent declares an implausible number of files");
         return LT_ERR;
     }
+    out->has_metadata = 1;
+    out->total_files = total;
+    out->first_index = first;
+    if (n == 0) return LT_OK;
     // piece_granularity counts only completed pieces, which is cheap (no
     // per-block walk) and is what "downloaded" means for a seeding client.
+    // Both cover the whole torrent (libtorrent has no ranged form); only the
+    // page is copied out of them.
     auto const progress = th.file_progress(lt::torrent_handle::piece_granularity);
     auto const prios = th.get_file_priorities();
 
-    out->has_metadata = 1;
-    if (n == 0) return LT_OK;
     // Published to *out only once fully built; the unique_ptr releases it if
     // anything below throws, so LT_ERR never leaves an allocation behind.
     std::unique_ptr<lt_torrent_file_entry, decltype(&std::free)> arr(
         static_cast<lt_torrent_file_entry*>(std::calloc(n, sizeof(lt_torrent_file_entry))),
         &std::free);
     if (!arr) throw std::bad_alloc{};
-    for (std::size_t i = 0; i < n; ++i) {
-        auto& e = arr.get()[i];
+    for (std::size_t j = 0; j < n; ++j) {
+        auto& e = arr.get()[j];
+        auto const i = first + j;
         auto const idx = lt::file_index_t{static_cast<int>(i)};
         // Empty save_path: the torrent-relative path, like lt_torrent_metadata.
         copy_utf8_truncated(e.path, LT_PATH_MAX, fs.file_path(idx));
