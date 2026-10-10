@@ -266,14 +266,24 @@ fn build_delete_orphans(
         return Ok(Err(Refused(copies_refusal(ih, area))));
     }
 
+    // A file unclaimed by path can still be a claimed file reached another
+    // way: a hard link, or the claimed file seen through a second root that
+    // aliases the first. The executor refuses those steps, and a refused step
+    // stops the plan, so they are left out here rather than emitted to fail.
+    let claimed = store.claimed_identities()?;
     let mut held_back = 0usize;
+    let mut aliased = 0usize;
     let orphans: Vec<String> = store
         .orphan_files_sized(root_id, prefix)?
         .into_iter()
-        .filter_map(|(rel, size)| {
+        .filter_map(|(rel, size, identity)| {
             // `.torrentd-trash` is where deleted files go; it is never indexed,
             // but an index from before that rule may still list it.
             if rel == TRASH_DIR || rel.starts_with(&format!("{TRASH_DIR}/")) {
+                return None;
+            }
+            if claimed.contains(&identity) {
+                aliased += 1;
                 return None;
             }
             if unresolved.sizes.contains(&size) {
@@ -284,10 +294,11 @@ fn build_delete_orphans(
         })
         .collect();
     if orphans.is_empty() {
-        return Ok(Err(Refused(if held_back > 0 {
+        return Ok(Err(Refused(if held_back + aliased > 0 {
             format!(
-                "every unclaimed file under that path ({held_back}) has the size of a file a \
-                 torrent in the library has not found, so none is provably unwanted"
+                "no unclaimed file under that path is provably unwanted: {held_back} have the \
+                 size of a file a torrent in the library has not found, and {aliased} are the \
+                 same file (device and inode) as one a torrent claims"
             )
         } else {
             "no unclaimed files under that path".into()

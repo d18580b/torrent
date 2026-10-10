@@ -271,6 +271,10 @@ DROP INDEX torrent_by_slot;
 CREATE INDEX torrent_by_profile ON torrent(profile) WHERE profile IS NOT NULL;
 "#;
 
+/// An unclaimed file from [`PoolStore::orphan_files_sized`]: its root-relative
+/// path, indexed size, and indexed `(dev, ino)`.
+pub type SizedOrphan = (String, u64, (u64, u64));
+
 pub struct PoolStore {
     conn: Connection,
     /// Nesting depth for [`PoolStore::in_transaction`]; 0 means autocommit.
@@ -1821,16 +1825,20 @@ impl PoolStore {
         Ok(self
             .orphan_files_sized(root_id, prefix)?
             .into_iter()
-            .map(|(p, _)| p)
+            .map(|(p, ..)| p)
             .collect())
     }
 
-    /// [`PoolStore::orphan_files`], with each file's indexed size.
+    /// [`PoolStore::orphan_files`], with each file's indexed size and
+    /// `(dev, ino)` identity.
+    ///
+    /// The identity lets the delete planner drop an orphan that is a claimed
+    /// file reached by another path (see [`PoolStore::claimed_identities`]).
     pub fn orphan_files_sized(
         &self,
         root_id: i64,
         prefix: &str,
-    ) -> Result<Vec<(String, u64)>, PoolError> {
+    ) -> Result<Vec<SizedOrphan>, PoolError> {
         let like = if prefix.is_empty() {
             String::new()
         } else {
@@ -1838,7 +1846,7 @@ impl PoolStore {
         };
         let upper = prefix_upper_bound(&like);
         let mut st = self.conn.prepare(
-            "SELECT f.rel_path, f.size FROM file f
+            "SELECT f.rel_path, f.size, f.dev, f.ino FROM file f
              WHERE f.root_id = ?1 AND f.rel_path >= ?2 AND f.rel_path < ?3
                AND NOT EXISTS (
                  SELECT 1 FROM claim c
@@ -1847,7 +1855,11 @@ impl PoolStore {
              ORDER BY f.rel_path",
         )?;
         let rows = st.query_map(params![root_id, like, upper], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)? as u64,
+                (r.get::<_, i64>(2)? as u64, r.get::<_, i64>(3)? as u64),
+            ))
         })?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }

@@ -2280,10 +2280,11 @@ mod tests {
     }
 
     /// A second root that reaches claimed bytes by another path — a hard link
-    /// here, standing in for a bind mount or union view of the first root —
-    /// indexes them as an orphan there, since claims are by path. The delete
-    /// step compares the file's identity with every claimed file's and
-    /// refuses; an ordinary orphan beside it still goes to the trash.
+    /// here, standing in for a bind mount of the first root — indexes them as
+    /// an orphan there, since claims are by path. The delete planner leaves
+    /// it out, and the delete step compares the file's identity with every
+    /// claimed file's and refuses; an ordinary orphan beside it still goes to
+    /// the trash.
     #[test]
     fn deleting_refuses_a_file_that_is_a_claimed_file_under_another_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -2312,6 +2313,20 @@ mod tests {
             .unwrap();
         assert!(unclaimed, "by path, the alias reads as an orphan");
 
+        // The planner leaves the alias out, so a plan never holds a step the
+        // executor would refuse halfway through.
+        let spec = torrentd_pool::plan::PlanSpec::DeleteOrphans {
+            root_id: second_id,
+            prefix: String::new(),
+        };
+        let steps = pool
+            .with_store(|st| torrentd_pool::plan::build(st, &spec, |id| pool.root_path_of(id)))
+            .unwrap()
+            .expect("plan builds");
+        let srcs: Vec<_> = steps.iter().map(|s| PathBuf::from(&s.src)).collect();
+        assert_eq!(srcs, vec![orphan.clone()], "only the unrelated orphan");
+
+        // The executor still refuses it, for a plan built before the claim.
         let mut guards = DeleteGuards::default();
         let e = delete_file(&pool, &alias, 1, &mut guards).unwrap_err();
         assert!(
