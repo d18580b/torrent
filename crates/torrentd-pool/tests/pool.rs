@@ -1805,6 +1805,44 @@ fn relocating_onto_existing_files_is_refused() {
     assert!(e.contains("already contains"), "got {e}");
 }
 
+/// A dangling symlink where a file of the torrent would land is still an
+/// entry a move would replace. `Path::exists()` follows the link, finds
+/// nothing, and calls the way clear; the destination check must not.
+#[cfg(unix)]
+#[test]
+fn relocating_onto_a_dangling_symlink_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("pool");
+    write_file(&root, "src/T/a.bin", 128);
+
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(&root).unwrap();
+    torrentd_pool::scan_root(&mut store, &root).unwrap();
+    add_torrent(&mut store, "x1", "T", Some("src"), &[("T/a.bin", 128)]);
+    torrentd_pool::match_all(&mut store).unwrap();
+
+    let link = root.join("dest/T/a.bin");
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("nowhere"), &link).unwrap();
+    assert!(
+        !link.exists(),
+        "the link must dangle for this test to mean anything"
+    );
+
+    let e = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "x1".into(),
+            dest_root_id: root_id,
+            dest_rel: "dest".into(),
+        },
+        root_id,
+        &root,
+    )
+    .unwrap_err();
+    assert!(e.contains("already contains T/a.bin"), "got {e}");
+}
+
 #[test]
 fn relocating_from_the_root_itself_is_refused() {
     // The matcher admits the root as a placement candidate, so a torrent whose
