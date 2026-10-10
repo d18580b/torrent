@@ -2044,9 +2044,21 @@ pub async fn list_torrent_files(
     .map_err(|_| ListFilesError::InvalidCursor)?;
     invalid.finish()?;
     let (st, engine) = loaded(&s, p.infohash.get())?;
-    // A torrent can list up to 250,000 files, and the shim copies them all;
-    // that is blocking work, kept off the async workers.
-    let files = match blocking_files(&engine, st.handle).await {
+    // The page starts strictly after the cursor's index. A key is a checked
+    // ten-digit decimal, which can name an index past any torrent's last
+    // file: that is an empty last page, as it was when the whole list was
+    // read and skipped through.
+    let start = page
+        .after
+        .as_deref()
+        .and_then(|key| key.parse::<u64>().ok())
+        .map_or(0, |after| u32::try_from(after + 1).unwrap_or(u32::MAX));
+    let limit = u32::try_from(page.limit).unwrap_or(u32::MAX);
+    // Only this page is copied out of the session, under its lock: every
+    // engine call and the alert loop's drain wait on that lock, so a page of
+    // a 250,000-file torrent must not copy the whole list. Still blocking
+    // work, kept off the async workers.
+    let files = match blocking_files(&engine, st.handle, start, limit).await {
         Ok(Some(files)) => files,
         Ok(None) => return Err(ListFilesError::MetadataPending),
         Err(e) if e.is_gone() => return Err(ListFilesError::TorrentNotFound),
@@ -2056,9 +2068,13 @@ pub async fn list_torrent_files(
             })
         }
     };
-    let (items, next_cursor) = paginate(&listing, files, |f| file_key(f.index), &page);
+    let next_cursor = files
+        .files
+        .last()
+        .filter(|last| u64::from(last.index) + 1 < u64::from(files.total))
+        .map(|last| crate::http::page::encode(&listing, &file_key(last.index)));
     Ok(Json(TorrentFilePage {
-        items: items.into_iter().map(TorrentFile::from).collect(),
+        items: files.files.into_iter().map(TorrentFile::from).collect(),
         next_cursor,
     }))
 }
@@ -2133,9 +2149,10 @@ pub async fn set_file_priority(
     body.validate()?;
     let (st, engine) = loaded(&s, p.infohash.get())?;
     // libtorrent ignores an index past the end without saying so; the file
-    // list is what tells a missing file from a set priority.
-    let count = match blocking_files(&engine, st.handle).await {
-        Ok(Some(files)) => files.len(),
+    // list's length is what tells a missing file from a set priority. An
+    // empty page reads it without copying a file.
+    let count = match blocking_files(&engine, st.handle, 0, 0).await {
+        Ok(Some(files)) => files.total as usize,
         Ok(None) => return Err(SetFilePriorityError::MetadataPending),
         Err(e) if e.is_gone() => return Err(SetFilePriorityError::TorrentNotFound),
         Err(e) => {
@@ -2159,16 +2176,19 @@ pub async fn set_file_priority(
     }
 }
 
-/// `engine.torrent_files(handle)`, on the blocking pool.
+/// `engine.torrent_files_page(handle, start, limit)`, on the blocking pool.
 ///
 /// A task that panicked is reported as the engine error it stands in for: the
 /// listing was not produced, and the caller's `500` says so.
 async fn blocking_files(
     engine: &Arc<dyn TorrentEngine>,
     handle: torrentd_engine::TorrentHandle,
-) -> Result<Option<Vec<torrentd_engine::TorrentFile>>, FilesFailure> {
+    start: u32,
+    limit: u32,
+) -> Result<Option<torrentd_engine::FilePage>, FilesFailure> {
     let engine = Arc::clone(engine);
-    match tokio::task::spawn_blocking(move || engine.torrent_files(handle)).await {
+    match tokio::task::spawn_blocking(move || engine.torrent_files_page(handle, start, limit)).await
+    {
         Ok(Ok(files)) => Ok(files),
         Ok(Err(e)) => Err(FilesFailure::Engine(e)),
         Err(join) => Err(FilesFailure::Task(join)),

@@ -40,6 +40,7 @@ pub use settings::MoveFlags;
 pub use settings::ResumeFlags;
 pub use settings::Settings;
 pub use settings::TorrentFlags;
+pub use torrent_info::FilePage;
 pub use torrent_info::TorrentDetails;
 pub use torrent_info::TorrentFile;
 pub use torrent_info::TrackerEntry;

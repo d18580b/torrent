@@ -443,21 +443,34 @@ struct lt_torrent_file_entry {
     uint8_t  _pad[7];
 };
 
-/* A torrent's file list. `files` is heap-allocated; release the whole struct
- * with lt_torrent_file_list_free(). */
+/* One page of a torrent's file list. `files` is heap-allocated; release the
+ * whole struct with lt_torrent_file_list_free(). */
 struct lt_torrent_file_list {
+    /* files[i] is the file at index first_index + i. */
     struct lt_torrent_file_entry* files;
     size_t   num_files;
+    /* How many files the whole torrent has, whatever page was asked for. */
+    size_t   total_files;
+    /* The index of files[0]: the requested start, or total_files when the
+     * start lies past the end. */
+    size_t   first_index;
     uint8_t  has_metadata;        /* 0: metadata not yet received, no files */
     uint8_t  _pad[7];
 };
 
-/* Fill *out with torrent `h`'s file list. A torrent without metadata (a
- * magnet still fetching it) is not an error: LT_OK with has_metadata = 0 and
- * num_files = 0. Refuses (LT_ERR) more than LT_MAX_TORRENT_FILES files, as
- * lt_torrent_metadata does. On LT_OK the caller MUST call
+/* Fill *out with at most `limit` files of torrent `h`, from file index
+ * `start` on. Only the page is copied, so a caller listing a large torrent
+ * page by page copies each entry (with its LT_PATH_MAX path) once rather than
+ * the whole list per page. `limit` 0 copies nothing and still reports
+ * total_files; a `start` at or past the end is an empty page, not an error.
+ *
+ * A torrent without metadata (a magnet still fetching it) is not an error:
+ * LT_OK with has_metadata = 0 and no files. Refuses (LT_ERR) a page of more
+ * than LT_MAX_TORRENT_FILES entries, the bound lt_torrent_metadata applies to
+ * a whole torrent. On LT_OK the caller MUST call
  * lt_torrent_file_list_free(out); on LT_ERR nothing was allocated. */
 int         lt_torrent_files(lt_session* s, lt_handle h,
+                             size_t start, size_t limit,
                              struct lt_torrent_file_list* out,
                              char* err_out, int err_len);
 

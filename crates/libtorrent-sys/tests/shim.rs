@@ -577,7 +577,7 @@ fn files_list_every_file_with_size_progress_and_priority() {
     for _ in 0..100 {
         let mut list: lt_torrent_file_list = unsafe { std::mem::zeroed() };
         let mut err = [0 as c_char; 512];
-        let rc = unsafe { lt_torrent_files(s, h, &mut list, err.as_mut_ptr(), 512) };
+        let rc = unsafe { lt_torrent_files(s, h, 0, usize::MAX, &mut list, err.as_mut_ptr(), 512) };
         assert_eq!(rc, LT_OK as i32, "lt_torrent_files: {}", c_buf(&err));
         assert_eq!(list.has_metadata, 1);
         assert_eq!(list.num_files, 3);
@@ -609,6 +609,55 @@ fn files_list_every_file_with_size_progress_and_priority() {
 }
 
 #[test]
+fn files_page_copies_only_the_requested_range_and_reports_the_total() {
+    let s = make_session();
+    let h = add_file(s, &multi_file_tracker_torrent());
+    // (start, limit) -> (first_index, paths)
+    let page = |start: usize, limit: usize| {
+        let mut list: lt_torrent_file_list = unsafe { std::mem::zeroed() };
+        let mut err = [0 as c_char; 512];
+        let rc = unsafe { lt_torrent_files(s, h, start, limit, &mut list, err.as_mut_ptr(), 512) };
+        assert_eq!(rc, LT_OK as i32, "lt_torrent_files: {}", c_buf(&err));
+        assert_eq!(list.has_metadata, 1);
+        assert_eq!(
+            list.total_files, 3,
+            "the whole torrent's count, whatever the page"
+        );
+        let paths: Vec<String> = if list.num_files == 0 {
+            assert!(list.files.is_null(), "an empty page allocates nothing");
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(list.files, list.num_files) }
+                .iter()
+                .map(|f| c_buf(&f.path))
+                .collect()
+        };
+        let first = list.first_index;
+        unsafe { lt_torrent_file_list_free(&mut list) };
+        (first, paths)
+    };
+    assert_eq!(
+        page(1, 1),
+        (1, vec!["multi-root/docs/notes.txt".to_string()])
+    );
+    assert_eq!(
+        page(1, 100),
+        (
+            1,
+            vec![
+                "multi-root/docs/notes.txt".to_string(),
+                "multi-root/data/blob.bin".to_string()
+            ]
+        )
+    );
+    // A count alone, and a start at or past the end: empty, not an error.
+    assert_eq!(page(0, 0), (0, vec![]));
+    assert_eq!(page(3, 10), (3, vec![]));
+    assert_eq!(page(usize::MAX, usize::MAX), (3, vec![]));
+    unsafe { lt_session_destroy(s) };
+}
+
+#[test]
 fn files_without_metadata_is_ok_and_empty() {
     let s = make_session();
     let h = add_magnet(
@@ -617,7 +666,7 @@ fn files_without_metadata_is_ok_and_empty() {
     );
     let mut list: lt_torrent_file_list = unsafe { std::mem::zeroed() };
     let mut err = [0 as c_char; 512];
-    let rc = unsafe { lt_torrent_files(s, h, &mut list, err.as_mut_ptr(), 512) };
+    let rc = unsafe { lt_torrent_files(s, h, 0, usize::MAX, &mut list, err.as_mut_ptr(), 512) };
     assert_eq!(rc, LT_OK as i32, "lt_torrent_files: {}", c_buf(&err));
     assert_eq!(list.has_metadata, 0);
     assert_eq!(list.num_files, 0);
@@ -846,7 +895,7 @@ fn queries_on_unknown_or_removed_handles_fail_with_the_marker() {
         let mut err = [0 as c_char; 512];
         let mut files: lt_torrent_file_list = unsafe { std::mem::zeroed() };
         assert_eq!(
-            unsafe { lt_torrent_files(s, h, &mut files, err.as_mut_ptr(), 512) },
+            unsafe { lt_torrent_files(s, h, 0, usize::MAX, &mut files, err.as_mut_ptr(), 512) },
             LT_ERR
         );
         assert_eq!(c_buf(&err), marker);
@@ -869,7 +918,7 @@ fn queries_on_unknown_or_removed_handles_fail_with_the_marker() {
         LT_ERR
     );
     assert_eq!(
-        unsafe { lt_torrent_files(s, 1, ptr::null_mut(), err.as_mut_ptr(), 512) },
+        unsafe { lt_torrent_files(s, 1, 0, usize::MAX, ptr::null_mut(), err.as_mut_ptr(), 512) },
         LT_ERR
     );
     assert_eq!(

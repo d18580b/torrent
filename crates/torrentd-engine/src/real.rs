@@ -13,6 +13,7 @@
 
 use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
+use libtorrent_safe::FilePage;
 use libtorrent_safe::MoveFlags;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::Session;
@@ -193,8 +194,22 @@ impl TorrentEngine for RealEngine {
     fn torrent_files(&self, h: TorrentHandle) -> Result<Option<Vec<TorrentFile>>, EngineError> {
         // The session lock covers the shim call only. Converting the list
         // copies every path, up to 250k of them, and needs no session.
-        let raw = self.session()?.torrent_files_raw(h)?;
+        let raw = self.session()?.torrent_files_raw(h, 0, usize::MAX)?;
         Ok(raw.into_files())
+    }
+
+    #[instrument(skip_all, fields(op = "torrent_files_page", infohash = %h.infohash, start, limit))]
+    fn torrent_files_page(
+        &self,
+        h: TorrentHandle,
+        start: u32,
+        limit: u32,
+    ) -> Result<Option<FilePage>, EngineError> {
+        // As above, but the shim copies only the page under the lock.
+        let raw = self
+            .session()?
+            .torrent_files_raw(h, start as usize, limit as usize)?;
+        Ok(raw.into_page())
     }
 
     #[instrument(skip_all, fields(op = "torrent_trackers", infohash = %h.infohash))]

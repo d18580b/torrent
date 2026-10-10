@@ -51,6 +51,7 @@ pub use libtorrent_safe::AddParams;
 pub use libtorrent_safe::Alert;
 pub use libtorrent_safe::AlertKind;
 pub use libtorrent_safe::Error as SafeError;
+pub use libtorrent_safe::FilePage;
 pub use libtorrent_safe::InfoHash;
 pub use libtorrent_safe::ResumeData;
 pub use libtorrent_safe::ResumeFlags;
