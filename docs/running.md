@@ -1536,11 +1536,15 @@ config, because nothing in the library claims those files and a delete plan
 would treat them as orphans.
 
 ```bash
-torrentd --config /etc/torrentd/torrentd.toml pool scan      # index + match
-torrentd --config /etc/torrentd/torrentd.toml pool status    # summarise
-torrentd --config /etc/torrentd/torrentd.toml pool check     # what changed since
-torrentd --config /etc/torrentd/torrentd.toml pool orphans   # unclaimed bytes
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool scan      # index + match
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool status    # summarise
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool check     # what changed since
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool orphans   # unclaimed bytes
 ```
+
+Run them as the daemon's user. Run as root, `pool scan` creates `pool.db`
+(and `registry.db`, with `import_legacy_registry` set) owned by root, and the
+daemon, which opens both at boot, then fails to start.
 
 The CLI and the daemon share one SQLite file. `pool scan` holds its write lock
 for the whole scan, which would fail every daemon write meanwhile, so it runs
