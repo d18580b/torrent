@@ -7599,7 +7599,7 @@
           "sessions"
         ],
         "summary": "Exchange the operator password for a session token.",
-        "description": "The token carries `read` and `write` and expires after\n`[auth] session_ttl_secs` (`GET /v1/server` reports it). Failed attempts\nare throttled per client, and every attempt spends from one daemon-wide\nbudget for the memory-hard password hash; either limit answers\n`429 login-throttled` with `Retry-After`.",
+        "description": "The token carries `read` and `write` and expires after\n`[auth] session_ttl_secs` (`GET /v1/server` reports it). Failed attempts\nare throttled per client, and attempts spend from one daemon-wide budget\nfor the memory-hard password hash. Once that budget is spent, a client\nthat has logged in since the daemon started spends from a small reserve\nthat only such clients share instead. Either limit answers\n`429 login-throttled` with `Retry-After`.",
         "operationId": "create_session",
         "requestBody": {
           "content": {
