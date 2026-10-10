@@ -251,8 +251,8 @@ Every profile takes `id` plus `network`, and then:
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
 
-Each `vpn` profile's tunnel must come up with its own address. A session is
-bound to its tunnel by address, so two tunnels sharing one — every Proton
+Each `vpn` profile's tunnel must come up with its own address. A tunnel is
+routed by its address (`from <address> lookup <table>`), so two sharing one — every Proton
 WireGuard config assigns `10.2.0.2/32` — leave nothing that keeps one account's
 traffic out of the other's tunnel. The address is known only once the tunnel is
 up, so this is checked at startup rather than by `--check-config`: the second
@@ -1452,16 +1452,31 @@ On a scratch pool, not your real one.
    device (`SO_BINDTODEVICE`, which needs `CAP_NET_RAW` before Linux 5.7;
    the unit grants only `CAP_NET_ADMIN`). Outgoing TCP peer connections are
    bound to the tunnel device (`outgoing_interfaces`). Outgoing uTP and UDP
-   tracker announces are sent from the listen sockets, which are bound to
-   the tunnel address; libtorrent also binds those to the first interface
-   whose network holds that address, which is the tunnel unless another
-   interface's network covers the tunnel address. Where the device binding
-   takes, that traffic keeps leaving by the tunnel. Where it is refused —
-   libtorrent then binds the socket to the address alone, for TCP as for the
-   listen sockets — or names the wrong interface, the traffic follows the
-   routing table and can leave by the physical interface, with the tunnel's
-   source address, until the next poll fences the profile. With
-   `network_kill_switch = true` the kill switch drops it.
+   tracker announces are sent from the listen sockets, and HTTP tracker
+   connections are bound to their device; the session listens on the tunnel
+   device (`<iface>:<port>`), on every address it holds, so those are bound
+   to the tunnel device too. Where the device binding takes, that traffic
+   keeps leaving by the tunnel. Where it is refused, libtorrent binds the
+   socket to the address alone, for TCP as for the listen sockets. The
+   traffic then follows the routing table and can leave by the physical
+   interface, with the tunnel's source address, until the next poll fences
+   the profile. With `network_kill_switch = true` the kill switch drops it.
+
+   A socket bound to the **wrong** device is a different case. A device
+   binding overrides policy routing, so its traffic leaves by that device
+   whatever the rules say. The route probe asks the routing table
+   (`ip route get … from <tunnel address>`), so it still answers
+   `dev <iface>` and never fences. That is why the session names the device
+   and not the address: libtorrent binds a socket named by address to the
+   first interface whose network holds it. A LAN whose network covers the
+   tunnel address (a `10.0.0.0/8` LAN beside Proton's `10.2.0.2/32`) would
+   win, and `ss -tulnp` would show `10.2.0.2%eth0`. The daemon also checks
+   every listen socket a vpn session opens against the kernel, as it comes
+   up and after each NAT-PMP rebind. A socket bound to any device but the
+   profile's `vpn_interface` stops the whole daemon, whatever other
+   sessions are up. It logs `a listen socket is not held to the profile's
+   tunnel device` and exits non-zero. A socket bound to no device is logged
+   as a warning and left to the route probe.
 
    A WireGuard tunnel that comes up and **never handshakes** — a wrong key,
    a dead endpoint — is fenced with `reason=no_handshake` once it has gone
