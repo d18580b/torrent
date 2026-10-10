@@ -1642,7 +1642,10 @@ On a scratch pool, not your real one.
    host's default route, and the daemon routes the tunnel (a routed `tun`
    device; a bridged `tap` profile is not supported) once it has its address,
    with a `from` rule for its IPv4 address and for each global IPv6 address
-   on the device, a pushed `ifconfig-ipv6` address included. It also runs
+   on the device, a pushed `ifconfig-ipv6` address included. An IPv6 address
+   openvpn assigns after that read gets its rule when startup reads the
+   device's IPv6 addresses for the kill switch, and the profile is disabled
+   if the rule will not add. It also runs
    with `--persist-tun`, because the table is keyed on the device's ifindex and its routes go with the device: a `ping-restart` or
    `SIGUSR1` reconnect keeps the device and its routing. A reconnect that
    recreates the device anyway — the server pushed different options — is
