@@ -1100,6 +1100,10 @@ pub async fn boot(
     // What the scans add, so a profile the VPN monitor or the kill-switch
     // watch fences mid-scan has it paused.
     let mut scan_fence = ScanFence::new(kill_switch.clone());
+    // Each info-hash the resume scan found in a profile the registry does not
+    // assign it to, and counted. The torrent-dir scan finds the same torrent
+    // again by its `.torrent` beside it, and counts it only once per boot.
+    let mut misplaced: HashSet<(ProfileId, libtorrent_safe::InfoHash)> = HashSet::new();
 
     // Managed pool. Opened before the alert loop so a bad index path fails
     // startup rather than surfacing as a 500 on the first API call, and
@@ -1162,6 +1166,7 @@ pub async fn boot(
                         "profile_assignment_registry_errors_total",
                         &[("profile_id", profile.as_str())],
                     );
+                    misplaced.insert((profile.clone(), ih));
                     continue;
                 }
             }
@@ -1289,6 +1294,32 @@ pub async fn boot(
     // (resume always wins; startup inventory). After this the torrent
     // dir is not re-scanned — new torrents arrive only via the API.
     let scan_save_path = cfg.default_save_path.to_string_lossy().into_owned();
+    // Adoptions `pool.db` holds as waiting for verification. Their claims
+    // and `.torrent`s are in place, but this scan adds in seed mode, which
+    // would skip the hash check they are waiting for: the verify queue adds
+    // them after the scans instead. `None` where the queue cannot be read,
+    // and then no claimed torrent is re-added here, since none can be told
+    // apart from an adoption.
+    let verify_queued: Option<std::collections::HashSet<libtorrent_safe::InfoHash>> =
+        match pool.as_ref() {
+            None => Some(std::collections::HashSet::new()),
+            Some(pool) => match pool.with_store(|s| s.verify_queue()) {
+                Ok(rows) => Some(
+                    rows.iter()
+                        .filter_map(|row| libtorrent_safe::InfoHash::from_hex(&row.infohash))
+                        .collect(),
+                ),
+                Err(e) => {
+                    warn!(
+                        error.cause = %e,
+                        "torrent-dir scan: could not read the persisted verify queue; torrents \
+                         claimed with no resume file are left unloaded rather than risk adding \
+                         an adoption unverified",
+                    );
+                    None
+                }
+            },
+        };
     for profile in source.profiles() {
         let Some(profile_cfg) = profile_registry.config(&profile) else {
             continue;
@@ -1310,9 +1341,42 @@ pub async fn boot(
                 }
                 scan_fence.enforce_all(&profile_registry, &metrics);
             }
-            // Resume data already loaded this torrent (the registry holds
-            // every resume-loaded info-hash after the scan above) — skip.
-            if registry.lookup(&ih).is_some() {
+            // Resume data already loaded this torrent — skip.
+            if loaded.contains(&ih) {
+                continue;
+            }
+            // A claim does not mean a load: `POST /v1/torrents` claims before
+            // its add, and the claim outlives a resume file that was never
+            // written or cannot be read. One this profile holds is re-added
+            // below without claiming again; one another profile holds is the
+            // operator's to reconcile, as in the resume scan.
+            let claimed_here = match registry.lookup(&ih) {
+                None => false,
+                Some(owner) if owner == profile => true,
+                Some(owner) => {
+                    warn!(
+                        profile_id = %profile,
+                        infohash = %ih,
+                        existing_profile = %owner,
+                        ".torrent in wrong profile; skipping (operator must reconcile)",
+                    );
+                    // Counted once: the resume scan counted it already where
+                    // its resume file sits in this profile too.
+                    if !misplaced.contains(&(profile.clone(), ih)) {
+                        metrics.inc_counter(
+                            "profile_assignment_registry_errors_total",
+                            &[("profile_id", profile.as_str())],
+                        );
+                    }
+                    continue;
+                }
+            };
+            // An adoption waiting for verification is the verify queue's to
+            // add, and one the pool recorded `drifted` stays unloaded; see
+            // `pool_holds_back`.
+            if claimed_here
+                && pool_holds_back(pool.as_deref(), verify_queued.as_ref(), &profile, &ih)
+            {
                 continue;
             }
             // The account-isolation guard, before the claim: a `.torrent`
@@ -1335,8 +1399,13 @@ pub async fn boot(
             // Rule 4 again: claim first, load second. Claiming afterwards
             // left a window in which the session held a torrent the registry
             // had never agreed to, and dropped the claim silently if it could
-            // not be written.
-            if let Err(e) = registry.assign(ih, profile.clone()) {
+            // not be written. A claim this profile already holds stands.
+            let claim = if claimed_here {
+                Ok(())
+            } else {
+                registry.assign(ih, profile.clone()).map(drop)
+            };
+            if let Err(e) = claim {
                 warn!(
                     profile_id = %profile,
                     infohash = %ih,
@@ -1366,10 +1435,18 @@ pub async fn boot(
                         .entry(profile.clone())
                         .or_default()
                         .torrent_dir_add += 1;
-                    // Release the claim so a later run can retry the add. A
-                    // release that fails to persist leaves the claim on disk,
-                    // and the next boot skips this torrent as already loaded.
-                    if let Err(e) = registry.remove(&ih) {
+                    // Release the claim this scan made, so nothing holds the
+                    // info-hash for a torrent no session has. A claim held
+                    // before the boot is left as it was: the torrent is one
+                    // the boot left unloaded, which `DELETE` clears, and the
+                    // next boot tries the add again either way, as it does
+                    // where a release fails to persist.
+                    let released = if claimed_here {
+                        Ok(())
+                    } else {
+                        registry.remove(&ih).map(drop)
+                    };
+                    if let Err(e) = released {
                         warn!(
                             profile_id = %profile,
                             infohash = %ih,
@@ -2000,6 +2077,56 @@ fn torrent_dir_save_path(
         &[("profile_id", profile.as_str())],
     );
     default.to_owned()
+}
+
+/// Whether the boot torrent-dir scan must leave a torrent this profile has
+/// claimed unloaded rather than re-add it in seed mode.
+///
+/// - An adoption `pool.db` holds in its verify queue (`verify_queued`) is the
+///   queue's to add after the scans, hashed.
+/// - One the pool index records `drifted` failed its verification, or changed
+///   on disk since, and was paused for it: a seed-mode add would announce a
+///   payload its piece hashes rejected. Adopting it again verifies it.
+/// - Where either cannot be read, none can be told apart from these, so the
+///   torrent stays unloaded, as every claimed torrent did before the scan
+///   re-added any.
+fn pool_holds_back(
+    pool: Option<&crate::pool_service::PoolService>,
+    verify_queued: Option<&HashSet<libtorrent_safe::InfoHash>>,
+    profile: &ProfileId,
+    ih: &libtorrent_safe::InfoHash,
+) -> bool {
+    let Some(queued) = verify_queued else {
+        return true;
+    };
+    if queued.contains(ih) {
+        return true;
+    }
+    let Some(pool) = pool else {
+        return false;
+    };
+    match pool.with_store(|s| s.adoption_state(&ih.to_hex())) {
+        Ok(Some(torrentd_pool::AdoptionState::Drifted)) => {
+            warn!(
+                profile_id = %profile,
+                infohash = %ih,
+                "torrent-dir scan: a claimed torrent with no resume file is recorded drifted; \
+                 leaving it unloaded (adopt it again to verify it)",
+            );
+            true
+        }
+        Ok(_) => false,
+        Err(e) => {
+            warn!(
+                profile_id = %profile,
+                infohash = %ih,
+                error.cause = %e,
+                "torrent-dir scan: could not read a claimed torrent's adoption state; \
+                 leaving it unloaded rather than risk seeding a drifted payload",
+            );
+            true
+        }
+    }
 }
 
 /// What the boot torrent-dir scan hands a session for a `.torrent` no resume
