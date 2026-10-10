@@ -127,7 +127,7 @@ pub fn torrent_metadata(bytes: &[u8]) -> Result<TorrentMeta> {
         slice
             .iter()
             .map(|f| TorrentMetaFile {
-                path: fixed_c_str(&f.path),
+                path: unsafe { sized_str(f.path, f.path_len) },
                 size: f.size,
                 pieces_root: (f.has_pieces_root != 0).then_some(f.pieces_root),
                 pad_file: f.pad_file != 0,
@@ -136,7 +136,7 @@ pub fn torrent_metadata(bytes: &[u8]) -> Result<TorrentMeta> {
     };
 
     let meta = TorrentMeta {
-        name: fixed_c_str(&raw.name),
+        name: unsafe { sized_str(raw.name, raw.name_len) },
         total_size: raw.total_size,
         piece_length: raw.piece_length,
         infohash_v1: (raw.has_v1 != 0).then_some(InfoHash(raw.infohash_v1)),
@@ -146,6 +146,22 @@ pub fn torrent_metadata(bytes: &[u8]) -> Result<TorrentMeta> {
 
     unsafe { ffi::lt_torrent_meta_free(&mut raw) };
     Ok(meta)
+}
+
+/// A shim string returned as a pointer and a byte length, read whole.
+///
+/// The length, not a NUL, bounds it, so nothing is cut short whatever its
+/// size. A null pointer reads as empty.
+///
+/// # Safety
+///
+/// `ptr` is null, or points at `len` readable bytes that outlive the call.
+unsafe fn sized_str(ptr: *const std::os::raw::c_char, len: usize) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 pub(crate) fn fixed_c_str(buf: &[std::os::raw::c_char]) -> String {
@@ -160,5 +176,84 @@ fn err_to_string(buf: &[std::os::raw::c_char]) -> String {
         "unknown shim error".to_string()
     } else {
         s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bstr(out: &mut Vec<u8>, s: &[u8]) {
+        out.extend_from_slice(format!("{}:", s.len()).as_bytes());
+        out.extend_from_slice(s);
+    }
+
+    /// A v1 multi-file `.torrent` named `name`, one byte per file, each
+    /// file's path given as its components. Keys are in bencode's sorted
+    /// order, which libtorrent requires to compute the info-hash.
+    fn multi_file_torrent(name: &str, files: &[Vec<String>]) -> Vec<u8> {
+        let mut info = b"d5:filesl".to_vec();
+        for components in files {
+            info.extend_from_slice(b"d6:lengthi1e4:pathl");
+            for c in components {
+                bstr(&mut info, c.as_bytes());
+            }
+            info.extend_from_slice(b"ee");
+        }
+        info.extend_from_slice(b"e4:name");
+        bstr(&mut info, name.as_bytes());
+        info.extend_from_slice(b"12:piece lengthi16384e6:pieces");
+        // Every file is one byte, so they all fit in a single piece.
+        bstr(&mut info, &[0u8; 20]);
+        info.push(b'e');
+
+        let mut out = b"d4:info".to_vec();
+        out.extend_from_slice(&info);
+        out.push(b'e');
+        out
+    }
+
+    /// Paths deeper than the 1023 bytes the shim's fixed buffers used to cut
+    /// them to, differing only in their last component: each has to come
+    /// back whole, and so distinct.
+    fn assert_long_paths_round_trip(name: &str, component: &str) {
+        let dirs: Vec<String> = std::iter::repeat_n(component.to_owned(), 6).collect();
+        let leaves = ["first.flac", "second.flac"];
+        let files: Vec<Vec<String>> = leaves
+            .iter()
+            .map(|leaf| {
+                let mut c = dirs.clone();
+                c.push((*leaf).to_owned());
+                c
+            })
+            .collect();
+
+        let meta = torrent_metadata(&multi_file_torrent(name, &files)).expect("parses");
+
+        assert_eq!(meta.name, name, "the name must come back whole");
+        let expected: Vec<String> = files
+            .iter()
+            .map(|c| format!("{name}/{}", c.join("/")))
+            .collect();
+        let got: Vec<&str> = meta.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(got, expected, "every path must come back whole");
+        assert!(
+            expected.iter().all(|p| p.len() > 1023),
+            "the fixture must exceed the old 1023-byte limit",
+        );
+        assert_ne!(meta.files[0].path, meta.files[1].path);
+    }
+
+    #[test]
+    fn ascii_paths_over_1023_bytes_are_not_truncated() {
+        assert_long_paths_round_trip("library", &"a".repeat(200));
+    }
+
+    #[test]
+    fn multi_byte_paths_over_1023_bytes_are_not_truncated() {
+        // Three bytes per character: 198 bytes per component, a 240-byte
+        // name, so the last characters sit far past byte 1023.
+        let name = "アルバム".repeat(20);
+        assert_long_paths_round_trip(&name, &"曲".repeat(66));
     }
 }

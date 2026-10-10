@@ -203,11 +203,17 @@ fn parse_meta(bytes: &[u8]) -> lt_torrent_meta {
     meta
 }
 
+/// A shim string returned as a pointer and a length. The NUL after the
+/// `len` bytes is part of the contract, so it is asserted here too.
+fn sized_c_str(ptr: *const c_char, len: usize) -> String {
+    assert!(!ptr.is_null(), "a returned string must not be null");
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(ptr as *const u8, len + 1) };
+    assert_eq!(bytes[len], 0, "a returned string must be NUL-terminated");
+    String::from_utf8_lossy(&bytes[..len]).into_owned()
+}
+
 fn meta_file_path(f: &lt_torrent_meta_file) -> String {
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(f.path.as_ptr() as *const u8, f.path.len()) };
-    let nul = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..nul]).into_owned()
+    sized_c_str(f.path, f.path_len)
 }
 
 #[test]
@@ -225,6 +231,7 @@ fn metadata_reads_v2_root_hashes_and_both_infohashes() {
 
     let files = unsafe { std::slice::from_raw_parts(meta.files, meta.num_files) };
     assert_eq!(meta_file_path(&files[0]), "test64K");
+    assert_eq!(sized_c_str(meta.name, meta.name_len), "test64K");
     assert_eq!(files[0].size, 65536);
     assert_eq!(files[0].has_pieces_root, 1);
     assert_eq!(
@@ -237,6 +244,7 @@ fn metadata_reads_v2_root_hashes_and_both_infohashes() {
     );
 
     unsafe { lt_torrent_meta_free(&mut meta) };
+    assert!(meta.strings.is_null() && meta.name.is_null() && meta.files.is_null());
     // Freeing twice must be safe — the daemon frees on every early return path.
     unsafe { lt_torrent_meta_free(&mut meta) };
 }
@@ -322,6 +330,10 @@ fn metadata_rejects_garbage_without_unwinding() {
     assert_eq!(rc, LT_ERR, "malformed input must return LT_ERR");
     assert_ne!(err[0], 0, "err_out should describe the parse failure");
     assert!(meta.files.is_null(), "no allocation should leak on failure");
+    assert!(
+        meta.strings.is_null(),
+        "no allocation should leak on failure"
+    );
 
     // Null args must not dereference.
     assert_eq!(
@@ -329,6 +341,66 @@ fn metadata_rejects_garbage_without_unwinding() {
         LT_ERR,
     );
     unsafe { lt_torrent_meta_free(ptr::null_mut()) };
+}
+
+/// A v1 multi-file `.torrent` declaring `count` one-byte files at the top
+/// level. The piece hashes are filler: only the parse is under test.
+fn v1_torrent_with_files(count: usize) -> Vec<u8> {
+    const PIECE_LEN: usize = 16 * 1024;
+    let num_pieces = count.div_ceil(PIECE_LEN);
+    let mut out = Vec::with_capacity(count * 32 + 1024);
+    out.extend_from_slice(b"d4:infod5:filesl");
+    for i in 0..count {
+        let name = format!("f{i}");
+        out.extend_from_slice(format!("d6:lengthi1e4:pathl{}:{name}ee", name.len()).as_bytes());
+    }
+    out.extend_from_slice(b"e4:name4:many");
+    out.extend_from_slice(format!("12:piece lengthi{PIECE_LEN}e").as_bytes());
+    out.extend_from_slice(format!("6:pieces{}:", num_pieces * 20).as_bytes());
+    out.extend(std::iter::repeat_n(0xAB_u8, num_pieces * 20));
+    out.extend_from_slice(b"ee");
+    out
+}
+
+#[test]
+fn metadata_refuses_more_than_the_file_cap_and_leaves_out_owning_nothing() {
+    let count = LT_MAX_TORRENT_FILES as usize + 1;
+    let bytes = v1_torrent_with_files(count);
+    // Non-null sentinels: the refusal must overwrite them, not leave a
+    // caller holding pointers it would free.
+    let mut meta: lt_torrent_meta = unsafe { std::mem::zeroed() };
+    meta.files = ptr::dangling_mut();
+    meta.strings = ptr::dangling_mut();
+    meta.name = ptr::dangling();
+    meta.num_files = 7;
+    let mut err = [0 as c_char; 512];
+    let rc = unsafe {
+        lt_torrent_metadata(
+            bytes.as_ptr(),
+            bytes.len(),
+            &mut meta,
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_eq!(rc, LT_ERR, "a manifest over the file cap must be refused");
+    assert!(
+        c_buf(&err).contains("implausible number of files"),
+        "the refusal should be the file-cap one, got {:?}",
+        c_buf(&err),
+    );
+    assert!(meta.files.is_null(), "a refusal must leave files null");
+    assert!(meta.strings.is_null(), "a refusal must leave strings null");
+    assert!(meta.name.is_null(), "a refusal must leave name null");
+    assert_eq!(meta.num_files, 0);
+    // Freeing the zeroed result is a no-op, as every caller's error path does.
+    unsafe { lt_torrent_meta_free(&mut meta) };
+
+    // The cap itself is accepted, so the refusal above is the count check
+    // and not libtorrent failing to parse a manifest this large.
+    let mut at_cap = parse_meta(&v1_torrent_with_files(count - 1));
+    assert_eq!(at_cap.num_files, count - 1);
+    unsafe { lt_torrent_meta_free(&mut at_cap) };
 }
 
 fn hex_of(bytes: &[u8]) -> String {
