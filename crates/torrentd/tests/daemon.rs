@@ -1920,3 +1920,125 @@ fn delete_files_refuses_a_payload_a_torrent_added_over_it_still_serves() {
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
 }
+
+/// Issue #199's acceptance: a rescan never relabels an adopted torrent a
+/// session still holds, whatever its payload reads as.
+///
+/// A root unmounted for maintenance used to commit an empty index for it, so
+/// the rescan turned every adopted torrent on it `missing` while its session
+/// went on seeding, and the rescan after the remount `matched`: the index
+/// offered them all for adoption again. Removed, the root keeps its previous
+/// index; with the root present but the payload gone, the matcher keeps the
+/// verdict of a torrent a session holds. Back in place, it is still adopted.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_rescan_with_the_root_or_payload_gone_keeps_a_loaded_torrent_adopted() {
+    use sha1::Digest;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let root = p.join("pool");
+    let away = p.join("pool-unmounted");
+    let library = p.join("library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    std::fs::write(root.join("a"), b"x").unwrap();
+    let mut torrent = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+    torrent.extend_from_slice(&sha1::Sha1::digest(b"x"));
+    torrent.extend_from_slice(b"ee");
+    std::fs::write(library.join("t.torrent"), &torrent).unwrap();
+    let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+        .unwrap()
+        .to_hex();
+
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\n",
+        root.display(),
+        library.display()
+    ));
+    std::fs::write(&cfg, text).unwrap();
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = KillOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_torrentd"))
+            .arg("--config")
+            .arg(&cfg)
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_healthy(addr);
+
+    let scan = || {
+        let (code, body) = http(addr, "POST", "/v1/pool/scan", None);
+        assert_eq!(code, 200, "{body}");
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()
+    };
+    scan();
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/pool/adoptions",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"selector\":{{\"kind\":\"infohashes\",\
+             \"infohashes\":[\"{ih}\"]}}}}"
+        )),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert_eq!(
+        session_name(addr, &ih, Duration::from_secs(30)).as_deref(),
+        Some("a"),
+        "the adopted torrent never loaded",
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while pool_state(addr, &ih).as_deref() != Some("adopted") {
+        assert!(
+            Instant::now() < deadline,
+            "the adoption never recorded `adopted`: {:?}",
+            pool_state(addr, &ih),
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // The root unmounted: counted as an error, and its previous index kept.
+    std::fs::rename(&root, &away).unwrap();
+    let summary = scan();
+    assert!(summary["errors"].as_u64().unwrap() >= 1, "{summary}");
+    assert_eq!(
+        pool_state(addr, &ih).as_deref(),
+        Some("adopted"),
+        "{summary}"
+    );
+
+    // The root back without the payload: the index finds nothing, and the
+    // session still holds the torrent.
+    std::fs::create_dir_all(&root).unwrap();
+    let summary = scan();
+    assert_eq!(summary["missing"], 1, "{summary}");
+    assert_eq!(
+        pool_state(addr, &ih).as_deref(),
+        Some("adopted"),
+        "{summary}"
+    );
+
+    // The payload back.
+    std::fs::remove_dir(&root).unwrap();
+    std::fs::rename(&away, &root).unwrap();
+    let summary = scan();
+    assert_eq!(summary["matched"], 1, "{summary}");
+    assert_eq!(
+        pool_state(addr, &ih).as_deref(),
+        Some("adopted"),
+        "{summary}"
+    );
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}
