@@ -527,10 +527,18 @@ curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer
 
 **Resume data (#109, #110).** A torrent's first resume file is saved as soon
 as the session adds it, unless the profile already holds one for it, as it
-does for every torrent the boot loads from its resume file; after that, resume data is saved every 30 minutes and
-by the shutdown drain. A crash loses whatever changed since the last save,
-such as a pause. A torrent killed before its first save landed has no resume
-file at all:
+does for every torrent the boot loads from its resume file. It is saved
+again at once when a recheck finishes (`POST /v1/torrents/{ih}/recheck`, the
+verify queue's, the disk-error retry's), when a pool relocation's move
+completes, and when `POST /v1/torrents/{ih}/pause` or a failed verification
+pauses the torrent. Otherwise resume data is saved every 30 minutes and by the
+shutdown drain, so a crash loses whatever else changed since the last save,
+such as the pauses of a profile's `pause-all`, of `POST /v1/torrents/pause-all`
+and of a VPN fence. A torrent whose resume file still names the
+directory a relocation moved it from, because the crash came before that
+save landed, is re-added where its `.save_path` record and the pool index
+both say it went. A torrent killed before its first save landed has no
+resume file at all:
 
 - **Added through `POST /v1/torrents` or adopted from the pool.** The boot
   finds its `.torrent` and re-adds it at the save path recorded beside it
