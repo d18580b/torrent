@@ -1443,6 +1443,35 @@ mod tests {
         );
     }
 
+    /// Each live vpn profile carries `profile_vpn_fenced_total{reason=
+    /// "kill_switch"}` at 0 from boot, so `increase()` over the first fence the
+    /// kill switch puts on has an earlier sample to measure from.
+    ///
+    /// Drop `KILL_SWITCH_FENCE_REASON` from the seeded reasons and this fails.
+    #[test]
+    fn every_vpn_profile_is_seeded_with_a_zero_kill_switch_fence_count() {
+        use crate::profile_registry::test_entry;
+
+        let profiles = ProfileRegistry::new(vec![
+            test_entry("account_a", ProfileStatus::Active),
+            test_entry("account_b", ProfileStatus::Active),
+        ]);
+        let metrics = PromSink::new();
+
+        seed_baselines(&profiles, &metrics);
+
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        for id in ["account_a", "account_b"] {
+            let line = format!(
+                "torrentd_profile_vpn_fenced_total{{profile_id=\"{id}\",reason=\"kill_switch\"}} 0"
+            );
+            assert!(
+                exported.lines().any(|l| l == line),
+                "expected `{line}`; got:\n{exported}",
+            );
+        }
+    }
+
     fn answering(
         ip: Option<IpAddr>,
         route: Option<RouteProbe>,
