@@ -1456,8 +1456,11 @@ On a scratch pool, not your real one.
    with a `save_path` inside a managed root, then try a `delete_orphans` plan
    over that path. It must refuse, naming the info-hash: claims are written
    by the matcher, so the index cannot prove anything about a torrent it has
-   not placed. This is derived from live session state, so restarting the
-   daemon does not clear it — only a rescan does.
+   not placed. This is derived from what the daemon owns - every loaded
+   torrent, every registry assignment and every queued adoption - so
+   restarting the daemon does not clear it, and neither does a profile that
+   failed to come up: its torrents are still owned while no session holds
+   them. Only a rescan that places them does.
 4. **Mutations are off.** Without `allow_mutations = true`, `POST
    /v1/pool/plans` and `DELETE /v1/torrents/{infohash}?delete_files=true` both
    answer 403 `mutations-disabled`.
@@ -1991,5 +1994,6 @@ run it by hand instead, start the service again afterwards:
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it leaves the link standing and does not tear it down, because it cannot vouch for it and removing it would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced. An operator restart is required by design. |
-| Delete plan refuses, "no claims in the index" | Torrents are loaded that the matcher has not placed. Run `pool scan` and rebuild the plan. |
+| Delete plan refuses, "no claims in the index" | Torrents the daemon owns - loaded, assigned in the registry, or queued for verification - that the matcher has not placed. Run `pool scan` and rebuild the plan. A torrent whose profile is down and whose payload the matcher cannot place keeps refusing until its profile loads it or it is removed. |
+| Relocate step fails, "is not loaded, but the registry assigns it" | The torrent belongs to a profile that did not load it, so its resume data and save path name the source directory. Bring the profile up and apply the plan again. |
 | Everything paused after a restart | Resume data records the paused flag, and the VPN monitor pauses a whole profile when its tunnel drops. Check `GET /v1/profiles`, then `POST /v1/profiles/<id>/resume-all`. |

@@ -80,6 +80,11 @@ pub struct PoolService {
     /// Every adoption writes its `.torrent` here, because the resume scan
     /// re-attaches metadata from this store alone.
     torrents: std::sync::OnceLock<Arc<dyn TorrentStore>>,
+    /// Which profile each torrent is assigned to, loaded or not. Set once by
+    /// the daemon; absent for `torrentd pool …`, which applies no plan. A
+    /// torrent whose profile failed at boot is here and not in `loaded`, and
+    /// a plan must still treat its payload as owned.
+    registry: std::sync::OnceLock<Arc<AssignmentRegistry>>,
 }
 
 impl std::fmt::Debug for PoolService {
@@ -136,7 +141,66 @@ impl PoolService {
             metrics: std::sync::OnceLock::new(),
             loaded: std::sync::OnceLock::new(),
             torrents: std::sync::OnceLock::new(),
+            registry: std::sync::OnceLock::new(),
         })))
+    }
+
+    /// The assignment registry, so a plan knows every torrent the daemon
+    /// owns and not only the ones a session loaded. The daemon sets this
+    /// once after opening; a second call is ignored.
+    pub fn set_registry(&self, registry: Arc<AssignmentRegistry>) {
+        let _ = self.registry.set(registry);
+    }
+
+    /// How many torrents the registry assigns; 0 where none is set. O(1).
+    pub fn registry_len(&self) -> usize {
+        self.registry.get().map_or(0, |r| r.len())
+    }
+
+    /// Every info-hash the daemon owns: loaded in `state`, assigned in the
+    /// registry, or waiting in the verify queue, in memory or in `pool.db`.
+    ///
+    /// The state map alone misses each torrent a session never loaded - its
+    /// profile failed at boot, its trackers fell outside the profile's list,
+    /// its resume add failed - and its assignment and payload still stand.
+    pub fn owned_infohashes(&self, state: &StateMap) -> Result<Vec<String>, String> {
+        let mut owned: std::collections::BTreeSet<String> =
+            state.infohashes().iter().map(|ih| ih.to_hex()).collect();
+        if let Some(registry) = self.registry.get() {
+            registry.for_each(|ih, _| {
+                owned.insert(ih.to_hex());
+            });
+        }
+        owned.extend(self.verify.held());
+        let rows = self
+            .with_store(|s| s.verify_queue())
+            .map_err(|e| e.to_string())?;
+        owned.extend(rows.into_iter().map(|r| r.infohash));
+        Ok(owned.into_iter().collect())
+    }
+
+    /// Why `infohash`, which no session holds, still belongs to a profile:
+    /// a registry assignment, a queued adoption, or an owner in the pool
+    /// index. `None` when nothing owns it.
+    pub fn unloaded_owner(&self, infohash: &str) -> Result<Option<String>, String> {
+        if let Some(profile) = libtorrent_safe::InfoHash::from_hex(infohash)
+            .and_then(|ih| self.registry.get().and_then(|r| r.lookup(&ih)))
+        {
+            return Ok(Some(format!(
+                "the registry assigns it to profile {profile}"
+            )));
+        }
+        if self.verify.held().iter().any(|ih| ih == infohash) {
+            return Ok(Some("it is waiting in the verify queue".into()));
+        }
+        self.with_store(|s| -> Result<Option<String>, torrentd_pool::PoolError> {
+            if s.verify_queue()?.iter().any(|r| r.infohash == infohash) {
+                return Ok(Some("it is waiting in the verify queue".into()));
+            }
+            Ok(s.profile_of(infohash)?
+                .map(|p| format!("the pool index records profile {p} as its owner")))
+        })
+        .map_err(|e| e.to_string())
     }
 
     /// The sessions' torrent store, which adoption writes each adopted
@@ -725,6 +789,18 @@ impl VerifyQueue {
 
     pub fn enqueue(&self, item: PendingVerify) {
         self.pending.lock().push_back(item);
+    }
+
+    /// Every info-hash the queue holds, waiting or in flight.
+    fn held(&self) -> Vec<String> {
+        let mut held: Vec<String> = self
+            .pending
+            .lock()
+            .iter()
+            .map(|p| p.infohash.clone())
+            .collect();
+        held.extend(self.in_flight.lock().iter().map(|f| f.infohash.clone()));
+        held
     }
 
     /// Wait on `infohash`, already in a session, for its verdict.
@@ -1958,6 +2034,33 @@ mod tests {
 
     fn owner_of(pool: &super::PoolService, ih: InfoHash) -> Option<String> {
         pool.with_store(|s| s.profile_of(&ih.to_hex()).unwrap())
+    }
+
+    /// The in-memory verify queue alone makes a torrent owned: an item
+    /// waiting or in flight with no registry claim, no `pool.db` row, and no
+    /// index owner is still refused by a relocate and kept by a delete plan.
+    #[test]
+    fn the_in_memory_verify_queue_alone_makes_a_torrent_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let waiting = InfoHash::from_hex(&"a1".repeat(20)).unwrap();
+        let flying = InfoHash::from_hex(&"b2".repeat(20)).unwrap();
+        let pool = pool_with(dir.path(), waiting, None);
+        let state = torrentd_engine::StateMap::new();
+
+        assert_eq!(pool.unloaded_owner(&waiting.to_hex()).unwrap(), None);
+        assert_eq!(pool.unloaded_owner(&flying.to_hex()).unwrap(), None);
+        assert!(pool.owned_infohashes(&state).unwrap().is_empty());
+
+        pool.verify_queue().enqueue(pending(waiting, "p"));
+        pool.verify_queue().track_in_flight(flying.to_hex());
+        assert!(pool.with_store(|s| s.verify_queue().unwrap()).is_empty());
+
+        for ih in [waiting, flying] {
+            let why = pool.unloaded_owner(&ih.to_hex()).unwrap();
+            assert_eq!(why.as_deref(), Some("it is waiting in the verify queue"));
+        }
+        let owned = pool.owned_infohashes(&state).unwrap();
+        assert_eq!(owned, vec![waiting.to_hex(), flying.to_hex()]);
     }
 
     /// The enqueue writes the pool index's owner before the worker runs, so a
