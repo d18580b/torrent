@@ -34,8 +34,10 @@ WatchdogSec=60s
 
 # Start: tunnel bring-up (up to 30 s a profile) plus the resume and
 # torrent-dir scans, minutes at 100K torrents. The daemon sends
-# EXTEND_TIMEOUT_USEC every 10 s while it boots, for up to 15 minutes, so
-# this bounds a boot that has stopped making progress rather than a large one.
+# EXTEND_TIMEOUT_USEC every 10 s while it boots, for as long as the boot keeps
+# getting further: the profiles' bring-up finishing, each store read and every
+# 256 scanned entries gives it 15 more minutes. So this bounds a boot that has
+# gone 15 minutes without progress, not a large one.
 TimeoutStartSec=90s
 # Stop: the HTTP drain (10 s), pool work finishing its current step (up to
 # 20 s), the resume drain (shutdown_drain_secs, default 60 s), then closing

@@ -1235,7 +1235,12 @@ The unit is `Type=notify`: `READY=1` once the HTTP listener is bound,
 `WATCHDOG=1` while the alert loop is making progress, `STOPPING=1` as the
 shutdown begins, and `EXTEND_TIMEOUT_USEC` while a long boot or drain is
 still running, so `TimeoutStartSec`/`TimeoutStopSec` bound a phase that has
-stalled rather than one that is merely large. The watchdog ping is withheld if
+stalled rather than one that is merely large. A boot is extended for as long
+as it keeps getting further — the profiles' bring-up finishing, each resume
+or torrent directory read, every 256 entries a scan gets through — and stops
+being extended 15 minutes after its last such step, so a 100K-torrent scan on
+slow storage is not cut off however long it takes. A stop is extended up to
+the sum of its stages' own bounds. The watchdog ping is withheld if
 the alert loop stops advancing, so a wedged daemon gets restarted rather than
 reported healthy.
 
