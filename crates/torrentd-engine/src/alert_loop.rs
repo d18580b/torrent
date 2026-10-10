@@ -60,6 +60,7 @@ use tracing::Span;
 use crate::clock::Clock;
 use crate::engine::TorrentEngine;
 use crate::handlers::listen::ListenFailures;
+use crate::handlers::warning::TrackerFailureLog;
 use crate::handlers::HandlerCtx;
 use crate::handlers::{self};
 use crate::metrics::MetricsSink;
@@ -462,6 +463,9 @@ fn run(
     // than derived from the last listen alert: a profile's sockets each
     // report on their own.
     let mut listen_failures = ListenFailures::default();
+    // How many tracker failures each profile has warned about in its current
+    // window, so an outage across every torrent is a bounded number of lines.
+    let mut tracker_failures = TrackerFailureLog::default();
 
     loop {
         // 0) Liveness stamp. Written at the top of every iteration so a loop
@@ -482,6 +486,7 @@ fn run(
                 &clock,
                 hooks.profile_fenced.as_ref(),
                 &mut listen_failures,
+                &mut tracker_failures,
             );
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
@@ -581,6 +586,7 @@ fn run(
                 &clock,
                 hooks.profile_fenced.as_ref(),
                 &mut listen_failures,
+                &mut tracker_failures,
             );
         }
         if let Some(why) = fatal {
@@ -600,6 +606,7 @@ fn run(
                 &clock,
                 hooks.profile_fenced.as_ref(),
                 &mut listen_failures,
+                &mut tracker_failures,
             );
             hooks.unsaved_at_shutdown.store(unsaved, Ordering::Relaxed);
             return;
@@ -709,6 +716,7 @@ fn dispatch_alert(
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
     listen_failures: &mut ListenFailures,
+    tracker_failures: &mut TrackerFailureLog,
 ) {
     let Some(engine) = source.engine_for(&profile) else {
         warn!(
@@ -734,6 +742,9 @@ fn dispatch_alert(
         profile_id: profile,
         span,
     };
+    // Any alert of the profile closes a tracker-failure window that has run
+    // its length, so its summary is written even after the tracker goes quiet.
+    handlers::warning::close_failure_window(&ctx, tracker_failures);
 
     match &alert {
         Alert::AddTorrent { .. } | Alert::TorrentRemoved { .. } => {
@@ -759,7 +770,7 @@ fn dispatch_alert(
         | Alert::StorageMoved { .. }
         | Alert::StorageMovedFailed { .. } => handlers::storage::handle(&alert, &mut ctx),
         Alert::TrackerError { .. } | Alert::Warning { .. } | Alert::TrackerReply { .. } => {
-            handlers::warning::handle(&alert, &mut ctx)
+            handlers::warning::handle(&alert, &mut ctx, tracker_failures)
         }
 
         // Peer disconnects are per-peer churn, not an operational condition;
@@ -1047,6 +1058,7 @@ fn run_shutdown(
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
     listen_failures: &mut ListenFailures,
+    tracker_failures: &mut TrackerFailureLog,
 ) -> u64 {
     let started = clock.now();
     let started_count = state.len();
@@ -1065,6 +1077,7 @@ fn run_shutdown(
         clock,
         profile_fenced,
         listen_failures,
+        tracker_failures,
     ) && clock.now() < stop_at
     {}
 
@@ -1111,6 +1124,7 @@ fn run_shutdown(
             clock,
             profile_fenced,
             listen_failures,
+            tracker_failures,
         );
         if state.pending_resume_count() == 0 {
             break;
@@ -1165,6 +1179,7 @@ fn drain_once(
     clock: &Arc<dyn Clock>,
     profile_fenced: Option<&ProfileFenced>,
     listen_failures: &mut ListenFailures,
+    tracker_failures: &mut TrackerFailureLog,
 ) -> bool {
     let alerts = source.drain();
     let drained = !alerts.is_empty();
@@ -1180,6 +1195,7 @@ fn drain_once(
             clock,
             profile_fenced,
             listen_failures,
+            tracker_failures,
         );
     }
     drained
@@ -2440,6 +2456,7 @@ mod tests {
             &clock,
             None,
             &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.len(), 1);
@@ -2485,6 +2502,7 @@ mod tests {
             &clock,
             None,
             &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2516,6 +2534,7 @@ mod tests {
             &clock,
             None,
             &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 1);
@@ -2559,6 +2578,7 @@ mod tests {
             &clock,
             None,
             &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2608,6 +2628,7 @@ mod tests {
             &clock,
             None,
             &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
         (
             unsaved,
@@ -2741,6 +2762,7 @@ mod tests {
                 &clock,
                 None,
                 &mut ListenFailures::default(),
+                &mut TrackerFailureLog::default(),
             )
         };
 
@@ -2810,6 +2832,7 @@ mod tests {
             &clock,
             None,
             &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 0);
@@ -2845,6 +2868,7 @@ mod tests {
             &clock,
             None,
             &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(state.pending_resume_count(), 1);
@@ -2907,6 +2931,7 @@ mod tests {
             &clock,
             None,
             &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(unsaved, 0, "every save settles inside the deadline");
@@ -2949,6 +2974,7 @@ mod tests {
             &clock,
             None,
             &mut ListenFailures::default(),
+            &mut TrackerFailureLog::default(),
         );
 
         assert_eq!(unsaved, 0);

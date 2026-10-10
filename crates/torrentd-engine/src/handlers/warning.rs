@@ -13,6 +13,17 @@
 //! from the fixed lists below. No per-torrent and no per-tracker-URL label:
 //! either would give every torrent a series of its own, and the URL carries
 //! the passkey. Which torrent and which tracker are in the log line.
+//!
+//! A tracker failure is warned at most [`TRACKER_FAILURE_WARNS_PER_WINDOW`]
+//! times per profile per [`TRACKER_FAILURE_WINDOW`] (see
+//! [`TrackerFailureLog`]). A tracker outage or a bulk pause starts a failure
+//! streak on every torrent at once, and one warn line each at 100K torrents is
+//! enough to trip journald's per-unit rate limit, which then drops the lines an
+//! operator needs, such as a fence's own errors.
+
+use std::collections::HashMap;
+use std::time::Duration;
+use std::time::Instant;
 
 use libtorrent_safe::Alert;
 use libtorrent_safe::AlertKind;
@@ -20,6 +31,91 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::handlers::HandlerCtx;
+use crate::profile::ProfileId;
+
+/// How many tracker failures one profile warns about individually in one
+/// [`TRACKER_FAILURE_WINDOW`]. The rest are logged at `debug` and counted into
+/// one summary warn when the window closes.
+pub const TRACKER_FAILURE_WARNS_PER_WINDOW: u64 = 10;
+
+/// The window [`TRACKER_FAILURE_WARNS_PER_WINDOW`] is counted over.
+pub const TRACKER_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+
+/// The alert loop's record of how many tracker failures each profile has
+/// warned about in its current window, and how many it held back to `debug`.
+///
+/// A window opens at a profile's first failure and closes on the first alert
+/// of that profile dispatched [`TRACKER_FAILURE_WINDOW`] or more after it
+/// opened; every profile posts a state update every few seconds, so the
+/// summary of a closed window is written within moments of its end. At most
+/// `TRACKER_FAILURE_WARNS_PER_WINDOW + 1` warn lines per profile per window,
+/// whatever the number of torrents.
+#[derive(Debug, Default)]
+pub struct TrackerFailureLog {
+    windows: HashMap<ProfileId, FailureWindow>,
+}
+
+#[derive(Debug)]
+struct FailureWindow {
+    opened: Instant,
+    warned: u64,
+    suppressed: u64,
+}
+
+impl TrackerFailureLog {
+    /// Whether this failure, at `now`, may be warned about individually.
+    /// Counts it either way.
+    fn admit(&mut self, profile: &ProfileId, now: Instant) -> bool {
+        let window = self
+            .windows
+            .entry(profile.clone())
+            .or_insert(FailureWindow {
+                opened: now,
+                warned: 0,
+                suppressed: 0,
+            });
+        if window.warned < TRACKER_FAILURE_WARNS_PER_WINDOW {
+            window.warned += 1;
+            true
+        } else {
+            window.suppressed += 1;
+            false
+        }
+    }
+
+    /// Close `profile`'s window if it is due at `now`, returning how many
+    /// failures it held back from `warn`.
+    fn close_due(&mut self, profile: &ProfileId, now: Instant) -> Option<u64> {
+        let window = self.windows.get(profile)?;
+        if now.saturating_duration_since(window.opened) < TRACKER_FAILURE_WINDOW {
+            return None;
+        }
+        let suppressed = window.suppressed;
+        self.windows.remove(profile);
+        Some(suppressed)
+    }
+}
+
+/// Close the profile's tracker-failure window if it has run its length, and
+/// warn once with the count of failures it logged at `debug` only. The alert
+/// loop calls this for every alert it dispatches, so a window closes even
+/// after the tracker goes quiet.
+pub fn close_failure_window(ctx: &HandlerCtx<'_>, log: &mut TrackerFailureLog) {
+    let Some(suppressed) = log.close_due(&ctx.profile_id, ctx.clock.now()) else {
+        return;
+    };
+    if suppressed == 0 {
+        return;
+    }
+    let _enter = ctx.span.enter();
+    warn!(
+        target: "torrentd_engine::handler::tracker",
+        suppressed,
+        window_secs = TRACKER_FAILURE_WINDOW.as_secs(),
+        "more tracker announces failed than were logged individually; the rest are at debug \
+         and every one is in tracker_alerts_total{{kind=\"error\"}}",
+    );
+}
 
 /// `tracker_alerts_total{kind}`: every value this handler can emit.
 pub const TRACKER_KINDS: &[&str] = &["error", "reply", "warning", "scrape_failed"];
@@ -32,7 +128,10 @@ pub const SESSION_KINDS: &[&str] = &[
     "performance_warning",
 ];
 
-pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
+/// `failures` is the loop's per-profile record of how many tracker failures
+/// were warned about in the current window; see [`TrackerFailureLog`].
+pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>, failures: &mut TrackerFailureLog) {
+    close_failure_window(ctx, failures);
     let _enter = ctx.span.enter();
     let profile = ctx.profile_id.as_str();
     match alert {
@@ -48,9 +147,21 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             //
             // Warned once per streak — a tracker that is down fails every
             // announce, and one line per announce per torrent would bury the
-            // journal. The counter sees every one.
-            if *times_in_row <= 1 {
+            // journal. And a streak's start is warned only while the
+            // profile's window has room: an outage starts a streak on every
+            // torrent at once. The counter sees every one.
+            let first = *times_in_row <= 1;
+            if first && failures.admit(&ctx.profile_id, ctx.clock.now()) {
                 warn!(
+                    target: "torrentd_engine::handler::tracker",
+                    infohash = hdr.infohash.map(|i| i.to_string()).unwrap_or_default(),
+                    error.code = *error_code,
+                    error.cause = %message,
+                    "tracker announce failed",
+                );
+            } else if first {
+                // Held back by the window; its summary warn counts this one.
+                debug!(
                     target: "torrentd_engine::handler::tracker",
                     infohash = hdr.infohash.map(|i| i.to_string()).unwrap_or_default(),
                     error.code = *error_code,
@@ -134,9 +245,12 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     use libtorrent_safe::alert::AlertHeader;
+    use parking_lot::Mutex;
 
     use super::*;
     use crate::clock::MockClock;
@@ -176,8 +290,173 @@ mod tests {
             profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
-        handle(&alert, &mut ctx);
+        handle(&alert, &mut ctx, &mut TrackerFailureLog::default());
         metrics.calls()
+    }
+
+    /// Counts the `warn` events dispatched to it and records the
+    /// `suppressed` field of each, so a test can bound the journal lines.
+    #[derive(Default)]
+    struct WarnCounter {
+        warns: AtomicUsize,
+        suppressed: Mutex<Vec<u64>>,
+    }
+
+    struct Suppressed<'a>(&'a Mutex<Vec<u64>>);
+
+    impl tracing::field::Visit for Suppressed<'_> {
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            if field.name() == "suppressed" {
+                self.0.lock().push(value);
+            }
+        }
+        fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    }
+
+    impl tracing::Subscriber for WarnCounter {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.warns.fetch_add(1, Ordering::Relaxed);
+                event.record(&mut Suppressed(&self.suppressed));
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    fn first_failure(n: u8) -> Alert {
+        Alert::TrackerError {
+            hdr: AlertHeader {
+                kind: AlertKind::TrackerError,
+                infohash: Some(libtorrent_safe::InfoHash([n; 20])),
+                handle: None,
+                timestamp_us: 0,
+            },
+            error_code: 36,
+            times_in_row: 1,
+            tracker_url: "http://t/announce?passkey=secret".into(),
+            message: String::new(),
+        }
+    }
+
+    #[test]
+    fn ten_thousand_first_failures_on_one_profile_warn_a_bounded_number_of_times() {
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = RecordingSink::new();
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let mut failures = TrackerFailureLog::default();
+        let counter = Arc::new(WarnCounter::default());
+        let ctx_for = || HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: ProfileId::new("p"),
+            span: tracing::info_span!("test"),
+        };
+
+        tracing::subscriber::with_default(Arc::clone(&counter), || {
+            for i in 0..10_000u32 {
+                handle(
+                    &first_failure((i % 251) as u8),
+                    &mut ctx_for(),
+                    &mut failures,
+                );
+            }
+        });
+        let total = TRACKER_FAILURE_WARNS_PER_WINDOW as usize;
+        assert_eq!(counter.warns.load(Ordering::Relaxed), total);
+        // Every one is still counted.
+        assert_eq!(metrics.calls().len(), 10_000);
+
+        // Before the window ends, another alert closes nothing.
+        clock.advance(TRACKER_FAILURE_WINDOW - Duration::from_secs(1));
+        tracing::subscriber::with_default(Arc::clone(&counter), || {
+            close_failure_window(&ctx_for(), &mut failures);
+        });
+        assert_eq!(counter.warns.load(Ordering::Relaxed), total);
+
+        // The first alert after it closes the window with one summary
+        // counting what was held back.
+        clock.advance(Duration::from_secs(1));
+        tracing::subscriber::with_default(Arc::clone(&counter), || {
+            close_failure_window(&ctx_for(), &mut failures);
+            close_failure_window(&ctx_for(), &mut failures);
+        });
+        assert_eq!(counter.warns.load(Ordering::Relaxed), total + 1);
+        assert_eq!(
+            *counter.suppressed.lock(),
+            vec![10_000 - TRACKER_FAILURE_WARNS_PER_WINDOW]
+        );
+
+        // A new window warns again.
+        tracing::subscriber::with_default(Arc::clone(&counter), || {
+            handle(&first_failure(1), &mut ctx_for(), &mut failures);
+        });
+        assert_eq!(counter.warns.load(Ordering::Relaxed), total + 2);
+    }
+
+    #[test]
+    fn each_profile_has_its_own_tracker_failure_window() {
+        let mut log = TrackerFailureLog::default();
+        let now = Instant::now();
+        let (a, b) = (ProfileId::new("a"), ProfileId::new("b"));
+        for _ in 0..TRACKER_FAILURE_WARNS_PER_WINDOW {
+            assert!(log.admit(&a, now));
+        }
+        assert!(!log.admit(&a, now));
+        assert!(log.admit(&b, now), "a's window spilled into b's");
+        let later = now + TRACKER_FAILURE_WINDOW;
+        assert_eq!(log.close_due(&a, later), Some(1));
+        assert_eq!(log.close_due(&b, later), Some(0));
+        assert!(log.windows.is_empty(), "a closed window is kept");
+    }
+
+    #[test]
+    fn a_continuing_streak_never_takes_a_place_in_the_window() {
+        let mut failures = TrackerFailureLog::default();
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = RecordingSink::new();
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: ProfileId::new("p"),
+            span: tracing::info_span!("test"),
+        };
+        let again = Alert::TrackerError {
+            hdr: hdr(AlertKind::TrackerError),
+            error_code: 111,
+            times_in_row: 2,
+            tracker_url: String::new(),
+            message: String::new(),
+        };
+        for _ in 0..100 {
+            handle(&again, &mut ctx, &mut failures);
+        }
+        assert!(failures.windows.is_empty());
     }
 
     fn labels_of(calls: &[MetricCall]) -> Vec<(String, Vec<(String, String)>)> {

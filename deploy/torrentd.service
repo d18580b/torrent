@@ -45,6 +45,14 @@ TimeoutStartSec=90s
 # stop is bounded even where the extensions do not arrive.
 TimeoutStopSec=120s
 
+# Logging. No LogRateLimitIntervalSec=/LogRateLimitBurst=, so journald's
+# defaults apply: 10000 lines per 30 s for this unit, after which it drops the
+# rest of that window's lines, including errors. The daemon keeps its own
+# bursts under that: a tracker outage or a fence across every torrent warns at
+# most 10 tracker failures per profile per minute plus one summary with the
+# count of the rest, which are at debug. Raise the burst here only for a
+# debug-level filter, which logs every one.
+
 # Resource limits Environment.
 LimitNOFILE=65536
 TasksMax=8192
