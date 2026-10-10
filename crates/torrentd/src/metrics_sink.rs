@@ -147,6 +147,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "disk_error_retry_errors_total" Counter Profile Zero => "Retry-timer resumes that failed.";
     "alert_queue_overflows_total" Counter Profile Zero =>
         "Times libtorrent's alert queue overflowed and dropped alerts.";
+    "alert_translate_errors_total" Counter Profile Zero =>
+        "Alerts libtorrent posted that the daemon dropped because it could not translate them; \
+         each may be a torrent's removal or a resume save's answer the daemon never saw.";
     "resume_saves_requeued_total" Counter Profile Zero =>
         "Resume saves asked for again because an overflow of this profile's alert queue may \
          have dropped their answer.";
@@ -187,6 +190,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
          what the boot counted; fixed for the life of the process.";
     "boot_alert_queue_overflows" Gauge Profile Owner("always") =>
         "alert_queue_overflows_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_alert_translate_errors" Gauge Profile Owner("always") =>
+        "alert_translate_errors_total as of the first scrape, which already holds what the boot \
          counted; fixed for the life of the process.";
     "boot_session_alerts" Gauge Profile ("kind": BOOT_SESSION_KINDS) Owner("always") =>
         "session_alerts_total for these kinds as of the first scrape, which already holds what \
@@ -337,8 +343,8 @@ pub struct BootCount {
 }
 
 /// See the module docs. The registry is written by both boot scans, the
-/// alert loop starts before the first scrape and counts overflows and
-/// session alerts from the scans' backlog, and the stores and their
+/// alert loop starts before the first scrape and counts overflows, alerts it
+/// could not translate, and session alerts from the scans' backlog, and the stores and their
 /// directory fsyncs are written by both.
 pub const BOOT_COUNTS: &[BootCount] = &[
     BootCount {
@@ -349,6 +355,11 @@ pub const BOOT_COUNTS: &[BootCount] = &[
     BootCount {
         counter: "alert_queue_overflows_total",
         gauge: "boot_alert_queue_overflows",
+        only: None,
+    },
+    BootCount {
+        counter: "alert_translate_errors_total",
+        gauge: "boot_alert_translate_errors",
         only: None,
     },
     BootCount {
@@ -954,6 +965,7 @@ mod tests {
         let p = [("profile_id", "a")];
         sink.add_counter("profile_assignment_registry_errors_total", 2, &p);
         sink.inc_counter("alert_queue_overflows_total", &p);
+        sink.add_counter("alert_translate_errors_total", 2, &p);
         let kind = |k| [("profile_id", "a"), ("kind", k)];
         sink.add_counter("session_alerts_total", 3, &kind("fastresume_rejected"));
         sink.inc_counter("session_alerts_total", &kind("performance_warning"));
@@ -972,6 +984,8 @@ mod tests {
             ("boot_registry_errors", b.to_string(), "0"),
             ("boot_alert_queue_overflows", a.to_string(), "1"),
             ("boot_alert_queue_overflows", b.to_string(), "0"),
+            ("boot_alert_translate_errors", a.to_string(), "2"),
+            ("boot_alert_translate_errors", b.to_string(), "0"),
             (
                 "boot_session_alerts",
                 session("a", "fastresume_rejected"),

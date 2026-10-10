@@ -12,6 +12,8 @@
 //! second per torrent, max).
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
@@ -54,6 +56,11 @@ pub struct RealEngine {
     /// cannot answer it: it also registers torrents an alert names, a removed
     /// one included until its disk jobs finish.
     held: Mutex<HashMap<InfoHash, TorrentHandle>>,
+    /// The session's alert translation failure count as the last
+    /// `pop_alerts` left it, read under the session lock that pop already
+    /// held. Only a pop moves the count, so this is never behind it, and
+    /// [`TorrentEngine::alert_translate_errors`] answers without the lock.
+    translate_errors: AtomicU64,
 }
 
 impl std::fmt::Debug for RealEngine {
@@ -76,6 +83,7 @@ impl RealEngine {
         Self {
             session: Mutex::new(Some(session)),
             held: Mutex::new(HashMap::new()),
+            translate_errors: AtomicU64::new(0),
         }
     }
 
@@ -164,9 +172,17 @@ impl TorrentEngine for RealEngine {
     }
 
     fn pop_alerts(&self) -> Vec<Alert> {
-        self.session()
-            .map(|s| s.drain_alerts_up_to(MAX_ALERTS_PER_POP))
-            .unwrap_or_default()
+        let Ok(session) = self.session() else {
+            return Vec::new();
+        };
+        let alerts = session.drain_alerts_up_to(MAX_ALERTS_PER_POP);
+        self.translate_errors
+            .store(session.alert_translate_errors(), Ordering::Relaxed);
+        alerts
+    }
+
+    fn alert_translate_errors(&self) -> u64 {
+        self.translate_errors.load(Ordering::Relaxed)
     }
 
     fn post_updates(&self) {

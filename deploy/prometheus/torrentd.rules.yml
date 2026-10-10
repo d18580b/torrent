@@ -269,6 +269,19 @@ groups:
         annotations:
           summary: "libtorrent dropped alerts for profile {{ $labels.profile_id }}; the alert loop is falling behind, or a fence, pause-all or set online/offline announced every torrent at once"
 
+      # Any increase: each is one alert the daemon popped and could not
+      # translate, so no handler saw it. It may have been a torrent's removal
+      # or a resume save's answer, which leaves the state map wrong until a
+      # restart. Not a backlog, so nothing here recovers on its own.
+      - alert: TorrentdAlertTranslateErrors
+        expr: >
+          increase(torrentd_alert_translate_errors_total[15m]) > 0
+          or torrentd_boot_alert_translate_errors > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The daemon dropped libtorrent alerts for profile {{ $labels.profile_id }} it could not translate; a torrent's removal or resume save may have gone unseen"
+
       - alert: TorrentdTrackerErrors
         # A fraction of announces, not any error: one dead tracker among many
         # torrents fails on every retry forever, while the rest keep replying.
