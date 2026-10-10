@@ -31,10 +31,13 @@ pub struct Cli {
     /// directory is not yet provisioned, which is the pre-flight case this
     /// flag exists for.
     ///
-    /// Of the host, it probes one thing: that `nft` runs, when
-    /// `network_kill_switch = true`. It does not check VPN prerequisites —
-    /// that profile files are readable, that `ip`, `wg` or `openvpn` are
-    /// installed, or which uid the daemon runs as. Run
+    /// Of the host, it probes two things, both only when
+    /// `network_kill_switch = true`: that this process is not uid 0, which the
+    /// kill switch refuses, and that `nft` runs. The uid judged is the
+    /// invoking process's, not the unit's `User=`, so run it as the daemon's
+    /// user (`sudo -u torrentd torrentd --config <path> --check-config`), not
+    /// as root. It does not check VPN prerequisites — that profile files are
+    /// readable, or that `ip`, `wg` or `openvpn` are installed. Run
     /// `torrentd --config <path> vpn check` for those. That command is kept
     /// out of this flag on purpose: its checks can come back "could not be
     /// checked" for want of a capability, and as a start-up check that would

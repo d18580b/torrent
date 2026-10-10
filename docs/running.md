@@ -35,7 +35,7 @@ runtime and are easy to miss because nothing checks for them at startup:
 | `ip` | `iproute2` / `iproute` | Any deployment with a `vpn` profile. Raises and routes each tunnel, and is polled every 30s per profile for the tunnel IP and the route from it. |
 | `wg` | `wireguard-tools` | WireGuard profiles — bring-up, teardown, handshake age. The daemon raises every link with `ip` and `wg` itself, as root or not, and never runs `wg-quick` (§11.6). |
 | `openvpn`, `kill` | `openvpn`, `util-linux` (`util-linux-core` on Fedora) | OpenVPN profiles. Teardown signals the pid `openvpn --writepid` recorded, after verifying it against `/proc/<pid>/cmdline`. `kill` is spawned as a binary and not as a shell builtin, so `/usr/bin/kill` has to be on the host: that is `util-linux`, not `procps-ng`, which ships `pgrep` and `pkill` and no `kill`. |
-| `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one. |
+| `nft` | `nftables` | Only with `network_kill_switch = true`. `--check-config` pre-flights this one, along with refusing uid 0 for the kill switch. |
 
 A deployment whose profiles are all `network = "host"` needs none of them.
 
@@ -43,8 +43,13 @@ The daemon runs each of them by bare name, looked up on its own `PATH`, and
 treats that environment as trusted: whoever can set it can also change
 `ExecStart=`. The packaged unit sets no `PATH`, so systemd's default for
 system services applies. Do not put a directory writable by anyone but root
-on it. `--check-config` probes only `nft`; `torrentd --config <path> vpn
-check` (§9) checks the rest.
+on it. Of the host, `--check-config` probes two things, both only with
+`network_kill_switch = true`: that `nft` runs, and that it is not running as
+uid 0. That uid is the
+invoking process's, not the unit's `User=`, so run it as the daemon's user:
+`sudo -u torrentd torrentd --config <path> --check-config`; under plain `sudo`
+it judges root and refuses a kill-switch config the daemon would boot.
+`torrentd --config <path> vpn check` (§9) checks the rest.
 
 **The shipped container image is WireGuard-only.** `deploy/Containerfile`'s
 runtime layer installs `iproute`, `wireguard-tools`, `nftables` and
@@ -747,10 +752,12 @@ refused; the top-level key has the same bound. It is not reloadable: a change
 to it is reported on SIGHUP and ignored until a restart, and a SIGHUP that
 changes the *top-level* limit is withheld from any profile that sets its own.
 
-Validate without starting anything:
+Validate without starting anything, as the daemon's own user (the kill
+switch's uid refusal judges the invoking process, so a root `--check-config`
+refuses a kill-switch config the `torrentd` user would boot):
 
 ```bash
-torrentd --config /etc/torrentd/torrentd.toml --check-config
+sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml --check-config
 ```
 
 ## 6. Authentication — required, one way or the other
