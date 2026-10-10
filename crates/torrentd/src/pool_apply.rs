@@ -1891,7 +1891,19 @@ mod tests {
         save_path: &Path,
         files: Option<&[&str]>,
     ) -> (Arc<dyn AlertSource>, StateMap) {
-        let mock = Arc::new(torrentd_engine::MockEngine::new());
+        unclaimed_loaded_on(
+            Arc::new(torrentd_engine::MockEngine::new()),
+            save_path,
+            files,
+        )
+    }
+
+    /// [`unclaimed_loaded`], in `mock`'s session.
+    fn unclaimed_loaded_on(
+        mock: Arc<torrentd_engine::MockEngine>,
+        save_path: &Path,
+        files: Option<&[&str]>,
+    ) -> (Arc<dyn AlertSource>, StateMap) {
         let hash = libtorrent_safe::InfoHash([0xee; 20]);
         let handle = mock.register_handle(hash);
         mock.set_torrent_details(
@@ -1993,22 +2005,36 @@ mod tests {
         pool.scan().unwrap();
         let plan_id = delete_plan(&pool);
 
-        let cases: [(&Path, Option<&[&str]>); 6] = [
-            (&root, Some(&["T/a.bin"])),
-            (dir.path(), None),
-            (dir.path(), Some(&["pool/junk/old.bin"])),
-            (&link, Some(&["junk/old.bin"])),
-            (&below, Some(&["junk/old.bin"])),
-            (&aliased, Some(&["old.bin"])),
+        // Each refusal names the rule that matched and the file it matched on.
+        let cases: [(&Path, Option<&[&str]>, &str); 6] = [
+            (&root, Some(&["T/a.bin"]), "lists T/a.bin, at "),
+            (dir.path(), None, "has no metadata yet and is saved at "),
+            (
+                dir.path(),
+                Some(&["pool/junk/old.bin"]),
+                "lists pool/junk/old.bin, at ",
+            ),
+            (&link, Some(&["junk/old.bin"]), "lists junk/old.bin, at "),
+            (&below, Some(&["junk/old.bin"]), "which a symlink leads to "),
+            (
+                &aliased,
+                Some(&["old.bin"]),
+                "the same file on disk (device and inode) as ",
+            ),
         ];
-        for (save_path, files) in cases {
+        for (save_path, files, rule) in cases {
             let (source, state) = unclaimed_loaded(save_path, files);
             let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
             assert!(
-                e.contains("no claims in the index") && e.contains(&"ee".repeat(20)),
+                e.contains("no claims in the index")
+                    && e.contains(&"ee".repeat(20))
+                    && e.contains(rule),
                 "{save_path:?} {files:?}: {e}"
             );
         }
+        let (source, state) = unclaimed_loaded(&aliased, Some(&["old.bin"]));
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert!(e.contains(&orphan.display().to_string()), "{e}");
         // Above the root, but every file it lists is elsewhere.
         let (source, state) = unclaimed_loaded(dir.path(), Some(&["other/T/a.bin"]));
         check_index_accounts_for_live_state(&pool, &source, &state, &scope_of(&pool, plan_id))
@@ -2021,6 +2047,138 @@ mod tests {
             .unwrap()
             .status;
         assert_eq!(status, torrentd_pool::model::plan_status::DRAFT);
+    }
+
+    /// A plan's scope is the roots its deletes lie under, not every root: an
+    /// unclaimed torrent seeding from under another root has no file among
+    /// this plan's orphans, so it does not block it.
+    #[test]
+    fn an_unclaimed_torrent_under_another_root_does_not_block_a_delete_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("pool");
+        let second = dir.path().join("second");
+        let orphan = write(&first, "junk/old.bin", 64);
+        let seeding = write(&second, "T/a.bin", 64);
+
+        let mut cfg = Config::minimal_for_tests(dir.path(), true);
+        cfg.pool.as_mut().unwrap().roots.push(second.clone());
+        let pool = PoolService::open(&cfg).unwrap().unwrap();
+        pool.scan().unwrap();
+        assert_eq!(
+            pool.roots()[0].1,
+            first,
+            "`delete_plan` plans the first root"
+        );
+        let plan_id = delete_plan(&pool);
+
+        for files in [Some(&["T/a.bin"][..]), None] {
+            let (source, state) = unclaimed_loaded(&second, files);
+            check_index_accounts_for_live_state(&pool, &source, &state, &scope_of(&pool, plan_id))
+                .unwrap_or_else(|e| panic!("refused with files {files:?}: {e}"));
+        }
+        let (source, state) = unclaimed_loaded(&second, Some(&["T/a.bin"]));
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (1, "applied"), "{out:?}");
+        assert!(!orphan.exists(), "the orphan was not trashed");
+        assert!(seeding.exists(), "the other root's payload was touched");
+    }
+
+    /// An unclaimed torrent whose session cannot say where its files lie
+    /// refuses: its profile has no session, or its session read fails.
+    #[test]
+    fn an_unclaimed_torrent_no_session_can_report_blocks_a_delete_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, orphan, _other) = one_orphan_delete_plan(dir.path());
+        let elsewhere = dir.path().join("other");
+
+        // Held by profile `q`, which the source has no session for.
+        let (source, _) = engine_and_state();
+        let state = StateMap::new();
+        let hash = libtorrent_safe::InfoHash([0xee; 20]);
+        state.insert(
+            hash,
+            torrentd_engine::TorrentState::newly_added(
+                torrentd_engine::TorrentHandle {
+                    id: 1,
+                    infohash: hash,
+                },
+                torrentd_engine::ProfileId::new("q"),
+                std::time::Instant::now(),
+            ),
+        );
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert!(
+            e.contains("no claims in the index") && e.contains("profile q, which has no session"),
+            "{e}"
+        );
+
+        for op in ["torrent_details", "torrent_files"] {
+            let mock = Arc::new(torrentd_engine::MockEngine::new());
+            let (source, state) = unclaimed_loaded_on(mock.clone(), &elsewhere, Some(&["T/a.bin"]));
+            mock.inject_error(op, torrentd_engine::EngineError::Shutdown);
+            let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+            assert!(
+                e.contains("no claims in the index")
+                    && e.contains("could not be read from its session"),
+                "{op}: {e}"
+            );
+        }
+
+        assert!(orphan.exists(), "payload was deleted against a stale index");
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, plan_status::DRAFT);
+    }
+
+    /// The between-steps re-check uses the plan's scope too: a torrent loaded
+    /// under the root mid-plan with no claims stops the plan as failed, with
+    /// the step it stopped at failed and its file untouched.
+    #[test]
+    fn an_unclaimed_torrent_loaded_under_the_root_mid_plan_fails_the_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let orphans = [
+            write(&root, "junk/a.bin", 64),
+            write(&root, "junk/b.bin", 64),
+        ];
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        assert_eq!(scope_of(&pool, plan_id).targets.len(), 2);
+
+        // The torrent's session, and its state, held back until the second step.
+        let (source, held) = unclaimed_loaded(&root, Some(&["T/a.bin"]));
+        let hash = libtorrent_safe::InfoHash([0xee; 20]);
+        let late = held.get(&hash).unwrap();
+        let state = StateMap::new();
+        // Polled between steps: loads the torrent once the first step ran.
+        let stop = || {
+            if state.is_empty() && orphans.iter().any(|o| !o.exists()) {
+                state.insert(hash, late.clone());
+            }
+            false
+        };
+        let out = apply(&pool, &source, &state, plan_id, &stop).unwrap();
+        assert_eq!(
+            (out.done, out.failed, out.status.as_str()),
+            (1, 1, "failed"),
+            "{out:?}"
+        );
+        assert_eq!(
+            orphans.iter().filter(|o| o.exists()).count(),
+            1,
+            "the step after the torrent loaded still ran"
+        );
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        let failed = steps
+            .iter()
+            .find(|s| s.status == step_status::FAILED)
+            .expect("a failed step");
+        assert!(
+            failed.error.as_deref().is_some_and(
+                |e| e.contains("no claims in the index") && e.contains("lists T/a.bin")
+            ),
+            "{failed:?}"
+        );
     }
 
     /// A delete plan over one orphan, `pool/junk/old.bin`, in an index at
