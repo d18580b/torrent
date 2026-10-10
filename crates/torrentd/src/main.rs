@@ -374,22 +374,62 @@ fn openapi_cmd(out: Option<&std::path::Path>) -> anyhow::Result<()> {
 /// not yet provisioned, which is the pre-flight case this flag exists for. The
 /// flag's own help text says so.
 ///
-/// What is left here is exactly one thing, and it is here because it is a
-/// probe of the host rather than of the file. `Config::check_boot_rules` moved
+/// What is left here are probes of the host rather than of the file. `Config::check_boot_rules` moved
 /// into `Config::validate`, above the authentication posture, where "shape
 /// before policy" puts every refusal that is a pure function of the config
-/// file; this one is not, and `Config::validate` is also what the SIGHUP pump
+/// file; these are not, and `Config::validate` is also what the SIGHUP pump
 /// and every operator subcommand run. Probing `nft` there refuses a reload,
 /// and refuses `hash-password`, on a machine without nftables — demonstrated —
 /// which is the check-about-serving-in-front-of-a-tool-that-serves-nothing
 /// shape this crate has already repaired twice.
+///
+/// The kill switch's uid refusal is a probe of the host too: whether the
+/// daemon runs as root is not in the file. Made here, it refuses before any
+/// tunnel is raised; left to `killswitch::enable`, it came after every
+/// profile's tunnel and session were up, as a boot failure the unit restarts.
 fn check_config(cfg: &config::Config) -> anyhow::Result<()> {
+    check_config_as(cfg, vpn::killswitch::current_uid)
+}
+
+/// [`check_config`], with the effective uid handed in so a test can be root.
+fn check_config_as(
+    cfg: &config::Config,
+    uid: impl FnOnce() -> std::io::Result<u32>,
+) -> anyhow::Result<()> {
+    if cfg.network_kill_switch {
+        let uid = uid().context("read this process's uid for the kill switch")?;
+        if let Some(refusal) = startup::kill_switch_uid_refusal(uid) {
+            return Err(refusal);
+        }
+    }
     // The kill switch shells out to `nft`; fail the pre-flight check now
     // rather than aborting startup later.
     if cfg.network_kill_switch && !vpn::killswitch::nft_available() {
         anyhow::bail!("network_kill_switch = true but the `nft` binary is not available");
     }
     Ok(())
+}
+
+/// `--check-config`'s reading of a [`check_config`] failure. The uid the
+/// kill switch judges is the invoking process's, not the unit's `User=`:
+/// under `sudo torrentd --check-config` that is root even where the daemon
+/// runs as `torrentd`. So the flag's uid refusal says so, and names the
+/// invocation that judges the daemon's own account. The daemon's pre-flight
+/// does not add this: there the uid judged *is* the daemon's, and the remedy
+/// is to stop running it as root, which the refusal itself already says.
+fn explain_invoking_uid(e: anyhow::Error) -> anyhow::Error {
+    let uid_refusal = e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(vpn::killswitch::is_uid_refusal)
+    });
+    if !uid_refusal {
+        return e;
+    }
+    e.context(
+        "this process runs as uid 0, and the uid judged is the invoking process's, \
+         not the unit's User=; to pre-flight the daemon's own account, run the check \
+         as that user: `sudo -u torrentd torrentd --config <path> --check-config`",
+    )
 }
 
 fn main() -> anyhow::Result<()> {
@@ -425,7 +465,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     if cli.check_config {
-        if let Err(e) = check_config(&cfg) {
+        if let Err(e) = check_config(&cfg).map_err(explain_invoking_uid) {
             refuse_config(&e);
         }
         eprintln!("config OK");
@@ -793,6 +833,44 @@ http_listen = "127.0.0.1:8080"
         ));
         assert!(!cfg.network_kill_switch);
         check_config(&cfg).expect("no kill switch, so no probe and nothing to refuse");
+    }
+
+    #[test]
+    fn check_config_refuses_the_kill_switch_as_root_before_boot() {
+        // As root the kill switch is refused whatever the host has, so the
+        // pre-flight makes the refusal, ahead of the `nft` probe — and both
+        // `--check-config` and the daemon exit 78 for it, before boot raises
+        // a single tunnel only to be refused after all of them are up.
+        let cfg = cfg_from(&format!(
+            "{TOP}network_kill_switch = true\n\n[[profile]]\nid = \"public\"\n\
+             network = \"host\"\nlisten_interfaces = \"0.0.0.0:6881\"\n"
+        ));
+        let e = check_config_as(&cfg, || Ok(0)).expect_err("uid 0 is refused");
+        assert!(startup::is_config_refusal(&e), "got: {e:#}");
+        assert!(format!("{e:#}").contains("non-root user"), "got: {e:#}");
+        // The daemon's pre-flight is judged as the daemon itself, so its
+        // refusal does not send a root daemon to re-run a pre-flight.
+        assert!(!format!("{e:#}").contains("sudo -u torrentd"), "got: {e:#}");
+
+        // `sudo torrentd --check-config` is judged as root, not as the unit's
+        // `User=`; the flag's message says which uid it judged and how to
+        // judge the daemon's, and stays a refusal.
+        let e = explain_invoking_uid(e);
+        assert!(startup::is_config_refusal(&e), "got: {e:#}");
+        assert!(format!("{e:#}").contains("non-root user"), "got: {e:#}");
+        assert!(format!("{e:#}").contains("invoking process"), "got: {e:#}");
+        assert!(format!("{e:#}").contains("sudo -u torrentd"), "got: {e:#}");
+
+        // Any other pre-flight failure is left as it was.
+        let other = explain_invoking_uid(anyhow::anyhow!("no nft"));
+        assert_eq!(format!("{other:#}"), "no nft");
+
+        // With the kill switch off the uid is never read.
+        let off = cfg_from(&format!(
+            "{TOP}\n[[profile]]\nid = \"public\"\nnetwork = \"host\"\n\
+             listen_interfaces = \"0.0.0.0:6881\"\n"
+        ));
+        check_config_as(&off, || unreachable!("no kill switch, no uid")).unwrap();
     }
 
     #[test]

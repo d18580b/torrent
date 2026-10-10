@@ -377,6 +377,23 @@ fn refused(e: anyhow::Error) -> anyhow::Error {
     e.context(ConfigRefused)
 }
 
+/// The kill switch's refusal of `uid`, as a [`ConfigRefused`]: the
+/// pre-flight `main` runs before `boot` makes it, so a daemon running as root
+/// exits 78 before any tunnel is raised rather than 70 after every one is.
+pub fn kill_switch_uid_refusal(uid: u32) -> Option<anyhow::Error> {
+    crate::vpn::killswitch::refusal_for_uid(uid).map(|e| refused(e.into()))
+}
+
+/// The error a failed [`crate::vpn::killswitch::enable`] fails the boot with:
+/// its uid refusal is the configuration's, and anything else (an `nft`
+/// failure, a tunnel address that could not be read) is not.
+fn kill_switch_enable_failure(e: std::io::Error) -> anyhow::Error {
+    let refusal = crate::vpn::killswitch::is_uid_refusal(&e);
+    let e = anyhow::Error::new(e);
+    let e = if refusal { refused(e) } else { e };
+    e.context("install nftables kill switch (network_kill_switch=true)")
+}
+
 /// Whether a boot failure is a [`ConfigRefused`].
 pub fn is_config_refusal(e: &anyhow::Error) -> bool {
     e.downcast_ref::<ConfigRefused>().is_some()
@@ -991,8 +1008,7 @@ pub async fn boot(
                  above, or unset network_kill_switch.",
             );
         }
-        let installed = vpn::killswitch::enable(&tunnels)
-            .context("install nftables kill switch (network_kill_switch=true)")?;
+        let installed = vpn::killswitch::enable(&tunnels).map_err(kill_switch_enable_failure)?;
         cleanup.note_kill_switch();
         // Read back as the watch will read it. A table this host's nft lists
         // in a shape the check does not read as the one rendered would read
@@ -3222,6 +3238,26 @@ mod shutdown_report_tests {
         );
         assert!(format!("{:#}", refused(anyhow::anyhow!("why"))).ends_with(": why"));
         assert!(!is_config_refusal(&anyhow::anyhow!("no profile came up")));
+    }
+
+    #[test]
+    fn the_kill_switch_s_root_refusal_is_the_configuration_s_and_an_nft_failure_is_not() {
+        // As root the kill switch is refused whatever the host does, so a
+        // restart only raises every tunnel again to be refused again: it
+        // exits 78, which the unit does not restart. An `nft` failure might
+        // pass on the next try, so it keeps exiting 70.
+        assert!(kill_switch_uid_refusal(1000).is_none());
+        let pre_flight = kill_switch_uid_refusal(0).expect("uid 0 is refused");
+        assert!(is_config_refusal(&pre_flight));
+        assert!(format!("{pre_flight:#}").contains("non-root user"));
+
+        let enable = crate::vpn::killswitch::refusal_for_uid(0).unwrap();
+        let e = kill_switch_enable_failure(enable);
+        assert!(is_config_refusal(&e), "got: {e:#}");
+        assert!(format!("{e:#}").contains("install nftables kill switch"));
+
+        let e = kill_switch_enable_failure(failed().unwrap_err());
+        assert!(!is_config_refusal(&e), "got: {e:#}");
     }
 
     #[test]
