@@ -356,6 +356,34 @@ impl StateMap {
         }
     }
 
+    /// Track `handle`, a torrent `profile`'s session holds, unless the map
+    /// already tracks that very torrent for that profile. Returns whether it
+    /// inserted a fresh entry.
+    ///
+    /// Every path that learns of a torrent goes through this: the boot scans
+    /// with the handle `add_torrent` returned, the `add_torrent_alert`
+    /// handler, and the reconciliation after libtorrent dropped such alerts.
+    /// More than one of them can report the same torrent, and the later one
+    /// must not reset what the earlier one's entry has gathered since. An
+    /// entry under another handle or profile is a torrent the info-hash has
+    /// outlived, and is replaced, as an add has always replaced it.
+    pub fn track_added(&self, handle: TorrentHandle, profile: &ProfileId, now: Instant) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.entry(handle.infohash) {
+            Entry::Occupied(e) if e.get().handle == handle && e.get().profile_id == *profile => {
+                false
+            }
+            Entry::Occupied(mut e) => {
+                e.insert(TorrentState::newly_added(handle, profile.clone(), now));
+                true
+            }
+            Entry::Vacant(e) => {
+                e.insert(TorrentState::newly_added(handle, profile.clone(), now));
+                true
+            }
+        }
+    }
+
     /// Remove `ih`'s entry if it is `profile`'s and, where `handle` is given,
     /// that torrent's.
     ///

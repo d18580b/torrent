@@ -261,6 +261,9 @@ pub struct MockEngine {
     /// When set, `force_recheck` / `move_storage` synthesize their completion
     /// alert immediately, mirroring libtorrent's async behaviour.
     auto_check: AtomicBool,
+    /// When set, every successful `add_torrent` queues the
+    /// `Alert::AddTorrent` libtorrent posts for it.
+    add_alerts: AtomicBool,
     /// infohash → what `torrent_details` returns. Unset: `default_details`.
     details: DashMap<InfoHash, TorrentDetails>,
     /// infohash → what `torrent_files` returns. Unset: `None` (no metadata).
@@ -296,6 +299,7 @@ impl MockEngine {
             handles: DashMap::new(),
             auto_save_resume: AtomicBool::new(false),
             auto_check: AtomicBool::new(false),
+            add_alerts: AtomicBool::new(false),
             details: DashMap::new(),
             files: DashMap::new(),
             largest_files_copy: AtomicUsize::new(0),
@@ -331,12 +335,19 @@ impl MockEngine {
         self.auto_check.store(on, Ordering::SeqCst);
     }
 
+    /// Queue an `AddTorrent` alert for every successful `add_torrent`, as
+    /// libtorrent does, subject to the alert capacity like any other alert.
+    pub fn with_add_alerts(self, on: bool) -> Self {
+        self.add_alerts.store(on, Ordering::SeqCst);
+        self
+    }
+
     // --- test fixture helpers -----------------------------------------------
 
     /// Bound the alert queue at `n`, dropping what overflows it the way
     /// libtorrent does: silently, reported afterwards only as a bitset of the
-    /// alert *types* lost. Saves are the one type mapped to their real bit
-    /// (37/38, `alert_types.hpp`); any other lost type sets bit 0.
+    /// alert *types* lost. Saves and adds are the types mapped to their real
+    /// bits (37/38 and 67, `alert_types.hpp`); any other lost type sets bit 0.
     pub fn with_alert_capacity(self, n: usize) -> Self {
         *self.alert_capacity.lock() = Some(n);
         self
@@ -346,12 +357,13 @@ impl MockEngine {
     pub fn push_alert(&self, a: Alert) {
         let mut q = self.alerts.lock();
         if self.alert_capacity.lock().is_some_and(|cap| q.len() >= cap) {
-            let bit = match a.kind() {
+            let bit: u32 = match a.kind() {
                 AlertKind::SaveResumeData => 37,
                 AlertKind::SaveResumeDataFailed => 38,
+                AlertKind::AddTorrent => 67,
                 _ => 0,
             };
-            self.dropped_bits.lock()[0] |= 1u64 << bit;
+            self.dropped_bits.lock()[(bit / 64) as usize] |= 1u64 << (bit % 64);
             return;
         }
         q.push_back(a);
@@ -500,7 +512,20 @@ impl TorrentEngine for MockEngine {
                 InfoHash(buf)
             }
         };
-        Ok(self.register_handle(ih))
+        let h = self.register_handle(ih);
+        if self.add_alerts.load(Ordering::SeqCst) {
+            self.push_alert(Alert::AddTorrent {
+                hdr: AlertHeader {
+                    kind: AlertKind::AddTorrent,
+                    infohash: Some(ih),
+                    handle: Some(h),
+                    timestamp_us: 0,
+                },
+                error_code: 0,
+                message: None,
+            });
+        }
+        Ok(h)
     }
 
     fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<(), EngineError> {
@@ -729,6 +754,13 @@ impl TorrentEngine for MockEngine {
             .get(&h.infohash)
             .map(|t| t.clone())
             .unwrap_or_default())
+    }
+
+    /// Every handle `add_torrent` or `register_handle` issued that
+    /// `remove_torrent` has not taken back. Not recorded: it is a query.
+    fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
+        self.check_error("torrents")?;
+        Ok(self.handles.iter().map(|e| *e.value()).collect())
     }
 
     fn close(&self) {

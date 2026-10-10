@@ -11,9 +11,12 @@
 //! is small for the shape of work torrentd does (one engine call per
 //! second per torrent, max).
 
+use std::collections::HashMap;
+
 use libtorrent_safe::AddParams;
 use libtorrent_safe::Alert;
 use libtorrent_safe::FilePage;
+use libtorrent_safe::InfoHash;
 use libtorrent_safe::MoveFlags;
 use libtorrent_safe::ResumeFlags;
 use libtorrent_safe::Session;
@@ -43,6 +46,14 @@ pub struct RealEngine {
     /// `None` once [`TorrentEngine::close`] has destroyed the session; every
     /// call after that answers [`EngineError::Shutdown`].
     session: Mutex<Option<Session>>,
+    /// Every torrent the session holds, by info-hash: what `add_torrent`
+    /// returned, less what `remove_torrent` took out. Written with the
+    /// session lock held, so it changes in the order the session does.
+    ///
+    /// This is [`TorrentEngine::torrents`]' answer. The shim's own handle map
+    /// cannot answer it: it also registers torrents an alert names, a removed
+    /// one included until its disk jobs finish.
+    held: Mutex<HashMap<InfoHash, TorrentHandle>>,
 }
 
 impl std::fmt::Debug for RealEngine {
@@ -56,9 +67,7 @@ impl RealEngine {
     /// libtorrent's `high_performance_seed()` preset.
     pub fn new(settings: &Settings) -> Result<Self, EngineError> {
         let session = Session::new(settings)?;
-        Ok(Self {
-            session: Mutex::new(Some(session)),
-        })
+        Ok(Self::from_session(session))
     }
 
     /// Build from an existing `Session`, such as one restored with
@@ -66,6 +75,7 @@ impl RealEngine {
     pub fn from_session(session: Session) -> Self {
         Self {
             session: Mutex::new(Some(session)),
+            held: Mutex::new(HashMap::new()),
         }
     }
 
@@ -78,12 +88,29 @@ impl RealEngine {
 impl TorrentEngine for RealEngine {
     #[instrument(skip_all, fields(op = "add_torrent"))]
     fn add_torrent(&self, params: AddParams) -> Result<TorrentHandle, EngineError> {
-        Ok(self.session()?.add_torrent(params)?)
+        let session = self.session()?;
+        let h = session.add_torrent(params)?;
+        // The handle the session just returned is the torrent it holds for
+        // the info-hash, whatever was recorded for it before.
+        self.held.lock().insert(h.infohash, h);
+        drop(session);
+        Ok(h)
     }
 
     #[instrument(skip_all, fields(op = "remove_torrent", infohash = %h.infohash, delete_files))]
     fn remove_torrent(&self, h: TorrentHandle, delete_files: bool) -> Result<(), EngineError> {
-        Ok(self.session()?.remove_torrent(h, delete_files)?)
+        let session = self.session()?;
+        let removed = session.remove_torrent(h, delete_files);
+        // Gone either way: removed now, or not a torrent the session holds,
+        // which is what a refusal says. Only where it is still the torrent
+        // recorded, since a stale handle names one the info-hash outlived.
+        let mut held = self.held.lock();
+        if held.get(&h.infohash) == Some(&h) {
+            held.remove(&h.infohash);
+        }
+        drop(held);
+        drop(session);
+        Ok(removed?)
     }
 
     #[instrument(skip_all, fields(op = "pause_torrent", infohash = %h.infohash))]
@@ -159,6 +186,7 @@ impl TorrentEngine for RealEngine {
         // threads, and nothing else should queue behind the lock meanwhile
         // only to be told the session is gone.
         let session = self.session.lock().take();
+        self.held.lock().clear();
         drop(session);
     }
 
@@ -216,6 +244,11 @@ impl TorrentEngine for RealEngine {
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
         Ok(self.session()?.torrent_trackers(h)?)
     }
+
+    fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
+        let _session = self.session()?;
+        Ok(self.held.lock().values().copied().collect())
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +291,116 @@ mod tests {
         s.enable_natpmp = Some(false);
         s.listen_interfaces = Some("127.0.0.1:0".into());
         s
+    }
+
+    /// A one-file, one-piece `.torrent` whose info-hash `n` makes unique.
+    fn tiny_torrent(n: u32) -> Vec<u8> {
+        let name = format!("t{n:08}");
+        let mut out = b"d4:infod6:lengthi1e".to_vec();
+        out.extend_from_slice(format!("4:name{}:{name}", name.len()).as_bytes());
+        out.extend_from_slice(b"12:piece lengthi16384e6:pieces20:");
+        out.extend_from_slice(&[0xab; 20]);
+        out.extend_from_slice(b"ee");
+        out
+    }
+
+    fn add_tiny(engine: &RealEngine, dir: &std::path::Path, n: u32) -> TorrentHandle {
+        engine
+            .add_torrent(AddParams::File {
+                bytes: tiny_torrent(n),
+                save_path: dir.to_string_lossy().into_owned(),
+                flags: TorrentFlags::PAUSED | TorrentFlags::UPLOAD_MODE,
+                trackers: Vec::new(),
+            })
+            .expect("add")
+    }
+
+    #[test]
+    fn torrents_lists_what_the_session_holds() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let engine = RealEngine::new(&local_settings()).expect("session");
+        let (a, b) = (
+            add_tiny(&engine, dir.path(), 1),
+            add_tiny(&engine, dir.path(), 2),
+        );
+        let mut held = engine.torrents().expect("list");
+        held.sort_by_key(|h| h.id);
+        assert_eq!(held, vec![a, b]);
+
+        engine.remove_torrent(a, false).expect("remove");
+        assert_eq!(engine.torrents().expect("list"), vec![b]);
+        // A refused removal of what is already gone changes nothing else.
+        assert!(engine.remove_torrent(a, false).is_err());
+        assert_eq!(engine.torrents().expect("list"), vec![b]);
+
+        engine.close();
+        assert!(matches!(engine.torrents(), Err(EngineError::Shutdown)));
+    }
+
+    /// More torrents added before any alert is popped than the alert queue
+    /// holds, as a boot scan does: libtorrent drops add alerts, and every
+    /// torrent still ends up tracked, under the handle a `DELETE` removes.
+    #[test]
+    fn torrents_whose_add_alerts_overflowed_the_queue_are_all_tracked() {
+        use crate::alert_loop::AlertLoopBuilder;
+        use crate::alert_loop::ShutdownReason;
+        use crate::metrics::RecordingSink;
+        use crate::profile::ProfileId;
+        use crate::resume_store::MemoryResumeStore;
+        use crate::source::ProfileSource;
+        use crate::state::StateMap;
+        use crate::torrent_store::MemoryTorrentStore;
+
+        // libtorrent lets critical alerts, adds among them, fill three times
+        // `alert_queue_size`: 1 500 adds overflow a queue of 100 many times.
+        const ADDS: u32 = 1_500;
+        let mut settings = local_settings();
+        settings.alert_queue_size = Some(100);
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let engine = Arc::new(RealEngine::new(&settings).expect("session"));
+        let added: Vec<TorrentHandle> = (0..ADDS)
+            .map(|n| add_tiny(&engine, dir.path(), n))
+            .collect();
+
+        let p = ProfileId::new("p");
+        let state = Arc::new(StateMap::new());
+        let metrics = Arc::new(RecordingSink::new());
+        let alert_loop = AlertLoopBuilder::new(
+            Arc::new(ProfileSource::new(vec![(p.clone(), engine.clone())])),
+            state.clone(),
+            Arc::new(MemoryResumeStore::new()),
+            Arc::new(MemoryTorrentStore::new()),
+            metrics.clone(),
+            Arc::new(crate::clock::SystemClock),
+        )
+        .shutdown_deadline(Duration::from_secs(1))
+        .spawn();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while state.len() < ADDS as usize && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            metrics.count_for("alert_queue_overflows_total") > 0,
+            "the queue overflowed, or this test proves nothing",
+        );
+        assert_eq!(state.len(), ADDS as usize, "every torrent is tracked");
+        // Fenceable: the VPN monitor pauses what this returns.
+        assert_eq!(state.handles_for_profile(&p).len(), ADDS as usize);
+        // Deletable: `DELETE` removes the handle the entry holds.
+        for h in &added {
+            let st = state.get(&h.infohash).expect("tracked");
+            assert_eq!((st.handle, &st.profile_id), (*h, &p));
+        }
+        engine.remove_torrent(added[0], false).expect("remove");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while state.contains(&added[0].infohash) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!state.contains(&added[0].infohash), "its removal settled");
+
+        alert_loop.signal_shutdown(ShutdownReason::Test);
+        alert_loop.join().expect("alert loop");
     }
 
     /// Many parallel listers paging a 250,000-file torrent, as parallel
