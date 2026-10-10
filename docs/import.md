@@ -150,10 +150,15 @@ sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool scan
 sudo -u torrentd torrentd --config /etc/torrentd/torrentd.toml pool status
 ```
 
-The CLI and the daemon share `pool.db` and one write lock, so a CLI scan while
-the daemon scans is refused rather than interleaved. `POST /v1/pool/scan`
-does the same through the daemon and returns the same counts. Nothing scans
-on its own: the daemon does not scan at boot.
+`pool scan` is for a stopped daemon. It holds `pool.db`'s write lock for the
+whole scan, an hour on a large pool, and every write the daemon made in that
+time would fail, a plan's step journal among them. So it refuses with `… is
+open in another process` while the daemon runs, idle or not, and a daemon
+started during the scan fails to start, with `the pool index is locked by
+another process`, until the scan ends. With the
+daemon up, `POST /v1/pool/scan` does the same scan through the daemon and
+returns the same counts. Nothing scans on its own: the daemon does not scan
+at boot.
 
 | State | Meaning | Adopts |
 | --- | --- | --- |
@@ -261,8 +266,8 @@ which case it is that error's message:
 | `refused by the profile's allowed_tracker_domains` | The torrent announces to a tracker outside the profile's list | Wrong profile, or the list is missing a domain. Never widen the list to fit another account's tracker |
 | `refused: the torrent announces to no tracker at all` | No tracker in the `.torrent` or the resume data | Supply a `.torrent` that carries its trackers |
 | `info-hash already loaded in profile …` | Another profile (or this one) already holds it | Adopt it into that profile, or `DELETE` it there first |
-| `infohash … already assigned to profile …` | The assignment registry gives it to another profile in a row the daemon had not seen yet, such as one `torrentd pool scan` wrote while the daemon ran | Adopt it into that profile, or `DELETE` it there first |
-| `assignment registry database …` | The assignment registry could not be written, or holds a row with an unusable profile id. A `torrentd pool scan` holding the database for longer than the 5-second busy timeout gives `database is locked` | Adopt again once the other writer finishes. For any other cause, the message names the database and what is wrong with it |
+| `infohash … already assigned to profile …` | The assignment registry gives it to another profile in a row the daemon had not seen yet | Adopt it into that profile, or `DELETE` it there first |
+| `assignment registry database …` | The assignment registry could not be written, or holds a row with an unusable profile id. Another process holding the database for longer than the 5-second busy timeout gives `database is locked` | Adopt again once the other writer finishes. For any other cause, the message names the database and what is wrong with it |
 | `the pool index assigns this torrent to profile …` | The index records another profile as its owner, even with no session holding it | Adopt into that profile, or `DELETE` it first, which clears the owner |
 | `profile … is not live`, `profile failed to start: …` | The session is not running | Fix the profile, then adopt |
 | `unknown profile_id` | The profile stopped being configured while the batch ran (an unknown id up front is a `404` for the whole request) | Check the `profile_id` against the configuration, then adopt |
