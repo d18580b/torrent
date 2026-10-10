@@ -1160,6 +1160,123 @@ async fn a_delete_clears_the_pool_index_owner_it_set() {
     }
 }
 
+/// Hold the writer inside a transaction, as a running scan does, until the
+/// returned sender is used or dropped.
+fn hold_writer_as_a_scan(
+    pool: &Arc<PoolService>,
+) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+    let held = Arc::clone(pool);
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        held.with_store_mut(|st| {
+            st.in_transaction(|_| {
+                locked_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                Ok::<(), torrentd_pool::PoolError>(())
+            })
+        })
+        .unwrap();
+    });
+    locked_rx.recv().unwrap();
+    (release_tx, holder)
+}
+
+/// Issue #217: a delete of a loaded torrent answers while a scan holds the
+/// writer. It used to wait out the scan to release the index's owner record,
+/// after the torrent was already gone from the registry, so a client that
+/// timed out and retried got `404` for a delete that had succeeded. The
+/// release lands once the scan lets go.
+#[tokio::test]
+async fn a_delete_answers_while_a_scan_holds_the_writer_and_releases_the_owner_after() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), false);
+    let index = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| {
+        profiles(s);
+        s.pool = Some(pool);
+    });
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    let p = torrentd_engine::ProfileId::new("p");
+    h.state.registry.assign(hash, p.clone()).unwrap();
+    h.state.state.insert(
+        hash,
+        torrentd_engine::TorrentState::newly_added(
+            torrentd_engine::TorrentHandle {
+                id: 1,
+                infohash: hash,
+            },
+            p,
+            std::time::Instant::now(),
+        ),
+    );
+    index.with_store(|st| st.set_profile(IH_A, Some("p")).unwrap());
+    let owner = || index.with_reader(|st| st.profile_of(IH_A).unwrap());
+
+    let (release, holder) = hold_writer_as_a_scan(&index);
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.write("DELETE", &format!("/v1/torrents/{IH_A}")),
+    )
+    .await
+    .expect("the delete waited on the writer");
+    resp.assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(
+        h.state.registry.lookup(&hash),
+        None,
+        "the assignment is gone"
+    );
+    assert_eq!(
+        owner().as_deref(),
+        Some("p"),
+        "the owner record waits for the writer",
+    );
+
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    // Nothing else takes the writer: the release lands on its own.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while owner().is_some() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owner record was never released once the writer was free",
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Issue #217: `delete_files`' co-claimant check reads the committed index,
+/// so a refusal answers while a scan holds the writer rather than after it.
+#[tokio::test]
+async fn a_shared_payload_delete_is_refused_while_a_scan_holds_the_writer() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, root_id) = fixture(dir.path(), true);
+    pool.with_store_mut(|st| {
+        st.replace_claims(IH_B, &[(root_id, "movies/a.bin".to_owned())])
+            .unwrap();
+    });
+    let index = Arc::clone(&pool);
+    let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
+
+    let (release, holder) = hold_writer_as_a_scan(&index);
+    let resp = tokio::time::timeout(
+        Duration::from_secs(5),
+        h.write(
+            "DELETE",
+            &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
+        ),
+    )
+    .await
+    .expect("the co-claimant check waited on the writer");
+    assert_problem(&resp, 409, "payload-shared");
+    release.send(()).unwrap();
+    holder.join().unwrap();
+}
+
 /// Issue #111's acceptance: a torrent adopted into one profile, deleted
 /// without its files, adopts into another. The delete used to leave the
 /// index's `adopted` verdict behind, and adoption refuses `adopted` outright.

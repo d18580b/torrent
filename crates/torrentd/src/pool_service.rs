@@ -62,6 +62,10 @@ pub struct PoolService {
     /// A query-only connection to the same file, which under WAL reads the
     /// last committed index while the writer is held.
     reader: Mutex<PoolStore>,
+    /// Owner releases a `DELETE` could not write because the writer was
+    /// held, applied by whoever takes the writer next: see
+    /// [`PoolService::release_owner_soon`].
+    deferred_releases: Mutex<Vec<DeferredRelease>>,
     /// Root id → absolute path, resolved once at startup from config.
     roots: Vec<(i64, PathBuf)>,
     library_dir: PathBuf,
@@ -85,6 +89,15 @@ pub struct PoolService {
     /// torrent whose profile failed at boot is here and not in `loaded`, and
     /// a plan must still treat its payload as owned.
     registry: std::sync::OnceLock<Arc<AssignmentRegistry>>,
+}
+
+/// An owner release waiting for the writer: [`PoolStore::release_owner`]'s
+/// arguments.
+#[derive(Debug)]
+struct DeferredRelease {
+    infohash: String,
+    profile: String,
+    payload_deleted: bool,
 }
 
 impl std::fmt::Debug for PoolService {
@@ -134,6 +147,7 @@ impl PoolService {
         Ok(Some(Arc::new(Self {
             store: Mutex::new(store),
             reader: Mutex::new(reader),
+            deferred_releases: Mutex::new(Vec::new()),
             roots,
             library_dir: pool_cfg.library_dir.clone(),
             verify: VerifyQueue::new(pool_cfg.max_concurrent_verify),
@@ -394,12 +408,109 @@ impl PoolService {
     /// for anything that only reads, or run the whole operation on the
     /// blocking pool.
     pub fn with_store<T>(&self, f: impl FnOnce(&PoolStore) -> T) -> T {
-        off_worker(|| f(&self.store.lock()))
+        off_worker(|| f(&self.lock_writer()))
     }
 
     /// [`PoolService::with_store`], mutably.
     pub fn with_store_mut<T>(&self, f: impl FnOnce(&mut PoolStore) -> T) -> T {
-        off_worker(|| f(&mut self.store.lock()))
+        off_worker(|| f(&mut self.lock_writer()))
+    }
+
+    /// Take the writer, first applying every owner release
+    /// [`PoolService::release_owner_soon`] deferred while it was held.
+    ///
+    /// Every acquisition goes through here, so a deferred release is in the
+    /// index before anything that takes the writer after the `DELETE`
+    /// answered — an adoption of the same info-hash included — can read or
+    /// overwrite the owner record it clears.
+    fn lock_writer(&self) -> parking_lot::MutexGuard<'_, PoolStore> {
+        let mut store = self.store.lock();
+        self.apply_deferred_releases(&mut store);
+        store
+    }
+
+    fn apply_deferred_releases(&self, store: &mut PoolStore) {
+        let pending = std::mem::take(&mut *self.deferred_releases.lock());
+        for r in pending {
+            match store.release_owner(&r.infohash, &r.profile, r.payload_deleted) {
+                Ok(_) => info!(
+                    target: "torrentd::pool",
+                    infohash = %r.infohash,
+                    profile_id = %r.profile,
+                    "released a deleted torrent's pool index owner record, deferred while the \
+                     writer was held",
+                ),
+                Err(e) => self.note_store_error("release_owner", &e),
+            }
+        }
+    }
+
+    /// Forget that `profile` owns `infohash` in the index, as
+    /// [`PoolStore::release_owner`] does, without waiting for the writer.
+    ///
+    /// A `DELETE` calls this after the torrent is gone from its session and
+    /// the registry. A scan holds the writer for its whole run, which on a
+    /// large pool is minutes to an hour, and the delete's response used to
+    /// wait it out: a client that timed out and retried got `404` for a
+    /// delete that had succeeded. Where the writer is free the release is
+    /// written now. Where it is held, the release is queued and written by
+    /// the next taker of the writer, before that taker's own work, and a
+    /// thread is started to take it so the queue drains as soon as the
+    /// holder lets go even if nothing else asks. Until then the index still
+    /// names `profile` as the owner, so an adoption read off the
+    /// last-committed index lags the registry for the rest of the scan; a
+    /// daemon that stops before the scan ends loses the release, as a failed
+    /// write would, and adoption keeps refusing the torrent elsewhere until
+    /// the record is cleared. A failed write is logged and counted.
+    pub fn release_owner_soon(
+        self: &Arc<Self>,
+        infohash: String,
+        profile: String,
+        payload_deleted: bool,
+    ) {
+        if let Some(mut store) = self.store.try_lock() {
+            off_worker(|| {
+                self.apply_deferred_releases(&mut store);
+                if let Err(e) = store.release_owner(&infohash, &profile, payload_deleted) {
+                    self.note_store_error("release_owner", &e);
+                }
+            });
+            return;
+        }
+        info!(
+            target: "torrentd::pool",
+            infohash = %infohash,
+            profile_id = %profile,
+            "the pool index writer is held, most likely by a scan; the deleted torrent's owner \
+             record is released when it is free",
+        );
+        let first = {
+            let mut pending = self.deferred_releases.lock();
+            pending.push(DeferredRelease {
+                infohash,
+                profile,
+                payload_deleted,
+            });
+            pending.len() == 1
+        };
+        // A queue that already held an entry already has a drainer waiting
+        // on the writer: nothing empties it but a taker of the writer.
+        if !first {
+            return;
+        }
+        let pool = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("pool-release".into())
+            .spawn(move || drop(pool.lock_writer()));
+        if let Err(e) = spawned {
+            warn!(
+                target: "torrentd::pool",
+                op = "release_owner",
+                error.cause = %e,
+                "could not start a thread to release a deleted torrent's owner record; it is \
+                 released by the next request that writes the pool index",
+            );
+        }
     }
 
     /// Run `f` against the read-only connection, inside one read
@@ -556,7 +667,7 @@ impl PoolService {
                 }
             }
         };
-        let mut store = self.store.lock();
+        let mut store = self.lock_writer();
         store.in_transaction(|store| {
             let mut summary = ScanSummary::default();
             let configured: Vec<_> = self.roots.iter().map(|(_, p)| p.clone()).collect();
@@ -2272,6 +2383,47 @@ mod tests {
             s.set_profile(&hex, owner).unwrap();
         });
         pool
+    }
+
+    #[test]
+    fn a_release_deferred_behind_the_writer_lands_before_the_next_takers_work() {
+        // An adoption that takes the writer after a `DELETE` answered must
+        // find the owner record the delete released, not the one it left
+        // queued: otherwise the release would land after the adoption and
+        // clear the owner it just wrote.
+        let dir = tempfile::tempdir().unwrap();
+        let ih = InfoHash([0x91; 20]);
+        let pool = std::sync::Arc::new(pool_with(dir.path(), ih, Some("p")));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let pool = std::sync::Arc::clone(&pool);
+            std::thread::spawn(move || {
+                let _store = pool.store.lock();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+        };
+        held_rx.recv().unwrap();
+
+        pool.release_owner_soon(ih.to_hex(), "p".into(), false);
+        // A second release while the first is queued is applied with it.
+        pool.release_owner_soon(ih.to_hex(), "q".into(), false);
+        assert_eq!(
+            pool.with_reader(|s| s.profile_of(&ih.to_hex()).unwrap())
+                .as_deref(),
+            Some("p"),
+            "the release waits for the writer",
+        );
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(
+            pool.with_store(|s| s.profile_of(&ih.to_hex()).unwrap()),
+            None,
+            "the next taker of the writer saw the record already released",
+        );
+        assert!(pool.deferred_releases.lock().is_empty());
     }
 
     fn owner_of(pool: &super::PoolService, ih: InfoHash) -> Option<String> {
