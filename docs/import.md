@@ -160,7 +160,7 @@ on its own: the daemon does not scan at boot.
 | `missing` | No file found under any root | No |
 | `overlap` | Another torrent claims some of the same files but not the same set | No |
 | `drifted` | A claimed file changed or vanished since it was indexed | Only by hashing |
-| `adopted` | Already loaded into a session | No |
+| `adopted` | Already loaded into a session. A rescan keeps it while a session holds the torrent or a profile owns it, even where its files are now partial or gone (an unmounted root, say); the scan's counts then report it under `partial` or `missing` | No |
 
 Before trusting the counts:
 
