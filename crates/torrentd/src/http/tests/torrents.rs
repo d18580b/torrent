@@ -987,6 +987,30 @@ pub(super) async fn body_framework_rejections(
         waited + Duration::from_secs(1) > deadline && waited <= deadline + Duration::from_secs(1),
         "{method} {path}: cut off at {deadline:?}, not before or long after: {waited:?}",
     );
+    // So is one that declares no length, which the body limit reads whole.
+    let (status, waited) = h.stalled_chunked_body(method, path, Some(&token)).await;
+    assert_eq!(
+        status.as_u16(),
+        408,
+        "{method} {path}: stalled chunked body"
+    );
+    assert!(
+        waited + Duration::from_secs(1) > deadline && waited <= deadline + Duration::from_secs(1),
+        "{method} {path}: chunked body cut off at {waited:?}, not {deadline:?}",
+    );
+    // Without a credential, that body is refused from the head, before a
+    // byte of it is read: it can neither hold the connection until the
+    // deadline nor be buffered up to the limit.
+    let (status, waited) = h.stalled_chunked_body(method, path, None).await;
+    assert_eq!(
+        status.as_u16(),
+        401,
+        "{method} {path}: unauthenticated chunked body"
+    );
+    assert!(
+        waited < Duration::from_secs(1),
+        "{method} {path}: answered only after {waited:?}"
+    );
 }
 
 async fn controls(h: &Harness, e: &Engines) {

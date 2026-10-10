@@ -112,6 +112,15 @@ pub struct Tokens {
     pub metrics: String,
 }
 
+/// How a stalled body says how long it is.
+#[derive(Clone, Copy)]
+enum Framing {
+    /// `content-length: 64`, and fewer bytes sent.
+    Declared,
+    /// `transfer-encoding: chunked`, and no last chunk.
+    Chunked,
+}
+
 /// One daemon's router, and what to authenticate against it with.
 pub struct Harness {
     pub client: TestClient<AppCtx>,
@@ -241,6 +250,31 @@ impl Harness {
         path: &str,
         token: Option<&str>,
     ) -> (StatusCode, std::time::Duration) {
+        self.stalled_body(method, path, token, Framing::Declared)
+            .await
+    }
+
+    /// As [`slow_body`](Self::slow_body), with a body that declares no
+    /// length: `transfer-encoding: chunked`, one chunk, and then nothing.
+    /// kynos' `BodySize` reads such a body whole before the handler runs, so
+    /// this is the request that reaches whatever the group checks before it.
+    pub async fn stalled_chunked_body(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+    ) -> (StatusCode, std::time::Duration) {
+        self.stalled_body(method, path, token, Framing::Chunked)
+            .await
+    }
+
+    async fn stalled_body(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        framing: Framing,
+    ) -> (StatusCode, std::time::Duration) {
         use tokio::io::AsyncReadExt;
         use tokio::io::AsyncWriteExt;
 
@@ -260,10 +294,16 @@ impl Harness {
         let auth = token
             .map(|t| format!("authorization: Bearer {t}\r\n"))
             .unwrap_or_default();
-        let head = format!(
-            "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
-             content-length: 64\r\n{auth}\r\n{{\"pad\": \""
-        );
+        let head = match framing {
+            Framing::Declared => format!(
+                "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+                 content-length: 64\r\n{auth}\r\n{{\"pad\": \""
+            ),
+            Framing::Chunked => format!(
+                "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+                 transfer-encoding: chunked\r\n{auth}\r\n9\r\n{{\"pad\": \"\r\n"
+            ),
+        };
         stream.write_all(head.as_bytes()).await.unwrap();
 
         // A request nothing bounds would otherwise wait forever. The guard is

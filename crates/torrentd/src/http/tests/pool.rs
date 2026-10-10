@@ -169,7 +169,8 @@ const OPERATIONS: &[(&str, &str)] = &[
     ("POST", "/v1/pool/plans/1/apply"),
 ];
 
-/// The body-taking operations mounted without `REQUEST_DEADLINE`.
+/// The body-taking operations mounted without `REQUEST_DEADLINE`, whose body
+/// read alone is bounded, by `BODY_DEADLINE`.
 const UNTIMED: &[(&str, &str)] = &[
     ("POST", "/v1/pool/adoptions"),
     ("POST", "/v1/pool/plans"),
@@ -2020,13 +2021,45 @@ async fn malformed_requests(cov: &Arc<Coverage>) {
             .await;
         assert_eq!(resp.status().as_u16(), 413, "{method} {path}");
         // Applying a plan waits for every step, and adopting or creating a
-        // plan waits on a scan, so the three carry no deadline: a stalled
-        // body there is bounded by nothing, with or without a token
-        // (`docs/running.md` §7). Every other operation cuts one off.
-        if !UNTIMED.contains(&(*method, *path)) {
-            let (status, _) = h.slow_body(method, path, Some(&w)).await;
-            assert_eq!(status.as_u16(), 408, "{method} {path}: stalled body");
+        // plan waits on a scan, so the three bound their body read and not
+        // their handler; a stalled body is cut off at the same 30 s either
+        // way, whether it declared its length or not.
+        let deadline = if UNTIMED.contains(&(*method, *path)) {
+            crate::http::v1::BODY_DEADLINE
+        } else {
+            crate::http::v1::REQUEST_DEADLINE
+        };
+        for (framing, (status, waited)) in [
+            ("declared", h.slow_body(method, path, Some(&w)).await),
+            (
+                "chunked",
+                h.stalled_chunked_body(method, path, Some(&w)).await,
+            ),
+        ] {
+            assert_eq!(
+                status.as_u16(),
+                408,
+                "{method} {path}: stalled {framing} body"
+            );
+            assert!(
+                waited + std::time::Duration::from_secs(1) > deadline
+                    && waited <= deadline + std::time::Duration::from_secs(1),
+                "{method} {path}: stalled {framing} body cut off at {waited:?}, not {deadline:?}",
+            );
         }
+        // Without a credential, a body that declares no length is refused
+        // from the head: nothing reads it, so it can neither stall the
+        // connection nor be buffered.
+        let (status, waited) = h.stalled_chunked_body(method, path, None).await;
+        assert_eq!(
+            status.as_u16(),
+            401,
+            "{method} {path}: unauthenticated chunked body"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "{method} {path}: answered only after {waited:?}"
+        );
     }
     h.assert_conformance();
 }

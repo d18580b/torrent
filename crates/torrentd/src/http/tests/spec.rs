@@ -282,23 +282,18 @@ fn a_bulk_outcome_publishes_how_many_failures_it_names() {
 fn only_operations_with_a_body_declare_a_deadline() {
     // `408` comes from the deadline a body-bearing group carries; one on an
     // operation without a body would be a promise nothing can produce, and
-    // one missing from a body-bearing operation (bar the plan apply, which
-    // waits for minutes by design, and adopting or creating a plan, which
-    // wait on a scan) is a slow body nothing bounds.
+    // one missing from a body-bearing operation is a slow body nothing
+    // bounds. The plan apply and adopting or creating a plan wait for minutes
+    // by design, so their deadline bounds the body read alone, and still
+    // declares the `408`; only the alert drill's test surface has none.
     let doc = doc();
     for (method, path, op) in operations(&doc) {
         let has_body = op.get("requestBody").is_some();
         let has_deadline = op["responses"].get("408").is_some();
-        let long = [
-            "/v1/pool/plans/{plan_id}/apply",
-            "/v1/pool/adoptions",
-            "/v1/pool/plans",
-            "/v1/faults",
-        ]
-        .contains(&path.as_str());
+        let unbounded = path == "/v1/faults";
         assert_eq!(
             has_deadline,
-            has_body && !long,
+            has_body && !unbounded,
             "{method} {path}: body {has_body}, 408 {has_deadline}"
         );
     }
