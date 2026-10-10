@@ -116,6 +116,18 @@ fn build_relocate(
         }
     }
 
+    // A held adopted torrent keeps `adopted` across a rescan that finds its
+    // payload partial or gone, which would read `partial` or `missing` had
+    // nothing held it. A move of a payload that is not all there is refused
+    // the same way for both.
+    if state == Some(AdoptionState::Adopted) && has_unplaced_files(store, infohash)? {
+        return Ok(Err(Refused(
+            "its payload is not all present as of the last rescan; rescan once it is back \
+             before moving it"
+                .into(),
+        )));
+    }
+
     // An adopted torrent keeps `adopted` across a rescan that finds another
     // torrent over its files, so the state alone does not rule sharing out.
     if store.shares_claims(infohash)? {
@@ -400,11 +412,29 @@ fn copies_refusal(ih: &str, area: &str) -> String {
     )
 }
 
+/// Whether the last rescan left any of `infohash`'s on-disk files unclaimed.
+///
+/// The adoption state alone does not say: a held `adopted` torrent keeps
+/// `adopted` across a rescan that finds its payload partial or gone, and then
+/// claims only what resolved, or nothing. A rescan rebuilds the claim table
+/// from one placement per torrent, one claim per file it found, so fewer
+/// claims than on-disk files is exactly a file it did not find.
+pub fn has_unplaced_files(store: &PoolStore, infohash: &str) -> Result<bool, PoolError> {
+    let on_disk = store
+        .torrent_files(infohash)?
+        .iter()
+        .filter(|f| f.is_on_disk())
+        .count();
+    Ok(store.claims_of(infohash)?.len() < on_disk)
+}
+
 /// Collect [`Unresolved`] for `root_id`.
 ///
-/// Only `partial`, `missing` and `overlap` torrents can have unplaced files:
-/// `matched`, `shared` and `adopted` are complete by definition, and `drifted`
-/// is complete as of the last rescan. Those complete ones are where a second
+/// `partial`, `missing` and `overlap` torrents can have unplaced files, and
+/// so can an `adopted` one a session holds while its payload is partial or
+/// gone, which [`has_unplaced_files`] tells apart. `matched` and `shared` are
+/// complete by definition, `drifted` is complete as of the last rescan, and
+/// so is every other `adopted` one. Those complete ones are where a second
 /// complete copy can be, and every copy of each such torrent is collected.
 fn unresolved_payload(
     store: &PoolStore,
@@ -414,12 +444,15 @@ fn unresolved_payload(
     let mut out = Unresolved::default();
     for t in store.torrents()? {
         let state = store.adoption_state(&t.infohash)?;
-        if !matches!(
-            state,
-            None | Some(AdoptionState::Partial)
-                | Some(AdoptionState::Missing)
-                | Some(AdoptionState::Overlap)
-        ) {
+        let incomplete = match state {
+            None
+            | Some(AdoptionState::Partial)
+            | Some(AdoptionState::Missing)
+            | Some(AdoptionState::Overlap) => true,
+            Some(AdoptionState::Adopted) => has_unplaced_files(store, &t.infohash)?,
+            _ => false,
+        };
+        if !incomplete {
             // Complete: nothing unplaced, but possibly more than one copy.
             let files = store.torrent_files(&t.infohash)?;
             let copies = crate::matcher::complete_copies(store, &t, &files)?;

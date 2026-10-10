@@ -1302,6 +1302,16 @@ fn recheck_relocatable(pool: &PoolService, infohash: &str, src: &Path) -> Result
             }
         }
 
+        // A held `adopted` torrent survives a rescan that finds its payload
+        // partial or gone, so completeness is asked of the claim table too.
+        if torrentd_pool::plan::has_unplaced_files(store, infohash).map_err(|e| e.to_string())? {
+            return Err(
+                "its payload is no longer all present as of the last rescan; rescan once it is \
+                 back and rebuild the plan"
+                    .into(),
+            );
+        }
+
         // `adopted` survives a rescan that finds another torrent over the
         // same files, so sharing is asked of the claim table directly.
         if store.shares_claims(infohash).map_err(|e| e.to_string())? {

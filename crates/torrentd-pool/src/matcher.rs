@@ -45,6 +45,11 @@ pub struct MatchStats {
 /// What a torrent still marked drifted reads as after a rescan.
 const DRIFT_NOTE: &str = "on-disk stats changed since the last scan; needs verification";
 
+/// What a held `adopted` torrent whose payload the rescan found nowhere reads
+/// as. It stays `adopted`: a session still holds it.
+const HELD_MISSING_NOTE: &str =
+    "no payload found under any managed root; still adopted while a session holds it";
+
 /// One torrent's placement: which root and base directory its files resolve
 /// against, and how completely.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -161,16 +166,21 @@ fn match_all_inner(
         let copies = search.complete.len();
         let best = search.best;
 
+        // Preserve an existing `adopted` verdict: matching runs on every
+        // rescan and must not relabel a torrent the daemon is seeding, whatever
+        // its payload now reads as. A root unmounted for maintenance, or files
+        // moved out from under a session, would otherwise turn it `missing`,
+        // then `matched` once they return, and the index would offer it for
+        // adoption while a session still serves it. One nothing holds any
+        // more is demoted, or adoption would refuse it for good.
+        let held = loaded.is_none_or(|l| l.contains(&t.infohash) || t.profile.is_some());
+        let keep_adopted = prior == Some(AdoptionState::Adopted) && held;
+
         match best {
             Some(p) if p.is_complete() => {
-                // Preserve an existing `adopted` verdict: matching runs on
-                // every rescan and must not demote a torrent the daemon is
-                // already seeding back to `matched`. One nothing holds any
-                // more is demoted, or adoption would refuse it for good.
-                let held = loaded.is_none_or(|l| l.contains(&t.infohash) || t.profile.is_some());
                 let state = if drift_at.is_some() {
                     AdoptionState::Drifted
-                } else if prior == Some(AdoptionState::Adopted) && held {
+                } else if keep_adopted {
                     AdoptionState::Adopted
                 } else {
                     AdoptionState::Matched
@@ -196,27 +206,54 @@ fn match_all_inner(
                 // Claim what did resolve, so a partially-present torrent still
                 // marks those bytes as spoken for and they are not offered up
                 // as orphans to delete.
+                //
+                // A held `adopted` torrent keeps its verdict and the base it
+                // is served from; the note says what the payload reads as,
+                // and the stats count it as partial, which is what it is.
                 store.replace_claims(&t.infohash, &p.claims)?;
+                let note = format!("{} of {} files present", p.resolved, p.total);
+                let (state, (root_id, base_rel)) = if keep_adopted {
+                    (
+                        AdoptionState::Adopted,
+                        recorded
+                            .as_ref()
+                            .map_or((p.root_id, p.base_rel.as_str()), |(r, b)| (*r, b.as_str())),
+                    )
+                } else {
+                    (AdoptionState::Partial, (p.root_id, p.base_rel.as_str()))
+                };
                 store.set_adoption(
                     &t.infohash,
-                    AdoptionState::Partial,
-                    Some(p.root_id),
-                    Some(&p.base_rel),
+                    state,
+                    Some(root_id),
+                    Some(base_rel),
                     None,
                     drift_at,
-                    Some(&format!("{} of {} files present", p.resolved, p.total)),
+                    Some(&note),
                 )?;
                 stats.partial += 1;
             }
             None => {
+                // A held `adopted` torrent keeps its verdict and its recorded
+                // base, so the next rescan looks there first once the payload
+                // is back.
+                let (state, base, note) = if keep_adopted {
+                    (
+                        AdoptionState::Adopted,
+                        recorded.as_ref(),
+                        Some(HELD_MISSING_NOTE),
+                    )
+                } else {
+                    (AdoptionState::Missing, None, None)
+                };
                 store.set_adoption(
                     &t.infohash,
-                    AdoptionState::Missing,
-                    None,
-                    None,
+                    state,
+                    base.map(|(r, _)| *r),
+                    base.map(|(_, b)| b.as_str()),
                     None,
                     drift_at,
-                    None,
+                    note,
                 )?;
                 stats.missing += 1;
             }
