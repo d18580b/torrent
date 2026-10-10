@@ -8533,7 +8533,7 @@
           "pool"
         ],
         "summary": "Re-hash loaded torrents.",
-        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks started; each torrent reports `checking` until it\nfinishes. A torrent not loaded in any session, or paused (libtorrent does\nnot hash a paused torrent), is skipped with the reason. Only a torrent in\nthe pool index has its outcome recorded: a pass marks it `adopted`, a\nfailure marks it `drifted` and pauses it.",
+        "description": "Asks libtorrent to check each torrent's payload against its piece hashes\n(v1 SHA-1, v2 SHA-256 merkle) — the daemon's only authoritative check.\n`202` means the checks are queued: the verify queue starts them as slots\nfree up, at most `[pool] max_concurrent_verify` at once together with\nadoptions' verifications, and `GET /v1/pool` counts them in\n`verify_queue_depth` while they wait and `verify_in_flight` while they\nhash. Each torrent reports `checking` from when its check starts until it\nfinishes. A torrent not loaded in any session, paused (libtorrent does not\nhash a paused torrent), or without metadata yet is skipped with the\nreason. The queue is held in memory: a restart drops the re-hashes that\nhad not started. Only a torrent in the pool index has its outcome\nrecorded: a pass marks it `adopted`, a failure marks it `drifted` and\npauses it.",
         "operationId": "verify_pool_torrents",
         "requestBody": {
           "content": {
@@ -10651,14 +10651,14 @@
             "maximum": 4294967295.0,
             "minimum": 0.0,
             "format": "uint32",
-            "description": "Adopted torrents waiting for a verification slot."
+            "description": "Adopted torrents, and re-hashes `POST /v1/pool/verifications` queued,\nwaiting for a verification slot."
           },
           "verify_in_flight": {
             "type": "integer",
             "maximum": 4294967295.0,
             "minimum": 0.0,
             "format": "uint32",
-            "description": "Adopted torrents libtorrent is hashing now."
+            "description": "Adopted torrents and re-hashes libtorrent is hashing now: at most\n`[pool] max_concurrent_verify`."
           }
         },
         "type": "object",
@@ -11294,7 +11294,7 @@
               "$ref": "#/components/schemas/InfoHashHex"
             },
             "type": "array",
-            "description": "Torrents libtorrent is now re-hashing."
+            "description": "Torrents queued for a re-hash. Each starts once the verify queue has\na slot free: `[pool] max_concurrent_verify` bounds re-hashes and\nadoptions' verifications together."
           },
           "skipped": {
             "items": {
@@ -11310,7 +11310,7 @@
           "started",
           "skipped"
         ],
-        "description": "Which re-hashes started."
+        "description": "Which re-hashes were queued."
       },
       "AdoptSelector": {
         "oneOf": [

@@ -284,13 +284,16 @@ announces, and seeds to nobody.
 ## 7. Monitoring the queue
 
 Hashing is bounded by `[pool] max_concurrent_verify` (default `4`), so a bulk
-adopt cannot saturate the disk and starve what already seeds. Raise it only
-before the first adopt (§2: changing it needs a restart).
+adopt cannot saturate the disk and starve what already seeds. The bound
+covers a manual verification too: `POST /v1/pool/verifications` only queues
+its re-hashes, and they take slots from the same limit as adoptions, which
+the queue alternates between. Raise it only before the first adopt (§2:
+changing it needs a restart).
 
 | Metric | What it says |
 | --- | --- |
-| `torrentd_pool_verify_queue_depth` | Torrents waiting for a slot |
-| `torrentd_pool_verify_in_flight` | Torrents libtorrent is hashing now |
+| `torrentd_pool_verify_queue_depth` | Torrents waiting for a slot, adoptions and queued re-hashes |
+| `torrentd_pool_verify_in_flight` | Torrents libtorrent is hashing now, adoptions and re-hashes |
 | `torrentd_pool_verify_completed_total` | Verified and seeding; the index records them `adopted` |
 | `torrentd_pool_verify_failed_total` | Failed or dropped |
 
@@ -306,14 +309,24 @@ before the first adopt (§2: changing it needs a restart).
   so it adopts again once the cause is fixed. The log line ends `dropping
   verify`, or reads `verify dropped: …` or `verify add failed`.
 - **A fenced or offline profile** holds the queue: nothing is admitted for it
-  until it is back (`verify held: profile is off the network`).
+  until it is back (`verify held: profile is off the network`, or `re-hash
+  held: …` for a queued re-hash, logged once per profile each second).
+- **A re-hash paused while it checks** keeps its slot until the check ends,
+  because libtorrent goes on with it once the torrent is resumed. Resume or
+  remove the torrent to free the slot; otherwise it is freed after 24 hours.
+- **A dropped re-hash** never started: by the time a slot was free its
+  torrent had been removed, paused, or had no metadata, or libtorrent refused
+  the request. The log reads `re-hash dropped: …`, or ends `dropping the
+  re-hash` or `dropping it`. Verify it again once the cause is fixed.
 
-**The queue survives a restart.** It is kept in `pool.db`, and the boot
+**The adoption queue survives a restart.** It is kept in `pool.db`, and the boot
 queues every torrent still waiting in it again, in order, so
 `torrentd_pool_verify_queue_depth` goes on draining after a restart or crash.
 A torrent that was still hashing comes back from its `.torrent`, is hashed
 again, and has that check's verdict recorded: a failure is paused and marked
-`drifted` exactly as without the restart.
+`drifted` exactly as without the restart. Queued re-hashes are held only in
+memory: a restart drops the ones not yet recorded, so send
+`POST /v1/pool/verifications` again for those still `drifted`.
 [After a crash](operations.md#after-a-crash) covers the rare claim a crash
 can still leave with nothing behind it.
 

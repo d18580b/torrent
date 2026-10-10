@@ -172,7 +172,7 @@ keeps. `GET /v1/server` reports which case applies as `auth.mode`.
   effects already started: an add may still complete, so a retry can get a
   `409` [`torrent-exists`](problems.md#torrent-exists) (re-read the torrent
   rather than adding it again), and a `POST /v1/pool/verifications` may still
-  start its rechecks.
+  queue its rechecks.
   Three pool operations have no deadline and answer only once their work is
   done: `POST /v1/pool/plans/{plan_id}/apply`, which waits for every step of
   a plan, and `POST /v1/pool/adoptions` and `POST /v1/pool/plans`, which wait

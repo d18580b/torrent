@@ -209,6 +209,9 @@ impl TorrentEngine for FaultEngine {
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
         self.inner.torrent_trackers(h)
     }
+    fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
+        self.inner.torrents()
+    }
     fn close(&self) {
         self.inner.close()
     }
