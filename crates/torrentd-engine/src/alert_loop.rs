@@ -26,7 +26,7 @@
 //!   - Listen outcomes: every `listen_succeeded` / `listen_failed` alert is
 //!     published into the `ListenEvents` the daemon supplies, which a NAT-PMP
 //!     rebind waits on before it reports and announces a new port. A
-//!     `listen_failed` for the endpoint a rebind is moving onto
+//!     `listen_failed` on the port a rebind is moving onto, at any address
 //!     ([`ListenEvents::rebind_in_progress`]) is the rebind's to revert and
 //!     is never fatal; the revert's own failure is.
 //!   - Liveness: every iteration stamps a wall-clock heartbeat that
@@ -213,7 +213,7 @@ impl AlertLoopBuilder {
     ///
     /// With two or more live sessions the failure is not fatal: the affected
     /// profile logs, counts and warns, and the others keep serving. Nor is a
-    /// failure on the endpoint a NAT-PMP rebind is moving onto, with any
+    /// failure on the port a NAT-PMP rebind is moving onto, with any
     /// number of sessions ([`ListenEvents::rebind_in_progress`]): the rebind
     /// reverts to its previous port, and a failure of that revert is fatal.
     pub fn fatal_listen_failure(mut self, yes: bool) -> Self {
@@ -489,7 +489,7 @@ fn run(
             // seeding silently stops. Note it, finish dispatching the batch
             // (so the failure is logged and counted), then unwind. Except
             // where a NAT-PMP rebind is moving the session onto that
-            // endpoint: the failure is published below to the waiting
+            // endpoint's port: the failure is published below to the waiting
             // rebind, which puts the previous port back. Asked before the
             // publish, which is what wakes the rebind and ends it.
             if let Alert::ListenFailed { endpoint, .. } = &alert {
@@ -1747,11 +1747,16 @@ mod tests {
 
     /// Run a NAT-PMP renewal of profile `p` from port 6881 to 40001 against
     /// `engine`, with the alert loop publishing into `events`, and have the
-    /// session answer the new port with a `listen_failed` and the revert to
-    /// 6881 with `revert`. Returns the renewal's outcome once it is over.
+    /// session answer the new port with a `listen_failed` on each of the
+    /// device's addresses (IPv6 first, then the tunnel address the rebind
+    /// waits on). Once the revert to 6881 is applied, the session posts
+    /// `late` (outcomes of the reopen onto the new port still queued) and
+    /// then `revert`, the revert's own outcome. Returns the renewal's
+    /// outcome once it is over.
     fn rebind_answered(
         engine: &Arc<MockEngine>,
         events: &Arc<ListenEvents>,
+        late: Vec<Alert>,
         revert: Alert,
     ) -> crate::port_forward::RenewOutcome {
         use crate::port_forward::renew_and_rebind;
@@ -1772,8 +1777,12 @@ mod tests {
                     events.rebind_in_progress(&p, "10.2.0.2:40001"),
                     "the new endpoint is marked before its outcome can arrive",
                 );
+                engine.push_alert(listen_failed_on("fd00::2:40001"));
                 engine.push_alert(listen_failed_on("10.2.0.2:40001"));
                 assert!(wait_for(|| applied_binds(&engine).len() == 2));
+                for alert in late {
+                    engine.push_alert(alert);
+                }
                 engine.push_alert(revert);
             })
         };
@@ -1825,7 +1834,12 @@ mod tests {
             })
             .spawn();
 
-        let out = rebind_answered(&engine, &events, listen_succeeded_alert("10.2.0.2:6881"));
+        let out = rebind_answered(
+            &engine,
+            &events,
+            Vec::new(),
+            listen_succeeded_alert("10.2.0.2:6881"),
+        );
         assert!(
             matches!(
                 &out,
@@ -1865,11 +1879,52 @@ mod tests {
             .listen_events(Arc::clone(&events))
             .spawn();
 
-        rebind_answered(&engine, &events, listen_failed_on("10.2.0.2:6881"));
+        rebind_answered(
+            &engine,
+            &events,
+            Vec::new(),
+            listen_failed_on("10.2.0.2:6881"),
+        );
         assert!(
             wait_for(|| handle.listen_failed()),
             "a failed revert leaves the only session without a listener",
         );
+        handle.join().expect("loop thread panicked");
+    }
+
+    /// The reopen onto the new port reports each of its sockets (TCP and
+    /// uTP, on every address of the device), so a second `listen_failed` for
+    /// the new port can still be queued once the rebind has seen the first
+    /// and applied the revert. The rebind stays in progress until the
+    /// revert's own outcome, so that late failure is not fatal either.
+    #[test]
+    fn a_late_failure_for_the_new_port_during_the_revert_is_not_fatal() {
+        let engine = Arc::new(MockEngine::new());
+        let events = Arc::new(ListenEvents::new());
+        let handle = builder_with(Arc::clone(&engine))
+            .fatal_listen_failure(true)
+            .listen_events(Arc::clone(&events))
+            .spawn();
+
+        rebind_answered(
+            &engine,
+            &events,
+            vec![
+                listen_failed_on("10.2.0.2:40001"),
+                listen_failed_on("fd00::2:40001"),
+            ],
+            listen_succeeded_alert("10.2.0.2:6881"),
+        );
+        assert!(!events.rebind_in_progress(&ProfileId::new("p"), "10.2.0.2:40001"));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !handle.listen_failed(),
+            "a failure for the new port queued ahead of the revert's outcome is the rebind's",
+        );
+
+        // Once the revert's outcome is in, the rebind is over.
+        engine.push_alert(listen_failed_on("fd00::2:40001"));
+        assert!(wait_for(|| handle.listen_failed()));
         handle.join().expect("loop thread panicked");
     }
 

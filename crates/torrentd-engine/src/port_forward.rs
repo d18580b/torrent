@@ -331,21 +331,25 @@ struct ListenEvent {
 struct ListenLog {
     next_seq: u64,
     recent: VecDeque<ListenEvent>,
-    /// The endpoints a rebind is moving a profile onto, one entry per
+    /// The ports a rebind is moving a profile onto, one entry per
     /// [`RebindInProgress`] held.
-    rebinding: Vec<(ProfileId, SocketAddr)>,
+    rebinding: Vec<(ProfileId, u16)>,
 }
 
-/// A rebind of `profile` onto `endpoint`, in progress until dropped. While
-/// one is held, a `listen_failed` for that endpoint belongs to the rebind,
-/// which reverts to the previous port, and the alert loop does not read it
-/// as the session losing its listener ([`ListenEvents::rebind_in_progress`]).
+/// A rebind of `profile` onto `port`, in progress until dropped. While one
+/// is held, a `listen_failed` on that port, at any address, belongs to the
+/// rebind, which reverts to the previous port, and the alert loop does not
+/// read it as the session losing its listener
+/// ([`ListenEvents::rebind_in_progress`]). Any address, because the session
+/// listens on every address the tunnel device holds
+/// ([`crate::profile::bind_endpoint`]), IPv6 ones included, and each of
+/// them reports its own outcome for the new port.
 #[must_use = "the rebind is in progress only while this is held"]
 #[derive(Debug)]
 pub struct RebindInProgress<'a> {
     events: &'a ListenEvents,
     profile: ProfileId,
-    endpoint: SocketAddr,
+    port: u16,
 }
 
 impl Drop for RebindInProgress<'_> {
@@ -354,7 +358,7 @@ impl Drop for RebindInProgress<'_> {
         if let Some(i) = log
             .rebinding
             .iter()
-            .position(|(p, ep)| *p == self.profile && *ep == self.endpoint)
+            .position(|(p, port)| *p == self.profile && *port == self.port)
         {
             log.rebinding.swap_remove(i);
         }
@@ -409,21 +413,21 @@ impl ListenEvents {
         self.published.notify_all();
     }
 
-    /// Mark a rebind of `profile` onto `endpoint` as in progress, until the
+    /// Mark a rebind of `profile` onto `port` as in progress, until the
     /// returned guard is dropped. Taken before the change is applied, so no
     /// outcome of it can reach the alert loop unmarked.
-    pub fn begin_rebind(&self, profile: &ProfileId, endpoint: SocketAddr) -> RebindInProgress<'_> {
-        self.log.lock().rebinding.push((profile.clone(), endpoint));
+    pub fn begin_rebind(&self, profile: &ProfileId, port: u16) -> RebindInProgress<'_> {
+        self.log.lock().rebinding.push((profile.clone(), port));
         RebindInProgress {
             events: self,
             profile: profile.clone(),
-            endpoint,
+            port,
         }
     }
 
-    /// Whether a rebind of `profile` onto `endpoint` (a listen alert's
-    /// `address:port` text) is in progress. An endpoint that does not parse
-    /// is never one.
+    /// Whether a rebind of `profile` onto the port of `endpoint` (a listen
+    /// alert's `address:port` text) is in progress, whatever its address.
+    /// An endpoint that does not parse is never one.
     pub fn rebind_in_progress(&self, profile: &ProfileId, endpoint: &str) -> bool {
         let Some(endpoint) = parse_listen_endpoint(endpoint) else {
             return false;
@@ -432,7 +436,7 @@ impl ListenEvents {
             .lock()
             .rebinding
             .iter()
-            .any(|(p, ep)| p == profile && *ep == endpoint)
+            .any(|(p, port)| p == profile && *port == endpoint.port())
     }
 
     /// A position in the stream: [`ListenEvents::wait_for`] considers only
@@ -555,9 +559,10 @@ pub struct Reannounce {
 /// `listen_interfaces` changes, so a retry that re-applied the endpoint
 /// already set would never produce an outcome to wait for. From before the
 /// new port is applied until the revert's outcome arrives (or
-/// `target.timeout` passes), the new endpoint is marked as rebinding
-/// ([`ListenEvents::begin_rebind`]), so the alert loop does not read its
-/// `listen_failed` as fatal and the revert gets to run. A rebind is not
+/// `target.timeout` passes), the new port is marked as rebinding
+/// ([`ListenEvents::begin_rebind`]), so the alert loop does not read a
+/// `listen_failed` on it, at any of the device's addresses, as fatal and the
+/// revert gets to run. A rebind is not
 /// attempted at all while nothing publishes listen outcomes
 /// ([`ListenEvents::is_attached`]), nor once the profile has been fenced
 /// ([`RebindTarget::fenced`], [`RebindFailure::Fenced`]).
@@ -631,9 +636,9 @@ pub fn renew_and_rebind(
             };
             let new_endpoint = SocketAddr::new(tunnel_ip, port);
             // Held until the rebind is settled, so a `listen_failed` for the
-            // new port is the rebind's to revert, not a fatal loss of the
-            // session's listener.
-            let _rebinding = target.listen.begin_rebind(target.profile, new_endpoint);
+            // new port, on any of the device's addresses, is the rebind's to
+            // revert, not a fatal loss of the session's listener.
+            let _rebinding = target.listen.begin_rebind(target.profile, port);
             let cursor = target.listen.cursor();
             if engine.apply_settings(&listen_on(port)).is_err() {
                 return failed(RebindFailure::Apply);
@@ -1166,13 +1171,15 @@ mod tests {
     }
 
     #[test]
-    fn a_rebind_is_in_progress_only_for_its_profile_and_endpoint_while_held() {
+    fn a_rebind_is_in_progress_only_for_its_profile_and_port_while_held() {
         let (p, listen) = (ProfileId::new("p"), ListenEvents::new());
-        let endpoint = SocketAddr::new(TUNNEL, 40001);
         assert!(!listen.rebind_in_progress(&p, "10.2.0.2:40001"));
-        let first = listen.begin_rebind(&p, endpoint);
-        let second = listen.begin_rebind(&p, endpoint);
+        let first = listen.begin_rebind(&p, 40001);
+        let second = listen.begin_rebind(&p, 40001);
         assert!(listen.rebind_in_progress(&p, "10.2.0.2:40001"));
+        // The session listens on each of the device's addresses, IPv6 too.
+        assert!(listen.rebind_in_progress(&p, "fd00::2:40001"));
+        assert!(listen.rebind_in_progress(&p, "fe80::1%3:40001"));
         assert!(!listen.rebind_in_progress(&ProfileId::new("other"), "10.2.0.2:40001"));
         assert!(!listen.rebind_in_progress(&p, "10.2.0.2:6881"));
         assert!(!listen.rebind_in_progress(&p, "not an endpoint"));
