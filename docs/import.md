@@ -48,10 +48,13 @@ but copying only the part named in §3 keeps the scan short.
 The shipped unit runs the daemon as `torrentd` with `ProtectSystem=strict`
 and `ProtectHome=yes` ([`deploy/torrentd.service`](../deploy/torrentd.service)).
 
-- **Payload must be readable by `torrentd`.** An unreadable directory looks
-  exactly like an empty one: the scan counts it under `errors` (and
-  `torrentd_pool_scan_errors_total{kind="walk"}` or `"stat"`), and the
-  torrents over it read `missing`. If you will use `allow_mutations` (plans
+- **Payload must be readable by `torrentd`.** The scan counts an unreadable
+  directory under `errors` (and `torrentd_pool_scan_errors_total{kind="walk"}`
+  or `"stat"`). An unreadable subdirectory of a root is indexed as empty, so
+  the torrents over it read `missing`. An unreadable or missing root keeps the
+  index from its last readable scan, so the torrents over it keep their
+  previous state; a root that was never read has no index, and its torrents
+  read `missing`. If you will use `allow_mutations` (plans
   that move or delete payload, or `DELETE … ?delete_files=true`), it must be
   writable too.
 - **Every root and `library_dir` goes in `ReadWritePaths=`.** A path the unit

@@ -480,8 +480,10 @@ impl PoolService {
     /// predicate the delete path trusts.
     pub fn scan(&self) -> anyhow::Result<ScanSummary> {
         // Each skipped entry was a `warn` line and a number in the API
-        // response; an unreadable root indexes as empty, and a delete plan
-        // built on an empty index is the dangerous case.
+        // response. An unreadable root keeps its previous index rather than
+        // indexing as empty, but an unreadable subdirectory still indexes as
+        // empty, and a delete plan built on a hole in the index is the
+        // dangerous case.
         let count = |s: &torrentd_pool::ScanStats| {
             for (kind, n) in &s.errors_by_kind {
                 if let Some(m) = self.metrics.get() {
