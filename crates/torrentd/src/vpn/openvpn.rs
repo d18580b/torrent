@@ -96,8 +96,10 @@
 //!   hook the file names can run.
 //! * The file is read before `openvpn` is spawned, and by `--check-config`
 //!   ([`config_refusal`]), and a file naming a hook, a plugin, a
-//!   management interface, a nested `config`, or a directive that changes
-//!   how openvpn runs its own process is refused with the directive named
+//!   management interface, a nested `config`, a directive that changes
+//!   how openvpn runs its own process, or one that has openvpn write a path
+//!   the file chooses (`log`, `status` and the like) is refused with the
+//!   directive named
 //!   ([`refused_directive`]). The flag alone would let a `plugin` or
 //!   `management` line through, and would leave a hook to fail at runtime
 //!   with a warning rather than at load with the line that names it.
@@ -182,50 +184,73 @@ fn refusal_reason(name: &str, args: &[String]) -> Option<&'static str> {
             Some("changes how openvpn runs its own process, which is the daemon's to decide")
         }
         "config" => Some("includes another file, which this check does not read"),
+        "log"
+        | "log-append"
+        | "status"
+        | "replay-persist"
+        | "ifconfig-pool-persist"
+        | "tls-export-cert" => {
+            Some("makes openvpn create or overwrite a path the file chooses, as the daemon's user")
+        }
         _ => None,
     }
 }
 
-/// The tokens of one `.ovpn` line, split the way openvpn splits them:
-/// whitespace separates, `"…"` and `'…'` quote, and a `\` outside single
-/// quotes escapes the next character. Empty for a blank line or one whose
-/// first non-blank character is `#` or `;`.
+/// The tokens of one `.ovpn` line, split the way openvpn's `parse_line`
+/// splits them. A word that starts with `"` or `'` is quoted, and it ends
+/// at its closing quote: `"plugin"/x.so` is the two words `plugin` and
+/// `/x.so`. A quote anywhere else in a word is an ordinary character.
+/// Whitespace (C's `isspace`) ends an unquoted word, a `\` outside single
+/// quotes makes the next character literal, and a `#` or `;` where a word
+/// would start ends the line.
+///
+/// Where openvpn rejects a line instead (an unclosed quote, a `\` before a
+/// character it may not escape), the words read so far are returned all
+/// the same, so such a line is scanned rather than skipped.
 fn tokens(line: &str) -> Vec<String> {
-    let line = line.trim_start();
-    if line.starts_with('#') || line.starts_with(';') {
-        return Vec::new();
+    #[derive(PartialEq)]
+    enum State {
+        Initial,
+        Unquoted,
+        Quoted,
+        SingleQuoted,
     }
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r');
     let mut out = Vec::new();
     let mut cur = String::new();
-    let mut in_token = false;
-    let mut quote: Option<char> = None;
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some('\''), '\'') | (Some('"'), '"') => quote = None,
-            (q, '\\') if q != Some('\'') => {
-                if let Some(next) = chars.next() {
-                    cur.push(next);
-                }
-                in_token = true;
-            }
-            (None, '"' | '\'') => {
-                quote = Some(c);
-                in_token = true;
-            }
-            (None, c) if c.is_whitespace() => {
-                if in_token {
-                    out.push(std::mem::take(&mut cur));
-                    in_token = false;
-                }
-            }
-            (_, c) => {
-                cur.push(c);
-                in_token = true;
-            }
+    let mut state = State::Initial;
+    let mut backslash = false;
+    for c in line.chars() {
+        if !backslash && c == '\\' && state != State::SingleQuoted {
+            backslash = true;
+            continue;
         }
+        let mut done = false;
+        let mut keep = None;
+        match state {
+            State::Initial if c == '#' || c == ';' => return out,
+            State::Initial if space(c) => {}
+            State::Initial if !backslash && c == '"' => state = State::Quoted,
+            State::Initial if !backslash && c == '\'' => state = State::SingleQuoted,
+            State::Initial => {
+                keep = Some(c);
+                state = State::Unquoted;
+            }
+            State::Unquoted if !backslash && space(c) => done = true,
+            State::Quoted if !backslash && c == '"' => done = true,
+            State::SingleQuoted if c == '\'' => done = true,
+            State::Unquoted | State::Quoted | State::SingleQuoted => keep = Some(c),
+        }
+        if let Some(c) = keep {
+            cur.push(c);
+        }
+        if done {
+            out.push(std::mem::take(&mut cur));
+            state = State::Initial;
+        }
+        backslash = false;
     }
-    if in_token {
+    if state != State::Initial {
         out.push(cur);
     }
     out
@@ -1019,6 +1044,21 @@ mod tests {
         refused_directive("crl-verify /etc/openvpn/crl.pem\nscript-security 0\n").unwrap();
     }
 
+    /// Words split the way openvpn's `parse_line` splits them: a quoted
+    /// word ends at its closing quote, a quote inside a word is an
+    /// ordinary character, and `#`/`;` where a word would start ends the
+    /// line.
+    #[test]
+    fn tokens_split_where_openvpn_splits() {
+        assert_eq!(tokens("\"plugin\"/x.so"), ["plugin", "/x.so"]);
+        assert_eq!(tokens("'a b'\"c\" d"), ["a b", "c", "d"]);
+        assert_eq!(tokens("pl\"ugin\" /x"), ["pl\"ugin\"", "/x"]);
+        assert_eq!(tokens("remote h # up /x"), ["remote", "h"]);
+        assert_eq!(tokens("remote h#x"), ["remote", "h#x"]);
+        assert_eq!(tokens("a\\ b \"c\\\"d\" ''"), ["a b", "c\"d", ""]);
+        assert!(tokens("  ; up /x").is_empty());
+    }
+
     /// Every directive #229 lists, and the spellings openvpn reads as the
     /// same directive, is refused with its line and its name. Drop one from
     /// `refusal_reason`, or stop reading a spelling, and this fails.
@@ -1046,10 +1086,24 @@ mod tests {
             ("chroot /var/empty", "chroot"),
             ("cd /etc/openvpn", "cd"),
             ("config /etc/openvpn/more.conf", "config"),
+            ("log /var/lib/torrentd/resume/x.fastresume", "log"),
+            ("log-append /var/lib/torrentd/x", "log-append"),
+            ("status /var/lib/torrentd/x 10", "status"),
+            ("replay-persist /var/lib/torrentd/x", "replay-persist"),
+            ("tls-export-cert /var/lib/torrentd", "tls-export-cert"),
+            (
+                "ifconfig-pool-persist /var/lib/torrentd/x",
+                "ifconfig-pool-persist",
+            ),
             // The spellings openvpn reads as the same directive.
             ("--up /x", "up"),
             ("  \"up\" /x", "up"),
             ("u\\p /x", "up"),
+            // A closing quote ends the word, as openvpn's `parse_line` ends
+            // it, so nothing glued to it hides the directive.
+            ("\"plugin\"/nonexistent/evil.so", "plugin"),
+            ("'plugin'/x.so", "plugin"),
+            ("\"management\"127.0.0.1 7505", "management"),
             ("setenv opt plugin /x.so", "plugin"),
             ("--setenv opt setenv opt up /x", "up"),
         ] {
