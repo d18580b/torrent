@@ -166,6 +166,37 @@ tests:
             exp_annotations:
               summary: "Fencing profile acct_a failed to pause some torrents; they may still be seeding without the tunnel"
 
+  # Boot-scan torrents the boot could not pause on a profile fenced at boot:
+  # 2 at the first sample, flat after it. The boot gauge fires it, past the
+  # 15-minute window. acct_b's boot counted none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_profile_fence_pause_errors_total{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_boot_fence_pause_errors{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_profile_fence_pause_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_fence_pause_errors{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdFencePauseFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Fencing profile acct_a failed to pause some torrents; they may still be seeding without the tunnel"
+      - eval_time: 30m
+        alertname: TorrentdFencePauseFailed
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Fencing profile acct_a failed to pause some torrents; they may still be seeding without the tunnel"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_profile_vpn_handshake_probe_ok{profile_id="acct_a"}'
@@ -465,6 +496,38 @@ tests:
             exp_annotations:
               summary: "Resume data for profile acct_a could not be written; a restart loses progress"
 
+  # Resume data the alert loop produced from the boot's backlog that could
+  # not be written: 3 at the first sample, flat after it, so increase() is 0.
+  # The boot gauge fires it, and keeps it firing past the 15-minute window.
+  # acct_b's boot counted none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_resume_write_errors_total{profile_id="acct_a"}'
+        values: '3x40'
+      - series: 'torrentd_boot_resume_write_errors{profile_id="acct_a"}'
+        values: '3x40'
+      - series: 'torrentd_resume_write_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_resume_write_errors{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdResumeWriteErrors
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Resume data for profile acct_a could not be written; a restart loses progress"
+      - eval_time: 30m
+        alertname: TorrentdResumeWriteErrors
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Resume data for profile acct_a could not be written; a restart loses progress"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_resume_save_failures_total{profile_id="acct_a"}'
@@ -480,6 +543,55 @@ tests:
               profile_id: acct_a
             exp_annotations:
               summary: "save_resume_data is failing for profile acct_a"
+
+  # Resume saves from the boot's backlog that libtorrent failed (acct_a) or
+  # that failed before reaching it (acct_b), all before the first scrape:
+  # flat from the first sample. The boot gauges fire it for both.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_resume_save_failures_total{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_boot_resume_save_failures{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_resume_save_dispatch_errors_total{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_boot_resume_save_dispatch_errors{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_resume_save_failures_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_resume_save_failures{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_resume_save_dispatch_errors_total{profile_id="acct_b"}'
+        values: '1x40'
+      - series: 'torrentd_boot_resume_save_dispatch_errors{profile_id="acct_b"}'
+        values: '1x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdResumeSaveFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "save_resume_data is failing for profile acct_a"
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "save_resume_data is failing for profile acct_b"
+      - eval_time: 30m
+        alertname: TorrentdResumeSaveFailures
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "save_resume_data is failing for profile acct_a"
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "save_resume_data is failing for profile acct_b"
 
   - interval: 1m
     input_series:
@@ -645,6 +757,39 @@ tests:
             exp_annotations:
               summary: "Trackers returned scrape_failed for profile acct_a"
 
+  # Tracker warnings answering the boot's first announces: 3 at the first
+  # sample, flat after it. The boot gauge fires it, past the hour window too.
+  # The gauge carries only the kinds this alert reads.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="warning"}'
+        values: '3x90'
+      - series: 'torrentd_boot_tracker_alerts{profile_id="acct_a", kind="warning"}'
+        values: '3x90'
+      - series: 'torrentd_tracker_alerts_total{profile_id="acct_a", kind="scrape_failed"}'
+        values: '0x90'
+      - series: 'torrentd_boot_tracker_alerts{profile_id="acct_a", kind="scrape_failed"}'
+        values: '0x90'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTrackerWarnings
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              profile_id: acct_a
+              kind: warning
+            exp_annotations:
+              summary: "Trackers returned warning for profile acct_a"
+      - eval_time: 90m
+        alertname: TorrentdTrackerWarnings
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              profile_id: acct_a
+              kind: warning
+            exp_annotations:
+              summary: "Trackers returned warning for profile acct_a"
+
   - interval: 1m
     input_series:
       - series: 'torrentd_session_alerts_total{profile_id="acct_a", kind="portmap_error"}'
@@ -725,6 +870,94 @@ tests:
             exp_annotations:
               summary: "Torrents in profile acct_a are failing"
 
+  # The boot's adds: acct_a's resume adds put two torrents in libtorrent's
+  # error state, and libtorrent rejected one of acct_b's adds, all before the
+  # first scrape. Each counter is flat from its first sample; the boot gauges
+  # fire the alert for both, past the 15-minute window. acct_c counted none.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_errors_total{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_boot_torrent_errors{profile_id="acct_a"}'
+        values: '2x40'
+      - series: 'torrentd_torrent_add_errors_total{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_add_errors{profile_id="acct_a"}'
+        values: '0x40'
+      - series: 'torrentd_torrent_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_errors{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_torrent_add_errors_total{profile_id="acct_b"}'
+        values: '1x40'
+      - series: 'torrentd_boot_torrent_add_errors{profile_id="acct_b"}'
+        values: '1x40'
+      - series: 'torrentd_torrent_errors_total{profile_id="acct_c"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_errors{profile_id="acct_c"}'
+        values: '0x40'
+      - series: 'torrentd_torrent_add_errors_total{profile_id="acct_c"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_add_errors{profile_id="acct_c"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Torrents in profile acct_a are failing"
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Torrents in profile acct_b are failing"
+      - eval_time: 30m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Torrents in profile acct_a are failing"
+          - exp_labels:
+              severity: warning
+              profile_id: acct_b
+            exp_annotations:
+              summary: "Torrents in profile acct_b are failing"
+
+  # A disk-error retry whose resume failed a minute into the boot, before a
+  # slow first scrape: 1 at the first sample, flat. The boot gauge fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_disk_error_retry_errors_total{profile_id="acct_a"}'
+        values: '1x40'
+      - series: 'torrentd_boot_disk_error_retry_errors{profile_id="acct_a"}'
+        values: '1x40'
+      - series: 'torrentd_disk_error_retry_errors_total{profile_id="acct_b"}'
+        values: '0x40'
+      - series: 'torrentd_boot_disk_error_retry_errors{profile_id="acct_b"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Torrents in profile acct_a are failing"
+      - eval_time: 30m
+        alertname: TorrentdTorrentErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+            exp_annotations:
+              summary: "Torrents in profile acct_a are failing"
+
   # disk_errors_total is labelled by libtorrent operation and so is not
   # seeded; the first error creates the series, and the rule matches that.
   - interval: 1m
@@ -736,6 +969,28 @@ tests:
         alertname: TorrentdDiskErrors
         exp_alerts: []
       - eval_time: 4m
+        alertname: TorrentdDiskErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              op: file_open
+            exp_annotations:
+              summary: "File errors (file_open) in profile acct_a; the journal names the torrent and file"
+
+  # A quick restart: the previous run counted one file_open error and ran to
+  # 20m; the next boot, scraped from 23m, counted one too before its first
+  # scrape. Same labels, same value, so increase() sees no rise, and the
+  # previous run's series is still there 15 minutes back, so the appearance
+  # clause is quiet. The boot gauge, which only the new run exports, fires it.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_disk_errors_total{profile_id="acct_a", op="file_open"}'
+        values: '1x20 _ _ 1x20'
+      - series: 'torrentd_boot_disk_errors{profile_id="acct_a", op="file_open"}'
+        values: '_x22 1x20'
+    alert_rule_test:
+      - eval_time: 25m
         alertname: TorrentdDiskErrors
         exp_alerts:
           - exp_labels:
@@ -835,6 +1090,39 @@ tests:
               source: metadata
             exp_annotations:
               summary: "A .torrent for profile acct_a could not be written (metadata)"
+
+  # The pool library's .torrent the boot's torrent-dir scan could not copy
+  # into the torrent store: 1 at the first sample, flat. The boot gauge fires
+  # it, for that source only.
+  - interval: 1m
+    input_series:
+      - series: 'torrentd_torrent_file_persist_errors_total{profile_id="acct_a", source="api"}'
+        values: '1x40'
+      - series: 'torrentd_boot_torrent_file_persist_errors{profile_id="acct_a", source="api"}'
+        values: '1x40'
+      - series: 'torrentd_torrent_file_persist_errors_total{profile_id="acct_a", source="metadata"}'
+        values: '0x40'
+      - series: 'torrentd_boot_torrent_file_persist_errors{profile_id="acct_a", source="metadata"}'
+        values: '0x40'
+    alert_rule_test:
+      - eval_time: 0m
+        alertname: TorrentdTorrentPersistFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              source: api
+            exp_annotations:
+              summary: "A .torrent for profile acct_a could not be written (api)"
+      - eval_time: 30m
+        alertname: TorrentdTorrentPersistFailed
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              profile_id: acct_a
+              source: api
+            exp_annotations:
+              summary: "A .torrent for profile acct_a could not be written (api)"
 
   - interval: 1m
     input_series:
