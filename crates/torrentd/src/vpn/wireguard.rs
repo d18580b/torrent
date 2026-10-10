@@ -1125,8 +1125,10 @@ mod native {
                 continue;
             };
             // `wg` reads `Private Key` as `PrivateKey`, so inner whitespace
-            // goes before the key is matched.
-            let (key, value) = (squeezed(key), value.trim());
+            // goes before the key is matched. The value loses only the
+            // whitespace `wg` strips, so a Unicode space around a key is
+            // refused here rather than echoed by `wg setconf`.
+            let (key, value) = (squeezed(key), value.trim_matches(is_wg_space));
             let key = key.as_str();
             let lower = key.to_ascii_lowercase();
             let known = match section {
@@ -2276,6 +2278,10 @@ PublicKey = x
                 format!("Private\u{2003}Key = \"{KEY}\""),
                 "line 3 is not a key",
             ),
+            // `wg` keeps a Unicode space around a value, so the key fails
+            // its base64 read and the line is echoed.
+            (format!("PrivateKey = \u{a0}{KEY}"), "line 3: PrivateKey"),
+            (format!("PrivateKey = {KEY}\u{2003}"), "line 3: PrivateKey"),
             // A line of nothing but a Unicode space is not blank to `wg`.
             (format!("PrivateKey = {KEY}\n\u{a0}"), "line 4 is neither"),
         ] {
