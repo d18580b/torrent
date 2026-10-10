@@ -469,7 +469,7 @@
       "id": 33,
       "type": "timeseries",
       "title": "Pool plan failures by kind",
-      "description": "Pool plans that stopped: a step failed, the index stopped accounting for what is loaded, or re-driving an interrupted plan failed (TorrentdPoolPlanFailed).",
+      "description": "Pool plans that stopped: a step failed, the index stopped accounting for what is loaded, re-driving an interrupted plan failed, or the boot re-drive gave up waiting for the loaded torrents to reach the state map and left interrupted plans applying (TorrentdPoolPlanFailed).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 85 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },
