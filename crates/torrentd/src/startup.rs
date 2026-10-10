@@ -3143,6 +3143,7 @@ async fn serve_until_shutdown(
         listener,
         app,
         build_app,
+        |fd: std::os::fd::BorrowedFd<'_>| fd.try_clone_to_owned(),
         |listener, app, server_shutdown| serve_once(listener, app, server_shutdown, work),
         http_listen,
         shutdown_tx,
@@ -3157,10 +3158,19 @@ async fn serve_until_shutdown(
 ///
 /// Returns 0 without serving again on a shutdown signalled before a run or
 /// during a backoff.
-async fn serve_through_exhaustion<A, B, S, F>(
+///
+/// `hold` duplicates a descriptor (`BorrowedFd::try_clone_to_owned` in the
+/// daemon; a stand-in in tests). The second descriptor for a run is held
+/// before it starts: the first from the bound listener, every later one from
+/// the spare the next run is served on, during the backoff. A duplicate that
+/// fails because descriptors are still short waits another backoff and is
+/// tried again, so the API is never served again without a spare.
+#[allow(clippy::too_many_arguments)]
+async fn serve_through_exhaustion<A, B, H, S, F>(
     mut listener: tokio::net::TcpListener,
     mut app: A,
     build_app: B,
+    mut hold: H,
     mut serve: S,
     http_listen: std::net::SocketAddr,
     shutdown_tx: &broadcast::Sender<ShutdownReason>,
@@ -3168,10 +3178,22 @@ async fn serve_through_exhaustion<A, B, S, F>(
 ) -> i32
 where
     B: Fn() -> Option<A>,
+    H: FnMut(std::os::fd::BorrowedFd<'_>) -> std::io::Result<std::os::fd::OwnedFd>,
     S: FnMut(tokio::net::TcpListener, A, broadcast::Receiver<ShutdownReason>) -> F,
     F: std::future::Future<Output = kynos::Result<()>>,
 {
     let mut backoff = ACCEPT_EXHAUSTION_BACKOFF_INITIAL;
+    let mut spare = match hold(std::os::fd::AsFd::as_fd(&listener)) {
+        Ok(fd) => Some(fd),
+        Err(e) => {
+            warn!(
+                error.cause = %e,
+                "could not hold a second descriptor on the HTTP listener; \
+                 running out of descriptors in accept will stop the daemon",
+            );
+            None
+        }
+    };
     loop {
         // Subscribed before the check, so a signal is either already in
         // `shutdown_rx` or reaches the server's own receiver.
@@ -3179,20 +3201,9 @@ where
         if shutdown_requested(&mut shutdown_rx) {
             return 0;
         }
-        let spare = match std::os::fd::AsFd::as_fd(&listener).try_clone_to_owned() {
-            Ok(fd) => Some(std::net::TcpListener::from(fd)),
-            Err(e) => {
-                warn!(
-                    error.cause = %e,
-                    "could not hold a second descriptor on the HTTP listener; \
-                     running out of descriptors in accept will stop the daemon",
-                );
-                None
-            }
-        };
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let outcome = serve(listener, app, server_shutdown).await;
-        let Some((cause, spare)) = descriptor_exhaustion(&outcome).zip(spare) else {
+        let Some((cause, held)) = descriptor_exhaustion(&outcome).zip(spare.take()) else {
             return http_exit_code(outcome);
         };
         if started.elapsed() > ACCEPT_EXHAUSTION_BACKOFF_MAX {
@@ -3205,18 +3216,46 @@ where
             "the HTTP server ran out of descriptors accepting a connection and \
              cut off its open requests; serving again after a backoff",
         );
-        sd_notify::status(&format!(
-            "seeding; API on {http_listen} out of descriptors, serving again in {}s",
-            backoff.as_secs()
-        ));
-        tokio::select! {
-            _ = shutdown_rx.recv() => return 0,
-            () = tokio::time::sleep(backoff) => {}
+        // `held` is the socket the next run serves on; it is not served on
+        // until a second descriptor of it is held for the run after that.
+        loop {
+            sd_notify::status(&format!(
+                "seeding; API on {http_listen} out of descriptors, serving again in {}s",
+                backoff.as_secs()
+            ));
+            tokio::select! {
+                _ = shutdown_rx.recv() => return 0,
+                () = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(ACCEPT_EXHAUSTION_BACKOFF_MAX);
+            match hold(std::os::fd::AsFd::as_fd(&held)) {
+                Ok(fd) => {
+                    spare = Some(fd);
+                    break;
+                }
+                Err(e) if matches!(e.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) => {
+                    warn!(
+                        addr = %http_listen,
+                        error.cause = %e,
+                        retry_in_secs = backoff.as_secs(),
+                        "still out of descriptors holding a second one on the HTTP \
+                         listener; serving again after another backoff",
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        error.cause = %e,
+                        "could not hold a second descriptor on the HTTP listener; \
+                         running out of descriptors in accept will stop the daemon",
+                    );
+                    break;
+                }
+            }
         }
-        backoff = (backoff * 2).min(ACCEPT_EXHAUSTION_BACKOFF_MAX);
-        listener = match spare
+        let held = std::net::TcpListener::from(held);
+        listener = match held
             .set_nonblocking(true)
-            .and_then(|()| tokio::net::TcpListener::from_std(spare))
+            .and_then(|()| tokio::net::TcpListener::from_std(held))
         {
             Ok(l) => l,
             Err(e) => {
@@ -3969,6 +4008,11 @@ mod shutdown_report_tests {
         assert!(descriptor_exhaustion(&timed_out).is_none());
     }
 
+    /// The daemon's `hold`: a second descriptor on the same socket.
+    fn dup(fd: std::os::fd::BorrowedFd<'_>) -> std::io::Result<std::os::fd::OwnedFd> {
+        fd.try_clone_to_owned()
+    }
+
     async fn bound() -> (tokio::net::TcpListener, std::net::SocketAddr) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -3993,6 +4037,7 @@ mod shutdown_report_tests {
                 builds.set(builds.get() + 1);
                 Some(builds.get())
             },
+            dup,
             |listener, app, _shutdown| {
                 runs += 1;
                 let run = runs;
@@ -4028,6 +4073,7 @@ mod shutdown_report_tests {
             listener,
             (),
             || Some(()),
+            dup,
             |_, (), _| {
                 runs += 1;
                 async { accept_failure(libc::EINVAL) }
@@ -4052,6 +4098,7 @@ mod shutdown_report_tests {
             listener,
             (),
             || Some(()),
+            dup,
             |_, (), _| {
                 runs += 1;
                 tx.send(ShutdownReason::Sigterm).unwrap();
@@ -4074,6 +4121,7 @@ mod shutdown_report_tests {
             listener,
             (),
             || Some(()),
+            dup,
             |_, (), _| async { unreachable!("a stop was already asked for") },
             addr,
             &tx,
@@ -4081,6 +4129,187 @@ mod shutdown_report_tests {
         )
         .await;
         assert_eq!(code, 0);
+    }
+
+    /// The seconds since `origin` at which each run in `starts` began.
+    fn offsets(origin: tokio::time::Instant, starts: &[tokio::time::Instant]) -> Vec<u64> {
+        starts.iter().map(|s| (*s - origin).as_secs()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_backoff_doubles_from_a_second_to_thirty_and_resets_after_a_long_run() {
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        let starts = std::cell::RefCell::new(Vec::new());
+        let origin = tokio::time::Instant::now();
+        let code = serve_through_exhaustion(
+            listener,
+            (),
+            || Some(()),
+            dup,
+            |_, (), _| {
+                starts.borrow_mut().push(tokio::time::Instant::now());
+                let run = starts.borrow().len();
+                async move {
+                    match run {
+                        // Runs 1-7 fail at once; run 8 serves 31 s first.
+                        1..=7 => accept_failure(libc::EMFILE),
+                        8 => {
+                            tokio::time::sleep(std::time::Duration::from_secs(31)).await;
+                            accept_failure(libc::EMFILE)
+                        }
+                        _ => Ok(()),
+                    }
+                }
+            },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        assert_eq!(code, 0);
+        // Gaps of 1, 2, 4, 8, 16, 30, 30; then 31 s serving and 1 s again.
+        assert_eq!(
+            offsets(origin, &starts.borrow()),
+            [0, 1, 3, 7, 15, 31, 61, 91, 123]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_spare_short_of_descriptors_is_held_again_after_another_backoff() {
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        let holds = std::cell::Cell::new(0);
+        let starts = std::cell::RefCell::new(Vec::new());
+        let origin = tokio::time::Instant::now();
+        let code = serve_through_exhaustion(
+            listener,
+            (),
+            || Some(()),
+            |fd: std::os::fd::BorrowedFd<'_>| {
+                holds.set(holds.get() + 1);
+                // The first two holds during the backoff are still short.
+                if matches!(holds.get(), 2 | 3) {
+                    return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+                }
+                fd.try_clone_to_owned()
+            },
+            |_, (), _| {
+                starts.borrow_mut().push(tokio::time::Instant::now());
+                let run = starts.borrow().len();
+                async move {
+                    if run < 3 {
+                        accept_failure(libc::EMFILE)
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        // Run 2 had a spare after all: its exhaustion was retried, not 70.
+        assert_eq!(code, 0);
+        assert_eq!(holds.get(), 5);
+        // Held at 1 s and 3 s (short), 7 s; then 8 s more for run 3.
+        assert_eq!(offsets(origin, &starts.borrow()), [0, 7, 15]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_that_cannot_serve_again_exits_70() {
+        // The router cannot be rebuilt.
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        let mut runs = 0;
+        let code = serve_through_exhaustion(
+            listener,
+            (),
+            || None,
+            dup,
+            |_, (), _| {
+                runs += 1;
+                async { accept_failure(libc::EMFILE) }
+            },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        assert_eq!((code, runs), (70, 1));
+
+        // The spare cannot be registered with the runtime: `/dev/null`
+        // cannot be polled, so `from_std` refuses it.
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        let mut runs = 0;
+        let code = serve_through_exhaustion(
+            listener,
+            (),
+            || Some(()),
+            |_: std::os::fd::BorrowedFd<'_>| {
+                std::fs::File::open("/dev/null").map(std::os::fd::OwnedFd::from)
+            },
+            |_, (), _| {
+                runs += 1;
+                async { accept_failure(libc::EMFILE) }
+            },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        assert_eq!((code, runs), (70, 1));
+
+        // No spare was held before the first run: exhaustion stops the daemon.
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        let mut runs = 0;
+        let code = serve_through_exhaustion(
+            listener,
+            (),
+            || Some(()),
+            |_: std::os::fd::BorrowedFd<'_>| Err(std::io::Error::from_raw_os_error(libc::EMFILE)),
+            |_, (), _| {
+                runs += 1;
+                async { accept_failure(libc::EMFILE) }
+            },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        assert_eq!((code, runs), (70, 1));
+
+        // A hold during the backoff that fails for another reason serves
+        // once more without a spare, and that run's exhaustion stops it.
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        let holds = std::cell::Cell::new(0);
+        let mut runs = 0;
+        let code = serve_through_exhaustion(
+            listener,
+            (),
+            || Some(()),
+            |fd: std::os::fd::BorrowedFd<'_>| {
+                holds.set(holds.get() + 1);
+                if holds.get() == 1 {
+                    fd.try_clone_to_owned()
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EBADF))
+                }
+            },
+            |_, (), _| {
+                runs += 1;
+                async { accept_failure(libc::EMFILE) }
+            },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        assert_eq!((code, runs, holds.get()), (70, 2, 2));
     }
 
     #[test]
