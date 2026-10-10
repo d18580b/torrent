@@ -2297,8 +2297,53 @@ async fn a_torrent_re_added_right_after_delete_keeps_its_files_and_entry() {
         "the new add's save path, not the removed torrent's"
     );
     let st = h.state.state.get(&ih).expect("the new torrent is tracked");
-    assert_eq!((st.handle, st.profile_id), (new, p));
+    assert_eq!((st.handle, st.profile_id.clone()), (new, p.clone()));
     assert_eq!(h.state.registry.lookup(&ih).unwrap().as_str(), "p");
+    assert!(
+        h.state.resume.tombstones(&p).unwrap().is_empty(),
+        "the removal's tombstone is spent, or the next boot deletes the re-add's files"
+    );
+}
+
+#[tokio::test]
+async fn delete_removes_the_stores_files_before_it_answers_and_the_removal_settles_its_tombstone() {
+    // The files used to go only when the session's `torrent_removed_alert`
+    // was handled, after the 204: a SIGKILL in between left the resume file
+    // for the next boot to load the torrent from.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p)
+    });
+    let engine = engine.unwrap();
+    let bytes = torrent_bytes('d');
+    let ih = libtorrent_safe::info_hash_from_torrent(&bytes).unwrap();
+    load(&h.state, &engine, ih, "p", TorrentPhase::Seeding);
+    let p = ProfileId::new("p");
+    h.state.torrents.write(&p, &ih, &bytes).unwrap();
+    h.state.torrents.write_save_path(&p, &ih, "/old").unwrap();
+    h.state.resume.write(&p, &ih, b"resume").unwrap();
+
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ih)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    assert!(!h.state.resume.exists(&p, &ih).unwrap());
+    assert_eq!(h.state.torrents.read(&p, &ih).unwrap(), None);
+    assert_eq!(h.state.torrents.read_save_path(&p, &ih).unwrap(), None);
+    assert_eq!(
+        h.state.resume.tombstones(&p).unwrap(),
+        vec![ih],
+        "the tombstone stands until the removal alert, the torrent's last"
+    );
+
+    // A resume save libtorrent queued before the removal lands after the
+    // request's delete; the removal's handler deletes it and spends the
+    // tombstone.
+    h.state.resume.write(&p, &ih, b"late").unwrap();
+    deliver(&h, "p", &removed(ih));
+    assert!(!h.state.resume.exists(&p, &ih).unwrap());
+    assert!(h.state.resume.tombstones(&p).unwrap().is_empty());
 }
 
 #[tokio::test]

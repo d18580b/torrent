@@ -867,6 +867,168 @@ mod tests {
         }
     }
 
+    /// A resume store whose deletes fail, as on a read-only or failing
+    /// directory, and whose tombstones work.
+    #[derive(Debug, Default)]
+    struct FailingDelete(MemoryResumeStore);
+    impl ResumeStore for FailingDelete {
+        fn scan(
+            &self,
+            p: &ProfileId,
+        ) -> Result<
+            crate::resume_store::Scan<libtorrent_safe::ResumeData>,
+            crate::resume_store::ResumeStoreError,
+        > {
+            self.0.scan(p)
+        }
+        fn write(
+            &self,
+            p: &ProfileId,
+            ih: &InfoHash,
+            d: &[u8],
+        ) -> Result<(), crate::resume_store::ResumeStoreError> {
+            self.0.write(p, ih, d)
+        }
+        fn delete(
+            &self,
+            _: &ProfileId,
+            _: &InfoHash,
+        ) -> Result<(), crate::resume_store::ResumeStoreError> {
+            Err(std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem).into())
+        }
+        fn exists(
+            &self,
+            p: &ProfileId,
+            ih: &InfoHash,
+        ) -> Result<bool, crate::resume_store::ResumeStoreError> {
+            self.0.exists(p, ih)
+        }
+        fn write_tombstone(
+            &self,
+            p: &ProfileId,
+            ih: &InfoHash,
+        ) -> Result<(), crate::resume_store::ResumeStoreError> {
+            self.0.write_tombstone(p, ih)
+        }
+        fn clear_tombstone(
+            &self,
+            p: &ProfileId,
+            ih: &InfoHash,
+        ) -> Result<(), crate::resume_store::ResumeStoreError> {
+            self.0.clear_tombstone(p, ih)
+        }
+        fn tombstones(
+            &self,
+            p: &ProfileId,
+        ) -> Result<Vec<InfoHash>, crate::resume_store::ResumeStoreError> {
+            self.0.tombstones(p)
+        }
+    }
+
+    /// Handle the removal alert of a torrent `DELETE` removed from `profile`
+    /// (tombstone written, removal recorded) against `resume`, after giving
+    /// it a resume file and a `.torrent`. Returns the `.torrent` store and
+    /// the metrics.
+    fn handle_removal(
+        resume: &dyn ResumeStore,
+        profile: &ProfileId,
+        ih: InfoHash,
+        tombstoned: bool,
+    ) -> (MemoryTorrentStore, crate::metrics::RecordingSink) {
+        let state = StateMap::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = crate::metrics::RecordingSink::new();
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let th = TorrentHandle {
+            id: 1,
+            infohash: ih,
+        };
+        state.insert(
+            ih,
+            TorrentState::newly_added(th, profile.clone(), clock.now()),
+        );
+        resume.write(profile, &ih, b"resume").unwrap();
+        torrents.write(profile, &ih, b"torrent").unwrap();
+        if tombstoned {
+            resume.write_tombstone(profile, &ih).unwrap();
+        }
+        state.begin_removal(profile, th);
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: profile.clone(),
+            span: tracing::info_span!("test"),
+        };
+        handle(&removed_alert(ih), &mut ctx);
+        (torrents, metrics)
+    }
+
+    /// The labels of every `torrent_remove_cleanup_errors_total` increment.
+    fn cleanup_errors(metrics: &crate::metrics::RecordingSink) -> Vec<Vec<(String, String)>> {
+        metrics
+            .calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                crate::metrics::MetricCall::IncCounter { name, labels }
+                    if name == REMOVE_CLEANUP_ERRORS =>
+                {
+                    Some(labels)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The removal's handler is the fallback for what `DELETE` deleted: it
+    /// deletes a file that came back and spends the tombstone once all are
+    /// gone, counting nothing.
+    #[test]
+    fn a_removal_whose_files_delete_spends_its_tombstone() {
+        let ih = InfoHash([0x91; 20]);
+        let profile = ProfileId::new("p");
+        let resume = MemoryResumeStore::new();
+        let (torrents, metrics) = handle_removal(&resume, &profile, ih, true);
+        assert!(!resume.exists(&profile, &ih).unwrap());
+        assert!(!torrents.exists(&profile, &ih));
+        assert!(resume.tombstones(&profile).unwrap().is_empty());
+        assert!(cleanup_errors(&metrics).is_empty());
+    }
+
+    /// A resume file that will not delete used to be logged and nothing
+    /// else: no counter, no retry, and the next boot loaded the torrent from
+    /// it. It is counted now, and a tombstone stands for the boot to finish
+    /// the delete, whether `DELETE` wrote one or not.
+    #[test]
+    fn a_removal_whose_resume_delete_fails_counts_it_and_leaves_a_tombstone() {
+        for tombstoned in [true, false] {
+            let ih = InfoHash([0x92; 20]);
+            let profile = ProfileId::new("p");
+            let resume = FailingDelete::default();
+            let (torrents, metrics) = handle_removal(&resume, &profile, ih, tombstoned);
+            assert_eq!(
+                cleanup_errors(&metrics),
+                vec![vec![
+                    ("profile_id".to_owned(), "p".to_owned()),
+                    ("store".to_owned(), "resume".to_owned()),
+                ]],
+                "tombstoned by DELETE: {tombstoned}",
+            );
+            assert!(resume.exists(&profile, &ih).unwrap());
+            assert_eq!(
+                resume.tombstones(&profile).unwrap(),
+                vec![ih],
+                "tombstoned by DELETE: {tombstoned}",
+            );
+            assert!(!torrents.exists(&profile, &ih), "the .torrent still goes");
+        }
+    }
+
     /// A store that cannot say whether the file exists gets the save: an
     /// extra write costs far less than a torrent no boot reloads.
     #[test]

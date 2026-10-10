@@ -631,6 +631,40 @@ mod tests {
     }
 
     #[test]
+    fn a_tombstone_is_listed_until_cleared_and_never_scanned_as_resume_data() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path());
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let (gone, kept) = (InfoHash([0x05u8; 20]), InfoHash([0x06u8; 20]));
+        assert!(store.tombstones(&p).unwrap().is_empty(), "no directory yet");
+        store.write(&p, &kept, b"kept").unwrap();
+        store.write_tombstone(&p, &gone).unwrap();
+        assert!(store.tombstone_path_for(&p, &gone).exists());
+        assert_eq!(store.tombstones(&p).unwrap(), vec![gone]);
+        assert!(
+            store.tombstones(&q).unwrap().is_empty(),
+            "another profile's"
+        );
+        let loaded = store.load_all(&p).unwrap();
+        assert_eq!(loaded.len(), 1, "the tombstone is not a resume file");
+        assert_eq!(loaded[0].0, kept);
+        store.clear_tombstone(&p, &gone).unwrap();
+        store.clear_tombstone(&p, &gone).unwrap();
+        assert!(store.tombstones(&p).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_tombstone_that_cannot_be_read_is_still_listed() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path());
+        let p = ProfileId::new("p");
+        let ih = InfoHash([0x07u8; 20]);
+        // A directory reads as EISDIR, as an unreadable file would fail.
+        std::fs::create_dir_all(store.tombstone_path_for(&p, &ih)).unwrap();
+        assert_eq!(store.tombstones(&p).unwrap(), vec![ih]);
+    }
+
+    #[test]
     fn memory_store_partitions_by_profile() {
         let store = MemoryResumeStore::new();
         let a = ProfileId::new("a");
