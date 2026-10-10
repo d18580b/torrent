@@ -1418,9 +1418,9 @@ pub async fn boot(
     // dir is not re-scanned — new torrents arrive only via the API.
     let scan_save_path = cfg.default_save_path.to_string_lossy().into_owned();
     // Adoptions `pool.db` holds as waiting for verification. Their claims
-    // and `.torrent`s are in place, but this scan adds in seed mode, which
-    // would skip the hash check they are waiting for: the verify queue adds
-    // them after the scans instead. `None` where the queue cannot be read,
+    // and `.torrent`s are in place, but this scan would hash them with
+    // nothing to record the verdict the pool is waiting for: the verify
+    // queue adds them after the scans instead. `None` where the queue cannot be read,
     // and then no claimed torrent is re-added here, since none can be told
     // apart from an adoption.
     let verify_queued: Option<std::collections::HashSet<libtorrent_safe::InfoHash>> =
@@ -2321,13 +2321,13 @@ fn torrent_dir_save_path(
 }
 
 /// Whether the boot torrent-dir scan must leave a torrent this profile has
-/// claimed unloaded rather than re-add it in seed mode.
+/// claimed unloaded rather than re-add it.
 ///
 /// - An adoption `pool.db` holds in its verify queue (`verify_queued`) is the
-///   queue's to add after the scans, hashed.
+///   queue's to add after the scans, hashed, so the pool records its verdict.
 /// - One the pool index records `drifted` failed its verification, or changed
-///   on disk since, and was paused for it: a seed-mode add would announce a
-///   payload its piece hashes rejected. Adopting it again verifies it.
+///   on disk since, and was paused for it: the operator decides when it is
+///   checked again, and adopting it again verifies it.
 /// - Where either cannot be read, none can be told apart from these, so the
 ///   torrent stays unloaded, as every claimed torrent did before the scan
 ///   re-added any.
@@ -2372,6 +2372,10 @@ fn pool_holds_back(
 
 /// What the boot torrent-dir scan hands a session for a `.torrent` no resume
 /// data covered.
+///
+/// Hash-checked before it seeds: with no resume data nothing vouches for the
+/// payload, which may be missing or truncated, and `SEED_MODE` would announce
+/// it complete until a peer's request failed a piece.
 fn torrent_dir_scan_params(
     profile: &ProfileConfig,
     bytes: Vec<u8>,
@@ -2380,7 +2384,7 @@ fn torrent_dir_scan_params(
     AddParams::File {
         bytes,
         save_path,
-        flags: torrentd_engine::seed_flags(profile),
+        flags: torrentd_engine::verify_flags(profile),
         trackers: Vec::new(),
     }
 }

@@ -693,8 +693,14 @@ enum AddSource {
 /// profile sets `allowed_tracker_domains`, every tracker the torrent announces
 /// to — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and
 /// there must be at least one; when it also sets `allowed_tracker_urls`, every
-/// announce URL must fall under one of those account prefixes. The response is the torrent as its session first reports
-/// it; its `phase` is `unknown` until the first state update.
+/// announce URL must fall under one of those account prefixes. A `.torrent`'s
+/// payload is hashed before the torrent seeds: it is `checking` first, and a
+/// payload that is absent, truncated or not yet fully written ends
+/// `incomplete` and never announces itself complete. The daemon never
+/// downloads, so supply the payload, then recheck it with
+/// `POST /v1/torrents/{infohash}/recheck`. The response is the torrent as its
+/// session first reports it; its `phase` is `unknown` until the first state
+/// update.
 #[kynos::post("/torrents", tag = Torrents)]
 pub async fn add_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -807,11 +813,16 @@ pub async fn add_torrent(
             },
             None,
         ),
+        // Nothing vouches for a payload named only by a `.torrent`: it may be
+        // absent, still copying or truncated. Hash it before it seeds, as
+        // pool adoption does without a complete `.fastresume`; `SEED_MODE`
+        // would announce it complete (`left=0`) until a peer's request
+        // failed a piece.
         AddSource::File(bytes) => (
             AddParams::File {
                 bytes: bytes.clone(),
                 save_path,
-                flags: torrentd_engine::seed_flags(profile_cfg),
+                flags: torrentd_engine::verify_flags(profile_cfg),
                 trackers: Vec::new(),
             },
             Some(bytes),
