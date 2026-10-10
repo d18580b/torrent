@@ -306,6 +306,10 @@ pub struct StateMap {
     /// removal's file deletes, so an add that marks one re-added either lands
     /// before them (and they are skipped) or after them.
     removals: Mutex<HashMap<(ProfileId, InfoHash), PendingRemoval>>,
+    /// Resume files a removal failed to delete. Each is the removed torrent's,
+    /// not whichever torrent the profile adds under the info-hash next, so
+    /// that add's first save must not be skipped for finding it.
+    stale_resume_files: Mutex<HashSet<(ProfileId, InfoHash)>>,
 }
 
 impl Default for StateMap {
@@ -315,6 +319,7 @@ impl Default for StateMap {
             saves: Mutex::new(ResumeSaves::default()),
             retry_heap: Mutex::new(BinaryHeap::new()),
             removals: Mutex::new(HashMap::new()),
+            stale_resume_files: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -449,6 +454,27 @@ impl StateMap {
         }
     }
 
+    /// Record whether `profile`'s resume file for `ih` is a removed torrent's
+    /// left behind: `true` where the removal's delete failed, `false` where a
+    /// later one succeeded.
+    pub fn set_stale_resume_file(&self, profile: &ProfileId, ih: &InfoHash, stale: bool) {
+        let mut stale_files = self.stale_resume_files.lock();
+        let key = (profile.clone(), *ih);
+        if stale {
+            stale_files.insert(key);
+        } else {
+            stale_files.remove(&key);
+        }
+    }
+
+    /// Whether `profile`'s resume file for `ih` was left behind by a removal,
+    /// forgetting it: the caller is about to replace it.
+    pub fn take_stale_resume_file(&self, profile: &ProfileId, ih: &InfoHash) -> bool {
+        self.stale_resume_files
+            .lock()
+            .remove(&(profile.clone(), *ih))
+    }
+
     pub fn get(&self, ih: &InfoHash) -> Option<TorrentState> {
         self.inner.get(ih).map(|e| e.value().clone())
     }
@@ -557,6 +583,11 @@ impl StateMap {
     /// Ask for a resume save of `ih`. Returns `false` when one is already
     /// queued or in flight: libtorrent answers each request with its own alert,
     /// so a second request for the same torrent is a second alert for nothing.
+    ///
+    /// The refused request's flags are dropped with it, and a queued
+    /// unconditional save is never downgraded to `ONLY_IF_MODIFIED`: each one
+    /// queued is a torrent whose modified bit cannot be trusted, either its
+    /// first save (no resume file yet) or a re-ask after a lost answer.
     pub fn queue_resume_save(&self, ih: InfoHash, flags: ResumeFlags) -> bool {
         let mut s = self.saves.lock();
         if s.in_flight.contains_key(&ih) || !s.queued_set.insert(ih) {
@@ -685,6 +716,20 @@ mod tests {
         // In flight counts as asked for, too.
         assert!(!m.queue_resume_save(ih(1), ResumeFlags::empty()));
         assert_eq!(m.pending_resume_count(), 1);
+    }
+
+    #[test]
+    fn a_later_only_if_modified_request_keeps_a_queued_unconditional_save() {
+        // The shutdown drain asks `ONLY_IF_MODIFIED` for every torrent; one
+        // still waiting on its first save has no file for "not modified" to
+        // leave in place.
+        let m = StateMap::new();
+        assert!(m.queue_resume_save(ih(1), ResumeFlags::empty()));
+        assert!(!m.queue_resume_save(ih(1), ResumeFlags::ONLY_IF_MODIFIED));
+        assert_eq!(
+            m.dispatch_resume_saves(10),
+            vec![(ih(1), ResumeFlags::empty())]
+        );
     }
 
     #[test]
