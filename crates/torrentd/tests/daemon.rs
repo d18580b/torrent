@@ -19,13 +19,18 @@ use std::time::Instant;
 /// Minimal blocking HTTP/1.1 client: sends `Connection: close` and reads the
 /// whole response to EOF. Returns `(status, body)`.
 fn http(addr: &str, method: &str, path: &str, body: Option<&str>) -> (u16, String) {
+    http_as(addr, method, path, body, "localhost")
+}
+
+/// As [`http`], naming `host` as the request's `Host`.
+fn http_as(addr: &str, method: &str, path: &str, body: Option<&str>, host: &str) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).expect("connect");
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
     let body = body.unwrap_or("");
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
@@ -209,6 +214,49 @@ fn daemon_end_to_end() {
     assert!(
         p.join(format!("session_state-{PROFILE}.dat")).exists(),
         "a dht profile's session state should be written on SIGTERM"
+    );
+}
+
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_configured_allowed_host_is_answered_and_another_is_refused() {
+    // The router tests set the allowlist on the state they build; this holds
+    // the path from the config file to the running daemon's gate.
+    let addr = free_http();
+    let addr = addr.as_str();
+    let dir = tempfile::tempdir().unwrap();
+    let p = dir.path();
+    let cfg = write_config(p, free_port(), addr);
+    let body = std::fs::read_to_string(&cfg).unwrap();
+    std::fs::write(
+        &cfg,
+        format!("allowed_hosts = [\"torrentd.example.com\"]\n{body}"),
+    )
+    .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_torrentd"))
+        .arg("--config")
+        .arg(&cfg)
+        .spawn()
+        .expect("spawn daemon");
+
+    wait_healthy(addr);
+
+    for host in ["torrentd.example.com", "torrentd.example.com:8443"] {
+        let (code, body) = http_as(addr, "GET", "/v1/torrents", None, host);
+        assert_eq!(code, 200, "GET with Host {host}: {body}");
+        let (code, body) = http_as(addr, "POST", "/v1/torrents/pause-all", None, host);
+        assert!(
+            (200..300).contains(&code),
+            "POST with Host {host}: {code} {body}"
+        );
+    }
+    let (code, body) = http_as(addr, "GET", "/v1/torrents", None, "attacker.example");
+    assert_eq!(code, 403, "a Host not in allowed_hosts: {body}");
+
+    sigterm(&child);
+    assert!(
+        wait_exit(&mut child, Duration::from_secs(30)),
+        "daemon did not exit within 30s of SIGTERM"
     );
 }
 

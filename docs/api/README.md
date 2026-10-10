@@ -74,8 +74,10 @@ Refusals:
   budget for its memory-hard password check. A throttled attempt is a `429`
   [`login-throttled`](problems.md#login-throttled) with `Retry-After`.
 
-With no cookies, there is no cross-site request forgery to defend against, and
-no CORS: the API has no browser clients.
+There is no CORS: the API has no browser clients. A bearer token is not an
+ambient credential, since a page on another site cannot make a browser
+attach one, so a daemon with `[auth]` needs no defence against cross-site
+request forgery. A daemon without `[auth]` does, and has one (below).
 
 **A daemon without `[auth]`.** With `allow_unauthenticated = true`, which the
 daemon permits only on a loopback `http_listen`, every operation admits every
@@ -86,6 +88,29 @@ other scheme — a `Basic` header a reverse proxy adds or passes through from
 its own login is a `401` on every operation — so a proxy in front of such a
 daemon must strip `Authorization` before forwarding (nginx:
 `proxy_set_header Authorization "";`, Caddy: `header_up -Authorization`).
+
+Loopback keeps out the network, not the operator's own browser: any page it
+visits can submit a form to `127.0.0.1`, and a page whose name rebinds to
+`127.0.0.1` is same-origin with the API. So a daemon without `[auth]`
+refuses, with a `403` whose `type` is `about:blank`:
+
+- every request whose `Host` is neither a loopback name or address
+  (`localhost`, `127.0.0.0/8`, `[::1]`) nor listed in `allowed_hosts`;
+- every request other than `GET`, `HEAD` and `OPTIONS` that carries
+  `Sec-Fetch-Site` other than `same-origin` or `none`, an `Origin` whose host
+  and port are not the request's `Host`, or a `Content-Type` other than
+  `application/json`.
+
+A client that is not a browser — `curl`, `torrentctl`, a script — sends none
+of those, or only a loopback `Host`, and is admitted. A reverse proxy in
+front of the daemon must pass the client's `Host` through (Caddy does by
+default; nginx needs `proxy_set_header Host $host;`) and the daemon's config
+must list that name in `allowed_hosts`. A proxy that does its own login, such
+as HTTP Basic, turns that login into an ambient credential a browser re-sends
+on a cross-site form, so the proxy must enforce cross-site request forgery
+protection of its own: the daemon's checks are a second line, not the only
+one.
+
 The document still describes the bearer
 requirement, because it is the contract every deployment with credentials
 keeps. `GET /v1/server` reports which case applies as `auth.mode`.

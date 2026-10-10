@@ -61,6 +61,8 @@ pub struct AppState {
     pub reload_tx: Option<tokio::sync::mpsc::Sender<()>>,
     /// Peers whose forwarding headers are believed. Empty means none are.
     pub trusted_proxies: crate::http::forwarded::TrustedProxies,
+    /// Host names a daemon without `[auth]` answers to beyond loopback.
+    pub allowed_hosts: crate::http::security::HostAllowlist,
     /// Info-hashes the assignment registry held after the startup scans that
     /// no scan loaded into a session: the only entries known to be held by
     /// no session at all.
@@ -290,6 +292,7 @@ pub(crate) fn build_test_state_with_sessions(
         torrent_dir: std::env::temp_dir(),
         reload_tx: None,
         trusted_proxies: Default::default(),
+        allowed_hosts: Default::default(),
         unloaded_at_boot: Arc::new(Mutex::new(HashSet::new())),
         shutdown: tokio::sync::broadcast::channel(4).0,
         work: Arc::default(),

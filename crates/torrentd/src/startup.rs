@@ -2499,6 +2499,8 @@ impl DaemonHandle {
             torrent_dir: cfg.torrent_dir.clone(),
             reload_tx: Some(reload_tx.clone()),
             trusted_proxies: trusted_proxies.clone(),
+            allowed_hosts: crate::http::security::HostAllowlist::parse(&cfg.allowed_hosts)
+                .expect("validated at startup"),
             unloaded_at_boot: Arc::new(parking_lot::Mutex::new(unloaded_at_boot)),
             shutdown: shutdown_tx.clone(),
             work: Arc::clone(&work),

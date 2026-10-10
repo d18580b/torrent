@@ -40,6 +40,7 @@ says everything there is to say:
 | --- | --- |
 | `400` | A path parameter, a query parameter or a JSON body that does not parse. |
 | `401` | No bearer token, or one that is unknown, expired or revoked. `WWW-Authenticate: Bearer` accompanies it. |
+| `403` | A daemon without `[auth]` refused a request a browser sent on another site's behalf: a `Host` that is not loopback or in `allowed_hosts`, or a state change whose `Sec-Fetch-Site`, `Origin` or `Content-Type` marks it cross-site. See [the README](README.md#authentication). |
 | `404` | No route matches the path. |
 | `405` | The route exists, but not for this method. |
 | `408` | An operation that takes a body did not receive it and answer within its deadline (30 seconds, or 300 for `POST /v1/torrents`). Effects already started are not undone: an add may still complete, and a pool verification's rechecks may still start. |

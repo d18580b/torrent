@@ -369,15 +369,20 @@ profile.
 **Required, one way or the other.** The daemon refuses to start unless you
 have either configured `[auth]` or written `allow_unauthenticated = true`.
 Without `[auth]` it authenticates nothing — every route, including every
-mutating one, is open to anyone who can reach the port. That is a legitimate
+mutating one, is open to any client that can reach the port, except a browser
+sent by another site: a request whose `Host` is neither loopback nor in
+`allowed_hosts` (a DNS-rebound page), or a state-changing one that
+`Sec-Fetch-Site`, a foreign `Origin` or a form `Content-Type` marks as
+cross-site, is refused with a `403` ([docs/api/README.md](docs/api/README.md)).
+That is a legitimate
 posture behind a reverse proxy that does its own access control; it is not one
 to arrive at by omission. The opt-out does not extend to a routable address
 either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
 and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
 inert and reads as though the daemon authenticates nothing. `http_listen`
-defaults to `127.0.0.1:8080`. All three, and `trusted_proxies` alongside them,
-are read once, at startup: changing any of the four takes a restart, not a
-`SIGHUP`. A `SIGHUP` that changes one says so — "requires daemon restart;
+defaults to `127.0.0.1:8080`. All three, and `trusted_proxies` and
+`allowed_hosts` alongside them, are read once, at startup: changing any of the
+five takes a restart, not a `SIGHUP`. A `SIGHUP` that changes one says so — "requires daemon restart;
 ignored" — rather than reporting the config unchanged.
 
 Every credential is a **bearer token**, sent as `Authorization: Bearer …`, and
