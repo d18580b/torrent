@@ -1428,6 +1428,10 @@ pub async fn boot(
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })
+    // libtorrent's device binding of a listen socket is best effort, and its
+    // `listen_succeeded` alert names no device, so every socket a vpn
+    // session opens is checked against the kernel as it comes up.
+    .listen_device_check(listen_device_check(profile_registry.clone()))
     .listen_events(listen_events)
     .spawn();
 
@@ -1459,6 +1463,74 @@ pub async fn boot(
         requeued_at_boot,
         instance_lock,
     })
+}
+
+/// The alert loop's [`AlertLoopBuilder::listen_device_check`]: a vpn profile's
+/// listen sockets must each be held to its `vpn_interface`.
+///
+/// A socket held to another device is the failure this exists for: its uTP
+/// and UDP and HTTP tracker traffic leaves by that device with the tunnel's
+/// address, and `vpn_monitor`'s route probe, which asks the routing table,
+/// reports the tunnel healthy. A socket held to no device, where the kernel
+/// refused the binding, follows the routing table, which that probe does
+/// watch, so it is logged and not fatal. A host profile is not checked.
+fn listen_device_check(
+    profiles: Arc<ProfileRegistry>,
+) -> torrentd_engine::alert_loop::ListenDeviceCheck {
+    Arc::new(move |id: &ProfileId, endpoint: &str| {
+        let Some(iface) = profiles
+            .resolve(id)
+            .active()
+            .and_then(|e| e.config.vpn_interface().map(str::to_owned))
+        else {
+            return Ok(());
+        };
+        let Some(at) = torrentd_engine::port_forward::parse_listen_endpoint(endpoint) else {
+            return Err(format!(
+                "could not read the listen endpoint {endpoint:?}, so could not check which \
+                 device its sockets are held to"
+            ));
+        };
+        let sockets = torrentd_engine::handlers::listen::sockets_at(at).map_err(|e| {
+            format!("could not list this process's sockets to check {at}'s device: {e}")
+        })?;
+        let unbound = listen_device_verdict(&iface, &sockets)?;
+        if unbound > 0 {
+            warn!(
+                profile_id = %id,
+                endpoint = %at,
+                vpn_iface = %iface,
+                sockets = unbound,
+                "a listen socket is held to no device, so its traffic follows the routing \
+                 table rather than the tunnel device; the kernel refused the binding \
+                 (SO_BINDTODEVICE needs CAP_NET_RAW before Linux 5.7)",
+            );
+        }
+        Ok(())
+    })
+}
+
+/// Judge one endpoint's sockets against the tunnel device `iface`: `Err`
+/// naming each socket held to another device, else how many are held to
+/// none.
+fn listen_device_verdict(
+    iface: &str,
+    sockets: &[torrentd_engine::handlers::listen::BoundSocket],
+) -> Result<usize, String> {
+    let wrong: Vec<String> = sockets
+        .iter()
+        .filter_map(|s| match &s.device {
+            Some(d) if d != iface => Some(format!("{} socket held to {d}", s.kind)),
+            _ => None,
+        })
+        .collect();
+    if !wrong.is_empty() {
+        return Err(format!(
+            "{}, not the tunnel device {iface}: its traffic leaves outside the tunnel",
+            wrong.join(", ")
+        ));
+    }
+    Ok(sockets.iter().filter(|s| s.device.is_none()).count())
 }
 
 /// The settings a profile's session is built with: the config's, plus whether
@@ -3300,6 +3372,50 @@ mod tests {
     use torrentd_engine::VpnType;
 
     use super::*;
+
+    fn socket(
+        kind: &'static str,
+        device: Option<&str>,
+    ) -> torrentd_engine::handlers::listen::BoundSocket {
+        torrentd_engine::handlers::listen::BoundSocket {
+            kind,
+            device: device.map(str::to_owned),
+        }
+    }
+
+    /// A socket held to any device but the tunnel's is refused, naming it;
+    /// one held to none is counted, for a warning, since the route probe
+    /// watches what it sends.
+    #[test]
+    fn a_listen_socket_off_the_tunnel_device_is_refused() {
+        assert_eq!(
+            listen_device_verdict(
+                "wg0",
+                &[socket("tcp", Some("wg0")), socket("udp", Some("wg0"))]
+            ),
+            Ok(0),
+        );
+        assert_eq!(
+            listen_device_verdict("wg0", &[socket("tcp", Some("wg0")), socket("udp", None)]),
+            Ok(1),
+        );
+        let err = listen_device_verdict(
+            "wg0",
+            &[
+                socket("tcp", Some("eth0")),
+                socket("udp", Some("eth0")),
+                socket("udp", None),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(
+                "tcp socket held to eth0, udp socket held to eth0, not the tunnel device wg0"
+            ),
+            "{err}"
+        );
+        assert_eq!(listen_device_verdict("wg0", &[]), Ok(0));
+    }
 
     /// The database path in the registry refusal's `sqlite3` command reaches
     /// the shell as one word, whatever the state directory is called.

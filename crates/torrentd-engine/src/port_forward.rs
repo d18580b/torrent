@@ -420,10 +420,13 @@ impl ListenEvents {
 }
 
 /// Parse a listen alert's endpoint, which the shim formats as
-/// `address:port` with no brackets around an IPv6 address.
-fn parse_listen_endpoint(s: &str) -> Option<SocketAddr> {
+/// `address:port` with no brackets around an IPv6 address. A link-local
+/// IPv6 address carries its scope (`fe80::1%3`), which is dropped: the
+/// address and port are what a listen socket is found by.
+pub fn parse_listen_endpoint(s: &str) -> Option<SocketAddr> {
     let (host, port) = s.rsplit_once(':')?;
     let host = host.trim_start_matches('[').trim_end_matches(']');
+    let host = host.split_once('%').map_or(host, |(addr, _scope)| addr);
     Some(SocketAddr::new(host.parse().ok()?, port.parse().ok()?))
 }
 
@@ -1149,6 +1152,12 @@ mod tests {
         assert_eq!(
             parse_listen_endpoint("fd00::2:40001"),
             Some("[fd00::2]:40001".parse().unwrap()),
+        );
+        // A link-local one with its scope, which a device-named listen
+        // opens wherever the tunnel device has one.
+        assert_eq!(
+            parse_listen_endpoint("fe80::1%3:40001"),
+            Some("[fe80::1]:40001".parse().unwrap()),
         );
         assert_eq!(parse_listen_endpoint(":0"), None);
     }
