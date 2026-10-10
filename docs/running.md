@@ -1475,7 +1475,10 @@ On a scratch pool, not your real one.
    up and after each NAT-PMP rebind. A socket bound to any device but the
    profile's `vpn_interface` stops the whole daemon, whatever other
    sessions are up. It logs `a listen socket is not held to the profile's
-   tunnel device` and exits non-zero. A socket bound to no device is logged
+   tunnel device`, closes that profile's listen sockets and then pauses its
+   session, so nothing more (its `stopped` announces included) leaves by
+   that device during the shutdown drain, and exits non-zero. A socket bound
+   to no device is logged
    as a warning and left to the route probe.
 
    A WireGuard tunnel that comes up and **never handshakes** — a wrong key,
@@ -1487,16 +1490,20 @@ On a scratch pool, not your real one.
    poll whose handshake probe could not run leaves the clock where it was.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
-   interfaces for the daemon's uid, one line per profile pairing its tunnel
-   address with its own interface:
+   interfaces for the daemon's uid, one line per tunnel address pairing it
+   with its own interface:
    `meta skuid <uid> ip saddr <tunnel address> oifname "<iface>" accept`.
-   The address is read off the live link (its first IPv4 address, the one
-   every session is bound to) when the switch is installed, and a tunnel with
-   none fails the install. So a packet from one profile's address that the
-   routing table sends out of another profile's tunnel — its per-source
-   `ip rule` lost or shadowed by another tool — is dropped rather than
-   leaving with the other account's exit address. IPv6 is not paired: the
-   daemon's IPv6 egress by a tunnel, which no session binds to, is dropped.
+   The addresses are read off the live link when the switch is installed:
+   its first IPv4 address, which a tunnel with none fails the install for,
+   and each of its global IPv6 addresses, paired the same way with
+   `ip6 saddr`. A session listens on its tunnel device, so it listens and
+   announces on every address the device holds, IPv6 included. So a packet
+   from one profile's address that the routing table sends out of another
+   profile's tunnel — its per-source `ip rule` lost or shadowed by another
+   tool — is dropped rather than leaving with the other account's exit
+   address. The daemon's IPv6 egress from any other address, a link-local
+   one included, is dropped. A link whose IPv6 addresses cannot be read is
+   paired for IPv4 only, with a warning, and its IPv6 traffic dropped.
    Setting it with no `vpn` profile, or
    beside any `host` profile, is a startup error, not a warning: the ruleset
    matches the daemon's uid and cannot tell a host profile's traffic from a
@@ -1604,9 +1611,10 @@ On a scratch pool, not your real one.
    derive it from the route; set `MTU` on a smaller path), and then — instead of
    `wg-quick`'s host-wide default route — **source-address routing**: each
    peer's `AllowedIPs` go into a routing table of the link's own, and an
-   `ip rule` sends traffic *from* the link's address to it. Every profile's
-   sockets are bound to its tunnel address, so that is all the daemon needs,
-   and nothing else on the host is rerouted. Shutdown removes the rules and
+   `ip rule` per `Address` sends traffic *from* that address to it. Every
+   profile's sockets send from its tunnel's addresses (the listen sockets
+   from each address the tunnel device holds, IPv6 included), so that is all
+   the daemon needs, and nothing else on the host is rerouted. Shutdown removes the rules and
    the link it raised. `ip rule show` lists them as `from <address> lookup <table>`.
    This is the only way the daemon raises a WireGuard link, as root too: as
    root, `wg-quick`'s host-wide default route made a second full-tunnel

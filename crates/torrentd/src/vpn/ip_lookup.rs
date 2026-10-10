@@ -1,5 +1,5 @@
-//! Interface lookups: an interface's IPv4 address, whether a link exists, and
-//! its ifindex.
+//! Interface lookups: an interface's IPv4 address, its global IPv6
+//! addresses, whether a link exists, and its ifindex.
 //!
 //! Shells out to `ip` (iproute2), found on the daemon's `PATH`, through
 //! [`super::exec::run`]. We deliberately don't depend on the netlink crate
@@ -38,6 +38,7 @@
 
 use std::io;
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 
 use super::exec;
 
@@ -73,6 +74,40 @@ fn parse_first_ipv4(iface: &str, text: &str) -> io::Result<Ipv4Addr> {
         io::ErrorKind::NotFound,
         format!("no IPv4 address on {iface}"),
     ))
+}
+
+/// Every global-scope IPv6 address on `iface`, in the order `ip` lists them.
+///
+/// A vpn session listens on its tunnel device, so it listens and announces on
+/// each of these as well as on the link's IPv4 address, and the kill switch
+/// pairs each with the link ([`super::killswitch::Tunnel::with_v6`]). None is
+/// an empty list, not an error: most tunnels carry no IPv6, and a host with
+/// IPv6 disabled lists nothing.
+pub fn global_ipv6(iface: &str) -> io::Result<Vec<Ipv6Addr>> {
+    let out = exec::run_ok(
+        "ip",
+        &[
+            "-6",
+            "-o",
+            "addr",
+            "show",
+            "dev",
+            exec::iface(iface)?,
+            "scope",
+            "global",
+        ],
+        None,
+        exec::QUICK,
+    )?;
+    Ok(parse_ipv6(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_ipv6(text: &str) -> Vec<Ipv6Addr> {
+    text.lines()
+        .filter_map(|line| line.split(" inet6 ").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|cidr| cidr.split('/').next()?.parse::<Ipv6Addr>().ok())
+        .collect()
 }
 
 /// Whether a link of this name exists in this process's network namespace.
@@ -135,6 +170,20 @@ mod tests {
             Ipv4Addr::new(10, 0, 0, 5)
         );
         assert!(parse_first_ipv4("wg0", "").is_err());
+    }
+
+    #[test]
+    fn each_inet6_address_is_read_off_a_one_line_listing() {
+        let text = "4: wg0    inet6 2001:db8::2/128 scope global \\       valid_lft forever preferred_lft forever\n\
+                    4: wg0    inet6 fd00::2/64 scope global \\       valid_lft forever preferred_lft forever\n";
+        assert_eq!(
+            parse_ipv6(text),
+            vec![
+                "2001:db8::2".parse::<Ipv6Addr>().unwrap(),
+                "fd00::2".parse().unwrap(),
+            ],
+        );
+        assert!(parse_ipv6("").is_empty());
     }
 
     /// Asked of `ip`, from this process's namespace, and the absent answer is
