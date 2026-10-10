@@ -1002,11 +1002,14 @@ Either way nothing becomes forgeable.
 
 Above the per-client buckets sits one daemon-wide ceiling: at most ten
 password verifications back to back, regaining one every three seconds,
-however many addresses the attempts come from. Without it a caller with many
-source addresses — one routed IPv6 /64 supplies more than enough — would get
-a bucket per address, and the Argon2 work and the guessing rate would scale
-with how many they hold. With it, a `POST /v1/sessions` that would exceed the
-ceiling gets `429`, with `Retry-After`, without running the KDF.
+however many addresses the attempts come from. The one exception is the
+returning-client reserve described below: a client that has logged in
+before can draw five more, regaining one every six seconds, once the
+ceiling is spent. Without the ceiling a caller with many source addresses —
+one routed IPv6 /64 supplies more than enough — would get a bucket per
+address, and the Argon2 work and the guessing rate would scale with how many
+they hold. With it, a `POST /v1/sessions` that would exceed the ceiling (and,
+for a returning client, the reserve) gets `429`, with `Retry-After`, without running the KDF.
 
 That ceiling can be kept spent, and it does not take many addresses. A
 request the ceiling refuses costs its client nothing, so each address takes

@@ -281,8 +281,10 @@ pub struct Auth {
 /// socket peer, or an address a trusted proxy supplied ([`throttle_key`]
 /// keys IPv6 per /64) — and in one global bucket where it is not, or where
 /// the per-client map is full of live entries. Every verification also
-/// spends from one daemon-wide budget ([`KdfBudget`]), which bounds how much
-/// Argon2 the route runs however many addresses a caller holds.
+/// spends from one daemon-wide budget ([`KdfBudget`]), or, once that is
+/// empty and only for a client that has logged in before, from the reserve
+/// described below; together they bound how much Argon2 the route runs
+/// however many addresses a caller holds.
 ///
 /// That budget can be kept spent, and every login refused while it is, by
 /// [`STARVING_ADDRESSES`] addresses (or IPv6 /64s) polling in a loop. A

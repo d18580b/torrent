@@ -146,8 +146,10 @@ impl Describe for ClientAddr {
 ///
 /// The token carries `read` and `write` and expires after
 /// `[auth] session_ttl_secs` (`GET /v1/server` reports it). Failed attempts
-/// are throttled per client, and every attempt spends from one daemon-wide
-/// budget for the memory-hard password hash; either limit answers
+/// are throttled per client, and attempts spend from one daemon-wide budget
+/// for the memory-hard password hash. Once that budget is spent, a client
+/// that has logged in since the daemon started spends from a small reserve
+/// that only such clients share instead. Either limit answers
 /// `429 login-throttled` with `Retry-After`.
 #[kynos::post("/sessions", tag = Sessions)]
 pub async fn create_session(
