@@ -1292,8 +1292,8 @@ async fn a_shared_payload_delete_is_refused_while_a_scan_holds_the_writer() {
 /// The handler's early co-claimant check reads the committed index, which a
 /// running scan can rewrite before it lets go of the writer. A cross-seed
 /// that commits a claim on this torrent's files after that check, and before
-/// the payload is proven on the writer, is refused there rather than having
-/// its files moved to the trash.
+/// the payload is proven, is refused there rather than having its files
+/// moved to the trash.
 #[tokio::test]
 async fn a_co_claimant_committed_after_the_early_check_is_refused_before_the_trash() {
     let dir = tempfile::tempdir().unwrap();
@@ -1383,6 +1383,90 @@ async fn a_co_claimant_committed_after_the_early_check_is_refused_before_the_tra
             .any(|c| matches!(c, torrentd_engine::RecordedCall::RemoveTorrent { .. })),
         "a refused delete leaves the torrent in its session",
     );
+}
+
+/// Issue #292: a `delete_files` delete of a torrent whose payload is
+/// provable answers while a scan holds the writer. Its proof read the claims
+/// and every file's row on the writer, so it waited out the scan before
+/// anything was removed.
+#[tokio::test]
+async fn a_provable_payload_delete_answers_while_a_scan_holds_the_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let (pool, _) = fixture(dir.path(), true);
+    let index = Arc::clone(&pool);
+    let engine = Arc::new(torrentd_engine::MockEngine::new());
+    let hash = libtorrent_safe::InfoHash::from_hex(IH_A).unwrap();
+    let p = torrentd_engine::ProfileId::new("p");
+    let handle = engine.register_handle(hash);
+    let movies = dir.path().join("pool/movies");
+    engine.set_torrent_details(
+        handle,
+        torrentd_engine::TorrentDetails {
+            save_path: movies.to_string_lossy().into_owned(),
+            ..torrentd_engine::MockEngine::default_details()
+        },
+    );
+    engine.set_torrent_files(
+        handle,
+        Some(
+            ["a.bin", "b.bin"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, path)| torrentd_engine::TorrentFile {
+                    index: u32::try_from(i).unwrap(),
+                    path: path.into(),
+                    size: 0,
+                    downloaded: 0,
+                    priority: 4,
+                })
+                .collect(),
+        ),
+    );
+    let session = Arc::clone(&engine);
+    let h = Harness::authed(&Coverage::new(), |s| {
+        profiles(s);
+        s.source = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            p.clone(),
+            session as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]));
+        s.pool = Some(pool);
+    });
+    h.state.registry.assign(hash, p.clone()).unwrap();
+    h.state.state.insert(
+        hash,
+        torrentd_engine::TorrentState::newly_added(handle, p, std::time::Instant::now()),
+    );
+
+    let (release, holder) = hold_writer_as_a_scan(&index);
+    let asked = std::time::Instant::now();
+    let resp = h
+        .write(
+            "DELETE",
+            &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
+        )
+        .await;
+    assert!(
+        asked.elapsed() < SCAN_HOLD / 2,
+        "the payload proof waited {:?} on the writer",
+        asked.elapsed(),
+    );
+    resp.assert_status(StatusCode::NO_CONTENT);
+    assert!(!movies.join("a.bin").exists() && !movies.join("b.bin").exists());
+    let trash = dir.path().join("pool/.torrentd-trash");
+    let bucket = std::fs::read_dir(&trash)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(bucket.len(), 1, "{bucket:?}");
+    assert!(bucket[0].join("movies/a.bin").exists());
+    assert!(bucket[0].join("movies/b.bin").exists());
+    assert_eq!(
+        h.state.registry.lookup(&hash),
+        None,
+        "the assignment is gone"
+    );
+    release.send(()).unwrap();
+    holder.join().unwrap();
 }
 
 /// Issue #111's acceptance: a torrent adopted into one profile, deleted

@@ -1242,9 +1242,10 @@ pub async fn delete_torrent(
             let hex = ih.to_hex();
             // Off the reader: the claims are the last committed index's, and
             // the writer would make a refusal wait out a whole running scan.
-            // That scan can still commit a new co-claimant, so
-            // `payload_to_trash` asks again on the writer before anything is
-            // moved; this one only answers the common refusal early.
+            // A scan can commit a new co-claimant after this, so
+            // `payload_to_trash` asks again, in the read its proof makes,
+            // before anything is moved; this one only answers the common
+            // refusal early.
             refuse_co_claimants(pool.with_reader(|st| st.co_claimants(&hex)))?;
         }
     }
@@ -1417,24 +1418,30 @@ fn payload_to_trash(
         .into_iter()
         .map(|f| f.path)
         .collect();
-    let payload = crate::pool_apply::torrent_payload(
+    // The handler's co-claimant check ran before the session was asked for
+    // the files, and a scan may have committed since: the proof asks again,
+    // in the same read of the committed index as the claims and rows it
+    // rests on. It reads the read connection, so it never waits out a scan
+    // still holding the writer.
+    let payload = match crate::pool_apply::torrent_payload(
         pool,
         &ih.to_hex(),
         FsPath::new(&details.save_path),
         &files,
-    )
-    .map_err(|why| DeleteTorrentError::PayloadUntrashable {
-        detail: format!(
-            "{why}. Nothing was changed; the torrent is still in its session. Retry \
-             without `delete_files` to remove the torrent alone."
-        ),
-    })?;
-    // The handler's co-claimant check read the last committed index, which a
-    // scan running then could rewrite before it let go of the writer. The
-    // writer reads above waited for that scan, so ask again on it: a
-    // cross-seed the scan newly placed over these files is refused here, as
-    // it would have been had the delete arrived after the scan.
-    refuse_co_claimants(pool.with_store(|st| st.co_claimants(&ih.to_hex())))?;
+    ) {
+        Ok(payload) => payload,
+        Err(crate::pool_apply::PayloadRefusal::Shared(others)) => {
+            return Err(payload_shared(&others));
+        }
+        Err(crate::pool_apply::PayloadRefusal::Unproven(why)) => {
+            return Err(DeleteTorrentError::PayloadUntrashable {
+                detail: format!(
+                    "{why}. Nothing was changed; the torrent is still in its session. Retry \
+                     without `delete_files` to remove the torrent alone."
+                ),
+            });
+        }
+    };
     refuse_live_overlap(s, ih, &payload)?;
     Ok(payload)
 }
@@ -1447,17 +1454,23 @@ fn refuse_co_claimants(
     let others = others.map_err(|e| DeleteTorrentError::Internal {
         detail: internal("reading the pool index", e),
     })?;
-    if let Some(first) = others.first() {
-        return Err(DeleteTorrentError::PayloadShared {
-            detail: format!(
-                "{} other torrent(s) claim files of this one in the pool index — the first is \
-                 {first} — so deleting its payload would delete theirs; retry without \
-                 `delete_files`",
-                others.len(),
-            ),
-        });
+    if others.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    Err(payload_shared(&others))
+}
+
+/// `409 payload-shared`, naming the first of `others`: the torrents the pool
+/// index has claiming files of the one being deleted.
+fn payload_shared(others: &[String]) -> DeleteTorrentError {
+    DeleteTorrentError::PayloadShared {
+        detail: format!(
+            "{} other torrent(s) claim files of this one in the pool index — the first is {} — \
+             so deleting its payload would delete theirs; retry without `delete_files`",
+            others.len(),
+            others.first().map_or("unknown", String::as_str),
+        ),
+    }
 }
 
 /// Refuse `payload` when any other torrent the daemon holds has a file at
