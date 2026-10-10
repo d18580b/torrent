@@ -1426,24 +1426,15 @@ fn refuse_live_overlap(
                 "is assigned to a profile but no session holds it".to_owned(),
             ));
         };
-        let Some(engine) = s.source.engine_for(&st.profile_id) else {
-            return Err(unprovable(
+        let live = crate::pool_apply::read_live_torrent(&s.source, &st).map_err(|e| match e {
+            crate::pool_apply::LiveReadError::NoSession => unprovable(
                 other,
                 format!("is held by profile {}, which has no session", st.profile_id),
-            ));
-        };
-        let read = || -> Result<_, EngineError> {
-            let details = engine.torrent_details(st.handle)?;
-            let files = engine
-                .torrent_files(st.handle)?
-                .map(|fs| fs.into_iter().map(|f| f.path).collect());
-            Ok(crate::pool_apply::LiveTorrent {
-                save_path: details.save_path.into(),
-                files,
-            })
-        };
-        let live = read()
-            .map_err(|e| unprovable(other, format!("could not be read from its session ({e})")))?;
+            ),
+            crate::pool_apply::LiveReadError::Engine(e) => {
+                unprovable(other, format!("could not be read from its session ({e})"))
+            }
+        })?;
         if let Some(path) = payload.shared_with(&live) {
             return Err(DeleteTorrentError::PayloadShared {
                 detail: format!(

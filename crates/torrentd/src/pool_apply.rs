@@ -91,10 +91,30 @@ fn check_index_accounts_for_live_state(
     let unindexed = pool
         .with_store(|st| st.loaded_without_claims(&owned))
         .map_err(|e| e.to_string())?;
-    let mut blocking = unindexed.iter().filter_map(|ih| {
-        unclaimed_payload_may_reach(source, state, ih, scope).map(|why| (ih, why))
-    });
-    if let Some((first, why)) = blocking.next() {
+    if unindexed.is_empty() {
+        return Ok(());
+    }
+    // Each unclaimed torrent costs a session read and a resolve and a stat
+    // per listed file, where a fully claimed index costs one query: logged,
+    // so a slow plan start or a slow step names what it spent its time on.
+    let started = std::time::Instant::now();
+    let mut files_read = 0usize;
+    let blocking: Vec<(&String, String)> = unindexed
+        .iter()
+        .filter_map(|ih| {
+            unclaimed_payload_may_reach(source, state, ih, scope, &mut files_read)
+                .map(|why| (ih, why))
+        })
+        .collect();
+    info!(
+        target: "torrentd::pool::apply",
+        unclaimed = unindexed.len(),
+        files = files_read,
+        blocking = blocking.len(),
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "compared the unclaimed torrents the daemon owns with the plan's deletes",
+    );
+    if let Some((first, why)) = blocking.first() {
         return Err(format!(
             "{} torrent(s) the daemon owns (loaded, assigned to a profile, or queued for \
              verification) have no claims in the index and may hold files under this \
@@ -104,47 +124,72 @@ fn check_index_accounts_for_live_state(
              added through POST /v1/torrents, which a scan never claims: copy its \
              `.torrent` into the library and rescan, move its payload out of this root, or \
              remove it. A torrent no session holds keeps refusing until its profile loads \
-             it or it is removed. A torrent whose payload lies outside this plan's root \
-             never blocks it.",
-            1 + blocking.count(),
+             it or it is removed. A torrent none of whose files lies under this plan's \
+             root, as spelled, through a symlink, or as a hard link, never blocks it.",
+            blocking.len(),
         ));
     }
     Ok(())
 }
 
 /// Why the unclaimed torrent `infohash` may hold a file in `scope`, or
-/// `None` where its session shows it holds none.
+/// `None` where its session shows it holds none. Adds the number of files
+/// its session lists to `files_read`.
 fn unclaimed_payload_may_reach(
     source: &Arc<dyn AlertSource>,
     state: &StateMap,
     infohash: &str,
     scope: &DeleteScope,
+    files_read: &mut usize,
 ) -> Option<String> {
     let Some(st) = libtorrent_safe::InfoHash::from_hex(infohash).and_then(|ih| state.get(&ih))
     else {
         return Some("no session holds, so where its files lie is unknown".into());
     };
-    let Some(engine) = source.engine_for(&st.profile_id) else {
-        return Some(format!(
+    match read_live_torrent(source, &st) {
+        Err(LiveReadError::NoSession) => Some(format!(
             "is held by profile {}, which has no session to say where its files lie",
             st.profile_id,
-        ));
-    };
-    let read = || -> Result<_, torrentd_engine::EngineError> {
-        let save_path = engine.torrent_details(st.handle)?.save_path;
-        let files: Option<Vec<String>> = engine
-            .torrent_files(st.handle)?
-            .map(|fs| fs.into_iter().map(|f| f.path).collect());
-        Ok((save_path, files))
-    };
-    match read() {
-        Err(e) => Some(format!(
+        )),
+        Err(LiveReadError::Engine(e)) => Some(format!(
             "could not be read from its session ({e}), so where its files lie is unknown"
         )),
-        Ok((save_path, files)) => scope
-            .reached_by(Path::new(&save_path), files.as_deref())
-            .then(|| format!("its session holds at {save_path}")),
+        Ok(live) => {
+            *files_read += live.files.as_ref().map_or(0, Vec::len);
+            scope.reached_by(&live)
+        }
     }
+}
+
+/// Why [`read_live_torrent`] could not read a torrent from its session.
+#[derive(Debug)]
+pub enum LiveReadError {
+    /// The profile holding it has no session.
+    NoSession,
+    /// Its session could not report it.
+    Engine(torrentd_engine::EngineError),
+}
+
+/// Where the session of the profile holding `st` says its payload lies:
+/// its save path and, once its metadata has arrived, its files.
+pub fn read_live_torrent(
+    source: &Arc<dyn AlertSource>,
+    st: &torrentd_engine::TorrentState,
+) -> Result<LiveTorrent, LiveReadError> {
+    let engine = source
+        .engine_for(&st.profile_id)
+        .ok_or(LiveReadError::NoSession)?;
+    let details = engine
+        .torrent_details(st.handle)
+        .map_err(LiveReadError::Engine)?;
+    let files = engine
+        .torrent_files(st.handle)
+        .map_err(LiveReadError::Engine)?
+        .map(|fs| fs.into_iter().map(|f| f.path).collect());
+    Ok(LiveTorrent {
+        save_path: details.save_path.into(),
+        files,
+    })
 }
 
 /// What a delete plan may remove, as an unclaimed torrent is compared with
@@ -154,9 +199,10 @@ struct DeleteScope {
     /// resolved.
     roots: Vec<std::path::PathBuf>,
     targets: Vec<std::path::PathBuf>,
-    /// `(device, inode)` of each target on disk, read on first use: only a
-    /// plan an unclaimed torrent sits beside pays for the stats.
-    identities: std::cell::OnceCell<std::collections::HashSet<(u64, u64)>>,
+    /// `(device, inode)` of each target on disk, and the target, read on
+    /// first use: only a plan an unclaimed torrent sits beside pays for the
+    /// stats.
+    identities: std::cell::OnceCell<std::collections::HashMap<(u64, u64), std::path::PathBuf>>,
 }
 
 impl DeleteScope {
@@ -191,20 +237,30 @@ impl DeleteScope {
         }
     }
 
-    fn identities(&self) -> &std::collections::HashSet<(u64, u64)> {
+    fn identities(&self) -> &std::collections::HashMap<(u64, u64), std::path::PathBuf> {
         use std::os::unix::fs::MetadataExt;
         self.identities.get_or_init(|| {
             self.targets
                 .iter()
-                .filter_map(|t| std::fs::symlink_metadata(t).ok())
-                .map(|md| (md.dev(), md.ino()))
+                .filter_map(|t| {
+                    let md = std::fs::symlink_metadata(t).ok()?;
+                    Some(((md.dev(), md.ino()), t.clone()))
+                })
                 .collect()
         })
     }
 
-    /// Whether a torrent saved at `save_path` with `files` (torrent-relative,
-    /// `/`-separated; `None` while its metadata has not arrived) may have a
-    /// file this plan deletes.
+    /// The root of this plan's that `p` lies under, if any.
+    fn root_over(&self, p: &Path) -> Option<&Path> {
+        self.roots
+            .iter()
+            .find(|r| p.starts_with(r))
+            .map(std::path::PathBuf::as_path)
+    }
+
+    /// Why `live`, a torrent its session holds, may have a file this plan
+    /// deletes, naming the rule and the path that matched; `None` where it
+    /// has none.
     ///
     /// Every path is compared both as spelled and with its symlinks resolved,
     /// so a save path reaching a root through a symlink, or a symlinked
@@ -213,32 +269,70 @@ impl DeleteScope {
     /// mount of a root reaches it too. A torrent with no metadata yet could
     /// write anything under its save path, so it reaches a root its save path
     /// is under or above.
-    fn reached_by(&self, save_path: &Path, files: Option<&[String]>) -> bool {
+    fn reached_by(&self, live: &LiveTorrent) -> Option<String> {
         use std::os::unix::fs::MetadataExt;
+        let save_path = live.save_path.as_path();
         let bases: Vec<std::path::PathBuf> = std::iter::once(save_path.to_path_buf())
             .chain(std::fs::canonicalize(save_path).ok())
             .collect();
-        let under_a_root = |p: &Path| self.roots.iter().any(|r| p.starts_with(r));
-        let Some(files) = files else {
-            return bases
-                .iter()
-                .any(|b| under_a_root(b) || self.roots.iter().any(|r| r.starts_with(b)));
+        let Some(files) = &live.files else {
+            return bases.iter().find_map(|b| {
+                if let Some(r) = self.root_over(b) {
+                    return Some(format!(
+                        "has no metadata yet and is saved at {}, under this plan's root {}, \
+                         so it could write any file there",
+                        b.display(),
+                        r.display(),
+                    ));
+                }
+                self.roots.iter().find(|r| r.starts_with(b)).map(|r| {
+                    format!(
+                        "has no metadata yet and is saved at {}, above this plan's root {}, \
+                         so it could write any file there",
+                        b.display(),
+                        r.display(),
+                    )
+                })
+            });
         };
-        files.iter().any(|rel| {
+        files.iter().find_map(|rel| {
             let joined = save_path.join(rel);
+            for b in &bases {
+                let p = b.join(rel);
+                if let Some(r) = self.root_over(&p) {
+                    return Some(format!(
+                        "lists {rel}, at {}, under this plan's root {}",
+                        p.display(),
+                        r.display(),
+                    ));
+                }
+            }
             // A file not written yet resolves through its parent: a symlinked
             // directory below the save path leads there all the same.
             let resolved = std::fs::canonicalize(&joined).ok().or_else(|| {
                 let parent = std::fs::canonicalize(joined.parent()?).ok()?;
                 Some(parent.join(joined.file_name()?))
             });
-            bases
-                .iter()
-                .map(|b| b.join(rel))
-                .chain(resolved)
-                .any(|p| under_a_root(&p))
-                || std::fs::metadata(&joined)
-                    .is_ok_and(|md| self.identities().contains(&(md.dev(), md.ino())))
+            if let Some(p) = resolved {
+                if let Some(r) = self.root_over(&p) {
+                    return Some(format!(
+                        "lists {rel}, at {}, which a symlink leads to {}, under this plan's \
+                         root {}",
+                        joined.display(),
+                        p.display(),
+                        r.display(),
+                    ));
+                }
+            }
+            let md = std::fs::metadata(&joined).ok()?;
+            self.identities().get(&(md.dev(), md.ino())).map(|target| {
+                format!(
+                    "lists {rel}, at {}, which is the same file on disk (device and inode) as \
+                     {}, which this plan deletes: a hard link or a bind mount of its root",
+                    joined.display(),
+                    target.display(),
+                )
+            })
         })
     }
 }
