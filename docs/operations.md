@@ -313,10 +313,13 @@ A stop runs four stages, each with its own bound:
    boundary: it gets 15 s more to land, and one still copying then is cut
    off. Its step stays `in_progress`, the plan is parked `failed`, and the
    journal line `shutting down while libtorrent is still moving the payload`
-   names the torrent and its destination. libtorrent removes the source files
-   only once every copy has succeeded, so the source is whole and the
-   destination may hold a partial copy. Recover it as for a plan killed inside
-   a step ([After a crash](#after-a-crash)). A scan or
+   names the torrent and its destination. The cut-off ends only the wait:
+   libtorrent goes on moving the payload through the resume drain, so the move
+   may still finish and delete the source before the sessions close, or stop
+   part way with a partial copy at the destination. Before removing anything,
+   find which of the source and the destination holds the complete payload,
+   then recover it as for a plan killed inside a step
+   ([After a crash](#after-a-crash)). A scan or
    drift check still running at the bound is cut off: run it again after the
    boot.
 3. **The resume drain,** `shutdown_drain_secs` (default 60). It saves resume
@@ -479,9 +482,12 @@ curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer
   `in_progress`. The journal line `resume failed` names the step and its path,
   and applying it again fails the same way, since nothing marks the step
   resolved. Look at that path, rescan, discard the plan, and build a new one.
-  For a relocate, look at its destination too: a new plan refuses to move
-  onto a file already there (`destination … already contains`), such as the
-  partial copy a move cut off mid-copy leaves, so remove what does not belong
+  For a relocate, look at its destination too, and find which of the two
+  holds the complete payload before removing anything: a move whose wait was
+  cut off can still finish and delete the source, so the destination may hold
+  the only whole copy, or the destination may hold a partial one. A new plan
+  refuses to move onto a file already there (`destination … already
+  contains`), so once you know which copy is complete, remove only the other
   before building it. A relocate libtorrent never reported on within 600 s,
   or one a stop cut off, is parked the same way.
 - With `[pool] allow_mutations` off, nothing is re-driven. The plan stays

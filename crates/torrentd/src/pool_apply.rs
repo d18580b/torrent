@@ -648,9 +648,11 @@ impl From<&str> for StepFailure {
 fn unknown_outcome_remedy(src: &str, dst: Option<&str>) -> String {
     let look = match dst {
         Some(dst) => format!(
-            "Look at {src} and {dst} to find where the payload is. A new plan refuses to \
-             move onto a file already at the destination, such as the partial copy a move \
-             cut off mid-copy leaves there, so remove what does not belong."
+            "Look at {src} and {dst} and find which of them holds the complete payload \
+             before removing anything: a move whose wait was cut off can still finish and \
+             delete {src}, or stop with a partial copy at {dst}. A new plan refuses to \
+             move onto a file already at the destination, so once you know which copy is \
+             complete, remove only the other."
         ),
         None => format!("Look at {src} to find what happened to it."),
     };
@@ -3495,6 +3497,13 @@ mod tests {
                     e.contains("/pool/old/T") && e.contains("/pool/new/T"),
                     "{e}"
                 );
+                // The move may still finish after the cut-off and delete the
+                // source, so the remedy never presumes which copy is whole.
+                assert!(
+                    e.contains("holds the complete payload before removing anything"),
+                    "{e}"
+                );
+                assert!(!e.contains("remove what does not belong"), "{e}");
                 assert_names_the_unknown_outcome_remedy(&e);
             }
             Err(StepFailure::Failed(e)) => panic!("recorded as failed: {e}"),
