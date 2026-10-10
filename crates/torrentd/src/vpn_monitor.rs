@@ -94,11 +94,44 @@ pub(crate) enum Handshake {
     Age(Duration),
 }
 
+/// What the address probe said about the interface's address.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Address {
+    /// `ip` ran and the interface holds this address.
+    Held(IpAddr),
+    /// `ip` ran and the interface holds no IPv4 address, or the link is gone.
+    Absent,
+    /// `ip` could not be run or did not finish: nothing is known about the
+    /// address, and (like an unavailable route or handshake probe) the
+    /// verdict rests on the other checks.
+    Unknown,
+}
+
+impl Address {
+    /// What `probe_tunnel` read: `Absent` for no address, `Unknown` when the
+    /// probe could not run.
+    pub(crate) fn from_probe(probe: &Result<Option<IpAddr>, vpn::AddrProbeUnavailable>) -> Self {
+        match probe {
+            Ok(Some(ip)) => Address::Held(*ip),
+            Ok(None) => Address::Absent,
+            Err(_) => Address::Unknown,
+        }
+    }
+
+    /// The address the probe saw, if it saw one.
+    pub(crate) fn held(self) -> Option<IpAddr> {
+        match self {
+            Address::Held(ip) => Some(ip),
+            Address::Absent | Address::Unknown => None,
+        }
+    }
+}
+
 /// What one poll observed about a profile's tunnel.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Observation {
     /// The interface's address now.
-    pub current: Option<IpAddr>,
+    pub current: Address,
     /// The address the profile's session is bound to.
     pub expected: Option<IpAddr>,
     /// Where a packet from `current` would be routed; `None` when the probe
@@ -124,10 +157,14 @@ pub(crate) struct Observation {
 /// the monitor's.
 ///
 /// Checked in order, and the first failure is the reason: the address, then
-/// the route, then the handshake.
+/// the route, then the handshake. An address the probe could not read
+/// ([`Address::Unknown`]) fails nothing: `ip` failing to run says nothing
+/// about the tunnel, and reading it as a lost address fenced every profile on
+/// a host fault.
 pub(crate) fn evaluate(obs: &Observation, max_age: Duration) -> Result<(), DownReason> {
     match (obs.current, obs.expected) {
-        (Some(c), Some(x)) if c == x => {}
+        (Address::Held(c), Some(x)) if c == x => {}
+        (Address::Unknown, Some(_)) => {}
         _ => return Err(DownReason::IpLostOrChanged),
     }
     if let Some(vpn::route::RouteProbe::Elsewhere(_)) = obs.route {
@@ -177,9 +214,11 @@ fn seed_baselines(profiles: &ProfileRegistry, metrics: &PromSink) {
         if e.config.vpn_type() == Some(VpnType::Wireguard) {
             metrics.set_gauge("profile_vpn_handshake_probe_ok", 1.0, &labels);
         }
-        // The route probe runs for both tunnel types. Same reasoning as the
-        // handshake series: `0` means the probe could not run on this host.
+        // The route and address probes run for both tunnel types. Same
+        // reasoning as the handshake series: `0` means the probe could not run
+        // on this host.
         metrics.set_gauge("profile_vpn_route_probe_ok", 1.0, &labels);
+        metrics.set_gauge("profile_vpn_addr_probe_ok", 1.0, &labels);
         for reason in DownReason::ALL
             .map(DownReason::as_str)
             .into_iter()
@@ -285,22 +324,25 @@ fn unanswered_clock(
     }
 }
 
-/// What one poll's probes of a tunnel returned: the interface's address,
-/// where a packet from it would be routed (asked only when there is an
-/// address), and — WireGuard only — the age of its latest handshake.
+/// What one poll's probes of a tunnel returned: the interface's address
+/// (`Err` when `ip` could not be run), where a packet from it would be routed
+/// (asked only when there is an address), and — WireGuard only — the age of
+/// its latest handshake.
 pub(crate) struct TunnelProbes {
-    pub ip: Option<IpAddr>,
+    pub ip: Result<Option<IpAddr>, vpn::AddrProbeUnavailable>,
     pub route: Option<Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>>,
     pub handshake: Option<Result<Option<Duration>, vpn::HandshakeProbeUnavailable>>,
 }
 
 /// The probes [`run`] makes of `iface` each poll, on the host.
 fn probe_tunnel(iface: &str, is_wg: bool) -> TunnelProbes {
-    let ip = vpn::first_ipv4(iface).ok().map(IpAddr::V4);
+    let ip = vpn::probe_ipv4(iface).map(|v4| v4.map(IpAddr::V4));
     // Asked from the address the interface holds now: if that is not the
-    // bound one the address check fences first, and with no address there is
-    // nothing to ask about.
-    let route = ip.map(|src| vpn::route::probe(iface, src, IpAddr::V4(vpn::route::PROBE_DEST)));
+    // bound one the address check fences first, and with no address (or none
+    // known) there is nothing to ask about.
+    let route = Address::from_probe(&ip)
+        .held()
+        .map(|src| vpn::route::probe(iface, src, IpAddr::V4(vpn::route::PROBE_DEST)));
     let handshake = is_wg.then(|| vpn::wireguard_handshake_age(iface));
     TunnelProbes {
         ip,
@@ -333,6 +375,11 @@ pub(crate) fn host_prober() -> Prober {
 /// it again from its next poll, once the profile carries traffic, and fences
 /// the profile again if no handshake follows.
 ///
+/// An address probe that could not run fails the check, with the address
+/// reason: lifting needs the bound address seen on the interface. The
+/// monitor's leniency toward an unknown address keeps a fence from going on;
+/// it never takes one off.
+///
 /// A host profile has no tunnel and is never fenced; it passes.
 pub(crate) fn recovery_check(
     entry: &crate::profile_registry::ProfileEntry,
@@ -342,8 +389,18 @@ pub(crate) fn recovery_check(
         return Ok(());
     };
     let probes = probe(iface, entry.config.vpn_type() == Some(VpnType::Wireguard));
+    if let Err(why) = &probes.ip {
+        warn!(
+            target: "torrentd::vpn_monitor",
+            profile_id = %entry.id(),
+            vpn_iface = %iface,
+            error.cause = %why.cause,
+            "address probe unavailable; the fence stays until the tunnel's address can be read",
+        );
+        return Err(DownReason::IpLostOrChanged);
+    }
     let observation = Observation {
-        current: probes.ip,
+        current: Address::from_probe(&probes.ip),
         expected: entry.session_ip,
         route: probes.route.and_then(Result::ok),
         handshake: Handshake::NoSignal,
@@ -666,7 +723,7 @@ async fn run_with(
                 move || probe(&iface, is_wg)
             })
             .await;
-            let (current, route_probe, handshake_probe) = match probed {
+            let (addr_probe, route_probe, handshake_probe) = match probed {
                 Ok(p) => (p.ip, p.route, p.handshake),
                 Err(e) => {
                     error!(
@@ -681,6 +738,25 @@ async fn run_with(
             // Handshake liveness applies to WireGuard only; OpenVPN keeps the
             // IP-presence check (no cheap equivalent probe).
             let labels = [("profile_id", profile_id.as_str())];
+            let current = Address::from_probe(&addr_probe);
+            match &addr_probe {
+                Ok(_) => metrics.set_gauge("profile_vpn_addr_probe_ok", 1.0, &labels),
+                Err(why) => {
+                    // `ip` failing to run (EMFILE, a stall past the timeout)
+                    // used to read as a lost address: one poll fenced every
+                    // vpn profile `ip_lost_or_changed`, and nothing said `ip`
+                    // had failed.
+                    metrics.set_gauge("profile_vpn_addr_probe_ok", 0.0, &labels);
+                    warn!(
+                        target: "torrentd::vpn_monitor",
+                        profile_id = %profile_id,
+                        vpn_iface = %iface,
+                        error.cause = %why.cause,
+                        "address probe unavailable; the tunnel's address is not being \
+                         checked this poll",
+                    );
+                }
+            }
             let route = match route_probe {
                 Some(Ok(r)) => {
                     metrics.set_gauge("profile_vpn_route_probe_ok", 1.0, &labels);
@@ -780,7 +856,13 @@ async fn run_with(
             };
 
             // Tunnel down, IP changed, or handshake stale → pause the profile.
-            let paused = fence(e, &state, current, metrics.as_ref());
+            // An unknown address keeps the one the profile was last seen
+            // with: the fence records what is known, not a loss nobody saw.
+            let fenced_ip = match current {
+                Address::Unknown => health.tunnel_ip,
+                seen => seen.held(),
+            };
+            let paused = fence(e, &state, fenced_ip, metrics.as_ref());
             // The clock goes with the fence, not with the next poll: a fence
             // lifted before that poll would otherwise keep the clock from
             // before it and be fenced `no_handshake` on the first poll after.
@@ -804,7 +886,7 @@ async fn run_with(
                 target: "torrentd::vpn_monitor",
                 profile_id = %profile_id,
                 vpn_iface = %iface,
-                tunnel_ip = current.map(|c| c.to_string()).unwrap_or_default(),
+                tunnel_ip = current.held().map(|c| c.to_string()).unwrap_or_default(),
                 reason = reason.as_str(),
                 route = match &route {
                     Some(vpn::route::RouteProbe::Elsewhere(why)) => why.as_str(),
@@ -833,11 +915,16 @@ mod tests {
         Some(IpAddr::V4(Ipv4Addr::new(10, 2, 0, a)))
     }
 
+    /// The address probe seeing 10.2.0.`a`.
+    fn held(a: u8) -> Address {
+        Address::Held(IpAddr::V4(Ipv4Addr::new(10, 2, 0, a)))
+    }
+
     /// A healthy WireGuard observation, one field at a time away from each
     /// failure below.
     fn healthy() -> Observation {
         Observation {
-            current: ip(2),
+            current: held(2),
             expected: ip(2),
             route: Some(RouteProbe::ViaTunnel),
             handshake: Handshake::Age(Duration::from_secs(20)),
@@ -864,15 +951,41 @@ mod tests {
     #[test]
     fn down_when_ip_lost_or_changed() {
         let lost = Observation {
-            current: None,
+            current: Address::Absent,
             ..healthy()
         };
         assert_eq!(evaluate(&lost, MAX), Err(DownReason::IpLostOrChanged));
         let changed = Observation {
-            current: ip(3),
+            current: held(3),
             ..healthy()
         };
         assert_eq!(evaluate(&changed, MAX), Err(DownReason::IpLostOrChanged));
+    }
+
+    /// An address probe that could not run is no verdict on the address: the
+    /// other checks decide, as for an unavailable route or handshake probe.
+    #[test]
+    fn an_unknown_address_leaves_the_verdict_to_the_other_checks() {
+        let unknown = Observation {
+            current: Address::Unknown,
+            route: None,
+            ..healthy()
+        };
+        assert_eq!(evaluate(&unknown, MAX), Ok(()));
+        let stale = Observation {
+            handshake: Handshake::Age(Duration::from_secs(181)),
+            ..unknown.clone()
+        };
+        assert_eq!(evaluate(&stale, MAX), Err(DownReason::HandshakeStale));
+        let unbound = Observation {
+            expected: None,
+            ..unknown
+        };
+        assert_eq!(
+            evaluate(&unbound, MAX),
+            Err(DownReason::IpLostOrChanged),
+            "with no bound address there is nothing it could be holding"
+        );
     }
 
     #[test]
@@ -888,7 +1001,7 @@ mod tests {
     fn ip_change_beats_stale_handshake() {
         // IP mismatch is reported even if the handshake is also stale.
         let obs = Observation {
-            current: ip(3),
+            current: held(3),
             handshake: Handshake::Age(Duration::from_secs(999)),
             ..healthy()
         };
@@ -1073,8 +1186,22 @@ mod tests {
         handshake: Result<Option<Duration>, vpn::HandshakeProbeUnavailable>,
     ) -> Prober {
         Arc::new(move |_iface: &str, is_wg: bool| TunnelProbes {
-            ip: ip(2),
+            ip: Ok(ip(2)),
             route: route.clone(),
+            handshake: is_wg.then_some(handshake),
+        })
+    }
+
+    /// A probe whose `ip` cannot run, as on a host out of file descriptors:
+    /// no address known, so no route asked, and the given handshake.
+    fn addr_unavailable(
+        handshake: Result<Option<Duration>, vpn::HandshakeProbeUnavailable>,
+    ) -> Prober {
+        Arc::new(move |_iface: &str, is_wg: bool| TunnelProbes {
+            ip: Err(vpn::AddrProbeUnavailable {
+                cause: "spawning `ip`: Too many open files (os error 24)".into(),
+            }),
+            route: None,
             handshake: is_wg.then_some(handshake),
         })
     }
@@ -1176,6 +1303,76 @@ mod tests {
         );
         assert!(
             exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+            "{exported}"
+        );
+    }
+
+    /// The regression for an `ip` that cannot run: a healthy profile is not
+    /// fenced `ip_lost_or_changed`, `profile_vpn_addr_probe_ok` reads 0, and
+    /// the cause is logged at warn. An address `ip` answered is gone still
+    /// fences.
+    #[tokio::test(start_paused = true)]
+    async fn the_poll_loop_does_not_fence_on_an_address_probe_that_could_not_run() {
+        let fresh = Ok(Some(Duration::from_secs(5)));
+        let log = crate::tracing_init::Buf::default();
+        let (_reload, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let guard = tracing::subscriber::set_default(subscriber);
+        let (status, exported) =
+            poll_acct_a(StateMap::new(), MAX, addr_unavailable(fresh), 2).await;
+        drop(guard);
+        assert_eq!(
+            status,
+            ProfileStatus::Active,
+            "a probe that could not run is reported, not fenced on: {exported}"
+        );
+        assert!(
+            exported.contains("torrentd_profile_vpn_addr_probe_ok{profile_id=\"acct_a\"} 0"),
+            "{exported}"
+        );
+        assert!(
+            exported.contains("torrentd_profile_vpn_tunnel_up{profile_id=\"acct_a\"} 1"),
+            "{exported}"
+        );
+        assert!(
+            exported
+                .contains("torrentd_profile_vpn_tunnel_ip_changes_total{profile_id=\"acct_a\"} 0"),
+            "no address changed: {exported}"
+        );
+        let log = log.text();
+        let warned = log
+            .lines()
+            .filter(|l| l.contains("address probe unavailable"))
+            .collect::<Vec<_>>();
+        assert_eq!(warned.len(), 2, "once per poll: {log}");
+        assert!(
+            warned
+                .iter()
+                .all(|l| l.contains("\"level\":\"WARN\"") && l.contains("Too many open files")),
+            "at warn, with the cause: {log}"
+        );
+
+        // Still fenced on a stale handshake: the other checks decide.
+        let stale = Ok(Some(Duration::from_secs(600)));
+        let (status, exported) =
+            poll_acct_a(StateMap::new(), MAX, addr_unavailable(stale), 1).await;
+        assert_eq!(status, ProfileStatus::VpnDown, "{exported}");
+        assert!(fenced_once_for(&exported, "handshake_stale"), "{exported}");
+
+        // `ip` ran and the link has no address: fenced, as before.
+        let absent: Prober = Arc::new(move |_, is_wg| TunnelProbes {
+            ip: Ok(None),
+            route: None,
+            handshake: is_wg.then_some(fresh),
+        });
+        let (status, exported) = poll_acct_a(StateMap::new(), MAX, absent, 1).await;
+        assert_eq!(status, ProfileStatus::VpnDown, "{exported}");
+        assert!(
+            fenced_once_for(&exported, "ip_lost_or_changed"),
+            "{exported}"
+        );
+        assert!(
+            exported.contains("torrentd_profile_vpn_addr_probe_ok{profile_id=\"acct_a\"} 1"),
             "{exported}"
         );
     }
@@ -1478,7 +1675,7 @@ mod tests {
         handshake: Option<Duration>,
     ) -> Prober {
         Arc::new(move |_, _| TunnelProbes {
-            ip,
+            ip: Ok(ip),
             route: route.clone().map(Ok),
             handshake: Some(Ok(handshake)),
         })
@@ -1523,6 +1720,11 @@ mod tests {
                 &answering(ip(2), Some(RouteProbe::Elsewhere("eth0".into())), stale),
             ),
             Err(DownReason::RouteMismatch),
+        );
+        assert_eq!(
+            recovery_check(&entry, &addr_unavailable(Ok(stale))),
+            Err(DownReason::IpLostOrChanged),
+            "an address nobody could read does not lift the fence",
         );
         let host = crate::profile_registry::test_host_entry("public");
         assert_eq!(

@@ -1157,7 +1157,7 @@ fn profile_checks(
     //     line above reports it).
     if let Some(ip) = tunnel_ip {
         let observation = crate::vpn_monitor::Observation {
-            current: Some(ip),
+            current: crate::vpn_monitor::Address::Held(ip),
             expected: Some(ip),
             route: route.and_then(Result::ok),
             handshake: match handshake_probe {

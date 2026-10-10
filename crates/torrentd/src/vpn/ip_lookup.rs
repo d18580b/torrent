@@ -58,6 +58,53 @@ pub fn first_ipv4(iface: &str) -> io::Result<Ipv4Addr> {
     parse_first_ipv4(iface, &String::from_utf8_lossy(&out.stdout))
 }
 
+/// Why [`probe_ipv4`] could not answer: `ip` could not be run, or did not
+/// finish, so nothing is known about the interface's address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddrProbeUnavailable {
+    /// The error, as `ip` failed to run (a spawn failure such as `EMFILE`,
+    /// the [`exec::QUICK`] timeout, or a name that cannot be passed to `ip`).
+    pub cause: String,
+}
+
+/// The interface's first IPv4 address, telling "no address" apart from "could
+/// not ask".
+///
+/// * `Ok(Some(addr))` — `ip` ran and listed this address.
+/// * `Ok(None)` — `ip` ran and the interface has no IPv4 address, or `ip`
+///   exited nonzero (the link does not exist). `ip` answered, as a refused
+///   `ip route get` is an answer to the route probe.
+/// * `Err(_)` — `ip` could not be run or did not finish. This is a host fault,
+///   not a fact about the tunnel, and a caller deciding whether the tunnel is
+///   down leaves its verdict to the other checks rather than reading it as a
+///   lost address.
+///
+/// [`first_ipv4`] keeps its single error for the callers that need an address
+/// and treat every reason for not having one alike.
+pub fn probe_ipv4(iface: &str) -> Result<Option<Ipv4Addr>, AddrProbeUnavailable> {
+    let unavailable = |e: io::Error| AddrProbeUnavailable {
+        cause: e.to_string(),
+    };
+    let out = exec::run(
+        "ip",
+        &[
+            "-4",
+            "-o",
+            "addr",
+            "show",
+            "dev",
+            exec::iface(iface).map_err(unavailable)?,
+        ],
+        None,
+        exec::QUICK,
+    )
+    .map_err(unavailable)?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_first_ipv4(iface, &String::from_utf8_lossy(&out.stdout)).ok())
+}
+
 fn parse_first_ipv4(iface: &str, text: &str) -> io::Result<Ipv4Addr> {
     for line in text.lines() {
         if let Some(rest) = line.split(" inet ").nth(1) {
@@ -150,5 +197,19 @@ mod tests {
         );
         assert!(link_standing("-x"), "and it is read as standing");
         assert_eq!(ifindex("lo").unwrap(), 1);
+    }
+
+    /// An address probe that ran tells "no address" (`Ok(None)`) apart from
+    /// one that could not ask (`Err`).
+    #[test]
+    fn the_address_probe_tells_no_address_from_could_not_ask() {
+        assert_eq!(probe_ipv4("lo"), Ok(Some(Ipv4Addr::LOCALHOST)));
+        assert_eq!(
+            probe_ipv4("torrentd-nonexistent-iface"),
+            Ok(None),
+            "a link that does not exist holds no address"
+        );
+        let err = probe_ipv4("-x").expect_err("a name that cannot be asked about");
+        assert!(!err.cause.is_empty(), "the cause is kept: {err:?}");
     }
 }
