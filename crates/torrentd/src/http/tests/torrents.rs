@@ -1063,6 +1063,28 @@ async fn controls(h: &Harness, e: &Engines) {
         "a fenced profile's torrent must not resume or announce: {fenced_calls:?}"
     );
 
+    // A recheck marks a torrent in `DiskError` `Checking` before it starts,
+    // so a check that fails before any status update is not read as a
+    // failed peer read; one that fails to start leaves `DiskError` in place;
+    // any other phase is left for the status updates to move.
+    let recheck = format!("/v1/torrents/{}/recheck", hex(LOADED));
+    let set_phase = |phase| h.state.state.update(&LOADED, |st| st.phase = phase);
+    let phase = || h.state.state.get(&LOADED).unwrap().phase;
+    set_phase(TorrentPhase::DiskError);
+    h.write("POST", &recheck)
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    assert_eq!(phase(), TorrentPhase::Checking);
+    set_phase(TorrentPhase::DiskError);
+    e.p.inject_error("force_recheck", injected("force_recheck"));
+    assert_problem(&h.write("POST", &recheck).await, 500, "internal");
+    assert_eq!(phase(), TorrentPhase::DiskError);
+    set_phase(TorrentPhase::Seeding);
+    h.write("POST", &recheck)
+        .await
+        .assert_status(StatusCode::ACCEPTED);
+    assert_eq!(phase(), TorrentPhase::Seeding);
+
     // Unloaded — never loaded, or mid-add — is 404; a session error is 500.
     for (verb, op) in [
         ("pause", "pause_torrent"),

@@ -1946,11 +1946,18 @@ pub async fn recheck_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<Accepted<()>, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    blocking(move || engine.force_recheck(st.handle))
-        .await
-        .map_err(|e| UnfencedControlError::Internal {
-            detail: internal("rechecking the torrent", e),
-        })?;
+    let state = Arc::clone(&s);
+    blocking(move || {
+        crate::pool_service::force_recheck_marking_checking(
+            engine.as_ref(),
+            &state.state,
+            st.handle,
+        )
+    })
+    .await
+    .map_err(|e| UnfencedControlError::Internal {
+        detail: internal("rechecking the torrent", e),
+    })?;
     Ok(Accepted::new(()))
 }
 

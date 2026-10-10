@@ -1227,6 +1227,48 @@ fn admit(
     }
 }
 
+/// Ask libtorrent to re-check `handle`, marking a torrent in `DiskError`
+/// `Checking` first.
+///
+/// A check that fails fast posts its `file_error` before any status update
+/// reports `checking`. The file-error handler reads a `file_error` on a
+/// torrent still in `DiskError` with no libtorrent error as one more failed
+/// peer read and leaves `has_error` clear, so the error-and-pause the failed
+/// check caused would go unrecorded, and a disk-error retry due before the
+/// next update would re-check a torrent paused for the error, which cannot
+/// check, and then retire with it paused. Marked before the call, not after:
+/// the alert loop runs on its own thread, so the alert can beat a mark made
+/// once the call returns. The disk-error retry marks its own re-checks, on
+/// the alert loop's thread.
+///
+/// Where the call fails, no check starts, and the mark is taken back unless
+/// something has moved the torrent on since: left in place, it would hold
+/// the retry back, which waits out a check, and the next update reporting
+/// the torrent seeding would map `Checking` to `Seeding` and drop the
+/// `DiskError` it still has.
+pub(crate) fn force_recheck_marking_checking(
+    engine: &dyn torrentd_engine::TorrentEngine,
+    state: &StateMap,
+    handle: libtorrent_safe::TorrentHandle,
+) -> Result<(), torrentd_engine::EngineError> {
+    let mut marked = false;
+    state.update(&handle.infohash, |s| {
+        if s.phase == TorrentPhase::DiskError {
+            s.phase = TorrentPhase::Checking;
+            marked = true;
+        }
+    });
+    let outcome = engine.force_recheck(handle);
+    if outcome.is_err() && marked {
+        state.update(&handle.infohash, |s| {
+            if s.phase == TorrentPhase::Checking {
+                s.phase = TorrentPhase::DiskError;
+            }
+        });
+    }
+    outcome
+}
+
 /// Start the re-hash at the head of the queue.
 ///
 /// The request checked each torrent when it was queued, but the queue can
@@ -1300,7 +1342,7 @@ fn admit_recheck(
     q.checking
         .lock()
         .push((r.clone(), std::time::Instant::now()));
-    if let Err(e) = engine.force_recheck(st.handle) {
+    if let Err(e) = force_recheck_marking_checking(engine.as_ref(), state, st.handle) {
         q.checking.lock().retain(|(c, _)| c.infohash != r.infohash);
         warn!(
             target: "torrentd::pool",
@@ -3981,5 +4023,64 @@ mod tests {
         assert_eq!(logged.len(), 1, "one profile, logged once");
         assert_eq!(q.depth(), 20, "every held re-hash stays queued");
         assert!(w.rechecked().is_empty());
+    }
+
+    /// A re-hash of a torrent in `DiskError` marks it `Checking` before
+    /// libtorrent is asked to check it, so a check that fails before any
+    /// status update is recorded as the error-and-pause it is rather than as
+    /// a failed peer read.
+    #[test]
+    fn a_rehash_marks_a_disk_error_torrent_checking_before_it_starts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let q = pool.verify_queue();
+        let ih = InfoHash([0xC0; 20]);
+        w.load(ih, 1, "p", TorrentPhase::DiskError);
+        q.enqueue_recheck(ih.to_hex(), false);
+
+        let held = w.engine.hold_next("force_recheck");
+        let admitted = std::thread::scope(|s| {
+            let admit = s.spawn(|| {
+                let mut logged = std::collections::HashSet::new();
+                super::admit_recheck(q, &*w.source, &w.state, &w.profiles, &mut logged)
+            });
+            held.wait_entered();
+            assert_eq!(
+                w.state.get(&ih).unwrap().phase,
+                TorrentPhase::Checking,
+                "marked while libtorrent is still being asked",
+            );
+            held.release();
+            admit.join().unwrap()
+        });
+        assert_eq!(admitted, super::Admission::Admitted);
+        assert_eq!(w.state.get(&ih).unwrap().phase, TorrentPhase::Checking);
+        assert_eq!(w.rechecked(), [ih]);
+    }
+
+    /// A re-hash that fails to start takes the `Checking` mark back: no check
+    /// runs, and the torrent is still in `DiskError`.
+    #[test]
+    fn a_rehash_that_fails_to_start_leaves_disk_error_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let q = pool.verify_queue();
+        let ih = InfoHash([0xC1; 20]);
+        w.load(ih, 1, "p", TorrentPhase::DiskError);
+        q.enqueue_recheck(ih.to_hex(), false);
+        w.engine
+            .inject_error("force_recheck", torrentd_engine::EngineError::Shutdown);
+
+        let mut logged = std::collections::HashSet::new();
+        assert_eq!(
+            super::admit_recheck(q, &*w.source, &w.state, &w.profiles, &mut logged),
+            super::Admission::Skipped,
+        );
+        assert_eq!(w.state.get(&ih).unwrap().phase, TorrentPhase::DiskError);
+        assert_eq!(q.in_flight(), 0);
     }
 }
