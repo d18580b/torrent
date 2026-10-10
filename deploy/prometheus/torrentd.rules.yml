@@ -108,7 +108,15 @@ groups:
         # dropping initiations, or a path losing UDP — while each one still
         # lands inside vpn_handshake_max_age_secs, so nothing has fenced yet.
         # A stale handshake that does fence is TorrentdVpnTunnelDown.
-        expr: avg_over_time(torrentd_profile_vpn_handshake_age_seconds[30m]) > 90
+        # WireGuard handshakes only when it has a packet to send, so an idle
+        # profile's age rises without end while the tunnel stays healthy and
+        # unfenced. The resets() term asks that a handshake has landed in the
+        # last 10 minutes: a profile that stops carrying traffic drops out of
+        # the alert before its `for` elapses, rather than firing for as long
+        # as it stays idle.
+        expr: |
+          avg_over_time(torrentd_profile_vpn_handshake_age_seconds[30m]) > 90
+            and resets(torrentd_profile_vpn_handshake_age_seconds[10m]) > 0
         for: 10m
         labels:
           severity: warning
