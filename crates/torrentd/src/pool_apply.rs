@@ -2400,6 +2400,39 @@ mod tests {
         assert_eq!(base.map(|(_, b)| b), Some("old".to_owned()));
     }
 
+    /// A session that cannot say where it holds the torrent cannot be shown to
+    /// hold it at the source, so the step is refused before the move rather
+    /// than trusting `move_storage` to start from the right place.
+    #[test]
+    fn a_session_that_cannot_report_its_save_path_refuses_the_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let src_file = write(&root, "old/T/a.bin", 100);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        let (plan_id, mock, source, state) = loaded_relocate(&pool, &root, &ih, &root.join("old"));
+        mock.inject_error("torrent_details", torrentd_engine::EngineError::Shutdown);
+
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (0, "failed"), "{out:?}");
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        assert_eq!(steps[0].status, step_status::FAILED);
+        let why = steps[0].error.clone().unwrap_or_default();
+        assert!(
+            why.contains("could not read where the session holds torrent"),
+            "{why}"
+        );
+        assert!(
+            !moved_storage(&mock),
+            "move_storage was called: {:?}",
+            mock.calls()
+        );
+        assert!(src_file.exists());
+        let base = pool.with_store(|s| s.adoption_base(&ih)).unwrap();
+        assert_eq!(base.map(|(_, b)| b), Some("old".to_owned()));
+    }
+
     /// The same directory spelled with a trailing separator is the source, and
     /// the step goes on to the move.
     #[test]
