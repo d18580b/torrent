@@ -2444,7 +2444,7 @@
           "torrents"
         ],
         "summary": "Resume a torrent.",
-        "description": "Refused with `409 profile-unavailable` while the torrent's profile is\nfenced: un-quarantining a torrent whose tunnel is down would announce it\nfrom the wrong address.",
+        "description": "Refused with `409 profile-unavailable` while the torrent's profile is\nfenced: un-quarantining a torrent whose tunnel is down would announce it\nfrom the wrong address. A profile fenced while the resume goes out is\nrefused the same way, and the torrent is paused again.",
         "operationId": "resume_torrent",
         "parameters": [
           {

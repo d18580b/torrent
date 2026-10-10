@@ -823,6 +823,132 @@ async fn a_pause_during_a_resume_all_is_not_undone_by_its_later_batches() {
     }
 }
 
+/// Whether the last call `engine` saw for `h` was a pause: what holds it off
+/// the network, whatever resumed it before.
+fn left_paused(engine: &MockEngine, h: TorrentHandle) -> bool {
+    engine
+        .calls()
+        .iter()
+        .rev()
+        .find_map(|c| match c {
+            RecordedCall::PauseTorrent(x) if *x == h => Some(true),
+            RecordedCall::ResumeTorrent(x) if *x == h => Some(false),
+            _ => None,
+        })
+        .unwrap_or(true)
+}
+
+/// Mark `profile` fenced while the next `resume_torrent` its session sees is
+/// going out, as the VPN monitor's fence does when its walk has already
+/// passed that torrent. Returns once the resume has been let go.
+async fn fence_during_next_resume(h: &Harness, engine: &MockEngine, profile: &str) {
+    let held = engine.hold_next("resume_torrent");
+    let profiles = Arc::clone(&h.state.profiles);
+    let id = ProfileId::new(profile);
+    tokio::task::spawn_blocking(move || {
+        held.wait_entered();
+        profiles
+            .resolve(&id)
+            .active()
+            .unwrap()
+            .update_health(|hl| hl.status = ProfileStatus::VpnDown);
+        held.release();
+    })
+    .await
+    .unwrap();
+}
+
+/// A fence that lands while a resume is going out wins: the single resume,
+/// the profile's resume-all and the daemon's each pause again what they
+/// resumed, and say the profile is `vpn_down`.
+#[tokio::test]
+async fn a_resume_that_races_a_fence_leaves_nothing_running() {
+    for path in [
+        "one torrent",
+        "/v1/profiles/acct_a/resume-all",
+        "/v1/torrents/resume-all",
+    ] {
+        let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+        let h = Harness::authed(&Coverage::new(), |s| install(s, vec![a], vec![]));
+        let handles = [load(&h.state, 1, "acct_a"), load(&h.state, 2, "acct_a")];
+        let uri = if path == "one torrent" {
+            format!("/v1/torrents/{}/resume", handles[0].infohash.to_hex())
+        } else {
+            path.to_owned()
+        };
+
+        let (resp, ()) = tokio::join!(
+            h.write("POST", &uri),
+            fence_during_next_resume(&h, &eng_a, "acct_a"),
+        );
+        if path == "one torrent" {
+            assert_problem(&resp, 409, "profile-unavailable");
+            assert_eq!(resp.json::<Value>()["profile_status"], "vpn_down");
+        } else {
+            resp.assert_status(kynos::http::StatusCode::OK);
+            let out: Value = resp.json();
+            assert_eq!(out["torrent_count"], 0, "{path}: nothing stayed resumed");
+            assert_eq!(out["skipped_profiles"][0]["profile_id"], "acct_a", "{path}");
+            assert_eq!(out["skipped_profiles"][0]["reason"], "vpn_down", "{path}");
+        }
+        for t in handles {
+            assert!(
+                left_paused(&eng_a, t),
+                "{path}: {} runs in a fenced profile: {:?}",
+                t.id,
+                eng_a.calls()
+            );
+        }
+        h.assert_conformance();
+    }
+}
+
+/// Setting a fenced profile online lifts its fence and resumes its torrents
+/// from a task of its own; a new fence that lands while that task resumes
+/// stops it, and what it had resumed is paused again.
+#[tokio::test]
+async fn a_lift_that_races_a_new_fence_leaves_nothing_running() {
+    let (b, eng_b) = live("acct_b", ProfileStatus::VpnDown);
+    let healthy = Arc::new(AtomicBool::new(true));
+    let h = Harness::authed(&Coverage::new(), |s| {
+        install(s, vec![b], vec![]);
+        s.tunnel_probe = switchable_probe(&healthy);
+    });
+    let handles = [load(&h.state, 1, "acct_b"), load(&h.state, 2, "acct_b")];
+
+    let token = h.tokens.write.clone();
+    let (resp, ()) = tokio::join!(
+        h.send(
+            "PATCH",
+            "/v1/profiles/acct_b",
+            Some(&token),
+            Some(json!({ "state": "online" })),
+        ),
+        fence_during_next_resume(&h, &eng_b, "acct_b"),
+    );
+    resp.assert_status(kynos::http::StatusCode::OK);
+    let entry = h
+        .state
+        .profiles
+        .resolve(&ProfileId::new("acct_b"))
+        .active()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while entry.is_resuming() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(!entry.is_resuming(), "the lift's run ended");
+    assert_eq!(entry.health().status, ProfileStatus::VpnDown);
+    for t in handles {
+        assert!(
+            left_paused(&eng_b, t),
+            "{} runs in a fenced profile: {:?}",
+            t.id,
+            eng_b.calls()
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_session_that_refuses_to_pause_is_reported_on_the_network() {
     let (a, eng_a) = live("acct_a", ProfileStatus::Active);

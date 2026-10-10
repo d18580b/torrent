@@ -974,6 +974,69 @@ pub(crate) fn hold_if_fenced(
     }
 }
 
+/// How a [`resume_unless_fenced`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SingleResume {
+    /// The session resumed the torrent, and the profile was not fenced.
+    Resumed,
+    /// The profile was fenced as the torrent was resumed; it was paused again.
+    Fenced,
+}
+
+/// Resume `handle` in `profile_id`'s session, then pause it again if the VPN
+/// monitor fenced the profile meanwhile.
+///
+/// The caller refuses a fenced profile before this, but a fence can land
+/// between that check and the resume. The fence marks the profile and then
+/// walks the state map pausing what it holds, so a resume that comes after
+/// its walk passed this torrent would leave it running in a `vpn_down`
+/// profile, and the monitor never fences a profile already marked. The
+/// `SeqCst` fence pairs with the fence's, between its mark and its walk:
+/// either the read below sees the mark and pauses the torrent again, or the
+/// mark, and the walk after it, came after the resume.
+///
+/// What this pauses is not added to `paused_for_vpn`, for the reason
+/// [`hold_if_fenced`] gives.
+pub(crate) fn resume_unless_fenced(
+    profiles: &ProfileRegistry,
+    profile_id: &ProfileId,
+    engine: &dyn TorrentEngine,
+    handle: TorrentHandle,
+    metrics: &dyn MetricsSink,
+) -> Result<SingleResume, torrentd_engine::EngineError> {
+    engine.resume_torrent(handle)?;
+    atomic::fence(atomic::Ordering::SeqCst);
+    let fenced = profiles
+        .resolve(profile_id)
+        .active()
+        .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
+    if !fenced {
+        return Ok(SingleResume::Resumed);
+    }
+    match engine.pause_torrent(handle) {
+        Ok(()) => warn!(
+            target: "torrentd::vpn_monitor",
+            profile_id = %profile_id,
+            infohash = %handle.infohash,
+            "profile was fenced while the torrent was being resumed; paused it again",
+        ),
+        Err(err) => {
+            error!(
+                target: "torrentd::vpn_monitor",
+                profile_id = %profile_id,
+                infohash = %handle.infohash,
+                error.cause = %err,
+                "could not pause again a torrent resumed as its profile was fenced",
+            );
+            metrics.inc_counter(
+                "profile_fence_pause_errors_total",
+                &[("profile_id", profile_id.as_str())],
+            );
+        }
+    }
+    Ok(SingleResume::Fenced)
+}
+
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,
@@ -2727,6 +2790,81 @@ mod tests {
         fence.lift();
         assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
         assert!(resumes(&engine).is_empty());
+    }
+
+    /// A single resume re-checks the fence after `resume_torrent`, and pauses
+    /// the torrent again only when the profile was fenced while it went out.
+    #[test]
+    fn a_resume_pauses_its_torrent_again_only_when_the_profile_was_fenced_meanwhile() {
+        let id = ProfileId::new("acct_a");
+        for fenced in [true, false] {
+            let (entry, engine) = mock_entry(ProfileStatus::Active);
+            let profiles = ProfileRegistry::new(vec![entry]);
+            let held = engine.hold_next("resume_torrent");
+            let out = std::thread::scope(|s| {
+                let resuming = s.spawn(|| {
+                    resume_unless_fenced(
+                        &profiles,
+                        &id,
+                        engine.as_ref(),
+                        handle(1),
+                        &PromSink::new(),
+                    )
+                });
+                held.wait_entered();
+                if fenced {
+                    profiles
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .update_health(|h| h.status = ProfileStatus::VpnDown);
+                }
+                held.release();
+                resuming.join().unwrap().unwrap()
+            });
+            let (want, paused) = if fenced {
+                (SingleResume::Fenced, vec![handle(1)])
+            } else {
+                (SingleResume::Resumed, vec![])
+            };
+            assert_eq!(out, want, "fenced: {fenced}");
+            assert_eq!(pauses(&engine), paused, "fenced: {fenced}");
+            assert_eq!(resumes(&engine), [handle(1)], "fenced: {fenced}");
+        }
+    }
+
+    /// A re-pause the session refuses still reports the resume as `Fenced`,
+    /// so the caller answers 409 rather than 204, and counts the failure in
+    /// `profile_fence_pause_errors_total`.
+    #[test]
+    fn a_resume_whose_re_pause_fails_is_still_fenced_and_counted() {
+        let id = ProfileId::new("acct_a");
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let profiles = ProfileRegistry::new(vec![entry]);
+        let metrics = PromSink::new();
+        engine.inject_error("pause_torrent", torrentd_engine::EngineError::Shutdown);
+        let held = engine.hold_next("resume_torrent");
+        let out = std::thread::scope(|s| {
+            let resuming = s.spawn(|| {
+                resume_unless_fenced(&profiles, &id, engine.as_ref(), handle(1), &metrics)
+            });
+            held.wait_entered();
+            profiles
+                .iter()
+                .next()
+                .unwrap()
+                .update_health(|h| h.status = ProfileStatus::VpnDown);
+            held.release();
+            resuming.join().unwrap().unwrap()
+        });
+        assert_eq!(out, SingleResume::Fenced);
+        assert_eq!(pauses(&engine), [handle(1)], "the re-pause was attempted");
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        let line = "torrentd_profile_fence_pause_errors_total{profile_id=\"acct_a\"} 1";
+        assert!(
+            exported.lines().any(|l| l == line),
+            "expected `{line}`; got:\n{exported}",
+        );
     }
 
     /// An add re-checks the fence after `add_torrent` and pauses what it just
