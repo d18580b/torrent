@@ -974,6 +974,69 @@ pub(crate) fn hold_if_fenced(
     }
 }
 
+/// How a [`resume_unless_fenced`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SingleResume {
+    /// The session resumed the torrent, and the profile was not fenced.
+    Resumed,
+    /// The profile was fenced as the torrent was resumed; it was paused again.
+    Fenced,
+}
+
+/// Resume `handle` in `profile_id`'s session, then pause it again if the VPN
+/// monitor fenced the profile meanwhile.
+///
+/// The caller refuses a fenced profile before this, but a fence can land
+/// between that check and the resume. The fence marks the profile and then
+/// walks the state map pausing what it holds, so a resume that comes after
+/// its walk passed this torrent would leave it running in a `vpn_down`
+/// profile, and the monitor never fences a profile already marked. The
+/// `SeqCst` fence pairs with the fence's, between its mark and its walk:
+/// either the read below sees the mark and pauses the torrent again, or the
+/// mark, and the walk after it, came after the resume.
+///
+/// What this pauses is not added to `paused_for_vpn`, for the reason
+/// [`hold_if_fenced`] gives.
+pub(crate) fn resume_unless_fenced(
+    profiles: &ProfileRegistry,
+    profile_id: &ProfileId,
+    engine: &dyn TorrentEngine,
+    handle: TorrentHandle,
+    metrics: &dyn MetricsSink,
+) -> Result<SingleResume, torrentd_engine::EngineError> {
+    engine.resume_torrent(handle)?;
+    atomic::fence(atomic::Ordering::SeqCst);
+    let fenced = profiles
+        .resolve(profile_id)
+        .active()
+        .is_some_and(|e| e.health().status == ProfileStatus::VpnDown);
+    if !fenced {
+        return Ok(SingleResume::Resumed);
+    }
+    match engine.pause_torrent(handle) {
+        Ok(()) => warn!(
+            target: "torrentd::vpn_monitor",
+            profile_id = %profile_id,
+            infohash = %handle.infohash,
+            "profile was fenced while the torrent was being resumed; paused it again",
+        ),
+        Err(err) => {
+            error!(
+                target: "torrentd::vpn_monitor",
+                profile_id = %profile_id,
+                infohash = %handle.infohash,
+                error.cause = %err,
+                "could not pause again a torrent resumed as its profile was fenced",
+            );
+            metrics.inc_counter(
+                "profile_fence_pause_errors_total",
+                &[("profile_id", profile_id.as_str())],
+            );
+        }
+    }
+    Ok(SingleResume::Fenced)
+}
+
 pub async fn run(
     profiles: Arc<ProfileRegistry>,
     state: Arc<StateMap>,

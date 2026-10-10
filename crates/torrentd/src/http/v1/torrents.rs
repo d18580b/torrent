@@ -1747,7 +1747,8 @@ from_lookup!(UnfencedControlError, fenced);
 ///
 /// Refused with `409 profile-unavailable` while the torrent's profile is
 /// fenced: un-quarantining a torrent whose tunnel is down would announce it
-/// from the wrong address.
+/// from the wrong address. A profile fenced while the resume goes out is
+/// refused the same way, and the torrent is paused again.
 #[kynos::post("/torrents/{infohash}/resume", tag = Torrents)]
 pub async fn resume_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1755,12 +1756,30 @@ pub async fn resume_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<NoContent, UnfencedControlError> {
     let (st, engine) = loaded_unfenced(&s, p.infohash.get())?;
-    blocking(move || engine.resume_torrent(st.handle))
-        .await
-        .map_err(|e| UnfencedControlError::Internal {
-            detail: internal("resuming the torrent", e),
-        })?;
-    Ok(NoContent)
+    let state = Arc::clone(&s);
+    let resumed = blocking(move || {
+        crate::vpn_monitor::resume_unless_fenced(
+            &state.profiles,
+            &st.profile_id,
+            engine.as_ref(),
+            st.handle,
+            &*state.metrics,
+        )
+    })
+    .await
+    .map_err(|e| UnfencedControlError::Internal {
+        detail: internal("resuming the torrent", e),
+    })?;
+    if resumed == crate::vpn_monitor::SingleResume::Resumed {
+        return Ok(NoContent);
+    }
+    let ProfileProblem::Unavailable { reason, detail } = ProfileProblem::vpn_down() else {
+        unreachable!("vpn_down is an unavailable profile");
+    };
+    Err(UnfencedControlError::ProfileUnavailable {
+        detail,
+        profile_status: reason.as_str(),
+    })
 }
 
 /// Re-verify a torrent's payload.
