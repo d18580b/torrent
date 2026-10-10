@@ -1695,16 +1695,26 @@ fn session_settings(cfg: &Config) -> torrentd_engine::Settings {
 /// re-asserted, and every flag that could lift upload mode is cleared from
 /// whatever the resume data carried, since it may have been written by another
 /// client.
+///
+/// With no `.torrent` beside it the torrent reloads without metadata, as a
+/// magnet still fetching it does, so DHT, PEX and LSD are disabled whatever the
+/// profile's posture: resume data written before magnets carried that guard
+/// does not carry it.
 fn resume_scan_params(
     profile: &ProfileConfig,
     resume: Vec<u8>,
     torrent: Option<Vec<u8>>,
 ) -> AddParams {
+    let flags_set = if torrent.is_some() {
+        torrentd_engine::resume_flags_set(profile)
+    } else {
+        torrentd_engine::resume_flags_set_without_metadata(profile)
+    };
     AddParams::Resume {
         bytes: resume,
         torrent,
         save_path: None,
-        flags_set: torrentd_engine::resume_flags_set(profile),
+        flags_set,
         flags_clear: torrentd_engine::resume_flags_clear(),
     }
 }
@@ -5426,5 +5436,24 @@ mod profile_construction_tests {
                 assert!(a.forbids_downloading(), "{}: {a:?}", p.id);
             }
         }
+    }
+
+    /// A resume entry with no `.torrent` beside it reloads without metadata,
+    /// as a magnet does, so the boot resume scan keeps it off DHT, PEX and
+    /// LSD even on a DHT-enabled host profile; one with its `.torrent` keeps
+    /// the host's posture.
+    #[test]
+    fn a_resume_entry_without_metadata_reloads_with_discovery_off() {
+        use libtorrent_safe::TorrentFlags;
+        let off = TorrentFlags::DISABLE_DHT | TorrentFlags::DISABLE_PEX | TorrentFlags::DISABLE_LSD;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[host("public", true)]);
+        let p = &cfg.profile[0];
+        let flags = |torrent| match resume_scan_params(p, vec![1; 32], torrent) {
+            AddParams::Resume { flags_set, .. } => flags_set,
+            other => panic!("not a resume add: {other:?}"),
+        };
+        assert!(flags(None).contains(off), "{:?}", flags(None));
+        assert!(!flags(Some(vec![2; 32])).intersects(off));
     }
 }

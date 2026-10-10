@@ -65,10 +65,15 @@
 //!    `dht` exists only on `ProfileNetwork::Host`, and it is off unless
 //!    written.
 //!
-//!    Rules 5 and 6 bind to the posture, not to the profile's name. The guard
-//!    is composed in one place — `policy::discovery_guards` — for all four add
-//!    paths, because it used to be spelled per path against whether the id
-//!    happened to be `default`, which a config could satisfy by accident.
+//!    Rules 5 and 6 bind to the posture, not to the profile's name. The
+//!    posture's guard is composed in one place — `policy::discovery_guards` —
+//!    for all four add paths, because it used to be spelled per path against
+//!    whether the id happened to be `default`, which a config could satisfy by
+//!    accident. A torrent without metadata is the one exception, on every
+//!    profile: `policy::magnet_flags` (a magnet add) and
+//!    `policy::resume_flags_set_without_metadata` (a boot resume entry with no
+//!    `.torrent`) disable all three whatever the posture, because its
+//!    `private` bit is not yet known.
 //! 7. **SIGHUP cannot change identity-critical fields.** The tunnel
 //!    interface, listen port, peer fingerprint and user agent are what a
 //!    tracker sees as an account's identity. Changes are detected, warned

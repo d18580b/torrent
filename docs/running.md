@@ -263,7 +263,12 @@ metadata arrives, and libtorrent announces a torrent without metadata on the
 DHT regardless, so a private tracker's magnet would publish its infohash and the
 host's address before anything knew it was private. A magnet is therefore added
 with DHT, PEX and LSD disabled on every profile, host or `vpn`, and keeps them
-disabled once its metadata arrives, across restarts too. Its metadata and its
+disabled once its metadata arrives, across restarts that reload its resume
+data. A torrent whose resume data reloads with no `.torrent` beside it, as a
+magnet still fetching metadata does, gets the same guard at boot. A former
+magnet re-added at boot from its `.torrent` alone, with no resume file, takes
+the profile's own posture instead: its `private` flag is known by then, and
+libtorrent honours it. Its metadata and its
 peers come from the trackers in its `tr=` parameters; a magnet with none can
 fetch its metadata only from a peer its `x.pe` parameters name. Add a public torrent you want on the DHT as
 a `.torrent` instead.

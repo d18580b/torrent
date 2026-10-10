@@ -97,7 +97,12 @@ pub fn seed_flags(profile: &ProfileConfig) -> TorrentFlags {
 ///
 /// The guard is not lifted when the metadata turns out public: the session
 /// API has no per-torrent flag clear yet. libtorrent keeps the three bits in
-/// the resume data it writes, so they survive a restart. A magnet on a host
+/// the resume data it writes, so they survive a restart that reloads that
+/// resume data, and [`resume_flags_set_without_metadata`] re-asserts them on
+/// one that reloads it still without metadata. A former magnet the boot
+/// torrent-dir scan re-adds from its `.torrent` alone, with no resume file,
+/// gets the profile's own posture instead: by then its `private` bit is known,
+/// and libtorrent honours it. A magnet on a host
 /// profile therefore finds its metadata and its peers through its trackers
 /// only, and a magnet with no `tr=` only from a peer its `x.pe` names.
 pub fn magnet_flags(profile: &ProfileConfig) -> TorrentFlags {
@@ -122,6 +127,19 @@ pub fn verify_flags(profile: &ProfileConfig) -> TorrentFlags {
 /// without it.
 pub fn resume_flags_set(profile: &ProfileConfig) -> TorrentFlags {
     no_download() | discovery_guards(profile)
+}
+
+/// Flags re-asserted when loading resume data with no metadata beside it:
+/// [`resume_flags_set`] with DHT, PEX and LSD disabled whatever the profile's
+/// posture, as [`magnet_flags`] does for a magnet add.
+///
+/// Such a torrent reloads exactly as a magnet does: its `private` bit is
+/// unknown until its metadata arrives, and libtorrent announces it on the DHT
+/// meanwhile. Resume data for a magnet added before [`magnet_flags`] existed
+/// carries no discovery bits, so without this it would reload on a host
+/// profile with DHT on and announce its infohash again.
+pub fn resume_flags_set_without_metadata(profile: &ProfileConfig) -> TorrentFlags {
+    resume_flags_set(profile) | discovery_off()
 }
 
 /// Flags cleared when loading resume data: everything [`forbidden`], which
@@ -306,6 +324,19 @@ mod tests {
             assert!(flags.contains(seed_flags(&p)), "{} {flags:?}", p.id);
             assert!(!flags.intersects(forbidden()), "{flags:?}");
         }
+    }
+
+    #[test]
+    fn resume_data_without_metadata_disables_discovery_on_every_profile() {
+        for p in [host(), vpn()] {
+            let flags = resume_flags_set_without_metadata(&p);
+            assert!(flags.contains(discovery_off()), "{} {flags:?}", p.id);
+            assert!(flags.contains(resume_flags_set(&p)), "{} {flags:?}", p.id);
+            assert!(!flags.contains(TorrentFlags::SEED_MODE), "{flags:?}");
+            assert!(!flags.intersects(forbidden()), "{flags:?}");
+        }
+        // Resume data with metadata beside it keeps the host's posture.
+        assert!(!resume_flags_set(&host()).intersects(discovery_off()));
     }
 
     #[test]
