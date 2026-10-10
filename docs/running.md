@@ -884,17 +884,22 @@ connect to `127.0.0.1`, and the daemon has no unix-socket listener and no
 peer-credential check, so it cannot tell the proxy from any other local
 process — and a local client does not go through the proxy at all. Without
 `[auth]`, any local user or service (another login, a web app, a CI runner)
-can pause, delete and reconfigure every profile, and with `[pool]`
-`allow_mutations` delete payload. The first shape is therefore safe only on a host where every
-local process belongs to you, or inside a network namespace or container that
-no other uid shares. Anywhere else, configure `[auth]` even on loopback.
+can pause and reconfigure every profile and delete its torrents, and with
+`[pool]` `allow_mutations` move payload to the trash. The first shape is
+therefore safe only on a host where every local process belongs to you, or
+inside a network namespace or container that no other uid shares. Anywhere else, configure `[auth]` even on loopback.
 
-`[auth]` does not close the gap entirely: `http_listen` is a TCP port above
-1024, so while the daemon is stopped or restarting another local user can
-bind it, and the next `torrentctl` call sends its bearer token (or login
-password) to that listener — nothing authenticates the server end of a
-plain-HTTP loopback connection. On a shared host, keep a restart short and do
-not run `torrentctl` against a daemon you know to be down.
+`[auth]` does not close the gap entirely: the default `http_listen` is a TCP
+port above 1024, so while the daemon is stopped or restarting another local
+user can bind it, and the next `torrentctl` call sends its bearer token (or
+login password) to that listener — nothing authenticates the server end of a
+plain-HTTP loopback connection. A port below 1024 removes this risk, since an
+unprivileged user cannot bind it (unless the host lowers
+`net.ipv4.ip_unprivileged_port_start`), but the daemon then needs
+`CAP_NET_BIND_SERVICE`, and `deploy/torrentd.service` grants no capability
+by default: add it to both `AmbientCapabilities=` and `CapabilityBoundingSet=`.
+Otherwise, on a shared host, keep a restart short and do not run `torrentctl`
+against a daemon you know to be down.
 
 **A proxy in front of an unauthenticated daemon must strip `Authorization`.**
 Without `[auth]` the daemon checks no credential, but it still reads the

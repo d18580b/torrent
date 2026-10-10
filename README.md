@@ -381,9 +381,12 @@ sent by another site: a request whose `Host` is neither loopback nor in
 `Sec-Fetch-Site`, a foreign `Origin` or a form `Content-Type` marks as
 cross-site, is refused with a `403` ([docs/api/README.md](docs/api/README.md)).
 That is a legitimate
-posture behind a reverse proxy that does its own access control; it is not one
-to arrive at by omission. The opt-out does not extend to a routable address
-either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
+posture behind a reverse proxy that does its own access control, but only on a
+single-user host, or in a network namespace or container no other uid shares:
+every local user can reach `127.0.0.1`, and without `[auth]` any of them
+controls the daemon ([docs/running.md §6](docs/running.md#6-authentication--required-one-way-or-the-other)).
+It is not one to arrive at by omission. The opt-out does not extend to a
+routable address either: `allow_unauthenticated` with a non-loopback `http_listen` is refused,
 and so is `allow_unauthenticated` alongside a configured `[auth]`, which is
 inert and reads as though the daemon authenticates nothing. `http_listen`
 defaults to `127.0.0.1:8080`. All three, and `trusted_proxies` and

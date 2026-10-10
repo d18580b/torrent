@@ -406,8 +406,13 @@ dht               = true
 # with a non-loopback `http_listen` is refused, because that is an
 # unauthenticated mutating API on the network. So the two safe shapes are:
 #
-#   loopback + allow_unauthenticated   access control is the proxy's job
+#   loopback + allow_unauthenticated   access control is the proxy's job;
+#                                      single-user host only
 #   any bind + [auth]                  the daemon authenticates itself
+#
+# Every local uid can reach 127.0.0.1, so on a shared host the first shape
+# hands every local user full control of the daemon: use the second there
+# (docs/running.md §6).
 #
 # This sample ships the first, because it binds loopback: see
 # `allow_unauthenticated` in the daemon-wide block at the top. Configure [auth]
