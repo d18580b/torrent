@@ -716,6 +716,33 @@ fn trackers_report_every_url_with_its_tier() {
     unsafe { lt_session_destroy(s) };
 }
 
+/// A tracker error carries the category its code belongs to: an announce to
+/// a closed loopback port is refused with an `errno`, in the system category,
+/// and was not cancelled.
+#[test]
+fn a_refused_announce_reports_a_system_category_error_not_an_abort() {
+    let s = make_session();
+    let h = add_file(s, &multi_file_tracker_torrent());
+    assert_eq!(unsafe { lt_torrent_resume(s, h) }, LT_OK as i32);
+    assert_eq!(unsafe { lt_torrent_force_reannounce(s, h) }, LT_OK as i32);
+
+    let got = wait_for(s, |u| {
+        if u.kind != lt_alert_kind_LT_ALERT_TRACKER_ERROR {
+            return None;
+        }
+        let e = unsafe { u.payload.tracker_error };
+        Some((e.error_code, e.error_category, e.aborted))
+    });
+    let (code, category, aborted) = got.expect("no tracker_error alert");
+    assert_ne!(code, 0);
+    assert_eq!(
+        category as u32, lt_error_category_LT_ERROR_CATEGORY_SYSTEM,
+        "code {code}"
+    );
+    assert_eq!(aborted, 0, "a refused announce is not a cancelled one");
+    unsafe { lt_session_destroy(s) };
+}
+
 /// Trackers given with a `.torrent` add replace its announce list, tiers
 /// kept, the way a resume file's `trackers` list does.
 #[test]

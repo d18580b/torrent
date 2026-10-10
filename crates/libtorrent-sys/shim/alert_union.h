@@ -132,8 +132,25 @@ struct lt_alert_alerts_dropped {
 /* Tracker / peer / log variants                                       */
 /* ------------------------------------------------------------------ */
 
+/* The error category a tracker_error_alert's `error_code` belongs to. The
+ * bare value is ambiguous: 36 is libtorrent's `errors::timed_out`, but
+ * ENAMETOOLONG in the system category. */
+enum lt_error_category {
+    LT_ERROR_CATEGORY_OTHER = 0,
+    LT_ERROR_CATEGORY_LIBTORRENT = 1,   /* lt::libtorrent_category() */
+    LT_ERROR_CATEGORY_SYSTEM = 2,       /* system_category or generic_category */
+    LT_ERROR_CATEGORY_HTTP = 3          /* lt::http_category(): an HTTP status */
+};
+
 struct lt_alert_tracker_error {
     int32_t error_code;
+    int32_t error_category;  /* lt_error_category */
+    /* 1 iff the announce was cancelled rather than answered or timed out:
+     * asio's operation_aborted, or libtorrent's torrent_aborted,
+     * session_is_closing or destructing_torrent. A pause, stop or shutdown
+     * causes these; no tracker failed. */
+    uint8_t aborted;
+    uint8_t _pad[3];
     int32_t times_in_row;
     char    tracker_url[LT_PATH_MAX];
     char    message[LT_MSG_MAX];

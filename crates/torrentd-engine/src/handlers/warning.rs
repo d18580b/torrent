@@ -7,7 +7,11 @@
 //! translated at all.
 //!
 //! Successful announces are counted too (`kind="reply"`), not logged: they are
-//! the denominator an alert divides tracker errors by.
+//! the denominator an alert divides tracker errors by. An announce that failed
+//! because the torrent was stopping — paused, fenced, removed, or the announce
+//! cancelled — is counted as `kind="stopped"` and logged at `debug` only: no
+//! tracker failed, and counting it as `error` would let a bulk pause raise the
+//! failure ratio (see [`stop_cause`]).
 //!
 //! Two counters, both with a bounded label set: `profile_id` and a `kind` drawn
 //! from the fixed lists below. No per-torrent and no per-tracker-URL label:
@@ -32,6 +36,7 @@ use tracing::warn;
 
 use crate::handlers::HandlerCtx;
 use crate::profile::ProfileId;
+use crate::state::TorrentPhase;
 
 /// How many tracker failures one profile warns about individually in one
 /// [`TRACKER_FAILURE_WINDOW`]. The rest are logged at `debug` and counted into
@@ -118,7 +123,54 @@ pub fn close_failure_window(ctx: &HandlerCtx<'_>, log: &mut TrackerFailureLog) {
 }
 
 /// `tracker_alerts_total{kind}`: every value this handler can emit.
-pub const TRACKER_KINDS: &[&str] = &["error", "reply", "warning", "scrape_failed"];
+/// `stopped` is an announce failure a pause, fence, removal or shutdown
+/// caused (see [`stop_cause`]); `error` is every other.
+pub const TRACKER_KINDS: &[&str] = &["error", "reply", "warning", "scrape_failed", "stopped"];
+
+/// Why a tracker error was caused by the torrent stopping rather than by the
+/// tracker, or `None` when nothing says it was.
+///
+/// Pausing a torrent (the API's pause, a fence's, or a disk error's) makes
+/// libtorrent send a stopped announce, and removing one does the same. That
+/// announce gets `stop_tracker_timeout` (5 s by default) where any other gets
+/// `tracker_receive_timeout`, so a tracker that a bulk pause floods with
+/// stopped announces lets many expire: libtorrent's `errors::timed_out`, 36 in
+/// the libtorrent category, with no failure reason. Neither the alert nor its
+/// code says which announce failed, so this asks what the daemon knows of the
+/// torrent: a paused torrent announces nothing but the stopped event.
+///
+/// - `aborted`: the announce was cancelled (see `Alert::TrackerError`).
+/// - `fenced`: the VPN monitor fenced the profile, which pauses every torrent
+///   in it at once, before the next state update says so.
+/// - `paused`: the last state update showed the torrent paused.
+/// - `removed`: the torrent is gone, so the handle carried no info-hash, or
+///   the state map no longer holds it. Every torrent in a session is in the
+///   state map from its add alert on, and libtorrent posts that before any
+///   announce the torrent makes.
+///
+/// A pause the state map has not yet seen (state updates come every two
+/// seconds) is missed and counted as `error`; a stopped announce that times
+/// out does so five seconds after the pause, by when the update has arrived.
+fn stop_cause(
+    hdr: &libtorrent_safe::alert::AlertHeader,
+    aborted: bool,
+    ctx: &HandlerCtx<'_>,
+) -> Option<&'static str> {
+    if aborted {
+        return Some("aborted");
+    }
+    if ctx.profile_fenced.is_some_and(|f| f(&ctx.profile_id)) {
+        return Some("fenced");
+    }
+    let Some(ih) = hdr.infohash else {
+        return Some("removed");
+    };
+    match ctx.state.get(&ih).map(|st| st.phase) {
+        None | Some(TorrentPhase::Removed) => Some("removed"),
+        Some(TorrentPhase::Paused) => Some("paused"),
+        Some(_) => None,
+    }
+}
 
 /// `session_alerts_total{kind}`: every value this handler can emit.
 pub const SESSION_KINDS: &[&str] = &[
@@ -138,10 +190,33 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>, failures: &mut TrackerFai
         Alert::TrackerError {
             hdr,
             error_code,
+            error_category,
+            aborted,
             times_in_row,
             message,
             ..
         } => {
+            // A pause, fence, removal or shutdown makes libtorrent cancel the
+            // torrent's announce or send a stopped one, and a failure of
+            // either says nothing about the tracker: logged at `debug` and
+            // counted apart, so it neither writes a failure line nor raises
+            // the failure ratio the tracker alert divides `kind="error"` by.
+            if let Some(cause) = stop_cause(hdr, *aborted, ctx) {
+                debug!(
+                    target: "torrentd_engine::handler::tracker",
+                    infohash = hdr.infohash.map(|i| i.to_string()).unwrap_or_default(),
+                    error.code = *error_code,
+                    error.category = error_category.as_str(),
+                    error.cause = %message,
+                    cause,
+                    "tracker announce failed while the torrent stopped",
+                );
+                ctx.metrics.inc_counter(
+                    "tracker_alerts_total",
+                    &[("profile_id", profile), ("kind", "stopped")],
+                );
+                return;
+            }
             // The URL is deliberately not logged: on a private tracker it
             // carries the passkey. The info-hash identifies the torrent.
             //
@@ -156,6 +231,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>, failures: &mut TrackerFai
                     target: "torrentd_engine::handler::tracker",
                     infohash = hdr.infohash.map(|i| i.to_string()).unwrap_or_default(),
                     error.code = *error_code,
+                    error.category = error_category.as_str(),
                     error.cause = %message,
                     "tracker announce failed",
                 );
@@ -165,6 +241,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>, failures: &mut TrackerFai
                     target: "torrentd_engine::handler::tracker",
                     infohash = hdr.infohash.map(|i| i.to_string()).unwrap_or_default(),
                     error.code = *error_code,
+                    error.category = error_category.as_str(),
                     error.cause = %message,
                     "tracker announce failed",
                 );
@@ -173,6 +250,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>, failures: &mut TrackerFai
                     target: "torrentd_engine::handler::tracker",
                     infohash = hdr.infohash.map(|i| i.to_string()).unwrap_or_default(),
                     error.code = *error_code,
+                    error.category = error_category.as_str(),
                     times_in_row = *times_in_row,
                     error.cause = %message,
                     "tracker announce failed again",
@@ -250,9 +328,13 @@ mod tests {
     use std::sync::Arc;
 
     use libtorrent_safe::alert::AlertHeader;
+    use libtorrent_safe::alert::ErrorCategory;
+    use libtorrent_safe::InfoHash;
+    use libtorrent_safe::TorrentHandle;
     use parking_lot::Mutex;
 
     use super::*;
+    use crate::alert_loop::ProfileFenced;
     use crate::clock::MockClock;
     use crate::engine::TorrentEngine;
     use crate::metrics::MetricCall;
@@ -261,19 +343,62 @@ mod tests {
     use crate::profile::ProfileId;
     use crate::resume_store::MemoryResumeStore;
     use crate::state::StateMap;
+    use crate::state::TorrentState;
     use crate::torrent_store::MemoryTorrentStore;
+
+    /// The info-hash [`hdr`] gives every alert; [`run`] tracks it as seeding.
+    const IH: InfoHash = InfoHash([7; 20]);
 
     fn hdr(kind: AlertKind) -> AlertHeader {
         AlertHeader {
             kind,
-            infohash: None,
+            infohash: Some(IH),
             handle: None,
             timestamp_us: 0,
         }
     }
 
+    /// Put `ih` in `state` in `phase`, as the state updates would.
+    fn track(state: &StateMap, ih: InfoHash, phase: TorrentPhase) {
+        let mut st = TorrentState::newly_added(
+            TorrentHandle {
+                id: 1,
+                infohash: ih,
+            },
+            ProfileId::new("p"),
+            Instant::now(),
+        );
+        st.phase = phase;
+        state.insert(ih, st);
+    }
+
+    fn tracker_error(error_code: i32, aborted: bool) -> Alert {
+        Alert::TrackerError {
+            hdr: hdr(AlertKind::TrackerError),
+            error_code,
+            error_category: ErrorCategory::Libtorrent,
+            aborted,
+            times_in_row: 1,
+            tracker_url: "http://t/announce?passkey=secret".into(),
+            message: String::new(),
+        }
+    }
+
     fn run(alert: Alert) -> Vec<MetricCall> {
+        run_in(alert, Some(TorrentPhase::Seeding), None).0
+    }
+
+    /// Dispatch `alert` with [`IH`] in `phase` (untracked when `None`) and the
+    /// given fence, returning the metric calls and how many lines it warned.
+    fn run_in(
+        alert: Alert,
+        phase: Option<TorrentPhase>,
+        fenced: Option<ProfileFenced>,
+    ) -> (Vec<MetricCall>, usize, TrackerFailureLog) {
         let state = StateMap::new();
+        if let Some(phase) = phase {
+            track(&state, IH, phase);
+        }
         let resume = MemoryResumeStore::new();
         let torrents = MemoryTorrentStore::new();
         let metrics = RecordingSink::new();
@@ -286,12 +411,17 @@ mod tests {
             metrics: &metrics,
             clock: &clock,
             engine: &engine,
-            profile_fenced: None,
+            profile_fenced: fenced.as_ref(),
             profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
-        handle(&alert, &mut ctx, &mut TrackerFailureLog::default());
-        metrics.calls()
+        let mut failures = TrackerFailureLog::default();
+        let counter = Arc::new(WarnCounter::default());
+        tracing::subscriber::with_default(Arc::clone(&counter), || {
+            handle(&alert, &mut ctx, &mut failures);
+        });
+        let warns = counter.warns.load(Ordering::Relaxed);
+        (metrics.calls(), warns, failures)
     }
 
     /// Counts the `warn` events dispatched to it and records the
@@ -336,11 +466,13 @@ mod tests {
         Alert::TrackerError {
             hdr: AlertHeader {
                 kind: AlertKind::TrackerError,
-                infohash: Some(libtorrent_safe::InfoHash([n; 20])),
+                infohash: Some(InfoHash([n; 20])),
                 handle: None,
                 timestamp_us: 0,
             },
             error_code: 36,
+            error_category: ErrorCategory::Libtorrent,
+            aborted: false,
             times_in_row: 1,
             tracker_url: "http://t/announce?passkey=secret".into(),
             message: String::new(),
@@ -350,6 +482,10 @@ mod tests {
     #[test]
     fn ten_thousand_first_failures_on_one_profile_warn_a_bounded_number_of_times() {
         let state = StateMap::new();
+        // Seeding, so none of them is put down to the torrent stopping.
+        for n in 0..=u8::MAX {
+            track(&state, InfoHash([n; 20]), TorrentPhase::Seeding);
+        }
         let resume = MemoryResumeStore::new();
         let torrents = MemoryTorrentStore::new();
         let metrics = RecordingSink::new();
@@ -446,9 +582,12 @@ mod tests {
             profile_id: ProfileId::new("p"),
             span: tracing::info_span!("test"),
         };
+        track(&state, IH, TorrentPhase::Seeding);
         let again = Alert::TrackerError {
             hdr: hdr(AlertKind::TrackerError),
             error_code: 111,
+            error_category: ErrorCategory::System,
+            aborted: false,
             times_in_row: 2,
             tracker_url: String::new(),
             message: String::new(),
@@ -457,6 +596,7 @@ mod tests {
             handle(&again, &mut ctx, &mut failures);
         }
         assert!(failures.windows.is_empty());
+        assert_eq!(metrics.calls().len(), 100);
     }
 
     fn labels_of(calls: &[MetricCall]) -> Vec<(String, Vec<(String, String)>)> {
@@ -478,6 +618,8 @@ mod tests {
         let calls = run(Alert::TrackerError {
             hdr: hdr(AlertKind::TrackerError),
             error_code: 111,
+            error_category: ErrorCategory::System,
+            aborted: false,
             times_in_row: 3,
             tracker_url: "http://t/announce?passkey=secret".into(),
             message: "connection refused".into(),
@@ -489,6 +631,87 @@ mod tests {
                 vec![pair("profile_id", "p"), pair("kind", "error")]
             )]
         );
+    }
+
+    fn kind_stopped() -> Vec<(String, Vec<(String, String)>)> {
+        vec![(
+            "tracker_alerts_total".to_string(),
+            vec![pair("profile_id", "p"), pair("kind", "stopped")],
+        )]
+    }
+
+    /// The bulk pause #226's harness ran: libtorrent's `timed_out` (36) on
+    /// the stopped announce of a torrent the state map holds as paused.
+    #[test]
+    fn a_paused_torrents_timed_out_announce_is_counted_as_stopped_and_not_warned() {
+        let (calls, warns, failures) =
+            run_in(tracker_error(36, false), Some(TorrentPhase::Paused), None);
+        assert_eq!(labels_of(&calls), kind_stopped());
+        assert_eq!(warns, 0);
+        assert!(
+            failures.windows.is_empty(),
+            "a stop took a place in the failure window"
+        );
+        assert!(TRACKER_KINDS.contains(&"stopped"));
+    }
+
+    #[test]
+    fn the_same_timeout_on_a_seeding_torrent_is_a_tracker_failure() {
+        let (calls, warns, _) = run_in(tracker_error(36, false), Some(TorrentPhase::Seeding), None);
+        assert_eq!(
+            labels_of(&calls),
+            vec![(
+                "tracker_alerts_total".to_string(),
+                vec![pair("profile_id", "p"), pair("kind", "error")]
+            )]
+        );
+        assert_eq!(warns, 1);
+    }
+
+    #[test]
+    fn a_cancelled_announce_is_counted_as_stopped_whatever_the_phase() {
+        let (calls, warns, _) = run_in(tracker_error(125, true), Some(TorrentPhase::Seeding), None);
+        assert_eq!(labels_of(&calls), kind_stopped());
+        assert_eq!(warns, 0);
+    }
+
+    /// A fence pauses the whole profile at once, before any state update.
+    #[test]
+    fn a_failure_in_a_fenced_profile_is_counted_as_stopped() {
+        let fenced = Arc::new(|p: &ProfileId| p.as_str() == "p") as ProfileFenced;
+        let (calls, warns, _) = run_in(
+            tracker_error(36, false),
+            Some(TorrentPhase::Seeding),
+            Some(fenced),
+        );
+        assert_eq!(labels_of(&calls), kind_stopped());
+        assert_eq!(warns, 0);
+
+        let other = Arc::new(|p: &ProfileId| p.as_str() == "q") as ProfileFenced;
+        let (calls, _, _) = run_in(
+            tracker_error(36, false),
+            Some(TorrentPhase::Seeding),
+            Some(other),
+        );
+        assert_eq!(labels_of(&calls)[0].1[1], pair("kind", "error"));
+    }
+
+    /// A removal sends a stopped announce too, and by the time its failure
+    /// is dispatched the torrent is out of the state map, or its handle no
+    /// longer names it.
+    #[test]
+    fn a_failure_for_a_removed_torrent_is_counted_as_stopped() {
+        for phase in [None, Some(TorrentPhase::Removed)] {
+            let (calls, warns, _) = run_in(tracker_error(36, false), phase, None);
+            assert_eq!(labels_of(&calls), kind_stopped(), "{phase:?}");
+            assert_eq!(warns, 0);
+        }
+        let mut alert = tracker_error(36, false);
+        if let Alert::TrackerError { hdr, .. } = &mut alert {
+            hdr.infohash = None;
+        }
+        let (calls, _, _) = run_in(alert, Some(TorrentPhase::Seeding), None);
+        assert_eq!(labels_of(&calls), kind_stopped());
     }
 
     #[test]
