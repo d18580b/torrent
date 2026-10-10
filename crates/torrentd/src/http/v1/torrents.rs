@@ -1219,21 +1219,12 @@ pub async fn delete_torrent(
     if delete_files {
         if let Some(pool) = s.pool.as_ref() {
             let hex = ih.to_hex();
-            let others = pool.with_store(|st| st.co_claimants(&hex)).map_err(|e| {
-                DeleteTorrentError::Internal {
-                    detail: internal("reading the pool index", e),
-                }
-            })?;
-            if let Some(first) = others.first() {
-                return Err(DeleteTorrentError::PayloadShared {
-                    detail: format!(
-                        "{} other torrent(s) claim files of this one in the pool index — the \
-                         first is {first} — so deleting its payload would delete theirs; \
-                         retry without `delete_files`",
-                        others.len(),
-                    ),
-                });
-            }
+            // Off the reader: the claims are the last committed index's, and
+            // the writer would make a refusal wait out a whole running scan.
+            // That scan can still commit a new co-claimant, so
+            // `payload_to_trash` asks again on the writer before anything is
+            // moved; this one only answers the common refusal early.
+            refuse_co_claimants(pool.with_reader(|st| st.co_claimants(&hex)))?;
         }
     }
     let profile = s
@@ -1383,8 +1374,35 @@ fn payload_to_trash(
              without `delete_files` to remove the torrent alone."
         ),
     })?;
+    // The handler's co-claimant check read the last committed index, which a
+    // scan running then could rewrite before it let go of the writer. The
+    // writer reads above waited for that scan, so ask again on it: a
+    // cross-seed the scan newly placed over these files is refused here, as
+    // it would have been had the delete arrived after the scan.
+    refuse_co_claimants(pool.with_store(|st| st.co_claimants(&ih.to_hex())))?;
     refuse_live_overlap(s, ih, &payload)?;
     Ok(payload)
+}
+
+/// Refuse `delete_files` when the pool index has other torrents claiming
+/// files of this one: deleting its payload would delete theirs.
+fn refuse_co_claimants(
+    others: Result<Vec<String>, torrentd_pool::PoolError>,
+) -> Result<(), DeleteTorrentError> {
+    let others = others.map_err(|e| DeleteTorrentError::Internal {
+        detail: internal("reading the pool index", e),
+    })?;
+    if let Some(first) = others.first() {
+        return Err(DeleteTorrentError::PayloadShared {
+            detail: format!(
+                "{} other torrent(s) claim files of this one in the pool index — the first is \
+                 {first} — so deleting its payload would delete theirs; retry without \
+                 `delete_files`",
+                others.len(),
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Refuse `payload` when any other torrent the daemon holds has a file at
@@ -1500,16 +1518,17 @@ fn clear_assignment(
 /// files are gone); one naming anything else was never this delete's. A
 /// failed write is logged and counted by the pool, and leaves adoption
 /// refusing rather than allowing.
+///
+/// The response does not wait for the write: while a scan holds the writer
+/// the release is queued until it lets go (see
+/// [`crate::pool_service::PoolService::release_owner_soon`]). The torrent is
+/// gone from the registry by then, so a client that timed out on the wait and
+/// retried got `404` for a delete that had succeeded.
 fn release_index_owner(s: &AppState, ih: &InfoHash, profile: &ProfileId, payload_deleted: bool) {
     let Some(pool) = s.pool.as_ref() else {
         return;
     };
-    let hex = ih.to_hex();
-    let released =
-        pool.with_store_mut(|st| st.release_owner(&hex, profile.as_str(), payload_deleted));
-    if let Err(e) = released {
-        pool.note_store_error("release_owner", &e);
-    }
+    pool.release_owner_soon(ih.to_hex(), profile.as_str().to_owned(), payload_deleted);
 }
 
 /// Remove a torrent whose profile has no live session.
