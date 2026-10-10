@@ -271,6 +271,43 @@ async fn the_login_throttle_keys_on_the_client_a_trusted_proxy_names() {
 }
 
 #[tokio::test]
+async fn a_client_that_logged_in_before_gets_past_a_spent_verification_budget() {
+    // Addresses polling in a loop can keep the daemon-wide budget spent.
+    // A client that has logged in since the daemon started falls back on a
+    // reserve that nobody else can spend; one that has not is refused.
+    let proxy = "192.0.2.10"; // the harness's socket peer
+    let h = Harness::authed(&Coverage::new(), |s| {
+        s.trusted_proxies = crate::http::forwarded::TrustedProxies::parse(&[proxy.to_owned()])
+            .expect("a literal address parses");
+    });
+    let h = &h;
+    let login = |client: &'static str| async move {
+        h.send_with(
+            "POST",
+            "/v1/sessions",
+            None,
+            Some(json!({"password": PASSWORD})),
+            &[("x-forwarded-for", client)],
+        )
+        .await
+    };
+    login("203.0.113.7")
+        .await
+        .assert_status(kynos::http::StatusCode::CREATED);
+
+    // Spend the shared budget the way an unidentified poller would.
+    let throttle = &h.state.auth.as_ref().unwrap().throttle;
+    while throttle.admit_verification(None).is_ok() {}
+
+    let resp = login("203.0.113.8").await;
+    assert_problem(&resp, 429, "login-throttled");
+    assert!(resp.header("retry-after").is_some());
+    login("203.0.113.7")
+        .await
+        .assert_status(kynos::http::StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn an_expired_session_is_refused_like_an_unknown_one() {
     let h = Harness::authed(&Coverage::new(), |_| {});
     let auth = h.state.auth.as_ref().unwrap();

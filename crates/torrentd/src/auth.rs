@@ -281,12 +281,26 @@ pub struct Auth {
 /// socket peer, or an address a trusted proxy supplied ([`throttle_key`]
 /// keys IPv6 per /64) — and in one global bucket where it is not, or where
 /// the per-client map is full of live entries. Every verification also
-/// spends from one daemon-wide budget ([`KdfBudget`]), which bounds how much
-/// Argon2 the route runs however many addresses a caller holds.
+/// spends from one daemon-wide budget ([`KdfBudget`]), or, once that is
+/// empty and only for a client that has logged in before, from the reserve
+/// described below; together they bound how much Argon2 the route runs
+/// however many addresses a caller holds.
 ///
-/// That budget can still be kept spent by a caller with enough addresses,
-/// which refuses every login while it lasts. What the per-client buckets buy
-/// is that a caller with one address, or a few, locks out only itself.
+/// That budget can be kept spent, and every login refused while it is, by
+/// [`STARVING_ADDRESSES`] addresses (or IPv6 /64s) polling in a loop. A
+/// refusal by the budget costs its client nothing, so each address takes a
+/// burst of verifications, sits out the penalty, and comes back; three that
+/// time their turns well come close, and fewer leave the budget refilling.
+/// The per-client buckets bound what one address costs everyone else; they
+/// do not stop a handful.
+///
+/// What gets a client past a spent budget is having logged in before: a
+/// client whose key has succeeded since the daemon started draws on a
+/// separate reserve ([`RESERVE_BURST`], [`RESERVE_REFILL`]) once the shared
+/// budget is empty, and no client that has never logged in can spend it. A
+/// client that never has — a new address, or any address after a restart —
+/// has only the shared budget, which is why a static `write` token is the
+/// break-glass credential.
 #[derive(Debug)]
 pub struct LoginThrottle {
     /// The fallback, for requests whose client cannot be established.
@@ -297,8 +311,37 @@ pub struct LoginThrottle {
     /// The daemon-wide ceiling on password verifications, across every
     /// bucket above.
     kdf: Mutex<KdfBudget>,
+    /// Verifications only a [`known`](Self::known) client may spend, and only
+    /// once [`kdf`](Self::kdf) is empty.
+    reserve: Mutex<KdfBudget>,
+    /// Throttle keys that have logged in, with when each last did. Bounded
+    /// by [`MAX_KNOWN_CLIENTS`], dropping the oldest success to make room,
+    /// and written only by a correct password, so a caller without it can
+    /// neither join nor evict.
+    known: Mutex<HashMap<IpAddr, Instant>>,
     max_burst: u32,
     penalty: Duration,
+    clock: Clock,
+}
+
+/// Where the throttle reads the time. A test drives a fake one, so a
+/// scenario minutes long runs in no time and lands exactly on the instants
+/// it means to.
+#[derive(Debug)]
+enum Clock {
+    System,
+    #[cfg(test)]
+    Fake(Mutex<Instant>),
+}
+
+impl Clock {
+    fn now(&self) -> Instant {
+        match self {
+            Self::System => Instant::now(),
+            #[cfg(test)]
+            Self::Fake(at) => *at.lock(),
+        }
+    }
 }
 
 /// The most password verifications the daemon runs back to back before the
@@ -308,8 +351,33 @@ const KDF_BURST: u32 = 10;
 /// How long the budget takes to regain one verification. With [`KDF_BURST`]
 /// that is at most ten verifications in any thirty seconds once the burst is
 /// spent — twice the old global bucket's five failures per thirty seconds,
-/// and well under 1% of one core at ~50 ms each.
+/// and under 2% of one core at ~50 ms each.
 const KDF_REFILL: Duration = Duration::from_secs(3);
+
+/// How many addresses, each polling `POST /v1/sessions` with a wrong
+/// password in a loop, keep the shared budget spent so that no client that
+/// has never logged in reaches a verification. Each claims five and is then
+/// locked out for thirty seconds, so at best it takes five per forty-five
+/// seconds (fifteen to collect them at one per [`KDF_REFILL`], then the
+/// penalty) while the budget accrues fifteen: three is the floor, for
+/// addresses that take turns perfectly. Addresses that simply loop collide,
+/// split the tokens, and lock out together, so it takes five; four let a
+/// login through every few minutes. `docs/running.md` §6a quotes this
+/// number; a test pins it.
+#[cfg_attr(not(test), allow(dead_code))]
+const STARVING_ADDRESSES: usize = 5;
+
+/// The reserve's burst: a whole per-client burst, so a returning client can
+/// mistype its password and still get in.
+const RESERVE_BURST: u32 = 5;
+
+/// How long the reserve takes to regain one verification: half the shared
+/// budget's rate, so the two together stay under 3% of one core.
+const RESERVE_REFILL: Duration = Duration::from_secs(6);
+
+/// Cap on remembered successful clients. A real deployment has a handful of
+/// operators, each on a handful of addresses.
+const MAX_KNOWN_CLIENTS: usize = 64;
 
 /// A token bucket over Argon2id runs, shared by every client.
 ///
@@ -326,18 +394,17 @@ struct KdfBudget {
 }
 
 impl KdfBudget {
-    fn new(burst: u32, refill: Duration) -> Self {
+    fn new(burst: u32, refill: Duration, now: Instant) -> Self {
         Self {
             tokens: burst,
-            refilled_at: Instant::now(),
+            refilled_at: now,
             burst,
             refill,
         }
     }
 
     /// Take one verification, or say how long until one is available.
-    fn take(&mut self) -> Result<(), Duration> {
-        let now = Instant::now();
+    fn take(&mut self, now: Instant) -> Result<(), Duration> {
         let elapsed = now.saturating_duration_since(self.refilled_at);
         let accrued = (elapsed.as_nanos() / self.refill.as_nanos().max(1)) as u64;
         if accrued > 0 {
@@ -399,25 +466,24 @@ struct ThrottleState {
     last_seen: Instant,
 }
 
-impl Default for ThrottleState {
-    fn default() -> Self {
+impl ThrottleState {
+    /// A cleared record, as of `now`.
+    fn new(now: Instant) -> Self {
         Self {
             failures: 0,
             locked_until: None,
-            last_seen: Instant::now(),
+            last_seen: now,
         }
     }
-}
 
-impl ThrottleState {
     /// How long the caller must wait, or `None` if an attempt is allowed.
     ///
     /// Not a liveness touch: the throttle is consulted before the body is
     /// read, so a request that ends in a 400 must not keep an entry alive at
     /// no KDF cost.
-    fn retry_after(&mut self) -> Option<Duration> {
+    fn retry_after(&mut self, now: Instant) -> Option<Duration> {
         match self.locked_until {
-            Some(until) if Instant::now() < until => Some(until - Instant::now()),
+            Some(until) if now < until => Some(until - now),
             Some(_) => {
                 // Window elapsed: allow another burst.
                 self.locked_until = None;
@@ -428,29 +494,54 @@ impl ThrottleState {
         }
     }
 
-    fn note_failure(&mut self, max_burst: u32, penalty: Duration) {
-        self.last_seen = Instant::now();
+    fn note_failure(&mut self, max_burst: u32, penalty: Duration, now: Instant) {
+        self.last_seen = now;
         self.failures = self.failures.saturating_add(1);
         if self.failures >= max_burst {
-            self.locked_until = Some(Instant::now() + penalty);
+            self.locked_until = Some(now + penalty);
         }
     }
 
     /// Whether this entry is worth keeping: it is still locking someone out,
     /// or it has been touched within `idle`.
-    fn is_live(&self, idle: Duration) -> bool {
-        self.locked_until.is_some_and(|u| u > Instant::now()) || self.last_seen.elapsed() < idle
+    fn is_live(&self, idle: Duration, now: Instant) -> bool {
+        self.locked_until.is_some_and(|u| u > now)
+            || now.saturating_duration_since(self.last_seen) < idle
     }
 }
 
 impl LoginThrottle {
     pub fn new() -> Self {
+        Self::with_clock(Clock::System)
+    }
+
+    fn with_clock(clock: Clock) -> Self {
+        let now = clock.now();
         Self {
-            global: Mutex::new(ThrottleState::default()),
+            global: Mutex::new(ThrottleState::new(now)),
             per_client: Mutex::new(HashMap::new()),
-            kdf: Mutex::new(KdfBudget::new(KDF_BURST, KDF_REFILL)),
+            kdf: Mutex::new(KdfBudget::new(KDF_BURST, KDF_REFILL, now)),
+            reserve: Mutex::new(KdfBudget::new(RESERVE_BURST, RESERVE_REFILL, now)),
+            known: Mutex::new(HashMap::new()),
             max_burst: 5,
             penalty: Duration::from_secs(30),
+            clock,
+        }
+    }
+
+    /// The production throttle on a clock only [`advance`](Self::advance)
+    /// moves.
+    #[cfg(test)]
+    fn with_fake_clock() -> Self {
+        Self::with_clock(Clock::Fake(Mutex::new(Instant::now())))
+    }
+
+    /// Move a fake clock forward by `by`.
+    #[cfg(test)]
+    fn advance(&self, by: Duration) {
+        match &self.clock {
+            Clock::Fake(at) => *at.lock() += by,
+            Clock::System => panic!("advance() needs with_fake_clock()"),
         }
     }
 
@@ -462,7 +553,11 @@ impl LoginThrottle {
     fn with_penalty(penalty: Duration) -> Self {
         Self {
             penalty,
-            kdf: Mutex::new(KdfBudget::new(u32::MAX, Duration::from_nanos(1))),
+            kdf: Mutex::new(KdfBudget::new(
+                u32::MAX,
+                Duration::from_nanos(1),
+                Instant::now(),
+            )),
             ..Self::new()
         }
     }
@@ -472,16 +567,34 @@ impl LoginThrottle {
     #[cfg(test)]
     pub(crate) fn with_kdf_budget(burst: u32, refill: Duration) -> Self {
         Self {
-            kdf: Mutex::new(KdfBudget::new(burst, refill)),
+            kdf: Mutex::new(KdfBudget::new(burst, refill, Instant::now())),
             ..Self::new()
         }
     }
 
-    /// Spend one password verification from the daemon-wide budget, or say
-    /// how long until one is available. Called immediately before the KDF
-    /// runs, after every other refusal.
-    pub fn admit_verification(&self) -> Result<(), Duration> {
-        self.kdf.lock().take()
+    /// Spend one password verification, or say how long until one is
+    /// available. Called immediately before the KDF runs, after every other
+    /// refusal.
+    ///
+    /// Every client spends from the daemon-wide budget first. Once that is
+    /// empty, a client that has logged in before spends from the reserve
+    /// instead, and is told the sooner of the two waits when both are empty;
+    /// anyone else is refused with the shared budget's wait.
+    pub fn admit_verification(&self, client: Option<IpAddr>) -> Result<Admission, Duration> {
+        let now = self.clock.now();
+        let Err(wait) = self.kdf.lock().take(now) else {
+            return Ok(Admission::Shared);
+        };
+        let Some(ip) = client.map(throttle_key) else {
+            return Err(wait);
+        };
+        if !self.known.lock().contains_key(&ip) {
+            return Err(wait);
+        }
+        match self.reserve.lock().take(now) {
+            Ok(()) => Ok(Admission::Reserve),
+            Err(reserve_wait) => Err(wait.min(reserve_wait)),
+        }
     }
 
     /// How long `client` must wait, or `None` if an attempt is allowed.
@@ -489,31 +602,33 @@ impl LoginThrottle {
     /// Mirrors `note_failure`: a client with no bucket of its own once the map
     /// is full is read from the global bucket its failures are written to.
     pub fn retry_after(&self, client: Option<IpAddr>) -> Option<Duration> {
+        let now = self.clock.now();
         let Some(ip) = client.map(throttle_key) else {
-            return self.global.lock().retry_after();
+            return self.global.lock().retry_after(now);
         };
         let mut g = self.per_client.lock();
         if let Some(state) = g.get_mut(&ip) {
-            return state.retry_after();
+            return state.retry_after(now);
         }
         if g.len() >= MAX_TRACKED_CLIENTS {
             drop(g);
-            return self.global.lock().retry_after();
+            return self.global.lock().retry_after(now);
         }
         None
     }
 
     /// Record a failed attempt, locking out once the burst is spent.
     pub fn note_failure(&self, client: Option<IpAddr>) {
+        let now = self.clock.now();
         let Some(ip) = client.map(throttle_key) else {
             self.global
                 .lock()
-                .note_failure(self.max_burst, self.penalty);
+                .note_failure(self.max_burst, self.penalty, now);
             return;
         };
         let mut g = self.per_client.lock();
         if g.len() >= MAX_TRACKED_CLIENTS && !g.contains_key(&ip) {
-            g.retain(|_, st| st.is_live(self.penalty));
+            g.retain(|_, st| st.is_live(self.penalty, now));
             // Still full of live entries: fall back to the global bucket
             // rather than letting the map grow, since an attack that fills it
             // is exactly when throttling has to keep working.
@@ -521,13 +636,13 @@ impl LoginThrottle {
                 drop(g);
                 self.global
                     .lock()
-                    .note_failure(self.max_burst, self.penalty);
+                    .note_failure(self.max_burst, self.penalty, now);
                 return;
             }
         }
         g.entry(ip)
-            .or_default()
-            .note_failure(self.max_burst, self.penalty);
+            .or_insert_with(|| ThrottleState::new(now))
+            .note_failure(self.max_burst, self.penalty, now);
     }
 
     /// A success clears the client's record, by **replacing** its entry, or
@@ -539,21 +654,26 @@ impl LoginThrottle {
     ///
     /// The global bucket is not cleared by an identified client: one valid
     /// credential must not reset the shared bucket between guesses at another.
+    ///
+    /// An identified client is also remembered as one that has logged in,
+    /// which is what lets it spend the reserve
+    /// ([`admit_verification`](Self::admit_verification)) from then on.
     pub fn note_success(&self, client: Option<IpAddr>) {
+        let now = self.clock.now();
         let Some(ip) = client.map(throttle_key) else {
-            *self.global.lock() = ThrottleState::default();
+            *self.global.lock() = ThrottleState::new(now);
             return;
         };
+        self.remember(ip, now);
         let mut g = self.per_client.lock();
         if let Some(state) = g.get_mut(&ip) {
-            *state = ThrottleState::default();
+            *state = ThrottleState::new(now);
             return;
         }
         if g.len() >= MAX_TRACKED_CLIENTS {
-            g.retain(|_, st| st.is_live(self.penalty));
+            g.retain(|_, st| st.is_live(self.penalty, now));
         }
         if g.len() >= MAX_TRACKED_CLIENTS {
-            let now = Instant::now();
             let stalest = g
                 .iter()
                 .filter(|(_, st)| st.locked_until.is_none_or(|u| u <= now))
@@ -567,8 +687,34 @@ impl LoginThrottle {
                 None => return,
             }
         }
-        g.insert(ip, ThrottleState::default());
+        g.insert(ip, ThrottleState::new(now));
     }
+
+    /// Record that `ip` (a throttle key) has logged in, dropping the oldest
+    /// success when the set is full.
+    fn remember(&self, ip: IpAddr, now: Instant) {
+        let mut known = self.known.lock();
+        if known.len() >= MAX_KNOWN_CLIENTS && !known.contains_key(&ip) {
+            let oldest = known
+                .iter()
+                .min_by_key(|(_, at)| **at)
+                .map(|(addr, _)| *addr);
+            if let Some(addr) = oldest {
+                known.remove(&addr);
+            }
+        }
+        known.insert(ip, now);
+    }
+}
+
+/// Which budget paid for an admitted verification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    /// The daemon-wide budget every client shares.
+    Shared,
+    /// The reserve for clients that have logged in before, because the
+    /// shared budget was spent.
+    Reserve,
 }
 
 impl Default for LoginThrottle {
@@ -1110,7 +1256,7 @@ mod tests {
 
         let t = LoginThrottle::new();
         fill(&t, 5);
-        *t.per_client.lock().get_mut(&filler(7)).unwrap() = ThrottleState::default();
+        *t.per_client.lock().get_mut(&filler(7)).unwrap() = ThrottleState::new(Instant::now());
         t.note_success(ip(1));
         assert!(t.per_client.lock().contains_key(&ip(1).unwrap()));
         assert!(!t.per_client.lock().contains_key(&filler(7)));
@@ -1144,7 +1290,7 @@ mod tests {
                 t.retry_after(addr).is_none(),
                 "a never-seen address is not throttled per client",
             );
-            if t.admit_verification().is_ok() {
+            if t.admit_verification(addr).is_ok() {
                 admitted += 1;
                 t.note_failure(addr);
             }
@@ -1154,7 +1300,7 @@ mod tests {
             "1024 addresses get the same burst of verifications as one",
         );
         let wait = t
-            .admit_verification()
+            .admit_verification(ip(1))
             .expect_err("the budget is spent until it refills");
         assert!(
             wait <= KDF_REFILL,
@@ -1166,26 +1312,205 @@ mod tests {
     fn the_verification_budget_refills_one_at_a_time() {
         let refill = Duration::from_millis(40);
         let t = LoginThrottle::with_kdf_budget(2, refill);
-        assert!(t.admit_verification().is_ok());
-        assert!(t.admit_verification().is_ok());
-        assert!(t.admit_verification().is_err(), "burst of two is spent");
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_err(), "burst of two is spent");
 
         std::thread::sleep(refill + Duration::from_millis(10));
         assert!(
-            t.admit_verification().is_ok(),
+            t.admit_verification(None).is_ok(),
             "one refill interval, one run"
         );
         assert!(
-            t.admit_verification().is_err(),
+            t.admit_verification(None).is_err(),
             "and only one: the budget accrues, it does not reset",
         );
 
         std::thread::sleep(refill * 4);
-        assert!(t.admit_verification().is_ok());
-        assert!(t.admit_verification().is_ok());
+        assert!(t.admit_verification(None).is_ok());
+        assert!(t.admit_verification(None).is_ok());
         assert!(
-            t.admit_verification().is_err(),
+            t.admit_verification(None).is_err(),
             "idle time accrues no more than the burst",
         );
+    }
+
+    /// One `POST /v1/sessions` as `create_session` runs it, against `t`'s
+    /// clock: the per-client consult, the budget, then the verdict the KDF
+    /// would reach. `Ok` names the budget that paid for a verification.
+    fn attempt(
+        t: &LoginThrottle,
+        client: Option<IpAddr>,
+        correct: bool,
+    ) -> Result<Admission, Duration> {
+        if let Some(wait) = t.retry_after(client) {
+            return Err(wait);
+        }
+        let paid = t.admit_verification(client)?;
+        if correct {
+            t.note_success(client);
+        } else {
+            t.note_failure(client);
+        }
+        Ok(paid)
+    }
+
+    /// How often each attacking address polls: far tighter than the refill,
+    /// so a token is taken within one tick of accruing.
+    const POLL: Duration = Duration::from_millis(100);
+
+    /// Advance `t` tick by tick for `span`, each tick letting each of
+    /// `attackers` addresses try a wrong password, and then calling
+    /// `after(t, elapsed)`, so whatever it does always comes second to the
+    /// attackers, as a human's retry does to a loop's.
+    fn siege(
+        t: &LoginThrottle,
+        attackers: usize,
+        span: Duration,
+        mut after: impl FnMut(&LoginThrottle, Duration),
+    ) {
+        let attacker = |n: usize| Some(IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, n as u8)));
+        let mut elapsed = Duration::ZERO;
+        while elapsed < span {
+            for n in 0..attackers {
+                let _ = attempt(t, attacker(n), false);
+            }
+            after(t, elapsed);
+            t.advance(POLL);
+            elapsed += POLL;
+        }
+    }
+
+    /// How many fresh clients, one a second for fifteen minutes after a
+    /// two-minute warm-up, `attackers` addresses polling in a loop let
+    /// through to a verification. Each is a new address, so no attempt is
+    /// helped by an earlier success.
+    fn newcomers_admitted(attackers: usize) -> usize {
+        let warm_up = Duration::from_secs(120);
+        let t = LoginThrottle::with_fake_clock();
+        let mut admitted = 0;
+        siege(
+            &t,
+            attackers,
+            warm_up + Duration::from_secs(900),
+            |t, elapsed| {
+                let ms = elapsed.as_millis();
+                if ms % 1000 == 0 && elapsed >= warm_up {
+                    let n = (ms / 1000) as u32;
+                    let newcomer = Some(IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + n)));
+                    if attempt(t, newcomer, true).is_ok() {
+                        admitted += 1;
+                    }
+                }
+            },
+        );
+        admitted
+    }
+
+    /// Pins the number `docs/running.md` §6a and [`LoginThrottle`] quote:
+    /// [`STARVING_ADDRESSES`] addresses polling in a loop keep a client that
+    /// has never logged in from ever reaching a verification, and one fewer
+    /// lets some through.
+    #[test]
+    fn polling_addresses_keep_a_new_client_out_from_the_documented_number() {
+        assert_eq!(newcomers_admitted(STARVING_ADDRESSES), 0);
+        assert!(newcomers_admitted(STARVING_ADDRESSES - 1) > 0);
+    }
+
+    /// The way past a spent budget: addresses polling for fifteen minutes —
+    /// three, as in the report, and the number that starves the budget
+    /// outright — cannot keep a client that has logged in before from
+    /// reaching a verification on its first try, every time it tries, even
+    /// after mistyping its password four times running.
+    #[test]
+    fn a_returning_client_gets_past_addresses_starving_the_budget() {
+        for attackers in [3, STARVING_ADDRESSES] {
+            let t = LoginThrottle::with_fake_clock();
+            let operator = ip(1);
+            assert_eq!(attempt(&t, operator, true), Ok(Admission::Shared));
+
+            let mut tries = 0;
+            let mut from_reserve = 0;
+            let mut admit = |t: &LoginThrottle, correct: bool, elapsed: Duration| {
+                let paid = attempt(t, operator, correct).unwrap_or_else(|wait| {
+                    panic!(
+                        "{attackers} addresses kept the returning client out at {elapsed:?} \
+                         for {wait:?}"
+                    )
+                });
+                if paid == Admission::Reserve {
+                    from_reserve += 1;
+                }
+            };
+            siege(&t, attackers, Duration::from_secs(900), |t, elapsed| {
+                let ms = elapsed.as_millis();
+                // Past the warm-up, once a minute: a mistyped burst every
+                // fifth time, otherwise a single correct attempt.
+                if ms < 120_000 || ms % 60_000 != 0 {
+                    return;
+                }
+                tries += 1;
+                if tries % 5 == 0 {
+                    for _ in 0..RESERVE_BURST - 1 {
+                        admit(t, false, elapsed);
+                    }
+                }
+                admit(t, true, elapsed);
+            });
+            assert_eq!(tries, 13);
+            if attackers == STARVING_ADDRESSES {
+                assert_eq!(
+                    from_reserve,
+                    13 + 2 * (RESERVE_BURST as usize - 1),
+                    "with the shared budget spent throughout, the reserve paid for every one",
+                );
+            }
+        }
+    }
+
+    /// The reserve is for clients that have logged in, so failing does not
+    /// earn it, nor does a success from another address or an anonymous one;
+    /// and the shared budget is spent first, so the reserve is untouched
+    /// while it lasts.
+    #[test]
+    fn only_a_client_that_has_logged_in_spends_the_reserve() {
+        let t = LoginThrottle::with_fake_clock();
+        assert_eq!(attempt(&t, ip(1), true), Ok(Admission::Shared));
+        assert_eq!(attempt(&t, None, true), Ok(Admission::Shared));
+        for n in 0..KDF_BURST - 2 {
+            assert_eq!(attempt(&t, ip(10 + n as u8), false), Ok(Admission::Shared));
+        }
+        assert!(attempt(&t, ip(2), false).is_err(), "budget spent");
+        assert!(attempt(&t, None, true).is_err(), "anonymous has no reserve");
+        assert!(attempt(&t, ip(3), true).is_err(), "nor has a newcomer");
+        for _ in 0..RESERVE_BURST {
+            assert_eq!(attempt(&t, ip(1), true), Ok(Admission::Reserve));
+        }
+        let wait = attempt(&t, ip(1), true).expect_err("the reserve is spent too");
+        assert!(
+            wait <= KDF_REFILL,
+            "the wait is the sooner of the two refills: {wait:?}",
+        );
+        t.advance(KDF_REFILL);
+        assert_eq!(
+            attempt(&t, ip(1), true),
+            Ok(Admission::Shared),
+            "the shared budget is spent before the reserve",
+        );
+    }
+
+    /// The remembered set is bounded, and makes room by forgetting the
+    /// client whose last success is oldest.
+    #[test]
+    fn the_remembered_clients_are_bounded_oldest_first() {
+        let t = LoginThrottle::with_fake_clock();
+        for n in 0..=MAX_KNOWN_CLIENTS {
+            t.note_success(Some(filler(n)));
+            t.advance(Duration::from_secs(1));
+        }
+        let known = t.known.lock();
+        assert_eq!(known.len(), MAX_KNOWN_CLIENTS);
+        assert!(!known.contains_key(&filler(0)));
+        assert!(known.contains_key(&filler(MAX_KNOWN_CLIENTS)));
     }
 }

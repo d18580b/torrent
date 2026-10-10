@@ -1002,19 +1002,44 @@ Either way nothing becomes forgeable.
 
 Above the per-client buckets sits one daemon-wide ceiling: at most ten
 password verifications back to back, regaining one every three seconds,
-however many addresses the attempts come from. Without it a caller with many
-source addresses — one routed IPv6 /64 supplies more than enough — would get
-a bucket per address, and the Argon2 work and the guessing rate would scale
-with how many they hold. With it, a `POST /v1/sessions` that would exceed the
-ceiling gets `429`, with `Retry-After`, without running the KDF.
+however many addresses the attempts come from. The one exception is the
+returning-client reserve described below: a client that has logged in
+before can draw five more, regaining one every six seconds, once the
+ceiling is spent. Without the ceiling a caller with many source addresses —
+one routed IPv6 /64 supplies more than enough — would get a bucket per
+address, and the Argon2 work and the guessing rate would scale with how many
+they hold. With it, a `POST /v1/sessions` that would exceed the ceiling (and,
+for a returning client, the reserve) gets `429`, with `Retry-After`, without running the KDF.
 
-It is not a promise that nobody can lock you out of `POST /v1/sessions`. A caller
-with enough source addresses can keep that ceiling spent, and while they do
-every login — yours included — is refused, exactly as the single shared
-bucket did before. That costs them nothing but requests: the ~50 ms of Argon2
-behind each attempt is spent by torrentd, not by the caller, which is why the
-ceiling exists. What the per-client key removes is the lockout by a caller
-with one address, or a few.
+That ceiling can be kept spent, and it does not take many addresses. A
+request the ceiling refuses costs its client nothing, so each address takes
+its five attempts, sits out its thirty seconds, and comes back. Five
+addresses (or IPv6 /64s) looping on a wrong password keep it spent
+indefinitely; four let a login through every few minutes; and three that
+take turns precisely come close, since three bursts of five every
+forty-five seconds is exactly what the ceiling regains. That costs them
+nothing but requests: the ~50 ms of Argon2 behind each attempt is spent by
+torrentd, not by the caller, which is why the ceiling exists. What the
+per-client key removes is the lockout by a caller with one address.
+
+A client that has **logged in before** gets past a spent ceiling. Once its
+address (or /64) has had a session issued since the daemon started, it can
+draw on a reserve of five more verifications, regaining one every six
+seconds, that only such clients can spend and only once the shared ceiling is
+empty. So a browser or `torrentctl` you have already logged in from keeps
+working through the loop above, and the daemon logs `login admitted from the
+returning-client reserve` when it happens. The reserve is no help to an
+address that has never logged in, or to any address after a restart, which
+forgets them all; behind a proxy with `trusted_proxies` unset, every client
+is the proxy's address, so the reserve is shared with whoever else comes
+through it.
+
+**Keep a static `write` token as the break-glass credential.** A
+`[[auth.token]]` entry with the `write` scope (§6) never touches
+`POST /v1/sessions` or either budget, so it works however long the login
+route is held. Store it where you can reach it when you cannot log in, and
+use it with `torrentctl --token-file` (or `TORRENTCTL_TOKEN`) or as
+`Authorization: Bearer`.
 
 The proxy must **strip or overwrite client-supplied forwarding headers before
 adding its own** — all three of the names in the table above, not just the two
