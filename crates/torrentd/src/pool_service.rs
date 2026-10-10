@@ -1278,7 +1278,8 @@ pub(crate) fn force_recheck_marking_checking(
 /// the network is put back, as an adoption is held, because a re-hash puts
 /// the torrent back on the network once it ends. So is one whose torrent a
 /// paced set-online holds paused until its batch comes
-/// ([`crate::profile_state::PacedHolds`]): it is not paused for good. The
+/// ([`crate::profile_state::PacedHolds`]): it is not paused for good. A held
+/// torrent that is no longer paused is not put back for its hold. The
 /// hold is logged once per profile per tick: `held_logged` names the profiles
 /// already logged.
 fn admit_recheck(
@@ -1319,8 +1320,12 @@ fn admit_recheck(
     }
     // A paced set-online pauses each running torrent until its batch, and
     // holds it meanwhile: it is paused by the daemon, not the operator, and
-    // runs again once its batch comes, so its re-hash waits for that.
-    if profiles.holds().holds(&st.profile_id, &st.handle.infohash) {
+    // runs again once its batch comes, so its re-hash waits for that. A held
+    // torrent that is running again, resumed by the operator before its
+    // batch, is hashable now: the hold is no reason to keep it waiting.
+    if st.phase == TorrentPhase::Paused
+        && profiles.holds().holds(&st.profile_id, &st.handle.infohash)
+    {
         if held_logged.insert(st.profile_id.clone()) {
             info!(
                 target: "torrentd::pool",
@@ -3917,6 +3922,33 @@ mod tests {
         w.profiles.holds().release(&id, [held]).unwrap();
         w.tick(&pool);
         assert_eq!(w.rechecked(), [held]);
+    }
+
+    /// A held torrent the operator resumed before its batch is hashable: its
+    /// re-hash starts though the hold is still in place, rather than waiting
+    /// on a hold that no longer pauses it.
+    #[test]
+    fn a_rehash_starts_when_a_held_torrent_was_resumed_by_hand() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool_with(dir.path(), InfoHash([0x01; 20]), None);
+        pool.verify = super::VerifyQueue::new(4);
+        let w = Worker::new(dir.path());
+        let held = InfoHash([0xD7; 20]);
+        let id = ProfileId::new("p");
+        w.load(held, 1, "p", TorrentPhase::Seeding);
+        w.profiles.holds().hold(&id, [held]).unwrap();
+        let q = pool.verify_queue();
+        q.enqueue_recheck(held.to_hex(), true);
+
+        let mut logged = std::collections::HashSet::new();
+        assert_eq!(
+            super::admit_recheck(q, &*w.source, &w.state, &w.profiles, &mut logged),
+            super::Admission::Admitted,
+        );
+        assert!(w.profiles.holds().holds(&id, &held), "the hold remains");
+        assert!(logged.is_empty(), "nothing was held");
+        assert_eq!(w.rechecked(), [held]);
+        assert_eq!(q.depth(), 0);
     }
 
     /// A re-hash paused while it checks holds its slot, so with
