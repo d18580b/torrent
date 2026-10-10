@@ -385,7 +385,9 @@ impl PoolService {
     }
 
     /// Forget `infohash`'s entry in the persisted verify queue: the queue
-    /// added it to a session or dropped it.
+    /// recorded its verdict, dropped it, or saw its torrent removed while it
+    /// was hashing. An entry the queue has added to a session is kept until
+    /// then, so a restart while it hashes still records the verdict.
     fn forget_queued(&self, infohash: &str) {
         if let Err(e) = self.with_store(|s| s.dequeue_verify(infohash)) {
             self.note_store_error("dequeue_verify", &e);
@@ -401,8 +403,11 @@ impl PoolService {
     /// with nothing behind it. An entry is queued again only while its claim
     /// still names its profile and no scan loaded it:
     ///
-    /// - one `loaded` names was added to a session before the crash, and is
-    ///   back from its `.torrent`; its entry is forgotten.
+    /// - one `loaded` names was added to a session before the restart, and is
+    ///   back from its `.torrent` or resume file with its verdict not yet
+    ///   recorded; the boot hashes it again, so it goes back in flight and
+    ///   the worker records that check's verdict, pausing a failure, as it
+    ///   would have without the restart. Its entry stays until then.
     /// - one whose claim is gone, or names another profile, is dropped as the
     ///   worker drops an item: its owner record goes too, while it still
     ///   names the entry's profile, and a claim someone else holds is left
@@ -437,10 +442,10 @@ impl PoolService {
                     target: "torrentd::pool",
                     infohash = %item.infohash,
                     profile_id = %item.profile,
-                    "a queued adoption was added before the restart and is loaded; \
-                     forgetting its queue entry",
+                    "an adoption was added before the restart and is loaded; \
+                     waiting for its verification",
                 );
-                self.forget_queued(&item.infohash);
+                self.verify.track_in_flight(item.infohash);
                 continue;
             }
             if registry.lookup(&ih).as_ref() != Some(&item.profile) {
@@ -565,7 +570,7 @@ pub struct ScanSummary {
 #[derive(Debug)]
 pub struct VerifyQueue {
     pending: Mutex<VecDeque<PendingVerify>>,
-    in_flight: Mutex<Vec<String>>,
+    in_flight: Mutex<Vec<InFlight>>,
     /// Loaded torrents `POST /v1/pool/verifications` asked libtorrent to
     /// re-hash, with when. Their outcome is recorded like an adopt's — which
     /// is the only way a loaded `drifted` torrent is ever cleared — once a
@@ -580,6 +585,16 @@ pub struct VerifyQueue {
     /// `_total` series that `rate()` and `increase()` read as a gauge.
     exported_completed: AtomicU64,
     exported_failed: AtomicU64,
+}
+
+/// A torrent in a session that the verify queue is waiting on.
+#[derive(Debug)]
+struct InFlight {
+    infohash: String,
+    /// Whether the state map has held the torrent since it went in flight.
+    /// One it held and no longer does was removed while it hashed, and has
+    /// no verdict left to record.
+    seen: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -638,6 +653,20 @@ impl VerifyQueue {
 
     pub fn enqueue(&self, item: PendingVerify) {
         self.pending.lock().push_back(item);
+    }
+
+    /// Wait on `infohash`, already in a session, for its verdict.
+    fn track_in_flight(&self, infohash: String) {
+        self.in_flight.lock().push(InFlight {
+            infohash,
+            seen: false,
+        });
+    }
+
+    /// Whether the queue is waiting on `infohash`'s verdict.
+    #[cfg(test)]
+    fn is_in_flight(&self, infohash: &str) -> bool {
+        self.in_flight.lock().iter().any(|f| f.infohash == infohash)
     }
 
     /// Record the outcome of a re-hash just requested for a loaded torrent.
@@ -703,20 +732,7 @@ pub async fn run_verify_queue(
         let q = pool.verify_queue();
 
         // 1) Retire anything that finished hashing.
-        {
-            let mut in_flight = q.in_flight.lock();
-            in_flight.retain(|ih| {
-                let Some(hash) = libtorrent_safe::InfoHash::from_hex(ih) else {
-                    return false;
-                };
-                let outcome = verify_outcome(state.get(&hash).as_ref(), VERIFY_SETTLE);
-                if outcome == VerifyOutcome::Waiting {
-                    return true;
-                }
-                record_verify_outcome(&pool, &*source, &state, &hash, ih, outcome);
-                false
-            });
-        }
+        retire_in_flight(&pool, &*source, &state);
         // 1b) Retire re-hashes of loaded torrents, once a check that finished
         //     after the request is in. One that finished before it is the
         //     previous check, and says nothing about this one.
@@ -846,9 +862,10 @@ pub async fn run_verify_queue(
                         &item.save_path.to_string_lossy(),
                     );
                     // A session holds it now, and a restart loads it from
-                    // the `.torrent` just written.
-                    pool.forget_queued(&item.infohash);
-                    q.in_flight.lock().push(item.infohash.clone());
+                    // the `.torrent` just written. Its persisted entry stays
+                    // until its verdict is recorded, so that restart waits
+                    // for the boot's check and records it.
+                    q.track_in_flight(item.infohash.clone());
                     info!(
                         target: "torrentd::pool",
                         infohash = %item.infohash,
@@ -876,6 +893,45 @@ pub async fn run_verify_queue(
             metrics.add_counter("pool_verify_failed_total", failed, &[]);
         }
     }
+}
+
+/// Record the verdict of every in-flight torrent whose hashing is over, and
+/// stop waiting on one removed while it hashed.
+///
+/// A removed torrent leaves the state map, and with no entry its outcome
+/// reads as still waiting; it is told apart from one whose add has not
+/// landed yet by having been seen there before. Its persisted entry goes
+/// with it, so a later restart does not wait on a re-add of the info-hash
+/// as though it were this adoption.
+fn retire_in_flight(pool: &PoolService, source: &dyn AlertSource, state: &StateMap) {
+    let q = pool.verify_queue();
+    let mut in_flight = q.in_flight.lock();
+    in_flight.retain_mut(|f| {
+        let Some(hash) = libtorrent_safe::InfoHash::from_hex(&f.infohash) else {
+            pool.forget_queued(&f.infohash);
+            return false;
+        };
+        let entry = state.get(&hash);
+        match (entry.is_some(), f.seen) {
+            (true, _) => f.seen = true,
+            (false, true) => {
+                info!(
+                    target: "torrentd::pool",
+                    infohash = %f.infohash,
+                    "a torrent was removed while it was being verified; forgetting it",
+                );
+                pool.forget_queued(&f.infohash);
+                return false;
+            }
+            (false, false) => {}
+        }
+        let outcome = verify_outcome(entry.as_ref(), VERIFY_SETTLE);
+        if outcome == VerifyOutcome::Waiting {
+            return true;
+        }
+        record_verify_outcome(pool, source, state, &hash, &f.infohash, outcome);
+        false
+    });
 }
 
 /// Hold the bytes the verify worker is about to add to the account-isolation
@@ -975,6 +1031,10 @@ fn release_dropped_claim(pool: &PoolService, registry: &AssignmentRegistry, item
 /// upload mode it would otherwise sit in its session announcing a payload the
 /// piece hashes just rejected, and an operator reading `drifted` would find it
 /// still on the network.
+///
+/// Either verdict forgets the info-hash's persisted verify-queue entry: an
+/// adoption keeps it until here, so a restart before the verdict is recorded
+/// waits for the boot's check rather than lose it.
 fn record_verify_outcome(
     pool: &PoolService,
     source: &dyn AlertSource,
@@ -1029,6 +1089,7 @@ fn record_verify_outcome(
     if let Err(e) = written {
         pool.note_store_error("set_adoption", &e);
     }
+    pool.forget_queued(ih);
 }
 
 /// What the verify queue should do with one in-flight torrent.
@@ -1841,9 +1902,10 @@ mod tests {
     /// An adoption claims its info-hash before it is queued, so the queue is
     /// kept in `pool.db` and a restart queues again what was still waiting:
     /// held in memory only, a crash left each claim with nothing to load it.
-    /// What the queue added or dropped before the restart is not queued
-    /// again, nor is an entry whose torrent a scan loaded, nor one whose
-    /// claim no longer names its profile.
+    /// What the queue recorded a verdict for or dropped before the restart is
+    /// not queued again, nor is one whose claim no longer names its profile.
+    /// An entry whose torrent a scan loaded was added and is still hashing:
+    /// it goes back in flight, its entry kept, so its verdict is recorded.
     #[test]
     fn a_restart_queues_again_the_adoptions_still_waiting() {
         use crate::profile_registry::test_entry;
@@ -1880,7 +1942,8 @@ mod tests {
             .unwrap();
         }
         assert_eq!(owner_of(&pool, reassigned).as_deref(), Some("p"));
-        // Before the crash the worker dropped one and added another.
+        // Before the crash the worker dropped one and recorded another's
+        // verdict.
         super::release_dropped_claim(&pool, &reg, &pending(dropped, "p"));
         pool.forget_queued(&admitted.to_hex());
         // Since then, `reassigned`'s claim went to another profile.
@@ -1904,14 +1967,94 @@ mod tests {
         // record goes, and the other profile's claim stays.
         assert_eq!(owner_of(&pool, reassigned), None);
         assert_eq!(reg.lookup(&reassigned), Some(ProfileId::new("other")));
-        // Only the waiting adoption is still kept, so a second restart before
-        // the queue adds it queues it again.
+        // The loaded adoption is waited on for the boot's check; the one
+        // whose verdict was recorded is not.
+        assert!(pool.verify_queue().is_in_flight(&loaded.to_hex()));
+        assert!(!pool.verify_queue().is_in_flight(&admitted.to_hex()));
+        assert_eq!(pool.verify_queue().in_flight(), 1);
+        // The waiting adoption and the loaded one are still kept, so a second
+        // restart before the queue adds the first, or records the second's
+        // verdict, does the same again.
         let kept: Vec<_> = pool
             .with_store(|s| s.verify_queue().unwrap())
             .into_iter()
             .map(|r| r.infohash)
             .collect();
-        assert_eq!(kept, [waiting.to_hex()]);
+        assert_eq!(kept, [waiting.to_hex(), loaded.to_hex()]);
+    }
+
+    /// The in-flight half of a restart mid-verify: a loaded adoption put
+    /// back in flight has its failed check recorded as a fresh adoption's
+    /// is, paused and `drifted`, and its persisted entry goes with the
+    /// verdict. One removed while it hashed is forgotten, entry and all,
+    /// without a verdict.
+    #[test]
+    fn a_restored_in_flight_adoption_records_its_verdict_and_a_removed_one_is_forgotten() {
+        use std::sync::Arc;
+
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+        use torrentd_engine::StateMap;
+        use torrentd_pool::AdoptionState;
+
+        use crate::profile_registry::test_entry;
+        use crate::profile_registry::ProfileRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let checked = InfoHash([0x71; 20]);
+        let removed = InfoHash([0x72; 20]);
+        let pool = pool_with(dir.path(), checked, None);
+        let profiles = ProfileRegistry::new(vec![test_entry("p", ProfileStatus::Active)]);
+        let reg = torrentd_engine::AssignmentRegistry::new_empty(dir.path().join("reg.json"));
+        for ih in [checked, removed] {
+            reg.assign(ih, ProfileId::new("p")).unwrap();
+            super::enqueue_verify(
+                &pool,
+                &profiles,
+                &ih.to_hex(),
+                dir.path().join("t.torrent"),
+                dir.path().join("payload"),
+                None,
+                ProfileId::new("p"),
+                false,
+            )
+            .unwrap();
+        }
+        drop(pool);
+
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let scanned: std::collections::HashSet<_> = [checked, removed].into();
+        assert!(pool.restore_verify_queue(&reg, &scanned).is_empty());
+        assert_eq!(pool.verify_queue().in_flight(), 2);
+
+        let engine = Arc::new(MockEngine::new());
+        let source = torrentd_engine::ProfileSource::new(vec![(
+            ProfileId::new("p"),
+            engine.clone() as Arc<dyn torrentd_engine::TorrentEngine>,
+        )]);
+        let state = StateMap::new();
+        // Both are in their sessions, still hashing.
+        state.insert(checked, st(TorrentPhase::Checking, None));
+        state.insert(removed, st(TorrentPhase::Checking, None));
+        super::retire_in_flight(&pool, &source, &state);
+        assert_eq!(pool.verify_queue().in_flight(), 2);
+
+        // One finishes its check without seeding; the other is removed.
+        state.insert(checked, st(TorrentPhase::Incomplete, Some(SETTLE)));
+        state.remove(&removed, &ProfileId::new("p"), None);
+        super::retire_in_flight(&pool, &source, &state);
+
+        assert_eq!(pool.verify_queue().in_flight(), 0);
+        assert!(engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+        let got = pool
+            .with_store(|s| s.adoption_state(&checked.to_hex()))
+            .unwrap();
+        assert_eq!(got, Some(AdoptionState::Drifted));
+        assert!(pool.with_store(|s| s.verify_queue().unwrap()).is_empty());
     }
 
     /// The enqueue reads the `.fastresume`'s trackers into the item, so the
