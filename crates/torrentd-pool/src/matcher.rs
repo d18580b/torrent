@@ -1,7 +1,9 @@
 //! Deciding which torrent owns which bytes on disk.
 //!
 //! Matching is `(relative path, size)` against a **candidate base** — the
-//! directory a torrent's relative paths hang off. Candidates come from three
+//! directory a torrent's relative paths hang off. A torrent a session serves
+//! tries the base it is recorded at first, and keeps it while it is complete:
+//! that is where the session reads from. Candidates otherwise come from three
 //! places, cheapest first:
 //!
 //! 1. The save path the previous client recorded in its `.fastresume`. On a
@@ -121,20 +123,43 @@ fn match_all_inner(
             continue;
         }
 
-        let best = best_placement(
-            store,
-            &roots,
-            t.declared_save_path.as_deref(),
-            &t.name,
-            &files,
-        )?;
-
         // Drift is cleared by a verification and by nothing else. A rescan
         // that finds the same sizes at the same paths says nothing about the
         // bytes — `drift` flagged them precisely because the sizes did not
         // change — so the marker is carried through every verdict here.
         let prior = store.adoption_state(&t.infohash)?;
         let drift_at = store.drift_at(&t.infohash)?;
+
+        // A torrent a session serves is served from its recorded base — the
+        // one adoption placed it at, and the one a relocate moves it to — so
+        // while that base is still complete it is kept. Picking another copy
+        // instead would leave the served files unclaimed, and a delete plan
+        // offers unclaimed files up as orphans.
+        //
+        // Served means `adopted`, held by a session, or owned by a profile in
+        // the index. The owner record is what reaches a torrent marked
+        // `drifted` while it was seeding when no session view is available —
+        // `torrentd pool scan`, or a boot scan before the sessions report —
+        // and one whose profile is offline: `release_owner` clears it once
+        // nothing holds the torrent.
+        let served = prior == Some(AdoptionState::Adopted)
+            || t.profile.is_some()
+            || loaded.is_some_and(|l| l.contains(&t.infohash));
+        let recorded = if served {
+            store.adoption_base(&t.infohash)?
+        } else {
+            None
+        };
+        let search = search_placements(
+            store,
+            &roots,
+            recorded.as_ref().map(|(r, b)| (*r, b.as_str())),
+            t.declared_save_path.as_deref(),
+            &t.name,
+            &files,
+        )?;
+        let copies = search.complete.len();
+        let best = search.best;
 
         match best {
             Some(p) if p.is_complete() => {
@@ -151,6 +176,7 @@ fn match_all_inner(
                     AdoptionState::Matched
                 };
                 store.replace_claims(&t.infohash, &p.claims)?;
+                let copies_note = (copies > 1).then(|| copies_note(copies));
                 store.set_adoption(
                     &t.infohash,
                     state,
@@ -158,7 +184,7 @@ fn match_all_inner(
                     Some(&p.base_rel),
                     None,
                     drift_at,
-                    drift_at.map(|_| DRIFT_NOTE),
+                    drift_at.map(|_| DRIFT_NOTE).or(copies_note.as_deref()),
                 )?;
                 if state == AdoptionState::Drifted {
                     stats.drifted += 1;
@@ -351,17 +377,47 @@ pub(crate) fn settle_released(
     Ok(())
 }
 
-/// Try every candidate base across every root, keeping the one that resolves
-/// the most files.
-fn best_placement(
+/// What a torrent with more than one complete copy reads as.
+fn copies_note(copies: usize) -> String {
+    format!(
+        "{copies} complete copies under the managed roots; delete plans refuse to touch any of \
+         them until only one is left"
+    )
+}
+
+/// The outcome of trying every candidate base for one torrent.
+struct Search {
+    /// Where the torrent is placed: the preferred base when it is complete,
+    /// else the first complete candidate in cost order, else the candidate
+    /// resolving the most files.
+    best: Option<Placement>,
+    /// `(root_id, base)` of every complete placement found, `best` among them
+    /// when it is complete.
+    complete: Vec<(i64, String)>,
+}
+
+/// Try every candidate base across every root.
+///
+/// `preferred`, where given, is tried first and wins whenever it is complete.
+/// Every candidate is tried even after a complete one is found, because a
+/// second complete copy is something a delete plan has to know about: which
+/// of two identical copies a session reads from is not in the index.
+fn search_placements(
     store: &PoolStore,
     roots: &[(i64, std::path::PathBuf)],
+    preferred: Option<(i64, &str)>,
     declared_save_path: Option<&str>,
     torrent_name: &str,
     files: &[TorrentFileRow],
-) -> Result<Option<Placement>, PoolError> {
-    let mut best: Option<Placement> = None;
-
+) -> Result<Search, PoolError> {
+    let mut candidates: Vec<(i64, String)> = Vec::new();
+    if let Some((root_id, base)) = preferred {
+        // A base recorded against a root no longer configured resolves
+        // nothing; leave it out rather than look it up.
+        if roots.iter().any(|(id, _)| *id == root_id) {
+            candidates.push((root_id, normalize(base)));
+        }
+    }
     for (root_id, root_path) in roots {
         for base in candidate_bases(
             store,
@@ -371,25 +427,64 @@ fn best_placement(
             torrent_name,
             files,
         )? {
-            let floor = best.as_ref().map_or(0, |b| b.resolved);
-            let Some(p) = evaluate_base(store, *root_id, &base, files, floor)? else {
-                continue;
-            };
-            let better = match &best {
-                None => true,
-                Some(b) => p.resolved > b.resolved,
-            };
-            if better {
-                let complete = p.is_complete();
-                best = Some(p);
-                // Nothing can beat every file resolving.
-                if complete {
-                    return Ok(best);
-                }
-            }
+            candidates.push((*root_id, base));
         }
     }
-    Ok(best)
+
+    let mut seen: HashSet<(i64, String)> = HashSet::new();
+    let mut best: Option<Placement> = None;
+    let mut complete: Vec<(i64, String)> = Vec::new();
+    for (root_id, base) in candidates {
+        if !seen.insert((root_id, base.clone())) {
+            continue;
+        }
+        // Once a complete placement is in hand only another complete one is
+        // of interest, so the floor rises to one file short of all of them
+        // and every other candidate costs a lookup or two.
+        let floor = match &best {
+            Some(b) if b.is_complete() => b.total - 1,
+            Some(b) => b.resolved,
+            None => 0,
+        };
+        let Some(p) = evaluate_base(store, root_id, &base, files, floor)? else {
+            continue;
+        };
+        if p.is_complete() {
+            complete.push((p.root_id, p.base_rel.clone()));
+        }
+        let better = match &best {
+            None => true,
+            Some(b) => !b.is_complete() && p.resolved > b.resolved,
+        };
+        if better {
+            best = Some(p);
+        }
+    }
+    Ok(Search { best, complete })
+}
+
+/// `(root_id, base)` of every complete placement of `torrent`, whose files
+/// are `files`, against the current file index. More than one means several
+/// copies of its payload are on disk.
+pub(crate) fn complete_copies(
+    store: &PoolStore,
+    torrent: &crate::model::PoolTorrent,
+    files: &[TorrentFileRow],
+) -> Result<Vec<(i64, String)>, PoolError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    let roots = store.roots()?;
+    let recorded = store.adoption_base(&torrent.infohash)?;
+    Ok(search_placements(
+        store,
+        &roots,
+        recorded.as_ref().map(|(r, b)| (*r, b.as_str())),
+        torrent.declared_save_path.as_deref(),
+        &torrent.name,
+        files,
+    )?
+    .complete)
 }
 
 /// Candidate base directories, relative to the root, in cost order.
