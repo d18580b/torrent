@@ -238,6 +238,18 @@ fn the_problem_catalogue_says_what_the_handlers_do() {
     for needle in ["generation", "rescan", "GET /v1/pool/plans/{plan_id}"] {
         assert!(mismatch.contains(needle), "{needle}: {mismatch}");
     }
+
+    // A `failed` plan with a step still `in_progress` is claimable, but the
+    // executor refuses it on every apply; the catalogue once promised that
+    // any `failed` plan retries.
+    for slug in ["plan-not-draft", "apply-failed"] {
+        let text = problem_text(&catalogue, slug);
+        assert!(text.contains("still `in_progress`"), "{slug}: {text}");
+    }
+    let apply_failed = problem_text(&catalogue, "apply-failed");
+    for needle in ["rescan", "discard the plan"] {
+        assert!(apply_failed.contains(needle), "{needle}: {apply_failed}");
+    }
 }
 
 #[test]
