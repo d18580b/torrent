@@ -343,6 +343,66 @@ fn metadata_rejects_garbage_without_unwinding() {
     unsafe { lt_torrent_meta_free(ptr::null_mut()) };
 }
 
+/// A v1 multi-file `.torrent` declaring `count` one-byte files at the top
+/// level. The piece hashes are filler: only the parse is under test.
+fn v1_torrent_with_files(count: usize) -> Vec<u8> {
+    const PIECE_LEN: usize = 16 * 1024;
+    let num_pieces = count.div_ceil(PIECE_LEN);
+    let mut out = Vec::with_capacity(count * 32 + 1024);
+    out.extend_from_slice(b"d4:infod5:filesl");
+    for i in 0..count {
+        let name = format!("f{i}");
+        out.extend_from_slice(format!("d6:lengthi1e4:pathl{}:{name}ee", name.len()).as_bytes());
+    }
+    out.extend_from_slice(b"e4:name4:many");
+    out.extend_from_slice(format!("12:piece lengthi{PIECE_LEN}e").as_bytes());
+    out.extend_from_slice(format!("6:pieces{}:", num_pieces * 20).as_bytes());
+    out.extend(std::iter::repeat_n(0xAB_u8, num_pieces * 20));
+    out.extend_from_slice(b"ee");
+    out
+}
+
+#[test]
+fn metadata_refuses_more_than_the_file_cap_and_leaves_out_owning_nothing() {
+    let count = LT_MAX_TORRENT_FILES as usize + 1;
+    let bytes = v1_torrent_with_files(count);
+    // Non-null sentinels: the refusal must overwrite them, not leave a
+    // caller holding pointers it would free.
+    let mut meta: lt_torrent_meta = unsafe { std::mem::zeroed() };
+    meta.files = ptr::dangling_mut();
+    meta.strings = ptr::dangling_mut();
+    meta.name = ptr::dangling();
+    meta.num_files = 7;
+    let mut err = [0 as c_char; 512];
+    let rc = unsafe {
+        lt_torrent_metadata(
+            bytes.as_ptr(),
+            bytes.len(),
+            &mut meta,
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    assert_eq!(rc, LT_ERR, "a manifest over the file cap must be refused");
+    assert!(
+        c_buf(&err).contains("implausible number of files"),
+        "the refusal should be the file-cap one, got {:?}",
+        c_buf(&err),
+    );
+    assert!(meta.files.is_null(), "a refusal must leave files null");
+    assert!(meta.strings.is_null(), "a refusal must leave strings null");
+    assert!(meta.name.is_null(), "a refusal must leave name null");
+    assert_eq!(meta.num_files, 0);
+    // Freeing the zeroed result is a no-op, as every caller's error path does.
+    unsafe { lt_torrent_meta_free(&mut meta) };
+
+    // The cap itself is accepted, so the refusal above is the count check
+    // and not libtorrent failing to parse a manifest this large.
+    let mut at_cap = parse_meta(&v1_torrent_with_files(count - 1));
+    assert_eq!(at_cap.num_files, count - 1);
+    unsafe { lt_torrent_meta_free(&mut at_cap) };
+}
+
 fn hex_of(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
