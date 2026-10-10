@@ -641,6 +641,7 @@ pub async fn boot(
         tokio::task::spawn_blocking(|| {
             remove_stale_kill_switch(
                 crate::vpn::killswitch::nft_available(),
+                &crate::vpn::killswitch::own_table_name(),
                 crate::vpn::killswitch::remove_table,
             )
         })
@@ -930,7 +931,7 @@ pub async fn boot(
                  rendered ({verdict:?}), so its runtime check could not tell it from a flushed \
                  one. Report this with `nft -j list table inet {}`, or unset \
                  network_kill_switch.",
-                vpn::killswitch::TABLE,
+                installed.table_name(),
             ),
         }
         metrics.set_gauge("kill_switch_active", 1.0, &[]);
@@ -2948,9 +2949,10 @@ fn finish_kill_switch_removal(
         Err(e) => {
             error!(
                 error.cause = %e,
+                table = %crate::vpn::killswitch::own_table_name(),
                 "failed to remove network kill switch; the daemon's uid stays \
                  confined to the tunnels until the table is removed \
-                 (nft delete table inet torrentd_ks) or a kill-switch boot replaces it",
+                 (nft delete table inet <table>) or a kill-switch boot replaces it",
             );
             report.kill_switch_removal_failed = true;
         }
@@ -3002,8 +3004,13 @@ enum StaleKillSwitch {
 /// A listing that fails is logged at `info` rather than `warn`: without
 /// `CAP_NET_ADMIN`, which a host-only deployment does not hold, it fails on
 /// every boot, and such a daemon could not have installed a table either.
+///
+/// Only this uid's table is this boot's to remove
+/// ([`crate::vpn::killswitch::remove_table`]): another uid's is another
+/// daemon's kill switch, in force in the same network namespace.
 fn remove_stale_kill_switch(
     nft_available: bool,
+    table: &str,
     remove: impl FnOnce() -> std::io::Result<bool>,
 ) -> StaleKillSwitch {
     if !nft_available {
@@ -3013,7 +3020,7 @@ fn remove_stale_kill_switch(
         Ok(false) => StaleKillSwitch::Absent,
         Ok(true) => {
             warn!(
-                table = crate::vpn::killswitch::TABLE,
+                table,
                 "removed a stale network kill-switch table left by an earlier run that did not \
                  exit cleanly; with network_kill_switch = false it would have dropped this \
                  daemon's traffic outside the tunnels",
@@ -3022,11 +3029,11 @@ fn remove_stale_kill_switch(
         }
         Err(e) => {
             info!(
-                table = crate::vpn::killswitch::TABLE,
+                table,
                 error.cause = %e,
                 "could not check for, or remove, a network kill-switch table left by an earlier \
                  run. If one is installed it drops this daemon's traffic outside the tunnels; \
-                 remove it with `nft delete table inet torrentd_ks`",
+                 remove it with `nft delete table inet <table>`",
             );
             StaleKillSwitch::Failed
         }
@@ -3044,9 +3051,10 @@ fn export_shutdown_report(metrics: &PromSink, report: &ShutdownReport) {
     }
     if report.kill_switch_removal_failed {
         warn!(
+            table = %crate::vpn::killswitch::own_table_name(),
             "the previous run could not remove the network kill switch on its way out; a boot \
              with network_kill_switch replaces it and one without removes it, or remove it with \
-             `nft delete table inet torrentd_ks`",
+             `nft delete table inet <table>`",
         );
     }
     metrics.set_gauge(
@@ -3399,22 +3407,60 @@ mod shutdown_report_tests {
     /// neither a failure nor a host without `nft` stops the boot.
     #[test]
     fn a_boot_with_the_kill_switch_off_removes_a_stale_table() {
+        const T: &str = "torrentd_ks_998";
         assert_eq!(
-            remove_stale_kill_switch(true, || Ok(true)),
+            remove_stale_kill_switch(true, T, || Ok(true)),
             StaleKillSwitch::Removed
         );
         assert_eq!(
-            remove_stale_kill_switch(true, || Ok(false)),
+            remove_stale_kill_switch(true, T, || Ok(false)),
             StaleKillSwitch::Absent
         );
         assert_eq!(
-            remove_stale_kill_switch(true, || failed().map(|()| true)),
+            remove_stale_kill_switch(true, T, || failed().map(|()| true)),
             StaleKillSwitch::Failed
         );
         assert_eq!(
-            remove_stale_kill_switch(false, || panic!("no nft, so nothing is asked of it")),
+            remove_stale_kill_switch(false, T, || panic!("no nft, so nothing is asked of it")),
             StaleKillSwitch::NoNft
         );
+    }
+
+    /// #168: an OpenVPN daemon with the kill switch off boots beside a
+    /// WireGuard daemon whose kill switch is in force under another uid. Its
+    /// boot finds that table listed and leaves it standing; only its own uid's
+    /// stale table is removed.
+    #[test]
+    fn a_boot_with_the_kill_switch_off_leaves_another_daemons_table() {
+        let others = || Ok("table inet torrentd_ks_998\n".to_string());
+        assert_eq!(
+            remove_stale_kill_switch(true, "torrentd_ks_1000", || {
+                crate::vpn::killswitch::disable_with(
+                    1000,
+                    others,
+                    |_| panic!("no legacy table is listed"),
+                    |name| panic!("{name} is the other daemon's kill switch, and stays"),
+                )
+            }),
+            StaleKillSwitch::Absent
+        );
+
+        let deleted = std::cell::RefCell::new(Vec::new());
+        assert_eq!(
+            remove_stale_kill_switch(true, "torrentd_ks_1000", || {
+                crate::vpn::killswitch::disable_with(
+                    1000,
+                    || Ok("table inet torrentd_ks_998\ntable inet torrentd_ks_1000\n".into()),
+                    |_| panic!("no legacy table is listed"),
+                    |name| {
+                        deleted.borrow_mut().push(name.to_string());
+                        Ok(())
+                    },
+                )
+            }),
+            StaleKillSwitch::Removed
+        );
+        assert_eq!(*deleted.borrow(), ["torrentd_ks_1000"]);
     }
 }
 

@@ -139,10 +139,31 @@ use tracing::info;
 
 use super::exec;
 
-/// nftables table this module owns. Torn down on graceful shutdown, by a boot
-/// with the kill switch off, and by `torrentd net-cleanup` (the packaged unit's
-/// `ExecStopPost=`).
-pub const TABLE: &str = "torrentd_ks";
+/// The name every table this module installs starts with, and the whole name
+/// of the one table earlier releases installed for whichever uid ran them.
+const TABLE_PREFIX: &str = "torrentd_ks";
+
+/// The nftables table this module owns for `uid`: `torrentd_ks_<uid>`. Torn
+/// down on graceful shutdown, by a boot with the kill switch off, and by
+/// `torrentd net-cleanup` (the packaged unit's `ExecStopPost=`).
+///
+/// One table per uid, because the ruleset confines one uid and each of those
+/// callers removes the table it finds. Under a single fixed name, a daemon
+/// with the kill switch off — an OpenVPN or host-profile daemon beside a
+/// WireGuard one, the layout docs/running.md prescribes — deleted the other
+/// daemon's table each time it booted or stopped, and left that daemon's
+/// egress unconfined until its watch noticed. Two daemons sharing a uid in one
+/// network namespace still share a table; docs/running.md requires separate
+/// uids.
+pub fn table_name(uid: u32) -> String {
+    format!("{TABLE_PREFIX}_{uid}")
+}
+
+/// The table for this process's uid, or the name's pattern where the uid
+/// cannot be read: for messages that tell an operator what to delete.
+pub fn own_table_name() -> String {
+    current_uid().map_or_else(|_| format!("{TABLE_PREFIX}_<uid>"), table_name)
+}
 
 /// One profile's tunnel as the ruleset pairs it: the interface, and the
 /// addresses on it the profile's sessions send from.
@@ -330,7 +351,8 @@ pub fn render_ruleset_with_transport(
     chain.push_str(&format!("\t\tmeta skuid {uid} counter drop\n"));
 
     Ok(format!(
-        "table inet {TABLE} {{\n\tchain output {{\n{chain}\t}}\n}}\n"
+        "table inet {} {{\n\tchain output {{\n{chain}\t}}\n}}\n",
+        table_name(uid)
     ))
 }
 
@@ -361,13 +383,14 @@ pub fn install_script(
     transports: &[Transport],
 ) -> io::Result<String> {
     let table = render_ruleset_with_transport(uid, tunnels, transports)?;
-    Ok(replace_script(&table))
+    Ok(replace_script(uid, &table))
 }
 
-/// `table`, preceded by the two lines that make `nft -f` replace a standing
-/// table of this name with it in one transaction; see [`install_script`].
-fn replace_script(table: &str) -> String {
-    format!("add table inet {TABLE}\ndelete table inet {TABLE}\n{table}")
+/// `table`, preceded by the two lines that make `nft -f` replace `uid`'s
+/// standing table with it in one transaction; see [`install_script`].
+fn replace_script(uid: u32, table: &str) -> String {
+    let name = table_name(uid);
+    format!("add table inet {name}\ndelete table inet {name}\n{table}")
 }
 
 /// The kill switch as `enable` installed it: the uid it confines, the
@@ -410,7 +433,12 @@ impl Installed {
     /// The script that installs this table again, replacing whatever stands
     /// in its place, as one transaction.
     fn script(&self) -> String {
-        replace_script(&self.table)
+        replace_script(self.uid, &self.table)
+    }
+
+    /// The name of the table this install owns.
+    pub(crate) fn table_name(&self) -> String {
+        table_name(self.uid)
     }
 }
 
@@ -481,15 +509,42 @@ pub(crate) fn refusal_for_uid(uid: u32) -> Option<io::Error> {
 /// transaction ([`install_script`]).
 ///
 /// Refuses uid 0 outright — see [`refusal_for_uid`].
+///
+/// A table an earlier release left under the single shared name
+/// `torrentd_ks` is removed once this uid's table is in force, where it
+/// confines this uid and no other ([`remove_legacy_with`]): it would otherwise
+/// keep dropping whatever the old run's tunnels no longer cover. A failure
+/// there is logged and does not fail the install.
 pub fn enable(tunnels: &[String]) -> io::Result<Installed> {
-    enable_for_uid(
+    let installed = enable_for_uid(
         current_uid()?,
         tunnels,
         super::ip_lookup::first_ipv4,
         tunnel_ipv6,
         transport,
         apply,
-    )
+    )?;
+    let legacy = list_tables().and_then(|listing| {
+        remove_legacy_with(installed.uid, &listing, list_table_json, delete_table)
+    });
+    match legacy {
+        Ok(false) => {}
+        Ok(true) => tracing::warn!(
+            target: "torrentd::vpn::killswitch",
+            table = TABLE_PREFIX,
+            uid = installed.uid,
+            "removed a kill-switch table an earlier release left under the shared name",
+        ),
+        Err(e) => tracing::warn!(
+            target: "torrentd::vpn::killswitch",
+            table = TABLE_PREFIX,
+            error.cause = %e,
+            "could not check for, or remove, a kill-switch table an earlier release left under \
+             the shared name. If it confines this daemon's uid, remove it with \
+             `nft delete table inet {TABLE_PREFIX}`",
+        ),
+    }
+    Ok(installed)
 }
 
 /// The global IPv6 addresses the ruleset pairs with `iface`, or none where
@@ -661,7 +716,9 @@ pub(crate) fn enable_for_uid(
     Ok(installed)
 }
 
-/// Remove the kill-switch table.
+/// Remove this process's uid's kill-switch table ([`table_name`]), and a
+/// table an earlier release left under the shared name where it confines
+/// this uid alone. Another uid's table is never touched.
 ///
 /// A missing table is success. Shutdown must never fail on it, and the other
 /// callers usually find no table: the failed-boot guard, a boot with
@@ -690,19 +747,76 @@ pub fn disable() -> io::Result<()> {
 /// and `torrentd net-cleanup` find one only where an earlier run exited
 /// without removing it, and say so.
 pub fn remove_table() -> io::Result<bool> {
-    disable_with(list_tables, delete_table)
+    remove_table_for(current_uid()?)
 }
 
-/// [`remove_table`], with both `nft` calls handed in so the decision between
-/// them is reachable by a test on a host without `nft` or `CAP_NET_ADMIN`.
+/// [`remove_table`] for `uid`'s table rather than this process's: for
+/// `torrentd net-cleanup` run by root on a daemon's behalf.
+pub fn remove_table_for(uid: u32) -> io::Result<bool> {
+    disable_with(uid, list_tables, list_table_json, delete_table)
+}
+
+/// [`remove_table_for`], with every `nft` call handed in so the decision
+/// between them is reachable by a test on a host without `nft` or
+/// `CAP_NET_ADMIN`: `list` is `nft list tables`, `list_json` lists one table
+/// as JSON, and `delete` deletes one table, each by name.
 pub(crate) fn disable_with(
+    uid: u32,
     list: impl Fn() -> io::Result<String>,
-    delete: impl Fn() -> io::Result<()>,
+    list_json: impl Fn(&str) -> io::Result<String>,
+    delete: impl Fn(&str) -> io::Result<()>,
 ) -> io::Result<bool> {
-    if !table_listed(&list()?) {
+    let listing = list()?;
+    let own = table_name(uid);
+    let mut removed = false;
+    if table_listed(&listing, &own) {
+        delete(&own)?;
+        removed = true;
+    }
+    Ok(remove_legacy_with(uid, &listing, list_json, delete)? || removed)
+}
+
+/// Delete the table an earlier release installed under the single shared
+/// name [`TABLE_PREFIX`], if `listing` names it and it confines `uid` and no
+/// other uid. Whose it is is read off its rules' `meta skuid` matches: that
+/// release rendered one uid into every rule but the fences, which match no
+/// uid. A table naming another uid, or none, is another daemon's or not a
+/// kill switch, and is left standing.
+fn remove_legacy_with(
+    uid: u32,
+    listing: &str,
+    list_json: impl Fn(&str) -> io::Result<String>,
+    delete: impl Fn(&str) -> io::Result<()>,
+) -> io::Result<bool> {
+    if !table_listed(listing, TABLE_PREFIX) {
         return Ok(false);
     }
-    delete().map(|()| true)
+    let json: serde_json::Value = serde_json::from_str(&list_json(TABLE_PREFIX)?).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("nft -j list table printed something that is not JSON: {e}"),
+        )
+    })?;
+    if skuids(&json) != BTreeSet::from([u64::from(uid)]) {
+        return Ok(false);
+    }
+    delete(TABLE_PREFIX).map(|()| true)
+}
+
+/// Every uid a `meta skuid` match in a `nft -j list table` listing names,
+/// whatever its operator; a value that is not a number reads as `u64::MAX`,
+/// which no uid is, so the table does not read as any one uid's.
+fn skuids(json: &serde_json::Value) -> BTreeSet<u64> {
+    json.get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.pointer("/rule/expr")?.as_array())
+        .flatten()
+        .filter_map(|e| e.get("match"))
+        .filter(|m| m.pointer("/left/meta/key").and_then(|k| k.as_str()) == Some("skuid"))
+        .map(|m| m["right"].as_u64().unwrap_or(u64::MAX))
+        .collect()
 }
 
 /// What [`verify`] found in place of the table `enable` installed.
@@ -728,7 +842,8 @@ pub(crate) enum Verdict {
 /// missing table fails with a localised message, and that failure is kept for
 /// what it is — a check that could not run.
 pub(crate) fn verify(installed: &Installed) -> io::Result<Verdict> {
-    verify_with(installed, list_tables, list_table_json)
+    let name = installed.table_name();
+    verify_with(installed, list_tables, || list_table_json(&name))
 }
 
 /// [`verify`], with both `nft` calls handed in.
@@ -737,7 +852,8 @@ pub(crate) fn verify_with(
     list: impl Fn() -> io::Result<String>,
     list_json: impl Fn() -> io::Result<String>,
 ) -> io::Result<Verdict> {
-    if !table_listed(&list()?) {
+    let name = installed.table_name();
+    if !table_listed(&list()?, &name) {
         return Ok(Verdict::Absent);
     }
     let json: serde_json::Value = serde_json::from_str(&list_json()?).map_err(|e| {
@@ -746,7 +862,7 @@ pub(crate) fn verify_with(
             format!("nft -j list table printed something that is not JSON: {e}"),
         )
     })?;
-    let live = match live_table(&json) {
+    let live = match live_table(&json, &name) {
         Ok(live) => live,
         Err(why) => return Ok(Verdict::Drifted(why)),
     };
@@ -771,14 +887,14 @@ pub(crate) fn verify_with(
     Ok(Verdict::Drifted(why))
 }
 
-/// `nft -j list table inet TABLE`, read back into the text
+/// `nft -j list table inet <name>`, read back into the text
 /// [`render_ruleset_with_transport`] writes, or why it cannot be: an object or
 /// expression of a kind this module never installs is not this module's
 /// table.
 ///
 /// Counters are read without their values, and an interface-name set in the
 /// order the renderer writes it.
-fn live_table(json: &serde_json::Value) -> Result<String, String> {
+fn live_table(json: &serde_json::Value, name: &str) -> Result<String, String> {
     use serde_json::Value;
     let items = json
         .get("nftables")
@@ -828,7 +944,7 @@ fn live_table(json: &serde_json::Value) -> Result<String, String> {
             }
         }
     }
-    let mut out = format!("table inet {TABLE} {{\n");
+    let mut out = format!("table inet {name} {{\n");
     for (name, header, rules) in chains {
         out.push_str(&format!("\tchain {name} {{\n"));
         for line in header.iter().chain(&rules) {
@@ -907,11 +1023,11 @@ fn rule_line(exprs: &serde_json::Value) -> Result<String, String> {
     Ok(words.join(" "))
 }
 
-/// `nft -j list table inet TABLE`, returning its stdout.
-fn list_table_json() -> io::Result<String> {
+/// `nft -j list table inet <name>`, returning its stdout.
+fn list_table_json(name: &str) -> io::Result<String> {
     let out = exec::run_ok(
         "nft",
-        &["-j", "list", "table", "inet", TABLE],
+        &["-j", "list", "table", "inet", name],
         None,
         exec::QUICK,
     )?;
@@ -981,6 +1097,9 @@ pub(crate) async fn watch(
     use torrentd_engine::MetricsSink;
     // Installed moments ago by `enable`, and verified by the boot.
     metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
+    // The uid, and so the table, is fixed for the run; every event a check
+    // logs carries it through this span.
+    let table = installed.table_name();
     let installed = std::sync::Arc::new(std::sync::Mutex::new(installed));
     let mut state = Watch::default();
     loop {
@@ -992,7 +1111,9 @@ pub(crate) async fn watch(
         // and fencing pauses torrents under each session's lock.
         let ticked = tokio::task::spawn_blocking({
             let (installed, fence, metrics) = (installed.clone(), fence.clone(), metrics.clone());
+            let span = tracing::info_span!("kill_switch_watch", table = %table);
             move || {
+                let _span = span.entered();
                 let mut installed = installed.lock().unwrap_or_else(|p| p.into_inner());
                 refresh(&mut installed, transport, apply);
                 let installed = &*installed;
@@ -1012,7 +1133,7 @@ pub(crate) async fn watch(
                 metrics.inc_counter("kill_switch_probe_errors_total", &[]);
                 tracing::warn!(
                     target: "torrentd::vpn::killswitch",
-                    table = TABLE,
+                    table = %table,
                     error.cause = %e,
                     "the network kill switch check failed to run",
                 );
@@ -1062,7 +1183,7 @@ fn refresh(
         Err(e) => {
             tracing::error!(
                 target: "torrentd::vpn::killswitch",
-                table = TABLE,
+                uid = installed.uid,
                 error.cause = %e,
                 "could not render the kill switch over the tunnels' live transport",
             );
@@ -1080,7 +1201,7 @@ fn refresh(
     if let Err(e) = apply(&installed.script()) {
         tracing::error!(
             target: "torrentd::vpn::killswitch",
-            table = TABLE,
+            uid = installed.uid,
             error.cause = %e,
             "could not install the kill switch with the tunnels' live transport",
         );
@@ -1112,7 +1233,6 @@ fn tick(
             if state != Watch::Intact {
                 tracing::warn!(
                     target: "torrentd::vpn::killswitch",
-                    table = TABLE,
                     "the network kill switch is in force as installed again; lifting the fence \
                      it put on the vpn profiles",
                 );
@@ -1126,7 +1246,7 @@ fn tick(
             metrics.inc_counter("kill_switch_probe_errors_total", &[]);
             tracing::warn!(
                 target: "torrentd::vpn::killswitch",
-                table = TABLE,
+                state = ?state,
                 error.cause = %e,
                 "could not check the network kill switch is still installed",
             );
@@ -1136,7 +1256,6 @@ fn tick(
     metrics.set_gauge("kill_switch_table_present", 0.0, &[]);
     tracing::error!(
         target: "torrentd::vpn::killswitch",
-        table = TABLE,
         drift = %why,
         "the network kill switch is not in force as installed, so the daemon's egress is no \
          longer confined to the tunnels; fencing every vpn profile",
@@ -1150,7 +1269,6 @@ fn tick(
             metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
             tracing::warn!(
                 target: "torrentd::vpn::killswitch",
-                table = TABLE,
                 "reinstalled the network kill switch and verified it; lifting the fence",
             );
             fence.lift();
@@ -1159,7 +1277,6 @@ fn tick(
         Ok(verdict) => {
             tracing::error!(
                 target: "torrentd::vpn::killswitch",
-                table = TABLE,
                 verdict = ?verdict,
                 "reinstalled the network kill switch, and it still does not check as installed; \
                  the vpn profiles stay fenced. Restart the daemon to reinstall it",
@@ -1169,7 +1286,7 @@ fn tick(
         Err(e) => {
             tracing::error!(
                 target: "torrentd::vpn::killswitch",
-                table = TABLE,
+                state = ?state,
                 error.cause = %e,
                 "could not reinstall the network kill switch; the vpn profiles stay fenced. \
                  Restart the daemon to reinstall it",
@@ -1185,14 +1302,15 @@ fn tick(
     next
 }
 
-/// Whether `nft list tables` output names this module's table. Each line is
-/// `table <family> <name>`; the table is matched on family and name exactly,
-/// so a same-named table in another family, or one whose name merely starts
-/// with [`TABLE`], is not taken for it.
-fn table_listed(listing: &str) -> bool {
+/// Whether `nft list tables` output names the `inet` table `name`. Each line
+/// is `table <family> <name>`; the table is matched on family and name
+/// exactly, so a same-named table in another family, or one whose name merely
+/// starts with `name` — another uid's, beside the shared legacy name — is not
+/// taken for it.
+fn table_listed(listing: &str, name: &str) -> bool {
     listing
         .lines()
-        .any(|line| line.split_whitespace().eq(["table", "inet", TABLE]))
+        .any(|line| line.split_whitespace().eq(["table", "inet", name]))
 }
 
 /// `nft list tables`, returning its stdout.
@@ -1201,13 +1319,13 @@ fn list_tables() -> io::Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// `nft delete table inet TABLE`. Any non-zero exit is an error: it is only
+/// `nft delete table inet <name>`. Any non-zero exit is an error: it is only
 /// called once the table has been listed, so there is no absent case to
 /// excuse.
-fn delete_table() -> io::Result<()> {
+fn delete_table(name: &str) -> io::Result<()> {
     exec::run_ok(
         "nft",
-        &["delete", "table", "inet", TABLE],
+        &["delete", "table", "inet", name],
         None,
         exec::CHANGE,
     )
@@ -1234,6 +1352,9 @@ pub(crate) fn check(script: &str) -> io::Result<std::process::Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The table every test install, for uid 998, owns.
+    const TABLE: &str = "torrentd_ks_998";
 
     const ADDR_A: Ipv4Addr = Ipv4Addr::new(10, 2, 0, 2);
     const ADDR_B: Ipv4Addr = Ipv4Addr::new(10, 64, 0, 7);
@@ -1441,9 +1562,9 @@ mod tests {
         let calls = calls.borrow();
         assert_eq!(calls.len(), 1, "one transaction; got {calls:?}");
         let expected = "\
-add table inet torrentd_ks
-delete table inet torrentd_ks
-table inet torrentd_ks {
+add table inet torrentd_ks_998
+delete table inet torrentd_ks_998
+table inet torrentd_ks_998 {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
 \t\tip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\" } drop
@@ -1801,7 +1922,7 @@ table inet torrentd_ks {
         )
         .unwrap();
         let expected = "\
-table inet torrentd_ks {
+table inet torrentd_ks_998 {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
 \t\tip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\" } drop
@@ -1848,8 +1969,10 @@ table inet torrentd_ks {
     fn disable_succeeds_without_deleting_when_the_table_is_absent() {
         let deleted = std::cell::Cell::new(false);
         let removed = disable_with(
+            998,
             || Ok("table ip filter\ntable inet other\n".to_string()),
-            || {
+            |_| panic!("no legacy table is listed, so none is read"),
+            |_| {
                 deleted.set(true);
                 Err(io::Error::other(
                     "nft delete table exited 1: Fehler: Datei oder Verzeichnis nicht gefunden",
@@ -1860,34 +1983,144 @@ table inet torrentd_ks {
         assert!(!deleted.get(), "nothing to delete, so no delete is run");
         assert!(!removed, "and no table is reported removed");
 
-        let removed = disable_with(|| Ok(String::new()), || panic!("no tables at all"))
-            .expect("an empty listing is an absent table");
+        let removed = disable_with(
+            998,
+            || Ok(String::new()),
+            |_| panic!("no tables at all"),
+            |_| panic!("no tables at all"),
+        )
+        .expect("an empty listing is an absent table");
         assert!(!removed);
     }
 
     #[test]
     fn disable_deletes_a_listed_table_and_reports_its_failure() {
-        let deleted = std::cell::Cell::new(false);
+        let deleted = std::cell::RefCell::new(Vec::new());
         let removed = disable_with(
+            998,
             || Ok(format!("table ip filter\ntable inet {TABLE}\n")),
-            || {
-                deleted.set(true);
+            |_| panic!("no legacy table is listed"),
+            |name| {
+                deleted.borrow_mut().push(name.to_string());
                 Ok(())
             },
         )
         .expect("a delete that succeeded");
-        assert!(deleted.get(), "a listed table is deleted");
+        assert_eq!(*deleted.borrow(), [TABLE], "the listed table is deleted");
         assert!(
             removed,
             "and reported removed, so a caller can say it found one"
         );
 
         let e = disable_with(
+            998,
             || Ok(format!("table inet {TABLE}\n")),
-            || Err(io::Error::other("nft delete table exited 1: busy")),
+            |_| panic!("no legacy table is listed"),
+            |_| Err(io::Error::other("nft delete table exited 1: busy")),
         )
         .expect_err("a table that exists and would not delete is not swallowed");
         assert!(e.to_string().contains("nft delete table"), "got {e}");
+    }
+
+    /// #168: a daemon with the kill switch off — an OpenVPN daemon beside a
+    /// WireGuard one, as docs/running.md prescribes — runs this at every boot
+    /// and, through `net-cleanup`, at every stop. Another uid's table is the
+    /// other daemon's kill switch in force, and is never deleted.
+    #[test]
+    fn disable_leaves_another_uids_table_standing() {
+        let removed = disable_with(
+            1000,
+            || {
+                Ok(format!(
+                    "table inet {TABLE}\ntable inet torrentd_ks_10000\n"
+                ))
+            },
+            |_| panic!("no legacy table is listed"),
+            |name| panic!("{name} is another daemon's kill switch, and is not deleted"),
+        )
+        .expect("nothing of this uid's is listed: success");
+        assert!(!removed);
+
+        let deleted = std::cell::RefCell::new(Vec::new());
+        disable_with(
+            998,
+            || Ok(format!("table inet torrentd_ks_1000\ntable inet {TABLE}\n")),
+            |_| panic!("no legacy table is listed"),
+            |name| {
+                deleted.borrow_mut().push(name.to_string());
+                Ok(())
+            },
+        )
+        .expect("this uid's table deletes");
+        assert_eq!(*deleted.borrow(), [TABLE], "and only this uid's");
+    }
+
+    /// `nft -j list table inet torrentd_ks` for a table an earlier release
+    /// installed for `uid`: the fence, which names no uid, then the drop.
+    fn legacy_listing(uid: u32) -> String {
+        format!(
+            r#"{{"nftables": [{{"metainfo": {{"json_schema_version": 1}}}}, {{"table": {{"family": "inet", "name": "torrentd_ks", "handle": 1}}}}, {{"rule": {{"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 2, "expr": [{{"match": {{"op": "==", "left": {{"payload": {{"protocol": "ip", "field": "saddr"}}}}, "right": "10.2.0.2"}}}}, {{"drop": null}}]}}}}, {{"rule": {{"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 3, "expr": [{{"match": {{"op": "==", "left": {{"meta": {{"key": "skuid"}}}}, "right": {uid}}}}}, {{"counter": {{"packets": 0, "bytes": 0}}}}, {{"drop": null}}]}}}}]}}"#
+        )
+    }
+
+    /// A table an earlier release left under the shared name is removed by
+    /// the uid it confines, and by no other.
+    #[test]
+    fn a_legacy_table_is_removed_only_by_the_uid_it_confines() {
+        let deleted = std::cell::RefCell::new(Vec::new());
+        let delete = |name: &str| {
+            deleted.borrow_mut().push(name.to_string());
+            Ok(())
+        };
+        let listing = || Ok(format!("table inet torrentd_ks\ntable inet {TABLE}\n"));
+
+        let removed =
+            disable_with(998, listing, |_| Ok(legacy_listing(998)), delete).expect("both delete");
+        assert!(removed);
+        assert_eq!(*deleted.borrow(), [TABLE, "torrentd_ks"]);
+
+        deleted.borrow_mut().clear();
+        let removed = disable_with(
+            998,
+            || Ok("table inet torrentd_ks\n".to_string()),
+            |_| Ok(legacy_listing(1000)),
+            delete,
+        )
+        .expect("another uid's legacy table is no failure");
+        assert!(!removed, "it is left standing");
+        assert!(deleted.borrow().is_empty(), "got {:?}", deleted.borrow());
+
+        let no_uid =
+            r#"{"nftables": [{"table": {"family": "inet", "name": "torrentd_ks", "handle": 1}}]}"#;
+        let removed = disable_with(
+            998,
+            || Ok("table inet torrentd_ks\n".to_string()),
+            |_| Ok(no_uid.to_string()),
+            delete,
+        )
+        .expect("a table naming no uid is no failure");
+        assert!(!removed, "and is nobody's to remove");
+        assert!(deleted.borrow().is_empty());
+
+        let e = disable_with(
+            998,
+            || Ok("table inet torrentd_ks\n".to_string()),
+            |_| Err(io::Error::other("nft -j list table exited 1")),
+            |_| panic!("nothing is deleted on a table nobody could read"),
+        )
+        .expect_err("a legacy table that could not be read is not taken for absent");
+        assert!(e.to_string().contains("nft -j list table"), "got {e}");
+    }
+
+    #[test]
+    fn a_table_naming_two_uids_is_nobodys() {
+        let json: serde_json::Value =
+            serde_json::from_str(&listing(&[LO, &DROP.replace("998", "1000")])).unwrap();
+        assert_eq!(skuids(&json), BTreeSet::from([998, 1000]));
+        assert_eq!(
+            skuids(&serde_json::from_str(&legacy_listing(998)).unwrap()),
+            BTreeSet::from([998])
+        );
     }
 
     /// A listing that fails — no `CAP_NET_ADMIN`, say — is an error, not an
@@ -1896,12 +2129,14 @@ table inet torrentd_ks {
     #[test]
     fn disable_reports_a_failed_listing_without_deleting() {
         let e = disable_with(
+            998,
             || {
                 Err(io::Error::other(
                     "nft list tables exited 1: Operation not permitted",
                 ))
             },
-            || panic!("nothing is deleted on a listing nobody could read"),
+            |_| panic!("nothing is read on a listing nobody could read"),
+            |_| panic!("nothing is deleted on a listing nobody could read"),
         )
         .expect_err("a failed listing is not an absent table");
         assert!(e.to_string().contains("nft list tables"), "got {e}");
@@ -1919,7 +2154,7 @@ table inet torrentd_ks {
     #[test]
     #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
     fn disable_against_real_nft() {
-        disable().expect("no table yet: success, in any locale");
+        remove_table_for(998).expect("no table yet: success, in any locale");
         apply(&install_script(998, &[tunnel("wg0")], &[]).unwrap()).expect("install onto no table");
         apply(&install_script(998, &[tunnel("wg1")], &[transport_on(51820)]).unwrap())
             .expect("and replace a standing one in the same transaction");
@@ -1930,26 +2165,77 @@ table inet torrentd_ks {
             listed.contains("wg1") && !listed.contains("wg0"),
             "the replace leaves only this install's rules: {listed}"
         );
-        assert!(table_listed(&list_tables().expect("list")));
-        disable().expect("an installed table is deleted");
-        assert!(!table_listed(&list_tables().expect("list")));
-        disable().expect("and deleting it again is still success");
+        // #168: a second daemon's, under another uid, beside it.
+        apply(&install_script(1000, &[tunnel("wg2")], &[]).unwrap()).expect("install uid 1000's");
+        assert!(table_listed(&list_tables().expect("list"), TABLE));
+        assert!(
+            remove_table_for(998).expect("an installed table is deleted"),
+            "and reported removed"
+        );
+        let listing = list_tables().expect("list");
+        assert!(!table_listed(&listing, TABLE));
+        assert!(
+            table_listed(&listing, "torrentd_ks_1000"),
+            "the other uid's table survives: {listing}"
+        );
+        assert!(!remove_table_for(998).expect("and deleting it again is still success"));
+        assert!(remove_table_for(1000).expect("uid 1000's own removal takes it"));
+    }
+
+    /// A table an earlier release left under the shared name, against a real
+    /// `nft`: another uid's removal leaves it, its own uid's removes it. Run
+    /// it as [`disable_against_real_nft`] says.
+    #[test]
+    #[ignore = "needs nft and CAP_NET_ADMIN in a private network namespace"]
+    fn a_legacy_table_against_real_nft() {
+        let legacy = render_ruleset(998, &[tunnel("wg0")])
+            .unwrap()
+            .replace(TABLE, TABLE_PREFIX);
+        apply(&legacy).expect("install a table under the shared name");
+        assert!(!remove_table_for(1000).expect("another uid's removal"));
+        assert!(table_listed(&list_tables().expect("list"), TABLE_PREFIX));
+        assert!(remove_table_for(998).expect("its own uid's removal"));
+        assert!(!table_listed(&list_tables().expect("list"), TABLE_PREFIX));
     }
 
     #[test]
     fn only_this_family_and_name_count_as_the_table() {
-        assert!(table_listed(&format!("table inet {TABLE}\n")));
-        assert!(table_listed(&format!("table ip nat\ntable inet {TABLE}")));
-        assert!(!table_listed(&format!("table ip {TABLE}\n")));
-        assert!(!table_listed(&format!("table inet {TABLE}_old\n")));
-        assert!(!table_listed(""));
+        assert!(table_listed(&format!("table inet {TABLE}\n"), TABLE));
+        assert!(table_listed(
+            &format!("table ip nat\ntable inet {TABLE}"),
+            TABLE
+        ));
+        assert!(!table_listed(&format!("table ip {TABLE}\n"), TABLE));
+        assert!(!table_listed(&format!("table inet {TABLE}_old\n"), TABLE));
+        assert!(!table_listed("", TABLE));
+        // The shared legacy name is not any uid's table, nor the reverse.
+        assert!(!table_listed("table inet torrentd_ks\n", TABLE));
+        assert!(!table_listed(
+            &format!("table inet {TABLE}\n"),
+            TABLE_PREFIX
+        ));
+    }
+
+    #[test]
+    fn each_uid_owns_its_own_table() {
+        assert_eq!(table_name(998), TABLE);
+        assert_ne!(table_name(998), table_name(1000));
+        let rs = render_ruleset(1000, &[tunnel("wg-a")]).unwrap();
+        assert!(rs.starts_with("table inet torrentd_ks_1000 {\n"), "{rs}");
+        let script = install_script(1000, &[tunnel("wg-a")], &[]).unwrap();
+        assert!(
+            script.starts_with(
+                "add table inet torrentd_ks_1000\ndelete table inet torrentd_ks_1000\n"
+            ),
+            "the replace touches only this uid's table: {script}"
+        );
     }
 
     #[test]
     fn ruleset_confines_uid_to_lo_and_tunnels() {
         let rs = render_ruleset(998, &[tunnel("wg-b"), tunnel("wg-a")]).unwrap();
         let expected = "\
-table inet torrentd_ks {
+table inet torrentd_ks_998 {
 \tchain output {
 \t\ttype filter hook output priority 0; policy accept;
 \t\tip saddr 10.2.0.2 oifname != { \"lo\", \"wg-a\" } drop
@@ -2049,13 +2335,13 @@ table inet torrentd_ks {
         .unwrap()
     }
 
-    const META: &str = r#"{"metainfo": {"version": "1.1.6", "release_name": "Commodore Bullmoose #7", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "torrentd_ks", "handle": 1}}, {"chain": {"family": "inet", "table": "torrentd_ks", "name": "output", "handle": 1, "type": "filter", "hook": "output", "prio": 0, "policy": "accept"}}"#;
-    const FENCE: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 2, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "10.2.0.2"}}, {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": {"set": ["lo", "wg-a"]}}}, {"drop": null}]}}"#;
-    const LO: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 2, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "lo"}}, {"accept": null}]}}"#;
-    const WG_A: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 3, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "10.2.0.2"}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg-a"}}, {"accept": null}]}}"#;
-    const PORT_V4: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 4, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": "198.51.100.1"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 51820}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 51820}}, {"accept": null}]}}"#;
-    const PORT_V6: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 5, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}}, "right": "2001:db8::7"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 51820}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 4500}}, {"accept": null}]}}"#;
-    const DROP: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 6, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"counter": {"packets": 12, "bytes": 960}}, {"drop": null}]}}"#;
+    const META: &str = r#"{"metainfo": {"version": "1.1.6", "release_name": "Commodore Bullmoose #7", "json_schema_version": 1}}, {"table": {"family": "inet", "name": "torrentd_ks_998", "handle": 1}}, {"chain": {"family": "inet", "table": "torrentd_ks_998", "name": "output", "handle": 1, "type": "filter", "hook": "output", "prio": 0, "policy": "accept"}}"#;
+    const FENCE: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 2, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "10.2.0.2"}}, {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": {"set": ["lo", "wg-a"]}}}, {"drop": null}]}}"#;
+    const LO: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 2, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "lo"}}, {"accept": null}]}}"#;
+    const WG_A: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 3, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "10.2.0.2"}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg-a"}}, {"accept": null}]}}"#;
+    const PORT_V4: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 4, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "daddr"}}, "right": "198.51.100.1"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 51820}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 51820}}, {"accept": null}]}}"#;
+    const PORT_V6: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 5, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}}, "right": "2001:db8::7"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "sport"}}, "right": 51820}}, {"match": {"op": "==", "left": {"payload": {"protocol": "udp", "field": "dport"}}, "right": 4500}}, {"accept": null}]}}"#;
+    const DROP: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 6, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"counter": {"packets": 12, "bytes": 960}}, {"drop": null}]}}"#;
 
     /// `nft -j list table` as nftables 1.1.6 printed it for [`installed`]'s
     /// table, entries in the order given.
@@ -2084,8 +2370,8 @@ table inet torrentd_ks {
     /// matches its fence and its accept carry are read as rendered.
     #[test]
     fn a_table_pairing_an_ipv6_address_verifies_intact() {
-        const FENCE_V6: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 7, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "saddr"}}, "right": "2001:db8::2"}}, {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": {"set": ["lo", "wg-a"]}}}, {"drop": null}]}}"#;
-        const WG_A_V6: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 8, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "saddr"}}, "right": "2001:db8::2"}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg-a"}}, {"accept": null}]}}"#;
+        const FENCE_V6: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 7, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "saddr"}}, "right": "2001:db8::2"}}, {"match": {"op": "!=", "left": {"meta": {"key": "oifname"}}, "right": {"set": ["lo", "wg-a"]}}}, {"drop": null}]}}"#;
+        const WG_A_V6: &str = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 8, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "saddr"}}, "right": "2001:db8::2"}}, {"match": {"op": "==", "left": {"meta": {"key": "oifname"}}, "right": "wg-a"}}, {"accept": null}]}}"#;
         let installed = Installed::render(
             998,
             vec![tunnel("wg-a").with_v6([ADDR_A6])],
@@ -2136,10 +2422,10 @@ table inet torrentd_ks {
     /// writes.
     #[test]
     fn a_changed_or_extended_table_is_drift() {
-        let accept_all = r#"{"rule": {"family": "inet", "table": "torrentd_ks", "chain": "output", "handle": 7, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"accept": null}]}}"#;
+        let accept_all = r#"{"rule": {"family": "inet", "table": "torrentd_ks_998", "chain": "output", "handle": 7, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "skuid"}}, "right": 998}}, {"accept": null}]}}"#;
         let other_addr = WG_A.replace("10.2.0.2", "10.9.9.9");
         let drop_policy = META.replace(r#""policy": "accept""#, r#""policy": "drop""#);
-        let set = r#"{"set": {"family": "inet", "name": "s", "table": "torrentd_ks", "type": "ipv4_addr", "handle": 4}}"#;
+        let set = r#"{"set": {"family": "inet", "name": "s", "table": "torrentd_ks_998", "type": "ipv4_addr", "handle": 4}}"#;
         let unread = DROP.replace(r#"{"drop": null}"#, r#"{"jump": {"target": "x"}}"#);
         let fence_widened = FENCE.replace(r#"["lo", "wg-a"]"#, r#"["eth0", "lo", "wg-a"]"#);
         let fence_eq = FENCE.replace(r#""op": "!=""#, r#""op": "==""#);
@@ -2523,7 +2809,7 @@ table inet torrentd_ks {
         assert!(matches!(verify(&installed).unwrap(), Verdict::Drifted(_)));
         apply(&installed.script()).expect("reinstall");
         assert_eq!(verify(&installed).unwrap(), Verdict::Intact);
-        disable().expect("remove");
+        remove_table_for(998).expect("remove");
         assert_eq!(verify(&installed).unwrap(), Verdict::Absent);
     }
 
@@ -2551,6 +2837,6 @@ table inet torrentd_ks {
         assert_eq!(verify(&installed).unwrap(), Verdict::Intact);
         apply(&self::installed().script()).expect("install the table without it");
         assert!(matches!(verify(&installed).unwrap(), Verdict::Drifted(_)));
-        disable().expect("remove");
+        remove_table_for(998).expect("remove");
     }
 }
