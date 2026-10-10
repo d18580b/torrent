@@ -30,7 +30,10 @@
 //!     rebind waits on before it reports and announces a new port. A
 //!     `listen_failed` on the port a rebind is moving onto, at any address
 //!     ([`ListenEvents::rebind_in_progress`]) is the rebind's to revert and
-//!     is never fatal; the revert's own failure is.
+//!     is never fatal; the revert's own failure is. Each profile's
+//!     `session_stats` alert also clears a listen failure that belongs to no
+//!     socket once every socket that came up is still held
+//!     ([`handlers::listen::recheck`]).
 //!   - Lost alerts: after every drain, each session's count of alerts the
 //!     shim popped and could not translate is read, and what it rose by is
 //!     added to `alert_translate_errors_total` and warned about. Such an
@@ -825,7 +828,12 @@ fn dispatch_alert(
         }
         Alert::AlertsDropped { .. } => handlers::dropped::handle(&alert, &mut ctx),
         Alert::TorrentLog { .. } | Alert::Log { .. } => handlers::log_msg::handle(&alert, &mut ctx),
-        Alert::SessionStats { .. } => handlers::stats::handle(&alert, &mut ctx),
+        Alert::SessionStats { .. } => {
+            handlers::stats::handle(&alert, &mut ctx);
+            // Posted after any reopen whose alerts precede it has returned,
+            // so the sockets it kept are known (see `ListenFailures`).
+            handlers::listen::recheck(&mut ctx, listen_failures);
+        }
         Alert::MetadataReceived { .. } => handlers::metadata::handle(&alert, &mut ctx),
         Alert::TorrentChecked { .. }
         | Alert::StorageMoved { .. }
@@ -2715,6 +2723,78 @@ mod tests {
 
         assert_eq!(state.len(), 1);
         assert!(state.contains(&InfoHash([0x42; 20])));
+    }
+
+    /// A reopen that keeps every socket posts a port-0 failure and no
+    /// `listen_succeeded`; the profile's next `session_stats` alert finds
+    /// the socket that came up still held and clears the gauge.
+    #[test]
+    fn session_stats_clears_a_port_0_listen_failure_while_every_socket_is_held() {
+        let engine = Arc::new(MockEngine::new());
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
+        let state = Arc::new(StateMap::new());
+        let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let recording = Arc::new(RecordingSink::new());
+        let metrics: Arc<dyn MetricsSink> = recording.clone();
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        let mut listen_failures = ListenFailures::default();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = socket.local_addr().unwrap().to_string();
+        let hdr = |kind| AlertHeader {
+            kind,
+            infohash: None,
+            handle: None,
+            timestamp_us: 0,
+        };
+        let alerts = [
+            Alert::ListenSucceeded {
+                hdr: hdr(AlertKind::ListenSucceeded),
+                endpoint: endpoint.clone(),
+            },
+            Alert::ListenFailed {
+                hdr: hdr(AlertKind::ListenFailed),
+                error_code: 19,
+                operation: "enum_route".into(),
+                endpoint: "0.0.0.0:0".into(),
+                iface: String::new(),
+                message: "No such device".into(),
+            },
+            Alert::SessionStats {
+                hdr: hdr(AlertKind::SessionStats),
+                counters: Vec::new(),
+                timestamp_ns: 0,
+            },
+        ];
+        let gauge = || {
+            recording
+                .calls()
+                .into_iter()
+                .filter_map(|c| match c {
+                    MetricCall::SetGauge { name, value, .. } if name == "listen_failure_active" => {
+                        Some(value)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        for alert in alerts {
+            dispatch_alert(
+                ProfileId::new("p"),
+                alert,
+                &source,
+                &state,
+                &resume,
+                &torrents,
+                &metrics,
+                &clock,
+                None,
+                &mut listen_failures,
+                &mut TrackerFailureLog::default(),
+            );
+        }
+        assert_eq!(gauge(), vec![0.0, 1.0, 0.0]);
+        drop(socket);
     }
 
     #[test]
