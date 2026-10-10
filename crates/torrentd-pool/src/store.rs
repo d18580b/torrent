@@ -43,7 +43,37 @@ use crate::model::VerifyQueueRow;
 
 /// Bumped whenever the schema changes; `migrate` walks forward from whatever
 /// the file reports. A file from the future is refused rather than guessed at.
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
+
+/// The version [`PoolStore::migrate_v6`] brings a file to.
+const V6: i64 = 6;
+
+/// v7 makes plan ids non-reusable: `plan.id` becomes `AUTOINCREMENT`.
+///
+/// Declared `INTEGER PRIMARY KEY` alone, SQLite hands out `max(id) + 1`, so
+/// discarding the newest plan gave its id to the next one, and a delete
+/// plan's trash directory is named after its id. SQLite cannot add
+/// `AUTOINCREMENT` to a column in place, so the table is rebuilt and its rows
+/// copied with their ids; `sqlite_sequence` starts at the highest id copied.
+/// `plan_step` refers to `plan` by name, so it follows the rebuilt table.
+/// Run with foreign keys off: dropping the old table with them on would
+/// cascade-delete every step.
+const SCHEMA_V7: &str = r#"
+CREATE TABLE plan_v7 (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind       TEXT    NOT NULL,
+    created_at INTEGER NOT NULL,
+    applied_at INTEGER,
+    -- draft | applying | applied | failed | cancelled
+    status     TEXT    NOT NULL,
+    spec       TEXT    NOT NULL
+);
+INSERT INTO plan_v7 (id, kind, created_at, applied_at, status, spec)
+    SELECT id, kind, created_at, applied_at, status, spec FROM plan;
+DROP TABLE plan;
+ALTER TABLE plan_v7 RENAME TO plan;
+CREATE INDEX plan_by_status ON plan(status);
+"#;
 
 /// The version [`PoolStore::migrate_v4`] brings a file to.
 const V4: i64 = 4;
@@ -231,7 +261,8 @@ CREATE INDEX claim_by_torrent ON claim(infohash);
 "#;
 
 /// The mutation journal, which v2 added: part of a new file, and the step a
-/// v1 file takes.
+/// v1 file takes. v7 rebuilds `plan` with an `AUTOINCREMENT` id
+/// ([`SCHEMA_V7`]); a new file takes that step like any other.
 const SCHEMA_JOURNAL: &str = r#"
 CREATE TABLE plan (
     id         INTEGER PRIMARY KEY,
@@ -447,6 +478,7 @@ impl PoolStore {
         store.migrate_v4()?;
         store.migrate_v5()?;
         store.migrate_v6()?;
+        store.migrate_v7()?;
         Ok(store)
     }
 
@@ -864,12 +896,45 @@ impl PoolStore {
         let found: i64 = self
             .conn
             .pragma_query_value(None, "user_version", |r| r.get(0))?;
+        if found >= V6 {
+            return Ok(());
+        }
+        self.step(found, V6, |st| Ok(st.conn.execute_batch(SCHEMA_V6)?))
+    }
+
+    /// Step a v6 file to v7: `plan.id` becomes `AUTOINCREMENT`, so a
+    /// discarded plan's id is never handed out again.
+    ///
+    /// `PRAGMA foreign_keys` is a no-op inside a transaction, so it is turned
+    /// off around the step rather than in it, and turned back on whatever the
+    /// step's outcome. `foreign_key_check` runs before the commit, so a
+    /// rebuild that left a step without its plan rolls back instead.
+    fn migrate_v7(&mut self) -> Result<(), PoolError> {
+        let found: i64 = self
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))?;
         if found >= SCHEMA_VERSION {
             return Ok(());
         }
-        self.step(found, SCHEMA_VERSION, |st| {
-            Ok(st.conn.execute_batch(SCHEMA_V6)?)
-        })
+        self.conn.pragma_update(None, "foreign_keys", "OFF")?;
+        let stepped = self.step(found, SCHEMA_VERSION, |st| {
+            st.conn.execute_batch(SCHEMA_V7)?;
+            let dangling: i64 = st.conn.query_row(
+                "SELECT count(*) FROM pragma_foreign_key_check('plan_step')",
+                [],
+                |r| r.get(0),
+            )?;
+            if dangling != 0 {
+                return Err(PoolError::Io(std::io::Error::other(format!(
+                    "{dangling} plan steps would be left without their plan by rebuilding the \
+                     plan table"
+                ))));
+            }
+            Ok(())
+        });
+        let restored = self.conn.pragma_update(None, "foreign_keys", "ON");
+        stepped?;
+        Ok(restored?)
     }
 
     // -- verify queue ------------------------------------------------------
