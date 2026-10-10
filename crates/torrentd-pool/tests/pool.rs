@@ -2170,6 +2170,69 @@ fn a_rescan_moves_an_adopted_torrent_off_a_recorded_base_that_is_no_longer_compl
     );
 }
 
+/// [`adopted_at_the_second_copy`], then marked drifted at that base, as
+/// `drift::detect` leaves an `adopted` torrent whose files changed.
+fn drifted_at_the_second_copy(root: &Path) -> (PoolStore, i64) {
+    let (store, root_id) = adopted_at_the_second_copy(root);
+    store
+        .set_adoption(
+            "aa",
+            AdoptionState::Drifted,
+            Some(root_id),
+            Some("seed"),
+            None,
+            Some(1),
+            None,
+        )
+        .unwrap();
+    (store, root_id)
+}
+
+#[test]
+fn a_rescan_keeps_a_loaded_drifted_torrent_at_its_recorded_base() {
+    // Not `adopted` any more, and no owner recorded: only the session view
+    // says it is served.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, root_id) = drifted_at_the_second_copy(dir.path());
+    let loaded = std::collections::HashSet::from(["aa".to_owned()]);
+
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Drifted);
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, "seed".to_owned()))
+    );
+    let orphans = store.orphan_files(root_id, "").unwrap();
+    assert!(!orphans.contains(&"seed/T/a.bin".to_owned()), "{orphans:?}");
+}
+
+#[test]
+fn a_rescan_with_no_session_view_keeps_an_owned_drifted_torrent_at_its_recorded_base() {
+    // `torrentd pool scan`, or a boot scan before the sessions report: the
+    // owner record is what says the torrent is served.
+    let dir = tempfile::tempdir().unwrap();
+    let (mut store, root_id) = drifted_at_the_second_copy(dir.path());
+    store.set_profile("aa", Some("p1")).unwrap();
+
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(state_of(&store, "aa"), AdoptionState::Drifted);
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, "seed".to_owned()))
+    );
+    let orphans = store.orphan_files(root_id, "").unwrap();
+    assert!(!orphans.contains(&"seed/T/a.bin".to_owned()), "{orphans:?}");
+
+    // With the owner released and nothing loading it, nothing serves it, and
+    // it is placed by cost order again.
+    store.set_profile("aa", None).unwrap();
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(
+        store.adoption_base("aa").unwrap(),
+        Some((root_id, String::new()))
+    );
+}
+
 #[test]
 fn a_delete_plan_refuses_every_copy_of_a_torrent_complete_more_than_once() {
     let dir = tempfile::tempdir().unwrap();

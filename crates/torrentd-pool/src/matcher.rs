@@ -135,7 +135,15 @@ fn match_all_inner(
         // while that base is still complete it is kept. Picking another copy
         // instead would leave the served files unclaimed, and a delete plan
         // offers unclaimed files up as orphans.
+        //
+        // Served means `adopted`, held by a session, or owned by a profile in
+        // the index. The owner record is what reaches a torrent marked
+        // `drifted` while it was seeding when no session view is available —
+        // `torrentd pool scan`, or a boot scan before the sessions report —
+        // and one whose profile is offline: `release_owner` clears it once
+        // nothing holds the torrent.
         let served = prior == Some(AdoptionState::Adopted)
+            || t.profile.is_some()
             || loaded.is_some_and(|l| l.contains(&t.infohash));
         let recorded = if served {
             store.adoption_base(&t.infohash)?
