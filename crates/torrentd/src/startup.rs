@@ -441,6 +441,77 @@ fn nofile_soft_limit() -> Option<u64> {
     (rc == 0).then_some(lim.rlim_cur)
 }
 
+/// Warn about every server two `vpn` profiles' WireGuard configs both name as
+/// their `Endpoint`.
+///
+/// A tracker sees the address a tunnel leaves from, not the tunnel's own
+/// address, so two accounts whose configs name one server announce from one
+/// public IP — the plainest sign of two accounts on one host a tracker can
+/// see. A warning rather than a refusal: the host is compared as written, so
+/// a match is not proof of one exit (a provider name can resolve to several
+/// servers), and profiles on unrelated trackers lose nothing by sharing one.
+fn warn_if_exits_are_shared(profiles: &[ProfileConfig]) {
+    for shared in shared_endpoint_hosts(profiles, |path| std::fs::read_to_string(path)) {
+        let profiles = shared
+            .profiles
+            .iter()
+            .map(ProfileId::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            vpn_endpoint = %shared.host,
+            profiles = %profiles,
+            "these profiles' WireGuard configs name the same Endpoint, so their accounts \
+             announce from one public address and a tracker can tie them together; give \
+             each account a config for a different server",
+        );
+    }
+}
+
+/// An `Endpoint` host more than one profile's WireGuard config names.
+#[derive(Debug, PartialEq, Eq)]
+struct SharedEndpoint {
+    host: String,
+    /// In configuration order.
+    profiles: Vec<ProfileId>,
+}
+
+/// Every `Endpoint` host ([`vpn::wireguard_endpoint_hosts`]) that more than one
+/// WireGuard profile's config names, ordered by host. `read` returns a
+/// config's text; a config it cannot read is skipped, since its bring-up
+/// refuses it with the reason.
+fn shared_endpoint_hosts(
+    profiles: &[ProfileConfig],
+    read: impl Fn(&std::path::Path) -> std::io::Result<String>,
+) -> Vec<SharedEndpoint> {
+    let mut by_host: std::collections::BTreeMap<String, Vec<ProfileId>> =
+        std::collections::BTreeMap::new();
+    for p in profiles {
+        let ProfileNetwork::Vpn {
+            vpn_type: torrentd_engine::VpnType::Wireguard,
+            vpn_config,
+            ..
+        } = &p.network
+        else {
+            continue;
+        };
+        let Ok(text) = read(vpn_config) else {
+            continue;
+        };
+        for host in vpn::wireguard_endpoint_hosts(&text) {
+            let holders = by_host.entry(host).or_default();
+            if !holders.contains(&p.id) {
+                holders.push(p.id.clone());
+            }
+        }
+    }
+    by_host
+        .into_iter()
+        .filter(|(_, profiles)| profiles.len() > 1)
+        .map(|(host, profiles)| SharedEndpoint { host, profiles })
+        .collect()
+}
+
 /// How many entries a boot scan adds between looks at the shutdown receiver.
 /// Cheap enough to check every time; every 256 keeps it out of profiles.
 const SCAN_SHUTDOWN_CHECK_EVERY: usize = 256;
@@ -568,6 +639,12 @@ pub async fn boot(
     let _extend_start = sd_notify::TimeoutExtender::start(BOOT_EXTEND_CAP);
 
     warn_if_descriptors_are_short(&cfg);
+    {
+        let profiles = cfg.profile.clone();
+        tokio::task::spawn_blocking(move || warn_if_exits_are_shared(&profiles))
+            .await
+            .context("shared WireGuard endpoint check")?;
+    }
 
     // Discard raised-interface records whose interface is gone (removed by
     // hand, say) before any bring-up can consult one.
@@ -4639,6 +4716,48 @@ mod profile_construction_tests {
             built,
             cleanup,
         }
+    }
+
+    /// Two accounts whose WireGuard configs name one server leave from one
+    /// public address, whatever tunnel address each is given, and that is
+    /// what a tracker sees (issue #171). The match ignores the port and the
+    /// host's case; a profile on another server, a host profile and a config
+    /// that cannot be read are not reported.
+    #[test]
+    fn two_vpn_profiles_whose_configs_name_one_endpoint_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(
+            dir.path(),
+            &[
+                vpn("acct_a", "wg-a", 1),
+                host("public", false),
+                vpn("acct_b", "wg-b", 2),
+                vpn("acct_c", "wg-c", 3),
+                vpn("acct_d", "wg-d", 4),
+            ],
+        );
+        let conf = |endpoint: &str| {
+            format!(
+                "[Interface]\nPrivateKey = k\nAddress = 10.2.0.2/32\n\n\
+                 [Peer]\nPublicKey = p\nAllowedIPs = 0.0.0.0/0\nEndpoint = {endpoint}\n"
+            )
+        };
+        let read = |path: &Path| match path.to_str() {
+            Some("/etc/wireguard/wg-a.conf") => Ok(conf("NL-free-7.example.net:51820")),
+            Some("/etc/wireguard/wg-b.conf") => Ok(conf("nl-free-7.example.net:443")),
+            Some("/etc/wireguard/wg-c.conf") => Ok(conf("nl-free-8.example.net:51820")),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+        };
+        assert_eq!(
+            shared_endpoint_hosts(&cfg.profile, read),
+            [SharedEndpoint {
+                host: "nl-free-7.example.net".to_string(),
+                profiles: vec![ProfileId::new("acct_a"), ProfileId::new("acct_b")],
+            }],
+        );
+
+        let distinct = |path: &Path| Ok(conf(&format!("{}:51820", path.display())));
+        assert!(shared_endpoint_hosts(&cfg.profile, distinct).is_empty());
     }
 
     #[tokio::test]
