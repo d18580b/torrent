@@ -263,6 +263,13 @@ struct PendingRemoval {
     /// The same profile added the info-hash again after the removal was asked
     /// for. Its stores' files are the new torrent's from then on.
     readded: bool,
+    /// Requests for this torrent's removal whose session call has not been
+    /// refused: one per [`StateMap::begin_removal`], less one per
+    /// [`StateMap::abandon_removal`]. Two DELETEs can run alongside each
+    /// other, and the second's call is refused once the first's removed the
+    /// torrent; that refusal must not drop the record the first one's alert
+    /// is still owed.
+    requests: usize,
 }
 
 /// What [`StateMap::settle_removal`] did.
@@ -367,12 +374,14 @@ impl StateMap {
     /// the removal's alert is handled; [`Self::abandon_removal`] when the
     /// session refused.
     ///
-    /// A removal already pending for the same torrent is left as it is, so a
-    /// second request for it cannot forget that the info-hash was re-added.
+    /// A removal already pending for the same torrent is kept, with one more
+    /// request counted against it, so a second request for it cannot forget
+    /// that the info-hash was re-added.
     pub fn begin_removal(&self, profile: &ProfileId, handle: TorrentHandle) {
         let mut removals = self.removals.lock();
         let key = (profile.clone(), handle.infohash);
-        if removals.get(&key).is_some_and(|p| p.handle == handle) {
+        if let Some(p) = removals.get_mut(&key).filter(|p| p.handle == handle) {
+            p.requests += 1;
             return;
         }
         removals.insert(
@@ -380,20 +389,23 @@ impl StateMap {
             PendingRemoval {
                 handle,
                 readded: false,
+                requests: 1,
             },
         );
     }
 
-    /// Forget a removal [`Self::begin_removal`] recorded, because the session
-    /// refused it and no alert will come. One the profile has re-added since
-    /// is kept: its alert is still owed by the earlier request.
+    /// Withdraw one request [`Self::begin_removal`] counted, because the
+    /// session refused it. The record is forgotten only when every request
+    /// for it was refused, so no alert will come: while one was accepted, its
+    /// alert is still owed and settles the record.
     pub fn abandon_removal(&self, profile: &ProfileId, handle: TorrentHandle) {
         let mut removals = self.removals.lock();
         let key = (profile.clone(), handle.infohash);
-        if removals
-            .get(&key)
-            .is_some_and(|p| p.handle == handle && !p.readded)
-        {
+        let Some(p) = removals.get_mut(&key).filter(|p| p.handle == handle) else {
+            return;
+        };
+        p.requests = p.requests.saturating_sub(1);
+        if p.requests == 0 {
             removals.remove(&key);
         }
     }
@@ -808,7 +820,7 @@ mod tests {
     }
 
     #[test]
-    fn an_abandoned_removal_is_forgotten_unless_the_infohash_was_added_again() {
+    fn an_abandoned_removal_is_forgotten_once_every_request_for_it_was_refused() {
         let m = StateMap::new();
         let p = ProfileId::new("p");
         let old = handle(1, 1);
@@ -827,6 +839,25 @@ mod tests {
         m.abandon_removal(&p, old);
         m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
         assert_eq!(seen, Some(true));
+
+        // Two requests alongside each other: the first's is accepted, the
+        // second's refused once the torrent is gone. The refusal leaves the
+        // record the first's alert is owed, unmarked, for a re-add to mark.
+        m.begin_removal(&p, old);
+        m.begin_removal(&p, old);
+        m.abandon_removal(&p, old);
+        m.note_readded(&p, &ih(1));
+        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
+        assert_eq!(seen, Some(true), "the accepted request's record survives");
+
+        // Every request refused: no alert is owed, and the record goes.
+        m.begin_removal(&p, old);
+        m.begin_removal(&p, old);
+        m.abandon_removal(&p, old);
+        m.abandon_removal(&p, old);
+        m.note_readded(&p, &ih(1));
+        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
+        assert_eq!(seen, Some(false), "nothing pending to mark");
     }
 
     #[test]
