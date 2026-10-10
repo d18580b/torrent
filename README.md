@@ -453,8 +453,9 @@ counts the gateway restarts a renewal detects on such a profile. A
 `profile_id` label marks a series as one session's rather than the daemon's,
 which is why most of those daemon counters carry one too — pool verification is
 daemon-wide and carries none. Outside both VPN groups, these are the labelled
-series worth an alert of their own: `listen_failure_active`, 0 once a profile's
-listen socket is up and 1 when it fails; `listen_failures_total`, which counts
+series worth an alert of their own: `listen_failure_active`, 1 while any of a
+profile's listen sockets is failed (a dual-stack `0.0.0.0:6881,[::]:6881`
+profile holds two) and 0 once every one of them is up; `listen_failures_total`, which counts
 those failures — and a listen failure on a daemon left with a single live
 session is fatal, so on that shape the alert that fires is the daemon going
 away; and `profile_assignment_registry_errors_total`, which counts the torrents

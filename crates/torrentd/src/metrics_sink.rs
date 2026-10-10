@@ -130,7 +130,8 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "resume_save_dispatch_errors_total" Counter Profile Zero =>
         "save_resume_data requests that failed before reaching libtorrent.";
     "listen_failures_total" Counter Profile Zero => "Listen sockets that failed.";
-    "listen_failure_active" Gauge Profile Zero => "1 while the profile's listen socket is failed.";
+    "listen_failure_active" Gauge Profile Zero =>
+        "1 while any of the profile's listen sockets is failed (one socket per `listen_interfaces` endpoint), 0 once each has come up or a socket is up on its address at another port.";
     "disk_error_retry_attempts_total" Counter Profile Zero =>
         "Torrents the disk-error retry timer resumed to clear a libtorrent error.";
     "disk_error_retry_errors_total" Counter Profile Zero => "Retry-timer resumes that failed.";
