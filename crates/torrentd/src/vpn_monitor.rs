@@ -2833,6 +2833,40 @@ mod tests {
         }
     }
 
+    /// A re-pause the session refuses still reports the resume as `Fenced`,
+    /// so the caller answers 409 rather than 204, and counts the failure in
+    /// `profile_fence_pause_errors_total`.
+    #[test]
+    fn a_resume_whose_re_pause_fails_is_still_fenced_and_counted() {
+        let id = ProfileId::new("acct_a");
+        let (entry, engine) = mock_entry(ProfileStatus::Active);
+        let profiles = ProfileRegistry::new(vec![entry]);
+        let metrics = PromSink::new();
+        engine.inject_error("pause_torrent", torrentd_engine::EngineError::Shutdown);
+        let held = engine.hold_next("resume_torrent");
+        let out = std::thread::scope(|s| {
+            let resuming = s.spawn(|| {
+                resume_unless_fenced(&profiles, &id, engine.as_ref(), handle(1), &metrics)
+            });
+            held.wait_entered();
+            profiles
+                .iter()
+                .next()
+                .unwrap()
+                .update_health(|h| h.status = ProfileStatus::VpnDown);
+            held.release();
+            resuming.join().unwrap().unwrap()
+        });
+        assert_eq!(out, SingleResume::Fenced);
+        assert_eq!(pauses(&engine), [handle(1)], "the re-pause was attempted");
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        let line = "torrentd_profile_fence_pause_errors_total{profile_id=\"acct_a\"} 1";
+        assert!(
+            exported.lines().any(|l| l == line),
+            "expected `{line}`; got:\n{exported}",
+        );
+    }
+
     /// An add re-checks the fence after `add_torrent` and pauses what it just
     /// added only when the profile was fenced in between.
     #[test]
