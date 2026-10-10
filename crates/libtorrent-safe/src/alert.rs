@@ -600,3 +600,37 @@ fn c_str_to_owned(buf: &[std::os::raw::c_char]) -> String {
     let cstr = CStr::from_bytes_until_nul(bytes).unwrap_or(c"");
     String::from_utf8_lossy(cstr.to_bytes()).into_owned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each `lt_error_category` value maps to its own variant, and a value
+    /// the shim does not define maps to `Other` rather than to a known one.
+    #[test]
+    fn error_category_from_raw_maps_each_shim_value() {
+        let cases = [
+            (
+                ffi::lt_error_category_LT_ERROR_CATEGORY_LIBTORRENT,
+                ErrorCategory::Libtorrent,
+            ),
+            (
+                ffi::lt_error_category_LT_ERROR_CATEGORY_SYSTEM,
+                ErrorCategory::System,
+            ),
+            (
+                ffi::lt_error_category_LT_ERROR_CATEGORY_HTTP,
+                ErrorCategory::Http,
+            ),
+            (
+                ffi::lt_error_category_LT_ERROR_CATEGORY_OTHER,
+                ErrorCategory::Other,
+            ),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(ErrorCategory::from_raw(raw as i32), want, "{raw}");
+        }
+        assert_eq!(ErrorCategory::from_raw(-1), ErrorCategory::Other);
+        assert_eq!(ErrorCategory::from_raw(i32::MAX), ErrorCategory::Other);
+    }
+}
