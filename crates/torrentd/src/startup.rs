@@ -1477,6 +1477,20 @@ pub async fn boot(
 fn listen_device_check(
     profiles: Arc<ProfileRegistry>,
 ) -> torrentd_engine::alert_loop::ListenDeviceCheck {
+    listen_device_check_with(profiles, torrentd_engine::handlers::listen::sockets_at)
+}
+
+/// [`listen_device_check`], with the kernel read handed in so a test can
+/// script what the sockets on an endpoint are held to, and a read that fails.
+fn listen_device_check_with(
+    profiles: Arc<ProfileRegistry>,
+    sockets_at: impl Fn(
+            std::net::SocketAddr,
+        ) -> std::io::Result<Vec<torrentd_engine::handlers::listen::BoundSocket>>
+        + Send
+        + Sync
+        + 'static,
+) -> torrentd_engine::alert_loop::ListenDeviceCheck {
     Arc::new(move |id: &ProfileId, endpoint: &str| {
         let Some(iface) = profiles
             .resolve(id)
@@ -1491,7 +1505,7 @@ fn listen_device_check(
                  device its sockets are held to"
             ));
         };
-        let sockets = torrentd_engine::handlers::listen::sockets_at(at).map_err(|e| {
+        let sockets = sockets_at(at).map_err(|e| {
             format!("could not list this process's sockets to check {at}'s device: {e}")
         })?;
         let unbound = listen_device_verdict(&iface, &sockets)?;
@@ -3381,6 +3395,210 @@ mod tests {
             kind,
             device: device.map(str::to_owned),
         }
+    }
+
+    /// A registry of one vpn profile (`acct_a`, tunnel `wg-acct_a`) and one
+    /// host profile (`public`), the vpn one on `engine`.
+    fn device_check_registry(engine: Arc<torrentd_engine::MockEngine>) -> Arc<ProfileRegistry> {
+        use crate::profile_registry::test_host_entry;
+        use crate::profile_registry::test_vpn_entry;
+        use crate::profile_registry::ProfileEntry;
+
+        let vpn = test_vpn_entry("acct_a", ProfileStatus::Active).config;
+        let tunnel_ip = Some(std::net::IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+        Arc::new(ProfileRegistry::new(vec![
+            ProfileEntry::new(vpn, engine, tunnel_ip, None, 0),
+            test_host_entry("public"),
+        ]))
+    }
+
+    /// A kernel read that answers `sockets` for every endpoint, noting each
+    /// endpoint it is asked about.
+    #[allow(clippy::type_complexity)]
+    fn scripted_sockets(
+        sockets: std::io::Result<Vec<torrentd_engine::handlers::listen::BoundSocket>>,
+    ) -> (
+        Arc<parking_lot::Mutex<Vec<std::net::SocketAddr>>>,
+        impl Fn(
+                std::net::SocketAddr,
+            ) -> std::io::Result<Vec<torrentd_engine::handlers::listen::BoundSocket>>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        let asked: Arc<parking_lot::Mutex<Vec<std::net::SocketAddr>>> = Arc::default();
+        let sockets = parking_lot::Mutex::new(sockets);
+        let read = {
+            let asked = Arc::clone(&asked);
+            move |at| {
+                asked.lock().push(at);
+                match &*sockets.lock() {
+                    Ok(s) => Ok(s.clone()),
+                    Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+                }
+            }
+        };
+        (asked, read)
+    }
+
+    /// The four answers the hook gives besides a wrong device: a host
+    /// profile is not checked at all, an endpoint it cannot read and a
+    /// kernel read that fails are each fatal, since the check could not run,
+    /// and a socket held to no device is warned about and passes.
+    #[test]
+    fn the_listen_device_check_skips_host_profiles_and_refuses_what_it_cannot_check() {
+        let engine = Arc::new(torrentd_engine::MockEngine::new());
+        let profiles = device_check_registry(engine);
+        let acct_a = ProfileId::new("acct_a");
+
+        let (asked, read) = scripted_sockets(Ok(vec![socket("tcp", Some("eth0"))]));
+        let check = listen_device_check_with(profiles.clone(), read);
+        assert_eq!(check(&ProfileId::new("public"), "0.0.0.0:6881"), Ok(()));
+        assert_eq!(
+            check(&ProfileId::new("nobody"), "10.9.9.9:6881"),
+            Ok(()),
+            "an id the registry does not hold has no tunnel to check against"
+        );
+        assert!(
+            asked.lock().is_empty(),
+            "a profile with no tunnel is never read"
+        );
+
+        let err = check(&acct_a, "not an endpoint").unwrap_err();
+        assert!(
+            err.contains("could not read the listen endpoint \"not an endpoint\""),
+            "{err}"
+        );
+        assert!(asked.lock().is_empty());
+
+        let err = check(&acct_a, "10.2.0.2:6881").unwrap_err();
+        assert!(
+            err.contains("tcp socket held to eth0, not the tunnel device wg-acct_a"),
+            "{err}"
+        );
+        assert_eq!(*asked.lock(), vec!["10.2.0.2:6881".parse().unwrap()]);
+
+        let (_, read) = scripted_sockets(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no /proc",
+        )));
+        let err =
+            listen_device_check_with(profiles.clone(), read)(&acct_a, "10.2.0.2:6881").unwrap_err();
+        assert!(
+            err.contains("could not list this process's sockets to check 10.2.0.2:6881's device")
+                && err.contains("no /proc"),
+            "{err}"
+        );
+
+        let log = crate::tracing_init::Buf::default();
+        let (_handle, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_, read) = scripted_sockets(Ok(vec![
+            socket("tcp", Some("wg-acct_a")),
+            socket("udp", None),
+        ]));
+        assert_eq!(
+            listen_device_check_with(profiles, read)(&acct_a, "10.2.0.2:6881"),
+            Ok(()),
+            "a socket held to no device follows the routing table, which the route probe \
+             watches"
+        );
+        let log = log.text();
+        assert!(
+            log.contains("\"level\":\"WARN\"")
+                && log.contains("a listen socket is held to no device")
+                && log.contains("\"sockets\":1"),
+            "{log}"
+        );
+    }
+
+    /// The hook as `boot` wires it into the alert loop: a vpn session's
+    /// listen socket on another device stops the loop as a fatal listen
+    /// failure, with the session's listen sockets closed and the session
+    /// paused first, and a host session's listen alert is let through.
+    #[test]
+    fn a_vpn_listen_socket_off_its_tunnel_stops_the_alert_loop_through_the_hook() {
+        use libtorrent_safe::alert::AlertHeader;
+        use torrentd_engine::state::StateMap;
+        use torrentd_engine::AlertKind;
+        use torrentd_engine::ProfileSource;
+        use torrentd_engine::RecordedCall;
+
+        let succeeded = |endpoint: &str| torrentd_engine::Alert::ListenSucceeded {
+            hdr: AlertHeader {
+                kind: AlertKind::ListenSucceeded,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            endpoint: endpoint.into(),
+        };
+        let vpn = Arc::new(torrentd_engine::MockEngine::new());
+        let host = Arc::new(torrentd_engine::MockEngine::new());
+        host.push_alert(succeeded("0.0.0.0:6881"));
+        vpn.push_alert(succeeded("10.2.0.2:6881"));
+        let profiles = device_check_registry(vpn.clone());
+        let source: Arc<dyn torrentd_engine::AlertSource> = Arc::new(ProfileSource::new(vec![
+            (
+                ProfileId::new("public"),
+                host.clone() as Arc<dyn TorrentEngine>,
+            ),
+            (
+                ProfileId::new("acct_a"),
+                vpn.clone() as Arc<dyn TorrentEngine>,
+            ),
+        ]));
+        let (asked, read) = scripted_sockets(Ok(vec![socket("udp", Some("eth0"))]));
+        let seen: Arc<parking_lot::Mutex<Vec<ShutdownReason>>> = Arc::default();
+        let handle = AlertLoopBuilder::new(
+            source,
+            Arc::new(StateMap::new()),
+            Arc::new(torrentd_engine::resume_store::MemoryResumeStore::new()),
+            Arc::new(torrentd_engine::torrent_store::MemoryTorrentStore::new()),
+            Arc::new(torrentd_engine::NoopSink),
+            Arc::new(SystemClock),
+        )
+        .fatal_listen_failure(false)
+        .shutdown_deadline(std::time::Duration::from_millis(200))
+        .on_fatal({
+            let seen = Arc::clone(&seen);
+            Arc::new(move |r| seen.lock().push(r)) as torrentd_engine::FatalCallback
+        })
+        .listen_device_check(listen_device_check_with(profiles, read))
+        .spawn();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.listen_failed() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(handle.listen_failed(), "a wrong device binding is fatal");
+        handle.join().expect("loop thread panicked");
+        assert_eq!(*seen.lock(), vec![ShutdownReason::ListenFailed]);
+        assert_eq!(
+            *asked.lock(),
+            vec!["10.2.0.2:6881".parse().unwrap()],
+            "only the vpn session's socket is read"
+        );
+        let calls = vpn.calls();
+        let closed = calls.iter().position(|c| {
+            matches!(c, RecordedCall::ApplySettings(s)
+                if s.listen_interfaces.as_deref() == Some(""))
+        });
+        let paused = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::PauseSession));
+        assert!(
+            matches!((closed, paused), (Some(c), Some(p)) if c < p),
+            "{calls:?}"
+        );
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PauseSession)),
+            "the host session is not the one fenced"
+        );
     }
 
     /// A socket held to any device but the tunnel's is refused, naming it;
