@@ -59,6 +59,72 @@ pub fn first_ipv4(iface: &str) -> io::Result<Ipv4Addr> {
     parse_first_ipv4(iface, &String::from_utf8_lossy(&out.stdout))
 }
 
+/// Why [`probe_ipv4`] could not answer: `ip` could not be run, or did not
+/// finish, so nothing is known about the interface's address.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AddrProbeUnavailable {
+    /// The error, as `ip` failed to run (a spawn failure such as `EMFILE`,
+    /// the [`exec::QUICK`] timeout, a signal that killed `ip`, or a name that
+    /// cannot be passed to `ip`).
+    pub cause: String,
+}
+
+/// The interface's first IPv4 address, telling "no address" apart from "could
+/// not ask".
+///
+/// * `Ok(Some(addr))` — `ip` ran and listed this address.
+/// * `Ok(None)` — `ip` ran and the interface has no IPv4 address, or `ip`
+///   exited nonzero (the link does not exist). `ip` answered, as a refused
+///   `ip route get` is an answer to the route probe.
+/// * `Err(_)` — `ip` could not be run, did not finish, or was killed by a
+///   signal before it answered. This is a host fault,
+///   not a fact about the tunnel, and a caller deciding whether the tunnel is
+///   down leaves its verdict to the other checks rather than reading it as a
+///   lost address.
+///
+/// [`first_ipv4`] keeps its single error for the callers that need an address
+/// and treat every reason for not having one alike.
+pub fn probe_ipv4(iface: &str) -> Result<Option<Ipv4Addr>, AddrProbeUnavailable> {
+    let unavailable = |e: io::Error| AddrProbeUnavailable {
+        cause: e.to_string(),
+    };
+    let out = exec::run(
+        "ip",
+        &[
+            "-4",
+            "-o",
+            "addr",
+            "show",
+            "dev",
+            exec::iface(iface).map_err(unavailable)?,
+        ],
+        None,
+        exec::QUICK,
+    )
+    .map_err(unavailable)?;
+    read_ipv4_listing(iface, &out)
+}
+
+/// [`probe_ipv4`]'s reading of what `ip` returned.
+///
+/// An `ip` killed by a signal (the OOM killer under memory pressure, say) has
+/// no exit code: it never answered, so it is a host fault like a spawn
+/// failure, not "the link is gone". Only an exit `ip` chose is an answer.
+fn read_ipv4_listing(
+    iface: &str,
+    out: &std::process::Output,
+) -> Result<Option<Ipv4Addr>, AddrProbeUnavailable> {
+    if out.status.code().is_none() {
+        return Err(AddrProbeUnavailable {
+            cause: format!("`ip` did not exit on its own: {}", out.status),
+        });
+    }
+    if !out.status.success() {
+        return Ok(None);
+    }
+    Ok(parse_first_ipv4(iface, &String::from_utf8_lossy(&out.stdout)).ok())
+}
+
 fn parse_first_ipv4(iface: &str, text: &str) -> io::Result<Ipv4Addr> {
     for line in text.lines() {
         if let Some(rest) = line.split(" inet ").nth(1) {
@@ -199,5 +265,46 @@ mod tests {
         );
         assert!(link_standing("-x"), "and it is read as standing");
         assert_eq!(ifindex("lo").unwrap(), 1);
+    }
+
+    /// An address probe that ran tells "no address" (`Ok(None)`) apart from
+    /// one that could not ask (`Err`).
+    #[test]
+    fn the_address_probe_tells_no_address_from_could_not_ask() {
+        assert_eq!(probe_ipv4("lo"), Ok(Some(Ipv4Addr::LOCALHOST)));
+        assert_eq!(
+            probe_ipv4("torrentd-nonexistent-iface"),
+            Ok(None),
+            "a link that does not exist holds no address"
+        );
+        let err = probe_ipv4("-x").expect_err("a name that cannot be asked about");
+        assert!(!err.cause.is_empty(), "the cause is kept: {err:?}");
+    }
+
+    /// An `ip` a signal killed never answered, so it is "could not ask"; an
+    /// exit status `ip` chose is an answer.
+    #[test]
+    fn an_ip_killed_by_a_signal_is_unavailable_not_an_absent_address() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+        use std::process::Output;
+
+        let listing = |status: i32, stdout: &str| Output {
+            status: ExitStatus::from_raw(status),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: Vec::new(),
+        };
+        // A raw wait status of 9 is SIGKILL; `1 << 8` is exit code 1.
+        let err =
+            read_ipv4_listing("wg0", &listing(9, "")).expect_err("a killed `ip` did not answer");
+        assert!(err.cause.contains("signal"), "the cause names it: {err:?}");
+        assert_eq!(read_ipv4_listing("wg0", &listing(1 << 8, "")), Ok(None));
+        assert_eq!(
+            read_ipv4_listing(
+                "wg0",
+                &listing(0, "2: wg0    inet 10.0.0.5/24 scope global wg0\n")
+            ),
+            Ok(Some(Ipv4Addr::new(10, 0, 0, 5)))
+        );
     }
 }

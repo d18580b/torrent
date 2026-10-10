@@ -1424,6 +1424,16 @@ On a scratch pool, not your real one.
    profile should pause its torrents, report `vpn_down`, and refuse adds and
    resumes with 409 until you restart the daemon. It must not restart itself.
 
+   A poll on which `ip` itself cannot run — the daemon out of file
+   descriptors, or `ip` stalled past its 10 s timeout — is not a lost
+   address. The monitor logs `address probe unavailable` at warn with the
+   error, sets `torrentd_profile_vpn_addr_probe_ok` to 0, and leaves the
+   verdict to the handshake check (the route probe needs the address, so it
+   is not asked either, and `torrentd_profile_vpn_route_probe_ok` reads 0).
+   An `ip` killed by a signal, such as the OOM killer, counts as one that
+   could not run. Setting a fenced profile online on such a poll keeps
+   the fence: lifting it needs the bound address seen on the interface.
+
    **Then take its route away and leave the tunnel up.** Each poll also asks
    the kernel where a packet from the tunnel address would go
    (`ip route get 1.1.1.1 from <tunnel address>`) and fences the profile

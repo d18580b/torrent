@@ -297,7 +297,7 @@ pub(crate) fn build_test_state_with_sessions(
         // No test reaches a real tunnel: every probe answers "no address",
         // which is unhealthy. A test that lifts a fence sets its own.
         tunnel_probe: Arc::new(|_, _| crate::vpn_monitor::TunnelProbes {
-            ip: None,
+            ip: Ok(None),
             route: None,
             handshake: None,
         }),

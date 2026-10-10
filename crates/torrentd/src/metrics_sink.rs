@@ -202,7 +202,12 @@ pub const CATALOGUE: &[Series] = catalogue! {
          unprivileged).";
     "profile_vpn_route_probe_ok" Gauge VpnProfile Owner("live vpn profiles") =>
         "1 while the route probe (ip route get from the tunnel address) runs; 0 when it \
-         cannot, and the tunnel's routing is not being checked.";
+         cannot, or is not asked because the address probe cannot run, and the tunnel's \
+         routing is not being checked.";
+    "profile_vpn_addr_probe_ok" Gauge VpnProfile Owner("live vpn profiles") =>
+        "1 while the address probe (ip addr show on the tunnel interface) runs; 0 when ip \
+         cannot be run or times out, and the tunnel's address and routing are not being \
+         checked.";
     "profile_vpn_handshake_age_seconds" Gauge VpnProfile OnFirstEvent => "Age of the last WireGuard handshake.";
     // port forwarding
     "profile_port_forward_up" Gauge NatpmpProfile Owner("live natpmp profiles") => "1 while the NAT-PMP lease is held.";

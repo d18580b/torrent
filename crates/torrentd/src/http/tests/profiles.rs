@@ -322,13 +322,13 @@ fn switchable_probe(healthy: &Arc<AtomicBool>) -> crate::vpn_monitor::Prober {
     Arc::new(move |_, _| {
         if healthy.load(Ordering::SeqCst) {
             crate::vpn_monitor::TunnelProbes {
-                ip: Some("10.2.0.2".parse().unwrap()),
+                ip: Ok(Some("10.2.0.2".parse().unwrap())),
                 route: Some(Ok(crate::vpn::route::RouteProbe::ViaTunnel)),
                 handshake: None,
             }
         } else {
             crate::vpn_monitor::TunnelProbes {
-                ip: None,
+                ip: Ok(None),
                 route: None,
                 handshake: None,
             }
