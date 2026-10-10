@@ -924,11 +924,15 @@ fn execute_due_retries(
 /// serving: re-check it, and back off as for a resume.
 ///
 /// The phase moves to `Checking` here rather than waiting for a status update
-/// to report it. A small torrent can finish its check between two updates,
-/// and an update that reports `seeding` keeps `DiskError`, so without this a
-/// check that passed would leave the torrent in `DiskError` and re-checking
-/// at every backoff step for good. A check that fails posts its own
-/// `file_error`, which puts `DiskError` back.
+/// to report it. A check that passes leaves `DiskError` either way: libtorrent
+/// posts `torrent_finished_alert` when it does, and that handler sets
+/// `Seeding`. Setting `Checking` now does two other things. The phase filter
+/// and `/status` show the check from the moment it starts, not `DiskError`
+/// until the next update. And a check that fails before any update arrives
+/// posts its `file_error` on a `Checking` torrent, which the file-error
+/// handler records as libtorrent's error-and-pause; on a torrent still in
+/// `DiskError` with no error it would read as one more failed peer read, and
+/// `has_error` would stay wrong until the next update reported the error.
 ///
 /// Not counted in `disk_error_retry_attempts_total` or
 /// `disk_error_retry_errors_total`, which count resumes; the check it starts

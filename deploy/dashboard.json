@@ -193,7 +193,7 @@
       "id": 12,
       "type": "timeseries",
       "title": "Disk errors by operation",
-      "description": "File errors, by the libtorrent operation that failed. Each one puts a torrent into the disk-error phase. The series appears with its first error.",
+      "description": "File errors, by the libtorrent operation that failed. The journal names the torrent and file. The series appears with its first error.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 26 },
       "fieldConfig": { "defaults": { "unit": "ops", "min": 0 }, "overrides": [] },
