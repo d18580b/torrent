@@ -2094,6 +2094,11 @@ struct ScanFenced {
     handles: Vec<torrentd_engine::TorrentHandle>,
     /// How many of `handles`, from the front, have been paused.
     paused: usize,
+    /// Which of `handles`, by index, a pause that took has added to the
+    /// profile's `paused_for_vpn` since that count last started over. A
+    /// pause that failed added nothing, so its torrent is counted the next
+    /// time a pause of it takes.
+    counted: Vec<bool>,
     /// The kill-switch fence's mark (`FenceRecord::mark`) those were paused
     /// under, `None` where it held no record of the profile then.
     mark: Option<u64>,
@@ -2186,6 +2191,7 @@ impl ScanFence {
             // does, resuming what it recorded: everything paused so far is
             // running again, and a later fence has all of it to pause.
             fenced.paused = 0;
+            fenced.counted.clear();
             return;
         }
         // Fenced, but not by the fence those were paused under: the
@@ -2197,18 +2203,19 @@ impl ScanFence {
         // A record that vanished while the profile stayed fenced is most
         // likely a kill-switch lift that left it fenced for a failing tunnel.
         // That lift resumed nothing and left the count standing, so what was
-        // paused already is not counted twice. It is still paused again,
-        // since a lift that did resume it, followed by the monitor's own
-        // fence, leaves no record either and reads the same here.
+        // paused already is not counted twice, while one whose earlier pause
+        // failed is counted once a pause of it takes. It is still paused
+        // again, since a lift that did resume it, followed by the monitor's
+        // own fence, leaves no record either and reads the same here.
         let mark = record.as_ref().map(|r| r.mark);
-        let mut counted = fenced.paused;
         if fenced.mark != mark {
             if mark.is_some() {
-                counted = 0;
+                fenced.counted.clear();
             }
             fenced.mark = mark;
             fenced.paused = 0;
         }
+        fenced.counted.resize(fenced.handles.len(), false);
         if fenced.paused == fenced.handles.len() {
             return;
         }
@@ -2221,9 +2228,12 @@ impl ScanFence {
         if let Some(record) = record {
             record.handles.extend_from_slice(pending);
         }
-        for (i, &h) in pending.iter().enumerate() {
+        for (&h, counted) in pending.iter().zip(&mut fenced.counted[from..]) {
             match entry.engine.pause_torrent(h) {
-                Ok(()) if from + i >= counted => paused += 1,
+                Ok(()) if !*counted => {
+                    *counted = true;
+                    paused += 1;
+                }
                 Ok(()) => {}
                 // As in the monitor's own fence: a torrent left running on a
                 // fenced profile is the one thing fencing is for.
@@ -6170,6 +6180,15 @@ mod tests {
                 .status
         }
 
+        fn paused_for_vpn(&self) -> u64 {
+            self.profiles
+                .resolve(&self.a)
+                .active()
+                .unwrap()
+                .health()
+                .paused_for_vpn
+        }
+
         /// Until every paced resume the lifts started has ended.
         async fn settle(&self) {
             for _ in 0..100_000 {
@@ -6199,6 +6218,7 @@ mod tests {
             scan.added(&t.profiles, &t.metrics, &t.a, h);
         }
         assert_eq!(t.pauses(), hs);
+        assert_eq!(t.paused_for_vpn(), 3);
         t.fence.lift();
         t.settle().await;
         assert_eq!(t.resumes(), hs);
@@ -6210,6 +6230,11 @@ mod tests {
             t.pauses()[3..],
             hs,
             "the lifted torrents are paused under the new fence"
+        );
+        assert_eq!(
+            t.paused_for_vpn(),
+            3,
+            "the new fence started the count over, and counts all of it"
         );
 
         t.fence.lift();
@@ -6228,19 +6253,11 @@ mod tests {
         let t = KillSwitchScan::with_tunnel(|| {}, up);
         let mut scan = ScanFence::new(Some(t.fence.clone()));
         let hs = [t.handle(1), t.handle(2), t.handle(3)];
-        let paused_for_vpn = || {
-            t.profiles
-                .resolve(&t.a)
-                .active()
-                .unwrap()
-                .health()
-                .paused_for_vpn
-        };
 
         t.fence.fence_all();
         scan.added(&t.profiles, &t.metrics, &t.a, hs[0]);
         scan.added(&t.profiles, &t.metrics, &t.a, hs[1]);
-        assert_eq!(paused_for_vpn(), 2);
+        assert_eq!(t.paused_for_vpn(), 2);
 
         t.fence.lift();
         assert_eq!(
@@ -6252,11 +6269,42 @@ mod tests {
 
         scan.added(&t.profiles, &t.metrics, &t.a, hs[2]);
         assert_eq!(t.pauses()[2..], hs, "every torrent is paused again");
-        assert_eq!(paused_for_vpn(), 3, "only the new pause is counted");
+        assert_eq!(t.paused_for_vpn(), 3, "only the new pause is counted");
 
         scan.enforce_all(&t.profiles, &t.metrics);
         assert_eq!(t.pauses().len(), 5, "nothing left to pause");
-        assert_eq!(paused_for_vpn(), 3);
+        assert_eq!(t.paused_for_vpn(), 3);
+    }
+
+    /// A torrent whose pause failed was never counted, so when the record
+    /// vanishes and its pause takes, it is counted then, while the ones whose
+    /// earlier pause took are not counted again.
+    #[tokio::test(start_paused = true)]
+    async fn a_vanished_fence_record_counts_a_torrent_whose_earlier_pause_failed() {
+        use crate::vpn::killswitch::Fence as _;
+
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let t = KillSwitchScan::with_tunnel(|| {}, up);
+        let mut scan = ScanFence::new(Some(t.fence.clone()));
+        let hs = [t.handle(1), t.handle(2), t.handle(3)];
+
+        t.fence.fence_all();
+        t.engine
+            .inject_error("pause_torrent", torrentd_engine::EngineError::Shutdown);
+        scan.added(&t.profiles, &t.metrics, &t.a, hs[0]);
+        scan.added(&t.profiles, &t.metrics, &t.a, hs[1]);
+        assert_eq!(t.paused_for_vpn(), 1, "the failed pause is not counted");
+
+        t.fence.lift();
+        assert_eq!(t.status(), ProfileStatus::VpnDown);
+
+        scan.added(&t.profiles, &t.metrics, &t.a, hs[2]);
+        assert_eq!(t.pauses()[2..], hs, "every torrent is paused again");
+        assert_eq!(
+            t.paused_for_vpn(),
+            3,
+            "the torrent whose pause failed is counted once its pause takes"
+        );
     }
 
     /// A fence that stops a lift before its paced resume reaches anything
