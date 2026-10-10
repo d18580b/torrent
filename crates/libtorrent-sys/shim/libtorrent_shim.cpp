@@ -399,6 +399,9 @@ struct lt_session {
     std::mutex alert_mutex;
     std::deque<lt_alert_union> ready_alerts;
 
+    // Alerts drain_session_alerts popped but could not translate.
+    std::atomic<std::uint64_t> alert_translate_errors{0};
+
     explicit lt_session(lt::session_params&& p) : ses(std::move(p)) {}
 
     // Register a torrent_handle, returning a stable lt_handle id. The same
@@ -551,10 +554,12 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
             auto* arr = static_cast<lt_torrent_status_view*>(
                 std::calloc(n, sizeof(lt_torrent_status_view)));
             if (!arr) throw std::bad_alloc{};
+            // Owned by `out` before anything below can throw, so the caller's
+            // lt_alert_payload_free on a failed translation releases it.
+            out.payload.state_update.statuses = arr;
             for (std::size_t i = 0; i < n; ++i) {
                 fill_state_view(arr[i], s, x->status[i]);
             }
-            out.payload.state_update.statuses = arr;
         }
         return true;
     }
@@ -592,7 +597,21 @@ bool translate_alert(lt_session* s, const lt::alert* a, lt_alert_union& out) {
         fill_torrent_scope(out, s, x->handle);
         // Pull the metadata buffer from the torrent_info now; libtorrent will
         // not retain it on the alert side past pop_alerts.
-        auto ti = x->handle.torrent_file();
+        //
+        // The torrent may be gone by the time its alert is popped: removed
+        // after the metadata arrived and before this pop. torrent_file() then
+        // throws invalid_torrent_handle, and is_valid() alone cannot rule
+        // that out, since the torrent can be freed between the two calls.
+        // The alert is still delivered, without a payload; the handler skips
+        // an empty info section.
+        std::shared_ptr<const lt::torrent_info> ti;
+        if (x->handle.is_valid()) {
+            try {
+                ti = x->handle.torrent_file();
+            } catch (const lt::system_error&) {
+                ti.reset();
+            }
+        }
         if (ti) {
             auto section = ti->info_section();
             if (!section.empty()) {
@@ -788,9 +807,22 @@ void drain_session_alerts(lt_session* s) {
     if (alerts.empty()) return;
     std::vector<lt_alert_union> translated;
     translated.reserve(alerts.size());
+    // Each alert is translated on its own. An exception out of one costs that
+    // alert and nothing else: before, it unwound past the whole batch, so
+    // every other alert in the pop (another torrent's add, a torrent_removed,
+    // a save_resume_data answer) was lost with it, the payloads already
+    // translated leaked, and lt_pop_alert reported an empty queue.
     for (auto* a : alerts) {
         lt_alert_union u;
-        if (translate_alert(s, a, u)) translated.push_back(u);
+        zero_init(u);
+        try {
+            if (translate_alert(s, a, u)) translated.push_back(u);
+        } catch (...) {
+            // translate_alert zeroes `u` and sets its kind before allocating,
+            // so this frees exactly what it had allocated so far.
+            lt_alert_payload_free(&u);
+            s->alert_translate_errors.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     if (!translated.empty()) {
         std::lock_guard<std::mutex> lk(s->alert_mutex);
@@ -1670,6 +1702,11 @@ extern "C" int lt_pop_alert(lt_session* s, lt_alert_union* out) {
         return 1;
     }
     LT_SHIM_CATCH(nullptr, 0, 0)
+}
+
+extern "C" uint64_t lt_alert_translate_errors(lt_session* s) {
+    if (!s) return 0;
+    return s->alert_translate_errors.load(std::memory_order_relaxed);
 }
 
 extern "C" void lt_alert_payload_free(lt_alert_union* u) {

@@ -521,6 +521,15 @@ impl Session {
         }
     }
 
+    /// How many alerts this session popped from libtorrent and then dropped
+    /// because translating them failed. The shim drops such an alert on its
+    /// own and still delivers the rest of its batch, so a nonzero count is
+    /// alerts lost one at a time, not a stalled queue. Monotonic for the
+    /// session's lifetime.
+    pub fn alert_translate_errors(&self) -> u64 {
+        unsafe { ffi::lt_alert_translate_errors(self.ptr) }
+    }
+
     /// Drain *all* alerts currently queued (after a single shim drain).
     ///
     /// Convenience for the engine's poll thread; equivalent to calling
@@ -816,4 +825,178 @@ fn query_error(h: TorrentHandle, err: ErrBuf) -> Error {
 /// `s` as a C string, or [`Error::InteriorNul`] naming the argument `what`.
 fn c_string(s: impl Into<Vec<u8>>, what: &str) -> Result<CString> {
     CString::new(s).map_err(|_| Error::InteriorNul(what.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::*;
+    use crate::alert::AlertKind;
+
+    /// Two real sessions on loopback, with nothing to discover peers but the
+    /// magnet's own `x.pe`.
+    fn loopback_settings() -> Settings {
+        let mut s = Settings::server_seed_overrides();
+        s.enable_dht = Some(false);
+        s.enable_lsd = Some(false);
+        s.enable_upnp = Some(false);
+        s.enable_natpmp = Some(false);
+        s.listen_interfaces = Some("127.0.0.1:0".into());
+        s
+    }
+
+    /// A single-file `.torrent` whose piece hashes are filler: serving its
+    /// metadata over `ut_metadata` never reads a piece, so nothing verifies
+    /// them.
+    fn single_file_torrent(name: &str, len: usize, piece_len: usize) -> Vec<u8> {
+        let pieces = vec![0xab_u8; len.div_ceil(piece_len) * 20];
+        let mut out = Vec::new();
+        out.extend_from_slice(b"d4:infod");
+        out.extend_from_slice(format!("6:lengthi{len}e").as_bytes());
+        out.extend_from_slice(format!("4:name{}:{name}", name.len()).as_bytes());
+        out.extend_from_slice(format!("12:piece lengthi{piece_len}e").as_bytes());
+        out.extend_from_slice(format!("6:pieces{}:", pieces.len()).as_bytes());
+        out.extend_from_slice(&pieces);
+        out.extend_from_slice(b"ee");
+        out
+    }
+
+    /// A scratch directory removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let p = std::env::temp_dir().join(format!(
+                "libtorrent-safe-{tag}-{}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&p).expect("create scratch dir");
+            Self(p)
+        }
+
+        fn path(&self) -> String {
+            self.0.to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Poll `f` until it returns `Some` or `timeout` passes.
+    fn wait_for<T>(timeout: Duration, mut f: impl FnMut() -> Option<T>) -> Option<T> {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if let Some(v) = f() {
+                return Some(v);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        None
+    }
+
+    /// A magnet whose torrent is removed after its metadata arrived but before
+    /// the `metadata_received_alert` is popped. Translating that alert used to
+    /// throw (the torrent it names no longer exists), which took every alert
+    /// in the same pop with it: `add_torrent`, `torrent_removed`, and any other
+    /// torrent's alerts in the batch.
+    #[test]
+    fn a_torrent_removed_before_its_metadata_alert_is_popped_loses_no_alerts() {
+        let seed_dir = Scratch::new("seed");
+        let fetch_dir = Scratch::new("fetch");
+        let seed = Session::new(&loopback_settings()).expect("seed session");
+        let fetch = Session::new(&loopback_settings()).expect("fetch session");
+
+        let torrent = single_file_torrent("payload.bin", 64 * 1024, 16 * 1024);
+        let ih = info_hash_from_torrent(&torrent).expect("info hash");
+        seed.add_torrent(AddParams::File {
+            bytes: torrent,
+            save_path: seed_dir.path(),
+            flags: TorrentFlags::empty(),
+            trackers: Vec::new(),
+        })
+        .expect("seed add");
+
+        // The listen port, and the seed's check finished: a peer that connects
+        // while the torrent is still checking is turned away, and the fetching
+        // side would not retry it within the test's deadline.
+        let (mut port, mut checked) = (None, false);
+        wait_for(Duration::from_secs(10), || {
+            for a in seed.drain_alerts() {
+                match a {
+                    Alert::ListenSucceeded { endpoint, .. } => {
+                        port = endpoint
+                            .rsplit_once(':')
+                            .and_then(|(_, p)| p.parse::<u16>().ok())
+                            .filter(|p| *p != 0)
+                            .or(port);
+                    }
+                    Alert::TorrentChecked { .. } => checked = true,
+                    _ => {}
+                }
+            }
+            (port.is_some() && checked).then_some(())
+        })
+        .expect("the seed session reports its listen port and finishes its check");
+        let port = port.expect("listen port");
+
+        // Anything the fetching session posted before the magnet is not what
+        // this test is about.
+        drop(fetch.drain_alerts());
+        let h = fetch
+            .add_torrent(AddParams::Magnet {
+                uri: format!("magnet:?xt=urn:btih:{}&x.pe=127.0.0.1:{port}", ih.to_hex()),
+                save_path: fetch_dir.path(),
+                flags: TorrentFlags::empty(),
+            })
+            .expect("magnet add");
+
+        // Watch for the metadata without popping the fetching session's
+        // alerts, so its metadata_received_alert is still queued.
+        wait_for(Duration::from_secs(30), || {
+            seed.drain_alerts();
+            fetch.torrent_details(h).ok().filter(|d| d.has_metadata)
+        })
+        .expect("the metadata arrives from the seed session");
+
+        fetch.remove_torrent(h, false).expect("remove");
+        // A synchronous session call runs on libtorrent's network thread after
+        // the removal it queued. The torrent object itself is freed a little
+        // later, once its peer connection and disk jobs let go of it, and
+        // nothing observable without a pop says when; only then does the
+        // alert's handle stop resolving. A pause well past that (20 ms already
+        // reproduced the loss) puts the pop after it.
+        fetch.is_paused().expect("session barrier");
+        std::thread::sleep(Duration::from_millis(500));
+
+        let mut kinds = Vec::new();
+        wait_for(Duration::from_secs(10), || {
+            kinds.extend(fetch.drain_alerts().iter().map(|a| a.header().kind));
+            kinds.contains(&AlertKind::TorrentRemoved).then_some(())
+        });
+
+        for kind in [
+            AlertKind::AddTorrent,
+            AlertKind::MetadataReceived,
+            AlertKind::TorrentRemoved,
+        ] {
+            assert!(
+                kinds.contains(&kind),
+                "{kind:?} was not delivered; delivered: {kinds:?}"
+            );
+        }
+        assert_eq!(
+            fetch.alert_translate_errors(),
+            0,
+            "no alert failed to translate"
+        );
+    }
 }
