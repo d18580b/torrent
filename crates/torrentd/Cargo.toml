@@ -23,6 +23,7 @@ kynos = { workspace = true }
 jiff = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
+http-body = { workspace = true }
 
 # CLI / config
 clap = { workspace = true }

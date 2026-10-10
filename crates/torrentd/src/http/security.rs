@@ -551,6 +551,93 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
     }
 }
 
+/// The check `Scoped<Bearer, R>` makes, run from the request head as an
+/// interceptor, so that a caller it refuses is answered before a byte of the
+/// body is read.
+///
+/// An extractor runs only once every interceptor of its group has let the
+/// request through, and kynos' `BodySize` reads a body that declares no
+/// length whole, frame by frame and with no clock, before it does. Checked
+/// only in the handler, the credential let anyone who could reach the API
+/// hold a connection with a chunked body that never ends, or have the daemon
+/// buffer up to the group's limit — 96 MiB for `POST /v1/torrents` — before
+/// it answered `401`. Mounted ahead of the body limit on every group whose
+/// operations take a body and need `R`, this refuses them first.
+///
+/// The handler's own `Scoped` argument still runs, and still declares the
+/// `401` and `403` in the document: an operation describes itself before its
+/// interceptors do, so what this contributes there is already present. A
+/// request it admits is checked twice, which costs a hash and a map lookup;
+/// one it refuses never reaches the second check, so a cross-site refusal or
+/// a scope denial is counted once.
+pub struct Authorized<R>(std::marker::PhantomData<fn() -> R>);
+
+impl<R> Authorized<R> {
+    pub const fn new() -> Self {
+        Self(std::marker::PhantomData)
+    }
+}
+
+/// What [`Authorized`] answers with: exactly what `Scoped<Bearer, _>` would
+/// have, and described as it describes it, so that the document is the same
+/// with this mounted or not.
+pub struct Refused<R>(AuthRejection, std::marker::PhantomData<fn() -> R>);
+
+impl<R> kynos::response::IntoResponse for Refused<R> {
+    fn into_response(self) -> kynos::http::Response {
+        self.0.into_response()
+    }
+}
+
+impl<R: Scopes> kynos::response::ShortCircuit for Refused<R> {
+    const STATUSES: &'static [u16] = &[401, 403];
+}
+
+impl<R: Scopes> kynos::response::Responses for Refused<R> {
+    fn responses(registry: &mut kynos::schema::registry::Registry) -> kynos::openapi::Responses {
+        <kynos::error::rejection::ScopedRejection<R> as kynos::response::Responses>::responses(
+            registry,
+        )
+    }
+}
+
+impl<R: Scopes> kynos::middleware::Interceptor<crate::http::ctx::AppCtx> for Authorized<R> {
+    type Reads = ();
+    type Adds = ();
+    type Short = Refused<R>;
+
+    async fn intercept(
+        &self,
+        request: kynos::http::Request,
+        (): (),
+        context: &crate::http::ctx::AppCtx,
+        next: kynos::middleware::Next<'_, crate::http::ctx::AppCtx>,
+    ) -> Result<kynos::middleware::Continued<()>, Refused<R>> {
+        use kynos::security::Authenticates;
+
+        let refused = |rejection: AuthRejection| {
+            Refused(
+                rejection.with_challenge(<Bearer as SecurityScheme>::challenge()),
+                std::marker::PhantomData,
+            )
+        };
+        let (parts, body) = request.into_parts();
+        let presented = Bearer::present(&parts)
+            .map_err(refused)?
+            .ok_or_else(|| refused(AuthRejection::unauthenticated()))?;
+        let gate = context.authenticator();
+        let caller = Authenticator::<Bearer, _>::authenticate(gate, presented, context)
+            .await
+            .map_err(refused)?;
+        Authenticator::<Bearer, _>::authorize(gate, &caller, R::SCOPES, context)
+            .await
+            .map_err(refused)?;
+        Ok(next
+            .run(kynos::http::Request::from_parts(parts, body))
+            .await)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

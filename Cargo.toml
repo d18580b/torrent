@@ -70,6 +70,9 @@ jwalk = "0.8"
 
 # Utility
 bytes = "1"
+# The body trait kynos' request body implements, to read one under a deadline
+# (`torrentd::http::v1::TimedBody`); already in the tree through kynos.
+http-body = "1"
 hex = { version = "0.4", features = ["serde"] }
 sha1 = "0.10"
 tempfile = "3"

@@ -78,6 +78,15 @@ const HTTP_MAX_CONNECTIONS: std::num::NonZeroUsize = match std::num::NonZeroUsiz
 /// `http::v1::REQUEST_DEADLINE`.
 const HTTP_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The most requests one HTTP/2 (h2c) connection carries at once.
+///
+/// [`HTTP_MAX_CONNECTIONS`] was sized for one request a connection, and
+/// kynos' default of 200 streams lets each connection multiply it: 256
+/// connections would carry 51,200 requests, each holding a body read or a
+/// handler. A client of this API needs a handful at once — a `/v1/events`
+/// stream and the requests beside it — and 16 leaves room for that.
+const HTTP2_MAX_CONCURRENT_STREAMS: u32 = 16;
+
 /// How often an HTTP/2 (h2c) connection is pinged, and how long the peer has
 /// to acknowledge, so a silent peer is dropped within 30 s. It does not bound
 /// a peer that answers pings and sends nothing else, nor a connection that
@@ -3297,7 +3306,11 @@ async fn serve_once(
             kynos::server::protocol::Http1Config::default()
                 .header_read_timeout(Some(HTTP_HEADER_READ_TIMEOUT)),
         )
-        .http2(kynos::server::protocol::Http2Config::default().keep_alive(Some(HTTP2_KEEP_ALIVE)))
+        .http2(
+            kynos::server::protocol::Http2Config::default()
+                .keep_alive(Some(HTTP2_KEEP_ALIVE))
+                .max_concurrent_streams(HTTP2_MAX_CONCURRENT_STREAMS),
+        )
         .graceful_shutdown(kynos::server::shutdown::Shutdown::on(async move {
             let _ = shutdown_rx.recv().await;
             // Latched first, so an apply still running stops at its next step
