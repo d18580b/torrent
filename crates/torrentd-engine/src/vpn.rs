@@ -8,6 +8,7 @@
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::net::Ipv6Addr;
 use std::path::PathBuf;
 #[cfg(any(test, feature = "test-support"))]
 use std::sync::Arc;
@@ -74,6 +75,11 @@ pub trait VpnManager: Send + Sync + std::fmt::Debug {
     /// poll to detect mid-session IP changes.
     fn current_ip(&self, iface: &str) -> Result<IpAddr, VpnError>;
 
+    /// Every global-scope IPv6 address `iface` holds, none being an empty
+    /// list. A vpn session listens on its tunnel device, so it sends from
+    /// each of these as well as from its IPv4 address.
+    fn global_ipv6(&self, iface: &str) -> Result<Vec<Ipv6Addr>, VpnError>;
+
     /// Tear down the tunnel. Best-effort; errors logged but never
     /// surfaced to callers (shutdown path).
     fn bring_down(&self, iface: &str);
@@ -91,6 +97,8 @@ pub struct MockVpn {
 #[derive(Debug, Default)]
 struct MockVpnInner {
     ips: HashMap<String, IpAddr>,
+    ipv6: HashMap<String, Vec<Ipv6Addr>>,
+    ipv6_unreadable: Vec<String>,
     foreign: Vec<String>,
     unroutable: Vec<String>,
     bring_up_calls: Vec<String>,
@@ -106,6 +114,18 @@ impl MockVpn {
     /// Pre-seed an interface so `bring_up` returns this IP.
     pub fn set_ip(&self, iface: &str, ip: IpAddr) {
         self.inner.lock().ips.insert(iface.to_string(), ip);
+    }
+
+    /// Pre-seed the global IPv6 addresses `global_ipv6` reads off an
+    /// interface. An interface never seeded holds none.
+    pub fn set_ipv6(&self, iface: &str, addrs: Vec<Ipv6Addr>) {
+        self.inner.lock().ipv6.insert(iface.to_string(), addrs);
+    }
+
+    /// Make `global_ipv6` of `iface` fail, as an `ip -6` that cannot answer
+    /// does.
+    pub fn set_ipv6_unreadable(&self, iface: &str) {
+        self.inner.lock().ipv6_unreadable.push(iface.to_string());
     }
 
     /// Pre-seed an interface as somebody else's, so `bring_up` fails the way
@@ -164,6 +184,16 @@ impl VpnManager for MockVpn {
             .ok_or_else(|| VpnError::NoAddress {
                 iface: iface.to_string(),
             })
+    }
+
+    fn global_ipv6(&self, iface: &str) -> Result<Vec<Ipv6Addr>, VpnError> {
+        let g = self.inner.lock();
+        if g.ipv6_unreadable.iter().any(|i| i == iface) {
+            return Err(VpnError::Io(std::io::Error::other(format!(
+                "ip -6 addr show {iface}: no answer"
+            ))));
+        }
+        Ok(g.ipv6.get(iface).cloned().unwrap_or_default())
     }
 
     fn bring_down(&self, iface: &str) {

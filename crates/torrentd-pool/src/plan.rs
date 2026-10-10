@@ -14,8 +14,10 @@
 //! * **Orphans must be provably unclaimed.** Deletion only ever targets files
 //!   with no claim from any torrent in the library, and only inside the
 //!   subtree the operator named. Not where a torrent the matcher could not
-//!   fully place expects its files, and never a file the size of one it is
-//!   still missing. A deleted file goes to [`TRASH_DIR`], not away.
+//!   fully place expects its files, never a file the size of one it is
+//!   still missing, and nowhere near any copy of a torrent whose payload is
+//!   on disk complete more than once. A deleted file goes to [`TRASH_DIR`],
+//!   not away.
 //! * **Every path stays inside its managed root.** Destinations arrive from
 //!   the API as root-relative strings, so a `..` component in one would have
 //!   the daemon write payload wherever the caller pointed it.
@@ -237,6 +239,13 @@ fn build_delete_orphans(
             if base.is_empty() { "/" } else { base.as_str() },
         ))));
     }
+    if let Some((ih, area)) = unresolved
+        .copies
+        .iter()
+        .find(|(_, area)| prefixes_overlap(prefix, area))
+    {
+        return Ok(Err(Refused(copies_refusal(ih, area))));
+    }
 
     let mut held_back = 0usize;
     let orphans: Vec<String> = store
@@ -324,6 +333,14 @@ impl DeleteGuard {
                 if area.is_empty() { "/" } else { area.as_str() },
             ));
         }
+        if let Some((ih, area)) = self
+            .0
+            .copies
+            .iter()
+            .find(|(_, area)| prefixes_overlap(rel, area))
+        {
+            return Some(format!("{}; rebuild the plan", copies_refusal(ih, area)));
+        }
         if self.0.sizes.contains(&size) {
             return Some(
                 "it has the size of a file a torrent in the library has not found, so it is \
@@ -335,7 +352,8 @@ impl DeleteGuard {
     }
 }
 
-/// What the library is still looking for and has not found.
+/// What the library is still looking for and has not found, and the copies
+/// of complete payload it cannot tell apart.
 #[derive(Debug, Default)]
 struct Unresolved {
     /// The size of every file a torrent expects and the matcher did not place.
@@ -344,13 +362,31 @@ struct Unresolved {
     /// directory, or its single file — of every torrent with an unplaced file
     /// in this root: where those files are expected to be.
     areas: Vec<(String, String)>,
+    /// `(infohash, root-relative path)` for the content root of every
+    /// complete copy, in this root, of a torrent the index holds more than
+    /// one complete copy of. Which copy a session serves is not in the index,
+    /// and the matcher claims only one, so the others read as orphans: none
+    /// of them is provably unwanted.
+    copies: Vec<(String, String)>,
+}
+
+/// Why nothing under `area`, one of several complete copies of `ih`, is
+/// deleted.
+fn copies_refusal(ih: &str, area: &str) -> String {
+    format!(
+        "torrent {ih} has more than one complete copy under the managed roots, one of them under \
+         {:?}, and which one is being seeded is not provable from the index; remove the copy you \
+         do not want by hand and rescan before deleting here",
+        if area.is_empty() { "/" } else { area },
+    )
 }
 
 /// Collect [`Unresolved`] for `root_id`.
 ///
 /// Only `partial`, `missing` and `overlap` torrents can have unplaced files:
 /// `matched`, `shared` and `adopted` are complete by definition, and `drifted`
-/// is complete as of the last rescan.
+/// is complete as of the last rescan. Those complete ones are where a second
+/// complete copy can be, and every copy of each such torrent is collected.
 fn unresolved_payload(
     store: &PoolStore,
     root_id: i64,
@@ -365,6 +401,17 @@ fn unresolved_payload(
                 | Some(AdoptionState::Missing)
                 | Some(AdoptionState::Overlap)
         ) {
+            // Complete: nothing unplaced, but possibly more than one copy.
+            let files = store.torrent_files(&t.infohash)?;
+            let copies = crate::matcher::complete_copies(store, &t, &files)?;
+            if copies.len() > 1 {
+                let tops = content_tops(&files);
+                for (_, b) in copies.iter().filter(|(r, _)| *r == root_id) {
+                    for top in &tops {
+                        out.copies.push((t.infohash.clone(), join_rel(b, top)));
+                    }
+                }
+            }
             continue;
         }
         let claimed: HashSet<(i64, String)> = store.claims_of(&t.infohash)?.into_iter().collect();
@@ -403,6 +450,17 @@ fn unresolved_payload(
         }
     }
     Ok(out)
+}
+
+/// The first path component of every on-disk file in `files`: the torrent's
+/// directory, or its single file.
+fn content_tops(files: &[crate::model::TorrentFileRow]) -> HashSet<String> {
+    files
+        .iter()
+        .filter(|f| f.is_on_disk())
+        .filter_map(|f| f.rel_path.trim_matches('/').split('/').next())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Whether deleting under `prefix` can touch anything under `area`, or the

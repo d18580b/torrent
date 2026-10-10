@@ -24,9 +24,10 @@
 //! route via the tunnel in a table of its own, and a rule sending traffic from
 //! the tunnel address to that table. The profile's sockets are bound to that
 //! address and device, so that is all they need, and nothing else on the host
-//! is rerouted. An IPv6 address on the device — a pushed `ifconfig-ipv6` —
-//! gets a rule and an IPv6 default route of its own too: nothing binds to it,
-//! but without one the kernel's replies from it follow the main table out of
+//! is rerouted. A global IPv6 address on the device — a pushed
+//! `ifconfig-ipv6` — gets a rule and an IPv6 default route of its own too:
+//! the session listens on the device and so sends from it, and without one
+//! its traffic and the kernel's replies from it follow the main table out of
 //! the physical interface. The addresses are read once the IPv4 one appears.
 //! openvpn assigns the IPv6 one straight after it, so a poll landing between
 //! the two misses it and leaves it unrouted until the next bring-up.
@@ -124,10 +125,11 @@ fn openvpn_args<'a>(config: &'a str, iface: &'a str, pid_file: &'a str) -> Vec<&
 /// rule for each address, and a default route via the tunnel in each family
 /// one of them is in.
 ///
-/// Every address, not only the IPv4 one the sessions bind to. A pushed
+/// Every address, not only the IPv4 one the tunnel is routed by. A pushed
 /// `ifconfig-ipv6` address with no rule of its own follows the main IPv6
-/// table, so the kernel's replies from it — a reset, an ICMP error — leave by
-/// the physical interface and tie the tunnel's address to the host.
+/// table, so what is sent from it — a session's announce, or a reset or
+/// ICMP error the kernel builds — leaves by the physical interface and ties
+/// the tunnel's address to the host.
 fn source_routing(addrs: &[IpAddr]) -> (Vec<String>, Vec<String>) {
     let addresses = addrs.iter().map(IpAddr::to_string).collect();
     let mut prefixes = Vec::new();
@@ -367,7 +369,7 @@ impl VpnManager for OpenvpnManager {
                     // The IPv6 addresses openvpn assigned beside it, which
                     // get a source rule each; a listing that cannot be read
                     // is a routing failure like a rule that will not add.
-                    let routed = super::ip_lookup::ipv6_addrs(&profile.interface)
+                    let routed = super::ip_lookup::global_ipv6(&profile.interface)
                         .map(|v6| {
                             std::iter::once(addr)
                                 .chain(v6.into_iter().map(IpAddr::V6))
@@ -429,6 +431,10 @@ impl VpnManager for OpenvpnManager {
             iface: iface.to_string(),
         })?;
         Ok(IpAddr::V4(v4))
+    }
+
+    fn global_ipv6(&self, iface: &str) -> Result<Vec<std::net::Ipv6Addr>, VpnError> {
+        super::ip_lookup::global_ipv6(iface).map_err(VpnError::Io)
     }
 
     /// Stop the openvpn daemon running `iface`, and only then drop its pid

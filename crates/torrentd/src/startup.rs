@@ -1428,6 +1428,10 @@ pub async fn boot(
                 .is_some_and(|e| e.health().status == ProfileStatus::VpnDown)
         }) as torrentd_engine::ProfileFenced
     })
+    // libtorrent's device binding of a listen socket is best effort, and its
+    // `listen_succeeded` alert names no device, so every socket a vpn
+    // session opens is checked against the kernel as it comes up.
+    .listen_device_check(listen_device_check(profile_registry.clone()))
     .listen_events(listen_events)
     .spawn();
 
@@ -1459,6 +1463,119 @@ pub async fn boot(
         requeued_at_boot,
         instance_lock,
     })
+}
+
+/// The alert loop's [`AlertLoopBuilder::listen_device_check`]: a vpn profile's
+/// listen sockets must each be held to its `vpn_interface`.
+///
+/// A socket held to another device is the failure this exists for: its uTP
+/// and UDP and HTTP tracker traffic leaves by that device with the tunnel's
+/// address, and `vpn_monitor`'s route probe, which asks the routing table,
+/// reports the tunnel healthy.
+///
+/// A socket held to no device, where the kernel refused the binding, follows
+/// the source-address rules. On an IPv4 endpoint that is the path the route
+/// probe asks about, from the tunnel's IPv4 address, so it is logged and not
+/// fatal. On an IPv6 endpoint it is fatal too: the probe never asks from an
+/// IPv6 address, so a lost `ip -6` source rule would send that socket's
+/// traffic by the main IPv6 route with nothing to fence it.
+///
+/// A check that cannot run (an endpoint that does not parse, or a failed read
+/// of this process's sockets) is fatal as well, unlike the route and
+/// handshake probes: those run again next poll, and this check runs once per
+/// listen socket. An endpoint at which no socket is found has nothing to
+/// check; that is logged. A host profile is not checked.
+fn listen_device_check(
+    profiles: Arc<ProfileRegistry>,
+) -> torrentd_engine::alert_loop::ListenDeviceCheck {
+    listen_device_check_with(profiles, torrentd_engine::handlers::listen::sockets_at)
+}
+
+/// [`listen_device_check`], with the kernel read handed in so a test can
+/// script what the sockets on an endpoint are held to, and a read that fails.
+fn listen_device_check_with(
+    profiles: Arc<ProfileRegistry>,
+    sockets_at: impl Fn(
+            std::net::SocketAddr,
+        ) -> std::io::Result<Vec<torrentd_engine::handlers::listen::BoundSocket>>
+        + Send
+        + Sync
+        + 'static,
+) -> torrentd_engine::alert_loop::ListenDeviceCheck {
+    Arc::new(move |id: &ProfileId, endpoint: &str| {
+        let Some(iface) = profiles
+            .resolve(id)
+            .active()
+            .and_then(|e| e.config.vpn_interface().map(str::to_owned))
+        else {
+            return Ok(());
+        };
+        let Some(at) = torrentd_engine::port_forward::parse_listen_endpoint(endpoint) else {
+            return Err(format!(
+                "could not read the listen endpoint {endpoint:?}, so could not check which \
+                 device its sockets are held to"
+            ));
+        };
+        let sockets = sockets_at(at).map_err(|e| {
+            format!("could not list this process's sockets to check {at}'s device: {e}")
+        })?;
+        if sockets.is_empty() {
+            warn!(
+                profile_id = %id,
+                endpoint = %at,
+                vpn_iface = %iface,
+                "found no socket of this process at a listen endpoint libtorrent reported \
+                 open, so which device it is held to was not checked; it may have closed \
+                 since",
+            );
+            return Ok(());
+        }
+        let unbound = listen_device_verdict(&iface, &sockets)?;
+        if unbound > 0 && at.is_ipv6() {
+            return Err(format!(
+                "{unbound} socket(s) at the IPv6 endpoint {at} held to no device, not the \
+                 tunnel device {iface}: the kernel refused the binding (SO_BINDTODEVICE needs \
+                 CAP_NET_RAW before Linux 5.7), and the route probe asks only from the \
+                 tunnel's IPv4 address, so nothing fences this traffic if its source rule \
+                 is lost"
+            ));
+        }
+        if unbound > 0 {
+            warn!(
+                profile_id = %id,
+                endpoint = %at,
+                vpn_iface = %iface,
+                sockets = unbound,
+                "a listen socket is held to no device, so its traffic follows the routing \
+                 table rather than the tunnel device; the kernel refused the binding \
+                 (SO_BINDTODEVICE needs CAP_NET_RAW before Linux 5.7)",
+            );
+        }
+        Ok(())
+    })
+}
+
+/// Judge one endpoint's sockets against the tunnel device `iface`: `Err`
+/// naming each socket held to another device, else how many are held to
+/// none.
+fn listen_device_verdict(
+    iface: &str,
+    sockets: &[torrentd_engine::handlers::listen::BoundSocket],
+) -> Result<usize, String> {
+    let wrong: Vec<String> = sockets
+        .iter()
+        .filter_map(|s| match &s.device {
+            Some(d) if d != iface => Some(format!("{} socket held to {d}", s.kind)),
+            _ => None,
+        })
+        .collect();
+    if !wrong.is_empty() {
+        return Err(format!(
+            "{}, not the tunnel device {iface}: its traffic leaves outside the tunnel",
+            wrong.join(", ")
+        ));
+    }
+    Ok(sockets.iter().filter(|s| s.device.is_none()).count())
 }
 
 /// The settings a profile's session is built with: the config's, plus whether
@@ -1748,11 +1865,12 @@ where
     let mut profile_entries: Vec<ProfileEntry> = Vec::new();
     let mut failed_profiles: Vec<FailedProfile> = Vec::new();
 
-    // Which profile holds each tunnel address. A vpn session is bound by
-    // address, listening and outgoing alike, so two tunnels that come up with
-    // one address (every Proton WireGuard config assigns 10.2.0.2/32) leave
-    // nothing — neither the bind nor a source-address routing rule — that can
-    // keep one account's traffic out of the other's tunnel. Only known after
+    // Which profile holds each tunnel address: the link's IPv4 address and
+    // each of its global IPv6 addresses, since a session sends from all of
+    // them. A tunnel is routed by its address, so two tunnels that come up
+    // with one address (every Proton WireGuard config assigns 10.2.0.2/32)
+    // leave no source-address routing rule, and no kill-switch pairing, that
+    // can keep one account's traffic out of the other's tunnel. Only known after
     // bring-up, since OpenVPN's address is pushed by the server.
     let mut tunnel_owner: std::collections::HashMap<IpAddr, ProfileId> =
         std::collections::HashMap::new();
@@ -1791,8 +1909,12 @@ where
                 // profile that fails a later step has its tunnel taken down,
                 // and still owning the address then disabled a later profile
                 // over a tunnel that no longer exists.
+                let (entry, v6) = entry;
                 if let Some(ip) = entry.health().tunnel_ip {
                     tunnel_owner.insert(ip, p.id.clone());
+                }
+                for a in v6 {
+                    tunnel_owner.insert(IpAddr::V6(a), p.id.clone());
                 }
                 profile_entries.push(entry);
             }
@@ -1846,7 +1968,7 @@ async fn build_profile<F, E>(
     held: Held<'_>,
     held_offline: bool,
     make_engine: &mut F,
-) -> Result<ProfileEntry, Box<FailedProfile>>
+) -> Result<(ProfileEntry, Vec<std::net::Ipv6Addr>), Box<FailedProfile>>
 where
     F: FnMut(&torrentd_engine::Settings, Option<Vec<u8>>) -> Result<Arc<dyn TorrentEngine>, E>,
     E: std::fmt::Display,
@@ -1910,6 +2032,7 @@ where
     // What differs between the two postures, and nothing else: where the
     // sockets bind, and whether discovery may run.
     let mut tunnel_ip: Option<IpAddr> = None;
+    let mut tunnel_v6: Vec<std::net::Ipv6Addr> = Vec::new();
     let mut forwarded_port: Option<u16> = None;
     let mut forwarded_epoch: u32 = 0;
     let mut session_state: Option<Vec<u8>> = None;
@@ -1966,8 +2089,8 @@ where
                     tunnel_ip = %ip,
                     other_profile_id = %owner,
                     "tunnel came up with an address another profile's tunnel already has; \
-                     profile disabled, since a session bound by address cannot be kept \
-                     out of the other account's tunnel",
+                     profile disabled, since a tunnel is routed by its address and a \
+                     session on one cannot be kept out of the other account's tunnel",
                 );
                 let reason = format!(
                     "tunnel address {ip} is also profile {owner}'s, so neither session can \
@@ -1976,6 +2099,54 @@ where
                 tear_down_or_warn!(iface);
                 fail_profile!(reason);
             }
+            // The session listens on the device, so it also sends from each
+            // global IPv6 address the link holds, and a shared one is shared
+            // the same way: the kill switch accepts it on both links. An
+            // address that cannot be read cannot be checked, so the profile
+            // does not come up on it.
+            let vpn = cleanup.manager_for(vpn_type);
+            let read_iface = iface.to_string();
+            let v6 = match tokio::task::spawn_blocking(move || vpn.global_ipv6(&read_iface)).await {
+                Ok(Ok(v6)) => v6,
+                Ok(Err(e)) => {
+                    error!(
+                        profile_id = %p.id,
+                        vpn_iface = %iface,
+                        error.cause = %e,
+                        "could not read the tunnel's IPv6 addresses, so could not check that \
+                         no other profile's tunnel has one; profile disabled",
+                    );
+                    tear_down_or_warn!(iface);
+                    fail_profile!(format!(
+                        "could not read tunnel {iface}'s IPv6 addresses to check none is \
+                         another profile's: {e}"
+                    ));
+                }
+                Err(e) => {
+                    tear_down_or_warn!(iface);
+                    profile_task_failed!("VPN IPv6 address read", e)
+                }
+            };
+            if let Some((addr, owner)) = v6
+                .iter()
+                .find_map(|a| held.tunnels.get(&IpAddr::V6(*a)).map(|o| (a, o)))
+            {
+                error!(
+                    profile_id = %p.id,
+                    tunnel_ip = %addr,
+                    other_profile_id = %owner,
+                    "tunnel came up with an IPv6 address another profile's tunnel already \
+                     has; profile disabled, since a tunnel is routed by its address and a \
+                     session on one cannot be kept out of the other account's tunnel",
+                );
+                let reason = format!(
+                    "tunnel address {addr} is also profile {owner}'s, so neither session can \
+                     be kept out of the other's tunnel"
+                );
+                tear_down_or_warn!(iface);
+                fail_profile!(reason);
+            }
+            tunnel_v6 = v6;
 
             // The listening port. A static profile binds the operator's
             // `listen_port`; a natpmp profile negotiates an ephemeral one
@@ -2042,14 +2213,19 @@ where
             };
 
             // The listen sockets, which also carry outgoing uTP and UDP
-            // tracker traffic, are named by address: a device endpoint would
-            // listen on every address the device holds. libtorrent's own
-            // device binding of them is best effort.
-            settings.listen_interfaces = Some(torrentd_engine::bind_endpoint(ip, effective_port));
-            // Outgoing TCP is bound to the device (`SO_BINDTODEVICE`, where
-            // permitted), so it leaves by the tunnel even if the source rule
-            // is lost. That narrows the window before `vpn_monitor`'s route
-            // check fences the profile; it does not close it.
+            // tracker traffic and whose device HTTP tracker connections
+            // reuse, are named by the tunnel device. Named by address,
+            // libtorrent bound them to the first interface whose network
+            // holds it, which is a LAN's where that network covers the
+            // tunnel address, and the traffic left by the LAN where no route
+            // probe looks (`bind_endpoint`). The alert loop checks each
+            // socket's device as it comes up (`listen_device_check`).
+            settings.listen_interfaces =
+                Some(torrentd_engine::bind_endpoint(iface, effective_port));
+            // Outgoing TCP is bound to the device too (`SO_BINDTODEVICE`,
+            // where permitted), so it leaves by the tunnel even if the source
+            // rule is lost. That narrows the window before `vpn_monitor`'s
+            // route check fences the profile; it does not close it.
             settings.outgoing_interfaces = Some(iface.to_string());
             // Not configurable, by construction: there is no key on a vpn
             // profile that reaches these.
@@ -2092,12 +2268,15 @@ where
                 dht = p.dht_enabled(),
                 "profile engine up",
             );
-            Ok(ProfileEntry::new(
-                p.clone(),
-                engine,
-                tunnel_ip,
-                forwarded_port,
-                forwarded_epoch,
+            Ok((
+                ProfileEntry::new(
+                    p.clone(),
+                    engine,
+                    tunnel_ip,
+                    forwarded_port,
+                    forwarded_epoch,
+                ),
+                tunnel_v6,
             ))
         }
         Err(e) => {
@@ -3296,6 +3475,274 @@ mod tests {
 
     use super::*;
 
+    fn socket(
+        kind: &'static str,
+        device: Option<&str>,
+    ) -> torrentd_engine::handlers::listen::BoundSocket {
+        torrentd_engine::handlers::listen::BoundSocket {
+            kind,
+            device: device.map(str::to_owned),
+        }
+    }
+
+    /// A registry of one vpn profile (`acct_a`, tunnel `wg-acct_a`) and one
+    /// host profile (`public`), the vpn one on `engine`.
+    fn device_check_registry(engine: Arc<torrentd_engine::MockEngine>) -> Arc<ProfileRegistry> {
+        use crate::profile_registry::test_host_entry;
+        use crate::profile_registry::test_vpn_entry;
+        use crate::profile_registry::ProfileEntry;
+
+        let vpn = test_vpn_entry("acct_a", ProfileStatus::Active).config;
+        let tunnel_ip = Some(std::net::IpAddr::V4(Ipv4Addr::new(10, 2, 0, 2)));
+        Arc::new(ProfileRegistry::new(vec![
+            ProfileEntry::new(vpn, engine, tunnel_ip, None, 0),
+            test_host_entry("public"),
+        ]))
+    }
+
+    /// A kernel read that answers `sockets` for every endpoint, noting each
+    /// endpoint it is asked about.
+    #[allow(clippy::type_complexity)]
+    fn scripted_sockets(
+        sockets: std::io::Result<Vec<torrentd_engine::handlers::listen::BoundSocket>>,
+    ) -> (
+        Arc<parking_lot::Mutex<Vec<std::net::SocketAddr>>>,
+        impl Fn(
+                std::net::SocketAddr,
+            ) -> std::io::Result<Vec<torrentd_engine::handlers::listen::BoundSocket>>
+            + Send
+            + Sync
+            + 'static,
+    ) {
+        let asked: Arc<parking_lot::Mutex<Vec<std::net::SocketAddr>>> = Arc::default();
+        let sockets = parking_lot::Mutex::new(sockets);
+        let read = {
+            let asked = Arc::clone(&asked);
+            move |at| {
+                asked.lock().push(at);
+                match &*sockets.lock() {
+                    Ok(s) => Ok(s.clone()),
+                    Err(e) => Err(std::io::Error::new(e.kind(), e.to_string())),
+                }
+            }
+        };
+        (asked, read)
+    }
+
+    /// The four answers the hook gives besides a wrong device: a host
+    /// profile is not checked at all, an endpoint it cannot read and a
+    /// kernel read that fails are each fatal, since the check could not run,
+    /// and a socket held to no device is warned about and passes.
+    #[test]
+    fn the_listen_device_check_skips_host_profiles_and_refuses_what_it_cannot_check() {
+        let engine = Arc::new(torrentd_engine::MockEngine::new());
+        let profiles = device_check_registry(engine);
+        let acct_a = ProfileId::new("acct_a");
+
+        let (asked, read) = scripted_sockets(Ok(vec![socket("tcp", Some("eth0"))]));
+        let check = listen_device_check_with(profiles.clone(), read);
+        assert_eq!(check(&ProfileId::new("public"), "0.0.0.0:6881"), Ok(()));
+        assert_eq!(
+            check(&ProfileId::new("nobody"), "10.9.9.9:6881"),
+            Ok(()),
+            "an id the registry does not hold has no tunnel to check against"
+        );
+        assert!(
+            asked.lock().is_empty(),
+            "a profile with no tunnel is never read"
+        );
+
+        let err = check(&acct_a, "not an endpoint").unwrap_err();
+        assert!(
+            err.contains("could not read the listen endpoint \"not an endpoint\""),
+            "{err}"
+        );
+        assert!(asked.lock().is_empty());
+
+        let err = check(&acct_a, "10.2.0.2:6881").unwrap_err();
+        assert!(
+            err.contains("tcp socket held to eth0, not the tunnel device wg-acct_a"),
+            "{err}"
+        );
+        assert_eq!(*asked.lock(), vec!["10.2.0.2:6881".parse().unwrap()]);
+
+        let (_, read) = scripted_sockets(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "no /proc",
+        )));
+        let err =
+            listen_device_check_with(profiles.clone(), read)(&acct_a, "10.2.0.2:6881").unwrap_err();
+        assert!(
+            err.contains("could not list this process's sockets to check 10.2.0.2:6881's device")
+                && err.contains("no /proc"),
+            "{err}"
+        );
+
+        let log = crate::tracing_init::Buf::default();
+        let (_handle, subscriber) =
+            crate::tracing_init::for_tests(crate::config::LogLevel::Info, log.clone());
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_, read) = scripted_sockets(Ok(vec![
+            socket("tcp", Some("wg-acct_a")),
+            socket("udp", None),
+        ]));
+        let check = listen_device_check_with(profiles.clone(), read);
+        assert_eq!(
+            check(&acct_a, "10.2.0.2:6881"),
+            Ok(()),
+            "a socket held to no device follows the routing table, which the route probe \
+             watches"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("\"level\":\"WARN\"")
+                && text.contains("a listen socket is held to no device")
+                && text.contains("\"sockets\":1"),
+            "{text}"
+        );
+        let err = check(&acct_a, "[2001:db8::2]:6881").unwrap_err();
+        assert!(
+            err.contains("1 socket(s) at the IPv6 endpoint [2001:db8::2]:6881 held to no device")
+                && err.contains("asks only from the tunnel's IPv4 address"),
+            "an unbound IPv6 socket is on a path the route probe never asks about: {err}"
+        );
+
+        let (_, read) = scripted_sockets(Ok(Vec::new()));
+        assert_eq!(
+            listen_device_check_with(profiles, read)(&acct_a, "10.2.0.2:6883"),
+            Ok(()),
+            "an endpoint with no socket left on it has nothing to check"
+        );
+        let text = log.text();
+        assert!(
+            text.contains("found no socket of this process at a listen endpoint")
+                && text.contains("10.2.0.2:6883"),
+            "{text}"
+        );
+    }
+
+    /// The hook as `boot` wires it into the alert loop: a vpn session's
+    /// listen socket on another device stops the loop as a fatal listen
+    /// failure, with the session's listen sockets closed and the session
+    /// paused first, and a host session's listen alert is let through.
+    #[test]
+    fn a_vpn_listen_socket_off_its_tunnel_stops_the_alert_loop_through_the_hook() {
+        use libtorrent_safe::alert::AlertHeader;
+        use torrentd_engine::state::StateMap;
+        use torrentd_engine::AlertKind;
+        use torrentd_engine::ProfileSource;
+        use torrentd_engine::RecordedCall;
+
+        let succeeded = |endpoint: &str| torrentd_engine::Alert::ListenSucceeded {
+            hdr: AlertHeader {
+                kind: AlertKind::ListenSucceeded,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            endpoint: endpoint.into(),
+        };
+        let vpn = Arc::new(torrentd_engine::MockEngine::new());
+        let host = Arc::new(torrentd_engine::MockEngine::new());
+        host.push_alert(succeeded("0.0.0.0:6881"));
+        vpn.push_alert(succeeded("10.2.0.2:6881"));
+        let profiles = device_check_registry(vpn.clone());
+        let source: Arc<dyn torrentd_engine::AlertSource> = Arc::new(ProfileSource::new(vec![
+            (
+                ProfileId::new("public"),
+                host.clone() as Arc<dyn TorrentEngine>,
+            ),
+            (
+                ProfileId::new("acct_a"),
+                vpn.clone() as Arc<dyn TorrentEngine>,
+            ),
+        ]));
+        let (asked, read) = scripted_sockets(Ok(vec![socket("udp", Some("eth0"))]));
+        let seen: Arc<parking_lot::Mutex<Vec<ShutdownReason>>> = Arc::default();
+        let handle = AlertLoopBuilder::new(
+            source,
+            Arc::new(StateMap::new()),
+            Arc::new(torrentd_engine::resume_store::MemoryResumeStore::new()),
+            Arc::new(torrentd_engine::torrent_store::MemoryTorrentStore::new()),
+            Arc::new(torrentd_engine::NoopSink),
+            Arc::new(SystemClock),
+        )
+        .fatal_listen_failure(false)
+        .shutdown_deadline(std::time::Duration::from_millis(200))
+        .on_fatal({
+            let seen = Arc::clone(&seen);
+            Arc::new(move |r| seen.lock().push(r)) as torrentd_engine::FatalCallback
+        })
+        .listen_device_check(listen_device_check_with(profiles, read))
+        .spawn();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !handle.listen_failed() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(handle.listen_failed(), "a wrong device binding is fatal");
+        handle.join().expect("loop thread panicked");
+        assert_eq!(*seen.lock(), vec![ShutdownReason::ListenFailed]);
+        assert_eq!(
+            *asked.lock(),
+            vec!["10.2.0.2:6881".parse().unwrap()],
+            "only the vpn session's socket is read"
+        );
+        let calls = vpn.calls();
+        let closed = calls.iter().position(|c| {
+            matches!(c, RecordedCall::ApplySettings(s)
+                if s.listen_interfaces.as_deref() == Some(""))
+        });
+        let paused = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::PauseSession));
+        assert!(
+            matches!((closed, paused), (Some(c), Some(p)) if c < p),
+            "{calls:?}"
+        );
+        assert!(
+            !host
+                .calls()
+                .iter()
+                .any(|c| matches!(c, RecordedCall::PauseSession)),
+            "the host session is not the one fenced"
+        );
+    }
+
+    /// A socket held to any device but the tunnel's is refused, naming it;
+    /// one held to none is counted, for a warning, since the route probe
+    /// watches what it sends.
+    #[test]
+    fn a_listen_socket_off_the_tunnel_device_is_refused() {
+        assert_eq!(
+            listen_device_verdict(
+                "wg0",
+                &[socket("tcp", Some("wg0")), socket("udp", Some("wg0"))]
+            ),
+            Ok(0),
+        );
+        assert_eq!(
+            listen_device_verdict("wg0", &[socket("tcp", Some("wg0")), socket("udp", None)]),
+            Ok(1),
+        );
+        let err = listen_device_verdict(
+            "wg0",
+            &[
+                socket("tcp", Some("eth0")),
+                socket("udp", Some("eth0")),
+                socket("udp", None),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(
+                "tcp socket held to eth0, udp socket held to eth0, not the tunnel device wg0"
+            ),
+            "{err}"
+        );
+        assert_eq!(listen_device_verdict("wg0", &[]), Ok(0));
+    }
+
     /// The database path in the registry refusal's `sqlite3` command reaches
     /// the shell as one word, whatever the state directory is called.
     #[test]
@@ -3461,6 +3908,13 @@ mod tests {
             Err(torrentd_engine::VpnError::NoAddress {
                 iface: iface.to_string(),
             })
+        }
+
+        fn global_ipv6(
+            &self,
+            _iface: &str,
+        ) -> Result<Vec<std::net::Ipv6Addr>, torrentd_engine::VpnError> {
+            Ok(Vec::new())
         }
 
         fn bring_down(&self, _iface: &str) {
@@ -3670,6 +4124,13 @@ mod tests {
             Err(torrentd_engine::VpnError::NoAddress {
                 iface: iface.to_string(),
             })
+        }
+
+        fn global_ipv6(
+            &self,
+            _iface: &str,
+        ) -> Result<Vec<std::net::Ipv6Addr>, torrentd_engine::VpnError> {
+            Ok(Vec::new())
         }
 
         fn bring_down(&self, iface: &str) {
@@ -4225,7 +4686,7 @@ mod profile_construction_tests {
         assert_eq!(out.up_ids(), vec!["acct_a"]);
         assert_eq!(
             out.built[0].0.listen_interfaces.as_deref(),
-            Some("10.2.0.2:51413"),
+            Some("wg-a:51413"),
         );
         let health = out.up[0].health();
         assert_eq!(health.forwarded_port, Some(51413));
@@ -4361,8 +4822,9 @@ mod profile_construction_tests {
         assert_eq!(settings.enable_natpmp, Some(false));
         assert_eq!(
             settings.listen_interfaces.as_deref(),
-            Some("10.2.0.2:6891"),
-            "bound to the tunnel endpoint",
+            Some("wg-a:6891"),
+            "listening on the tunnel device, not its address: an address is bound to \
+             the first interface whose network holds it, which can be a LAN's",
         );
         assert!(
             !settings
@@ -4484,6 +4946,50 @@ mod profile_construction_tests {
             vec!["wg-b".to_string()],
             "and the surviving profile's tunnel stays up",
         );
+    }
+
+    /// Two tunnels on distinct IPv4 addresses that share a global IPv6
+    /// address: the sessions send from it too, so the second is refused as
+    /// for a shared IPv4 address. A tunnel whose IPv6 addresses cannot be
+    /// read cannot be checked, and is refused as well.
+    #[tokio::test]
+    async fn a_tunnel_sharing_an_ipv6_address_or_unable_to_read_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(
+            dir.path(),
+            &[
+                vpn("acct_a", "wg-a", 1),
+                vpn("acct_b", "wg-b", 2),
+                vpn("acct_c", "wg-c", 3),
+            ],
+        );
+        let shared: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", TUNNEL_IP);
+        vpn.set_ip("wg-b", OTHER_TUNNEL_IP);
+        vpn.set_ip("wg-c", IpAddr::V4(Ipv4Addr::new(10, 3, 0, 2)));
+        vpn.set_ipv6("wg-a", vec![shared]);
+        vpn.set_ipv6("wg-b", vec!["2001:db8::9".parse().unwrap(), shared]);
+        vpn.set_ipv6_unreadable("wg-c");
+
+        let mut out = build(&cfg, &vpn, &MockForwarder::new(), None).await;
+
+        assert_eq!(out.up_ids(), vec!["acct_a"]);
+        let reason = &out.failed("acct_b").reason;
+        assert!(
+            reason.contains("tunnel address 2001:db8::2 is also profile acct_a's"),
+            "{reason}"
+        );
+        let reason = &out.failed("acct_c").reason;
+        assert!(
+            reason.contains("could not read tunnel wg-c's IPv6 addresses")
+                && reason.contains("no answer"),
+            "{reason}"
+        );
+        let mut lowered = vpn.bring_down_calls();
+        lowered.sort();
+        assert_eq!(lowered, vec!["wg-b".to_string(), "wg-c".to_string()]);
+        out.cleanup.disarm();
     }
 
     #[tokio::test]

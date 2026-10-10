@@ -17,7 +17,6 @@
 
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
-use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -228,9 +227,9 @@ pub trait CheckHost {
     /// and the one `killswitch::enable` pairs the profile's interface with.
     fn first_ipv4(&self, iface: &str) -> std::io::Result<Ipv4Addr>;
 
-    /// The IPv6 addresses on `iface`, link-local aside, which
-    /// `killswitch::enable` fences beside the IPv4 one.
-    fn ipv6_addrs(&self, iface: &str) -> std::io::Result<Vec<Ipv6Addr>>;
+    /// The link's global IPv6 addresses, which `killswitch::enable` also
+    /// pairs with the interface; none where they cannot be read, as there.
+    fn tunnel_ipv6(&self, iface: &str) -> Vec<std::net::Ipv6Addr>;
 
     /// The tunnel manager for a profile's VPN type.
     fn manager(&self, t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager>;
@@ -321,8 +320,8 @@ impl CheckHost for RealHost {
         vpn::first_ipv4(iface)
     }
 
-    fn ipv6_addrs(&self, iface: &str) -> std::io::Result<Vec<Ipv6Addr>> {
-        vpn::ipv6_addrs(iface)
+    fn tunnel_ipv6(&self, iface: &str) -> Vec<std::net::Ipv6Addr> {
+        vpn::killswitch::tunnel_ipv6(iface)
     }
 
     fn manager(&self, t: VpnType, run_dir: &Path) -> Arc<dyn VpnManager> {
@@ -802,9 +801,6 @@ struct Unread {
     /// Tunnels with no address to pair their interface with, which the
     /// dry-run therefore carries no accept for.
     addresses: Vec<String>,
-    /// Tunnels paired with an address whose IPv6 addresses could not be read,
-    /// which the dry-run therefore does not fence.
-    ipv6: Vec<String>,
     /// Tunnels with no listen port or peer endpoint, whose transport the
     /// dry-run therefore does not exempt.
     ports: Vec<String>,
@@ -837,16 +833,9 @@ fn boot_install_script(
     let mut transports = Vec::new();
     for iface in tunnels {
         match host.first_ipv4(iface) {
-            Ok(addr) => {
-                let tunnel = vpn::killswitch::Tunnel::new(iface.as_str(), addr);
-                match host.ipv6_addrs(iface) {
-                    Ok(addrs6) => paired.push(tunnel.with_ipv6(addrs6)),
-                    Err(_) => {
-                        unread.ipv6.push(iface.clone());
-                        paired.push(tunnel);
-                    }
-                }
-            }
+            Ok(addr) => paired.push(
+                vpn::killswitch::Tunnel::new(iface.as_str(), addr).with_v6(host.tunnel_ipv6(iface)),
+            ),
             Err(_) => unread.addresses.push(iface.clone()),
         }
         match host.transport(iface) {
@@ -875,14 +864,6 @@ fn note_unread(mut verdict: Check, unread: &Unread) -> Check {
              nothing on it; boot pairs each tunnel's interface with the address read off \
              the live link and refuses to install the kill switch without it",
             unread.addresses.join(", "),
-        ));
-    }
-    if !unread.ipv6.is_empty() {
-        verdict.detail.push_str(&format!(
-            "\nno IPv6 address listing could be read for {}, so this dry-run fences none \
-             of its IPv6 addresses; boot reads them off the live link and refuses to \
-             install the kill switch without them",
-            unread.ipv6.join(", "),
         ));
     }
     if !unread.ports.is_empty() {
@@ -1556,6 +1537,8 @@ mod tests {
         /// `existing`".
         exists_seq: Mutex<Vec<bool>>,
         addrs: Mutex<Vec<(String, Option<Ipv4Addr>)>>,
+        /// Scripted `tunnel_ipv6` answers. An interface not listed has none.
+        v6: Vec<(String, Vec<std::net::Ipv6Addr>)>,
         sysctls: Mutex<Vec<(String, String)>>,
         /// Every host interaction, in the order it happened, so *when* a
         /// sysctl was read relative to the raise is assertable. Shared with
@@ -1586,8 +1569,6 @@ mod tests {
         /// What `route_probe` answers for every lookup. Defaults to a route by
         /// the tunnel, which is the healthy host.
         route: Result<vpn::route::RouteProbe, vpn::route::RouteProbeUnavailable>,
-        /// Scripted `ipv6_addrs` answers. An interface not listed holds none.
-        addrs6: Vec<(String, Vec<Ipv6Addr>)>,
     }
 
     impl FakeHost {
@@ -1596,6 +1577,7 @@ mod tests {
                 existing: Vec::new(),
                 exists_seq: Mutex::new(Vec::new()),
                 addrs: Mutex::new(Vec::new()),
+                v6: Vec::new(),
                 sysctls: Mutex::new(Vec::new()),
                 events: Arc::new(Mutex::new(Vec::new())),
                 vpn: MockVpn::new(),
@@ -1608,7 +1590,6 @@ mod tests {
                 handshake: Err("refused"),
                 ports: Vec::new(),
                 route: Ok(vpn::route::RouteProbe::ViaTunnel),
-                addrs6: Vec::new(),
             }
         }
 
@@ -1616,12 +1597,6 @@ mod tests {
         /// is [`fake_transport`]'s.
         fn with_listen_port(mut self, iface: &str, port: u16) -> Self {
             self.ports.push((iface.to_string(), port));
-            self
-        }
-
-        /// Script the IPv6 addresses `iface`'s link holds.
-        fn with_ipv6(mut self, iface: &str, addrs: &[Ipv6Addr]) -> Self {
-            self.addrs6.push((iface.to_string(), addrs.to_vec()));
             self
         }
 
@@ -1706,6 +1681,12 @@ mod tests {
                 seq.into_iter().map(|(i, a)| (i.to_string(), a)).collect();
             self
         }
+
+        /// Script the IPv6 addresses `iface`'s link holds.
+        fn with_v6(mut self, iface: &str, addrs: &[std::net::Ipv6Addr]) -> Self {
+            self.v6.push((iface.to_string(), addrs.to_vec()));
+            self
+        }
     }
 
     impl CheckHost for FakeHost {
@@ -1745,13 +1726,12 @@ mod tests {
             }
         }
 
-        fn ipv6_addrs(&self, iface: &str) -> std::io::Result<Vec<Ipv6Addr>> {
-            Ok(self
-                .addrs6
+        fn tunnel_ipv6(&self, iface: &str) -> Vec<std::net::Ipv6Addr> {
+            self.v6
                 .iter()
                 .find(|(i, _)| i == iface)
                 .map(|(_, a)| a.clone())
-                .unwrap_or_default())
+                .unwrap_or_default()
         }
 
         fn manager(&self, _t: VpnType, _run_dir: &Path) -> Arc<dyn VpnManager> {
@@ -1860,6 +1840,13 @@ mod tests {
 
         fn current_ip(&self, iface: &str) -> Result<IpAddr, torrentd_engine::VpnError> {
             self.inner.current_ip(iface)
+        }
+
+        fn global_ipv6(
+            &self,
+            iface: &str,
+        ) -> Result<Vec<std::net::Ipv6Addr>, torrentd_engine::VpnError> {
+            self.inner.global_ipv6(iface)
         }
 
         fn bring_down(&self, iface: &str) {
@@ -3581,10 +3568,10 @@ user_agent           = "Transmission/4.0.5"
         let cfg = cfg_with_two_profiles();
         let addr_a = Ipv4Addr::new(10, 2, 0, 2);
         let addr_b = Ipv4Addr::new(10, 64, 0, 7);
-        let addr_a6: Ipv6Addr = "fd7d:1::2".parse().unwrap();
+        let addr_a6: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
         let host = FakeHost::new()
             .with_addrs([("wg-acct-a", Some(addr_a)), ("wg-acct-b", Some(addr_b))])
-            .with_ipv6("wg-acct-a", &[addr_a6])
+            .with_v6("wg-acct-a", &[addr_a6])
             .with_listen_port("wg-acct-a", 51820)
             .with_listen_port("wg-acct-b", 40001);
         host_checks(&cfg, Some(998), None, &host);
@@ -3611,10 +3598,11 @@ user_agent           = "Transmission/4.0.5"
                 })
             },
             |iface| {
-                Ok(match iface {
-                    "wg-acct-a" => vec![addr_a6],
-                    _ => vec![],
-                })
+                if iface == "wg-acct-a" {
+                    vec![addr_a6]
+                } else {
+                    Vec::new()
+                }
             },
             |iface| {
                 Ok(fake_transport(match iface {
@@ -3631,13 +3619,9 @@ user_agent           = "Transmission/4.0.5"
         assert_eq!(dry_run[0], *installed.borrow());
         assert!(
             dry_run[0].contains("ip saddr 10.2.0.2 oifname \"wg-acct-a\" accept")
+                && dry_run[0].contains("ip6 saddr 2001:db8::2 oifname \"wg-acct-a\" accept")
                 && dry_run[0].contains("ip saddr 10.64.0.7 oifname \"wg-acct-b\" accept"),
             "each profile is accepted on its own tunnel alone: {}",
-            dry_run[0],
-        );
-        assert!(
-            dry_run[0].contains("ip6 saddr fd7d:1::2 oifname != { \"lo\", \"wg-acct-a\" } drop"),
-            "a tunnel's IPv6 address is fenced in the dry-run as at boot: {}",
             dry_run[0],
         );
     }

@@ -1153,7 +1153,9 @@ async fn a_deleted_adoption_adopts_again_into_another_profile() {
         Some((root_id, "movies".to_owned())),
     );
     // And the session drops it, as its removal alert would.
-    h.state.state.remove(&hash);
+    h.state
+        .state
+        .remove(&hash, &torrentd_engine::ProfileId::new("p"), None);
 
     let r = adopt_into("q").await;
     assert_eq!(r["fast_path"], json!([IH_A]), "{r}");

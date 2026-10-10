@@ -251,13 +251,17 @@ Every profile takes `id` plus `network`, and then:
 DHT, PEX and LSD are disabled unconditionally on a `vpn` profile; no key turns
 them on.
 
-Each `vpn` profile's tunnel must come up with its own address. A session is
-bound to its tunnel by address, so two tunnels sharing one — every Proton
+Each `vpn` profile's tunnel must come up with its own address. A tunnel is
+routed by its address (`from <address> lookup <table>`), so two sharing one — every Proton
 WireGuard config assigns `10.2.0.2/32` — leave nothing that keeps one account's
-traffic out of the other's tunnel. The address is known only once the tunnel is
+traffic out of the other's tunnel. The session sends from each global IPv6
+address the tunnel holds as well, so none of those may be shared either. The
+addresses are known only once the tunnel is
 up, so this is checked at startup rather than by `--check-config`: the second
 profile to come up with an address already taken is disabled, with a reason
-naming the other profile, and the rest of the daemon runs. Two accounts behind
+naming the other profile, and the rest of the daemon runs. A profile whose
+tunnel's IPv6 addresses cannot be read is disabled the same way, since they
+cannot be checked. Two accounts behind
 a provider that gives every client the same address cannot share one daemon;
 run the second in a daemon of its own, in its own network namespace.
 
@@ -1452,16 +1456,44 @@ On a scratch pool, not your real one.
    device (`SO_BINDTODEVICE`, which needs `CAP_NET_RAW` before Linux 5.7;
    the unit grants only `CAP_NET_ADMIN`). Outgoing TCP peer connections are
    bound to the tunnel device (`outgoing_interfaces`). Outgoing uTP and UDP
-   tracker announces are sent from the listen sockets, which are bound to
-   the tunnel address; libtorrent also binds those to the first interface
-   whose network holds that address, which is the tunnel unless another
-   interface's network covers the tunnel address. Where the device binding
-   takes, that traffic keeps leaving by the tunnel. Where it is refused —
-   libtorrent then binds the socket to the address alone, for TCP as for the
-   listen sockets — or names the wrong interface, the traffic follows the
-   routing table and can leave by the physical interface, with the tunnel's
-   source address, until the next poll fences the profile. With
-   `network_kill_switch = true` the kill switch drops it.
+   tracker announces are sent from the listen sockets, and HTTP tracker
+   connections are bound to their device; the session listens on the tunnel
+   device (`<iface>:<port>`), on every address it holds, so those are bound
+   to the tunnel device too. Where the device binding takes, that traffic
+   keeps leaving by the tunnel. Where it is refused, libtorrent binds the
+   socket to the address alone, for TCP as for the listen sockets. The
+   traffic then follows the routing table. From the tunnel's IPv4 address it
+   can leave by the physical interface, with that source address, until the
+   next poll fences the profile. The route probe asks only from the IPv4
+   address, so it would never fence that path for an IPv6 address. A listen
+   socket on an IPv6 address that is bound to no device therefore stops the
+   daemon, as a wrong device does (below). On such a kernel, a tunnel that
+   holds an IPv6 address runs only once the unit grants `CAP_NET_RAW` or the
+   address is dropped from the tunnel's config. With
+   `network_kill_switch = true` the kill switch drops this traffic.
+
+   A socket bound to the **wrong** device is a different case. A device
+   binding overrides policy routing, so its traffic leaves by that device
+   whatever the rules say. The route probe asks the routing table
+   (`ip route get … from <tunnel address>`), so it still answers
+   `dev <iface>` and never fences. That is why the session names the device
+   and not the address: libtorrent binds a socket named by address to the
+   first interface whose network holds it. A LAN whose network covers the
+   tunnel address (a `10.0.0.0/8` LAN beside Proton's `10.2.0.2/32`) would
+   win, and `ss -tulnp` would show `10.2.0.2%eth0`. The daemon also checks
+   every listen socket a vpn session opens against the kernel, as it comes
+   up and after each NAT-PMP rebind. A socket bound to any device but the
+   profile's `vpn_interface` stops the whole daemon, whatever other
+   sessions are up. It logs `a listen socket is not held to the profile's
+   tunnel device`, closes that profile's listen sockets and then pauses its
+   session, so nothing more (its `stopped` announces included) leaves by
+   that device during the shutdown drain, and exits non-zero. A socket on an
+   IPv6 address bound to no device does the same. A socket on an IPv4
+   address bound to no device is logged as a warning and left to the route
+   probe. So is a listen endpoint at which the daemon finds no socket, which
+   it logs as `found no socket of this process at a listen endpoint`. A check
+   that cannot run (the daemon cannot read its own sockets) stops the daemon
+   too.
 
    A WireGuard tunnel that comes up and **never handshakes** — a wrong key,
    a dead endpoint — is fenced with `reason=no_handshake` once it has gone
@@ -1472,16 +1504,20 @@ On a scratch pool, not your real one.
    poll whose handshake probe could not run leaves the clock where it was.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
-   interfaces for the daemon's uid, one line per profile pairing its tunnel
-   address with its own interface:
+   interfaces for the daemon's uid, one line per tunnel address pairing it
+   with its own interface:
    `meta skuid <uid> ip saddr <tunnel address> oifname "<iface>" accept`.
-   The address is read off the live link (its first IPv4 address, the one
-   every session is bound to) when the switch is installed, and a tunnel with
-   none fails the install. So a packet from one profile's address that the
-   routing table sends out of another profile's tunnel — its per-source
-   `ip rule` lost or shadowed by another tool — is dropped rather than
-   leaving with the other account's exit address. IPv6 is not paired: the
-   daemon's IPv6 egress by a tunnel, which no session binds to, is dropped.
+   The addresses are read off the live link when the switch is installed:
+   its first IPv4 address, which a tunnel with none fails the install for,
+   and each of its global IPv6 addresses, paired the same way with
+   `ip6 saddr`. A session listens on its tunnel device, so it listens and
+   announces on every address the device holds, IPv6 included. So a packet
+   from one profile's address that the routing table sends out of another
+   profile's tunnel — its per-source `ip rule` lost or shadowed by another
+   tool — is dropped rather than leaving with the other account's exit
+   address. The daemon's IPv6 egress from any other address, a link-local
+   one included, is dropped. A link whose IPv6 addresses cannot be read is
+   paired for IPv4 only, with a warning, and its IPv6 traffic dropped.
    Setting it with no `vpn` profile, or
    beside any `host` profile, is a startup error, not a warning: the ruleset
    matches the daemon's uid and cannot tell a host profile's traffic from a
@@ -1526,10 +1562,11 @@ On a scratch pool, not your real one.
    a TCP reset or an ICMP error, which the kernel builds with no socket of
    the daemon's attached; with a tunnel's `from <address>` rule lost, its
    answer to a probe of the tunnel address arriving on the physical link
-   used to leave by that link from the tunnel address (drill 8). Each IPv6
-   address the link holds when the switch is installed, link-local ones
-   aside, gets the same fence as `ip6 saddr <address> oifname != { … }
-   drop`; one added to the link later is not fenced until the next start.
+   used to leave by that link from the tunnel address (drill 8). Each global
+   IPv6 address the link holds when the switch is installed gets the same
+   fence as `ip6 saddr <address> oifname != { … } drop`; one added to the
+   link later is not fenced until the next start, and a link whose IPv6
+   addresses cannot be read gets no IPv6 fence (the warning above).
 
    What that leaves:
 
@@ -1592,9 +1629,10 @@ On a scratch pool, not your real one.
    derive it from the route; set `MTU` on a smaller path), and then — instead of
    `wg-quick`'s host-wide default route — **source-address routing**: each
    peer's `AllowedIPs` go into a routing table of the link's own, and an
-   `ip rule` sends traffic *from* the link's address to it. Every profile's
-   sockets are bound to its tunnel address, so that is all the daemon needs,
-   and nothing else on the host is rerouted. Shutdown removes the rules and
+   `ip rule` per `Address` sends traffic *from* that address to it. Every
+   profile's sockets send from its tunnel's addresses (the listen sockets
+   from each address the tunnel device holds, IPv6 included), so that is all
+   the daemon needs, and nothing else on the host is rerouted. Shutdown removes the rules and
    the link it raised. `ip rule show` lists them as `from <address> lookup <table>`.
    This is the only way the daemon raises a WireGuard link, as root too: as
    root, `wg-quick`'s host-wide default route made a second full-tunnel
@@ -1603,9 +1641,9 @@ On a scratch pool, not your real one.
    ignore redirect-gateway`, so it installs no routes and never takes the
    host's default route, and the daemon routes the tunnel (a routed `tun`
    device; a bridged `tap` profile is not supported) once it has its address,
-   with a `from` rule for each address on the device — a pushed
-   `ifconfig-ipv6` address included, link-local ones aside. It also runs with `--persist-tun`, because the table is keyed on the
-   device's ifindex and its routes go with the device: a `ping-restart` or
+   with a `from` rule for its IPv4 address and for each global IPv6 address
+   on the device, a pushed `ifconfig-ipv6` address included. It also runs
+   with `--persist-tun`, because the table is keyed on the device's ifindex and its routes go with the device: a `ping-restart` or
    `SIGUSR1` reconnect keeps the device and its routing. A reconnect that
    recreates the device anyway — the server pushed different options — is
    fenced as a route mismatch or an address change, and routing is not

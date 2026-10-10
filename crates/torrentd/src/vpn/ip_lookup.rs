@@ -1,5 +1,5 @@
-//! Interface lookups: an interface's IPv4 address and its IPv6 ones, whether a link exists, and
-//! its ifindex.
+//! Interface lookups: an interface's IPv4 address, its global IPv6
+//! addresses, whether a link exists, and its ifindex.
 //!
 //! Shells out to `ip` (iproute2), found on the daemon's `PATH`, through
 //! [`super::exec::run`]. We deliberately don't depend on the netlink crate
@@ -76,41 +76,38 @@ fn parse_first_ipv4(iface: &str, text: &str) -> io::Result<Ipv4Addr> {
     ))
 }
 
-/// Every IPv6 address on `iface` that is not link-local, in the order `ip`
-/// lists them; an empty list for a link with none.
+/// Every global-scope IPv6 address on `iface`, in the order `ip` lists them.
 ///
-/// Asked without a family flag and read off the `inet6` lines, so a host
-/// with IPv6 disabled answers with no addresses rather than an error.
-///
-/// Link-local (`fe80::/10`) addresses are left out. One leaves only by its
-/// own link anyway, so a fence or a source rule adds nothing for it, and the
-/// same link-local address can stand on another interface: a fence keyed on
-/// it would drop that interface's neighbour discovery.
-pub fn ipv6_addrs(iface: &str) -> io::Result<Vec<Ipv6Addr>> {
+/// A vpn session listens on its tunnel device, so it listens and announces on
+/// each of these as well as on the link's IPv4 address, and the kill switch
+/// pairs each with the link ([`super::killswitch::Tunnel::with_v6`]). None is
+/// an empty list, not an error: most tunnels carry no IPv6, and a host with
+/// IPv6 disabled lists nothing.
+pub fn global_ipv6(iface: &str) -> io::Result<Vec<Ipv6Addr>> {
     let out = exec::run_ok(
         "ip",
-        &["-o", "addr", "show", "dev", exec::iface(iface)?],
+        &[
+            "-6",
+            "-o",
+            "addr",
+            "show",
+            "dev",
+            exec::iface(iface)?,
+            "scope",
+            "global",
+        ],
         None,
         exec::QUICK,
     )?;
-    Ok(parse_ipv6_addrs(&String::from_utf8_lossy(&out.stdout)))
+    Ok(parse_ipv6(&String::from_utf8_lossy(&out.stdout)))
 }
 
-fn parse_ipv6_addrs(text: &str) -> Vec<Ipv6Addr> {
-    let mut addrs = Vec::new();
-    for line in text.lines() {
-        let Some(rest) = line.split(" inet6 ").nth(1) else {
-            continue;
-        };
-        let cidr = rest.split_whitespace().next().unwrap_or("");
-        let Ok(ip) = cidr.split('/').next().unwrap_or("").parse::<Ipv6Addr>() else {
-            continue;
-        };
-        if ip.segments()[0] & 0xffc0 != 0xfe80 && !addrs.contains(&ip) {
-            addrs.push(ip);
-        }
-    }
-    addrs
+fn parse_ipv6(text: &str) -> Vec<Ipv6Addr> {
+    text.lines()
+        .filter_map(|line| line.split(" inet6 ").nth(1))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|cidr| cidr.split('/').next()?.parse::<Ipv6Addr>().ok())
+        .collect()
 }
 
 /// Whether a link of this name exists in this process's network namespace.
@@ -175,31 +172,18 @@ mod tests {
         assert!(parse_first_ipv4("wg0", "").is_err());
     }
 
-    /// The `inet6` lines of a family-less listing, link-local left out, and
-    /// the `inet` line not mistaken for one.
     #[test]
-    fn every_ipv6_address_but_link_local_is_read_off_a_listing() {
-        let text = "\
-3: wg0    inet 10.2.0.2/32 scope global wg0\\       valid_lft forever preferred_lft forever
-3: wg0    inet6 fd7d:1::2/128 scope global \\       valid_lft forever preferred_lft forever
-3: wg0    inet6 2001:db8::5/64 scope global \\       valid_lft forever preferred_lft forever
-3: wg0    inet6 fe80::1c2d:3e4f/64 scope link \\       valid_lft forever preferred_lft forever
-";
+    fn each_inet6_address_is_read_off_a_one_line_listing() {
+        let text = "4: wg0    inet6 2001:db8::2/128 scope global \\       valid_lft forever preferred_lft forever\n\
+                    4: wg0    inet6 fd00::2/64 scope global \\       valid_lft forever preferred_lft forever\n";
         assert_eq!(
-            parse_ipv6_addrs(text),
+            parse_ipv6(text),
             vec![
-                "fd7d:1::2".parse::<Ipv6Addr>().unwrap(),
-                "2001:db8::5".parse().unwrap(),
+                "2001:db8::2".parse::<Ipv6Addr>().unwrap(),
+                "fd00::2".parse().unwrap(),
             ],
         );
-        assert!(parse_ipv6_addrs("").is_empty());
-    }
-
-    #[test]
-    fn a_live_link_answers_the_ipv6_listing() {
-        // Loopback's `::1` is not link-local, where IPv6 is enabled at all.
-        assert!(ipv6_addrs("lo").is_ok());
-        assert!(ipv6_addrs("torrentd-nonexistent-iface").is_err());
+        assert!(parse_ipv6("").is_empty());
     }
 
     /// Asked of `ip`, from this process's namespace, and the absent answer is
