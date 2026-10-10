@@ -483,7 +483,7 @@ tests:
               severity: warning
               profile_id: acct_a
             exp_annotations:
-              summary: "libtorrent dropped alerts for profile acct_a; the alert loop is falling behind"
+              summary: "libtorrent dropped alerts for profile acct_a; the alert loop is falling behind, or a fence, pause-all or set online/offline announced every torrent at once"
 
   # The alert is a fraction of announces held for 30 minutes.
   #   acct_a: three of every four announces fail (a tracker outage). Fires.
