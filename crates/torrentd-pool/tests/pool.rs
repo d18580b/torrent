@@ -616,6 +616,113 @@ fn a_rescan_keeps_a_held_adopted_torrent_adopted_while_its_payload_is_partial() 
     assert_eq!(state_of(&store, "ab"), AdoptionState::Partial);
 }
 
+/// `ab`, files `src/T/a.bin` (64) and `src/T/b.bin` (32), adopted at `src`
+/// and held by a session, after `b.bin` moved to `misc/b.bin` and a rescan
+/// kept it `adopted` with its payload partial. Plus an unrelated loose file
+/// in `misc/`.
+fn held_adopted_with_a_file_moved_away(root: &Path) -> (PoolStore, i64) {
+    write_file(root, "src/T/a.bin", 64);
+    write_file(root, "src/T/b.bin", 32);
+    write_file(root, "misc/junk.txt", 9);
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let root_id = store.upsert_root(root).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    add_torrent(
+        &mut store,
+        "ab",
+        "T",
+        None,
+        &[("T/a.bin", 64), ("T/b.bin", 32)],
+    );
+    torrentd_pool::match_all(&mut store).unwrap();
+    assert_eq!(
+        store.adoption_base("ab").unwrap(),
+        Some((root_id, "src".to_owned()))
+    );
+    store
+        .set_adoption(
+            "ab",
+            AdoptionState::Adopted,
+            Some(root_id),
+            Some("src"),
+            Some(1),
+            None,
+            None,
+        )
+        .unwrap();
+
+    std::fs::create_dir_all(root.join("misc")).unwrap();
+    std::fs::rename(root.join("src/T/b.bin"), root.join("misc/b.bin")).unwrap();
+    torrentd_pool::scan_root(&mut store, root).unwrap();
+    let loaded = std::collections::HashSet::from(["ab".to_owned()]);
+    torrentd_pool::match_all_serving(&mut store, &loaded).unwrap();
+    assert_eq!(state_of(&store, "ab"), AdoptionState::Adopted);
+    (store, root_id)
+}
+
+#[test]
+fn a_delete_plan_guards_the_payload_a_held_adopted_torrent_has_not_found() {
+    // Kept `adopted` with a file it did not find, the torrent read as
+    // complete to the delete planner: its moved file was planned for
+    // deletion and nothing under its own base was protected.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (store, root_id) = held_adopted_with_a_file_moved_away(root);
+
+    // A file the size of the one it is missing is held back.
+    let steps = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "misc".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap();
+    assert_eq!(steps.len(), 1, "{steps:?}");
+    assert!(steps[0].src.ends_with("misc/junk.txt"), "{steps:?}");
+
+    // Where it expects its payload, nothing is deleted at all.
+    let err = build_plan(
+        &store,
+        &PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: "src/T".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(err.contains("not fully present"), "{err}");
+
+    // The executor's guard agrees.
+    let guard = torrentd_pool::plan::DeleteGuard::load(&store, root_id, root).unwrap();
+    assert!(guard.refusal("misc/b.bin", 32).is_some());
+    assert!(guard.refusal("misc/junk.txt", 9).is_none());
+}
+
+#[test]
+fn relocating_a_held_adopted_torrent_with_a_file_missing_is_refused() {
+    // Had nothing held it, the rescan would have read it `partial`, which a
+    // relocate refuses; held, it keeps `adopted` and must be refused too.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let (store, root_id) = held_adopted_with_a_file_moved_away(root);
+    let err = build_plan(
+        &store,
+        &PlanSpec::Relocate {
+            infohash: "ab".into(),
+            dest_root_id: root_id,
+            dest_rel: "dest".into(),
+        },
+        root_id,
+        root,
+    )
+    .unwrap_err();
+    assert!(err.contains("not all present"), "{err}");
+}
+
 #[test]
 fn releasing_the_owner_clears_its_adopted_verdict() {
     let dir = tempfile::tempdir().unwrap();
