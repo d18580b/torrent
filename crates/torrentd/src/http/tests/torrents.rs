@@ -258,6 +258,40 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         h.state.registry.lookup(&STALE).is_some(),
         "the entry stays, to clear with a plain delete"
     );
+    // A torrent the boot left unloaded on a live profile: no session holds
+    // it either, so `delete_files` is refused before anything changes, rather
+    // than answered 204 over a payload nothing touched.
+    h.state.unloaded_at_boot.lock().insert(ADDING);
+    let live = ProfileId::new("p");
+    h.state
+        .resume
+        .write(&live, &ADDING, b"resume-bytes")
+        .unwrap();
+    let resp = h
+        .write(
+            "DELETE",
+            &format!(
+                "/v1/torrents/{}?delete_files=true&confirm={}",
+                hex(ADDING),
+                hex(ADDING)
+            ),
+        )
+        .await;
+    assert_problem(&resp, 409, "payload-untrashable");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(detail.contains("unloaded"), "{detail}");
+    assert!(detail.contains("delete_files"), "{detail}");
+    assert_eq!(h.state.registry.lookup(&ADDING), Some(live.clone()));
+    assert!(h.state.unloaded_at_boot.lock().contains(&ADDING));
+    assert!(
+        h.state
+            .resume
+            .load_all(&live)
+            .unwrap()
+            .iter()
+            .any(|(ih, _)| *ih == ADDING),
+        "a refused delete leaves the resume file in place"
+    );
     // A cross-seed claims the same file in the pool index: deleting this
     // torrent's payload would delete that one's, so it is refused, and the
     // torrent stays loaded.
@@ -1342,12 +1376,41 @@ async fn deleting(h: &Harness, e: &Engines) {
         .await;
     assert_problem(&resp, 409, "torrent-adding");
     assert!(h.state.registry.lookup(&ADDING).is_some());
-    // Once the boot is known to have left it unloaded, it is clearable.
+    // Once the boot is known to have left it unloaded, it is clearable, and
+    // so are the resume file and `.torrent` its failed resume add left on
+    // disk, which would re-assign it at the next start.
     h.state.unloaded_at_boot.lock().insert(ADDING);
+    let live = ProfileId::new("p");
+    h.state
+        .resume
+        .write(&live, &ADDING, b"resume-bytes")
+        .unwrap();
+    h.state
+        .torrents
+        .write(&live, &ADDING, b"torrent-bytes")
+        .unwrap();
     h.write("DELETE", &format!("/v1/torrents/{}", hex(ADDING)))
         .await
         .assert_status(StatusCode::NO_CONTENT);
     assert!(h.state.registry.lookup(&ADDING).is_none());
+    assert!(
+        !h.state
+            .resume
+            .load_all(&live)
+            .unwrap()
+            .iter()
+            .any(|(ih, _)| *ih == ADDING),
+        "the resume store still holds the cleared torrent"
+    );
+    assert!(
+        !h.state
+            .torrents
+            .load_all(&live)
+            .unwrap()
+            .iter()
+            .any(|(ih, _)| *ih == ADDING),
+        "the .torrent store still holds the cleared torrent"
+    );
     assert!(
         !h.state.unloaded_at_boot.lock().contains(&ADDING),
         "a later add of the same infohash must not be taken for a boot leftover"

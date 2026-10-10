@@ -197,6 +197,10 @@ Nothing was changed: the torrent is still in its session. Rescan
 (`POST /v1/pool/scan`) and retry, or retry without `delete_files` to remove
 the torrent alone and deal with the files by hand.
 
+It is also the answer for a torrent the boot left unloaded: no session holds
+it, so nothing can reach its payload. Nothing was changed; retry without
+`delete_files` to clear its assignment, resume file and `.torrent`.
+
 ## `metadata-pending`
 
 **409.** The torrent was added from a magnet URI and has not received its
