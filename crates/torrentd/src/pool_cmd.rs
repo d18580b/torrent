@@ -22,12 +22,24 @@ pub fn scan(cfg: &Config) -> anyhow::Result<()> {
         .context("no [pool] section in the config file")?;
 
     let db = cfg.pool_db_path();
-    let mut store = PoolStore::open(&db).with_context(|| format!("open {}", db.display()))?;
+    // Exclusive: the scan below holds SQLite's write lock for its whole
+    // duration, and every write a running daemon made in that time would fail
+    // at once, a plan's step journal among them. So it refuses while the
+    // daemon has the index open, whether or not the daemon is scanning.
+    let mut store = match PoolStore::open_exclusive(&db) {
+        Ok(store) => store,
+        Err(torrentd_pool::PoolError::Busy) => anyhow::bail!(
+            "{} is open in another process, most likely the running daemon. \
+             `pool scan` runs only against a stopped daemon: stop it first, or rescan \
+             through the daemon with `POST /v1/pool/scan`",
+            db.display(),
+        ),
+        Err(e) => return Err(e).with_context(|| format!("open {}", db.display())),
+    };
     println!("index: {}", db.display());
 
-    // One transaction for the whole scan, which also takes SQLite's write lock:
-    // if the daemon is running and scanning, this refuses with PoolError::Busy
-    // rather than interleaving two rebuilds of the claim table.
+    // One transaction for the whole scan, so a reader never sees the claim
+    // table half rebuilt.
     store.in_transaction(|store| scan_inner(cfg, pool_cfg, store))
 }
 
@@ -351,6 +363,24 @@ listen_interfaces = "0.0.0.0:6881"
         )
         .unwrap();
         assert!(open_registry(&cfg).is_err());
+    }
+
+    /// A CLI scan beside a running daemon held SQLite's write lock for the
+    /// whole scan and failed every daemon write meanwhile, a plan's step
+    /// journal included. It must refuse before it writes anything.
+    #[test]
+    fn a_scan_refuses_while_the_daemon_holds_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config::minimal_for_tests(dir.path(), true);
+        // What the daemon's `PoolService::open` holds for its whole life.
+        let daemon = PoolStore::open(&cfg.pool_db_path()).unwrap();
+
+        let e = scan(&cfg).unwrap_err().to_string();
+        assert!(e.contains("stopped daemon"), "{e}");
+        assert!(daemon.roots().unwrap().is_empty(), "the refused scan wrote");
+
+        drop(daemon);
+        scan(&cfg).expect("the scan runs once the daemon is gone");
     }
 
     #[test]
