@@ -79,6 +79,11 @@ pub struct PoolService {
     /// `torrentd pool …`, which runs no session. A scan keeps every torrent
     /// in it in the index even after its `.torrent` leaves the library.
     loaded: std::sync::OnceLock<Arc<StateMap>>,
+    /// The sessions themselves, so a scan can ask each where it holds the
+    /// torrents in `loaded`. Set once by the daemon; absent for
+    /// `torrentd pool …`, and then a scan places a loaded torrent by its
+    /// recorded base alone.
+    source: std::sync::OnceLock<Arc<dyn AlertSource>>,
     /// Where the sessions' `.torrent` files are kept, per profile. Set once
     /// by the daemon; absent for `torrentd pool …`, which adds nothing.
     /// Every adoption writes its `.torrent` here, because the resume scan
@@ -154,6 +159,7 @@ impl PoolService {
             allow_mutations: pool_cfg.allow_mutations,
             metrics: std::sync::OnceLock::new(),
             loaded: std::sync::OnceLock::new(),
+            source: std::sync::OnceLock::new(),
             torrents: std::sync::OnceLock::new(),
             registry: std::sync::OnceLock::new(),
         })))
@@ -369,6 +375,56 @@ impl PoolService {
     /// sets this once after opening; a second call is ignored.
     pub fn set_state(&self, state: Arc<StateMap>) {
         let _ = self.loaded.set(state);
+    }
+
+    /// The sessions, so a scan places each loaded torrent where its session
+    /// holds it. The daemon sets this once after opening; a second call is
+    /// ignored.
+    pub fn set_source(&self, source: Arc<dyn AlertSource>) {
+        let _ = self.source.set(source);
+    }
+
+    /// Hex info-hash of every torrent in `state`, with the `save_path` its
+    /// session reports where the session could be asked.
+    ///
+    /// Read before a scan takes the writer: each is a call into a session,
+    /// and none of them needs the index. One that fails is logged and left
+    /// `None`, and the matcher falls back to the recorded base for it.
+    fn session_save_paths(
+        &self,
+        state: &StateMap,
+    ) -> std::collections::HashMap<String, Option<PathBuf>> {
+        let source = self.source.get();
+        state
+            .infohashes()
+            .into_iter()
+            .map(|ih| {
+                let save_path = source.and_then(|source| {
+                    let st = state.get(&ih)?;
+                    let details = match source.engine_for(&st.profile_id) {
+                        Some(engine) => {
+                            engine.torrent_details(st.handle).map_err(|e| e.to_string())
+                        }
+                        None => Err("its profile has no session".to_owned()),
+                    };
+                    match details {
+                        Ok(d) => Some(PathBuf::from(d.save_path)),
+                        Err(e) => {
+                            warn!(
+                                target: "torrentd::pool",
+                                infohash = %ih.to_hex(),
+                                profile_id = %st.profile_id,
+                                error.cause = %e,
+                                "could not read where a session holds a torrent; the scan \
+                                 places it by its recorded base",
+                            );
+                            None
+                        }
+                    }
+                });
+                (ih.to_hex(), save_path)
+            })
+            .collect()
     }
 
     /// Where the pool's failures are counted. The daemon sets this once after
@@ -667,6 +723,14 @@ impl PoolService {
                 }
             }
         };
+        // Where each session holds what it serves, read before the writer is
+        // taken, since every read is a call into a session: a torrent loaded
+        // between this and the match is placed by its recorded base, as it
+        // was before the sessions were asked.
+        let serving: Option<std::collections::HashMap<String, Option<PathBuf>>> = self
+            .loaded
+            .get()
+            .map(|state| self.session_save_paths(state));
         let mut store = self.lock_writer();
         store.in_transaction(|store| {
             let mut summary = ScanSummary::default();
@@ -680,22 +744,38 @@ impl PoolService {
                 summary.errors += s.errors;
                 count(&s);
             }
-            let serving: Option<std::collections::HashSet<String>> = self
+            // What is loaded is read again under the writer, as it always
+            // was: a torrent loaded since the save paths were read must still
+            // count as served, or its `adopted` verdict would be demoted.
+            let loaded: Option<std::collections::HashSet<String>> = self
                 .loaded
                 .get()
                 .map(|s| s.infohashes().iter().map(|ih| ih.to_hex()).collect());
             let none = std::collections::HashSet::new();
-            let loaded = serving.as_ref().unwrap_or(&none);
-            let lib = torrentd_pool::scan_library(store, &self.library_dir, loaded)
-                .with_context(|| format!("scan library {}", self.library_dir.display()))?;
+            let lib = torrentd_pool::scan_library(
+                store,
+                &self.library_dir,
+                loaded.as_ref().unwrap_or(&none),
+            )
+            .with_context(|| format!("scan library {}", self.library_dir.display()))?;
             summary.torrents = lib.torrents_indexed;
             summary.errors += lib.errors;
             count(&lib);
 
             // Only where the sessions' view is known may an `adopted` verdict
             // nothing holds be demoted; without one, every verdict stands.
-            let m = match &serving {
-                Some(loaded) => torrentd_pool::match_all_serving(store, loaded)?,
+            let m = match loaded {
+                Some(loaded) => {
+                    let save_paths = serving.as_ref();
+                    let loaded = loaded
+                        .into_iter()
+                        .map(|ih| {
+                            let at = save_paths.and_then(|s| s.get(&ih).cloned().flatten());
+                            (ih, at)
+                        })
+                        .collect();
+                    torrentd_pool::match_all_serving(store, &loaded)?
+                }
                 None => torrentd_pool::match_all(store)?,
             };
             summary.matched = m.matched;
@@ -2345,6 +2425,80 @@ mod tests {
         state.remove(&hash, &ProfileId::new("p"), None);
         pool.scan().unwrap();
         assert!(pool.with_store(|s| s.torrent(&ih).unwrap()).is_none());
+    }
+
+    /// The daemon's scan places a loaded torrent where its session holds it,
+    /// not where the index recorded it, when both copies are complete.
+    #[test]
+    fn a_scan_places_a_loaded_torrent_at_its_session_save_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = super::PoolService::open(&cfg).unwrap().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(root.join("seed")).unwrap();
+        std::fs::write(root.join("a"), b"x").unwrap();
+        std::fs::write(root.join("seed/a"), b"x").unwrap();
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), &bare).unwrap();
+        let hash = libtorrent_safe::info_hash_from_torrent(&bare).unwrap();
+        let ih = hash.to_hex();
+        pool.scan().unwrap();
+        let root_id = pool.roots()[0].0;
+        // Recorded at the copy under `seed`.
+        pool.with_store_mut(|s| {
+            s.set_adoption(
+                &ih,
+                super::AdoptionState::Adopted,
+                Some(root_id),
+                Some("seed"),
+                Some(1),
+                None,
+                None,
+            )
+        })
+        .unwrap();
+
+        // The session reads from the root.
+        let mock = std::sync::Arc::new(torrentd_engine::MockEngine::new());
+        let handle = mock.register_handle(hash);
+        mock.set_torrent_details(
+            handle,
+            libtorrent_safe::TorrentDetails {
+                save_path: root.to_string_lossy().into_owned(),
+                ..torrentd_engine::MockEngine::default_details()
+            },
+        );
+        let engine: std::sync::Arc<dyn torrentd_engine::TorrentEngine> = mock;
+        let state = std::sync::Arc::new(torrentd_engine::StateMap::new());
+        state.insert(
+            hash,
+            TorrentState::newly_added(handle, ProfileId::new("p"), Instant::now()),
+        );
+        pool.set_state(state);
+
+        // Without the sessions to ask, the recorded base stands.
+        pool.scan().unwrap();
+        assert_eq!(
+            pool.with_store(|s| s.adoption_base(&ih).unwrap()),
+            Some((root_id, "seed".to_owned()))
+        );
+
+        pool.set_source(std::sync::Arc::new(torrentd_engine::ProfileSource::new(
+            vec![(ProfileId::new("p"), engine)],
+        )));
+        pool.scan().unwrap();
+        assert_eq!(
+            pool.with_store(|s| s.adoption_base(&ih).unwrap()),
+            Some((root_id, String::new()))
+        );
+        assert_eq!(
+            pool.with_store(|s| s.adoption_state(&ih).unwrap()),
+            Some(super::AdoptionState::Adopted)
+        );
+        let orphans = pool.with_store(|s| s.orphan_files(root_id, "").unwrap());
+        assert_eq!(orphans, vec!["seed/a".to_owned()]);
     }
 
     fn pending(ih: InfoHash, profile: &str) -> super::PendingVerify {
