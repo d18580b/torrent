@@ -54,18 +54,39 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             let Some(ih) = hdr.infohash else { return };
             let now = ctx.clock.now();
             // Record the error now rather than waiting for the next
-            // `state_update` to report it. libtorrent follows every
-            // `file_error_alert` a seeder can reach (a failed read, a failed
-            // check, a failed priority change) with `set_error` + `pause()`,
-            // but the status that carries `errc` arrives later. A retry timer
-            // that comes due in between would otherwise see no error and a
-            // phase other than `Checking`, and retire, leaving the torrent
-            // error-paused with no timer. Where libtorrent did not set an
-            // error (ENOMEM, or a write failure it routed to upload mode),
-            // the next status update for this torrent clears the flag again.
+            // `state_update` to report it. A `file_error_alert` from a failed
+            // check, a failed `read_piece` or a failed priority change comes
+            // with `set_error` + `pause()` (vendor/libtorrent/src/torrent.cpp),
+            // but the status that carries `errc` arrives later.
+            // A retry timer that comes due in between would otherwise see no
+            // error and a phase other than `Checking`, and retire, leaving
+            // the torrent error-paused with no timer.
+            //
+            // Where libtorrent did not set an error, the next status update
+            // clears the flag again and `DiskError` stays: a disk read for a
+            // peer's request that fails only rejects the request and posts
+            // this alert (vendor/libtorrent/src/peer_connection.cpp), so the
+            // torrent keeps reporting `seeding` while it cannot serve; ENOMEM
+            // and a write failure routed to upload mode leave no error
+            // either. The retry re-checks such a torrent, which is the one
+            // probe that settles whether its files can be read.
+            //
+            // So a torrent already in `DiskError` that a status update has
+            // since reported free of a libtorrent error is still serving, and
+            // a further `file_error` on it is another failed peer read: leave
+            // the flag clear. Setting it would send a retry that comes due
+            // before the next update down the resume path, where `resume()`
+            // is a no-op on an unpaused torrent that still counts as an
+            // attempt and backs off, so peers whose reads keep failing could
+            // push the re-check out towards hourly. A check the retry started
+            // moves the torrent to `Checking` first, so a `file_error` from
+            // that check is still recorded as libtorrent's error-and-pause.
             ctx.state.update(&ih, |st| {
+                let still_serving = st.phase == TorrentPhase::DiskError && !st.has_error;
                 st.phase = TorrentPhase::DiskError;
-                st.has_error = true;
+                if !still_serving {
+                    st.has_error = true;
+                }
                 if st.retry.is_none() {
                     st.retry = Some(RetryState::first(now));
                 }
@@ -197,6 +218,40 @@ mod tests {
         assert!(metrics.calls().iter().any(
             |c| matches!(c, MetricCall::IncCounter { name, .. } if name == "disk_errors_total")
         ));
+    }
+
+    /// A torrent a status update already showed in `DiskError` with no
+    /// libtorrent error is still serving: another failed peer read must not
+    /// mark it error-paused, or the retry would take the resume path on it.
+    /// One in any other phase (a check the retry started, say) still records
+    /// the error.
+    #[test]
+    fn a_further_file_error_on_a_serving_disk_error_torrent_records_no_libtorrent_error() {
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        seed_state(&state, 0x44);
+        let file_error = || Alert::FileError {
+            hdr: hdr(0x44, AlertKind::FileError),
+            error_code: 13,
+            filename: "data.bin".into(),
+            operation: "file_read".into(),
+            message: "Permission denied".into(),
+        };
+        state.update(&ih(0x44), |st| {
+            st.phase = TorrentPhase::DiskError;
+            st.has_error = false;
+        });
+        dispatch(&file_error(), &state, &metrics);
+        let st = state.get(&ih(0x44)).unwrap();
+        assert_eq!(st.phase, TorrentPhase::DiskError);
+        assert!(!st.has_error, "a further peer-read failure set has_error");
+        assert!(st.retry.is_some(), "retry timer must be armed");
+
+        state.update(&ih(0x44), |st| st.phase = TorrentPhase::Checking);
+        dispatch(&file_error(), &state, &metrics);
+        let st = state.get(&ih(0x44)).unwrap();
+        assert_eq!(st.phase, TorrentPhase::DiskError);
+        assert!(st.has_error, "a check's file error must record the error");
     }
 
     #[test]

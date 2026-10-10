@@ -164,10 +164,12 @@ pub struct TorrentState {
     pub is_finished: bool,
     pub is_seeding: bool,
     /// libtorrent holds an error on this torrent, as of the last
-    /// state_update_alert. A disk error that libtorrent does not route to
-    /// upload mode (every read failure, and any failure while checking) sets
-    /// one *and* pauses the torrent; `resume()` clears both. This is what the
-    /// disk-error retry has to recover, so it is what the retry keys on.
+    /// state_update_alert. A disk error that reaches libtorrent's
+    /// `handle_disk_error` and is not routed to upload mode (any failure while
+    /// checking, a failed `read_piece`) sets one *and* pauses the torrent;
+    /// `resume()` clears both, so the disk-error retry resumes a torrent that
+    /// has one. A failed disk read for a peer's request sets neither: that
+    /// torrent stays `DiskError` with this false, and the retry re-checks it.
     pub has_error: bool,
     /// Outcome of the most recent `move_storage`, or `None` if none was ever
     /// requested.
