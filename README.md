@@ -470,9 +470,13 @@ daemon-wide gauge, seeded at 0 at startup whether or not any kill switch or any
 > [`deploy/prometheus/`](deploy/prometheus) and the Grafana dashboard in
 > [`deploy/dashboard.json`](deploy/dashboard.json) read only series that table
 > holds, and `cargo test -p torrentd` fails if either reads one it does not.
-> Most daemon counters are written at zero from boot, so `increase()` sees
-> their first event; a series the table marks "on first event" reads as "no
-> data" rather than zero until something happens. The per-profile families do
+> Most daemon counters are written at zero from boot, so `increase()` sees an
+> event that follows the first scrape. What a boot counts comes before any
+> scrape, so it is already in the counter's first sample, where `increase()`
+> cannot see it; the `torrentd_boot_*` gauges carry what the boot counted, and
+> the alerts that read those counters also fire on them. A series the table
+> marks "on first event" reads as "no data" rather than zero until something
+> happens. The per-profile families do
 > not wait for one: every family a per-profile monitor owns is pre-registered at
 > its baseline when that monitor starts, so `rate()` and alerting queries over
 > it resolve on a healthy daemon rather than on the first event ever to occur.
