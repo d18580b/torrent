@@ -1242,8 +1242,10 @@ impl Config {
 /// A root that cannot be stat'ed is skipped by the first test, and the second
 /// is skipped where `mountinfo` is `None`. FUSE union views (shfs, mergerfs)
 /// sit on their own device with their own inode numbers, so neither test can
-/// relate one to its branches; `docs/operations.md` forbids listing them side
-/// by side, and the delete step's inode check is the backstop for what slips.
+/// relate one to its branches. The delete step's `(dev, ino)` check does not
+/// cover them either: a file seen through the view carries the view's device,
+/// which never equals the branch file's. That case is not covered;
+/// `docs/operations.md` forbids listing a view beside its branches.
 fn check_roots_do_not_alias(roots: &[PathBuf], mountinfo: Option<&str>) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 

@@ -686,8 +686,9 @@ refuses to start on two roots that alias one tree through a bind mount
 view such as unRAID's `/mnt/user` (shfs) or a mergerfs pool, which has its own
 device and inode numbers, so never list a union view beside one of its
 branches (`/mnt/user/media` with `/mnt/disk3/media`): list the view, or the
-branches, not both. A delete step still refuses a file that is a hard link to
-a claimed file, but an alias through a union view can slip past that too.
+branches, not both. A delete plan leaves out, and a delete step refuses, a
+file that is a hard link to a claimed file, but neither catches an alias
+through a union view: the view's device number never matches the branch's.
 Nothing re-points stored paths. If a path changes anyway:
 
 - **A `[pool] roots` entry.** The next scan drops the old root from the
