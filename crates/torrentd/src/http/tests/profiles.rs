@@ -504,14 +504,18 @@ async fn states(cov: &Arc<Coverage>) {
     assert_eq!(detail["status"], "active");
     assert_eq!(detail["effective_state"], "online");
     assert_eq!(detail["paused_for_vpn"], 0);
-    assert_eq!(
+    // Resumed by a paced task that goes on after the response.
+    let resumed = || {
         calls(
             &eng_b,
-            |c| matches!(c, RecordedCall::ResumeTorrent(x) if *x == hb)
-        ),
-        1,
-        "the torrents the fence paused are resumed",
-    );
+            |c| matches!(c, RecordedCall::ResumeTorrent(x) if *x == hb),
+        )
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while resumed() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(resumed(), 1, "the torrents the fence paused are resumed");
 
     // An id no profile declares, and one that is not UTF-8.
     assert_problem(&set("typo", "offline").await, 404, "profile-not-found");

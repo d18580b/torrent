@@ -6,6 +6,8 @@
 //! `Arc<ProfileRegistry>` rather than an `Option`.
 
 use std::net::IpAddr;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -16,6 +18,7 @@ use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus;
 use torrentd_engine::Settings;
 use torrentd_engine::TorrentEngine;
+use torrentd_engine::TorrentHandle;
 
 use crate::profile_state::DesiredStates;
 use crate::profile_state::Record;
@@ -54,6 +57,31 @@ pub struct ProfileEntry {
     /// cannot move.
     pub session_ip: Option<IpAddr>,
     health: Mutex<ProfileHealth>,
+    /// The paced resume that lifting a fence started in this profile, while it
+    /// runs. See [`ProfileEntry::begin_resume`].
+    resuming: Mutex<Option<Arc<PacedResume>>>,
+}
+
+/// A paced resume a fence's lift started in one profile
+/// (`vpn_monitor::spawn_lift`): every torrent it was asked to resume, and
+/// whether it has been told to stop.
+#[derive(Debug)]
+pub struct PacedResume {
+    handles: Vec<TorrentHandle>,
+    cancelled: AtomicBool,
+}
+
+impl PacedResume {
+    /// Every torrent the run was asked to resume, those it already has
+    /// included.
+    pub fn handles(&self) -> &[TorrentHandle] {
+        &self.handles
+    }
+
+    /// Whether the run has been told to stop before its next batch.
+    pub fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
 }
 
 impl ProfileEntry {
@@ -77,6 +105,7 @@ impl ProfileEntry {
                 forwarded_epoch,
                 port_forward_ok: true,
             }),
+            resuming: Mutex::new(None),
         }
     }
 
@@ -90,6 +119,48 @@ impl ProfileEntry {
 
     pub fn update_health<F: FnOnce(&mut ProfileHealth)>(&self, f: F) {
         f(&mut self.health.lock());
+    }
+
+    /// Record a paced resume of `handles` as the one running in this profile,
+    /// telling the one before it, if any, to stop.
+    ///
+    /// A lift resumes its torrents a batch at a time, so a fence can land
+    /// while some are still paused. The fence takes the run back with
+    /// [`ProfileEntry::take_resume`], so the torrents it had not reached yet
+    /// are not lost to the next lift: they read as paused when the fence
+    /// looks for what is running.
+    pub fn begin_resume(&self, handles: Vec<TorrentHandle>) -> Arc<PacedResume> {
+        let run = Arc::new(PacedResume {
+            handles,
+            cancelled: AtomicBool::new(false),
+        });
+        if let Some(before) = self.resuming.lock().replace(run.clone()) {
+            before.cancelled.store(true, Ordering::SeqCst);
+        }
+        run
+    }
+
+    /// Stop the paced resume running in this profile before its next batch,
+    /// and hand back every torrent it was asked to resume. `None` when none
+    /// is running.
+    pub fn take_resume(&self) -> Option<Vec<TorrentHandle>> {
+        let run = self.resuming.lock().take()?;
+        run.cancelled.store(true, Ordering::SeqCst);
+        Some(run.handles.clone())
+    }
+
+    /// Clear `run` once it has finished, unless another has replaced it.
+    pub fn end_resume(&self, run: &Arc<PacedResume>) {
+        let mut resuming = self.resuming.lock();
+        if resuming.as_ref().is_some_and(|r| Arc::ptr_eq(r, run)) {
+            *resuming = None;
+        }
+    }
+
+    /// Whether a paced resume is running in this profile.
+    #[cfg(test)]
+    pub fn is_resuming(&self) -> bool {
+        self.resuming.lock().is_some()
     }
 }
 

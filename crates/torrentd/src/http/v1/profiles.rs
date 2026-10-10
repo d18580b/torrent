@@ -10,13 +10,13 @@ use kynos::prelude::*;
 use kynos::security::auth::Scoped;
 use serde::Deserialize;
 use serde::Serialize;
+use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::DesiredState;
 use torrentd_engine::MetricsSink;
 use torrentd_engine::PortForwardMode as EnginePortForwardMode;
 use torrentd_engine::ProfileId;
 use torrentd_engine::ProfileStatus as EngineProfileStatus;
 use torrentd_engine::TorrentEngine;
-use tracing::error;
 use tracing::info;
 use tracing::warn;
 
@@ -230,8 +230,9 @@ pub struct BulkOutcome {
     /// `failed_count` is larger, repeat the bulk operation after those.
     #[schema(max_items = 100)]
     pub failed_infohashes: Vec<InfoHashHex>,
-    /// Profiles this request did not act on, each with why. Always empty for
-    /// a single profile's operation, which refuses instead.
+    /// Profiles this request did not act on, or not on all of, each with why.
+    /// A single profile's operation refuses a profile it cannot act on, so
+    /// lists one here only when a resume was cut short by a fence.
     pub skipped_profiles: Vec<SkippedProfile>,
 }
 
@@ -448,9 +449,10 @@ pub enum SetProfileStateError {
 /// Setting a fenced (`vpn_down`) profile online is how the fence is lifted
 /// without a restart. The tunnel is checked first: its interface must hold
 /// the address the session is bound to, and a packet from that address must
-/// route by the tunnel. If it passes, the fence's pauses are undone and the
-/// VPN monitor watches the profile again, handshake included; if it fails,
-/// `409` and nothing changes. A profile that never came up keeps the setting
+/// route by the tunnel. If it passes, the VPN monitor watches the profile
+/// again, handshake included, and the fence's pauses are undone 100 torrents
+/// a second, going on after the response, since each torrent resumed
+/// announces to its trackers; if it fails, `409` and nothing changes. A profile that never came up keeps the setting
 /// for its next boot. `offline_all`, while on, keeps every profile offline
 /// whatever this sets.
 #[kynos::patch("/profiles/{profile_id}", tag = Profiles)]
@@ -528,6 +530,9 @@ fn set_state(
 /// The fence paused every torrent in the profile and recorded none of them,
 /// so every one is resumed, including one the operator had paused on its own
 /// before the fence. Pause it again after.
+///
+/// The resumes are paced, a batch a second, by a task that goes on after the
+/// request is answered ([`crate::vpn_monitor::spawn_lift`]).
 fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     let profile_id = entry.id();
     entry.update_health(|h| {
@@ -539,27 +544,19 @@ fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     s.metrics.set_gauge("profile_vpn_tunnel_up", 1.0, &labels);
     s.metrics
         .set_gauge("profile_torrents_paused_vpn_down", 0.0, &labels);
-    let mut resumed = 0u64;
-    let mut refused = 0u64;
-    for h in s.state.handles_for_profile(profile_id) {
-        match entry.engine.resume_torrent(h) {
-            Ok(()) => resumed += 1,
-            Err(e) => {
-                refused += 1;
-                error!(
-                    profile_id = %profile_id,
-                    infohash = %h.infohash,
-                    error.cause = %e,
-                    "could not resume a torrent while lifting the profile's fence",
-                );
-            }
-        }
-    }
+    let handles = s.state.handles_for_profile(profile_id);
     info!(
         profile_id = %profile_id,
-        torrent_count = resumed,
-        failed_count = refused,
-        "fence lifted: the tunnel checked healthy and the profile was set online",
+        torrent_count = handles.len(),
+        "fence lifted: the tunnel checked healthy and the profile was set online; resuming \
+         its torrents a batch at a time",
+    );
+    crate::vpn_monitor::spawn_lift(
+        &s.profiles,
+        &s.metrics,
+        entry,
+        handles,
+        crate::vpn_monitor::Lift::SetOnline,
     );
 }
 
@@ -744,6 +741,65 @@ async fn for_each_torrent(
     .await
 }
 
+/// Resume every torrent `profile_id` holds, through the shared pacer
+/// ([`crate::vpn_monitor::resume_paced`]), and add what it reached to `out`.
+/// A profile fenced before the last batch is added to `skipped_profiles` with
+/// how many it did not reach.
+///
+/// On a task of its own, which the request only awaits, so a client that
+/// stops waiting does not leave the profile half resumed.
+async fn resume_each(s: &AppState, profile_id: &ProfileId, out: &mut BulkOutcome) {
+    let handles = s.state.handles_for_profile(profile_id);
+    let (profiles, metrics, id) = (
+        Arc::clone(&s.profiles),
+        Arc::clone(&s.metrics),
+        profile_id.clone(),
+    );
+    let task = tokio::spawn(async move {
+        let mut reached = Reached {
+            ok: 0,
+            failed_count: 0,
+            failed: Vec::new(),
+        };
+        let resumed = crate::vpn_monitor::resume_paced(
+            profiles,
+            id,
+            &handles,
+            REANNOUNCE_PACE,
+            || false,
+            metrics,
+            |h, _| reached.fail(h),
+        )
+        .await;
+        reached.ok = u32::try_from(resumed.resumed).unwrap_or(u32::MAX);
+        reached.keep_smallest();
+        (reached, resumed.not_reached)
+    });
+    let (reached, not_reached) = match task.await {
+        Ok(v) => v,
+        Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+        // Only a runtime shutting down cancels the task, and then the request
+        // that awaited it is being torn down with it.
+        Err(e) => panic!("resume task did not run: {e}"),
+    };
+    tally(out, reached);
+    if not_reached > 0 {
+        warn!(
+            profile_id = %profile_id,
+            torrent_count = not_reached,
+            "profile fenced while its torrents were being resumed; the rest stay paused",
+        );
+        out.skipped_profiles.push(SkippedProfile {
+            profile_id: profile_id.as_str().to_owned(),
+            reason: ProfileUnavailableReason::VpnDown,
+            detail: format!(
+                "profile fenced (vpn_down) while its torrents were being resumed: {not_reached} \
+                 were not resumed and stay paused until the profile is set online."
+            ),
+        });
+    }
+}
+
 /// Add one profile's share to `out`, naming its failures while there is room.
 ///
 /// Across profiles the named ones are the smallest infohashes that failed,
@@ -796,6 +852,12 @@ pub async fn pause_profile(
 
 /// Resume every torrent in one profile.
 ///
+/// Each torrent resumed announces to its trackers, so they are resumed 100 a
+/// second, and the response comes once the last is: about a second per 100
+/// torrents in the profile. The resume goes on if the client stops waiting.
+/// A profile fenced while it runs stops it there: the profile is then listed
+/// in `skipped_profiles` (`vpn_down`), with how many torrents stayed paused.
+///
 /// Refused with `409 profile-unavailable` for a profile that never came up
 /// (nothing of it is loaded), for a fenced (`vpn_down`) one, whose torrents
 /// were paused because the tunnel is gone and stay paused until the profile
@@ -808,12 +870,9 @@ pub async fn resume_profile(
     Path(path): Path<ProfilePath>,
 ) -> Result<Json<BulkOutcome>, ProfileBulkError> {
     let profile_id = ProfileId::new(path.profile_id);
-    let engine = unfenced_engine(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
+    unfenced_engine(&s, &profile_id).map_err(|p| explain(&s, &profile_id, p))?;
     let mut out = BulkOutcome::default();
-    tally(
-        &mut out,
-        for_each_torrent(&s, &profile_id, engine, |e, h| e.resume_torrent(h).is_ok()).await,
-    );
+    resume_each(&s, &profile_id, &mut out).await;
     if out.failed_count > 0 {
         warn!(
             profile_id = %profile_id,
@@ -887,6 +946,13 @@ pub async fn pause_all_torrents(
 /// not stop the others resuming, and resuming it is exactly what the
 /// profile's own resume-all refuses. Profiles that never came up are listed
 /// too.
+///
+/// Each torrent resumed announces to its trackers, so each profile's are
+/// resumed 100 a second, one profile after another, and the response comes
+/// once the last is: about a second per 100 torrents in the daemon. The
+/// resume goes on if the client stops waiting. A profile fenced while its
+/// torrents are being resumed is listed in `skipped_profiles` (`vpn_down`)
+/// with how many stayed paused.
 #[kynos::post("/torrents/resume-all", tag = Torrents)]
 pub async fn resume_all_torrents(
     _caller: Scoped<Bearer, Write>,
@@ -915,11 +981,7 @@ pub async fn resume_all_torrents(
             });
             continue;
         }
-        let reached = for_each_torrent(&s, entry.id(), Arc::clone(&entry.engine), |e, h| {
-            e.resume_torrent(h).is_ok()
-        })
-        .await;
-        tally(&mut out, reached);
+        resume_each(&s, entry.id(), &mut out).await;
     }
     if out.failed_count > 0 {
         warn!(

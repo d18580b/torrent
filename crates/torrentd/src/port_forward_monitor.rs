@@ -8,8 +8,8 @@
 //! (`apply_settings` → `reopen_listen_sockets`), waits for the alert loop to
 //! relay the session's `listen_succeeded` for the new endpoint, and only then
 //! records the port and reannounces every torrent in the profile — paced,
-//! [`REANNOUNCE_BATCH`] at a time — so trackers learn the new port within
-//! seconds to minutes rather than at their next scheduled announce, and never
+//! [`torrentd_engine::port_forward::REANNOUNCE_BATCH`] at a time — so
+//! trackers learn the new port within seconds to minutes rather than at their next scheduled announce, and never
 //! all at once. A `listen_failed` for it, or no outcome within
 //! [`torrentd_engine::port_forward::LISTEN_CONFIRM_TIMEOUT`], is a `rebind`
 //! failure and is retried like one. A new port another profile already holds
@@ -45,7 +45,6 @@ use torrentd_engine::port_forward::Reannounce;
 use torrentd_engine::port_forward::RebindFailure;
 use torrentd_engine::port_forward::RebindTarget;
 use torrentd_engine::port_forward::LISTEN_CONFIRM_TIMEOUT;
-use torrentd_engine::port_forward::REANNOUNCE_BATCH;
 use torrentd_engine::port_forward::REANNOUNCE_PACE;
 use torrentd_engine::renew_and_rebind;
 use torrentd_engine::MetricsSink;
@@ -363,9 +362,10 @@ impl Next {
     }
 }
 
-/// Reannounce `handles` [`REANNOUNCE_BATCH`] at a time, `pace` apart, through
-/// the shared [`Pacer`], then record how long the whole reannounce
-/// took from `detected` and what the session refused.
+/// Reannounce `handles` [`torrentd_engine::port_forward::REANNOUNCE_BATCH`]
+/// at a time, `pace` apart, through the shared [`Pacer`], then record how
+/// long the whole reannounce took from `detected` and what the session
+/// refused.
 ///
 /// A rebind used to reannounce every torrent in the profile in one burst,
 /// inside the blocking renewal; at tens of thousands of torrents that was a
@@ -866,6 +866,7 @@ mod tests {
 
     use libtorrent_safe::InfoHash;
     use torrentd_engine::metrics::MetricCall;
+    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
     use torrentd_engine::MockEngine;
     use torrentd_engine::MockForwarder;
     use torrentd_engine::PortForwardError;
