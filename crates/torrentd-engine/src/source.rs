@@ -7,7 +7,6 @@
 //! with a single profile is that vector with one entry, and handler logic does
 //! not branch on how many there are.
 
-use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
@@ -62,17 +61,30 @@ pub trait AlertSource: Send + Sync + std::fmt::Debug {
 #[derive(Debug)]
 pub struct ProfileSource {
     entries: Vec<(ProfileId, Arc<dyn TorrentEngine>)>,
-    /// Alerts [`ProfileSource::hold_alerts`] took off a session before the
-    /// alert loop ran, oldest first. `drain` hands them out a bounded batch
-    /// at a time, ahead of anything their own session posted since.
-    held: Mutex<VecDeque<(ProfileId, Alert)>>,
+    held: Mutex<Held>,
+}
+
+/// Alerts [`ProfileSource::hold_alerts`] took off a session before the alert
+/// loop ran. `drain` hands them out a bounded batch at a time, ahead of
+/// anything their own session posted since.
+#[derive(Debug)]
+struct Held {
+    /// Oldest first, each tagged with its profile's index in `entries`.
+    queue: VecDeque<(usize, Alert)>,
+    /// How many of `queue`'s alerts each entry has, by the same index, so a
+    /// drain learns which profiles still hold alerts without walking `queue`.
+    counts: Vec<usize>,
 }
 
 impl ProfileSource {
     pub fn new(entries: Vec<(ProfileId, Arc<dyn TorrentEngine>)>) -> Self {
+        let held = Held {
+            queue: VecDeque::new(),
+            counts: vec![0; entries.len()],
+        };
         Self {
             entries,
-            held: Mutex::new(VecDeque::new()),
+            held: Mutex::new(held),
         }
     }
 
@@ -87,19 +99,22 @@ impl ProfileSource {
     /// than handling it, leaves every alert for the loop to dispatch in the
     /// order the session posted it.
     pub fn hold_alerts(&self, profile: &ProfileId) -> usize {
-        let Some(engine) = self.engine_for(profile) else {
+        let Some(idx) = self.entries.iter().position(|(p, _)| p == profile) else {
             return 0;
         };
+        let engine = &self.entries[idx].1;
         let mut held = self.held.lock();
-        let before = held.len();
+        let before = held.queue.len();
         loop {
             let popped = engine.pop_alerts();
             if popped.is_empty() {
                 break;
             }
-            held.extend(popped.into_iter().map(|a| (profile.clone(), a)));
+            held.queue.extend(popped.into_iter().map(|a| (idx, a)));
         }
-        held.len() - before
+        let taken = held.queue.len() - before;
+        held.counts[idx] += taken;
+        taken
     }
 }
 
@@ -113,24 +128,26 @@ impl AlertSource for ProfileSource {
     ///
     /// A profile with alerts still held is not popped, so nothing its session
     /// posted since overtakes them; the other profiles are popped as usual.
+    /// Which profiles still hold alerts comes from a per-profile count, so a
+    /// drain costs its batch and the profile count, not the held queue's
+    /// length.
     fn drain(&self) -> Vec<(ProfileId, Alert)> {
         let (mut out, still_held) = {
             let mut held = self.held.lock();
-            let n = held.len().min(MAX_ALERTS_PER_POP);
-            let batch: Vec<_> = held.drain(..n).collect();
-            let mut still_held = HashSet::new();
-            for (p, _) in held.iter() {
-                if still_held.len() == self.entries.len() {
-                    break;
-                }
-                if !still_held.contains(p) {
-                    still_held.insert(p.clone());
-                }
-            }
+            let Held { queue, counts } = &mut *held;
+            let n = queue.len().min(MAX_ALERTS_PER_POP);
+            let batch: Vec<_> = queue
+                .drain(..n)
+                .map(|(idx, a)| {
+                    counts[idx] -= 1;
+                    (self.entries[idx].0.clone(), a)
+                })
+                .collect();
+            let still_held: Vec<bool> = counts.iter().map(|&c| c > 0).collect();
             (batch, still_held)
         };
-        for (profile, engine) in &self.entries {
-            if still_held.contains(profile) {
+        for ((profile, engine), &is_held) in self.entries.iter().zip(&still_held) {
+            if is_held {
                 continue;
             }
             for a in engine.pop_alerts() {
@@ -291,6 +308,47 @@ mod tests {
             .map(stamp)
             .collect();
         assert_eq!(from_a, (0..=HELD).collect::<Vec<_>>(), "in posted order");
+    }
+
+    /// Two profiles hold alerts, and one batch empties the first one's and
+    /// cuts into the second one's: the first is popped again from that very
+    /// drain, the second only once a later drain has handed out the rest of
+    /// what it held.
+    #[test]
+    fn a_profile_is_popped_once_its_own_held_alerts_are_out() {
+        let (a, b) = (Arc::new(MockEngine::new()), Arc::new(MockEngine::new()));
+        let (pa, pb) = (ProfileId::new("a"), ProfileId::new("b"));
+        let src = ProfileSource::new(vec![
+            (pa.clone(), a.clone() as Arc<dyn TorrentEngine>),
+            (pb.clone(), b.clone() as Arc<dyn TorrentEngine>),
+        ]);
+        let from_a = MAX_ALERTS_PER_POP - 10;
+        a.push_alerts((0..from_a).map(|_| finished(1)));
+        assert_eq!(src.hold_alerts(&pa), from_a);
+        b.push_alerts((0..100).map(|_| finished(2)));
+        assert_eq!(src.hold_alerts(&pb), 100);
+        a.push_alert(finished(0xA0));
+        b.push_alert(finished(0xB0));
+
+        let first = src.drain();
+        assert_eq!(first.len(), MAX_ALERTS_PER_POP + 1, "a is popped");
+        assert_eq!(first.iter().filter(|(p, _)| *p == pa).count(), from_a + 1);
+        assert_eq!(first.iter().filter(|(p, _)| *p == pb).count(), 10);
+        assert!(matches!(
+            first.last(),
+            Some((p, Alert::TorrentFinished { hdr })) if *p == pa
+                && hdr.infohash == Some(InfoHash([0xA0; 20]))
+        ));
+
+        let second = src.drain();
+        assert_eq!(second.len(), 90 + 1, "the rest of b's, then b is popped");
+        assert!(second.iter().all(|(p, _)| *p == pb));
+        assert!(matches!(
+            second.last(),
+            Some((_, Alert::TorrentFinished { hdr }))
+                if hdr.infohash == Some(InfoHash([0xB0; 20]))
+        ));
+        assert!(src.drain().is_empty());
     }
 
     #[test]
