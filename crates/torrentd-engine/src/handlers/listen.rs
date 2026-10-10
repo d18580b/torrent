@@ -77,7 +77,9 @@ use crate::profile::ProfileId;
 /// failure and no `listen_succeeded` at all. So each profile's endpoints that
 /// came up are kept too, and on the profile's next `session_stats` alert
 /// ([`recheck`]) a port-0 failure is forgotten when at least one came up and
-/// this process still holds a socket on every one. libtorrent posts that
+/// this process still holds a listening socket on every one; a peer
+/// connection accepted there outlives a listener a reopen closes, so it does
+/// not count. libtorrent posts that
 /// alert from its network thread after the reopen that posted the failure
 /// has returned, so the reopen has closed whatever it was going to close.
 /// While no port-0 failure is held, that same alert forgets the endpoints
@@ -156,12 +158,27 @@ impl ListenFailures {
     }
 }
 
-/// Whether this process holds a socket on a listen alert's endpoint. An
-/// endpoint that does not parse, or a read of this process's sockets that
-/// fails, holds none.
+/// Whether this process holds a listening socket on a listen alert's
+/// endpoint: a TCP socket in the listening state (`SO_ACCEPTCONN`), or a UDP
+/// socket. A peer connection the listener accepted has the same local
+/// address, and libtorrent does not disconnect those when a reopen closes
+/// the listener, so they are not counted. An endpoint that does not parse,
+/// or a read of this process's sockets that fails, holds none.
 fn socket_held(endpoint: &str) -> bool {
-    crate::port_forward::parse_listen_endpoint(endpoint)
-        .is_some_and(|at| sockets_at(at).is_ok_and(|found| !found.is_empty()))
+    crate::port_forward::parse_listen_endpoint(endpoint).is_some_and(|at| {
+        let mut listening = false;
+        each_socket_at(at, |fd| listening |= is_listening(fd)).is_ok() && listening
+    })
+}
+
+/// Whether the socket listens for peers: a UDP socket, or a TCP socket
+/// `listen` was called on rather than one `accept` returned.
+fn is_listening(fd: libc::c_int) -> bool {
+    match sockopt_int(fd, libc::SO_TYPE) {
+        Some(libc::SOCK_DGRAM) => true,
+        Some(libc::SOCK_STREAM) => sockopt_int(fd, libc::SO_ACCEPTCONN) == Some(1),
+        _ => false,
+    }
 }
 
 /// The address part of an alert's `address:port`. IPv6 addresses are
@@ -204,6 +221,23 @@ pub struct BoundSocket {
 /// this runs can be missed. Nothing else is.
 pub fn sockets_at(endpoint: SocketAddr) -> io::Result<Vec<BoundSocket>> {
     let mut found = Vec::new();
+    each_socket_at(endpoint, |fd| {
+        let kind = match sockopt_int(fd, libc::SO_TYPE) {
+            Some(libc::SOCK_STREAM) => "tcp",
+            Some(libc::SOCK_DGRAM) => "udp",
+            _ => "other",
+        };
+        found.push(BoundSocket {
+            kind,
+            device: bound_device(fd),
+        });
+    })?;
+    Ok(found)
+}
+
+/// Call `f` with each descriptor in `/proc/self/fd` that is a socket whose
+/// local address is `endpoint`.
+fn each_socket_at(endpoint: SocketAddr, mut f: impl FnMut(libc::c_int)) -> io::Result<()> {
     for entry in std::fs::read_dir("/proc/self/fd")? {
         let Ok(entry) = entry else { continue };
         let Some(fd) = std::str::from_utf8(entry.file_name().as_bytes())
@@ -216,20 +250,11 @@ pub fn sockets_at(endpoint: SocketAddr) -> io::Result<Vec<BoundSocket>> {
             Ok(target) if target.as_os_str().as_bytes().starts_with(b"socket:") => {}
             _ => continue,
         }
-        if local_addr(fd) != Some(endpoint) {
-            continue;
+        if local_addr(fd) == Some(endpoint) {
+            f(fd);
         }
-        let kind = match sockopt_int(fd, libc::SO_TYPE) {
-            Some(libc::SOCK_STREAM) => "tcp",
-            Some(libc::SOCK_DGRAM) => "udp",
-            _ => "other",
-        };
-        found.push(BoundSocket {
-            kind,
-            device: bound_device(fd),
-        });
     }
-    Ok(found)
+    Ok(())
 }
 
 /// The socket's local address, scope dropped; `None` for a descriptor that
@@ -686,6 +711,39 @@ mod tests {
         drop(tcp);
         assert!(!socket_held(&at));
         assert!(!socket_held("not an endpoint"));
+    }
+
+    /// libtorrent does not disconnect the peers a listener accepted when a
+    /// reopen closes it, and each accepted connection's local address is
+    /// the listener's endpoint. With only such a connection left, nothing
+    /// listens there, so the endpoint is not held.
+    #[test]
+    fn an_accepted_connection_that_outlives_its_listener_is_not_held() {
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let at = tcp.local_addr().unwrap();
+        let client = std::net::TcpStream::connect(at).unwrap();
+        let (accepted, _) = tcp.accept().unwrap();
+        assert_eq!(accepted.local_addr().unwrap(), at);
+        assert!(socket_held(&at.to_string()));
+        drop(tcp);
+        assert_eq!(
+            sockets_at(at).unwrap().len(),
+            1,
+            "the accepted connection is still open on the endpoint",
+        );
+        assert!(!socket_held(&at.to_string()));
+        drop((client, accepted));
+    }
+
+    /// A UDP socket (libtorrent's uTP and DHT socket) listens with no
+    /// `listen` call, so it holds its endpoint.
+    #[test]
+    fn a_udp_socket_holds_its_endpoint() {
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let at = udp.local_addr().unwrap().to_string();
+        assert!(socket_held(&at));
+        drop(udp);
+        assert!(!socket_held(&at));
     }
 
     #[test]
