@@ -26,6 +26,14 @@ log_level         = "info"   # error | warn | info | debug (reloadable)
 # edit warns "requires daemon restart; ignored" and changes nothing.
 allow_unauthenticated = true
 
+# Without [auth], a request whose Host is not loopback (localhost, 127.0.0.0/8,
+# [::1]) is refused, so a web page whose name rebinds to 127.0.0.1 cannot read
+# the API. A reverse proxy in front of this daemon passes its own name through
+# as Host (Caddy does by default; nginx needs `proxy_set_header Host $host;`):
+# list that name here. Names or addresses only, no scheme or port. Refused
+# beside [auth]. Read once, at startup.
+# allowed_hosts = ["torrentd.example.com"]
+
 # Peers whose forwarding headers are believed, as IPs or CIDR blocks. There
 # are three such headers and all three are read: X-Forwarded-For,
 # X-Forwarded-Proto and RFC 7239 Forwarded. Empty by default, which means no
