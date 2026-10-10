@@ -1581,3 +1581,149 @@ fn an_adopted_torrent_keeps_its_metadata_across_a_restart() {
     );
     stop(child);
 }
+
+/// The phase `GET /v1/torrents/{ih}` reports, or `None` while it answers
+/// anything but 200.
+fn torrent_phase(addr: &str, ih: &str) -> Option<String> {
+    let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+    if code != 200 {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    v["phase"].as_str().map(str::to_owned)
+}
+
+/// The adoption state `GET /v1/pool/torrents` reports for `ih`.
+fn pool_state(addr: &str, ih: &str) -> Option<String> {
+    let (code, body) = http(addr, "GET", "/v1/pool/torrents?limit=1000", None);
+    assert_eq!(code, 200, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["infohash"].as_str() == Some(ih))
+        .and_then(|t| t["state"].as_str().map(str::to_owned))
+}
+
+/// Issue #187's acceptance: a restart while an adoption is still hashing
+/// records the verdict the boot's check reaches, as the adoption would have
+/// without the restart.
+///
+/// An 8 GiB sparse payload with one wrong byte in its last piece is adopted
+/// without resume data, so the verify queue hashes it. One graceful SIGTERM
+/// lands while it is still `checking`. The worker used to forget the
+/// adoption's persisted queue entry once the session held the torrent, and
+/// the boot forgot every entry a scan loaded, so after the restart nothing
+/// waited for the check: the torrent came back `incomplete`, unpaused and
+/// announcing, and the pool index said `matched`. It has to end `paused` and
+/// `drifted`.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent and hashes 8 GiB; run with --ignored"]
+fn a_restart_while_an_adoption_hashes_still_records_its_verdict() {
+    use sha1::Digest;
+
+    const PIECE: u64 = 16 << 20;
+    const SIZE: u64 = 8 << 30;
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let root = p.join("pool");
+    let library = p.join("library");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&library).unwrap();
+    // Sparse, so it costs no disk: every byte reads as zero but the last.
+    let payload = std::fs::File::create(root.join("big")).unwrap();
+    payload.set_len(SIZE).unwrap();
+    {
+        use std::os::unix::fs::FileExt;
+        payload.write_at(&[1], SIZE - 1).unwrap();
+    }
+    drop(payload);
+    // Every piece's hash is the all-zero piece's, so the last one fails.
+    let zero = sha1::Sha1::digest(vec![0u8; PIECE as usize]);
+    let mut torrent = format!(
+        "d4:infod6:lengthi{SIZE}e4:name3:big12:piece lengthi{PIECE}e6:pieces{}:",
+        SIZE / PIECE * 20
+    )
+    .into_bytes();
+    for _ in 0..SIZE / PIECE {
+        torrent.extend_from_slice(&zero);
+    }
+    torrent.extend_from_slice(b"ee");
+    std::fs::write(library.join("t.torrent"), &torrent).unwrap();
+    let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+        .unwrap()
+        .to_hex();
+
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let mut text = std::fs::read_to_string(&cfg).unwrap();
+    text.push_str(&format!(
+        "\n[pool]\nroots = [\"{}\"]\nlibrary_dir = \"{}\"\n",
+        root.display(),
+        library.display()
+    ));
+    std::fs::write(&cfg, text).unwrap();
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        let child = KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_torrentd"))
+                .arg("--config")
+                .arg(&cfg)
+                .spawn()
+                .expect("spawn daemon"),
+        );
+        wait_healthy(addr);
+        child
+    };
+
+    let mut child = spawn();
+    let (code, body) = http(addr, "POST", "/v1/pool/scan", None);
+    assert_eq!(code, 200, "{body}");
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/pool/adoptions",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"selector\":{{\"kind\":\"infohashes\",\
+             \"infohashes\":[\"{ih}\"]}}}}"
+        )),
+    );
+    assert_eq!(code, 200, "{body}");
+    assert!(body.contains("queued_for_verification"), "{body}");
+    // The verify queue admits it within a tick or two, and 8 GiB takes
+    // libtorrent a good while longer than that to hash.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while torrent_phase(addr, &ih).as_deref() != Some("checking") {
+        assert!(
+            Instant::now() < deadline,
+            "the adoption never started hashing: {:?}",
+            torrent_phase(addr, &ih),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(60)));
+
+    let _child = spawn();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let phase = torrent_phase(addr, &ih);
+        let state = pool_state(addr, &ih);
+        if phase.as_deref() == Some("paused") && state.as_deref() == Some("drifted") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "after a restart mid-verify the failed payload was left {phase:?} and \
+             indexed {state:?}, not paused and drifted",
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
