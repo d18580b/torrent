@@ -427,6 +427,11 @@ impl Config {
                     }
                 }
             }
+            // Canonicalisation resolves symlinks, not bind mounts: the same
+            // directory reached through two mount points passes the lexical
+            // check above and is indexed twice all the same.
+            let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok();
+            check_roots_do_not_alias(&resolved, mountinfo.as_deref())?;
 
             // The daemon's own state must not sit inside a managed root.
             // Nothing in the library claims those files, so they are orphans by
@@ -1215,6 +1220,153 @@ impl Config {
             trusted_proxies: vec![],
         }
     }
+}
+
+/// Refuse two `[pool] roots` that reach the same files by different paths,
+/// which the lexical roots-must-not-nest check cannot see.
+///
+/// Two independent tests, either of which refuses:
+///
+/// 1. **Ancestor chain.** Neither root's `(st_dev, st_ino)` may be the
+///    identity of the other root or of any directory above it. That catches a
+///    root which is a bind mount of the other root or of one of its
+///    ancestors, without reading the mount table.
+/// 2. **Mount table.** Each root is located on its filesystem through
+///    `mountinfo` (`/proc/self/mountinfo`'s text): the mount it sits on gives
+///    the device and the directory of that filesystem mounted there, so the
+///    root's path *within the filesystem* follows. Two roots on one device
+///    whose filesystem paths nest are one tree seen twice — a bind mount of a
+///    descendant, which the ancestor chain misses, or two container volumes
+///    taken from nested host directories.
+///
+/// A root that cannot be stat'ed is skipped by the first test, and the second
+/// is skipped where `mountinfo` is `None`. FUSE union views (shfs, mergerfs)
+/// sit on their own device with their own inode numbers, so neither test can
+/// relate one to its branches; `docs/operations.md` forbids listing them side
+/// by side, and the delete step's inode check is the backstop for what slips.
+fn check_roots_do_not_alias(roots: &[PathBuf], mountinfo: Option<&str>) -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let identity = |p: &Path| fs::metadata(p).ok().map(|m| (m.dev(), m.ino()));
+    for (i, a) in roots.iter().enumerate() {
+        for (j, b) in roots.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            let Some(b_id) = identity(b) else { continue };
+            if let Some(same) = a.ancestors().find(|anc| identity(anc) == Some(b_id)) {
+                anyhow::bail!(
+                    "[pool] roots alias the same files: {} is {} reached by another path \
+                     (a bind mount?), so {} sits inside it. List one of them, not both",
+                    b.display(),
+                    same.display(),
+                    a.display(),
+                );
+            }
+        }
+    }
+
+    let Some(mountinfo) = mountinfo else {
+        return Ok(());
+    };
+    let mounts = parse_mountinfo(mountinfo);
+    let located: Vec<Option<(&str, PathBuf)>> = roots
+        .iter()
+        .map(|r| locate_on_filesystem(&mounts, r))
+        .collect();
+    for (i, a) in located.iter().enumerate() {
+        for (j, b) in located.iter().enumerate().skip(i + 1) {
+            let (Some((dev_a, fs_a)), Some((dev_b, fs_b))) = (a, b) else {
+                continue;
+            };
+            if dev_a == dev_b && (fs_a.starts_with(fs_b) || fs_b.starts_with(fs_a)) {
+                anyhow::bail!(
+                    "[pool] roots alias the same files: {} and {} are {} and {} of one \
+                     filesystem (device {dev_a}), reached through different mounts. \
+                     List one of them, not both",
+                    roots[i].display(),
+                    roots[j].display(),
+                    fs_a.display(),
+                    fs_b.display(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One line of `/proc/self/mountinfo`: the device (`major:minor`), the
+/// directory of that filesystem mounted here, and where it is mounted.
+#[derive(Debug)]
+struct MountEntry<'a> {
+    dev: &'a str,
+    fs_root: PathBuf,
+    mount_point: PathBuf,
+}
+
+/// Parse `mountinfo`'s fields 3-5, skipping any line too short to carry them.
+fn parse_mountinfo(text: &str) -> Vec<MountEntry<'_>> {
+    text.lines()
+        .filter_map(|line| {
+            let mut f = line.split(' ');
+            let dev = f.nth(2)?;
+            let fs_root = f.next()?;
+            let mount_point = f.next()?;
+            Some(MountEntry {
+                dev,
+                fs_root: PathBuf::from(unescape_mountinfo(fs_root)),
+                mount_point: PathBuf::from(unescape_mountinfo(mount_point)),
+            })
+        })
+        .collect()
+}
+
+/// Undo the kernel's octal escapes (`\040` for a space, and so on) in a
+/// `mountinfo` path field.
+fn unescape_mountinfo(field: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = bytes.get(i + 1..i + 4).and_then(|d| {
+            d.iter()
+                .all(|c| (b'0'..=b'7').contains(c))
+                .then(|| u8::from_str_radix(std::str::from_utf8(d).ok()?, 8).ok())
+                .flatten()
+        });
+        match (bytes[i], octal) {
+            (b'\\', Some(b)) => {
+                out.push(b);
+                i += 4;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    std::ffi::OsString::from_vec(out)
+}
+
+/// The device `path` lives on and its path within that filesystem: the
+/// mount with the longest mount point above `path` (the last listed, where
+/// one is mounted over another), its mounted directory joined with the rest.
+fn locate_on_filesystem<'a>(mounts: &[MountEntry<'a>], path: &Path) -> Option<(&'a str, PathBuf)> {
+    let mut best: Option<&MountEntry<'a>> = None;
+    for m in mounts {
+        if path.starts_with(&m.mount_point)
+            && best.is_none_or(|b| {
+                m.mount_point.components().count() >= b.mount_point.components().count()
+            })
+        {
+            best = Some(m);
+        }
+    }
+    let m = best?;
+    let rest = path.strip_prefix(&m.mount_point).ok()?;
+    Some((m.dev, m.fs_root.join(rest)))
 }
 
 #[cfg(test)]
@@ -3134,6 +3286,91 @@ library_dir = "{d}/library"
         let p = write_cfg(dir.path(), &body);
         let msg = format!("{:#}", Config::load(&p).unwrap_err());
         assert!(msg.contains("must not nest"), "got: {msg}");
+    }
+
+    /// A root whose `(st_dev, st_ino)` is an ancestor of another root is the
+    /// same tree, whatever its path. A bind mount needs privileges a test
+    /// lacks, so an uncanonicalised symlink stands in for the second path:
+    /// `metadata` follows it to the ancestor's identity just as it would see
+    /// through a bind mount.
+    #[test]
+    fn a_root_that_is_another_roots_ancestor_by_identity_is_refused() {
+        let dir = tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(tree.join("inner")).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&tree, &alias).unwrap();
+
+        let msg = check_roots_do_not_alias(&[tree.join("inner"), alias.clone()], None)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("alias the same files"), "got: {msg}");
+        let msg = check_roots_do_not_alias(&[alias, tree.join("inner")], None)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("alias the same files"), "got: {msg}");
+
+        // Siblings share an ancestor, which is not an alias.
+        std::fs::create_dir_all(tree.join("other")).unwrap();
+        check_roots_do_not_alias(&[tree.join("inner"), tree.join("other")], None)
+            .expect("sibling roots are allowed");
+    }
+
+    /// `/data/b` is a bind mount of `/srv/a`, a descendant of the root `/srv`:
+    /// no ancestor of either root has the other's identity, and only the
+    /// mount table relates them.
+    #[test]
+    fn a_bind_mount_of_a_directory_inside_another_root_is_refused() {
+        let mountinfo = "\
+22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw
+40 22 8:1 /srv/a /data/b rw,relatime shared:1 - ext4 /dev/sda1 rw
+41 22 0:50 / /mnt/usb rw,relatime shared:9 - vfat /dev/sdb1 rw
+";
+        let roots = |a: &str, b: &str| [PathBuf::from(a), PathBuf::from(b)];
+        let msg = check_roots_do_not_alias(&roots("/srv", "/data/b"), Some(mountinfo))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("alias the same files"), "got: {msg}");
+        assert!(msg.contains("/srv/a"), "names the filesystem path: {msg}");
+        check_roots_do_not_alias(&roots("/data/b/x", "/srv/a"), Some(mountinfo))
+            .expect_err("a root inside the bind mount nests in the other");
+
+        // A sibling of the bound directory, and another device, are distinct.
+        check_roots_do_not_alias(&roots("/srv/c", "/data/b"), Some(mountinfo))
+            .expect("siblings on one filesystem are allowed");
+        check_roots_do_not_alias(&roots("/mnt/usb/media", "/media"), Some(mountinfo))
+            .expect("roots on different devices are allowed");
+    }
+
+    #[test]
+    fn mountinfo_paths_are_unescaped_and_the_deepest_mount_wins() {
+        let mountinfo = "\
+22 1 8:1 / / rw - ext4 /dev/sda1 rw
+40 22 8:1 /my\\040disk /mnt/a\\040b rw - ext4 /dev/sda1 rw
+41 40 0:60 / /mnt/a\\040b/over rw - tmpfs tmpfs rw
+";
+        let mounts = parse_mountinfo(mountinfo);
+        let (dev, fs_path) = locate_on_filesystem(&mounts, Path::new("/mnt/a b/x")).unwrap();
+        assert_eq!((dev, fs_path), ("8:1", PathBuf::from("/my disk/x")));
+        let (dev, fs_path) = locate_on_filesystem(&mounts, Path::new("/mnt/a b/over/y")).unwrap();
+        assert_eq!((dev, fs_path), ("0:60", PathBuf::from("/y")));
+        check_roots_do_not_alias(
+            &[PathBuf::from("/my disk"), PathBuf::from("/mnt/a b/x")],
+            Some(mountinfo),
+        )
+        .expect_err("the escaped bind mount is seen through");
+    }
+
+    /// The real mount table, with two sibling roots, refuses nothing.
+    #[test]
+    fn sibling_roots_pass_against_this_hosts_mount_table() {
+        let dir = tempdir().unwrap();
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let mountinfo = fs::read_to_string("/proc/self/mountinfo").ok();
+        let roots = [a.canonicalize().unwrap(), b.canonicalize().unwrap()];
+        check_roots_do_not_alias(&roots, mountinfo.as_deref()).expect("siblings are allowed");
     }
 
     #[test]
