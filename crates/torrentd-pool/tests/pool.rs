@@ -1412,7 +1412,7 @@ fn a_v4_index_migrates_to_the_materialised_tree() {
     }
 
     let store = PoolStore::open(&db).unwrap();
-    assert_eq!(user_version(&db), 6);
+    assert_eq!(user_version(&db), 7);
     let root_id = store.root_id(&root).unwrap();
     assert_eq!(
         store.children(root_id, "").unwrap(),
@@ -1443,7 +1443,7 @@ fn a_v5_index_migrates_to_an_empty_persisted_verify_queue() {
     }
 
     let store = PoolStore::open(&db).unwrap();
-    assert_eq!(user_version(&db), 6);
+    assert_eq!(user_version(&db), 7);
     assert!(store.verify_queue().unwrap().is_empty());
 }
 
@@ -2980,6 +2980,101 @@ fn plan_steps_are_journaled_before_they_run() {
     assert_eq!(steps[1].status, "pending");
 }
 
+#[test]
+fn a_discarded_plans_id_is_never_handed_out_again() {
+    // A delete plan's trash directory is named after its id. Before v7 the id
+    // was `max(id) + 1`, so discarding the newest plan gave the next one the
+    // same id, and the same directory.
+    let mut store = PoolStore::open_in_memory().unwrap();
+    let first = store.create_plan("delete_orphans", "{}", 100).unwrap();
+    store.delete_plan(first).unwrap();
+    let second = store.create_plan("delete_orphans", "{}", 100).unwrap();
+    assert_ne!(first, second, "a discarded plan's id came back");
+    assert!(second > first);
+}
+
+#[test]
+fn a_v6_index_migrates_its_plans_to_ids_that_are_never_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool.db");
+    {
+        let store = PoolStore::open(&db).unwrap();
+        let id = store.create_plan("relocate", "{}", 123).unwrap();
+        assert_eq!(id, 1);
+    }
+    // Take the file back to what a v6 build wrote: `plan.id` without
+    // `AUTOINCREMENT`, holding plans 1 and 3 and plan 3's steps. Plan 4 was
+    // the newest and has been discarded, which a v6 file does not remember.
+    {
+        let c = rusqlite::Connection::open(&db).unwrap();
+        c.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             CREATE TABLE plan_v6 (
+                 id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+                 created_at INTEGER NOT NULL, applied_at INTEGER,
+                 status TEXT NOT NULL, spec TEXT NOT NULL);
+             INSERT INTO plan_v6 SELECT * FROM plan;
+             DROP TABLE plan;
+             ALTER TABLE plan_v6 RENAME TO plan;
+             CREATE INDEX plan_by_status ON plan(status);
+             DELETE FROM sqlite_sequence WHERE name = 'plan';
+             INSERT INTO plan VALUES (3, 'delete_orphans', 456, 789, 'applied', '{}');
+             INSERT INTO plan_step VALUES (3, 0, 'delete_file', '/r/a', NULL, 'done', NULL);
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+    }
+
+    let mut store = PoolStore::open(&db).unwrap();
+    assert_eq!(user_version(&db), 7);
+    let sql: String = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'plan'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(sql.contains("AUTOINCREMENT"), "{sql}");
+
+    // Every plan and step survives the rebuild, under its own id: dropping
+    // the old table with foreign keys on would have cascaded to the steps.
+    let plans = store.plans().unwrap();
+    assert_eq!(
+        plans.iter().map(|p| p.id).collect::<Vec<_>>(),
+        [3, 1],
+        "{plans:?}"
+    );
+    let applied = store.plan(3).unwrap().unwrap();
+    assert_eq!(
+        (
+            applied.created_at,
+            applied.applied_at,
+            applied.status.as_str()
+        ),
+        (456, Some(789), "applied"),
+    );
+    let steps = store.plan_steps(3).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].src, "/r/a");
+
+    // From here on an id is never reused: discarding the newest plan does not
+    // give its id to the next one.
+    let next = store.create_plan("delete_orphans", "{}", 1000).unwrap();
+    assert_eq!(next, 4);
+    store.delete_plan(next).unwrap();
+    assert_eq!(store.create_plan("delete_orphans", "{}", 1001).unwrap(), 5);
+
+    // The migration turned foreign keys off around the rebuild and back on
+    // after it: a step for a plan that does not exist is still refused.
+    let orphan_step = torrentd_pool::model::PlanStep {
+        op: "delete_file".into(),
+        src: "/r/b".into(),
+        dst: None,
+    };
+    assert!(store.add_plan_steps(999, &[orphan_step]).is_err());
+}
+
 /// Hand-build a genuine v1 index at `db`, carrying one torrent assigned to
 /// `acct_a`.
 ///
@@ -3225,7 +3320,7 @@ fn an_ordinary_v3_index_is_opened_without_touching_it() {
 
     PoolStore::open(&db).expect("a second open is an ordinary v3 open");
 
-    assert_eq!(user_version(&db), 6);
+    assert_eq!(user_version(&db), 7);
     assert_eq!(torrent_indexes(&db), before, "nothing may be rebuilt here");
     assert!(
         !backup.exists(),
@@ -3393,7 +3488,7 @@ fn a_real_backup_already_at_the_path_is_replaced_by_a_fresh_copy_once_the_migrat
 
     PoolStore::open(&db).expect("the migration runs");
 
-    assert_eq!(user_version(&db), 6, "the migration really ran");
+    assert_eq!(user_version(&db), 7, "the migration really ran");
     assert_eq!(
         user_version(&backup),
         2,

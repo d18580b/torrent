@@ -33,8 +33,8 @@ The small state files are described in full in
 
 The plan journal is the one record here that a rescan cannot reconstruct.
 Losing it loses the trail of what each delete plan moved where, and with it the
-mapping from `<root>/.torrentd-trash/<plan id>/` back to the plan that filled
-that directory.
+mapping from `<root>/.torrentd-trash/<plan id>-<created_at>/` back to the plan
+that filled that directory.
 
 ### Backing up
 
@@ -184,30 +184,62 @@ record the step`, and nothing it would have moved is touched. A
 `failed` plan can be applied again.
 
 **The trash.** A deleted file is moved, never unlinked, to
-`<root>/.torrentd-trash/<plan id>/<its path relative to the root>`, on the same
-filesystem. The scanner never indexes the trash, so trashed files never read as
-orphans again and never match a torrent. Nothing ever empties it. That is left
-to you, and until you do, the bytes still take up space on the root.
+`<root>/.torrentd-trash/<plan id>-<created_at>/<its path relative to the root>`,
+on the same filesystem, where `created_at` is the second the plan was created,
+in unix seconds. The scanner never indexes the trash, so trashed files never
+read as orphans again and never match a torrent. Nothing ever empties it. That
+is left to you, and until you do, the bytes still take up space on the root.
 
-Before emptying `<root>/.torrentd-trash/<plan id>/`:
+The creation second is in the name because a plan id alone can come back.
+A discarded plan's id is never handed out again, but restoring an older
+`pool.db` ([Restoring from backup](#restoring-from-backup)) takes the id
+sequence back with it, and the next plan then repeats an id whose trash may
+still be on disk. A plan applied by a build older than pool schema v7 filed
+into `<root>/.torrentd-trash/<plan id>/`; one that build left part-way and this
+one finishes has files in both directories.
 
-1. Check that the plan is `applied`:
-   `curl -s localhost:8080/v1/pool/plans/$PLAN -H "Authorization: Bearer $TOKEN"`.
+Before emptying a plan's trash directory:
+
+1. Check that the plan is `applied`, and work out its directory from the
+   plan itself:
+
+   ```bash
+   ROOT=/data/torrents
+   plan=$(curl -s localhost:8080/v1/pool/plans/$PLAN -H "Authorization: Bearer $TOKEN")
+   jq -r .status <<<"$plan"
+   BUCKET=$(jq -r '"\(.id)-\(.created_at | fromdateiso8601)"' <<<"$plan")
+   ```
+
    A plan in `applying` is still running, or was interrupted and is re-driven
    at the next boot. A `failed` plan stopped part-way, and applying it again
    finishes the rest, unless a step is still `in_progress`: that step's
    outcome is unknown, nothing marks it resolved, and applying again always
    refuses. Look at its path, rescan, discard the plan and build a new one
    ([After a crash](#after-a-crash)).
-2. Check that everything that should still seed is seeding. To undo a
+2. Check that the directory holds that plan's files and nothing else. This
+   prints nothing when every file in it is one of the plan's done
+   `delete_file` steps and every such step's file is in it:
+
+   ```bash
+   diff <(sudo -u torrentd find "$ROOT/.torrentd-trash/$BUCKET" -type f -printf '%P\n' | sort) \
+        <(jq -r --arg root "$ROOT/" '.steps[]
+            | select(.op == "delete_file" and .status == "done")
+            | .src | ltrimstr($root)' <<<"$plan" | sort)
+   ```
+
+   A line marked `<` is a file the plan did not put there: leave the
+   directory alone until you know whose it is. A line marked `>` is a file
+   the plan moved that is no longer in its trash, which someone has already
+   moved back or removed.
+3. Check that everything that should still seed is seeding. To undo a
    deletion, move the file back to its original path and rescan.
-3. Then remove the directory, as a user that can write to the root:
-   `sudo -u torrentd rm -rf -- /data/torrents/.torrentd-trash/$PLAN`.
+4. Then remove the directory, as a user that can write to the root:
+   `sudo -u torrentd rm -rf -- "$ROOT/.torrentd-trash/$BUCKET"`.
 
 Discarding a plan (`DELETE /v1/pool/plans/{plan_id}`) removes its record and
 leaves the disk unchanged. It neither restores nor empties that plan's trash.
-Empty the trash first if you also want the record gone, because the plan id is
-what ties a trash directory to the steps that filled it.
+Empty the trash first if you also want the record gone, because the plan's
+steps are the only record of which files its trash directory should hold.
 
 ### Retiring a profile
 
@@ -628,7 +660,10 @@ Once it is up:
    step whose file is already gone or changed fails instead of acting twice.
    Expect such a plan to end `failed`, then read it and discard it. A trash
    directory left by a plan the backup never recorded has no plan to tie it
-   to. Its contents are what that plan deleted.
+   to. Its contents are what that plan deleted. The next plan may repeat
+   that plan's id, because the backup holds the id sequence as it stood, but
+   not its directory: the directory is named by the id and the second the
+   plan was created ([Archiving payload](#archiving-payload)).
 
 What changed after the backup is lost. A torrent added since then is gone
 from the stores, while its payload stays on disk, so add or adopt it again. A

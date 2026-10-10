@@ -23,8 +23,8 @@ expression: screen
 │                                                                                                                                                              │
 │                                               ╭ Apply plan #8 ───────────────────────────────────────────────╮                                               │
 │                                               │This moves 2 files to the pool's trash; they can be restored  │                                               │
-│                                               │from .torrentd-trash/8. The daemon waits until every step has │                                               │
-│                                               │run.                                                          │                                               │
+│                                               │from .torrentd-trash/8-1790503200. The daemon waits until     │                                               │
+│                                               │every step has run.                                           │                                               │
 │                                               │                                                              │                                               │
 │                                               │Type 7f3a-9c21 to confirm:                                    │                                               │
 │                                               │› 7f3a                                                        │                                               │
