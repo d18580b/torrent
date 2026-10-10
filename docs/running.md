@@ -1076,7 +1076,11 @@ The daemon sets none of these itself.
   immediately. The systemd unit sets 65536 and the compose file matches; **a
   bare-metal run outside either gets nothing** and will hit `EMFILE`. The
   daemon warns at boot when the soft limit is below `connections_limit +
-  file_pool_size` per profile plus the API's 256-connection cap. The
+  file_pool_size + 32` per profile plus the API's 256-connection cap and 64
+  for the process itself (the database, logs, listeners and the commands it
+  runs). An API that runs out of descriptors accepting a connection cuts off
+  its open requests and serves again on the same socket after a backoff of
+  1 s doubling to 30 s, logging each time; the daemon does not restart. The
   HTTP API draws on the same table and holds at most 256 connections; the
   next waits in the listen backlog. It closes an HTTP/1 connection whose
   request head takes more than 10 seconds, closes an HTTP/2 connection that

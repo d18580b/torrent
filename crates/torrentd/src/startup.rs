@@ -441,7 +441,8 @@ fn warn_if_descriptors_are_short(cfg: &Config) {
             needed = need,
             "the open-file limit is below what the daemon may hold at once \
              (connections_limit + file_pool_size per profile, plus the HTTP \
-             connection cap); raise LimitNOFILE or lower those keys, or peers, \
+             connection cap and an allowance for the sessions and the process \
+             themselves); raise LimitNOFILE or lower those keys, or peers, \
              payload files and API clients will fail with EMFILE under load",
         ),
         Some(_) => {}
@@ -449,14 +450,30 @@ fn warn_if_descriptors_are_short(cfg: &Config) {
     }
 }
 
-/// `connections_limit + file_pool_size` per configured profile, plus the
-/// HTTP connection cap.
+/// `connections_limit + file_pool_size` and [`DESCRIPTORS_PER_SESSION`] per
+/// configured profile, plus the HTTP connection cap and
+/// [`DESCRIPTORS_FOR_THE_PROCESS`].
 fn descriptors_needed(cfg: &Config) -> u64 {
     let s = cfg.libtorrent_settings();
     let per_session = u64::from(s.connections_limit.unwrap_or_default())
-        + u64::from(s.file_pool_size.unwrap_or_default());
-    per_session * cfg.profile.len() as u64 + http_connection_cap()
+        + u64::from(s.file_pool_size.unwrap_or_default())
+        + DESCRIPTORS_PER_SESSION;
+    per_session * cfg.profile.len() as u64 + http_connection_cap() + DESCRIPTORS_FOR_THE_PROCESS
 }
+
+/// What a session holds beside its peers and payload files: its listen
+/// sockets (TCP and uTP, per address), DHT, the trackers and port mappings
+/// it is talking to, the `.torrent` and resume files being written, its
+/// reactor's own descriptors, and a tunnel's helper (an OpenVPN process's
+/// pipes and management socket).
+const DESCRIPTORS_PER_SESSION: u64 = 32;
+
+/// What the process holds whatever its configuration: stdio, the log and
+/// journal, `pool.db` with its WAL and shared-memory files and a reader, the
+/// API listener and its spare (`serve_until_shutdown`), the runtime's
+/// reactor, signal and timer descriptors, the instance lock, and the pipes
+/// of the `nft` and `ip` commands it runs.
+const DESCRIPTORS_FOR_THE_PROCESS: u64 = 64;
 
 /// [`HTTP_MAX_CONNECTIONS`] as a descriptor count.
 fn http_connection_cap() -> u64 {
@@ -3703,7 +3720,11 @@ mod shutdown_report_tests {
             crate::profile_registry::test_entry("a", ProfileStatus::Active).config,
             crate::profile_registry::test_entry("b", ProfileStatus::Active).config,
         ];
-        assert_eq!(descriptors_needed(&cfg), 2 * 1_100 + 256);
+        assert_eq!(
+            descriptors_needed(&cfg),
+            2 * (1_100 + DESCRIPTORS_PER_SESSION) + 256 + DESCRIPTORS_FOR_THE_PROCESS,
+            "the database, subprocess pipes, logs and listeners count too",
+        );
         // And the shipped unit's LimitNOFILE covers a one-profile default.
         cfg.connections_limit = None;
         cfg.file_pool_size = None;
