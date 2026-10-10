@@ -806,6 +806,7 @@ async fn adoption(cov: &Arc<Coverage>) {
             .change_states(
                 |r| r.set(&torrentd_engine::ProfileId::new("p"), state),
                 &torrentd_engine::NoopSink,
+                &crate::profile_registry::NoTorrents,
             )
             .unwrap()
     };

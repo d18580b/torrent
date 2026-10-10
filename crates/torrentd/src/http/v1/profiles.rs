@@ -443,7 +443,11 @@ pub enum SetProfileStateError {
 /// Adds, adoptions, and resumes into it are refused with
 /// `409 profile-unavailable` (`offline`) until it is set online. `online`
 /// resumes the session (and its DHT), and every torrent goes back to what
-/// its own paused flag says. The setting is written to the state directory
+/// its own paused flag says: those that were running are started again 100
+/// a second, going on after the response, since each one started announces
+/// to its trackers. Setting it offline meanwhile stops that, and the next
+/// `online` starts the rest; a restart starts them at boot. The setting is
+/// written to the state directory
 /// before it takes effect, so it survives a crash and a restart; a profile left offline
 /// starts with its session paused, before any torrent is loaded into it.
 ///
@@ -513,7 +517,7 @@ fn set_state(
         _ => None,
     };
     s.profiles
-        .change_states(|r| r.set(profile_id, desired), &*s.metrics)
+        .change_states(|r| r.set(profile_id, desired), &*s.metrics, &online_pace(s))
         .map_err(|e| SetProfileStateError::Internal {
             detail: internal("setting the profile's state", e),
         })?;
@@ -561,6 +565,16 @@ fn lift_fence(s: &AppState, entry: &ProfileEntry) {
     );
 }
 
+/// How a profile going online has its torrents resumed: a batch a second,
+/// from a task that goes on after the request is answered.
+fn online_pace(s: &AppState) -> crate::vpn_monitor::OnlinePace<'_> {
+    crate::vpn_monitor::OnlinePace {
+        profiles: &s.profiles,
+        state: &s.state,
+        metrics: &s.metrics,
+    }
+}
+
 /// Why offline-all or online-all did not fully apply.
 #[derive(Debug, thiserror::Error, ApiError)]
 #[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
@@ -579,9 +593,11 @@ async fn switch_all(
 ) -> Result<Json<ProfileList>, StateSwitchError> {
     let state = Arc::clone(&s);
     blocking(move || {
-        state
-            .profiles
-            .change_states(|r| r.offline_all = offline, &*state.metrics)
+        state.profiles.change_states(
+            |r| r.offline_all = offline,
+            &*state.metrics,
+            &online_pace(&state),
+        )
     })
     .await
     .map_err(|e| StateSwitchError::Internal {
@@ -616,7 +632,9 @@ pub async fn set_offline_all(
 /// Clear offline-all.
 ///
 /// Each profile returns to its own `desired_state`: one set offline on its
-/// own stays offline. A fenced (`vpn_down`) profile stays fenced; setting it
+/// own stays offline. Each profile that goes online has its running torrents
+/// started again 100 a second, as `PATCH /v1/profiles/{profile_id}` does,
+/// going on after the response. A fenced (`vpn_down`) profile stays fenced; setting it
 /// online with `PATCH /v1/profiles/{profile_id}` is what checks its tunnel
 /// and lifts the fence.
 #[kynos::post("/profiles/online-all", tag = Profiles)]

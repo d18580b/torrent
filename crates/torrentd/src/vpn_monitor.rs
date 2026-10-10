@@ -721,13 +721,16 @@ impl vpn::killswitch::Fence for KillSwitchFence {
     }
 }
 
-/// Which fence a [`spawn_lift`] is undoing, for its logs.
+/// Which pause a [`spawn_lift`] is undoing, for its logs.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Lift {
-    /// The kill-switch watch's, once the ruleset checks intact again.
+    /// The kill-switch watch's fence, once the ruleset checks intact again.
     KillSwitch,
     /// Any fence, by the operator setting the profile online.
     SetOnline,
+    /// The operator's offline, by setting the profile online or by
+    /// online-all ([`OnlinePace`]).
+    Offline,
 }
 
 impl Lift {
@@ -735,20 +738,64 @@ impl Lift {
         match self {
             Self::KillSwitch => "kill_switch",
             Self::SetOnline => "set_online",
+            Self::Offline => "offline",
         }
     }
 }
 
-/// Resume `handles`, the torrents a fence on `entry` paused, from a task on
-/// the runtime through [`resume_paced`]: a batch per [`REANNOUNCE_PACE`],
-/// since each one resumed sends its trackers a `started` announce. The profile is marked lifted by the caller, before this.
+/// How the daemon paces a profile going online
+/// ([`crate::profile_registry::OnlinePacing`]): the running torrents are read
+/// from the state map, and resumed through [`spawn_lift`].
+pub(crate) struct OnlinePace<'a> {
+    pub(crate) profiles: &'a Arc<ProfileRegistry>,
+    pub(crate) state: &'a StateMap,
+    pub(crate) metrics: &'a Arc<PromSink>,
+}
+
+impl crate::profile_registry::OnlinePacing for OnlinePace<'_> {
+    fn torrents(&self, id: &ProfileId) -> Vec<(TorrentHandle, bool)> {
+        // The torrent's own paused flag, as its last state update reported
+        // it: the session's pause does not set it. The kill-switch fence
+        // reads what is running the same way.
+        self.state
+            .handles_for_profile(id)
+            .into_iter()
+            .map(|h| {
+                let running = self
+                    .state
+                    .get(&h.infohash)
+                    .is_some_and(|s| s.phase != TorrentPhase::Paused);
+                (h, running)
+            })
+            .collect()
+    }
+
+    fn start(&self, entry: &ProfileEntry, handles: Vec<TorrentHandle>) {
+        info!(
+            target: "torrentd::vpn_monitor",
+            profile_id = %entry.id(),
+            torrent_count = handles.len(),
+            "profile set online; resuming its torrents a batch at a time",
+        );
+        spawn_lift(self.profiles, self.metrics, entry, handles, Lift::Offline);
+    }
+}
+
+/// Resume `handles`, the torrents a fence or a profile's offline paused in
+/// `entry`, from a task on the runtime through [`resume_paced`]: a batch per
+/// [`REANNOUNCE_PACE`], since each one resumed sends its trackers a `started`
+/// announce. The profile is marked lifted, or its session resumed, by the
+/// caller, before this.
 ///
 /// The run is recorded on the entry ([`ProfileEntry::begin_resume`]), so a
 /// fence that lands before it ends stops it and takes back what it had not
-/// reached, a newer lift replaces and stops it, and a pause in the profile
+/// reached, a newer lift replaces and stops it, setting the profile offline
+/// stops it and holds what it had not reached, and a pause in the profile
 /// halts it or leaves the paused torrent out ([`ProfileEntry::halt_resumes`],
-/// [`ProfileEntry::exclude_from_resumes`]). Must be called inside the
-/// runtime: both callers run on its blocking pool.
+/// [`ProfileEntry::exclude_from_resumes`]). What it resumed, or left out for
+/// the operator's pause, is then released from what a paced set-online holds
+/// ([`ProfileEntry::release_holds`]); what it did not reach stays held. Must
+/// be called inside the runtime: every caller runs on its blocking pool.
 pub(crate) fn spawn_lift(
     profiles: &Arc<ProfileRegistry>,
     metrics: &Arc<PromSink>,
@@ -759,6 +806,7 @@ pub(crate) fn spawn_lift(
     let run = entry.begin_resume(handles);
     let (profiles, metrics, id) = (profiles.clone(), metrics.clone(), entry.id().clone());
     tokio::runtime::Handle::current().spawn(async move {
+        let mut failed = std::collections::HashSet::new();
         let resumed = resume_paced(
             profiles.clone(),
             id.clone(),
@@ -768,6 +816,7 @@ pub(crate) fn spawn_lift(
             run.gate().clone(),
             metrics,
             |h, err| {
+                failed.insert(h);
                 error!(
                     target: "torrentd::vpn_monitor",
                     profile_id = %id,
@@ -779,6 +828,28 @@ pub(crate) fn spawn_lift(
             },
         )
         .await;
+        // The run goes in order, so what it reached is the front of its
+        // list: resumed, left out for a pause, or refused. A refused one is
+        // still paused by the pace, so it stays held.
+        let reached: Vec<TorrentHandle> = run.handles()
+            [..run.handles().len() - resumed.not_reached]
+            .iter()
+            .filter(|h| !failed.contains(*h))
+            .copied()
+            .collect();
+        let release = {
+            let (profiles, id) = (profiles.clone(), id.clone());
+            tokio::task::spawn_blocking(move || {
+                if let Some(entry) = profiles.resolve(&id).active() {
+                    entry.release_holds(&reached);
+                }
+            })
+        };
+        if let Err(e) = release.await {
+            if e.is_panic() {
+                std::panic::resume_unwind(e.into_panic());
+            }
+        }
         if let Some(entry) = profiles.resolve(&id).active() {
             entry.end_resume(&run);
         }
@@ -1800,6 +1871,7 @@ mod tests {
                         )
                     },
                     &*metrics,
+                    &crate::profile_registry::NoTorrents,
                 )
                 .unwrap();
         }

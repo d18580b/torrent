@@ -919,6 +919,27 @@ pub async fn boot(
         }
         states
     };
+    // The torrents a paced set-online paused and had not resumed when the
+    // daemon stopped: the resume scan loads them unpaused.
+    let paced_holds = {
+        let path = cfg
+            .profile_state_path()
+            .with_file_name(crate::profile_state::PACED_HOLDS_FILE);
+        let shown = path.display().to_string();
+        let (holds, unreadable) =
+            tokio::task::spawn_blocking(move || crate::profile_state::PacedHolds::load(path))
+                .await
+                .context("read the record of what paced set-onlines hold")?;
+        if let Some(why) = unreadable {
+            error!(
+                path = %shown,
+                error.cause = %why,
+                "the record of the torrents a paced set-online paused could not be read; any it \
+                 named come back paused, and POST /v1/profiles/{{id}}/resume-all resumes them",
+            );
+        }
+        holds
+    };
 
     // One libtorrent session per configured profile. There is no other shape:
     // a deployment with one profile is this with n = 1, not a mode of its own.
@@ -972,7 +993,8 @@ pub async fn boot(
     let profile_registry = Arc::new(
         ProfileRegistry::new(profile_entries)
             .with_failed(failed_profiles)
-            .with_states(desired_states),
+            .with_states(desired_states)
+            .with_holds(paced_holds),
     );
     profile_registry.export_offline(&*metrics);
     // Kept as itself too: the scans below hold each session's alerts on it
@@ -1180,6 +1202,11 @@ pub async fn boot(
         let mut missing_metadata = 0usize;
         let mut from_library = 0usize;
         let mut added_from_resume = 0usize;
+        // Paused by a paced set-online the daemon stopped in, not by the
+        // operator: loaded unpaused, as they were before the profile went
+        // offline.
+        let held = profile_registry.holds().held(&profile);
+        let mut unheld = Vec::new();
         let engine = source
             .engine_for(&profile)
             .ok_or_else(|| anyhow::anyhow!("no engine for profile {}", profile))?;
@@ -1268,9 +1295,14 @@ pub async fn boot(
             }
             // The flags re-asserted are `torrentd_engine::policy`'s. PAUSED is
             // not cleared: resume data does not say why a torrent was paused,
-            // and restarting one an operator paused is not recoverable.
+            // and restarting one an operator paused is not recoverable. The
+            // one exception is a pause the record of paced set-onlines names,
+            // which is the daemon's own and is released by any pause the
+            // operator makes over it.
             let relocated = relocated_save_path(&*torrent_store, pool.as_deref(), &profile, &ih);
-            let params = resume_scan_params(profile_cfg, data.into_inner(), torrent, relocated);
+            let paced = held.contains(&ih);
+            let params =
+                resume_scan_params(profile_cfg, data.into_inner(), torrent, relocated, paced);
             // The account-isolation guard, on the trackers this resume data
             // would announce to — its own `trackers` list where it has one.
             // A file written before the profile's allow-list was set, or
@@ -1310,6 +1342,9 @@ pub async fn boot(
                 Ok(h) => {
                     added_from_resume += 1;
                     loaded.insert(ih);
+                    if paced {
+                        unheld.push(ih);
+                    }
                     scan_fence.added(&profile_registry, &metrics, &profile, h);
                 }
                 Err(e) => {
@@ -1319,6 +1354,31 @@ pub async fn boot(
             }
         }
         profile_source.hold_alerts(&profile);
+        if !unheld.is_empty() {
+            // Loaded unpaused, so no longer the record's: saved now, so their
+            // resume data stops saying paused, and released, so a pause the
+            // operator makes from here on is kept by the next boot.
+            for ih in &unheld {
+                state.queue_resume_save_now(*ih);
+            }
+            if let Err(e) = profile_registry
+                .holds()
+                .release(&profile, unheld.iter().copied())
+            {
+                warn!(
+                    profile_id = %profile,
+                    error.cause = %e,
+                    "could not release the paced set-online's holds the boot loaded unpaused; \
+                     the next boot loads them unpaused again",
+                );
+            }
+            info!(
+                profile_id = %profile,
+                torrent_count = unheld.len(),
+                "loaded unpaused the torrents a paced set-online had paused and not resumed \
+                 when the daemon stopped",
+            );
+        }
         if from_library > 0 {
             info!(
                 profile_id = %profile,
@@ -1939,18 +1999,23 @@ fn resume_scan_params(
     resume: Vec<u8>,
     torrent: Option<Vec<u8>>,
     save_path: Option<String>,
+    paced: bool,
 ) -> AddParams {
     let flags_set = if torrent.is_some() {
         torrentd_engine::resume_flags_set(profile)
     } else {
         torrentd_engine::resume_flags_set_without_metadata(profile)
     };
+    let mut flags_clear = torrentd_engine::resume_flags_clear();
+    if paced {
+        flags_clear |= libtorrent_safe::TorrentFlags::PAUSED;
+    }
     AddParams::Resume {
         bytes: resume,
         torrent,
         save_path,
         flags_set,
-        flags_clear: torrentd_engine::resume_flags_clear(),
+        flags_clear,
     }
 }
 
@@ -5799,12 +5864,12 @@ mod tests {
         let scans = [
             (
                 ih,
-                resume_scan_params(&profile, data, Some(a.clone()), None),
+                resume_scan_params(&profile, data, Some(a.clone()), None, false),
                 "resume",
             ),
             (
                 ih,
-                resume_scan_params(&profile, resume(&b, Some(a_url)).1, None, None),
+                resume_scan_params(&profile, resume(&b, Some(a_url)).1, None, None, false),
                 "resume",
             ),
             (
@@ -5827,7 +5892,7 @@ mod tests {
             &metrics,
             &profile,
             &ih,
-            &resume_scan_params(&profile, data, Some(b.clone()), None),
+            &resume_scan_params(&profile, data, Some(b.clone()), None, false),
             "resume",
         )
         .unwrap();
@@ -7036,7 +7101,7 @@ mod profile_construction_tests {
         for p in &cfg.profile {
             let engine = MockEngine::new();
             engine
-                .add_torrent(resume_scan_params(p, vec![1; 32], None, None))
+                .add_torrent(resume_scan_params(p, vec![1; 32], None, None, false))
                 .unwrap();
             engine
                 .add_torrent(torrent_dir_scan_params(p, vec![2; 32], "/data".into()))
@@ -7067,12 +7132,28 @@ mod profile_construction_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_with(dir.path(), &[host("public", true)]);
         let p = &cfg.profile[0];
-        let flags = |torrent| match resume_scan_params(p, vec![1; 32], torrent, None) {
+        let flags = |torrent| match resume_scan_params(p, vec![1; 32], torrent, None, false) {
             AddParams::Resume { flags_set, .. } => flags_set,
             other => panic!("not a resume add: {other:?}"),
         };
         assert!(flags(None).contains(off), "{:?}", flags(None));
         assert!(!flags(Some(vec![2; 32])).intersects(off));
+    }
+
+    /// A resume entry a paced set-online still holds reloads with its saved
+    /// pause cleared, since the pause was the pace's; any other keeps it.
+    #[test]
+    fn only_a_paced_hold_reloads_unpaused() {
+        use libtorrent_safe::TorrentFlags;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(dir.path(), &[host("public", true)]);
+        let p = &cfg.profile[0];
+        let clear = |paced| match resume_scan_params(p, vec![1; 32], None, None, paced) {
+            AddParams::Resume { flags_clear, .. } => flags_clear,
+            other => panic!("not a resume add: {other:?}"),
+        };
+        assert!(clear(true).contains(TorrentFlags::PAUSED));
+        assert!(!clear(false).contains(TorrentFlags::PAUSED));
     }
 }
 
