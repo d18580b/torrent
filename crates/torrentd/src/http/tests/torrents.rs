@@ -2188,6 +2188,56 @@ async fn status_counts_every_phase_across_profiles() {
     assert_eq!(status["profile_count"], 3);
 }
 
+/// The saves queued since the last call, as `(infohash, unconditional)`.
+fn queued_saves(h: &Harness) -> Vec<(InfoHash, bool)> {
+    h.state
+        .state
+        .dispatch_resume_saves(usize::MAX)
+        .into_iter()
+        .map(|(ih, flags)| {
+            h.state.state.note_resume_settled(&ih);
+            (ih, flags.is_empty())
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn every_pause_the_api_takes_queues_an_unconditional_resume_save() {
+    // Issue #311: a pause is saved at once, not at the next 30-minute sweep,
+    // so a crash before it cannot bring the torrent back running. A torrent
+    // whose pause the engine refused is not paused, and queues nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engines = None;
+    let h = Harness::authed(&Coverage::new(), |s| engines = Some(fixture(s, dir.path())));
+    let e = engines.unwrap();
+    assert_eq!(queued_saves(&h), []);
+
+    h.write("POST", &format!("/v1/torrents/{}/pause", hex(LOADED)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+    assert_eq!(queued_saves(&h), [(LOADED, true)]);
+
+    let resp = h.write("POST", "/v1/profiles/p/pause-all").await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["torrent_count"], 1);
+    assert_eq!(queued_saves(&h), [(LOADED, true)]);
+
+    e.p.inject_error("pause_torrent", injected("pause_torrent"));
+    let resp = h.write("POST", "/v1/profiles/p/pause-all").await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["failed_count"], 1);
+    assert_eq!(queued_saves(&h), []);
+
+    // Daemon-wide, the fenced profile's torrent is paused again, and saved
+    // too.
+    let resp = h.write("POST", "/v1/torrents/pause-all").await;
+    resp.assert_status(StatusCode::OK);
+    assert_eq!(resp.json::<Value>()["torrent_count"], 2);
+    let mut saves = queued_saves(&h);
+    saves.sort_by_key(|(ih, _)| ih.0);
+    assert_eq!(saves, [(LOADED, true), (FENCED, true)]);
+}
+
 #[tokio::test]
 async fn a_torrent_outside_the_allow_list_is_counted_as_a_registry_error() {
     let dir = tempfile::tempdir().unwrap();
