@@ -1058,7 +1058,7 @@ mod native {
     /// are not zero, so that character must be one of the sixteen whose low
     /// two bits are clear.
     fn is_wg_key(value: &str) -> bool {
-        let key: Vec<u8> = value.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+        let key: Vec<u8> = value.bytes().filter(|&b| !is_wg_space(b.into())).collect();
         key.len() == 44
             && key[43] == b'='
             && key[..43]
@@ -1067,10 +1067,20 @@ mod native {
             && b"AEIMQUYcgkosw048".contains(&key[42])
     }
 
+    /// Whether `wg` counts `c` as whitespace: C's `isspace` in the C locale,
+    /// which wireguard-tools' `config_read_line` uses. That is ASCII space,
+    /// `\t`, `\n`, `\v`, `\f` and `\r`, and nothing outside ASCII, so `wg`
+    /// reads `Private<U+00A0>Key` as a key it does not know. Rust's
+    /// `is_ascii_whitespace` leaves out `\v`, and `char::is_whitespace` takes
+    /// in Unicode spaces `wg` keeps.
+    fn is_wg_space(c: char) -> bool {
+        c.is_ascii_whitespace() || c == '\x0b'
+    }
+
     /// `s` with every whitespace character removed, as wireguard-tools'
     /// `config_read_line` removes it from a line before reading it.
     fn squeezed(s: &str) -> String {
-        s.chars().filter(|c| !c.is_whitespace()).collect()
+        s.chars().filter(|&c| !is_wg_space(c)).collect()
     }
 
     /// Split a config the way `wg-quick`'s `parse_options` does: `#` starts a
@@ -1094,7 +1104,7 @@ mod native {
         for (i, line) in text.lines().enumerate() {
             let n = i + 1;
             let stripped = line.split('#').next().unwrap_or_default();
-            if stripped.trim().is_empty() {
+            if stripped.chars().all(is_wg_space) {
                 p.wg_conf.push_str(line);
                 p.wg_conf.push('\n');
                 continue;
@@ -2258,6 +2268,16 @@ PublicKey = x
             (format!("PrivateKey: {KEY}"), "line 3"),
             (format!("PrivateKey {KEY}"), "line 3"),
             (format!("PrivateKey\t{}", &KEY[..43]), "line 3 is neither"),
+            // `wg` strips only ASCII whitespace, so it reads
+            // `Private<U+00A0>Key` as a key it does not know and would echo
+            // the line; the name is not letters only, so it is not shown.
+            (format!("Private\u{a0}Key = {KEY}"), "line 3 is not a key"),
+            (
+                format!("Private\u{2003}Key = \"{KEY}\""),
+                "line 3 is not a key",
+            ),
+            // A line of nothing but a Unicode space is not blank to `wg`.
+            (format!("PrivateKey = {KEY}\n\u{a0}"), "line 4 is neither"),
         ] {
             let e = native::parse(&private(&line)).expect_err(&line);
             assert!(!e.contains(&KEY[..43]), "{line:?} leaked the key: {e}");
@@ -2288,8 +2308,10 @@ PublicKey = x
             .replace("[Peer]", "[ Pe er ]")
             .replace(
                 &format!("PrivateKey = {KEY}"),
+                // `\v` is whitespace to `wg`'s `isspace`, though not to
+                // Rust's `is_ascii_whitespace`.
                 &format!(
-                    "Private Key = {} {}\nListen Port = 51820\nFwMark = 0x1",
+                    "Private\x0bKey = {}\x0b {}\nListen Port = 51820\nFwMark = 0x1\n\x0b",
                     &KEY[..20],
                     &KEY[20..]
                 ),
