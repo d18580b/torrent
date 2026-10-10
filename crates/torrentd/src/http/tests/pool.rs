@@ -1160,8 +1160,14 @@ async fn a_delete_clears_the_pool_index_owner_it_set() {
     }
 }
 
+/// How long [`hold_writer_as_a_scan`] holds the writer at most. A handler
+/// that waits on it on the test's current-thread runtime stalls every timer,
+/// so a regression shows up as an answer later than this rather than a test
+/// that never ends.
+const SCAN_HOLD: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Hold the writer inside a transaction, as a running scan does, until the
-/// returned sender is used or dropped.
+/// returned sender is used or dropped, or [`SCAN_HOLD`] passes.
 fn hold_writer_as_a_scan(
     pool: &Arc<PoolService>,
 ) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
@@ -1172,7 +1178,7 @@ fn hold_writer_as_a_scan(
         held.with_store_mut(|st| {
             st.in_transaction(|_| {
                 locked_tx.send(()).unwrap();
-                let _ = release_rx.recv();
+                let _ = release_rx.recv_timeout(SCAN_HOLD);
                 Ok::<(), torrentd_pool::PoolError>(())
             })
         })
@@ -1216,12 +1222,13 @@ async fn a_delete_answers_while_a_scan_holds_the_writer_and_releases_the_owner_a
     let owner = || index.with_reader(|st| st.profile_of(IH_A).unwrap());
 
     let (release, holder) = hold_writer_as_a_scan(&index);
-    let resp = tokio::time::timeout(
-        Duration::from_secs(5),
-        h.write("DELETE", &format!("/v1/torrents/{IH_A}")),
-    )
-    .await
-    .expect("the delete waited on the writer");
+    let asked = std::time::Instant::now();
+    let resp = h.write("DELETE", &format!("/v1/torrents/{IH_A}")).await;
+    assert!(
+        asked.elapsed() < SCAN_HOLD / 2,
+        "the delete waited {:?} on the writer",
+        asked.elapsed(),
+    );
     resp.assert_status(StatusCode::NO_CONTENT);
     assert_eq!(
         h.state.registry.lookup(&hash),
@@ -1251,8 +1258,6 @@ async fn a_delete_answers_while_a_scan_holds_the_writer_and_releases_the_owner_a
 /// so a refusal answers while a scan holds the writer rather than after it.
 #[tokio::test]
 async fn a_shared_payload_delete_is_refused_while_a_scan_holds_the_writer() {
-    use std::time::Duration;
-
     let dir = tempfile::tempdir().unwrap();
     let (pool, root_id) = fixture(dir.path(), true);
     pool.with_store_mut(|st| {
@@ -1263,15 +1268,18 @@ async fn a_shared_payload_delete_is_refused_while_a_scan_holds_the_writer() {
     let h = Harness::authed(&Coverage::new(), |s| s.pool = Some(pool));
 
     let (release, holder) = hold_writer_as_a_scan(&index);
-    let resp = tokio::time::timeout(
-        Duration::from_secs(5),
-        h.write(
+    let asked = std::time::Instant::now();
+    let resp = h
+        .write(
             "DELETE",
             &format!("/v1/torrents/{IH_A}?delete_files=true&confirm={IH_A}"),
-        ),
-    )
-    .await
-    .expect("the co-claimant check waited on the writer");
+        )
+        .await;
+    assert!(
+        asked.elapsed() < SCAN_HOLD / 2,
+        "the co-claimant check waited {:?} on the writer",
+        asked.elapsed(),
+    );
     assert_problem(&resp, 409, "payload-shared");
     release.send(()).unwrap();
     holder.join().unwrap();
