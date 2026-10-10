@@ -2036,6 +2036,33 @@ mod tests {
         pool.with_store(|s| s.profile_of(&ih.to_hex()).unwrap())
     }
 
+    /// The in-memory verify queue alone makes a torrent owned: an item
+    /// waiting or in flight with no registry claim, no `pool.db` row, and no
+    /// index owner is still refused by a relocate and kept by a delete plan.
+    #[test]
+    fn the_in_memory_verify_queue_alone_makes_a_torrent_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        let waiting = InfoHash::from_hex(&"a1".repeat(20)).unwrap();
+        let flying = InfoHash::from_hex(&"b2".repeat(20)).unwrap();
+        let pool = pool_with(dir.path(), waiting, None);
+        let state = torrentd_engine::StateMap::new();
+
+        assert_eq!(pool.unloaded_owner(&waiting.to_hex()).unwrap(), None);
+        assert_eq!(pool.unloaded_owner(&flying.to_hex()).unwrap(), None);
+        assert!(pool.owned_infohashes(&state).unwrap().is_empty());
+
+        pool.verify_queue().enqueue(pending(waiting, "p"));
+        pool.verify_queue().track_in_flight(flying.to_hex());
+        assert!(pool.with_store(|s| s.verify_queue().unwrap()).is_empty());
+
+        for ih in [waiting, flying] {
+            let why = pool.unloaded_owner(&ih.to_hex()).unwrap();
+            assert_eq!(why.as_deref(), Some("it is waiting in the verify queue"));
+        }
+        let owned = pool.owned_infohashes(&state).unwrap();
+        assert_eq!(owned, vec![waiting.to_hex(), flying.to_hex()]);
+    }
+
     /// The enqueue writes the pool index's owner before the worker runs, so a
     /// drop has to take it back: left behind, it refused adoption into every
     /// other profile, and `DELETE` (with no registry entry) answered not
