@@ -771,8 +771,8 @@ pub enum ProfileConfigError {
     #[error(
         "profile {profile:?}: allowed_tracker_urls[{index}] is not an announce-URL prefix: write \
          it as scheme://host[:port]/path, copied from the start of the account's announce URL \
-         (such as \"https://tracker.example.com/<passkey>/\"), with no whitespace, and no '@', \
-         '?' or '#' before the path"
+         (such as \"https://tracker.example.com/<passkey>/\"), with no whitespace, no '@', '?' \
+         or '#' before the path, and no trailing '.' on the host"
     )]
     BadTrackerUrl { profile: String, index: usize },
     /// An `allowed_tracker_urls` entry whose host no domain on the profile's
@@ -1443,6 +1443,11 @@ impl ProfileConfig {
             },
         };
         if port.is_some_and(|p| p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit())) {
+            return None;
+        }
+        // The authority is matched as written, so a root dot the announce
+        // URL does not carry would match nothing.
+        if host.ends_with('.') {
             return None;
         }
         let host = Self::canonical_host(host);
@@ -2187,7 +2192,7 @@ mod tests {
         for good in [
             "https://tracker.example.com/PASS/",
             "udp://announce.tracker.example.com:6969/PASS/announce",
-            "http://Tracker.Example.com./announce.php?passkey=PASS",
+            "http://Tracker.Example.com/announce.php?passkey=PASS",
         ] {
             p.allowed_tracker_urls = vec![good.into()];
             ProfileConfig::validate_set(&[p.clone()])
@@ -2202,6 +2207,7 @@ mod tests {
             "https://tracker.example.com?x/PASS/",
             "https://tracker.example.com:/PASS/",
             "https://tracker.example.com:x/PASS/",
+            "https://tracker.example.com./PASS/",
             "https://tracker.example.com/PA SS/",
             "1http://tracker.example.com/PASS/",
         ] {
