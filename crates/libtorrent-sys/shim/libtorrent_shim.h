@@ -503,6 +503,12 @@ int         lt_save_resume_data(lt_session* s, lt_handle h, uint32_t flags);
 /* lt_pop_alert and lt_alert_payload_free are declared in alert_union.h
  * after the full struct definition for bindgen's benefit. */
 
+/* How many libtorrent alerts this session popped and then could not
+ * translate, because translating one threw. Each such alert is dropped on
+ * its own, its partial payload freed; the rest of its batch is still
+ * delivered. Monotonic for the session's lifetime; 0 for a null session. */
+uint64_t    lt_alert_translate_errors(lt_session* s);
+
 #ifdef __cplusplus
 }
 #endif
