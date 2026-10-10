@@ -1842,6 +1842,13 @@ mod tests {
             self.inner.current_ip(iface)
         }
 
+        fn global_ipv6(
+            &self,
+            iface: &str,
+        ) -> Result<Vec<std::net::Ipv6Addr>, torrentd_engine::VpnError> {
+            self.inner.global_ipv6(iface)
+        }
+
         fn bring_down(&self, iface: &str) {
             self.events
                 .lock()

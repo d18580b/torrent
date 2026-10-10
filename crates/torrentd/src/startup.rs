@@ -1865,11 +1865,12 @@ where
     let mut profile_entries: Vec<ProfileEntry> = Vec::new();
     let mut failed_profiles: Vec<FailedProfile> = Vec::new();
 
-    // Which profile holds each tunnel address. A vpn session is bound by
-    // address, listening and outgoing alike, so two tunnels that come up with
-    // one address (every Proton WireGuard config assigns 10.2.0.2/32) leave
-    // nothing — neither the bind nor a source-address routing rule — that can
-    // keep one account's traffic out of the other's tunnel. Only known after
+    // Which profile holds each tunnel address: the link's IPv4 address and
+    // each of its global IPv6 addresses, since a session sends from all of
+    // them. A tunnel is routed by its address, so two tunnels that come up
+    // with one address (every Proton WireGuard config assigns 10.2.0.2/32)
+    // leave no source-address routing rule, and no kill-switch pairing, that
+    // can keep one account's traffic out of the other's tunnel. Only known after
     // bring-up, since OpenVPN's address is pushed by the server.
     let mut tunnel_owner: std::collections::HashMap<IpAddr, ProfileId> =
         std::collections::HashMap::new();
@@ -1908,8 +1909,12 @@ where
                 // profile that fails a later step has its tunnel taken down,
                 // and still owning the address then disabled a later profile
                 // over a tunnel that no longer exists.
+                let (entry, v6) = entry;
                 if let Some(ip) = entry.health().tunnel_ip {
                     tunnel_owner.insert(ip, p.id.clone());
+                }
+                for a in v6 {
+                    tunnel_owner.insert(IpAddr::V6(a), p.id.clone());
                 }
                 profile_entries.push(entry);
             }
@@ -1963,7 +1968,7 @@ async fn build_profile<F, E>(
     held: Held<'_>,
     held_offline: bool,
     make_engine: &mut F,
-) -> Result<ProfileEntry, Box<FailedProfile>>
+) -> Result<(ProfileEntry, Vec<std::net::Ipv6Addr>), Box<FailedProfile>>
 where
     F: FnMut(&torrentd_engine::Settings, Option<Vec<u8>>) -> Result<Arc<dyn TorrentEngine>, E>,
     E: std::fmt::Display,
@@ -2027,6 +2032,7 @@ where
     // What differs between the two postures, and nothing else: where the
     // sockets bind, and whether discovery may run.
     let mut tunnel_ip: Option<IpAddr> = None;
+    let mut tunnel_v6: Vec<std::net::Ipv6Addr> = Vec::new();
     let mut forwarded_port: Option<u16> = None;
     let mut forwarded_epoch: u32 = 0;
     let mut session_state: Option<Vec<u8>> = None;
@@ -2093,6 +2099,54 @@ where
                 tear_down_or_warn!(iface);
                 fail_profile!(reason);
             }
+            // The session listens on the device, so it also sends from each
+            // global IPv6 address the link holds, and a shared one is shared
+            // the same way: the kill switch accepts it on both links. An
+            // address that cannot be read cannot be checked, so the profile
+            // does not come up on it.
+            let vpn = cleanup.manager_for(vpn_type);
+            let read_iface = iface.to_string();
+            let v6 = match tokio::task::spawn_blocking(move || vpn.global_ipv6(&read_iface)).await {
+                Ok(Ok(v6)) => v6,
+                Ok(Err(e)) => {
+                    error!(
+                        profile_id = %p.id,
+                        vpn_iface = %iface,
+                        error.cause = %e,
+                        "could not read the tunnel's IPv6 addresses, so could not check that \
+                         no other profile's tunnel has one; profile disabled",
+                    );
+                    tear_down_or_warn!(iface);
+                    fail_profile!(format!(
+                        "could not read tunnel {iface}'s IPv6 addresses to check none is \
+                         another profile's: {e}"
+                    ));
+                }
+                Err(e) => {
+                    tear_down_or_warn!(iface);
+                    profile_task_failed!("VPN IPv6 address read", e)
+                }
+            };
+            if let Some((addr, owner)) = v6
+                .iter()
+                .find_map(|a| held.tunnels.get(&IpAddr::V6(*a)).map(|o| (a, o)))
+            {
+                error!(
+                    profile_id = %p.id,
+                    tunnel_ip = %addr,
+                    other_profile_id = %owner,
+                    "tunnel came up with an IPv6 address another profile's tunnel already \
+                     has; profile disabled, since a tunnel is routed by its address and a \
+                     session on one cannot be kept out of the other account's tunnel",
+                );
+                let reason = format!(
+                    "tunnel address {addr} is also profile {owner}'s, so neither session can \
+                     be kept out of the other's tunnel"
+                );
+                tear_down_or_warn!(iface);
+                fail_profile!(reason);
+            }
+            tunnel_v6 = v6;
 
             // The listening port. A static profile binds the operator's
             // `listen_port`; a natpmp profile negotiates an ephemeral one
@@ -2214,12 +2268,15 @@ where
                 dht = p.dht_enabled(),
                 "profile engine up",
             );
-            Ok(ProfileEntry::new(
-                p.clone(),
-                engine,
-                tunnel_ip,
-                forwarded_port,
-                forwarded_epoch,
+            Ok((
+                ProfileEntry::new(
+                    p.clone(),
+                    engine,
+                    tunnel_ip,
+                    forwarded_port,
+                    forwarded_epoch,
+                ),
+                tunnel_v6,
             ))
         }
         Err(e) => {
@@ -3853,6 +3910,13 @@ mod tests {
             })
         }
 
+        fn global_ipv6(
+            &self,
+            _iface: &str,
+        ) -> Result<Vec<std::net::Ipv6Addr>, torrentd_engine::VpnError> {
+            Ok(Vec::new())
+        }
+
         fn bring_down(&self, _iface: &str) {
             self.down_on
                 .lock()
@@ -4060,6 +4124,13 @@ mod tests {
             Err(torrentd_engine::VpnError::NoAddress {
                 iface: iface.to_string(),
             })
+        }
+
+        fn global_ipv6(
+            &self,
+            _iface: &str,
+        ) -> Result<Vec<std::net::Ipv6Addr>, torrentd_engine::VpnError> {
+            Ok(Vec::new())
         }
 
         fn bring_down(&self, iface: &str) {
@@ -4875,6 +4946,50 @@ mod profile_construction_tests {
             vec!["wg-b".to_string()],
             "and the surviving profile's tunnel stays up",
         );
+    }
+
+    /// Two tunnels on distinct IPv4 addresses that share a global IPv6
+    /// address: the sessions send from it too, so the second is refused as
+    /// for a shared IPv4 address. A tunnel whose IPv6 addresses cannot be
+    /// read cannot be checked, and is refused as well.
+    #[tokio::test]
+    async fn a_tunnel_sharing_an_ipv6_address_or_unable_to_read_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_with(
+            dir.path(),
+            &[
+                vpn("acct_a", "wg-a", 1),
+                vpn("acct_b", "wg-b", 2),
+                vpn("acct_c", "wg-c", 3),
+            ],
+        );
+        let shared: std::net::Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let vpn = MockVpn::new();
+        vpn.set_ip("wg-a", TUNNEL_IP);
+        vpn.set_ip("wg-b", OTHER_TUNNEL_IP);
+        vpn.set_ip("wg-c", IpAddr::V4(Ipv4Addr::new(10, 3, 0, 2)));
+        vpn.set_ipv6("wg-a", vec![shared]);
+        vpn.set_ipv6("wg-b", vec!["2001:db8::9".parse().unwrap(), shared]);
+        vpn.set_ipv6_unreadable("wg-c");
+
+        let mut out = build(&cfg, &vpn, &MockForwarder::new(), None).await;
+
+        assert_eq!(out.up_ids(), vec!["acct_a"]);
+        let reason = &out.failed("acct_b").reason;
+        assert!(
+            reason.contains("tunnel address 2001:db8::2 is also profile acct_a's"),
+            "{reason}"
+        );
+        let reason = &out.failed("acct_c").reason;
+        assert!(
+            reason.contains("could not read tunnel wg-c's IPv6 addresses")
+                && reason.contains("no answer"),
+            "{reason}"
+        );
+        let mut lowered = vpn.bring_down_calls();
+        lowered.sort();
+        assert_eq!(lowered, vec!["wg-b".to_string(), "wg-c".to_string()]);
+        out.cleanup.disarm();
     }
 
     #[tokio::test]
