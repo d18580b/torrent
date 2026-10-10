@@ -2478,3 +2478,189 @@ fn a_delete_answered_204_stays_deleted_across_a_sigkill() {
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
 }
+
+/// Which pieces a two-piece torrent's resume file records as held: the
+/// top-level `pieces` string, one byte a piece, bit 0 set for a piece held.
+/// The info dict's `pieces` holds 40 bytes of hashes, so `6:pieces2:` is the
+/// top-level one alone.
+fn resume_pieces(resume: &[u8]) -> Option<[bool; 2]> {
+    const KEY: &[u8] = b"6:pieces2:";
+    let at = resume.windows(KEY.len()).position(|w| w == KEY)? + KEY.len();
+    let held = resume.get(at..at + 2)?;
+    Some([held[0] & 1 == 1, held[1] & 1 == 1])
+}
+
+/// Poll `GET /v1/torrents/{ih}` until its `(phase, progress)` satisfies
+/// `done`, returning it; or, once `within` has passed, the last one seen as
+/// the error. The phase can move a status update before the progress does,
+/// so a wait names both.
+fn settled_in(
+    addr: &str,
+    ih: &str,
+    within: Duration,
+    done: impl Fn(&str, f64) -> bool,
+) -> Result<(String, f64), Option<(String, f64)>> {
+    let deadline = Instant::now() + within;
+    let mut last = None;
+    loop {
+        let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+        if code == 200 {
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let seen = (
+                v["phase"].as_str().unwrap_or_default().to_owned(),
+                v["progress"].as_f64().unwrap_or_default(),
+            );
+            if done(&seen.0, seen.1) {
+                return Ok(seen);
+            }
+            last = Some(seen);
+        }
+        if Instant::now() >= deadline {
+            return Err(last);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Issue #182's acceptance, left to #311: a recheck's verdict survives a
+/// SIGKILL straight after it.
+///
+/// A recheck used to queue no resume save, so until the next 30-minute sweep
+/// the resume file still said what the last graceful stop wrote: every piece
+/// held, `seed_mode 0`. A crash in that window booted the torrent from it as
+/// complete, without hashing, and it seeded a piece it no longer had. Here a
+/// two-piece torrent is stopped gracefully, one of its pieces is corrupted in
+/// place with the file's size unchanged, and a recheck finds it out; the
+/// daemon is killed once the verdict reaches the resume file, and the boot
+/// after must not report the torrent complete.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_recheck_verdict_survives_a_sigkill() {
+    use std::os::unix::fs::FileExt as _;
+
+    use base64::Engine as _;
+    use sha1::Digest;
+
+    const PIECE: usize = 16384;
+    let payload: Vec<u8> = (0..2 * PIECE).map(|i| (i % 251) as u8).collect();
+    let mut torrent = format!(
+        "d4:infod6:lengthi{}e4:name7:recheck12:piece lengthi{PIECE}e6:pieces40:",
+        payload.len()
+    )
+    .into_bytes();
+    for piece in payload.chunks(PIECE) {
+        torrent.extend_from_slice(&sha1::Sha1::digest(piece));
+    }
+    torrent.extend_from_slice(b"ee");
+    let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+        .unwrap()
+        .to_hex();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    let data = p.join("data").join("recheck");
+    std::fs::write(&data, &payload).unwrap();
+    let resume = p.join("resume").join(PROFILE).join(format!("{ih}.resume"));
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        let child = KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_torrentd"))
+                .arg("--config")
+                .arg(&cfg)
+                .spawn()
+                .expect("spawn daemon"),
+        );
+        wait_healthy(addr);
+        child
+    };
+    let seeding = |what: &str| {
+        let seen = settled_in(addr, &ih, Duration::from_secs(60), |phase, progress| {
+            phase == "seeding" && progress == 1.0
+        });
+        assert!(
+            seen.is_ok(),
+            "{what}: the complete torrent never reached seeding: {seen:?}"
+        );
+    };
+
+    // Added and hashed complete, then stopped gracefully: its resume file
+    // says every piece is held, and not in seed mode.
+    let mut child = spawn();
+    let (code, body) = http(
+        addr,
+        "POST",
+        "/v1/torrents",
+        Some(&format!(
+            "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"metainfo\",\
+             \"data\":\"{}\"}}}}",
+            base64::engine::general_purpose::STANDARD.encode(&torrent),
+        )),
+    );
+    assert_eq!(code, 201, "{body}");
+    seeding("after the add");
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+    let stopped = std::fs::read(&resume).expect("the graceful stop wrote no resume file");
+    assert_eq!(resume_pieces(&stopped), Some([true, true]));
+    assert!(
+        stopped.windows(14).any(|w| w == b"9:seed_modei0e"),
+        "the resume file is not seed_mode 0"
+    );
+
+    // Booted from it, the first piece corrupted in place, and rechecked.
+    let mut child = spawn();
+    seeding("after the restart");
+    let file = std::fs::OpenOptions::new().write(true).open(&data).unwrap();
+    file.write_all_at(&[!payload[0]], 0).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let (code, body) = http(addr, "POST", &format!("/v1/torrents/{ih}/recheck"), None);
+    assert_eq!(code, 202, "{body}");
+    let seen = settled_in(addr, &ih, Duration::from_secs(60), |phase, progress| {
+        phase == "incomplete" && progress == 0.5
+    });
+    assert!(
+        seen.is_ok(),
+        "the recheck did not find the corrupted piece: {seen:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::fs::read(&resume)
+        .ok()
+        .as_deref()
+        .and_then(resume_pieces)
+        != Some([false, true])
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the recheck's verdict did not reach the resume file within 30s",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // SIGKILL: no drain, no save after this.
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let mut child = spawn();
+    // Settled either way: incomplete with the one piece it holds counted, or
+    // seeding complete, which is the regression.
+    let after = settled_in(addr, &ih, Duration::from_secs(60), |phase, progress| {
+        (phase == "incomplete" && progress > 0.0) || (phase == "seeding" && progress == 1.0)
+    });
+    assert!(
+        after
+            .as_ref()
+            .is_ok_and(|(phase, progress)| phase == "incomplete" && *progress < 1.0),
+        "booted after the SIGKILL as {after:?}, not incomplete",
+    );
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}
