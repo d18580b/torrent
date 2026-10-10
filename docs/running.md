@@ -795,6 +795,39 @@ on it anyway exits `78`, which `deploy/torrentd.service` leaves stopped rather
 than restarting. Move the file to `/etc/wireguard/<vpn_interface>.conf` and
 update `vpn_config`.
 
+**An OpenVPN profile's `vpn_config` is executable configuration.** An `.ovpn`
+can run programs (`up`, `route-up` and the other hooks, once `script-security
+2` allows them), load a shared library into `openvpn` (`plugin`), and open a
+socket that drives it (`management`) — all as the daemon's user, holding
+whatever `CAP_NET_ADMIN` it has, with which a hook could re-point another
+profile's routing. Treat a provider's bundle, or a file in a shared
+directory, as code. The daemon closes this two ways, as it refuses
+`wg-quick` hooks for WireGuard (§11.6):
+
+- `openvpn` runs with `--script-security 1` after `--config`, so whatever
+  level the file sets is overridden and no hook it names can run.
+- The file is read before `openvpn` is spawned, and by `--check-config` and
+  the daemon's own pre-flight, and is **refused** — the error names the line
+  and the directive — when it carries any of `up`, `down`, `route-up`,
+  `route-pre-down`, `ipchange`, `tls-verify`, `auth-user-pass-verify`,
+  `tls-crypt-v2-verify`, `client-connect`, `client-disconnect`,
+  `learn-address`, `iproute`, `plugin`, `management`, `script-security`
+  above 1, `daemon`, `chroot`, `cd`, `config` (a nested include), or one
+  that has `openvpn` create or overwrite a path the file chooses as the
+  daemon's user — `log`, `log-append`, `status`, `replay-persist`,
+  `ifconfig-pool-persist`, `tls-export-cert` (the daemon's state, resume
+  and token files are writable by that user). Words are split as `openvpn`
+  splits them, so a word ends at its closing quote (`"plugin"/x.so` is
+  `plugin`). A leading `--` and `setenv opt` do not hide one; the body of an inline
+  `<ca>`/`<key>`/… block is data and is not read as directives, a
+  `<connection>` block is. `crl-verify` and `verify-x509-name` are not
+  programs and are allowed. A refusal at the pre-flight exits `78`; a file
+  the pre-flight cannot read is left to that profile's bring-up, which fails
+  the profile alone. Remove the line. A provider's DNS hook such as `up
+  /etc/openvpn/update-resolv-conf` is not run either way; routing is the
+  daemon's (§11.6), and lookups through a tunnel are set up as "Tracker
+  lookups through a tunnel" (§5) describes.
+
 **`[[profile]] upload_rate_limit`** (optional, bytes/sec) is applied to that
 profile's session at boot. **Omit it to inherit the top-level
 `upload_rate_limit`; set it to `0` to make that profile explicitly unlimited**
@@ -2105,6 +2138,7 @@ run it by hand instead, start the service again afterwards:
 | Daemon refuses to start, "requires a dedicated non-root user" | `network_kill_switch = true` as uid 0 (§11.6). Run it as `torrentd` with `CAP_NET_ADMIN`, which raises WireGuard links with `ip` and `wg` itself (§11.6). Otherwise unset `network_kill_switch`. |
 | A WireGuard profile fails with "hooks are not run" or "Table = … is not supported" | The daemon raises every link with `ip` and `wg`, as root too, and runs no `wg-quick` hooks and honours no named table (§11.6). Either raise the link as root before the daemon starts — it is adopted by its key — or move the key into the config's `PrivateKey`, drop the hooks, and use `Table = auto` or `off`. |
 | Kill switch on, handshakes fresh, nothing seeds | Check that `nft list table inet torrentd_ks_<uid>` carries a `udp sport` line with each tunnel's `wg show <iface> listen-port` to its `wg show <iface> endpoints`, and an `ip saddr` line pairing each tunnel's `ip -4 addr show <iface>` address with that interface. A link re-raised on a new port or endpoint gets them within 30 s (the log says `a tunnel's transport changed`); a link re-raised with a new address does not, and needs a restart of the daemon. If tracker hostnames do not resolve, the host resolver is not on loopback (§11.6). |
+| Config refused or an OpenVPN profile fails, "`<directive>` is refused: it …" | The profile's `.ovpn` names a hook, a plugin, a management interface or another directive the daemon does not let it run (§5). Remove the line the error names. Catchable before a restart with `--check-config`. |
 | Config refused, "cannot be used with an OpenVPN profile" | `network_kill_switch = true` beside a `vpn_type = "openvpn"` profile. `openvpn` runs under the daemon's uid, so the kill switch would drop its connection to the provider (§11.6). The kill switch is WireGuard-only. |
 | One profile fenced at boot, log says "an interface of this name is already up and is not this profile's" | A link named by that profile's `vpn_interface` was standing when the profile tried to come up, and this boot did not adopt it. **The daemon leaves it completely alone either way** — nothing this attempt created may be removed by it — but the cause decides the remedy, and there are four. Three are links the daemon *could not establish as its own*: a different public key on the live link, a link that is not a WireGuard device, or a name another tunnel has taken. For those it leaves the link standing and does not tear it down, because it cannot vouch for it and removing it would take a stranger's routes and rules with it: find out whose it is (`wg show <iface>`, `ip -d link show <iface>`), and if it is yours, rename one of the two — which also means moving the WireGuard config, since the file's stem must equal the interface name (§5). The fourth is a link that **is** this profile's own and carries **no address** (`ip -4 addr show <iface>` is empty): there the daemon did establish ownership and still declined, because a tunnel with no address is nothing a profile can bind to and tearing it down is not this attempt's to do. For that one, and for a link that is simply stale from an earlier run, `wg-quick down <iface>` or `ip link delete <iface>` by hand and restart. The daemon discards the matching `wireguard-<iface>.raised` (§4) by itself — at the next startup and whenever it declines an adoption — so there is nothing to clean up after it. |
 | Adds fail with 409 `profile-unavailable`, `profile_status: "vpn_down"` | The profile is fenced. An operator restart is required by design. |

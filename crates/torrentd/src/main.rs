@@ -407,6 +407,21 @@ fn check_config_as(
     if cfg.network_kill_switch && !vpn::killswitch::nft_available() {
         anyhow::bail!("network_kill_switch = true but the `nft` binary is not available");
     }
+    // An OpenVPN profile's file is executable configuration: one naming a
+    // hook, a plugin or a management interface is refused here, before any
+    // tunnel is raised, as `bring_up` would refuse it. A file this process
+    // cannot read is left to that profile's bring-up (`config_refusal`).
+    for p in &cfg.profile {
+        let Some(tunnel) = p.vpn_tunnel() else {
+            continue;
+        };
+        if tunnel.r#type != torrentd_engine::VpnType::Openvpn {
+            continue;
+        }
+        if let Ok(Some(refusal)) = vpn::openvpn_config_refusal(&tunnel.config_path) {
+            anyhow::bail!("[[profile]] id = \"{}\": {refusal}", p.id.as_str());
+        }
+    }
     Ok(())
 }
 
@@ -871,6 +886,46 @@ http_listen = "127.0.0.1:8080"
              listen_interfaces = \"0.0.0.0:6881\"\n"
         ));
         check_config_as(&off, || unreachable!("no kill switch, no uid")).unwrap();
+    }
+
+    /// #229: an OpenVPN profile whose `.ovpn` names a hook or a plugin is
+    /// refused by `--check-config` — and by the daemon's pre-flight, which
+    /// is the same call — with the profile, the file and the directive
+    /// named. A file the check cannot read is left to that profile's
+    /// bring-up rather than refusing the whole configuration. Drop the scan
+    /// from `check_config_as` and the first two expectations fail.
+    #[test]
+    fn check_config_refuses_an_ovpn_that_names_a_hook_or_a_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = |ovpn: &std::path::Path| {
+            cfg_from(&format!(
+                "{TOP}\n[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\n\
+                 vpn_type = \"openvpn\"\nvpn_config = \"{}\"\nvpn_interface = \"tun-b\"\n",
+                ovpn.display()
+            ))
+        };
+        for (line, name) in [
+            ("script-security 2\nup /bin/sh", "script-security"),
+            ("up \"/bin/sh -c id\"", "up"),
+            ("plugin /usr/lib/openvpn/evil.so", "plugin"),
+        ] {
+            let ovpn = dir.path().join("acct_b.ovpn");
+            std::fs::write(&ovpn, format!("client\ndev tun\n{line}\n")).unwrap();
+            let msg = format!(
+                "{:#}",
+                check_config_as(&profile(&ovpn), || unreachable!("no kill switch"))
+                    .expect_err(line)
+            );
+            assert!(msg.contains(&format!("`{name}`")), "{line:?}: {msg}");
+            assert!(msg.contains("acct_b.ovpn"), "{line:?}: {msg}");
+            assert!(msg.contains("id = \"acct_b\""), "{line:?}: {msg}");
+        }
+
+        let clean = dir.path().join("clean.ovpn");
+        std::fs::write(&clean, "client\ndev tun\nremote 203.0.113.7 1194\n").unwrap();
+        check_config(&profile(&clean)).expect("a file with no hook passes");
+        check_config(&profile(&dir.path().join("missing.ovpn")))
+            .expect("an unreadable file is the profile's bring-up's to refuse");
     }
 
     #[test]
