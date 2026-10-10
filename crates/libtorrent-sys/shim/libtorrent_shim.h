@@ -82,13 +82,25 @@ typedef uintptr_t lt_handle;
  * need them, and alert_union.h is the one that includes this file. */
 #define LT_PATH_MAX 1024
 
-/* Upper bound on the file count `lt_torrent_metadata` will materialise.
+/* Upper bound on the file count `lt_torrent_metadata` and
+ * `lt_torrent_status_files` will materialise.
  *
- * Each entry carries a fixed LT_PATH_MAX buffer, so the array costs ~1 KiB per
- * file whatever the paths actually are. 250k files is far past any real
- * torrent (a 100 TiB release is thousands, not millions) and caps the
- * allocation at ~256 MiB. */
+ * Each `lt_torrent_status_files` entry carries a fixed LT_PATH_MAX buffer, so
+ * that array costs ~1 KiB per file whatever the paths actually are. 250k files
+ * is far past any real torrent (a 100 TiB release is thousands, not millions)
+ * and caps the allocation at ~256 MiB. */
 #define LT_MAX_TORRENT_FILES 250000u
+
+/* Upper bound on the bytes of path and name text `lt_torrent_metadata`
+ * returns, NULs included.
+ *
+ * Paths come back at full length, and each one repeats its directories: a
+ * small .torrent whose files all sit under one deep directory expands to
+ * that directory once per file. 256 MiB is the worst case the fixed 1 KiB
+ * path buffers this replaced already allowed, and a real manifest of
+ * thousands of files at a few hundred bytes each is under 1% of it. A
+ * manifest past it is refused, never truncated. */
+#define LT_MAX_TORRENT_PATH_BYTES (256u * 1024u * 1024u)
 #define LT_MSG_MAX  2048
 #define LT_ADDR_MAX 64
 #define LT_OP_MAX   64
@@ -303,9 +315,14 @@ int         lt_magnet_info_hash(const char* uri,
  * entry that aligns the next file to a piece boundary, carries a non-zero
  * size, and is never written to disk. Anything that looks for a torrent's
  * files on disk has to skip these, or every padded torrent reads as
- * incomplete. */
+ * incomplete.
+ *
+ * `path` is torrent-relative and '/'-separated, at its full length:
+ * `path_len` bytes followed by a NUL. It points into storage the enclosing
+ * lt_torrent_meta owns and is valid until lt_torrent_meta_free(). */
 struct lt_torrent_meta_file {
-    char     path[LT_PATH_MAX];   /* torrent-relative, '/'-separated */
+    const char* path;
+    size_t   path_len;
     uint64_t size;
     uint8_t  pieces_root[32];
     uint8_t  has_pieces_root;
@@ -313,10 +330,15 @@ struct lt_torrent_meta_file {
     uint8_t  _pad[6];
 };
 
-/* Parsed .torrent metadata. `files` is heap-allocated; release the whole
- * struct with lt_torrent_meta_free(). */
+/* Parsed .torrent metadata. `files` and every string are heap-allocated;
+ * release the whole struct with lt_torrent_meta_free().
+ *
+ * `name` is the torrent's name at its full length: `name_len` bytes followed
+ * by a NUL, in the same storage as the file paths. `strings` is that storage;
+ * it is the shim's, and only lt_torrent_meta_free() releases it. */
 struct lt_torrent_meta {
-    char     name[LT_PATH_MAX];
+    const char* name;
+    size_t   name_len;
     uint64_t total_size;
     uint32_t piece_length;
     uint8_t  has_v1;
@@ -326,10 +348,16 @@ struct lt_torrent_meta {
     uint8_t  infohash_v2[32];     /* zeroed when has_v2 == 0 */
     struct lt_torrent_meta_file* files;
     size_t   num_files;
+    char*    strings;
 };
 
 /* Parse a .torrent buffer into *out. Returns LT_OK / LT_ERR (err_out
  * populated). On success the caller MUST call lt_torrent_meta_free(out).
+ * On LT_ERR *out is zeroed and owns nothing.
+ *
+ * Names and paths are never truncated. A manifest of more than
+ * LT_MAX_TORRENT_FILES files, or whose names and paths together exceed
+ * LT_MAX_TORRENT_PATH_BYTES, is refused with LT_ERR.
  *
  * This is the pool library scanner's parser: libtorrent already handles v1,
  * v2, and hybrid torrents plus hostile input, so the daemon does not carry a
@@ -339,7 +367,8 @@ int         lt_torrent_metadata(const uint8_t* data, size_t len,
                                 struct lt_torrent_meta* out,
                                 char* err_out, int err_len);
 
-/* Release the heap file list. Idempotent; safe on a zero-initialized struct. */
+/* Release the heap file list and strings. Idempotent; safe on a
+ * zero-initialized struct. */
 void        lt_torrent_meta_free(struct lt_torrent_meta* m);
 
 /* The account-isolation guard: whether every tracker an add would announce to

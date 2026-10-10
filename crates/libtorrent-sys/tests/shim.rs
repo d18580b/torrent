@@ -203,11 +203,17 @@ fn parse_meta(bytes: &[u8]) -> lt_torrent_meta {
     meta
 }
 
+/// A shim string returned as a pointer and a length. The NUL after the
+/// `len` bytes is part of the contract, so it is asserted here too.
+fn sized_c_str(ptr: *const c_char, len: usize) -> String {
+    assert!(!ptr.is_null(), "a returned string must not be null");
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(ptr as *const u8, len + 1) };
+    assert_eq!(bytes[len], 0, "a returned string must be NUL-terminated");
+    String::from_utf8_lossy(&bytes[..len]).into_owned()
+}
+
 fn meta_file_path(f: &lt_torrent_meta_file) -> String {
-    let bytes: &[u8] =
-        unsafe { std::slice::from_raw_parts(f.path.as_ptr() as *const u8, f.path.len()) };
-    let nul = bytes.iter().position(|b| *b == 0).unwrap_or(bytes.len());
-    String::from_utf8_lossy(&bytes[..nul]).into_owned()
+    sized_c_str(f.path, f.path_len)
 }
 
 #[test]
@@ -225,6 +231,7 @@ fn metadata_reads_v2_root_hashes_and_both_infohashes() {
 
     let files = unsafe { std::slice::from_raw_parts(meta.files, meta.num_files) };
     assert_eq!(meta_file_path(&files[0]), "test64K");
+    assert_eq!(sized_c_str(meta.name, meta.name_len), "test64K");
     assert_eq!(files[0].size, 65536);
     assert_eq!(files[0].has_pieces_root, 1);
     assert_eq!(
@@ -237,6 +244,7 @@ fn metadata_reads_v2_root_hashes_and_both_infohashes() {
     );
 
     unsafe { lt_torrent_meta_free(&mut meta) };
+    assert!(meta.strings.is_null() && meta.name.is_null() && meta.files.is_null());
     // Freeing twice must be safe — the daemon frees on every early return path.
     unsafe { lt_torrent_meta_free(&mut meta) };
 }
@@ -322,6 +330,10 @@ fn metadata_rejects_garbage_without_unwinding() {
     assert_eq!(rc, LT_ERR, "malformed input must return LT_ERR");
     assert_ne!(err[0], 0, "err_out should describe the parse failure");
     assert!(meta.files.is_null(), "no allocation should leak on failure");
+    assert!(
+        meta.strings.is_null(),
+        "no allocation should leak on failure"
+    );
 
     // Null args must not dereference.
     assert_eq!(
