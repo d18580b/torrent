@@ -69,36 +69,58 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         Alert::TorrentRemoved { hdr } => {
             let _enter = ctx.span.enter();
             if let Some(ih) = hdr.infohash {
-                ctx.state.remove(&ih);
+                // Delete persisted state so a removed torrent doesn't
+                // resurrect from disk on the next startup scan. This fires
+                // after libtorrent has fully removed the torrent, so it can't
+                // race a still-pending save_resume_data write.
+                //
+                // The `.torrent` and save path are kept where this profile
+                // added the info-hash again in the meantime: `DELETE` clears
+                // the assignment as soon as the session accepts the removal,
+                // so an add can be accepted and write both before this alert
+                // is handled, and they are the new torrent's. Its resume file
+                // is not yet: the save its own `AddTorrent` queues writes it,
+                // and that alert follows this one, so the resume file here is
+                // still the removed torrent's, recording where that one was.
+                // The entry is dropped only if it is this profile's, and the
+                // removed torrent's where the removal was recorded: another
+                // profile may hold the info-hash by now.
+                let (resume, torrents, profile) = (ctx.resume, ctx.torrents, &ctx.profile_id);
+                let settled = ctx.state.settle_removal(profile, &ih, |readded| {
+                    if let Err(e) = resume.delete(profile, &ih) {
+                        warn!(
+                            target: "torrentd_engine::handler::add",
+                            infohash = %ih,
+                            error.cause = %e,
+                            "failed to delete resume file on remove",
+                        );
+                    }
+                    if readded {
+                        return;
+                    }
+                    if let Err(e) = torrents.delete(profile, &ih) {
+                        warn!(
+                            target: "torrentd_engine::handler::add",
+                            infohash = %ih,
+                            error.cause = %e,
+                            "failed to delete torrent file on remove",
+                        );
+                    }
+                });
                 // Settle a save that was in flight when the torrent went: its
                 // answer arrives with no info-hash (the shim skips an invalid
                 // handle), so `resume::handle` cannot settle it, and the drain
                 // would wait out its deadline on it while it held a cap slot.
                 // A queued one is dropped at dispatch, which finds no state.
-                ctx.state.note_resume_settled(&ih);
-                // Delete persisted state so a removed torrent doesn't
-                // resurrect from disk on the next startup scan. This fires
-                // after libtorrent has fully removed the torrent, so it can't
-                // race a still-pending save_resume_data write.
-                if let Err(e) = ctx.resume.delete(&ctx.profile_id, &ih) {
-                    warn!(
-                        target: "torrentd_engine::handler::add",
-                        infohash = %ih,
-                        error.cause = %e,
-                        "failed to delete resume file on remove",
-                    );
-                }
-                if let Err(e) = ctx.torrents.delete(&ctx.profile_id, &ih) {
-                    warn!(
-                        target: "torrentd_engine::handler::add",
-                        infohash = %ih,
-                        error.cause = %e,
-                        "failed to delete torrent file on remove",
-                    );
+                // Not where the map holds a torrent added since: a save in
+                // flight is that torrent's, and its answer settles it.
+                if settled.entry_released {
+                    ctx.state.note_resume_settled(&ih);
                 }
                 info!(
                     target: "torrentd_engine::handler::add",
                     infohash = %ih,
+                    readded = settled.readded,
                     "torrent removed",
                 );
                 ctx.metrics.inc_counter(
@@ -225,6 +247,120 @@ mod tests {
         assert!(!state.contains(&ih));
         assert!(resume.snapshot(&profile).is_empty());
         assert!(torrents.load_all(&profile).unwrap().is_empty());
+    }
+
+    fn removed_alert(ih: InfoHash) -> Alert {
+        Alert::TorrentRemoved {
+            hdr: AlertHeader {
+                kind: AlertKind::TorrentRemoved,
+                infohash: Some(ih),
+                handle: None,
+                timestamp_us: 0,
+            },
+        }
+    }
+
+    /// `DELETE`'s removal is recorded, the same profile adds the info-hash
+    /// again and writes its `.torrent` and save path, and only then is the old
+    /// torrent's `torrent_removed_alert` handled.
+    #[test]
+    fn a_removal_handled_after_a_same_profile_re_add_keeps_the_new_files() {
+        let ih = InfoHash([0x7B; 20]);
+        let profile = ProfileId::new("p");
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = NoopSink;
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let old = TorrentHandle {
+            id: 1,
+            infohash: ih,
+        };
+        state.insert(
+            ih,
+            TorrentState::newly_added(old, profile.clone(), clock.now()),
+        );
+        resume.write(&profile, &ih, b"old-resume").unwrap();
+
+        state.begin_removal(&profile, old);
+        state.note_readded(&profile, &ih);
+        torrents.write(&profile, &ih, b"new-torrent").unwrap();
+        torrents.write_save_path(&profile, &ih, "/new").unwrap();
+
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: profile.clone(),
+            span: tracing::info_span!("test"),
+        };
+        handle(&removed_alert(ih), &mut ctx);
+
+        assert!(!state.contains(&ih), "the removed torrent's entry is gone");
+        assert_eq!(
+            torrents.load_all(&profile).unwrap(),
+            vec![(ih, b"new-torrent".to_vec())],
+        );
+        assert_eq!(
+            torrents.read_save_path(&profile, &ih).unwrap().as_deref(),
+            Some("/new"),
+        );
+        // Still the removed torrent's, recording where that one was.
+        assert!(resume.snapshot(&profile).is_empty());
+    }
+
+    /// Re-added to another profile, whose `AddTorrent` is handled before the
+    /// first profile's `TorrentRemoved`: the new entry and its in-flight save
+    /// are left, and only the first profile's files are deleted.
+    #[test]
+    fn a_removal_handled_after_a_cross_profile_re_add_leaves_the_new_entry() {
+        let ih = InfoHash([0x7C; 20]);
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = NoopSink;
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let old = TorrentHandle {
+            id: 1,
+            infohash: ih,
+        };
+        let new = TorrentHandle {
+            id: 2,
+            infohash: ih,
+        };
+        state.insert(ih, TorrentState::newly_added(old, p.clone(), clock.now()));
+        torrents.write(&p, &ih, b"torrent").unwrap();
+        torrents.write(&q, &ih, b"torrent").unwrap();
+        state.begin_removal(&p, old);
+        state.note_readded(&q, &ih);
+
+        let ctx_for = |profile: &ProfileId| HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: profile.clone(),
+            span: tracing::info_span!("test"),
+        };
+        handle(&add_alert(ih, Some(new), 0), &mut ctx_for(&q));
+        assert_eq!(state.dispatch_resume_saves(8).len(), 1);
+        handle(&removed_alert(ih), &mut ctx_for(&p));
+
+        let st = state.get(&ih).expect("q's entry survives");
+        assert_eq!((st.handle, st.profile_id), (new, q.clone()));
+        assert_eq!(state.resume_saves_in_flight(), 1, "q's save is still owed");
+        assert!(torrents.load_all(&p).unwrap().is_empty());
+        assert_eq!(torrents.load_all(&q).unwrap().len(), 1);
     }
 
     #[test]
