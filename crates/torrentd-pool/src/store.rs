@@ -1819,6 +1819,46 @@ impl PoolStore {
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// Up to `limit` steps of `plan_id` after `after_seq` (from the first
+    /// when `None`), in `seq` order: one page, read off the primary key
+    /// whatever the plan's size.
+    pub fn plan_steps_page(
+        &self,
+        plan_id: i64,
+        after_seq: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<PlanStepRow>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT seq, op, src, dst, status, error FROM plan_step
+             WHERE plan_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+        )?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = st.query_map(params![plan_id, after_seq.unwrap_or(-1), limit], |r| {
+            Ok(PlanStepRow {
+                seq: r.get(0)?,
+                op: r.get(1)?,
+                src: r.get(2)?,
+                dst: r.get(3)?,
+                status: r.get(4)?,
+                error: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    /// How many of `plan_id`'s steps stand in each status, as `(status,
+    /// count)` pairs in status order. A status no step holds is absent.
+    pub fn plan_step_counts(&self, plan_id: i64) -> Result<Vec<(String, u64)>, PoolError> {
+        let mut st = self.conn.prepare(
+            "SELECT status, count(*) FROM plan_step WHERE plan_id = ?1
+             GROUP BY status ORDER BY status",
+        )?;
+        let rows = st.query_map(params![plan_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?))
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
     pub fn set_step_status(
         &self,
         plan_id: i64,
@@ -1831,6 +1871,43 @@ impl PoolStore {
             params![plan_id, seq, status, error],
         )?;
         Ok(())
+    }
+
+    /// Set the status and error of several of `plan_id`'s steps, each
+    /// `(seq, status, error)`, in one transaction: one commit, so one WAL
+    /// fsync, however many steps it records. Either every row is written or
+    /// none is.
+    pub fn set_steps_status(
+        &mut self,
+        plan_id: i64,
+        steps: &[(i64, &str, Option<&str>)],
+    ) -> Result<(), PoolError> {
+        let tx = self.conn.savepoint()?;
+        {
+            let mut up = tx.prepare(
+                "UPDATE plan_step SET status = ?3, error = ?4 WHERE plan_id = ?1 AND seq = ?2",
+            )?;
+            for (seq, status, error) in steps {
+                up.execute(params![plan_id, seq, status, error])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Count every transaction this connection commits from now on, into
+    /// the returned counter. Replaces any counter installed before.
+    ///
+    /// Each commit of the writer is a WAL fsync under `synchronous=FULL`, so
+    /// this is how a test holds a loop to the number of fsyncs it makes.
+    pub fn count_commits(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let seen = std::sync::Arc::clone(&counter);
+        self.conn.commit_hook(Some(move || {
+            seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }));
+        counter
     }
 
     // -- rollups -----------------------------------------------------------
@@ -2531,5 +2608,69 @@ mod tests {
         }
         let store = PoolStore::open(&db).expect("an unreadable lock file does not refuse the open");
         assert!(store._hold.is_none());
+    }
+
+    fn plan_of(store: &mut PoolStore, n: usize) -> i64 {
+        let id = store.create_plan("delete_orphans", "{}", 0).unwrap();
+        let steps: Vec<PlanStep> = (0..n)
+            .map(|i| PlanStep {
+                op: "delete_file".into(),
+                src: format!("/r/f{i}"),
+                dst: None,
+            })
+            .collect();
+        store.add_plan_steps(id, &steps).unwrap();
+        id
+    }
+
+    /// Pages walk every step once, in order, and stop at the plan's end; a
+    /// plan's steps never leak into another's pages.
+    #[test]
+    fn plan_step_pages_cover_the_plan_once_in_order() {
+        let mut store = PoolStore::open_in_memory().unwrap();
+        let id = plan_of(&mut store, 7);
+        let other = plan_of(&mut store, 3);
+        let mut seen = Vec::new();
+        let mut after = None;
+        loop {
+            let page = store.plan_steps_page(id, after, 3).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            after = page.last().map(|s| s.seq);
+            seen.extend(page.into_iter().map(|s| s.seq));
+        }
+        assert_eq!(seen, (0..7).collect::<Vec<i64>>());
+        assert_eq!(store.plan_steps_page(other, Some(1), 10).unwrap().len(), 1);
+    }
+
+    /// Several step outcomes are one commit, and the counts read them back.
+    #[test]
+    fn step_outcomes_written_together_are_one_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = PoolStore::open(&dir.path().join("pool.db")).unwrap();
+        let id = plan_of(&mut store, 5);
+        let commits = store.count_commits();
+        store
+            .set_steps_status(
+                id,
+                &[
+                    (0, "done", None),
+                    (1, "done", None),
+                    (2, "failed", Some("boom")),
+                ],
+            )
+            .unwrap();
+        assert_eq!(commits.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            store.plan_step_counts(id).unwrap(),
+            vec![
+                ("done".to_owned(), 2),
+                ("failed".to_owned(), 1),
+                ("pending".to_owned(), 2),
+            ],
+        );
+        let failed = &store.plan_steps_page(id, Some(1), 1).unwrap()[0];
+        assert_eq!(failed.error.as_deref(), Some("boom"));
     }
 }
