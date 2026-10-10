@@ -306,14 +306,15 @@
     {
       "id": 21,
       "type": "timeseries",
-      "title": "Handshake probe running",
-      "description": "1 while the WireGuard handshake probe runs; 0 when it cannot (wg missing or unprivileged), which leaves only IP presence checked (TorrentdHandshakeProbeUnavailable).",
+      "title": "VPN probes running",
+      "description": "1 while each probe runs. Handshake: 0 when the WireGuard handshake probe cannot run (wg missing or unprivileged), which leaves only IP presence checked (TorrentdHandshakeProbeUnavailable). Route: 0 when the route probe cannot run, or is not asked because the address probe cannot, which leaves the tunnel's routing unchecked (TorrentdRouteProbeUnavailable).",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 44 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "decimals": 0, "custom": { "lineInterpolation": "stepAfter" } }, "overrides": [] },
       "options": { "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "none" } },
       "targets": [
-        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_vpn_handshake_probe_ok{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}}" }
+        { "refId": "A", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_vpn_handshake_probe_ok{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}} handshake" },
+        { "refId": "B", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "expr": "torrentd_profile_vpn_route_probe_ok{instance=~\"$instance\", profile_id=~\"$profile_id\"}", "legendFormat": "{{profile_id}} route" }
       ]
     },
     {
