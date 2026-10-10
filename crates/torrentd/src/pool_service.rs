@@ -168,6 +168,11 @@ impl PoolService {
         let Some(ih) = libtorrent_safe::InfoHash::from_hex(infohash) else {
             return;
         };
+        // A `DELETE` of this info-hash whose removal alert is still queued
+        // would otherwise delete the files written below when it is handled.
+        if let Some(state) = self.loaded.get() {
+            state.note_readded(profile, &ih);
+        }
         if let Err(e) = off_worker(|| store.write_save_path(profile, &ih, save_path)) {
             warn!(
                 target: "torrentd::pool",
@@ -1750,7 +1755,7 @@ mod tests {
         pool.scan().unwrap();
         assert!(pool.with_store(|s| s.torrent(&ih).unwrap()).is_some());
 
-        state.remove(&hash);
+        state.remove(&hash, &ProfileId::new("p"), None);
         pool.scan().unwrap();
         assert!(pool.with_store(|s| s.torrent(&ih).unwrap()).is_none());
     }

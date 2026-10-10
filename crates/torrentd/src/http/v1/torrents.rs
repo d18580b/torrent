@@ -942,6 +942,10 @@ fn add_and_settle(
     // between that check and the add.
     crate::vpn_monitor::hold_if_fenced(&s.profiles, profile_id, engine, handle, &*s.metrics);
 
+    // A `DELETE` of this info-hash whose removal alert is still queued would
+    // otherwise delete the two files written below when it is handled.
+    s.state.note_readded(profile_id, &infohash);
+
     // Persist the .torrent so the startup inventory scan can recover it if
     // resume data is ever lost, and the save path first, so that scan never
     // finds the one without the other and re-adds the torrent at
@@ -1247,9 +1251,16 @@ pub async fn delete_torrent(
                 } else {
                     None
                 };
+                // Recorded before the session is asked, so the alert that
+                // settles it finds the record: the assignment is cleared below
+                // as soon as the session accepts, and an add of the same
+                // info-hash can land before that alert, whose handler must
+                // then leave the new torrent's files and entry alone.
+                settler.state.begin_removal(&profile, st.handle);
                 // libtorrent never deletes the files itself: they go to the
                 // trash below, where an operator can take them back.
                 engine.remove_torrent(st.handle, false).map_err(|e| {
+                    settler.state.abandon_removal(&profile, st.handle);
                     DeleteTorrentError::Internal {
                         detail: internal("removing the torrent from its session", e),
                     }

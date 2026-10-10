@@ -250,6 +250,34 @@ struct ResumeSaves {
 /// Retry deadlines, earliest on top: `(next_attempt, infohash bytes)`.
 type RetrySchedule = BinaryHeap<Reverse<(Instant, [u8; 20])>>;
 
+/// A removal the daemon asked a session for whose `torrent_removed_alert` has
+/// not been handled yet, keyed by `(profile, infohash)`.
+///
+/// The alert carries the info-hash and nothing else: no handle, and no way to
+/// tell the removed torrent from one added under the same info-hash since.
+/// This is what tells them apart.
+#[derive(Debug)]
+struct PendingRemoval {
+    /// The removed torrent's handle: the state-map entry the alert may clear.
+    handle: TorrentHandle,
+    /// The same profile added the info-hash again after the removal was asked
+    /// for. Its stores' files are the new torrent's from then on.
+    readded: bool,
+}
+
+/// What [`StateMap::settle_removal`] did.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct RemovalSettled {
+    /// The state map holds no entry for the info-hash that the removal did
+    /// not own: it had none, or it held the removed torrent's and dropped it.
+    /// `false` when the entry is another torrent's, one added since, whose
+    /// bookkeeping (its in-flight resume save) is not the removal's to settle.
+    pub entry_released: bool,
+    /// The removal's profile added the info-hash again before the alert was
+    /// handled, so its `.torrent` and save path are the new torrent's.
+    pub readded: bool,
+}
+
 /// Concurrent state map: `infohash → TorrentState`. Insertion is
 /// thread-safe (`DashMap`), reads use lock-free shards.
 ///
@@ -267,6 +295,10 @@ pub struct StateMap {
     /// drops the stale ones, so nothing has to find and remove them eagerly.
     /// The info-hash is held as its bytes, which order; `InfoHash` does not.
     retry_heap: Mutex<RetrySchedule>,
+    /// Removals asked for and not yet settled by their alert. Held across the
+    /// removal's file deletes, so an add that marks one re-added either lands
+    /// before them (and they are skipped) or after them.
+    removals: Mutex<HashMap<(ProfileId, InfoHash), PendingRemoval>>,
 }
 
 impl Default for StateMap {
@@ -275,6 +307,7 @@ impl Default for StateMap {
             inner: DashMap::new(),
             saves: Mutex::new(ResumeSaves::default()),
             retry_heap: Mutex::new(BinaryHeap::new()),
+            removals: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -309,8 +342,99 @@ impl StateMap {
         }
     }
 
-    pub fn remove(&self, ih: &InfoHash) -> Option<TorrentState> {
-        self.inner.remove(ih).map(|(_, v)| v)
+    /// Remove `ih`'s entry if it is `profile`'s and, where `handle` is given,
+    /// that torrent's.
+    ///
+    /// The map is keyed by info-hash alone, so an unconditional remove for a
+    /// torrent that left one session would also drop an entry another
+    /// session inserted for the same info-hash since: that torrent would go
+    /// on seeding, untracked until a restart.
+    pub fn remove(
+        &self,
+        ih: &InfoHash,
+        profile: &ProfileId,
+        handle: Option<TorrentHandle>,
+    ) -> Option<TorrentState> {
+        self.inner
+            .remove_if(ih, |_, st| {
+                st.profile_id == *profile && handle.is_none_or(|h| h == st.handle)
+            })
+            .map(|(_, v)| v)
+    }
+
+    /// Record that the session is being asked to remove `profile`'s torrent
+    /// `handle`, before it is asked. [`Self::settle_removal`] consumes it when
+    /// the removal's alert is handled; [`Self::abandon_removal`] when the
+    /// session refused.
+    ///
+    /// A removal already pending for the same torrent is left as it is, so a
+    /// second request for it cannot forget that the info-hash was re-added.
+    pub fn begin_removal(&self, profile: &ProfileId, handle: TorrentHandle) {
+        let mut removals = self.removals.lock();
+        let key = (profile.clone(), handle.infohash);
+        if removals.get(&key).is_some_and(|p| p.handle == handle) {
+            return;
+        }
+        removals.insert(
+            key,
+            PendingRemoval {
+                handle,
+                readded: false,
+            },
+        );
+    }
+
+    /// Forget a removal [`Self::begin_removal`] recorded, because the session
+    /// refused it and no alert will come. One the profile has re-added since
+    /// is kept: its alert is still owed by the earlier request.
+    pub fn abandon_removal(&self, profile: &ProfileId, handle: TorrentHandle) {
+        let mut removals = self.removals.lock();
+        let key = (profile.clone(), handle.infohash);
+        if removals
+            .get(&key)
+            .is_some_and(|p| p.handle == handle && !p.readded)
+        {
+            removals.remove(&key);
+        }
+    }
+
+    /// `profile`'s session accepted `ih` again, and its stores' files are
+    /// about to be written for the new torrent. Called before they are
+    /// written, so a removal still pending for the old torrent leaves them be
+    /// rather than deleting them when its alert is handled.
+    pub fn note_readded(&self, profile: &ProfileId, ih: &InfoHash) {
+        if let Some(p) = self.removals.lock().get_mut(&(profile.clone(), *ih)) {
+            p.readded = true;
+        }
+    }
+
+    /// Settle the removal of `profile`'s torrent `ih`, for its
+    /// `torrent_removed_alert`: drop its state-map entry, and run
+    /// `delete_files` with whether the profile has added the info-hash again
+    /// since, for it to delete the stores' files the new torrent does not own.
+    ///
+    /// `delete_files` runs under the lock [`Self::note_readded`] takes, so a
+    /// re-add's files are written either after the delete or with the
+    /// re-add seen, never between the check and the delete.
+    ///
+    /// A removal nobody recorded (no `begin_removal`) drops `profile`'s
+    /// entry whatever its handle, and reports no re-add.
+    pub fn settle_removal(
+        &self,
+        profile: &ProfileId,
+        ih: &InfoHash,
+        delete_files: impl FnOnce(bool),
+    ) -> RemovalSettled {
+        let mut removals = self.removals.lock();
+        let pending = removals.remove(&(profile.clone(), *ih));
+        self.remove(ih, profile, pending.as_ref().map(|p| p.handle));
+        let readded = pending.is_some_and(|p| p.readded);
+        delete_files(readded);
+        drop(removals);
+        RemovalSettled {
+            entry_released: !self.inner.contains_key(ih),
+            readded,
+        }
     }
 
     pub fn get(&self, ih: &InfoHash) -> Option<TorrentState> {
@@ -629,8 +753,80 @@ mod tests {
             m.insert(h.infohash, s);
         }
         m.update(&ih(1), |s| s.retry = None);
-        m.remove(&ih(2));
+        assert!(m.remove(&ih(2), &ProfileId::new("p"), None).is_some());
         assert!(m.retries_due(now + RetryState::MAX_DELAY).is_empty());
+    }
+
+    #[test]
+    fn a_remove_leaves_an_entry_another_profile_or_torrent_holds() {
+        let m = StateMap::new();
+        let now = Instant::now();
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let old = handle(1, 1);
+        let new = handle(2, 1);
+        m.insert(ih(1), TorrentState::newly_added(new, q.clone(), now));
+        assert!(m.remove(&ih(1), &p, None).is_none(), "q's entry, not p's");
+        assert!(
+            m.remove(&ih(1), &q, Some(old)).is_none(),
+            "not that torrent"
+        );
+        assert_eq!(m.get(&ih(1)).map(|s| s.handle), Some(new));
+        assert!(m.remove(&ih(1), &q, Some(new)).is_some());
+        assert!(!m.contains(&ih(1)));
+    }
+
+    #[test]
+    fn a_removal_settles_with_whether_its_profile_added_the_infohash_again() {
+        let m = StateMap::new();
+        let now = Instant::now();
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let old = handle(1, 1);
+        m.insert(ih(1), TorrentState::newly_added(old, p.clone(), now));
+        m.begin_removal(&p, old);
+        // Another profile's add is not this removal's re-add.
+        m.note_readded(&q, &ih(1));
+        let mut seen = None;
+        let settled = m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
+        assert_eq!(seen, Some(false));
+        assert_eq!(
+            settled,
+            RemovalSettled {
+                entry_released: true,
+                readded: false,
+            }
+        );
+
+        m.insert(ih(1), TorrentState::newly_added(old, p.clone(), now));
+        m.begin_removal(&p, old);
+        m.note_readded(&p, &ih(1));
+        let settled = m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
+        assert_eq!(seen, Some(true));
+        assert!(settled.readded);
+        // Consumed: a later removal of the re-added torrent deletes.
+        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
+        assert_eq!(seen, Some(false));
+    }
+
+    #[test]
+    fn an_abandoned_removal_is_forgotten_unless_the_infohash_was_added_again() {
+        let m = StateMap::new();
+        let p = ProfileId::new("p");
+        let old = handle(1, 1);
+        let mut seen = None;
+
+        m.begin_removal(&p, old);
+        m.abandon_removal(&p, old);
+        m.note_readded(&p, &ih(1));
+        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
+        assert_eq!(seen, Some(false), "nothing pending to mark");
+
+        m.begin_removal(&p, old);
+        m.note_readded(&p, &ih(1));
+        // A second request for the same torrent, refused, keeps the mark.
+        m.begin_removal(&p, old);
+        m.abandon_removal(&p, old);
+        m.settle_removal(&p, &ih(1), |readded| seen = Some(readded));
+        assert_eq!(seen, Some(true));
     }
 
     #[test]
