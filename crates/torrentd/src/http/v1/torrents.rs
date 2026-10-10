@@ -654,13 +654,12 @@ torrent_error! {
         #[problem(status = 422, title = "Invalid metainfo")]
         InvalidMetainfo(String),
         /// The profile sets `allowed_tracker_domains`, and the torrent
-        /// announces to a tracker outside them, or to none.
-        #[error(
-            "the torrent announces to a tracker outside the profile's allowed_tracker_domains, \
-             or to no tracker at all"
-        )]
+        /// announces to a tracker outside them, to one under none of the
+        /// profile's `allowed_tracker_urls` (another account's passkey), or
+        /// to none. The detail says which.
+        #[error("{0}")]
         #[problem(status = 422, title = "Tracker not allowed")]
-        TrackerNotAllowed,
+        TrackerNotAllowed(String),
         /// A torrent with this infohash is already assigned, to this profile
         /// or another.
         #[error("{0}")]
@@ -691,7 +690,8 @@ enum AddSource {
 /// `409 torrent-exists` and the session never receives a duplicate. When the
 /// profile sets `allowed_tracker_domains`, every tracker the torrent announces
 /// to — a `.torrent`'s announce list, a magnet's `tr=` — must be on it, and
-/// there must be at least one. The response is the torrent as its session first reports
+/// there must be at least one; when it also sets `allowed_tracker_urls`, every
+/// announce URL must fall under one of those account prefixes. The response is the torrent as its session first reports
 /// it; its `phase` is `unknown` until the first state update.
 #[kynos::post("/torrents", tag = Torrents)]
 pub async fn add_torrent(
@@ -819,13 +819,19 @@ pub async fn add_torrent(
     // The account-isolation guard, the same one every add path runs (see
     // `torrentd_engine::policy::check_trackers`): on a profile with
     // `allowed_tracker_domains`, every tracker the torrent announces to — a
-    // `.torrent`'s announce list, a magnet's `tr=` — must be on it.
+    // `.torrent`'s announce list, a magnet's `tr=` — must be on it, and
+    // under one of its `allowed_tracker_urls` where it sets them.
     match torrentd_engine::check_trackers(profile_cfg, &params) {
         Ok(()) => {}
-        // The problem type already covers a torrent with no tracker.
-        Err(TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers) => {
+        // The problem type covers a foreign tracker, another account's, and
+        // none at all; the detail tells them apart.
+        Err(
+            e @ (TrackerRefusal::NotAllowed
+            | TrackerRefusal::ForeignAccount
+            | TrackerRefusal::NoTrackers),
+        ) => {
             registry_error();
-            return Err(AddTorrentError::TrackerNotAllowed);
+            return Err(AddTorrentError::TrackerNotAllowed(e.to_string()));
         }
         Err(TrackerRefusal::Unreadable(e)) => {
             return Err(AddTorrentError::InvalidMetainfo(format!(

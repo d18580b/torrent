@@ -1543,7 +1543,8 @@ fn retire_rechecks(pool: &PoolService, source: &dyn AlertSource, state: &StateMa
 /// Hold the bytes the verify worker is about to add to the account-isolation
 /// guard.
 ///
-/// A refusal is logged, and a `NotAllowed` or `NoTrackers` one is counted in
+/// A refusal is logged, and a guard refusal (`NotAllowed`, `ForeignAccount`
+/// or `NoTrackers`) is counted in
 /// `profile_assignment_registry_errors_total`, where `POST /v1/torrents`, both
 /// boot scans and the adoption's enqueue count theirs. Bytes whose trackers
 /// cannot be read are a failed verify, not an isolation refusal.
@@ -1562,7 +1563,7 @@ fn verify_guard(
         profile_id = %item.profile,
         infohash = %item.infohash,
         error.cause = %refusal,
-        "verify dropped: refused by the profile's allowed_tracker_domains",
+        "verify dropped: refused by the profile's tracker guard",
     );
     if refusal.is_guard_refusal() {
         metrics.inc_counter(
@@ -1894,6 +1895,9 @@ impl From<String> for AdoptRefusal {
 fn tracker_refusal(e: &TrackerRefusal) -> AdoptRefusal {
     let reason = match e {
         TrackerRefusal::NoTrackers => format!("refused: {e}"),
+        TrackerRefusal::ForeignAccount => {
+            format!("refused by the profile's allowed_tracker_urls: {e}")
+        }
         _ => format!("refused by the profile's allowed_tracker_domains: {e}"),
     };
     AdoptRefusal {
@@ -1995,7 +1999,11 @@ pub fn execute_adopt(
             );
             match torrentd_engine::check_trackers(profile_cfg, &params) {
                 Ok(()) => {}
-                Err(e @ (TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers)) => {
+                Err(
+                    e @ (TrackerRefusal::NotAllowed
+                    | TrackerRefusal::ForeignAccount
+                    | TrackerRefusal::NoTrackers),
+                ) => {
                     return Err(tracker_refusal(&e));
                 }
                 Err(TrackerRefusal::Unreadable(e)) if files_renamed => {
@@ -2213,6 +2221,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         };
         let engine = MockEngine::new();
@@ -3409,6 +3418,67 @@ mod tests {
             text.lines()
                 .any(|l| l
                     .ends_with("profile_assignment_registry_errors_total{profile_id=\"acct\"} 2")),
+            "{text}"
+        );
+    }
+
+    /// Issue 166: an adoption onto account B's profile, bound to B's passkey,
+    /// is refused when the previous client's resume trackers carry account
+    /// A's — on the verify path, which adds the bare `.torrent` with those
+    /// trackers, and on the resume fast path, which hands the resume data
+    /// itself — though A's tracker is on B's domain list. The refusal names
+    /// the binding and is counted as the guard's.
+    #[test]
+    fn an_adoption_carrying_another_accounts_passkey_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut profile = crate::profile_registry::test_entry("acct", ProfileStatus::Active).config;
+        profile.allowed_tracker_domains = vec!["allowed.example".to_owned()];
+        profile.allowed_tracker_urls = vec!["http://tracker.allowed.example/PASS-B/".to_owned()];
+        let metrics = crate::metrics_sink::PromSink::new();
+        let item = pending(InfoHash([0x46; 20]), "acct");
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        let resume = |passkey: &str| {
+            let url = format!("http://tracker.allowed.example/{passkey}/announce");
+            let p = dir.path().join("t.fastresume");
+            std::fs::write(&p, format!("d8:trackersll{}:{url}eee", url.len())).unwrap();
+            super::previous_trackers(Some(&p))
+        };
+
+        let verify =
+            |trackers| super::verify_add_params(&profile, bare.clone(), "/p".into(), trackers);
+        super::verify_guard(&metrics, &profile, &item, &verify(resume("PASS-B"))).unwrap();
+        let refusal =
+            super::verify_guard(&metrics, &profile, &item, &verify(resume("PASS-A"))).unwrap_err();
+        assert!(matches!(refusal, super::TrackerRefusal::ForeignAccount));
+        let adopt = super::tracker_refusal(&refusal);
+        assert!(adopt.isolation);
+        assert!(
+            adopt.reason.contains("allowed_tracker_urls"),
+            "{}",
+            adopt.reason
+        );
+
+        // The fast path: libtorrent resume data whose own `trackers` list is
+        // A's, in front of a bare `.torrent`.
+        let ih = libtorrent_safe::info_hash_from_torrent(&bare).unwrap();
+        let url = "http://tracker.allowed.example/PASS-A/announce";
+        let mut data =
+            b"d11:file-format22:libtorrent resume file12:file-versioni1e9:info-hash20:".to_vec();
+        data.extend_from_slice(&ih.0);
+        data.extend_from_slice(format!("8:trackersll{}:{url}eee", url.len()).as_bytes());
+        let params = super::adoption_resume_params(&profile, data, Some(bare), "/p".into());
+        assert!(matches!(
+            torrentd_engine::check_trackers(&profile, &params),
+            Err(super::TrackerRefusal::ForeignAccount)
+        ));
+
+        let text = String::from_utf8(metrics.render()).unwrap();
+        assert!(
+            text.lines()
+                .any(|l| l
+                    .ends_with("profile_assignment_registry_errors_total{profile_id=\"acct\"} 1")),
             "{text}"
         );
     }

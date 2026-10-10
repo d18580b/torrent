@@ -157,6 +157,14 @@ pub enum TrackerRefusal {
     /// `allowed_tracker_domains`, or to one whose host cannot be read.
     #[error("the torrent announces to a tracker outside the profile's allowed_tracker_domains")]
     NotAllowed,
+    /// Every tracker is on the profile's domains, but one announce URL is
+    /// under none of its `allowed_tracker_urls`: the torrent belongs to
+    /// another account on the same tracker.
+    #[error(
+        "the torrent announces to a tracker under none of the profile's allowed_tracker_urls, so \
+         it carries another account's passkey"
+    )]
+    ForeignAccount,
     /// The add would announce to no tracker at all, which names no account
     /// the profile holds. A `.torrent` another client wrote without its
     /// trackers, and no resume data carrying them, is the usual cause.
@@ -175,9 +183,14 @@ pub enum TrackerRefusal {
 ///
 /// A profile that sets `allowed_tracker_domains` — every `vpn` profile must —
 /// takes a torrent only when **every** tracker it would announce to is on
-/// that list, and it announces to at least one. This is what keeps one
-/// account's passkey from being announced from another account's session, so
-/// it is checked on all five add paths — `POST /v1/torrents`, pool adoption
+/// that list, and it announces to at least one. The list compares hosts, so
+/// it separates trackers; a profile that also sets `allowed_tracker_urls`
+/// further requires every announce URL to fall under one of those prefixes,
+/// which carry the account's passkey, and that is what separates two
+/// accounts on one tracker (`ProfileConfig::validate_set` requires it of
+/// two profiles whose domains overlap). This is what keeps one account's
+/// passkey from being announced from another account's session, so it is
+/// checked on all five add paths — `POST /v1/torrents`, pool adoption
 /// (the resume fast path and the verify queue), the startup resume reload and
 /// the startup torrent-dir scan — against the exact params each hands the
 /// session, before that session sees them.
@@ -197,20 +210,24 @@ pub fn check_trackers(
     if domains.is_empty() {
         return Ok(());
     }
-    match libtorrent_safe::add_trackers_allowed(params, domains) {
+    match libtorrent_safe::add_trackers_allowed(params, domains, &profile.allowed_tracker_urls) {
         Ok(TrackerVerdict::Allowed) => Ok(()),
         Ok(TrackerVerdict::NotAllowed) => Err(TrackerRefusal::NotAllowed),
+        Ok(TrackerVerdict::AccountMismatch) => Err(TrackerRefusal::ForeignAccount),
         Ok(TrackerVerdict::NoTrackers) => Err(TrackerRefusal::NoTrackers),
         Err(e) => Err(TrackerRefusal::Unreadable(e)),
     }
 }
 
 impl TrackerRefusal {
-    /// Whether the guard itself refused the add — a foreign tracker or none
-    /// at all — as opposed to a source it could not read. Each add path
-    /// counts these in `profile_assignment_registry_errors_total`.
+    /// Whether the guard itself refused the add — a foreign tracker, another
+    /// account's, or none at all — as opposed to a source it could not read.
+    /// Each add path counts these in `profile_assignment_registry_errors_total`.
     pub fn is_guard_refusal(&self) -> bool {
-        matches!(self, Self::NotAllowed | Self::NoTrackers)
+        matches!(
+            self,
+            Self::NotAllowed | Self::ForeignAccount | Self::NoTrackers
+        )
     }
 }
 
@@ -239,6 +256,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -255,6 +273,7 @@ mod tests {
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -434,7 +453,11 @@ mod tests {
     fn allowed(p: &ProfileConfig, params: &libtorrent_safe::AddParams) -> bool {
         match check_trackers(p, params) {
             Ok(()) => true,
-            Err(TrackerRefusal::NotAllowed | TrackerRefusal::NoTrackers) => false,
+            Err(
+                TrackerRefusal::NotAllowed
+                | TrackerRefusal::ForeignAccount
+                | TrackerRefusal::NoTrackers,
+            ) => false,
             Err(e) => panic!("unexpected {e}"),
         }
     }
@@ -552,6 +575,60 @@ mod tests {
         // None given keeps the `.torrent`'s.
         assert!(allowed(&p, &file_with(torrent(&[OURS]), &[])));
         assert!(no_trackers(&p, &file_with(bare, &[&[]])));
+    }
+
+    /// Issue 166: two accounts on one tracker. Account A's announce URLs
+    /// pass account B's domain list, and only B's account binding refuses
+    /// them — on every source an add path hands the guard: a `.torrent`
+    /// (API file, `server_path`, the boot torrent-dir scan, the verify
+    /// queue), one with resume trackers in place of its own (adoption), a
+    /// magnet's `tr=`, and resume data (the boot resume scan, adoption's fast
+    /// path).
+    #[test]
+    fn an_account_binding_refuses_another_accounts_passkey_on_every_source() {
+        const A: &str = "https://tracker.example/PASS-A/announce";
+        const A_UDP: &str = "udp://tracker.example:6969/PASS-A/announce";
+        const B: &str = "https://tracker.example/PASS-B/announce";
+        let mut acct_b = guarded();
+        acct_b.allowed_tracker_urls = vec!["https://tracker.example/PASS-B/".into()];
+        let mut acct_a = guarded();
+        acct_a.allowed_tracker_urls = vec![
+            "https://tracker.example/PASS-A/".into(),
+            "udp://tracker.example:6969/PASS-A/".into(),
+        ];
+        let foreign = |p: &ProfileConfig, params: &libtorrent_safe::AddParams| {
+            matches!(
+                check_trackers(p, params),
+                Err(TrackerRefusal::ForeignAccount)
+            )
+        };
+        let enc = |u: &str| u.replace(':', "%3A").replace('/', "%2F");
+        let a_torrent = torrent(&[A, A_UDP]);
+        let bare = torrent(&[]);
+        let sources = [
+            file(a_torrent.clone()),
+            file_with(bare.clone(), &[&[A], &[A_UDP]]),
+            magnet(&format!("&tr={}&tr={}", enc(A), enc(A_UDP))),
+            resumed(resume(&a_torrent, None), Some(a_torrent.clone())),
+            resumed(resume(&bare, Some(&[A, A_UDP])), Some(bare.clone())),
+            resumed(resume(&bare, Some(&[A])), None),
+        ];
+        for params in &sources {
+            // The domain list alone admits it: the hole the binding closes.
+            assert!(allowed(&guarded(), params));
+            assert!(foreign(&acct_b, params));
+            assert!(allowed(&acct_a, params));
+        }
+        // One of A's trackers beside one of B's is still B's passkey
+        // announced from A's session.
+        assert!(foreign(&acct_a, &file(torrent(&[A, B]))));
+        // A foreign tracker is reported as one, binding or not.
+        assert!(matches!(
+            check_trackers(&acct_a, &file(torrent(&[A, FOREIGN]))),
+            Err(TrackerRefusal::NotAllowed)
+        ));
+        assert!(no_trackers(&acct_a, &file(torrent(&[]))));
+        assert!(TrackerRefusal::ForeignAccount.is_guard_refusal());
     }
 
     #[test]

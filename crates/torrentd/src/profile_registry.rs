@@ -395,6 +395,7 @@ pub(crate) fn test_vpn_entry(id: &str, status: ProfileStatus) -> ProfileEntry {
         resume_dir: None,
         torrent_dir: None,
         allowed_tracker_domains: vec![],
+        allowed_tracker_urls: vec![],
         upload_rate_limit: None,
     };
     let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
@@ -435,6 +436,7 @@ pub(crate) fn test_host_entry(id: &str) -> ProfileEntry {
         resume_dir: None,
         torrent_dir: None,
         allowed_tracker_domains: vec![],
+        allowed_tracker_urls: vec![],
         upload_rate_limit: None,
     };
     let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());

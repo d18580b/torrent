@@ -779,6 +779,8 @@ fn a_file_add_announces_to_the_trackers_given_in_place_of_its_own() {
             ptr::null(),
             0,
             csv.as_ptr(),
+            ptr::null(),
+            0,
             err.as_mut_ptr(),
             512,
         )
@@ -809,11 +811,85 @@ fn the_tracker_guard_reports_no_trackers_on_its_own() {
             ptr::null(),
             0,
             domains.as_ptr(),
+            ptr::null(),
+            0,
             err.as_mut_ptr(),
             512,
         )
     };
     assert_eq!(rc, LT_NO_TRACKERS as i32, "{}", c_buf(&err));
+}
+
+/// With an account binding, a tracker on an allowed host under another
+/// account's passkey is told apart from a foreign tracker.
+#[test]
+fn the_tracker_guard_holds_a_tracker_to_the_account_prefixes() {
+    let enc = |u: &str| {
+        u.replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('?', "%3F")
+    };
+    let magnet = |tr: &str| {
+        CString::new(format!(
+            "magnet:?xt=urn:btih:0505050505050505050505050505050505050505&tr={}",
+            enc(tr)
+        ))
+        .unwrap()
+    };
+    let domains = CString::new("tracker.example").unwrap();
+    let prefix = CString::new("https://tracker.example/PASS-A/").unwrap();
+    let prefixes = [prefix.as_ptr()];
+    let mut err = [0 as c_char; 512];
+    let mut verdict = |uri: &CString, n: usize| unsafe {
+        lt_add_trackers_allowed(
+            uri.as_ptr(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            ptr::null(),
+            0,
+            ptr::null(),
+            0,
+            domains.as_ptr(),
+            prefixes.as_ptr(),
+            n,
+            err.as_mut_ptr(),
+            512,
+        )
+    };
+    let ours = magnet("https://tracker.example/PASS-A/announce");
+    let theirs = magnet("https://tracker.example/PASS-B/announce");
+    let foreign = magnet("https://other.example/PASS-A/announce");
+    assert_eq!(verdict(&ours, 1), 1);
+    assert_eq!(verdict(&theirs, 1), LT_TRACKER_ACCOUNT_MISMATCH as i32);
+    assert_eq!(verdict(&foreign, 1), 0);
+    // No binding: the host alone decides.
+    assert_eq!(verdict(&theirs, 0), 1);
+}
+
+#[test]
+fn an_announce_url_prefix_matches_at_a_boundary_only() {
+    let has = |url: &str, prefix: &str| {
+        let (u, p) = (CString::new(url).unwrap(), CString::new(prefix).unwrap());
+        unsafe { lt_announce_url_has_prefix(u.as_ptr(), p.as_ptr()) == 1 }
+    };
+    let q = "https://t.example/announce.php?passkey=abc";
+    assert!(has(q, q));
+    assert!(has("https://t.example/announce.php?passkey=abc&x=1", q));
+    assert!(!has("https://t.example/announce.php?passkey=abcd", q));
+    // Scheme and authority case-insensitively, the rest exactly.
+    assert!(has("HTTPS://T.Example/announce.php?passkey=abc", q));
+    assert!(!has("https://t.example/announce.php?passkey=ABC", q));
+    let p = "https://t.example/abc/";
+    assert!(has("https://t.example/abc/announce", p));
+    assert!(!has("https://t.example:443/abc/announce", p));
+    assert!(!has("https://t.example.evil/abc/announce", p));
+    assert!(!has("https://t.example@evil.example/abc/", p));
+    assert!(!has("http://t.example/abc/announce", p));
+    // A prefix with no path, or no scheme, matches nothing.
+    assert!(!has("https://t.example/abc", "https://t.example"));
+    assert!(!has("https://t.example/abc", "t.example/abc"));
+    assert!(!has("https://t.example/abc", "https:///abc"));
 }
 
 #[test]

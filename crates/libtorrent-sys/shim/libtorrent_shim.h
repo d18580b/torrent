@@ -373,7 +373,8 @@ void        lt_torrent_meta_free(struct lt_torrent_meta* m);
 
 /* The account-isolation guard: whether every tracker an add would announce to
  * is on one of the comma-separated `domains_csv` (the host equals a domain or
- * is a subdomain of it, case-insensitively).
+ * is a subdomain of it, case-insensitively), and, when `url_prefixes` are
+ * given, under one of them.
  *
  * The source is read as the matching add reads it: resume data when
  * `resume_buf` is given (with `torrent_buf` as the metadata it lacks, as
@@ -384,18 +385,33 @@ void        lt_torrent_meta_free(struct lt_torrent_meta* m);
  * params — a resume file's own `trackers` list, or that override, replaces
  * the metadata's.
  *
+ * `url_prefixes` (`num_prefixes` of them, none when 0) is the account
+ * binding: when given, every tracker must also be announced under one of
+ * these announce-URL prefixes, as lt_announce_url_has_prefix reads one.
+ *
  * Returns 1 when there is at least one tracker and every one is allowed; 0
  * when any is outside the list or cannot be parsed; LT_NO_TRACKERS when there
- * is none at all; LT_ERR when the source cannot be parsed (err_out
- * populated). */
+ * is none at all; LT_TRACKER_ACCOUNT_MISMATCH when every host is on the list
+ * but a tracker is announced under none of `url_prefixes`; LT_ERR when the
+ * source cannot be parsed (err_out populated). */
 #define LT_NO_TRACKERS 2
+#define LT_TRACKER_ACCOUNT_MISMATCH 3
 int         lt_add_trackers_allowed(const char* magnet_uri,
                                     const uint8_t* torrent_buf, size_t torrent_len,
                                     const char* const* tracker_urls,
                                     const int* tracker_tiers, size_t num_trackers,
                                     const uint8_t* resume_buf, size_t resume_len,
                                     const char* domains_csv,
+                                    const char* const* url_prefixes, size_t num_prefixes,
                                     char* err_out, int err_len);
+
+/* Whether announce URL `url` falls under announce-URL prefix `prefix`
+ * (`scheme://authority/...`): the scheme and authority equal the URL's,
+ * case-insensitively, and the rest is a byte-exact prefix of the URL's that
+ * ends at a boundary — the prefix ends in '/', '?' or '&', or the URL ends
+ * there or continues with one of "/?&#;". A prefix of any other shape, or a
+ * null argument, matches nothing. Returns 1 or 0. */
+int         lt_announce_url_has_prefix(const char* url, const char* prefix);
 
 /* ------------------------------------------------------------------ */
 /* Per-torrent queries (session required)                              */

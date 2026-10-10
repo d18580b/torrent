@@ -1039,6 +1039,7 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
             resume_dir,
             torrent_dir,
             allowed_tracker_domains,
+            allowed_tracker_urls,
             upload_rate_limit,
         } = a;
         let ProfileConfig {
@@ -1049,6 +1050,7 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
             resume_dir: b_resume_dir,
             torrent_dir: b_torrent_dir,
             allowed_tracker_domains: b_allowed_tracker_domains,
+            allowed_tracker_urls: b_allowed_tracker_urls,
             upload_rate_limit: b_upload_rate_limit,
         } = b;
         // Compared whole: which tunnel, which port, whether DHT runs.
@@ -1071,6 +1073,12 @@ fn diff_profiles(old: &[ProfileConfig], new: &[ProfileConfig]) -> Vec<ProfileCha
         field(
             "allowed_tracker_domains",
             allowed_tracker_domains != b_allowed_tracker_domains,
+            NonIdentity,
+        );
+        // Named, never shown: each entry holds a passkey.
+        field(
+            "allowed_tracker_urls",
+            allowed_tracker_urls != b_allowed_tracker_urls,
             NonIdentity,
         );
     }
@@ -1485,6 +1493,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -1505,6 +1514,7 @@ listen_interfaces = "0.0.0.0:6881"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         }
     }
@@ -1626,7 +1636,7 @@ vpn_interface        = "wg1"
 listen_port          = 6882
 peer_fingerprint     = "-AA1000-"
 user_agent           = "ua-b"
-allowed_tracker_domains = ["t.example"]
+allowed_tracker_domains = ["u.example"]
 "#
         );
         let p = write_cfg(dir.path(), &body);
@@ -2249,6 +2259,7 @@ listen_interfaces = "eth0:6882"
             resume_dir,
             torrent_dir,
             allowed_tracker_domains,
+            allowed_tracker_urls,
             upload_rate_limit,
         } = base;
         let with = |edit: &dyn Fn(&mut ProfileConfig)| {
@@ -2266,6 +2277,7 @@ listen_interfaces = "eth0:6882"
         let new_resume_dir = Some(PathBuf::from("/var/lib/torrentd/resume-public"));
         let new_torrent_dir = Some(PathBuf::from("/var/lib/torrentd/torrents-public"));
         let new_domains = vec!["tracker.example.com".to_string()];
+        let new_urls = vec!["https://tracker.example.com/PASS/".to_string()];
         let new_rate = Some(100_000);
         assert_ne!(network, &new_network);
         assert_ne!(peer_fingerprint, &new_fingerprint);
@@ -2273,6 +2285,7 @@ listen_interfaces = "eth0:6882"
         assert_ne!(resume_dir, &new_resume_dir);
         assert_ne!(torrent_dir, &new_torrent_dir);
         assert_ne!(allowed_tracker_domains, &new_domains);
+        assert_ne!(allowed_tracker_urls, &new_urls);
         assert_ne!(upload_rate_limit, &new_rate);
 
         use ProfileChangeKind::Identity;
@@ -2307,6 +2320,11 @@ listen_interfaces = "eth0:6882"
                 "allowed_tracker_domains",
                 NonIdentity,
                 with(&|p| p.allowed_tracker_domains = new_domains.clone()),
+            ),
+            (
+                "allowed_tracker_urls",
+                NonIdentity,
+                with(&|p| p.allowed_tracker_urls = new_urls.clone()),
             ),
             (
                 "upload_rate_limit",
@@ -3074,7 +3092,7 @@ upload_rate_limit = 0"#,
         let ovpn = "[[profile]]\nid = \"acct_b\"\nnetwork = \"vpn\"\nvpn_type = \"openvpn\"\n\
                     vpn_config = \"/etc/openvpn/acct_b.conf\"\nvpn_interface = \"tun-b\"\n\
                     listen_port = 6892\npeer_fingerprint = \"-BB1000-\"\n\
-                    user_agent = \"ua-b\"\nallowed_tracker_domains = [\"t.example\"]\n";
+                    user_agent = \"ua-b\"\nallowed_tracker_domains = [\"u.example\"]\n";
 
         let body = format!("{TOP_LEVEL}\nnetwork_kill_switch = true\n\n{wg}\n{ovpn}");
         let msg = format!(
@@ -3089,6 +3107,57 @@ upload_rate_limit = 0"#,
         let body = format!("{TOP_LEVEL}\n{wg}\n{ovpn}");
         Config::load(&write_cfg(dir.path(), &body))
             .expect("an OpenVPN profile without the kill switch is accepted");
+    }
+
+    /// Issue 166: two accounts on one tracker. The domain lists alone cannot
+    /// tell them apart, so the load — and with it `--check-config` and a
+    /// reload — refuses them until each binds its account's announce URL, and
+    /// the refusal never echoes a passkey.
+    #[test]
+    fn two_accounts_on_one_tracker_are_refused_until_each_binds_its_passkey() {
+        let dir = tempdir().unwrap();
+        let account = |id: &str, n: u8, extra: &str| {
+            format!(
+                "[[profile]]\nid = \"{id}\"\nnetwork = \"vpn\"\nvpn_type = \"wireguard\"\n\
+                 vpn_config = \"/etc/wireguard/wg{n}.conf\"\nvpn_interface = \"wg{n}\"\n\
+                 listen_port = 689{n}\npeer_fingerprint = \"-AA100{n}-\"\n\
+                 user_agent = \"ua-{n}\"\nallowed_tracker_domains = [\"tracker.example.com\"]\n\
+                 {extra}\n"
+            )
+        };
+        let load = |a: &str, b: &str| {
+            let body = format!(
+                "{TOP_LEVEL}\n{}\n{}",
+                account("acct_a", 1, a),
+                account("acct_b", 2, b)
+            );
+            Config::load(&write_cfg(dir.path(), &body)).map_err(|e| format!("{e:#}"))
+        };
+        let msg = load("", "").unwrap_err();
+        assert!(
+            msg.contains("acct_a")
+                && msg.contains("acct_b")
+                && msg.contains("allowed_tracker_urls"),
+            "got: {msg}"
+        );
+        let a = r#"allowed_tracker_urls = ["https://tracker.example.com/PASSKEY-A/"]"#;
+        let b = r#"allowed_tracker_urls = ["https://tracker.example.com/PASSKEY-B/"]"#;
+        load(a, "").unwrap_err();
+        load(a, b).expect("two accounts bound to their own passkeys are accepted");
+        let msg = load(a, a.replace("PASSKEY-A", "PASSKEY-A/x").as_str()).unwrap_err();
+        assert!(
+            msg.contains("overlap") && !msg.contains("PASSKEY"),
+            "got: {msg}"
+        );
+        let msg = load(
+            a,
+            r#"allowed_tracker_urls = ["tracker.example.com/PASSKEY-B/"]"#,
+        )
+        .unwrap_err();
+        assert!(
+            msg.contains("allowed_tracker_urls[0]") && !msg.contains("PASSKEY"),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -3465,6 +3534,7 @@ library_dir = "{d}/library"
             resume_dir: None,
             torrent_dir: None,
             allowed_tracker_domains: vec![],
+            allowed_tracker_urls: vec![],
             upload_rate_limit: None,
         };
         let msg = format!("{:#}", c.validate_http_listen_port().unwrap_err());

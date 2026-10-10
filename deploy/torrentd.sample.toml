@@ -245,16 +245,26 @@ dht               = true
 # The eight rules this is built on, and why each exists, are documented on the
 # `torrentd-engine::profile` module.
 #
-# `allowed_tracker_domains` is the account-isolation guard, and a vpn profile
-# must set it: the domains of the trackers this account belongs to. Every
-# torrent the profile takes — added over the API, adopted from the pool, or
-# found at startup in its resume or `.torrent` directory — must announce only
-# to trackers on those domains or their subdomains, and to at least one. One
+# `allowed_tracker_domains` is the tracker guard, and a vpn profile must set
+# it: the domains of the trackers this account belongs to. Every torrent the
+# profile takes — added over the API, adopted from the pool, or found at
+# startup in its resume or `.torrent` directory — must announce only to
+# trackers on those domains or their subdomains, and to at least one. One
 # tracker outside the list refuses the torrent, whatever else it announces
 # to; a resume file's own tracker list is what is checked where it has one.
-# It keeps one account's torrent, and its passkey, from being announced from
-# another account's tunnel. It is not an egress control. A host profile may
-# set it too, and is not checked when it does not.
+# It compares only the tracker's host, so it keeps apart accounts on
+# different trackers, and cannot tell two accounts on one tracker apart. It is
+# not an egress control. A host profile may set it too, and is not checked
+# when it does not.
+#
+# `allowed_tracker_urls` tells two accounts on one tracker apart: the start of
+# this account's announce URLs, up to and including its passkey, such as
+# "https://tracker.example.com/<passkey>/". Every announce URL must then also
+# fall under one of them, on the same add paths. Two profiles whose
+# `allowed_tracker_domains` overlap — like the two below, both on
+# tracker.example.com — are refused at load unless both set it, with
+# prefixes that do not overlap. Each entry holds a passkey: keep this file
+# private. No error and no API response repeats one.
 
 # The port here shares one namespace with the ports `public` binds above, so
 # it is 6891 rather than 6881: an announced port that two profiles share is
@@ -279,6 +289,7 @@ dht               = true
 # resume_dir               = "/var/lib/torrentd/resume/account_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/account_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
+# allowed_tracker_urls     = ["https://tracker.example.com/<account_a's passkey>/"]
 # `0` means unlimited for this profile, overriding the daemon-wide cap; omit
 # the key to inherit it.
 # upload_rate_limit        = 0
@@ -304,6 +315,7 @@ dht               = true
 # resume_dir               = "/var/lib/torrentd/resume/proton_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/proton_a"
 # allowed_tracker_domains  = ["tracker.example.com"]
+# allowed_tracker_urls     = ["https://tracker.example.com/<proton_a's passkey>/"]
 
 # A two-account deployment, live and uncommented, is in
 # deploy/torrentd.multi-account.sample.toml. Both files are parsed and

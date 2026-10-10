@@ -613,6 +613,7 @@ fn a_magnet_on_a_dht_host_profile_carries_the_discovery_guards() {
         resume_dir: None,
         torrent_dir: None,
         allowed_tracker_domains: vec!["tracker.example".into()],
+        allowed_tracker_urls: vec![],
         upload_rate_limit: None,
     };
     let dir = tempfile::tempdir().unwrap();
