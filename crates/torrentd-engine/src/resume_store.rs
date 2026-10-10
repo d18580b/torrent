@@ -84,6 +84,15 @@ pub trait ResumeStore: Send + Sync + std::fmt::Debug {
     /// Delete the resume file for `(profile, ih)`. Missing files are not an
     /// error.
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError>;
+
+    /// Whether `(profile, ih)` has a resume file, on disk or queued for one.
+    ///
+    /// The add handler asks this to skip the save a torrent loaded from its
+    /// own resume file does not need. A store that cannot tell answers
+    /// `false`, which costs a save rather than leaving a torrent with no file.
+    fn exists(&self, _profile: &ProfileId, _ih: &InfoHash) -> Result<bool, ResumeStoreError> {
+        Ok(false)
+    }
 }
 
 /// Read every `<infohash><suffix>` file in `dir`, skipping — with a warning
@@ -263,6 +272,17 @@ impl PartitionedDir {
         }
     }
 
+    /// Whether `(profile, ih)` has a file on disk or a write queued for one.
+    /// The queue is read first: a batch drops its entry once the rename has
+    /// landed, so a file between the two is seen in one or the other.
+    pub(crate) fn exists(&self, profile: &ProfileId, ih: &InfoHash) -> std::io::Result<bool> {
+        let path = self.path_for(profile, ih);
+        if self.pending(&path).is_some() {
+            return Ok(true);
+        }
+        path.try_exists()
+    }
+
     /// The bytes queued for `path` and not yet on disk, if any.
     pub(crate) fn pending(&self, path: &Path) -> Option<std::sync::Arc<[u8]>> {
         self.writer.as_ref().and_then(|w| w.pending(path))
@@ -333,6 +353,10 @@ impl ResumeStore for FsResumeStore {
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
         Ok(self.0.delete(profile, ih)?)
     }
+
+    fn exists(&self, profile: &ProfileId, ih: &InfoHash) -> Result<bool, ResumeStoreError> {
+        Ok(self.0.exists(profile, ih)?)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +416,10 @@ impl ResumeStore for MemoryResumeStore {
     fn delete(&self, profile: &ProfileId, ih: &InfoHash) -> Result<(), ResumeStoreError> {
         self.inner.remove(&(profile.clone(), *ih));
         Ok(())
+    }
+
+    fn exists(&self, profile: &ProfileId, ih: &InfoHash) -> Result<bool, ResumeStoreError> {
+        Ok(self.inner.contains_key(&(profile.clone(), *ih)))
     }
 }
 
@@ -461,6 +489,24 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, kept);
         assert_eq!(loaded[0].1.as_bytes(), b"kept");
+    }
+
+    #[test]
+    fn exists_sees_a_queued_write_a_landed_one_and_not_a_deleted_one() {
+        let dir = tempdir().unwrap();
+        let store = FsResumeStore::new(dir.path()).with_batched_writes(None);
+        let (p, q) = (ProfileId::new("p"), ProfileId::new("q"));
+        let ih = InfoHash([0x03u8; 20]);
+        assert!(!store.exists(&p, &ih).unwrap(), "nothing written yet");
+        // Queued or already renamed by the writer thread: either way it is
+        // the torrent's file.
+        store.write_batched(&p, &ih, b"queued").unwrap();
+        assert!(store.exists(&p, &ih).unwrap());
+        store.flush();
+        assert!(store.exists(&p, &ih).unwrap());
+        assert!(!store.exists(&q, &ih).unwrap(), "another profile's file");
+        store.delete(&p, &ih).unwrap();
+        assert!(!store.exists(&p, &ih).unwrap());
     }
 
     #[test]

@@ -48,14 +48,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 TorrentState::newly_added(handle, ctx.profile_id.clone(), now),
             );
             hold_if_fenced(handle, ctx);
-            // Make the add durable now rather than at the next 30-minute sweep
-            // or the shutdown drain: until a resume file exists, a crash
-            // leaves the registry claiming a torrent no session reloads.
-            // Unconditional, because an `ONLY_IF_MODIFIED` save depends on
-            // libtorrent's modified bit, which says nothing about whether
-            // this torrent has a file on disk yet.
-            ctx.state
-                .queue_resume_save(handle.infohash, ResumeFlags::empty());
+            queue_first_resume_save(handle, ctx);
             info!(
                 target: "torrentd_engine::handler::add",
                 infohash = %handle.infohash,
@@ -131,6 +124,37 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
         }
         _ => unreachable!("add::handle called with non-add alert"),
     }
+}
+
+/// Make an add durable now rather than at the next 30-minute sweep or the
+/// shutdown drain, where the torrent has no resume file yet: until one exists,
+/// a crash leaves the registry claiming a torrent no session reloads. That is
+/// an API add, an adoption, or a torrent-dir scan's load.
+///
+/// Unconditional, because an `ONLY_IF_MODIFIED` save depends on libtorrent's
+/// modified bit, which says nothing about whether this torrent has a file on
+/// disk yet.
+///
+/// Skipped where the profile already holds a resume file for it: that is the
+/// boot's resume scan loading the file it just read. Saving each of those
+/// again would rewrite every file at every boot, and the saves would hold the
+/// queue's place against the shutdown drain's `ONLY_IF_MODIFIED` requests, so
+/// a stop soon after a boot would spend its deadline on them. A re-add after
+/// a removal is not skipped: the removal's alert, handled first, deleted the
+/// old torrent's file. A store that cannot answer gets the save.
+fn queue_first_resume_save(handle: TorrentHandle, ctx: &HandlerCtx<'_>) {
+    let ih = handle.infohash;
+    match ctx.resume.exists(&ctx.profile_id, &ih) {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(e) => warn!(
+            target: "torrentd_engine::handler::add",
+            infohash = %ih,
+            error.cause = %e,
+            "could not tell whether the torrent has a resume file; saving it",
+        ),
+    }
+    ctx.state.queue_resume_save(ih, ResumeFlags::empty());
 }
 
 /// Pause a torrent just inserted into the state map if its profile is fenced.
@@ -477,6 +501,155 @@ mod tests {
         assert_eq!(state.pending_resume_count(), 1);
         assert_eq!(
             state.dispatch_resume_saves(8),
+            vec![(ih, ResumeFlags::empty())],
+        );
+    }
+
+    /// Handle a successful `add_torrent_alert` for `ih` in `profile` against
+    /// `resume`, returning the saves it queued.
+    fn saves_queued_by_add(
+        resume: &dyn ResumeStore,
+        profile: &ProfileId,
+        ih: InfoHash,
+    ) -> Vec<(InfoHash, ResumeFlags)> {
+        let state = StateMap::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = NoopSink;
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let th = TorrentHandle {
+            id: 1,
+            infohash: ih,
+        };
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: profile.clone(),
+            span: tracing::info_span!("test"),
+        };
+        handle(&add_alert(ih, Some(th), 0), &mut ctx);
+        assert!(state.contains(&ih));
+        state.dispatch_resume_saves(8)
+    }
+
+    /// The boot's resume scan loads each torrent from the file it just read:
+    /// saving it again rewrote every resume file at every boot, and the saves
+    /// crowded out the shutdown drain's `ONLY_IF_MODIFIED` requests (#190).
+    #[test]
+    fn a_torrent_loaded_from_its_own_resume_file_queues_no_save() {
+        let ih = InfoHash([0x7D; 20]);
+        let profile = ProfileId::new("p");
+        let resume = MemoryResumeStore::new();
+        resume.write(&profile, &ih, b"resume-bytes").unwrap();
+
+        assert_eq!(saves_queued_by_add(&resume, &profile, ih), vec![]);
+        assert_eq!(
+            resume.snapshot(&profile),
+            vec![(ih, b"resume-bytes".to_vec())],
+            "the file is left as the boot read it",
+        );
+    }
+
+    /// Another profile's resume file for the same info-hash is not this
+    /// torrent's: the add still saves its own.
+    #[test]
+    fn another_profiles_resume_file_does_not_skip_the_save() {
+        let ih = InfoHash([0x7E; 20]);
+        let resume = MemoryResumeStore::new();
+        resume.write(&ProfileId::new("q"), &ih, b"q's").unwrap();
+
+        assert_eq!(
+            saves_queued_by_add(&resume, &ProfileId::new("p"), ih),
+            vec![(ih, ResumeFlags::empty())],
+        );
+    }
+
+    /// Removed and added again in the same profile: the removal's alert,
+    /// handled first, deleted the old torrent's file, so the new one is saved.
+    #[test]
+    fn a_re_add_after_a_removal_is_saved() {
+        let ih = InfoHash([0x80; 20]);
+        let profile = ProfileId::new("p");
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = NoopSink;
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let old = TorrentHandle {
+            id: 1,
+            infohash: ih,
+        };
+        let new = TorrentHandle {
+            id: 2,
+            infohash: ih,
+        };
+        state.insert(
+            ih,
+            TorrentState::newly_added(old, profile.clone(), clock.now()),
+        );
+        resume.write(&profile, &ih, b"old-resume").unwrap();
+        state.begin_removal(&profile, old);
+        state.note_readded(&profile, &ih);
+
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: profile,
+            span: tracing::info_span!("test"),
+        };
+        handle(&removed_alert(ih), &mut ctx);
+        handle(&add_alert(ih, Some(new), 0), &mut ctx);
+
+        assert_eq!(
+            state.dispatch_resume_saves(8),
+            vec![(ih, ResumeFlags::empty())],
+        );
+    }
+
+    /// A store that cannot say whether the file exists gets the save: an
+    /// extra write costs far less than a torrent no boot reloads.
+    #[test]
+    fn a_store_that_cannot_answer_gets_the_save() {
+        use crate::resume_store::ResumeStoreError;
+        use crate::resume_store::Scan;
+
+        #[derive(Debug)]
+        struct Unanswerable;
+        impl ResumeStore for Unanswerable {
+            fn scan(
+                &self,
+                _: &ProfileId,
+            ) -> Result<Scan<libtorrent_safe::ResumeData>, ResumeStoreError> {
+                Ok(Scan {
+                    entries: Vec::new(),
+                    unreadable: 0,
+                })
+            }
+            fn write(&self, _: &ProfileId, _: &InfoHash, _: &[u8]) -> Result<(), ResumeStoreError> {
+                Ok(())
+            }
+            fn delete(&self, _: &ProfileId, _: &InfoHash) -> Result<(), ResumeStoreError> {
+                Ok(())
+            }
+            fn exists(&self, _: &ProfileId, _: &InfoHash) -> Result<bool, ResumeStoreError> {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied).into())
+            }
+        }
+
+        let ih = InfoHash([0x7F; 20]);
+        assert_eq!(
+            saves_queued_by_add(&Unanswerable, &ProfileId::new("p"), ih),
             vec![(ih, ResumeFlags::empty())],
         );
     }
