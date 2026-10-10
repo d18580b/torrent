@@ -22,6 +22,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::app_state::AppState;
+use crate::auth::Admission;
 use crate::auth::Scope;
 use crate::http::forwarded::Client;
 use crate::http::security::Bearer;
@@ -199,19 +200,32 @@ pub async fn create_session(
     // the KDF. The per-client consult above cannot bound this on its own:
     // every address a caller holds brings a bucket of its own, so without
     // one shared budget the Argon2 rate — and the guessing rate — scale with
-    // the number of addresses. See `LoginThrottle`.
-    if let Err(wait) = auth.throttle.admit_verification() {
-        warn!(
-            target: "torrentd::auth",
-            client_ip,
-            retry_after_secs = wait.as_secs(),
-            "login refused: daemon-wide password verification budget spent",
-        );
-        refused("verification_budget");
-        return Err(throttled(
-            "too many login attempts; try again shortly",
-            wait,
-        ));
+    // the number of addresses. A client that has logged in before falls back
+    // on a reserve once it is spent, so a few polling addresses cannot keep
+    // a returning operator out. See `LoginThrottle`.
+    match auth.throttle.admit_verification(client.ip) {
+        Ok(Admission::Shared) => {}
+        Ok(Admission::Reserve) => {
+            warn!(
+                target: "torrentd::auth",
+                client_ip,
+                "login admitted from the returning-client reserve: \
+                 daemon-wide password verification budget spent",
+            );
+        }
+        Err(wait) => {
+            warn!(
+                target: "torrentd::auth",
+                client_ip,
+                retry_after_secs = wait.as_secs(),
+                "login refused: daemon-wide password verification budget spent",
+            );
+            refused("verification_budget");
+            return Err(throttled(
+                "too many login attempts; try again shortly",
+                wait,
+            ));
+        }
     }
 
     // ~50 ms of deliberate CPU per call: run on the blocking pool, not on an
