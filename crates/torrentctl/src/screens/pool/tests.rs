@@ -1417,17 +1417,37 @@ fn the_step_table_pages_past_the_plans_inline_steps() {
         "the list and the plan"
     );
     let stale = steps_tag(&state);
-    assert_eq!(
-        send(
-            &mut state,
-            Msg::Plans(plans::Msg::DetailLoaded {
-                id: 8,
-                result: Ok(big_plan()),
-            }),
-            true,
-        ),
-        1,
-        "every loaded step, again"
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a test runtime");
+    let (url, daemon) = runtime.block_on(testing::serve_once(
+        "200 OK",
+        json!({"items": [], "next_cursor": null}).to_string(),
+    ));
+    let api = crate::api::Api::new(&url, Some("tdp_test")).expect("a valid URL");
+    let theme = testing::theme();
+    let ctx = Ctx {
+        api: &api,
+        server: Some(&server),
+        theme: &theme,
+        tick: 0,
+    };
+    let mut effects = update(
+        &mut state,
+        Msg::Plans(plans::Msg::DetailLoaded {
+            id: 8,
+            result: Ok(big_plan()),
+        }),
+        &ctx,
+    );
+    assert_eq!(effects.len(), 1, "every loaded step, again");
+    runtime.block_on(effects.remove(0).0);
+    let request = runtime.block_on(daemon).expect("the request");
+    let line = request.lines().next().unwrap_or_default();
+    assert!(
+        line.starts_with("GET /v1/pool/plans/8/steps?") && line.contains("limit=300"),
+        "the 250 loaded steps rounded up to a page, not the default 100: {line}"
     );
     let detail = state.plans.detail.as_ref().unwrap();
     assert_eq!(detail.steps.items.len(), 250, "kept until the answer");

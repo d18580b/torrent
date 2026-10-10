@@ -96,6 +96,52 @@ pub fn deliver(effect: crate::app::Effect) -> crate::app::Msg {
         .block_on(effect.0)
 }
 
+/// Serve one request with `status` and `body`, returning what was sent.
+pub async fn serve_once(
+    status: &'static str,
+    body: String,
+) -> (String, tokio::task::JoinHandle<String>) {
+    use tokio::io::AsyncReadExt as _;
+    use tokio::io::AsyncWriteExt as _;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut received = Vec::new();
+        let mut buf = [0u8; 65536];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            received.extend_from_slice(&buf[..n]);
+            let text = String::from_utf8_lossy(&received);
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let length = text[..head_end]
+                    .lines()
+                    .find_map(|l| {
+                        l.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|v| v.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                if received.len() >= head_end + 4 + length {
+                    break;
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\nx-request-id: \
+             feedface\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(response.as_bytes()).await.unwrap();
+        String::from_utf8_lossy(&received).into_owned()
+    });
+    (url, handle)
+}
+
 /// A key press.
 pub fn key(code: crossterm::event::KeyCode) -> crossterm::event::KeyEvent {
     crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE)
