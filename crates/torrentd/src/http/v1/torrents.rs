@@ -1124,7 +1124,8 @@ torrent_error! {
         /// safe to move to the trash: a file outside every managed root, one
         /// the index does not record this torrent claiming, one that changed
         /// since the scan, or another assigned torrent whose files no session
-        /// can report to compare against. Nothing was changed.
+        /// can report to compare against; or the torrent itself is one the
+        /// boot left unloaded, which no session holds. Nothing was changed.
         #[error("{detail}")]
         #[problem(status = 409, title = "The payload cannot be trashed")]
         PayloadUntrashable { detail: String },
@@ -1297,15 +1298,31 @@ pub async fn delete_torrent(
             .await?;
         }
         None if s.unloaded_at_boot.lock().contains(&ih) => {
+            if delete_files {
+                // Refused before anything changes, as `clear_sessionless`
+                // refuses it: no session holds the torrent, so nothing can
+                // reach its payload, and a 204 would tell the client files
+                // went to the trash that were never touched.
+                return Err(DeleteTorrentError::PayloadUntrashable {
+                    detail: format!(
+                        "no session holds torrent {ih}: the startup scans left it unloaded, so \
+                         its payload cannot be reached to move to the trash. Nothing was \
+                         changed; retry without `delete_files` to clear it from the daemon's \
+                         records and leave the files where they are."
+                    ),
+                });
+            }
+            // The boot left it unloaded mostly because its resume add failed,
+            // so its resume file is still on disk to re-assign it at the next
+            // start: the stores go too, as for a sessionless profile.
+            clear_unheld(&s, &ih, &profile)?;
             warn!(
                 target: "torrentd::http",
                 infohash = %ih,
                 profile_id = %profile,
-                "no session holds an info-hash the registry still assigns; the startup \
-                 scans did not load it, so clearing the assignment alone",
+                "cleared an assignment the startup scans left unloaded, and deleted its resume \
+                 and .torrent files so the startup scan does not re-assign it",
             );
-            // No session held it, so `delete_files` reached no payload.
-            clear_assignment(&s, &ih, &profile, false)?;
         }
         None => return Err(DeleteTorrentError::TorrentAdding),
     }
@@ -1511,6 +1528,24 @@ fn clear_sessionless(
             profile_status: crate::http::v1::common::ProfileUnavailableReason::Failed.as_str(),
         });
     }
+    clear_unheld(s, ih, profile)?;
+    warn!(
+        target: "torrentd::http",
+        infohash = %ih,
+        profile_id = %profile,
+        "cleared an assignment whose profile has no running session, and deleted its resume \
+         and .torrent files so the startup scan does not re-assign it",
+    );
+    Ok(NoContent)
+}
+
+/// Clear the assignment of `ih` to `profile`, which no session holds, with
+/// the resume file and `.torrent` that would re-assign it at the next start.
+fn clear_unheld(
+    s: &AppState,
+    ih: &InfoHash,
+    profile: &ProfileId,
+) -> Result<(), DeleteTorrentError> {
     // The two stores first, then the registry entry.
     //
     // Clearing the registry entry alone does not hold: `startup.rs` re-scans
@@ -1555,16 +1590,9 @@ fn clear_sessionless(
                 internal("clearing the torrent's assignment", e)
             ),
         })?;
-    warn!(
-        target: "torrentd::http",
-        infohash = %ih,
-        profile_id = %profile,
-        "cleared an assignment whose profile has no running session, and deleted its resume \
-         and .torrent files so the startup scan does not re-assign it",
-    );
     s.unloaded_at_boot.lock().remove(ih);
     release_index_owner(s, ih, profile, false);
-    Ok(NoContent)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
