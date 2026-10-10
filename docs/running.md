@@ -1059,7 +1059,8 @@ The daemon sets none of these itself.
   request head takes more than 10 seconds, closes an HTTP/2 connection that
   stops answering pings for 30 seconds, and answers `408` to a request whose
   body has not arrived and been answered within 30 seconds (300 for
-  `POST /v1/torrents`). A `408` does not undo what the request already
+  `POST /v1/torrents`; adopting, creating a plan and applying one have no
+  deadline). A `408` does not undo what the request already
   started: an add may still complete (a retry then gets `409`
   `torrent-exists`; re-read the torrent), and a pool verification's
   rechecks may still start. **Two idle cases are not bounded:** a connection that
