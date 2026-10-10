@@ -30,6 +30,8 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use std::time::Instant;
 use std::time::SystemTime;
 
 use kynos::error::rejection::AuthRejection;
@@ -114,23 +116,23 @@ impl Site {
     /// absence marks a client no page drives. A request that names no site
     /// and carries no body is admitted for the same reason, which is what
     /// keeps `curl -X POST` and `torrentctl` working unchanged.
-    fn refusal(&self, allowed: &HostAllowlist) -> Option<&'static str> {
+    fn refusal(&self, allowed: &HostAllowlist) -> Option<Refusal> {
         let authority = match self.authority.as_ref().map(HeaderValue::to_str) {
             None => None,
             Some(Ok(authority)) => Some(authority),
-            Some(Err(_)) => return Some("the request authority is not text"),
+            Some(Err(_)) => return Some(Refusal::host("the request authority is not text")),
         };
         let own = match authority {
             None => None,
             Some(authority) => {
                 let Some((host, port)) = split_authority(authority) else {
-                    return Some("the request authority does not parse");
+                    return Some(Refusal::host("the request authority does not parse"));
                 };
                 if !is_loopback_host(&host) && !allowed.contains(&host) {
-                    return Some(
+                    return Some(Refusal::host(
                         "the Host is neither loopback nor in allowed_hosts, as a DNS-rebound \
                          page's would be",
-                    );
+                    ));
                 }
                 Some((host, port))
             }
@@ -140,12 +142,17 @@ impl Site {
         }
         if let Some(site) = &self.fetch_site {
             if !matches!(site.to_str(), Ok("same-origin" | "none")) {
-                return Some("Sec-Fetch-Site says another site sent this request");
+                return Some(Refusal {
+                    label: "sec_fetch_site",
+                    reason: "Sec-Fetch-Site says another site sent this request",
+                });
             }
         }
         if let Some(origin) = &self.origin {
             let Some(own) = own else {
-                return Some("the request names an Origin and no Host to hold it to");
+                return Some(Refusal::origin(
+                    "the request names an Origin and no Host to hold it to",
+                ));
             };
             let same = origin
                 .to_str()
@@ -155,7 +162,7 @@ impl Site {
                     host == own.0 && own.1.map_or(port.is_default, |p| p == port.number)
                 });
             if !same {
-                return Some("the Origin is not this daemon's own");
+                return Some(Refusal::origin("the Origin is not this daemon's own"));
             }
         }
         if let Some(content_type) = &self.content_type {
@@ -165,10 +172,77 @@ impl Site {
                 .and_then(|v| v.split(';').next())
                 .map(str::trim);
             if !essence.is_some_and(|e| e.eq_ignore_ascii_case("application/json")) {
-                return Some("the body is not application/json, so an HTML form could send it");
+                return Some(Refusal {
+                    label: "content_type",
+                    reason: "the body is not application/json, so an HTML form could send it",
+                });
             }
         }
         None
+    }
+}
+
+/// Why a daemon without `[auth]` refused a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Refusal {
+    /// The header that refused it, as `auth_cross_site_refusals_total`'s
+    /// `reason` label names it.
+    label: &'static str,
+    /// The same, for the operator reading the log.
+    reason: &'static str,
+}
+
+impl Refusal {
+    fn host(reason: &'static str) -> Self {
+        Self {
+            label: "host",
+            reason,
+        }
+    }
+
+    fn origin(reason: &'static str) -> Self {
+        Self {
+            label: "origin",
+            reason,
+        }
+    }
+}
+
+/// How often, at most, a cross-site refusal is logged.
+const REFUSAL_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// The cross-site refusal's `warn` line, written at most once per
+/// [`REFUSAL_LOG_INTERVAL`].
+///
+/// Any page the operator has open can loop requests the daemon refuses, and a
+/// line for each would let that page fill the log. Every refusal is counted
+/// in `auth_cross_site_refusals_total` whether or not it is logged, and each
+/// line says how many went unlogged since the one before it.
+#[derive(Debug, Default)]
+pub struct RefusalLog(parking_lot::Mutex<RefusalLogState>);
+
+#[derive(Debug, Default)]
+struct RefusalLogState {
+    /// When the last line was written, if one has been.
+    last: Option<Instant>,
+    /// Refusals since then that were not logged.
+    suppressed: u64,
+}
+
+impl RefusalLog {
+    /// Whether a refusal at `now` is logged, and if so, how many refusals
+    /// went unlogged before it.
+    fn admit(&self, now: Instant) -> Option<u64> {
+        let mut state = self.0.lock();
+        let due = state
+            .last
+            .is_none_or(|at| now.saturating_duration_since(at) >= REFUSAL_LOG_INTERVAL);
+        if !due {
+            state.suppressed += 1;
+            return None;
+        }
+        state.last = Some(now);
+        Some(std::mem::take(&mut state.suppressed))
     }
 }
 
@@ -388,6 +462,8 @@ pub struct Gate {
     /// `allowed_hosts`: what a daemon without `[auth]` answers to beyond
     /// loopback. Unread where `[auth]` is configured.
     pub allowed_hosts: HostAllowlist,
+    /// Paces the cross-site refusal's log line; shared by every clone.
+    pub refusal_log: Arc<RefusalLog>,
 }
 
 impl<C: Sync> Authenticator<Bearer, C> for Gate {
@@ -402,15 +478,25 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
             // confined it to loopback. Loopback keeps out the network, not
             // the operator's own browser, so a request a page drove from
             // another site is refused here.
-            if let Some(reason) = presented.site.refusal(&self.allowed_hosts) {
-                warn!(
-                    target: "torrentd::auth",
-                    reason,
-                    host = ?presented.site.authority,
-                    origin = ?presented.site.origin,
-                    sec_fetch_site = ?presented.site.fetch_site,
-                    "refused a request a browser sent from another site",
+            if let Some(refusal) = presented.site.refusal(&self.allowed_hosts) {
+                self.metrics.inc_counter(
+                    "auth_cross_site_refusals_total",
+                    &[("reason", refusal.label)],
                 );
+                if let Some(unlogged) = self.refusal_log.admit(Instant::now()) {
+                    warn!(
+                        target: "torrentd::auth",
+                        reason = refusal.reason,
+                        host = ?presented.site.authority,
+                        origin = ?presented.site.origin,
+                        sec_fetch_site = ?presented.site.fetch_site,
+                        content_type = ?presented.site.content_type,
+                        refused_unlogged_since_last = unlogged,
+                        "refused a request a browser sent from another site; further refusals \
+                         are logged at most once a minute and all are counted in \
+                         auth_cross_site_refusals_total",
+                    );
+                }
                 return Err(AuthRejection::forbidden());
             }
             return Ok(Caller::Anonymous);
@@ -462,5 +548,31 @@ impl<C: Sync> Authenticator<Bearer, C> for Gate {
                 .inc_counter("auth_token_scope_denials_total", &[]);
         }
         Err(AuthRejection::forbidden_as(INSUFFICIENT_SCOPE))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_refusal_log_writes_one_line_a_minute_and_counts_the_rest() {
+        let log = RefusalLog::default();
+        let start = Instant::now();
+        assert_eq!(log.admit(start), Some(0), "the first refusal is logged");
+        for s in [0, 1, 30, 59] {
+            assert_eq!(
+                log.admit(start + Duration::from_secs(s)),
+                None,
+                "{s}s later"
+            );
+        }
+        assert_eq!(
+            log.admit(start + REFUSAL_LOG_INTERVAL),
+            Some(4),
+            "the next line says how many went unlogged"
+        );
+        assert_eq!(log.admit(start + REFUSAL_LOG_INTERVAL), None);
+        assert_eq!(log.admit(start + 3 * REFUSAL_LOG_INTERVAL), Some(1));
     }
 }

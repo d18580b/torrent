@@ -241,6 +241,11 @@ pub const CATALOGUE: &[Series] = catalogue! {
          daemon-wide verification budget spent.";
     "auth_token_scope_denials_total" Counter Daemon Zero =>
         "Requests carrying a valid token without the scope the route needs.";
+    "auth_cross_site_refusals_total" Counter Daemon
+        ("reason": &["host", "sec_fetch_site", "origin", "content_type"]) Zero =>
+        "Requests a daemon without [auth] refused as sent by a browser from another site, by \
+         the header that refused them: a Host neither loopback nor in allowed_hosts, a \
+         cross-site Sec-Fetch-Site, a foreign Origin, or a body type an HTML form can send.";
     "config_reload_failures_total" Counter Daemon ("stage": &["load", "log_level", "apply_settings"]) Zero =>
         "Reloads (SIGHUP or POST /v1/config/reload) that failed, by the step that failed.";
     // kill switch

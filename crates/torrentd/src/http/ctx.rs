@@ -24,6 +24,7 @@ impl AppCtx {
             auth: state.auth.clone(),
             metrics: Arc::clone(&state.metrics),
             allowed_hosts: state.allowed_hosts.clone(),
+            refusal_log: Arc::default(),
         };
         Self {
             state: Arc::new(state),
