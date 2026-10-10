@@ -159,7 +159,7 @@ pub const MIN_RENEW_AFTER: Duration = Duration::from_secs(2);
 
 /// How many torrents a bulk operation that makes them announce hands to the
 /// session at once: the reannounce after a port change, and every bulk
-/// resume (see [`paced`]).
+/// resume (see [`Pacer`]).
 ///
 /// A rebind used to reannounce every torrent in the profile in one burst. At
 /// the scale this daemon runs — tens of thousands of torrents per session —
@@ -175,29 +175,41 @@ pub const REANNOUNCE_BATCH: usize = 100;
 /// The pause between two batches of [`REANNOUNCE_BATCH`].
 pub const REANNOUNCE_PACE: Duration = Duration::from_secs(1);
 
-/// Hand `handles` to `batch` [`REANNOUNCE_BATCH`] at a time, `pace` apart,
-/// the first at once, until every one has been handed over or `batch`
-/// breaks. `batch` is also given how many handles came before its own.
+/// Splits a bulk operation over `len` torrents into batches of
+/// [`REANNOUNCE_BATCH`], handed out `pace` apart, the first at once.
 ///
 /// The one pacer every bulk operation that makes the sessions announce goes
 /// through, so that none of them hands a session a profile's worth of
-/// announces in one instant. It sleeps on the runtime's timer between
-/// batches and holds no thread while it waits; each batch runs on the
-/// calling task, so a batch is never cut in half by dropping the future.
-/// Each run is paced on its own: two runs over the same profile at once
-/// announce at twice the rate.
-pub async fn paced<B>(
-    handles: &[TorrentHandle],
+/// announces in one instant. [`Pacer::next_batch`] sleeps on the runtime's
+/// timer, so a paced operation holds no thread while it waits; what each
+/// batch does, and on which thread, is the caller's. Each pacer paces only
+/// its own operation: two over the same profile at once announce at twice
+/// the rate.
+#[derive(Debug)]
+pub struct Pacer {
+    len: usize,
+    next: usize,
     pace: Duration,
-    mut batch: impl FnMut(usize, &[TorrentHandle]) -> std::ops::ControlFlow<B>,
-) -> std::ops::ControlFlow<B> {
-    for (i, chunk) in handles.chunks(REANNOUNCE_BATCH).enumerate() {
-        if i > 0 {
-            tokio::time::sleep(pace).await;
-        }
-        batch(i * REANNOUNCE_BATCH, chunk)?;
+}
+
+impl Pacer {
+    pub fn new(len: usize, pace: Duration) -> Self {
+        Self { len, next: 0, pace }
     }
-    std::ops::ControlFlow::Continue(())
+
+    /// The indices of the next batch, once `pace` has passed since the last
+    /// one was handed out; `None` once all `len` have been.
+    pub async fn next_batch(&mut self) -> Option<std::ops::Range<usize>> {
+        if self.next >= self.len {
+            return None;
+        }
+        if self.next > 0 {
+            tokio::time::sleep(self.pace).await;
+        }
+        let batch = self.next..self.len.min(self.next + REANNOUNCE_BATCH);
+        self.next = batch.end;
+        Some(batch)
+    }
 }
 
 /// Ask each torrent in `handles` to reannounce, and count what the session
@@ -1043,46 +1055,31 @@ mod tests {
         assert!(REANNOUNCE_PACE * (batches as u32 - 1) <= Duration::from_secs(100));
     }
 
-    /// The pacer hands over a batch at once and the next only a pace later,
-    /// says how many came before each, and stops where a batch breaks.
+    /// The pacer hands out a batch at once and each next one only a pace
+    /// later, until every torrent has been handed out.
     #[tokio::test(start_paused = true)]
-    async fn the_pacer_hands_over_a_batch_per_pace_and_stops_where_a_batch_breaks() {
-        use std::ops::ControlFlow;
-        let handles: Vec<TorrentHandle> = (0..(2 * REANNOUNCE_BATCH + 1) as u64)
-            .map(|id| TorrentHandle {
-                id,
-                infohash: InfoHash([0; 20]),
-            })
-            .collect();
+    async fn the_pacer_hands_out_a_batch_per_pace() {
+        let len = 2 * REANNOUNCE_BATCH + 1;
         let start = tokio::time::Instant::now();
+        let mut pacer = Pacer::new(len, REANNOUNCE_PACE);
         let mut seen = Vec::new();
-        let out = paced(&handles, REANNOUNCE_PACE, |before, batch| {
-            seen.push((start.elapsed(), before, batch.len()));
-            ControlFlow::<()>::Continue(())
-        })
-        .await;
-        assert_eq!(out, ControlFlow::Continue(()));
+        while let Some(batch) = pacer.next_batch().await {
+            seen.push((start.elapsed(), batch));
+        }
         assert_eq!(
             seen,
             [
-                (Duration::ZERO, 0, REANNOUNCE_BATCH),
-                (REANNOUNCE_PACE, REANNOUNCE_BATCH, REANNOUNCE_BATCH),
-                (2 * REANNOUNCE_PACE, 2 * REANNOUNCE_BATCH, 1),
+                (Duration::ZERO, 0..REANNOUNCE_BATCH),
+                (REANNOUNCE_PACE, REANNOUNCE_BATCH..2 * REANNOUNCE_BATCH),
+                (2 * REANNOUNCE_PACE, 2 * REANNOUNCE_BATCH..len),
             ],
         );
-
-        let mut batches = 0;
-        let out = paced(&handles, REANNOUNCE_PACE, |before, _| {
-            batches += 1;
-            if before > 0 {
-                ControlFlow::Break(before)
-            } else {
-                ControlFlow::Continue(())
-            }
-        })
-        .await;
-        assert_eq!(out, ControlFlow::Break(REANNOUNCE_BATCH));
-        assert_eq!(batches, 2, "nothing after the batch that broke");
+        assert_eq!(
+            start.elapsed(),
+            2 * REANNOUNCE_PACE,
+            "no wait after the last"
+        );
+        assert_eq!(Pacer::new(0, REANNOUNCE_PACE).next_batch().await, None);
     }
 
     #[test]

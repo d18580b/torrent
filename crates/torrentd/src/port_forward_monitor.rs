@@ -29,7 +29,6 @@
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
-use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
@@ -38,10 +37,10 @@ use libtorrent_safe::TorrentHandle;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio::task::JoinSet;
-use torrentd_engine::port_forward::paced;
 use torrentd_engine::port_forward::reannounce_batch;
 use torrentd_engine::port_forward::renew_after;
 use torrentd_engine::port_forward::ListenEvents;
+use torrentd_engine::port_forward::Pacer;
 use torrentd_engine::port_forward::Reannounce;
 use torrentd_engine::port_forward::RebindFailure;
 use torrentd_engine::port_forward::RebindTarget;
@@ -365,7 +364,7 @@ impl Next {
 }
 
 /// Reannounce `handles` [`REANNOUNCE_BATCH`] at a time, `pace` apart, through
-/// the shared pacer ([`paced`]), then record how long the whole reannounce
+/// the shared [`Pacer`], then record how long the whole reannounce
 /// took from `detected` and what the session refused.
 ///
 /// A rebind used to reannounce every torrent in the profile in one burst,
@@ -389,25 +388,28 @@ async fn reannounce_paced(
 ) {
     let mut dispatched = 0;
     let mut failed = 0;
-    let run = paced(&handles, pace, |before, batch| {
+    let mut pacer = Pacer::new(handles.len(), pace);
+    loop {
+        let batch = tokio::select! {
+            batch = pacer.next_batch() => match batch {
+                Some(batch) => batch,
+                None => break,
+            },
+            _ = stop.changed() => return,
+        };
         if fenced() {
             info!(
                 target: "torrentd::port_forward_monitor",
                 profile_id = %id,
-                torrent_count = handles.len() - before,
+                torrent_count = handles.len() - batch.start,
                 "the profile was fenced during the reannounce after the port change; \
                  not reannouncing the rest",
             );
-            return ControlFlow::Break(());
+            return;
         }
-        let (d, f) = reannounce_batch(&*engine, batch);
+        let (d, f) = reannounce_batch(&*engine, &handles[batch]);
         dispatched += d;
         failed += f;
-        ControlFlow::Continue(())
-    });
-    tokio::select! {
-        ran = run => if ran.is_break() { return },
-        _ = stop.changed() => return,
     }
     record_reannounce(
         &*metrics,
