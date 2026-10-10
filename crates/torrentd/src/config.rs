@@ -573,6 +573,9 @@ impl Config {
         if old.user_agent != *new_user_agent {
             d.non_reloadable_changes.push("user_agent");
         }
+        // Restart-only by decision (#209): the authenticator is built once at
+        // startup, so a `[[auth.token]]` removed here keeps authenticating
+        // until the daemon restarts, and the reload pump says so.
         if old.auth != *new_auth {
             d.non_reloadable_changes.push("auth");
         }
@@ -2557,6 +2560,36 @@ upload_rate_limit = 0"#,
             assert!(d.reloadable_changes.is_empty(), "{key}");
             assert!(d.profile_changes.is_empty(), "{key}");
         }
+    }
+
+    /// Removing one `[[auth.token]]` is the revocation an operator reaches
+    /// for, and it is an `[auth]` change like any other: reported as
+    /// needing a restart, and never applied.
+    #[test]
+    fn removing_one_static_token_is_a_non_reloadable_auth_change() {
+        use crate::auth::AuthConfig;
+        use crate::auth::Scope;
+        use crate::auth::TokenConfig;
+        let token = |name: &str, sha: char| TokenConfig {
+            name: name.into(),
+            sha256: sha.to_string().repeat(64),
+            scopes: vec![Scope::Read],
+        };
+        let auth = |token: Vec<TokenConfig>| AuthConfig {
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+            session_ttl_secs: 43_200,
+            token,
+        };
+        let dir = tempdir().unwrap();
+        let mut a = Config::load(&write_cfg(dir.path(), &single_session())).unwrap();
+        a.auth = Some(auth(vec![token("ci", 'a'), token("scrape", 'b')]));
+        let mut b = a.clone();
+        b.auth = Some(auth(vec![token("scrape", 'b')]));
+        let d = Config::diff(&a, &b);
+        assert!(!d.is_empty());
+        assert_eq!(d.non_reloadable_changes, vec!["auth"]);
+        assert!(d.reloadable_changes.is_empty(), "{d:?}");
+        assert!(d.profile_changes.is_empty(), "{d:?}");
     }
 
     #[test]
