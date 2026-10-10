@@ -1113,15 +1113,18 @@ torrent_error! {
         #[problem(status = 409, title = "The torrent is still being added")]
         TorrentAdding,
         /// `delete_files=true` for a torrent whose files the pool index has
-        /// another torrent claiming too — a cross-seed, or a conflict.
-        /// Deleting them would take the other torrent's payload with them.
+        /// another torrent claiming too — a cross-seed, or a conflict — or
+        /// one of whose files another torrent a session holds lists at the
+        /// same path, however it was added. Deleting them would take the
+        /// other torrent's payload with them.
         #[error("{detail}")]
         #[problem(status = 409, title = "The payload is shared")]
         PayloadShared { detail: String },
         /// `delete_files=true` for a torrent whose payload cannot be proven
         /// safe to move to the trash: a file outside every managed root, one
-        /// the index does not record this torrent claiming, or one that
-        /// changed since the scan. Nothing was changed.
+        /// the index does not record this torrent claiming, one that changed
+        /// since the scan, or another assigned torrent whose files no session
+        /// can report to compare against. Nothing was changed.
         #[error("{detail}")]
         #[problem(status = 409, title = "The payload cannot be trashed")]
         PayloadUntrashable { detail: String },
@@ -1149,12 +1152,14 @@ torrent_error! {
 /// of the managed root it lies in, never unlinking it, and needs `[pool]
 /// allow_mutations` and `confirm` repeating the infohash. It is refused,
 /// changing nothing, unless every file is under a managed root, claimed by
-/// this torrent alone in the pool index, and unchanged since the scan that
-/// indexed it. A torrent whose profile has no running session, or that the
-/// boot left unloaded, is cleared from the daemon's records alone
-/// (`delete_files` is refused there: nothing can reach the payload). A
-/// torrent still being added is `409 torrent-adding`; retry once it lists a
-/// phase other than `unknown`.
+/// this torrent alone in the pool index, listed at the same path by no other
+/// torrent any session holds, and unchanged since the scan that indexed it;
+/// while another assigned torrent is held by no session, its files cannot be
+/// compared, and that refuses too. A torrent whose profile has no running
+/// session, or that the boot left unloaded, is cleared from the daemon's
+/// records alone (`delete_files` is refused there: nothing can reach the
+/// payload). A torrent still being added is `409 torrent-adding`; retry once
+/// it lists a phase other than `unknown`.
 #[kynos::delete("/torrents/{infohash}", tag = Torrents)]
 pub async fn delete_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1331,13 +1336,92 @@ fn payload_to_trash(
         .into_iter()
         .map(|f| f.path)
         .collect();
-    crate::pool_apply::torrent_payload(pool, &ih.to_hex(), FsPath::new(&details.save_path), &files)
-        .map_err(|why| DeleteTorrentError::PayloadUntrashable {
-            detail: format!(
-                "{why}. Nothing was changed; the torrent is still in its session. Retry \
+    let payload = crate::pool_apply::torrent_payload(
+        pool,
+        &ih.to_hex(),
+        FsPath::new(&details.save_path),
+        &files,
+    )
+    .map_err(|why| DeleteTorrentError::PayloadUntrashable {
+        detail: format!(
+            "{why}. Nothing was changed; the torrent is still in its session. Retry \
              without `delete_files` to remove the torrent alone."
-            ),
-        })
+        ),
+    })?;
+    refuse_live_overlap(s, ih, &payload)?;
+    Ok(payload)
+}
+
+/// Refuse `payload` when any other torrent the daemon holds has a file at
+/// one of its paths.
+///
+/// The co-claimant check reads the pool index, where only the matcher writes
+/// claims, so a cross-seed added through `POST /v1/torrents` with a
+/// `save_path` over the same files is invisible to it. This reads every other
+/// torrent from its session instead: each one assigned in the registry and
+/// each one in the state map, whichever profile holds it. One whose files no
+/// session can report — assigned but not loaded, or loaded where its session
+/// cannot be asked — cannot be shown not to overlap, so it refuses too.
+fn refuse_live_overlap(
+    s: &AppState,
+    ih: &InfoHash,
+    payload: &crate::pool_apply::TorrentPayload,
+) -> Result<(), DeleteTorrentError> {
+    let mut others: Vec<InfoHash> = s
+        .registry
+        .entries()
+        .into_iter()
+        .map(|(other, _)| other)
+        .chain(s.state.infohashes())
+        .filter(|other| other != ih)
+        .collect();
+    others.sort_unstable_by_key(InfoHash::to_hex);
+    others.dedup();
+    let unprovable = |other: &InfoHash, why: String| DeleteTorrentError::PayloadUntrashable {
+        detail: format!(
+            "torrent {other} {why}, so its files cannot be compared with this one's. Nothing \
+             was changed; retry once it is loaded or removed, or retry without `delete_files` \
+             to remove this torrent alone."
+        ),
+    };
+    for other in &others {
+        let Some(st) = s.state.get(other) else {
+            return Err(unprovable(
+                other,
+                "is assigned to a profile but no session holds it".to_owned(),
+            ));
+        };
+        let Some(engine) = s.source.engine_for(&st.profile_id) else {
+            return Err(unprovable(
+                other,
+                format!("is held by profile {}, which has no session", st.profile_id),
+            ));
+        };
+        let read = || -> Result<_, EngineError> {
+            let details = engine.torrent_details(st.handle)?;
+            let files = engine
+                .torrent_files(st.handle)?
+                .map(|fs| fs.into_iter().map(|f| f.path).collect());
+            Ok(crate::pool_apply::LiveTorrent {
+                save_path: details.save_path.into(),
+                files,
+            })
+        };
+        let live = read()
+            .map_err(|e| unprovable(other, format!("could not be read from its session ({e})")))?;
+        if let Some(path) = payload.shared_with(&live) {
+            return Err(DeleteTorrentError::PayloadShared {
+                detail: format!(
+                    "torrent {other}, in profile {}, has a file at {}, so deleting this \
+                     torrent's payload would delete its files too; retry without \
+                     `delete_files`",
+                    st.profile_id,
+                    path.display(),
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Seconds since the epoch, naming a deleted torrent's trash directory.

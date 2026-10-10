@@ -333,10 +333,65 @@ pub(crate) async fn scenarios(cov: &Arc<Coverage>) {
         .iter()
         .any(|c| matches!(c, RecordedCall::RemoveTorrent { .. })));
 
-    // Scanned and claimed: the torrent leaves its session with libtorrent
-    // deleting nothing, and the file moves to the root's trash intact.
+    // Scanned and claimed, so the index proves it this torrent's alone. Every
+    // other torrent the daemon holds must also be shown not to have a file at
+    // the same path, which the index cannot say for one added through
+    // `POST /v1/torrents`.
     pool.scan().unwrap();
     add(&hex(LOADED)).unwrap();
+    let untouched = |resp: &TestResponse, problem: &str, names: InfoHash| {
+        assert_problem(resp, 409, problem);
+        let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+        assert!(detail.contains(&hex(names)), "{detail}");
+        assert!(data.exists());
+        assert!(h.state.registry.lookup(&LOADED).is_some());
+        assert!(!engines
+            .p
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::RemoveTorrent { .. })));
+    };
+    // Other torrents are compared in infohash order: FENCED, ADDING, STALE.
+    // A torrent with no metadata yet could write anything under its save
+    // path, and the mock's default save path is `/`.
+    let fenced = handle(&engines.f, FENCED);
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-shared", FENCED);
+    // A cross-seed in another profile, with the same file under its own save
+    // path and file list.
+    engines.f.set_torrent_details(
+        fenced,
+        TorrentDetails {
+            save_path: root.join("X").to_string_lossy().into_owned(),
+            ..MockEngine::default_details()
+        },
+    );
+    engines
+        .f
+        .set_torrent_files(fenced, Some(vec![file(0, "data.bin")]));
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-shared", FENCED);
+    // A session that cannot report one is no proof either.
+    engines
+        .f
+        .inject_error("torrent_files", injected("torrent_files"));
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-untrashable", FENCED);
+    engines
+        .f
+        .set_torrent_files(fenced, Some(vec![file(0, "other.bin")]));
+    // Assigned but held by no session — mid-add, or on a profile that failed
+    // to come up: its files cannot be read, so they cannot be compared.
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-untrashable", ADDING);
+    h.state.registry.remove(&ADDING).unwrap();
+    let resp = h.write("DELETE", &delete_files).await;
+    untouched(&resp, "payload-untrashable", STALE);
+    h.state.registry.remove(&STALE).unwrap();
+
+    // Nothing else has a file there: the torrent leaves its session with
+    // libtorrent deleting nothing, and the file moves to the root's trash
+    // intact.
     let resp = h.write("DELETE", &delete_files).await;
     resp.assert_status(StatusCode::NO_CONTENT);
     assert!(called(

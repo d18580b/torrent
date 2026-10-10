@@ -763,6 +763,9 @@ pub struct TorrentPayload {
 #[derive(Debug)]
 struct PayloadFile {
     path: std::path::PathBuf,
+    /// `path` with every symlink resolved, when it resolves: what
+    /// [`TorrentPayload::shared_with`] compares besides `path` itself.
+    resolved: Option<std::path::PathBuf>,
     root: std::path::PathBuf,
     rel: String,
     stamp: (u64, i64, u64, u64),
@@ -774,6 +777,48 @@ impl TorrentPayload {
     pub fn file_count(&self) -> usize {
         self.files.len()
     }
+
+    /// The first file of this payload that `other`, another torrent a
+    /// session holds, has at the same path — or `None` when it has none.
+    ///
+    /// The pool index cannot answer this: claims come from the matcher
+    /// alone, so a torrent added through `POST /v1/torrents` with a
+    /// `save_path` over the same files claims nothing, and trashing them
+    /// would leave it serving nothing. Each path is compared both as the
+    /// sessions spell it and resolved, so a `save_path` reaching the same
+    /// directory through a symlink is still caught. A torrent whose metadata
+    /// has not arrived yet could write any file under its `save_path`, so
+    /// every payload file under it counts as shared.
+    pub fn shared_with(&self, other: &LiveTorrent) -> Option<&std::path::Path> {
+        let bases: Vec<std::path::PathBuf> = std::iter::once(other.save_path.clone())
+            .chain(std::fs::canonicalize(&other.save_path).ok())
+            .collect();
+        fn forms(f: &PayloadFile) -> impl Iterator<Item = &std::path::PathBuf> {
+            std::iter::once(&f.path).chain(f.resolved.as_ref())
+        }
+        let hit: Box<dyn Fn(&PayloadFile) -> bool> = match &other.files {
+            None => Box::new(|f| forms(f).any(|p| bases.iter().any(|b| p.starts_with(b)))),
+            Some(files) => {
+                let theirs: std::collections::HashSet<std::path::PathBuf> = files
+                    .iter()
+                    .flat_map(|rel| bases.iter().map(move |b| b.join(rel)))
+                    .collect();
+                Box::new(move |f| forms(f).any(|p| theirs.contains(p)))
+            }
+        };
+        self.files.iter().find(|f| hit(f)).map(|f| f.path.as_path())
+    }
+}
+
+/// Another torrent a session holds, as [`TorrentPayload::shared_with`]
+/// compares it: where its session says its payload lies.
+#[derive(Debug)]
+pub struct LiveTorrent {
+    /// The session's save path for it.
+    pub save_path: std::path::PathBuf,
+    /// Its files, torrent-relative and `/`-separated, or `None` while its
+    /// metadata has not arrived.
+    pub files: Option<Vec<String>>,
 }
 
 /// What [`trash_torrent_payload`] did.
@@ -876,6 +921,7 @@ pub fn torrent_payload(
             ));
         }
         out.push(PayloadFile {
+            resolved: std::fs::canonicalize(&path).ok(),
             path,
             root,
             rel,
@@ -2149,6 +2195,48 @@ mod tests {
 
         assert!(claimed_file.exists() && unclaimed.exists());
         assert!(!root.join(".torrentd-trash").exists());
+    }
+
+    #[test]
+    fn a_payload_is_shared_with_a_live_torrent_holding_a_file_at_its_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let a = write(&root, "T/a.bin", 16);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        claimed(&pool, dir.path(), &ih, "T/a.bin");
+        let payload = torrent_payload(&pool, &ih, &root, &["T/a.bin".to_owned()]).unwrap();
+        let live = |save: &Path, files: Option<&[&str]>| LiveTorrent {
+            save_path: save.to_path_buf(),
+            files: files.map(|f| f.iter().map(|s| (*s).to_owned()).collect()),
+        };
+
+        // The same file through another torrent's save path and file list.
+        assert_eq!(
+            payload.shared_with(&live(&root.join("T"), Some(&["a.bin"]))),
+            Some(a.as_path())
+        );
+        // The same directory reached through a symlink.
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert_eq!(
+            payload.shared_with(&live(&link, Some(&["T/a.bin"]))),
+            Some(a.as_path())
+        );
+        // No metadata yet: it could write anything under its save path.
+        assert_eq!(payload.shared_with(&live(&root, None)), Some(a.as_path()));
+
+        // A sibling file, another directory, or no metadata elsewhere.
+        assert_eq!(payload.shared_with(&live(&root, Some(&["T/b.bin"]))), None);
+        assert_eq!(
+            payload.shared_with(&live(&dir.path().join("data"), Some(&["T/a.bin"]))),
+            None
+        );
+        assert_eq!(
+            payload.shared_with(&live(&dir.path().join("data"), None)),
+            None
+        );
     }
 
     #[test]
