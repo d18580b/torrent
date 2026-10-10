@@ -1777,6 +1777,9 @@ pub async fn pause_torrent(
         .map_err(|e| PauseTorrentError::Internal {
             detail: internal("pausing the torrent", e),
         })?;
+    // Saved now rather than at the next 30-minute sweep: a crash before it
+    // would bring the torrent back running.
+    s.state.queue_resume_save_now(st.handle.infohash);
     Ok(NoContent)
 }
 

@@ -1670,7 +1670,12 @@ fn record_verify_outcome(
                 let paused = source
                     .engine_for(&st.profile_id)
                     .map(|e| e.pause_torrent(st.handle));
-                if !matches!(paused, Some(Ok(()))) {
+                if matches!(paused, Some(Ok(()))) {
+                    // Saved now: a crash before the next sweep would bring
+                    // the torrent back unpaused, announcing a payload its
+                    // piece hashes just rejected.
+                    state.queue_resume_save_now(*hash);
+                } else {
                     warn!(
                         target: "torrentd::pool",
                         infohash = %ih,
@@ -3575,6 +3580,11 @@ mod tests {
             .calls()
             .iter()
             .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+        // The pause is saved at once, not left for the 30-minute sweep.
+        assert_eq!(
+            state.dispatch_resume_saves(10),
+            vec![(hash, torrentd_engine::ResumeFlags::empty())],
+        );
         let (got, drift) = pool
             .with_store(|s| {
                 Ok::<_, torrentd_pool::PoolError>((s.adoption_state(&ih)?, s.drift_at(&ih)?))
