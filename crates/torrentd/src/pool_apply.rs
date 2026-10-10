@@ -249,14 +249,38 @@ fn apply_inner(
         // which made "never started" and "started, outcome unknown"
         // indistinguishable to the resume path.
         //
-        // A journal write that fails here leaves the step `pending`, so a
-        // crash during it re-runs the step instead of parking it for a human.
-        // The step still runs — refusing would strand the claimed plan — but
-        // the gap is reported.
+        // A step whose start the journal cannot record is not run. Running it
+        // anyway moved files the journal still called `pending`, and the
+        // `done` and plan-status writes that followed failed the same way,
+        // so nothing recorded which files the plan had moved. Stop as a
+        // failed plan, like the divergence above, so the claimed plan is not
+        // stranded in `applying`: the step never ran, so applying the plan
+        // again starts it afresh. Where even that cannot be written, the
+        // plan stays `applying` with this step `pending`, which the next boot
+        // re-drives from exactly here.
         if let Err(e) = pool
             .with_store(|s| s.set_step_status(plan_id, step.seq, step_status::IN_PROGRESS, None))
         {
             pool.note_store_error("set_step_status", &e);
+            let msg = format!("not started: the plan journal could not record the step: {e}");
+            out.failed += 1;
+            out.status = plan_status::FAILED.to_string();
+            if let Err(se) = pool.with_store(|s| {
+                s.set_step_status(plan_id, step.seq, step_status::FAILED, Some(&msg))
+            }) {
+                pool.note_store_error("set_step_status", &se);
+            }
+            error!(
+                target: "torrentd::pool::apply",
+                plan_id,
+                step = step.seq,
+                op = %step.op,
+                src = %step.src,
+                error.cause = %e,
+                "stopping: the plan journal could not record a step as started",
+            );
+            pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
+            break;
         }
         let result = match step.op.as_str() {
             ops::MOVE_TORRENT => move_torrent(pool, source, state, &step),
@@ -1613,6 +1637,89 @@ mod tests {
             .unwrap()
             .status;
         assert_eq!(status, torrentd_pool::model::plan_status::DRAFT);
+    }
+
+    /// A delete plan over one orphan, `pool/junk/old.bin`, in an index at
+    /// `dir`, and a raw connection to that index for a test to hold or rig.
+    fn one_orphan_delete_plan(
+        dir: &Path,
+    ) -> (Arc<PoolService>, i64, PathBuf, rusqlite::Connection) {
+        let root = dir.join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let orphan = write(&root, "junk/old.bin", 64);
+        let pool = service(dir, true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        assert_eq!(steps.len(), 1, "{steps:?}");
+        let other = rusqlite::Connection::open(Config::minimal_for_tests(dir, true).pool_db_path())
+            .unwrap();
+        (pool, plan_id, orphan, other)
+    }
+
+    /// Another process holding the index's write lock, as a CLI `pool scan`
+    /// beside the daemon did for its whole run, made every journal write fail
+    /// while the steps still ran. The plan must be refused before its claim,
+    /// with nothing moved, and apply once the lock is gone.
+    #[test]
+    fn a_delete_plan_applied_while_another_writer_holds_the_index_moves_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, orphan, other) = one_orphan_delete_plan(dir.path());
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (source, state) = engine_and_state();
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert!(
+            orphan.exists(),
+            "a file moved while the journal was locked: {e}"
+        );
+        other.execute_batch("ROLLBACK").unwrap();
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, plan_status::DRAFT, "claimed under the lock");
+
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (1, "applied"), "{out:?}");
+        assert!(!orphan.exists());
+    }
+
+    /// A step whose `in_progress` write fails is not run: running it moved a
+    /// file the journal still called `pending`. The plan ends `failed` with
+    /// the step `failed`, so applying it again runs the step afresh.
+    #[test]
+    fn a_step_the_journal_cannot_record_as_started_is_not_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let (pool, plan_id, orphan, other) = one_orphan_delete_plan(dir.path());
+        // After the claim, so only the step's own journal write fails.
+        other
+            .execute_batch(
+                "CREATE TRIGGER journal_refuses BEFORE UPDATE OF status ON plan_step
+                 WHEN NEW.status = 'in_progress'
+                 BEGIN SELECT RAISE(ABORT, 'journal unavailable'); END;",
+            )
+            .unwrap();
+
+        let (source, state) = engine_and_state();
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!(
+            (out.done, out.failed, out.status.as_str()),
+            (0, 1, "failed"),
+            "{out:?}"
+        );
+        assert!(orphan.exists(), "the step ran unjournalled");
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        assert_eq!(steps[0].status, step_status::FAILED);
+        let why = steps[0].error.clone().unwrap_or_default();
+        assert!(
+            why.contains("not started") && why.contains("journal unavailable"),
+            "{why}"
+        );
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, plan_status::FAILED);
+
+        other.execute_batch("DROP TRIGGER journal_refuses").unwrap();
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (1, "applied"), "{out:?}");
+        assert!(!orphan.exists());
     }
 
     /// A registry over `dir` assigning `ih` to profile `p`, handed to `pool`

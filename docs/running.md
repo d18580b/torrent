@@ -1414,9 +1414,14 @@ torrentd --config /etc/torrentd/torrentd.toml pool check     # what changed sinc
 torrentd --config /etc/torrentd/torrentd.toml pool orphans   # unclaimed bytes
 ```
 
-The CLI and the daemon share one SQLite file and one write lock, so a CLI scan
-while the daemon is scanning is refused rather than interleaved. Then adopt,
-always dry-run first:
+The CLI and the daemon share one SQLite file. `pool scan` holds its write lock
+for the whole scan, which would fail every daemon write meanwhile, so it runs
+only against a stopped daemon: beside a running one, scanning or idle, it
+refuses with `… is open in another process`, and a daemon started during a
+CLI scan fails to start, with `the pool index is locked by another process`,
+until the scan ends. With the daemon up,
+rescan through `POST /v1/pool/scan`. `pool status`, `pool check` and
+`pool orphans` run beside the daemon. Then adopt, always dry-run first:
 
 ```bash
 curl -sX POST localhost:8080/v1/pool/adoptions \

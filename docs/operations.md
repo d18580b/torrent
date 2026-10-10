@@ -18,6 +18,7 @@ The small state files are described in full in
 | `registry.db`, plus `registry.db-wal` and `registry.db-shm` while the daemon runs (`registry_path`) | Which profile owns each info-hash. This is the authority: the pool index's owner column defers to it. | Ownership of every torrent. | The next boot. Its resume and torrent-dir scans re-assign every info-hash they load to the profile whose directory holds it. Claims whose files are gone are not rebuilt, and do not need to be. |
 | `profile_assignments.json.imported` (also `.imported.N`, or `slot_assignments.json.imported`) | The legacy JSON registry, already imported into `registry.db` and renamed so it is not read again. | Nothing the daemon reads. It is the rollback copy for a build that predates `registry.db`. | Nothing. |
 | `pool.db`, plus `pool.db-wal` and `pool.db-shm` (`[pool] db_path`) | The library index (roots, files, torrents, matches, claims) and the mutation journal (`plan` and `plan_step`). | The index, each torrent's adoption state and owner, and every plan with its steps. | A rescan (`POST /v1/pool/scan`) rebuilds the file index and the matches. It does **not** rebuild the plan journal, `adopted` verdicts, owners, or drift markers. |
+| `pool.db.lock` (beside `pool.db`) | Nothing. Every process that writes the index holds an advisory lock on it: shared for the daemon and `pool check`, exclusive for a CLI `pool scan`, which is how that scan refuses to run beside the daemon. It is made readable by every user, so a `pool scan` run as root leaves one the daemon's user can still lock; one a process cannot read at all is skipped with a warning, and the index opens without the lock. | Nothing. The lock is the kernel's and goes with the process. | Every open of the index for writing. |
 | `pool.db.pre-v3.bak` | The index as it stood before this build's one-way schema migration. | Nothing the daemon reads. It is the only way back to a pre-v3 build. | Nothing. |
 | `resume/<profile>/<infohash>.resume` (`resume_dir`, or a profile's own `resume_dir`) | libtorrent resume data: save path, piece state, and settings. | Piece state and settings. A torrent whose `.torrent` survives is re-added at the save path recorded beside it and hashed there, or, with no such record, at `default_save_path`, which is logged and counted in `torrentd_boot_save_path_fallbacks_total`. | Nothing. Pool torrents can be re-adopted after a rescan. |
 | `torrents/<profile>/<infohash>.torrent` (`torrent_dir`, or a profile's own `torrent_dir`) | The metainfo of every torrent the profile holds. | Metadata. A resume entry with no `.torrent` relies on peers to supply it, which a private tracker's torrent usually cannot. | Nothing, except the copy in `library_dir` for pool torrents. |
@@ -177,6 +178,9 @@ index stands. A plan that deletes data applies only with its `confirm_token`.
 The token changes when a rescan moves the index under the plan. Re-read the
 plan for its current token rather than reusing one you noted earlier. Applying stops at the first failed step and
 answers `status: failed`, with the steps saying which one failed and why. A
+step is recorded `in_progress` before it runs, and one the index cannot record
+that way is not run: it fails with `not started: the plan journal could not
+record the step`, and nothing it would have moved is touched. A
 `failed` plan can be applied again.
 
 **The trash.** A deleted file is moved, never unlinked, to
@@ -191,7 +195,9 @@ Before emptying `<root>/.torrentd-trash/<plan id>/`:
    `curl -s localhost:8080/v1/pool/plans/$PLAN -H "Authorization: Bearer $TOKEN"`.
    A plan in `applying` is still running, or was interrupted and is re-driven
    at the next boot. A `failed` plan stopped part-way, and applying it again
-   finishes the rest.
+   finishes the rest, unless a step is still `in_progress`: that step's
+   outcome is unknown, and applying again refuses until you have looked at its
+   path ([After a crash](#after-a-crash)).
 2. Check that everything that should still seed is seeding. To undo a
    deletion, move the file back to its original path and rescan.
 3. Then remove the directory, as a user that can write to the root:

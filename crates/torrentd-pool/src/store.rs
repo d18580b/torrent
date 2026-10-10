@@ -279,6 +279,95 @@ pub struct PoolStore {
     conn: Connection,
     /// Nesting depth for [`PoolStore::in_transaction`]; 0 means autocommit.
     tx_depth: u32,
+    /// This writer's advisory lock on the index's `.lock` file, held for the
+    /// life of the store: shared from [`PoolStore::open`], exclusive from
+    /// [`PoolStore::open_exclusive`]. `None` for an in-memory store or a
+    /// read-only connection, which take no lock.
+    _hold: Option<std::fs::File>,
+}
+
+/// The advisory lock file beside the index at `db`: `pool.db.lock` for
+/// `pool.db`.
+///
+/// Not the database file itself. SQLite takes its own byte-range locks on
+/// that, and where `flock` is emulated over `fcntl` (NFS) a whole-file lock
+/// there would collide with them.
+fn lock_path(db: &Path) -> PathBuf {
+    let mut name = db.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    db.with_file_name(name)
+}
+
+/// Take the advisory lock that says which processes hold the index at `db`
+/// for writing, without waiting: [`PoolError::Busy`] when it is held in a
+/// mode that excludes this one.
+///
+/// `None` where the lock file neither exists nor can be created, in a
+/// directory this process may not write: no process of the same user can
+/// hold a lock there either, so there is nothing to exclude. `None` too, with
+/// a warning, where it exists but this process may not even read it: a file
+/// another user left unreadable must not keep the daemon from booting.
+fn hold_index(db: &Path, exclusive: bool) -> Result<Option<std::fs::File>, PoolError> {
+    use std::io::ErrorKind;
+    use std::os::unix::fs::PermissionsExt;
+    let path = lock_path(db);
+    // The lock needs an open file, not a writable one. A `.lock` file another
+    // user created (a CLI run as root before the daemon's user) is still
+    // lockable read-only.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+    {
+        Ok(file) => {
+            // Readable by every user whatever the umask, so a root CLI run
+            // under umask 077 leaves a file the daemon's user can still
+            // open read-only and lock. Best effort: only the owner may
+            // chmod, and an owner who can open it for writing already can.
+            if let Ok(meta) = file.metadata() {
+                let mode = meta.permissions().mode();
+                if mode & 0o044 != 0o044 {
+                    let _ = file
+                        .set_permissions(std::fs::Permissions::from_mode((mode | 0o044) & 0o7777));
+                }
+            }
+            file
+        }
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::PermissionDenied | ErrorKind::ReadOnlyFilesystem
+            ) =>
+        {
+            match std::fs::File::open(&path) {
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+                Err(e) if e.kind() == ErrorKind::PermissionDenied => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "cannot open the pool index lock file even read-only; \
+                         opening the index without the lock that keeps a CLI \
+                         `pool scan` off it",
+                    );
+                    return Ok(None);
+                }
+                other => other?,
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let taken = if exclusive {
+        file.try_lock()
+    } else {
+        file.try_lock_shared()
+    };
+    match taken {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Err(PoolError::Busy),
+        Err(std::fs::TryLockError::Error(e)) => Err(PoolError::Io(e)),
+    }
 }
 
 impl std::fmt::Debug for PoolStore {
@@ -288,13 +377,41 @@ impl std::fmt::Debug for PoolStore {
 }
 
 impl PoolStore {
-    /// Open (creating if needed) the pool database at `path`.
+    /// Open (creating if needed) the pool database at `path` as one of any
+    /// number of concurrent writers: the daemon, or a short CLI command such
+    /// as `pool check`.
+    ///
+    /// Holds a shared lock on `pool.db.lock` for the life of the store, which
+    /// is what makes [`PoolStore::open_exclusive`] refuse while the daemon
+    /// runs. [`PoolError::Busy`] while an exclusive holder has it.
     pub fn open(path: &Path) -> Result<Self, PoolError> {
+        Self::open_held(path, false)
+    }
+
+    /// Open the pool database at `path` as its only writer, for a CLI
+    /// `pool scan`.
+    ///
+    /// That scan is one write transaction for its whole duration, an hour on
+    /// a large pool, and SQLite refuses every other writer at once for all of
+    /// it. Beside a running daemon that is every daemon write: a plan's step
+    /// journal, a verification's verdict, a released owner. So it refuses to
+    /// start, with [`PoolError::Busy`], while any other [`PoolStore::open`]
+    /// holds the index, and while it runs no other one can open it.
+    pub fn open_exclusive(path: &Path) -> Result<Self, PoolError> {
+        Self::open_held(path, true)
+    }
+
+    fn open_held(path: &Path, exclusive: bool) -> Result<Self, PoolError> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        // Before the connection, so an exclusive holder also keeps a second
+        // process from migrating the schema under it.
+        let hold = hold_index(path, exclusive)?;
         let conn = Connection::open(path)?;
-        Self::from_conn(conn)
+        let mut store = Self::from_conn(conn)?;
+        store._hold = hold;
+        Ok(store)
     }
 
     /// In-memory store, for tests.
@@ -316,11 +433,16 @@ impl PoolStore {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         // A scan takes the database's write lock for its whole duration (see
-        // `in_transaction`). A second writer — the CLI `pool scan` racing the
-        // daemon — must fail fast with SQLITE_BUSY so the caller can say so,
-        // not block for hours.
+        // `in_transaction`). A second writer that meets it — a `pool check`
+        // beside the daemon's scan — must fail fast with SQLITE_BUSY so the
+        // caller can say so, not block for hours. The CLI `pool scan` cannot
+        // be that scan beside the daemon: `open_exclusive` refuses it first.
         conn.busy_timeout(std::time::Duration::from_millis(0))?;
-        let mut store = Self { conn, tx_depth: 0 };
+        let mut store = Self {
+            conn,
+            tx_depth: 0,
+            _hold: None,
+        };
         store.migrate()?;
         store.migrate_v4()?;
         store.migrate_v5()?;
@@ -360,7 +482,11 @@ impl PoolStore {
                 expected: SCHEMA_VERSION,
             });
         }
-        Ok(Self { conn, tx_depth: 0 })
+        Ok(Self {
+            conn,
+            tx_depth: 0,
+            _hold: None,
+        })
     }
 
     /// Run `f` inside one read transaction, so every query it makes sees the
@@ -2234,4 +2360,111 @@ fn row_to_torrent(r: &rusqlite::Row<'_>) -> rusqlite::Result<PoolTorrent> {
             .unwrap_or_default(),
         profile: r.get(11)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The daemon and a CLI `pool check` may write side by side; a CLI
+    /// `pool scan` may not run beside either, and nothing opens beside it.
+    #[test]
+    fn an_exclusive_writer_and_any_other_writer_exclude_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+
+        let daemon = PoolStore::open(&db).unwrap();
+        let check = PoolStore::open(&db).expect("shared writers coexist");
+        assert!(matches!(
+            PoolStore::open_exclusive(&db),
+            Err(PoolError::Busy)
+        ));
+        drop(check);
+        assert!(
+            matches!(PoolStore::open_exclusive(&db), Err(PoolError::Busy)),
+            "refused while any one writer remains",
+        );
+        // A reader takes no lock: the API reads through one during a scan.
+        drop(PoolStore::open_read_only(&db).unwrap());
+        drop(daemon);
+
+        let scan = PoolStore::open_exclusive(&db).expect("alone, the scan opens");
+        assert!(matches!(PoolStore::open(&db), Err(PoolError::Busy)));
+        assert!(matches!(
+            PoolStore::open_exclusive(&db),
+            Err(PoolError::Busy)
+        ));
+        drop(PoolStore::open_read_only(&db).unwrap());
+        drop(scan);
+        PoolStore::open(&db).expect("released when the scan's store drops");
+        assert!(dir.path().join("pool.db.lock").exists());
+    }
+
+    /// Whether this process can open `path` for writing despite its mode: a
+    /// root or CAP_DAC_OVERRIDE test run, where the permission tests below
+    /// cannot set up the situation they check.
+    fn bypasses_permissions(path: &Path) -> bool {
+        std::fs::OpenOptions::new().write(true).open(path).is_ok()
+    }
+
+    /// A lock file this process may not write (another user's, here 0444) is
+    /// opened read-only and still locks: the scan and any other writer still
+    /// exclude each other through it.
+    #[test]
+    fn a_lock_file_that_cannot_be_written_still_locks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        let lock = dir.path().join("pool.db.lock");
+        drop(PoolStore::open(&db).unwrap());
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if bypasses_permissions(&lock) {
+            return;
+        }
+
+        let daemon = PoolStore::open(&db).expect("a read-only lock file opens");
+        assert!(daemon._hold.is_some(), "and is locked");
+        assert!(matches!(
+            PoolStore::open_exclusive(&db),
+            Err(PoolError::Busy)
+        ));
+        drop(daemon);
+
+        let scan = PoolStore::open_exclusive(&db).expect("alone, the scan opens");
+        assert!(scan._hold.is_some());
+        assert!(matches!(PoolStore::open(&db), Err(PoolError::Busy)));
+        drop(scan);
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "a file this process cannot write is not chmodded",
+        );
+    }
+
+    /// A lock file created under a restrictive umask is made readable by
+    /// every user, so another user's process can still open it to lock; one
+    /// this process cannot read at all opens the index without the lock,
+    /// rather than refusing it.
+    #[test]
+    fn the_lock_file_is_left_readable_and_an_unreadable_one_is_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("pool.db");
+        let lock = dir.path().join("pool.db.lock");
+        std::fs::File::create(&lock).unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        drop(PoolStore::open(&db).unwrap());
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777,
+            0o644,
+        );
+
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if bypasses_permissions(&lock) {
+            return;
+        }
+        let store = PoolStore::open(&db).expect("an unreadable lock file does not refuse the open");
+        assert!(store._hold.is_none());
+    }
 }
