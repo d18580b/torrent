@@ -1670,6 +1670,83 @@ async fn a_same_profile_add_that_loses_the_claim_race_is_refused_and_keeps_the_w
     assert_eq!(h.state.registry.lookup(&ih), Some(ProfileId::new("p")));
 }
 
+/// Issue #212: a registry that cannot be written is not a duplicate. The add
+/// used to answer `409 torrent-exists`, which the docs tell a client to read
+/// as "already added", so an automation stopped retrying a torrent that was
+/// never assigned and whose re-read answered 404.
+#[tokio::test]
+async fn an_add_whose_registry_write_fails_answers_500_and_assigns_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p);
+        // Every insert into the registry fails, as on a full or read-only
+        // state directory.
+        let db = dir.path().join("failing.db");
+        s.registry = Arc::new(AssignmentRegistry::new_empty(&db));
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch(
+                "CREATE TRIGGER no_insert BEFORE INSERT ON assignment \
+                   BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+            )
+            .unwrap();
+    });
+    let engine = engine.unwrap();
+    let ih = InfoHash([1; 20]); // MAGNET's btih
+
+    let resp = h.write_json("POST", "/v1/torrents", magnet("p")).await;
+    assert_problem(&resp, 500, "internal");
+    let detail = resp.json::<Value>()["detail"].as_str().unwrap().to_owned();
+    assert!(
+        detail.contains("registry"),
+        "the detail names what failed: {detail}"
+    );
+    assert!(
+        h.state.registry.lookup(&ih).is_none(),
+        "a failed write assigns nothing"
+    );
+    assert!(
+        !engine
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::AddTorrent(_))),
+        "the add reached the session: {:?}",
+        engine.calls()
+    );
+    let text = String::from_utf8(h.state.metrics.render()).unwrap();
+    assert!(
+        text.contains("profile_assignment_registry_errors_total{profile_id=\"p\"} 1"),
+        "{text}"
+    );
+    let resp = h.read(&format!("/v1/torrents/{}", hex(ih))).await;
+    assert_eq!(resp.status().as_u16(), 404, "nothing was added to re-read");
+}
+
+/// The other half of issue #212: a real duplicate that only `assign` finds —
+/// a row another process wrote for another profile — is still
+/// `torrent-exists`.
+#[tokio::test]
+async fn an_add_whose_infohash_another_process_assigned_elsewhere_is_still_torrent_exists() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg_path = dir.path().join("reg.db");
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p);
+        s.registry = Arc::new(AssignmentRegistry::new_empty(&reg_path));
+    });
+    let engine = engine.unwrap();
+    let ih = InfoHash([1; 20]); // MAGNET's btih
+    AssignmentRegistry::new_empty(&reg_path)
+        .assign(ih, ProfileId::new("strict"))
+        .unwrap();
+
+    let resp = h.write_json("POST", "/v1/torrents", magnet("p")).await;
+    assert_problem(&resp, 409, "torrent-exists");
+    assert!(engine.calls().is_empty(), "{:?}", engine.calls());
+    assert_eq!(h.state.registry.lookup(&ih), Some(ProfileId::new("strict")));
+}
+
 #[tokio::test]
 async fn an_add_whose_profile_is_fenced_mid_add_pauses_the_torrent() {
     // The add passed the fence check, then the VPN monitor fenced the profile
