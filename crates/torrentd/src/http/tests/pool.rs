@@ -2060,6 +2060,22 @@ async fn malformed_requests(cov: &Arc<Coverage>) {
             waited < std::time::Duration::from_secs(1),
             "{method} {path}: answered only after {waited:?}"
         );
+        // A body that declares more than the limit is refused from the head,
+        // before a byte of it is read: none is sent, so a server that read it
+        // first would answer 408 at the deadline rather than 413 at once.
+        // For the untimed three this is `TimedBody`'s own check, since the
+        // in-process client's oversized body above declares no length.
+        let declared = u64::try_from(crate::http::v1::MAX_BODY_BYTES).unwrap() + 1;
+        let (status, waited) = h.oversized_body(method, path, Some(&w), declared).await;
+        assert_eq!(
+            status.as_u16(),
+            413,
+            "{method} {path}: declared oversized body"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(1),
+            "{method} {path}: declared oversized body answered only after {waited:?}"
+        );
     }
     h.assert_conformance();
 }

@@ -119,6 +119,8 @@ enum Framing {
     Declared,
     /// `transfer-encoding: chunked`, and no last chunk.
     Chunked,
+    /// A `content-length` of this many bytes, and none of them sent.
+    Oversized(u64),
 }
 
 /// One daemon's router, and what to authenticate against it with.
@@ -268,6 +270,22 @@ impl Harness {
             .await
     }
 
+    /// As [`slow_body`](Self::slow_body), with a request that declares a
+    /// `content-length` of `declared` bytes and sends none of them. The
+    /// in-process client always sends what it declares, so this is the only
+    /// way to show a body over the limit is refused from the head: a server
+    /// that read it before answering would wait out its deadline instead.
+    pub async fn oversized_body(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        declared: u64,
+    ) -> (StatusCode, std::time::Duration) {
+        self.stalled_body(method, path, token, Framing::Oversized(declared))
+            .await
+    }
+
     async fn stalled_body(
         &self,
         method: &str,
@@ -302,6 +320,10 @@ impl Harness {
             Framing::Chunked => format!(
                 "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
                  transfer-encoding: chunked\r\n{auth}\r\n9\r\n{{\"pad\": \"\r\n"
+            ),
+            Framing::Oversized(declared) => format!(
+                "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\n\
+                 content-length: {declared}\r\n{auth}\r\n"
             ),
         };
         stream.write_all(head.as_bytes()).await.unwrap();
