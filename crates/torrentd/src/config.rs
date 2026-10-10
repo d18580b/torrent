@@ -162,9 +162,10 @@ pub struct PoolConfig {
     #[serde(default)]
     pub db_path: Option<PathBuf>,
 
-    /// How many torrents may be hashing at once during a bulk adopt. Adopting
-    /// a large subtree otherwise saturates the disk and starves whatever is
-    /// already seeding.
+    /// How many torrents may be hashing at once, adoptions' verifications and
+    /// `POST /v1/pool/verifications` re-hashes together. Adopting a large
+    /// subtree, or re-hashing a library, otherwise saturates the disk and
+    /// starves whatever is already seeding.
     #[serde(default = "PoolConfig::default_max_concurrent_verify")]
     pub max_concurrent_verify: usize,
 

@@ -667,8 +667,15 @@ sudo systemctl enable --now torrentd
 ```
 
 If a drift check already ran, the drifted torrents need
-`POST /v1/pool/verifications` with their info-hashes, which re-hashes each
-one.
+`POST /v1/pool/verifications` with their info-hashes, at most 1000 to a
+request. The request only queues the re-hashes and answers `202` at once; the
+verify queue runs them `[pool] max_concurrent_verify` at a time, sharing
+that bound with adoptions, so sending the whole library in batches does not
+start every check at once. Each re-hash disconnects the torrent's peers until
+it ends. `torrentd_pool_verify_queue_depth` shows the backlog draining and
+`torrentd_pool_verify_in_flight` the checks running. The queue is held in
+memory, so after a restart send the requests again for what is still
+`drifted`.
 
 Then run the checks in [Planned restart](#planned-restart) and `running.md`
 §9, and `torrentd vpn check --profile <id>` for each `vpn` profile.

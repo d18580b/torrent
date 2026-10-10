@@ -304,9 +304,9 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "pool_verify_completed_total" Counter Daemon Zero => "Adopted torrents that verified and are seeding.";
     "pool_verify_failed_total" Counter Daemon Zero => "Adopted torrents whose verification failed or was dropped.";
     "pool_verify_queue_depth" Gauge Daemon Owner("pool configured, from the first queue tick") =>
-        "Adoptions waiting to verify.";
+        "Adoptions waiting to verify, and re-hashes POST /v1/pool/verifications queued that have not started.";
     "pool_verify_in_flight" Gauge Daemon Owner("pool configured, from the first queue tick") =>
-        "Adoptions verifying now.";
+        "Adoptions verifying and re-hashes checking now, together bounded by [pool] max_concurrent_verify.";
     "pool_index_profile_disagreements" Gauge Daemon Owner("pool configured") =>
         "Torrents whose pool-index profile disagrees with the assignment registry at boot.";
     // persistence and the exporter itself
