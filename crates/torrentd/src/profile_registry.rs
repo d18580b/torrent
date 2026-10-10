@@ -307,10 +307,23 @@ impl ProfileEntry {
         gates.iter().filter_map(Weak::upgrade).collect()
     }
 
-    /// Clear `run` once it has finished, unless another has replaced it.
-    pub fn end_resume(&self, run: &Arc<PacedResume>) {
+    /// Clear `run` once it has finished, and release `reached`, the torrents
+    /// it resumed or left out for a pause, from what a paced set-online holds
+    /// ([`ProfileEntry::release_holds`]) - unless the run was stopped or
+    /// replaced first.
+    ///
+    /// A run that is no longer this profile's has been taken back by a
+    /// set-offline, a fence or a pause, or replaced by a newer lift, and
+    /// whatever stopped it decided what is held from then on: a set-offline
+    /// holds every torrent of the run, and a set-online after it may already
+    /// have held and paused the very torrents this run reached. Releasing
+    /// them then would leave those paused at the next boot. The check and the
+    /// release are made under the lock [`ProfileEntry::take_resume`] and
+    /// [`ProfileEntry::begin_resume`] take, so neither can land between them.
+    pub fn end_resume(&self, run: &Arc<PacedResume>, reached: &[TorrentHandle]) {
         let mut resuming = self.resuming.lock();
         if resuming.as_ref().is_some_and(|r| Arc::ptr_eq(r, run)) {
+            self.release_holds(reached);
             *resuming = None;
         }
     }
@@ -651,20 +664,33 @@ impl ProfileRegistry {
             } else {
                 // Only a session paused now is going online; one already
                 // running has nothing to start. One whose state cannot be
-                // read is resumed as before, which starts nothing it was not
-                // already running if it was running.
-                let paced = if matches!(e.engine.session_paused(), Ok(true)) {
-                    self.hold_running(e, pacing)
-                } else {
-                    Ok(Vec::new())
+                // read is treated as paused: if it was running, its torrents
+                // are paused and paced back, rather than a paused one
+                // starting every torrent at once.
+                let paced = match e.engine.session_paused() {
+                    Ok(true) => self.hold_running(e, pacing),
+                    Ok(false) => Ok(Vec::new()),
+                    Err(err) => {
+                        tracing::warn!(
+                            profile_id = %e.id(),
+                            error.cause = %err,
+                            "could not read whether the profile's session is paused; pacing \
+                             the resume of its torrents as if it were",
+                        );
+                        self.hold_running(e, pacing)
+                    }
                 };
                 paced.and_then(|paced| {
                     e.engine.resume_session()?;
-                    if has_dht {
-                        e.engine.apply_settings(&dht(true))?;
-                    }
+                    // The session runs now, so the pace starts whatever the
+                    // DHT call returns: the torrents just paused are held,
+                    // and a retried set-online finds the session running
+                    // and would not reach them.
                     if !paced.is_empty() {
                         pacing.start(e, paced);
+                    }
+                    if has_dht {
+                        e.engine.apply_settings(&dht(true))?;
                     }
                     Ok(())
                 })

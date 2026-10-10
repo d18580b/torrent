@@ -793,8 +793,9 @@ impl crate::profile_registry::OnlinePacing for OnlinePace<'_> {
 /// stops it and holds what it had not reached, and a pause in the profile
 /// halts it or leaves the paused torrent out ([`ProfileEntry::halt_resumes`],
 /// [`ProfileEntry::exclude_from_resumes`]). What it resumed, or left out for
-/// the operator's pause, is then released from what a paced set-online holds
-/// ([`ProfileEntry::release_holds`]); what it did not reach stays held. Must
+/// the operator's pause, is then released from what a paced set-online holds,
+/// if the run is still the profile's ([`ProfileEntry::end_resume`]); what it
+/// did not reach, or refused, stays held. Must
 /// be called inside the runtime: every caller runs on its blocking pool.
 pub(crate) fn spawn_lift(
     profiles: &Arc<ProfileRegistry>,
@@ -837,11 +838,14 @@ pub(crate) fn spawn_lift(
             .filter(|h| !failed.contains(*h))
             .copied()
             .collect();
+        // Released only while the run is still the profile's: one a
+        // set-offline, fence, pause or newer lift stopped leaves what is held
+        // to whatever stopped it ([`ProfileEntry::end_resume`]).
         let release = {
-            let (profiles, id) = (profiles.clone(), id.clone());
+            let (profiles, id, run) = (profiles.clone(), id.clone(), run.clone());
             tokio::task::spawn_blocking(move || {
                 if let Some(entry) = profiles.resolve(&id).active() {
-                    entry.release_holds(&reached);
+                    entry.end_resume(&run, &reached);
                 }
             })
         };
@@ -849,9 +853,6 @@ pub(crate) fn spawn_lift(
             if e.is_panic() {
                 std::panic::resume_unwind(e.into_panic());
             }
-        }
-        if let Some(entry) = profiles.resolve(&id).active() {
-            entry.end_resume(&run);
         }
         info!(
             target: "torrentd::vpn_monitor",
