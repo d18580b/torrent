@@ -2795,17 +2795,20 @@ impl DaemonHandle {
         // `GET /v1/openapi.json` costs nothing per request and is byte-for-byte
         // what `torrentd openapi` prints. Neither step can fail short of a bug
         // in a route's description; if one does, the daemon exits 70 through
-        // the same teardown a bind failure takes.
-        let app = http::document_json()
-            .and_then(|openapi| {
-                http::service(
-                    app_state,
-                    http::OpenApiJson(Arc::new(bytes::Bytes::from(openapi))),
-                )
-                .map_err(|e| anyhow::anyhow!("build the HTTP router: {e}"))
-            })
+        // the same teardown a bind failure takes. Built again from the same
+        // parts each time the server is restarted after running out of
+        // descriptors (`serve_until_shutdown`).
+        let openapi = http::document_json()
             .map_err(|e| error!(error.cause = %e, "build the HTTP API"))
-            .ok();
+            .ok()
+            .map(|openapi| Arc::new(bytes::Bytes::from(openapi)));
+        let build_app = move || {
+            let openapi = openapi.clone()?;
+            http::service(app_state.clone(), http::OpenApiJson(openapi))
+                .map_err(|e| error!(error.cause = %e, "build the HTTP router"))
+                .ok()
+        };
+        let app = build_app().map(|app| (app, build_app));
         let http_listen = cfg.http_listen;
 
         // SIGHUP pump.
@@ -2841,10 +2844,11 @@ impl DaemonHandle {
         let mut exit_code = run_http_stage(
             listener,
             app,
-            |listener, app| {
+            |listener, (app, build_app)| {
                 serve_until_shutdown(
                     listener,
                     app,
+                    build_app,
                     http_listen,
                     unauthenticated_posture(&cfg),
                     &shutdown_tx,
@@ -3039,7 +3043,9 @@ where
 }
 
 /// Serve the API on a bound listener until a shutdown is signalled, returning
-/// the exit code the server's own outcome implies.
+/// the exit code the server's own outcome implies. A server that stops
+/// because the process ran out of descriptors is started again on the same
+/// socket, with `build_app`'s router, after a backoff.
 ///
 /// Split out of `run_until_signal` so that function has no early return
 /// between `boot`'s `disarm` and its teardown: a failure to bind skips this
@@ -3048,10 +3054,11 @@ where
 async fn serve_until_shutdown(
     listener: tokio::net::TcpListener,
     app: kynos::router::service::Service<http::ctx::AppCtx>,
+    build_app: impl Fn() -> Option<kynos::router::service::Service<http::ctx::AppCtx>>,
     http_listen: std::net::SocketAddr,
     posture: Option<String>,
     shutdown_tx: &broadcast::Sender<ShutdownReason>,
-    mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
+    shutdown_rx: broadcast::Receiver<ShutdownReason>,
     alert_loop: &torrentd_engine::AlertLoopHandle,
     work: &Arc<crate::app_state::WorkGate>,
 ) -> i32 {
@@ -3108,8 +3115,126 @@ async fn serve_until_shutdown(
     // timeout. This is a single-operator control plane sharing one descriptor
     // limit (`LimitNOFILE`) with libtorrent, whose peer connections and file
     // pool are what the limit is for; see `HTTP_MAX_CONNECTIONS`.
+    //
+    // kynos gives up on a listener after five consecutive accept failures
+    // inside about 150 ms, `EMFILE` and `ENFILE` included, and drops it. A
+    // daemon briefly out of descriptors is not one to restart — the restart
+    // tears down every tunnel and session to fix what a closing peer socket
+    // fixes — so a second descriptor on the socket keeps it bound, and the
+    // server is started again on it after a backoff (`descriptor_exhaustion`).
+    serve_through_exhaustion(
+        listener,
+        app,
+        build_app,
+        |listener, app, server_shutdown| serve_once(listener, app, server_shutdown, work),
+        http_listen,
+        shutdown_tx,
+        shutdown_rx,
+    )
+    .await
+}
+
+/// Run `serve` on `listener` until it stops for a reason other than running
+/// out of descriptors, starting it again on a second descriptor of the same
+/// socket after each that is, and return the exit code of the last run.
+///
+/// Returns 0 without serving again on a shutdown signalled before a run or
+/// during a backoff.
+async fn serve_through_exhaustion<A, B, S, F>(
+    mut listener: tokio::net::TcpListener,
+    mut app: A,
+    build_app: B,
+    mut serve: S,
+    http_listen: std::net::SocketAddr,
+    shutdown_tx: &broadcast::Sender<ShutdownReason>,
+    mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
+) -> i32
+where
+    B: Fn() -> Option<A>,
+    S: FnMut(tokio::net::TcpListener, A, broadcast::Receiver<ShutdownReason>) -> F,
+    F: std::future::Future<Output = kynos::Result<()>>,
+{
+    let mut backoff = ACCEPT_EXHAUSTION_BACKOFF_INITIAL;
+    loop {
+        // Subscribed before the check, so a signal is either already in
+        // `shutdown_rx` or reaches the server's own receiver.
+        let server_shutdown = shutdown_tx.subscribe();
+        if shutdown_requested(&mut shutdown_rx) {
+            return 0;
+        }
+        let spare = match std::os::fd::AsFd::as_fd(&listener).try_clone_to_owned() {
+            Ok(fd) => Some(std::net::TcpListener::from(fd)),
+            Err(e) => {
+                warn!(
+                    error.cause = %e,
+                    "could not hold a second descriptor on the HTTP listener; \
+                     running out of descriptors in accept will stop the daemon",
+                );
+                None
+            }
+        };
+        let started = std::time::Instant::now();
+        let outcome = serve(listener, app, server_shutdown).await;
+        let Some((cause, spare)) = descriptor_exhaustion(&outcome).zip(spare) else {
+            return http_exit_code(outcome);
+        };
+        if started.elapsed() > ACCEPT_EXHAUSTION_BACKOFF_MAX {
+            backoff = ACCEPT_EXHAUSTION_BACKOFF_INITIAL;
+        }
+        warn!(
+            addr = %http_listen,
+            error.cause = %cause,
+            retry_in_secs = backoff.as_secs(),
+            "the HTTP server ran out of descriptors accepting a connection and \
+             cut off its open requests; serving again after a backoff",
+        );
+        sd_notify::status(&format!(
+            "seeding; API on {http_listen} out of descriptors, serving again in {}s",
+            backoff.as_secs()
+        ));
+        tokio::select! {
+            _ = shutdown_rx.recv() => return 0,
+            () = tokio::time::sleep(backoff) => {}
+        }
+        backoff = (backoff * 2).min(ACCEPT_EXHAUSTION_BACKOFF_MAX);
+        listener = match spare
+            .set_nonblocking(true)
+            .and_then(|()| tokio::net::TcpListener::from_std(spare))
+        {
+            Ok(l) => l,
+            Err(e) => {
+                error!(error.cause = %e, "take the HTTP listener back");
+                return 70;
+            }
+        };
+        app = match build_app() {
+            Some(app) => app,
+            None => return 70,
+        };
+        info!(addr = %http_listen, "HTTP server listening again");
+        sd_notify::status(&format!("seeding; API on {http_listen}"));
+    }
+}
+
+/// The first backoff before the API is served again after running out of
+/// descriptors in `accept`, doubling per consecutive failure to
+/// [`ACCEPT_EXHAUSTION_BACKOFF_MAX`]. A server that ran longer than the cap
+/// before failing starts again from here.
+const ACCEPT_EXHAUSTION_BACKOFF_INITIAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest backoff between two of those restarts.
+const ACCEPT_EXHAUSTION_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// One run of the HTTP server on `listener`, to a signalled drain or its own
+/// failure.
+async fn serve_once(
+    listener: tokio::net::TcpListener,
+    app: kynos::router::service::Service<http::ctx::AppCtx>,
+    mut shutdown_rx: broadcast::Receiver<ShutdownReason>,
+    work: &Arc<crate::app_state::WorkGate>,
+) -> kynos::Result<()> {
     let work = Arc::clone(work);
-    let server = kynos::server::Server::new(app)
+    kynos::server::Server::new(app)
         .listener(listener)
         .max_connections(HTTP_MAX_CONNECTIONS)
         .http1(
@@ -3129,9 +3254,22 @@ async fn serve_until_shutdown(
         // of a stop budget (`deploy/torrentd.service` `TimeoutStopSec`) that
         // the pool-work wait, the resume drain and the teardown share.
         .shutdown_timeout(HTTP_DRAIN_TIMEOUT)
-        .serve();
+        .serve()
+        .await
+}
 
-    http_exit_code(server.await)
+/// The accept failure in `outcome` when it is the process or the system
+/// running out of descriptors (`EMFILE`, `ENFILE`): a shortage that passes
+/// as connections close, rather than a listener that is broken.
+fn descriptor_exhaustion(outcome: &kynos::Result<()>) -> Option<&std::io::Error> {
+    match outcome {
+        Err(kynos::Error::Server(kynos::server::error::ServerError::Accept { source, .. }))
+            if matches!(source.raw_os_error(), Some(libc::EMFILE | libc::ENFILE)) =>
+        {
+            Some(source)
+        }
+        _ => None,
+    }
 }
 
 /// The exit code the HTTP server's outcome implies.
@@ -3784,6 +3922,144 @@ mod shutdown_report_tests {
         let code = run_http_stage(Some(()), Some(()), |(), ()| async { 0 }, &tx).await;
         assert_eq!(code, 0);
         assert!(!shutdown_requested(&mut rx));
+    }
+
+    /// kynos' terminal accept failure, with `errno`.
+    fn accept_failure(errno: i32) -> kynos::Result<()> {
+        Err(kynos::Error::Server(
+            kynos::server::error::ServerError::Accept {
+                address: "127.0.0.1:1".parse().unwrap(),
+                source: std::io::Error::from_raw_os_error(errno),
+            },
+        ))
+    }
+
+    #[test]
+    fn only_running_out_of_descriptors_is_an_accept_failure_worth_retrying() {
+        assert!(descriptor_exhaustion(&accept_failure(libc::EMFILE)).is_some());
+        assert!(descriptor_exhaustion(&accept_failure(libc::ENFILE)).is_some());
+        assert!(descriptor_exhaustion(&accept_failure(libc::EINVAL)).is_none());
+        assert!(descriptor_exhaustion(&Ok(())).is_none());
+        let timed_out = Err(kynos::Error::Server(
+            kynos::server::error::ServerError::ShutdownTimeout {
+                timeout: HTTP_DRAIN_TIMEOUT,
+            },
+        ));
+        assert!(descriptor_exhaustion(&timed_out).is_none());
+    }
+
+    async fn bound() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, addr)
+    }
+
+    #[tokio::test]
+    async fn running_out_of_descriptors_serves_the_same_socket_again() {
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        // Queued in the backlog before anything accepts: it is answered only
+        // if the socket survives the first run dropping its listener.
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_port = client.local_addr().unwrap().port();
+        let builds = std::cell::Cell::new(0);
+        let mut runs = 0;
+        let accepted = std::cell::Cell::new(None);
+        let code = serve_through_exhaustion(
+            listener,
+            0_u32,
+            || {
+                builds.set(builds.get() + 1);
+                Some(builds.get())
+            },
+            |listener, app, _shutdown| {
+                runs += 1;
+                let run = runs;
+                let accepted = &accepted;
+                async move {
+                    assert_eq!(app, run - 1, "each run has a router of its own");
+                    if run == 1 {
+                        drop(listener);
+                        return accept_failure(libc::EMFILE);
+                    }
+                    let (_, peer) = listener.accept().await.unwrap();
+                    accepted.set(Some(peer.port()));
+                    Ok(())
+                }
+            },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(runs, 2);
+        assert_eq!(builds.get(), 1);
+        assert_eq!(accepted.get(), Some(client_port));
+    }
+
+    #[tokio::test]
+    async fn any_other_server_failure_is_not_retried() {
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        let mut runs = 0;
+        let code = serve_through_exhaustion(
+            listener,
+            (),
+            || Some(()),
+            |_, (), _| {
+                runs += 1;
+                async { accept_failure(libc::EINVAL) }
+            },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        assert_eq!(code, 70);
+        assert_eq!(runs, 1);
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_during_the_backoff_or_before_a_run_serves_no_more() {
+        // Signalled while the first run fails: the backoff ends at once.
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        let mut runs = 0;
+        let started = std::time::Instant::now();
+        let code = serve_through_exhaustion(
+            listener,
+            (),
+            || Some(()),
+            |_, (), _| {
+                runs += 1;
+                tx.send(ShutdownReason::Sigterm).unwrap();
+                async { accept_failure(libc::EMFILE) }
+            },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(runs, 1);
+        assert!(started.elapsed() < ACCEPT_EXHAUSTION_BACKOFF_INITIAL);
+
+        // Signalled before the first run, as during boot: nothing is served.
+        let (listener, addr) = bound().await;
+        let (tx, rx) = broadcast::channel(8);
+        tx.send(ShutdownReason::Sigterm).unwrap();
+        let code = serve_through_exhaustion(
+            listener,
+            (),
+            || Some(()),
+            |_, (), _| async { unreachable!("a stop was already asked for") },
+            addr,
+            &tx,
+            rx,
+        )
+        .await;
+        assert_eq!(code, 0);
     }
 
     #[test]
