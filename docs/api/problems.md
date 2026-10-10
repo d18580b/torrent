@@ -265,7 +265,9 @@ applied in its current status: it is `applying` (another request claimed it
 first), `applied` or `cancelled`.
 
 A `draft` plan can be applied. So can a `failed` one: re-applying it retries
-the steps that did not complete.
+the steps that did not complete, unless a step is still `in_progress`. That
+plan is accepted here but refused on every apply with
+[`apply-failed`](#apply-failed).
 
 ## `apply-failed`
 
@@ -273,9 +275,16 @@ the steps that did not complete.
 run at all, for example because the index could not be locked. `detail` names
 the failure.
 
+It is also the answer, on every apply, for a `failed` plan with a step still
+`in_progress`: that step's outcome is unknown, because a run died mid-step or
+a move's wait was cut off, and nothing marks it resolved. Applying it again
+never succeeds. Inspect the step's `src` (and `dst` for a move), rescan, then
+discard the plan and build a new one.
+
 A run that starts and then stops on a failing step is **not** this problem.
 It answers `200` with an `ApplyOutcome` whose `status` is `failed`, and the
-plan's steps show how far it got. Apply it again to retry.
+plan's steps show how far it got. Apply it again to retry, unless a step is
+still `in_progress`, as above.
 
 ## `confirm-token-required`
 

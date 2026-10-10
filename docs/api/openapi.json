@@ -9206,7 +9206,7 @@
           "pool"
         ],
         "summary": "Apply a mutation plan.",
-        "description": "Performs every step not yet done, in order, and waits for the last: a\nlarge delete or a cross-device move can run for minutes. Each step is\njournalled before it is attempted, and applying stops at the first failure\n— answering `200` with `status: failed` and the plan's steps saying which\nand why. A `failed` plan can be applied again to retry.\n\nA plan that deletes data applies only with its `confirm_token`: not a\nsecurity control, but a guard against applying the wrong plan id. Refused\nwith `403 mutations-disabled` unless `[pool] allow_mutations` is set.",
+        "description": "Performs every step not yet done, in order, and waits for the last: a\nlarge delete or a cross-device move can run for minutes. Each step is\njournalled before it is attempted, and applying stops at the first failure\n— answering `200` with `status: failed` and the plan's steps saying which\nand why. A `failed` plan can be applied again to retry, unless a step is\nstill `in_progress`: its outcome is unknown, nothing marks it resolved, and\nevery apply refuses the plan with `409`. Rescan, discard the plan, and\nbuild a new one.\n\nA plan that deletes data applies only with its `confirm_token`: not a\nsecurity control, but a guard against applying the wrong plan id. Refused\nwith `403 mutations-disabled` unless `[pool] allow_mutations` is set.",
         "operationId": "apply_plan",
         "parameters": [
           {
