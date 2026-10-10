@@ -1295,13 +1295,13 @@ pub async fn delete_torrent(
                 settler.state.begin_removal(&profile, st.handle);
                 // libtorrent never deletes the files itself: they go to the
                 // trash below, where an operator can take them back.
+                //
+                // A tombstone left by a refusal is not cleared: a second
+                // `DELETE` running alongside may have written it, and its
+                // removal still needs it. One left standing is harmless, as
+                // the assignment is kept, and the boot spends it.
                 engine.remove_torrent(st.handle, false).map_err(|e| {
                     settler.state.abandon_removal(&profile, st.handle);
-                    if tombstoned.is_ok() {
-                        if let Err(e) = settler.resume.clear_tombstone(&profile, &ih) {
-                            count_cleanup_error(&settler, &ih, &profile, "tombstone", &e);
-                        }
-                    }
                     DeleteTorrentError::Internal {
                         detail: internal("removing the torrent from its session", e),
                     }
