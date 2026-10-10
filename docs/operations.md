@@ -25,6 +25,7 @@ The small state files are described in full in
 | `torrents/<profile>/<infohash>.save_path` (beside the `.torrent`) | The save path a torrent was added at through `POST /v1/torrents` or adopted at from the pool, as UTF-8 text. | Where a torrent with no resume file is re-added: without it, `default_save_path`. | Nothing. Each API add and each adoption writes it, and a pool relocation of a loaded torrent rewrites it. |
 | `session_state-<profile>.dat` | That profile's DHT routing table. | A few minutes of DHT bootstrap. | The session, on its own. |
 | `profile_state.json` | The operator's online/offline choices: the profiles set offline through `PATCH /v1/profiles/{id}`, and whether `offline_all` is on. Rewritten whole before each change takes effect, and read at boot before any torrent is loaded. | Every profile comes up online at the next boot, including one you held offline. A file that exists but cannot be parsed holds every profile offline instead, until `POST /v1/profiles/online-all` rewrites it. | Nothing. Each `PATCH` or `offline-all`/`online-all` writes it again. |
+| `paced_holds.json` | The torrents a profile set online paused itself and has not started again yet. Going online pauses every torrent that was running, then starts them 100 a second; this names them, so a boot in the middle loads them unpaused rather than as paused as their resume data says. Written before those pauses, and again as they start or as you pause one of them. | Those torrents come back paused after a restart in the middle of a set-online, like ones you paused yourself. `POST /v1/profiles/{id}/resume-all` starts them, and any you paused on purpose with them. | Nothing. Each set-online writes it again. |
 | `last_shutdown.json` | The last exit's unsaved-resume count and kill-switch-removal result. The next boot exports it as the `torrentd_last_shutdown_*` gauges, then deletes it. | One boot's report. | Every graceful exit writes a new one. |
 | `torrentd.lock` | The single-instance lock, holding the running daemon's pid. | Nothing while the daemon is stopped. | Every start. |
 | `wireguard-<iface>.raised` | A note that this boot of this host raised the WireGuard link standing under that name, with the public key it carried. | For every profile: shutdown leaves the daemon's own link standing instead of removing it, because teardown removes only a link this record names by the key it carries. A config that carries its private key is still adopted by that key at the next start. For a keyless config (`PostUp = wg set %i private-key …`) the record is the only ground for adoption, so a restart finds the link still standing, after an unclean exit or after that shutdown, and cannot adopt it: that profile stays dark until you remove the link by hand and restart. | Every WireGuard bring-up. |
@@ -625,7 +626,12 @@ ones it paused. Pause those again afterwards. The torrents are resumed 100 a
 second after the request returns, since each one announces to its trackers,
 so a profile of 20,000 takes over three minutes; a fence that lands meanwhile
 stops it. `resume-all` is paced the same way and answers once its last torrent
-is resumed. While `offline_all` is on, the
+is resumed. So is setting a profile online that you had set offline, by
+`PATCH` or by `online-all`: the torrents that were running when it went
+offline are started again 100 a second after the request returns, and a
+torrent you had paused stays paused. Setting it offline again meanwhile stops
+that, and the next set-online starts the rest; a restart meanwhile loads the
+rest running, as recorded in `paced_holds.json`. While `offline_all` is on, the
 lifted profile stays offline, its session paused, until
 `POST /v1/profiles/online-all`.
 
