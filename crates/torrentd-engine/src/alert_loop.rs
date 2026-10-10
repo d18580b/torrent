@@ -2725,6 +2725,96 @@ mod tests {
         assert!(state.contains(&InfoHash([0x42; 20])));
     }
 
+    /// Dispatch each of `alerts` for profile `p`, then hand the saves they
+    /// queued to the engine as the loop does after a drain, and return the
+    /// flags of every `save_resume_data` the engine was asked for.
+    fn saves_after(
+        engine: &Arc<MockEngine>,
+        state: &Arc<StateMap>,
+        alerts: Vec<Alert>,
+    ) -> Vec<ResumeFlags> {
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(engine.clone()));
+        let resume: Arc<dyn ResumeStore> = Arc::new(MemoryResumeStore::new());
+        let torrents: Arc<dyn TorrentStore> = Arc::new(MemoryTorrentStore::new());
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+        let clock: Arc<dyn Clock> = Arc::new(MockClock::new());
+        for alert in alerts {
+            dispatch_alert(
+                ProfileId::new("p"),
+                alert,
+                &source,
+                state,
+                &resume,
+                &torrents,
+                &metrics,
+                &clock,
+                None,
+                &mut ListenFailures::default(),
+                &mut TrackerFailureLog::default(),
+            );
+        }
+        dispatch_saves(&source, state, &metrics);
+        save_flags(engine)
+    }
+
+    /// A torrent in the state map, as the boot's resume scan leaves it: no
+    /// save queued for it.
+    fn tracked(engine: &MockEngine, state: &StateMap, byte: u8) -> TorrentHandle {
+        let h = engine.register_handle(InfoHash([byte; 20]));
+        state.insert(
+            h.infohash,
+            crate::state::TorrentState::newly_added(h, ProfileId::new("p"), Instant::now()),
+        );
+        h
+    }
+
+    fn checked_alert(h: TorrentHandle) -> Alert {
+        Alert::TorrentChecked {
+            hdr: AlertHeader {
+                kind: AlertKind::TorrentChecked,
+                infohash: Some(h.infohash),
+                handle: Some(h),
+                timestamp_us: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn a_recheck_saves_resume_data_at_once_and_the_add_time_check_does_not() {
+        // The check every add runs changes nothing a boot-loaded torrent's
+        // file does not already hold; a re-hash's verdict is what a crash
+        // must not lose, since libtorrent trusts a saved bitfield.
+        let engine = Arc::new(MockEngine::new());
+        let state = Arc::new(StateMap::new());
+        let h = tracked(&engine, &state, 0x51);
+        assert_eq!(saves_after(&engine, &state, vec![checked_alert(h)]), vec![]);
+        assert_eq!(
+            saves_after(&engine, &state, vec![checked_alert(h)]),
+            vec![ResumeFlags::empty()],
+            "the recheck's verdict is saved unconditionally",
+        );
+    }
+
+    #[test]
+    fn a_completed_move_saves_resume_data_at_once() {
+        let engine = Arc::new(MockEngine::new());
+        let state = Arc::new(StateMap::new());
+        let h = tracked(&engine, &state, 0x52);
+        let moved = Alert::StorageMoved {
+            hdr: AlertHeader {
+                kind: AlertKind::StorageMoved,
+                infohash: Some(h.infohash),
+                handle: Some(h),
+                timestamp_us: 0,
+            },
+            path: "/data/b".into(),
+        };
+        assert_eq!(
+            saves_after(&engine, &state, vec![moved]),
+            vec![ResumeFlags::empty()]
+        );
+    }
+
     /// A reopen that keeps every socket posts a port-0 failure and no
     /// `listen_succeeded`; the profile's next `session_stats` alert finds
     /// the socket that came up still held and clears the gauge.
