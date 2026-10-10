@@ -11,7 +11,10 @@ table should hold.
   `each vpn profile` and `each natpmp profile` narrow that.
 - **Present** — when the series first exists. `from boot, at 0` series are
   written at zero for every instance and every label value before the alert
-  loop starts, so `increase()` sees their first event. `from boot: …` series
+  loop starts, so `increase()` sees an event that follows the first scrape.
+  What a boot counts comes before any scrape, so it is already in the first
+  sample; the `torrentd_boot_*` gauges hold what each such counter an alert
+  reads had counted at that first scrape. `from boot: …` series
   are written with their real starting value by the code that owns them, for
   the instances named. `on first event` series appear when something first
   happens; the alert rules that read one also match its appearance.
@@ -56,6 +59,11 @@ hold.
 | `torrentd_boot_torrent_load_failures` | gauge | `profile_id`; `source`: `resume_add`, `torrent_read`, `torrent_dir_add`, `resume_file`, `torrent_file` | each profile | from boot: always | Torrents the boot scans could not load: a resume add that failed, a .torrent that could not be read, a torrent-dir add that failed, or a resume or torrent-dir file the scan could not read and skipped. |
 | `torrentd_profile_unloaded_registry_torrents` | gauge | `profile_id` | each profile | from boot: live profiles | Torrents the assignment registry claims for the profile that no boot scan loaded. |
 | `torrentd_boot_save_path_fallbacks_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents the boot torrent-dir scan placed at default_save_path because no usable save path was recorded beside their .torrent. |
+| `torrentd_boot_registry_errors` | gauge | `profile_id` | each profile | from boot: always | profile_assignment_registry_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_alert_queue_overflows` | gauge | `profile_id` | each profile | from boot: always | alert_queue_overflows_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_session_alerts` | gauge | `profile_id`; `kind`: `portmap_error`, `udp_error`, `fastresume_rejected` | each profile | from boot: always | session_alerts_total for these kinds as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_store_write_errors` | gauge | `store`: `registry`, `pool_index` | daemon | from boot: always | store_write_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_dir_fsync_errors` | gauge | — | daemon | from boot: always | dir_fsync_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |
 | `torrentd_libtorrent_peers_connected` | gauge | `profile_id` | each profile | on first event | libtorrent peer.num_peers_connected. |

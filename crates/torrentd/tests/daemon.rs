@@ -1252,6 +1252,13 @@ fn the_boot_scans_hold_every_torrent_to_the_profiles_tracker_domains() {
         }),
         "three refusals should be counted:\n{metrics}"
     );
+    // They are the boot's, already in the counter's first sample, where
+    // increase() cannot see them; the boot gauge holds them for the alert.
+    let boot = format!("torrentd_boot_registry_errors{{profile_id=\"{PROFILE}\"}} 3");
+    assert!(
+        metrics.lines().any(|l| l == boot),
+        "the boot's refusals should be exported as {boot}:\n{metrics}"
+    );
 
     sigterm(&child);
     assert!(wait_exit(&mut child, Duration::from_secs(30)));
