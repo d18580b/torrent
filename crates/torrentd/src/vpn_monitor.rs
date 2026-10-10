@@ -41,6 +41,10 @@ use crate::vpn;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The `reason` of `profile_vpn_fenced_total` for a fence [`KillSwitchFence`]
+/// put on: the kill switch was not in force, whatever the tunnel's health.
+pub(crate) const KILL_SWITCH_FENCE_REASON: &str = "kill_switch";
+
 /// Why the monitor decided a profile's tunnel is unhealthy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DownReason {
@@ -176,11 +180,15 @@ fn seed_baselines(profiles: &ProfileRegistry, metrics: &PromSink) {
         // The route probe runs for both tunnel types. Same reasoning as the
         // handshake series: `0` means the probe could not run on this host.
         metrics.set_gauge("profile_vpn_route_probe_ok", 1.0, &labels);
-        for reason in DownReason::ALL {
+        for reason in DownReason::ALL
+            .map(DownReason::as_str)
+            .into_iter()
+            .chain([KILL_SWITCH_FENCE_REASON])
+        {
             metrics.add_counter(
                 "profile_vpn_fenced_total",
                 0,
-                &[("profile_id", e.id().as_str()), ("reason", reason.as_str())],
+                &[("profile_id", e.id().as_str()), ("reason", reason)],
             );
         }
     }
@@ -469,6 +477,13 @@ impl vpn::killswitch::Fence for KillSwitchFence {
             // Not fenced now, so any earlier record is one the operator's lift
             // already undid: what is running now replaces it.
             fenced.insert(e.id().clone(), running);
+            self.metrics.inc_counter(
+                "profile_vpn_fenced_total",
+                &[
+                    ("profile_id", e.id().as_str()),
+                    ("reason", KILL_SWITCH_FENCE_REASON),
+                ],
+            );
             error!(
                 target: "torrentd::vpn_monitor",
                 profile_id = %e.id(),
@@ -1284,6 +1299,22 @@ mod tests {
         let labels: std::collections::BTreeSet<_> =
             DownReason::ALL.iter().map(|r| r.as_str()).collect();
         assert_eq!(labels.len(), DownReason::ALL.len());
+        assert!(!labels.contains(KILL_SWITCH_FENCE_REASON));
+    }
+
+    /// Every `reason` either fence writes is one the catalogue lists, so
+    /// seeding and `deploy/metrics.md` cover each.
+    #[test]
+    fn the_catalogue_lists_every_fence_reason() {
+        let (_, listed) = crate::metrics_sink::catalogued("profile_vpn_fenced_total")
+            .and_then(|s| s.label)
+            .expect("a reason label");
+        let written: Vec<&str> = DownReason::ALL
+            .map(DownReason::as_str)
+            .into_iter()
+            .chain([KILL_SWITCH_FENCE_REASON])
+            .collect();
+        assert_eq!(listed, &written[..]);
     }
 
     /// The profile the baseline block used to miss, for exactly the metric it
@@ -1410,6 +1441,35 @@ mod tests {
             !exported.contains("profile_id=\"public\""),
             "got:\n{exported}",
         );
+    }
+
+    /// Each live vpn profile carries `profile_vpn_fenced_total{reason=
+    /// "kill_switch"}` at 0 from boot, so `increase()` over the first fence the
+    /// kill switch puts on has an earlier sample to measure from.
+    ///
+    /// Drop `KILL_SWITCH_FENCE_REASON` from the seeded reasons and this fails.
+    #[test]
+    fn every_vpn_profile_is_seeded_with_a_zero_kill_switch_fence_count() {
+        use crate::profile_registry::test_entry;
+
+        let profiles = ProfileRegistry::new(vec![
+            test_entry("account_a", ProfileStatus::Active),
+            test_entry("account_b", ProfileStatus::Active),
+        ]);
+        let metrics = PromSink::new();
+
+        seed_baselines(&profiles, &metrics);
+
+        let exported = String::from_utf8(metrics.render()).expect("utf-8");
+        for id in ["account_a", "account_b"] {
+            let line = format!(
+                "torrentd_profile_vpn_fenced_total{{profile_id=\"{id}\",reason=\"kill_switch\"}} 0"
+            );
+            assert!(
+                exported.lines().any(|l| l == line),
+                "expected `{line}`; got:\n{exported}",
+            );
+        }
     }
 
     fn answering(
@@ -1571,6 +1631,18 @@ mod tests {
         fence.profiles.iter().next().unwrap().health().status
     }
 
+    /// `profile_vpn_fenced_total{reason="kill_switch"}` as the fence's sink
+    /// exports it for `acct_a`; `None` while it has no sample.
+    fn kill_switch_fenced(fence: &KillSwitchFence) -> Option<f64> {
+        let exported = String::from_utf8(fence.metrics.render()).expect("utf-8");
+        exported.lines().find_map(|l| {
+            l.strip_prefix(
+                "torrentd_profile_vpn_fenced_total{profile_id=\"acct_a\",reason=\"kill_switch\"} ",
+            )
+            .map(|v| v.parse().expect("a number"))
+        })
+    }
+
     /// The kill switch's fence is the monitor's: the profile is marked
     /// `vpn_down` and every torrent in it paused. Lifted once the ruleset is
     /// verified, it resumes only the torrent it found running.
@@ -1580,6 +1652,7 @@ mod tests {
         let (fence, engine) = kill_switch_fence(ProfileStatus::Active, true);
         fence.fence_all();
         assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
+        assert_eq!(kill_switch_fenced(&fence), Some(1.0));
         let mut paused: Vec<u64> = pauses(&engine).iter().map(|h| h.id).collect();
         paused.sort_unstable();
         assert_eq!(
@@ -1612,11 +1685,17 @@ mod tests {
         fence.lift();
         assert_eq!(status_of(&fence), ProfileStatus::VpnDown);
         assert!(pauses(&engine).is_empty() && resumes(&engine).is_empty());
+        assert_eq!(
+            kill_switch_fenced(&fence),
+            None,
+            "the monitor's fence is not counted as the kill switch's"
+        );
 
         let (fence, engine) = kill_switch_fence(ProfileStatus::Active, true);
         fence.fence_all();
         fence.fence_all();
         assert_eq!(pauses(&engine).len(), 2, "fenced once");
+        assert_eq!(kill_switch_fenced(&fence), Some(1.0), "and counted once");
         fence.lift();
         assert_eq!(resumes(&engine), [handle(1)], "and lifted once");
     }

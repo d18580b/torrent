@@ -1032,6 +1032,14 @@ fn refresh(
 /// One check of [`watch`]'s, from where the last one left it: verify, fence
 /// and reinstall on a loss, lift on a verified recovery. Returns where it
 /// leaves the watch.
+///
+/// Each loss found from [`Watch::Intact`] counts once in
+/// `kill_switch_lost_total`, by whether the one reinstall checked intact
+/// (`reinstalled`) or not (`lost`). The whole loss, fence and reinstall
+/// included, happens within this one call, so `kill_switch_table_present` is
+/// back at 1 before any scrape can read the 0: the counter is the only trace a
+/// loss the reinstall repaired leaves. The checks that repeat while the watch
+/// is [`Watch::Lost`] are the same loss, and are not counted again.
 fn tick(
     state: Watch,
     verify: impl Fn() -> io::Result<Verdict>,
@@ -1078,7 +1086,7 @@ fn tick(
     if state == Watch::Lost {
         return Watch::Lost;
     }
-    match reinstall().and_then(|()| verify()) {
+    let next = match reinstall().and_then(|()| verify()) {
         Ok(Verdict::Intact) => {
             metrics.set_gauge("kill_switch_table_present", 1.0, &[]);
             tracing::warn!(
@@ -1109,7 +1117,13 @@ fn tick(
             );
             Watch::Lost
         }
-    }
+    };
+    let outcome = match next {
+        Watch::Intact => "reinstalled",
+        Watch::Lost => "lost",
+    };
+    metrics.inc_counter("kill_switch_lost_total", &[("outcome", outcome)]);
+    next
 }
 
 /// Whether `nft list tables` output names this module's table. Each line is
@@ -2126,6 +2140,55 @@ table inet torrentd_ks {
         Ok(Verdict::Drifted("installed x, live <nothing>".into()))
     }
 
+    /// What `kill_switch_lost_total{outcome}` was raised by.
+    fn lost_for(metrics: &torrentd_engine::RecordingSink, outcome: &str) -> u64 {
+        metrics
+            .calls()
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    torrentd_engine::metrics::MetricCall::IncCounter { name, labels }
+                        if name == "kill_switch_lost_total"
+                            && labels[..] == [("outcome".to_string(), outcome.to_string())]
+                )
+            })
+            .count() as u64
+    }
+
+    /// The loss a reinstall repairs is over within one check, so the gauge a
+    /// scrape reads is back at 1; the counter is what keeps it.
+    #[test]
+    fn a_loss_the_reinstall_repairs_is_counted_once_and_reads_present() {
+        let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
+        let next = tick(
+            Watch::Intact,
+            verdicts(vec![Ok(Verdict::Absent), Ok(Verdict::Intact)]),
+            || Ok(()),
+            &fence,
+            &metrics,
+        );
+        assert_eq!(next, Watch::Intact);
+        assert_eq!(lost_for(&metrics, "reinstalled"), 1);
+        assert_eq!(lost_for(&metrics, "lost"), 0);
+        assert_eq!(metrics.count_for("kill_switch_lost_total"), 1);
+        assert_eq!(gauge(&metrics), Some(1.0));
+
+        let next = tick(
+            next,
+            verdicts(vec![Ok(Verdict::Intact)]),
+            || panic!("nothing to reinstall"),
+            &fence,
+            &metrics,
+        );
+        assert_eq!(next, Watch::Intact);
+        assert_eq!(
+            metrics.count_for("kill_switch_lost_total"),
+            1,
+            "an intact check counts nothing"
+        );
+    }
+
     #[test]
     fn an_intact_table_fences_nothing_and_reads_present() {
         let (fence, metrics) = (Recorded::default(), torrentd_engine::RecordingSink::new());
@@ -2162,6 +2225,7 @@ table inet torrentd_ks {
             assert_eq!(next, Watch::Intact, "{label}");
             assert_eq!(fence.take(), ["fence", "lift"], "{label}");
             assert_eq!(reinstalled.get(), 1, "{label}: one reinstall");
+            assert_eq!(lost_for(&metrics, "reinstalled"), 1, "{label}");
             assert_eq!(gauge(&metrics), Some(1.0), "{label}");
             assert!(
                 metrics.calls().iter().any(|c| matches!(
@@ -2217,6 +2281,12 @@ table inet torrentd_ks {
             assert_eq!(next, Watch::Intact, "{label}");
             assert_eq!(fence.take(), ["lift"], "{label}: lifted once found intact");
             assert_eq!(gauge(&metrics), Some(1.0), "{label}");
+            assert_eq!(
+                lost_for(&metrics, "lost"),
+                1,
+                "{label}: one loss, counted once"
+            );
+            assert_eq!(lost_for(&metrics, "reinstalled"), 0, "{label}");
         }
     }
 
@@ -2235,6 +2305,7 @@ table inet torrentd_ks {
             assert_eq!(gauge(&metrics), None, "not knowing is not absent");
             assert_eq!(fence.take(), Vec::<&str>::new());
             assert_eq!(metrics.count_for("kill_switch_probe_errors_total"), 1);
+            assert_eq!(metrics.count_for("kill_switch_lost_total"), 0);
         }
     }
 
