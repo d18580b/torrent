@@ -114,6 +114,12 @@ enable_lsd = false
 # agent is a client that does not exist. Nothing checks the pairing; take both
 # from the one client a profile presents as, as every example in this file
 # does ("-qB4630-" is qBittorrent 4.6.3's prefix).
+#
+# Only the prefix and the strings change: the rest of the peer id, the
+# extension handshake and the announce parameters stay libtorrent's. Name a
+# client built on libtorrent 2.0, in a version that ships on it — qBittorrent
+# or Deluge, as every example here does — never Transmission or rTorrent,
+# whose identity a tracker can tell this daemon's wire behaviour from.
 # peer_fingerprint = "-qB4630-"
 # user_agent       = "qBittorrent/4.6.3"
 
@@ -210,8 +216,8 @@ dht               = true
 # is fine, since neither store descends into a subdirectory.
 # resume_dir           = "/var/lib/torrentd/resume/public"
 # torrent_dir          = "/var/lib/torrentd/torrents/public"
-# peer_fingerprint     = "-TR3000-"
-# user_agent           = "Transmission/3.00"
+# peer_fingerprint     = "-qB4670-"
+# user_agent           = "qBittorrent/4.6.7"
 # Per-profile upload cap in bytes/sec, overriding the daemon-wide key above.
 # `0` here means *unlimited* for this profile, not "unset": writing it is how
 # you uncap one account while the daemon-wide key caps the rest. Omit the key
@@ -293,8 +299,8 @@ dht               = true
 # vpn_interface            = "proton-a"
 # port_forward             = "natpmp"
 # port_forward_gateway     = "10.2.0.1"   # ProtonVPN WireGuard gateway (default)
-# peer_fingerprint         = "-TR4060-"
-# user_agent               = "Transmission/4.0.6"
+# peer_fingerprint         = "-DE211s-"
+# user_agent               = "Deluge/2.1.1 libtorrent/2.0.14.0"
 # resume_dir               = "/var/lib/torrentd/resume/proton_a"
 # torrent_dir              = "/var/lib/torrentd/torrents/proton_a"
 # allowed_tracker_domains  = ["tracker.example.com"]

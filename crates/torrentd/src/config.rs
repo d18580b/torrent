@@ -1928,6 +1928,54 @@ listen_interfaces = "eth0:6882"
         }
     }
 
+    /// The `"..."` value of a `key = "..."` line, commented or not. `None` for
+    /// any other line, including a longer key that `key` is a prefix of.
+    fn sample_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        let rest = line.trim_start_matches(['#', ' ']).strip_prefix(key)?;
+        let rest = rest.trim_start().strip_prefix('=')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        Some(&rest[..rest.find('"')?])
+    }
+
+    #[test]
+    fn every_sample_identity_names_a_libtorrent_based_client() {
+        // Only the peer-id prefix and the user agent change; the rest of the
+        // peer id, the extension handshake and the announces stay
+        // libtorrent's. A Transmission identity on that wire is one a tracker
+        // can tell is spoofed, so the samples name only clients built on
+        // libtorrent, each prefix beside its own client's user agent. The
+        // scan covers commented lines too: an example the operator uncomments
+        // is never parsed before then.
+        const LIBTORRENT_CLIENTS: [(&str, &str); 2] = [("-qB", "qBittorrent/"), ("-DE", "Deluge/")];
+        for name in ["torrentd.sample.toml", "torrentd.multi-account.sample.toml"] {
+            let text = fs::read_to_string(sample(name)).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            let mut seen = 0;
+            for (i, line) in lines.iter().enumerate() {
+                let Some(fp) = sample_value(line, "peer_fingerprint") else {
+                    continue;
+                };
+                seen += 1;
+                let (_, agent_prefix) = LIBTORRENT_CLIENTS
+                    .iter()
+                    .find(|(prefix, _)| fp.starts_with(prefix))
+                    .unwrap_or_else(|| {
+                        panic!("{name}:{}: {fp:?} is not a libtorrent-based client", i + 1)
+                    });
+                let agent = lines[i + 1..]
+                    .iter()
+                    .find_map(|l| sample_value(l, "user_agent"))
+                    .unwrap_or_else(|| panic!("{name}:{}: {fp:?} has no user_agent", i + 1));
+                assert!(
+                    agent.starts_with(agent_prefix),
+                    "{name}:{}: {fp:?} beside user agent {agent:?}",
+                    i + 1,
+                );
+            }
+            assert!(seen > 0, "{name} shows no peer_fingerprint at all");
+        }
+    }
+
     #[test]
     fn a_reload_does_not_overwrite_a_per_profile_upload_rate_limit() {
         // `startup.rs` applies a per-profile `upload_rate_limit` over the
