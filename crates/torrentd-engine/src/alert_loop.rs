@@ -15,8 +15,10 @@
 //!     when `next_attempt <= now` and libtorrent still holds an error on the
 //!     torrent, we call `engine.resume_torrent(handle)` (which clears the
 //!     error and the pause libtorrent put on it) and schedule the next
-//!     attempt with exponential backoff. A torrent with no error left has
-//!     its timer retired instead.
+//!     attempt with exponential backoff. A torrent still in `DiskError` with
+//!     no libtorrent error — a failed peer read, which libtorrent neither
+//!     pauses nor errors — is re-checked instead, on the same backoff. A
+//!     torrent with neither has its timer retired.
 //!   - Shutdown: on signal, queue a resume save (`ONLY_IF_MODIFIED`) for
 //!     every torrent, then loop dispatching and draining until
 //!     `pending_resume_count == 0` or the drain deadline (default
@@ -813,19 +815,27 @@ fn execute_due_retries(
         }
         // What a `file_error_alert` leaves behind under this daemon's flags
         // (vendor/libtorrent/src/torrent.cpp, `handle_disk_error` and
-        // `on_piece_hashed`): a read failure, or any failure while checking,
-        // sets an error on the torrent and pauses it. A write failure of the
-        // disk-full / read-only kind only sets upload mode, which every
-        // torrent here already carries (`policy::no_download`), and ENOMEM
-        // only disconnects the peer. So the one thing there is to recover is
-        // an error-paused torrent, and `resume()` is what recovers it:
-        // `torrent::do_resume` unpauses and calls `clear_error`, which
-        // re-checks the files if the error came from a check.
+        // `on_piece_hashed`): any failure while checking, or a failed
+        // `read_piece`, sets an error on the torrent and pauses it. That
+        // error-paused torrent is the first thing to recover, and `resume()`
+        // recovers it: `torrent::do_resume` unpauses and calls `clear_error`,
+        // which re-checks the files if the error came from a check.
         //
-        // A torrent with no error left has nothing for the retry to do — it
-        // recovered, an operator resumed it, or the error never paused it —
-        // and resuming it anyway would undo an operator's pause every hour,
-        // forever, because nothing else ever clears the timer. Retire it.
+        // The rest set no error and pause nothing. A disk read for a peer's
+        // request that fails (vendor/libtorrent/src/peer_connection.cpp,
+        // `on_disk_read_complete`) rejects the request, posts the alert and
+        // carries on seeding; a write failure of the disk-full / read-only
+        // kind only sets upload mode, which every torrent here already
+        // carries (`policy::no_download`); ENOMEM only disconnects the peer.
+        // The status updates keep such a torrent in `DiskError`, and nothing
+        // libtorrent reports says whether its files are readable again, so
+        // the retry re-checks it. A check that fails takes the error-paused
+        // route above; one that passes leaves the torrent seeding.
+        //
+        // A torrent in neither state has nothing for the retry to do — it
+        // recovered, or an operator paused or resumed it — and acting on it
+        // anyway would undo an operator's pause every hour, forever, because
+        // nothing else ever clears the timer. Retire it.
         //
         // Except while the torrent is checking. `clear_error` empties the
         // error before the re-check it starts, so a check still running when
@@ -850,7 +860,7 @@ fn execute_due_retries(
             });
             continue;
         }
-        if !st.has_error {
+        if !st.has_error && st.phase != TorrentPhase::DiskError {
             debug!(
                 target: "torrentd_engine::alert_loop",
                 profile_id = %st.profile_id,
@@ -866,6 +876,10 @@ fn execute_due_retries(
             defer_retry(state, clock, &handle.infohash);
             continue;
         };
+        if !st.has_error {
+            recheck_unpaused_disk_error(engine.as_ref(), state, clock, handle, &st.profile_id);
+            continue;
+        }
         match engine.resume_torrent(handle) {
             Ok(()) => {
                 info!(
@@ -904,6 +918,51 @@ fn execute_due_retries(
             }
         }
     }
+}
+
+/// The disk-error retry for a torrent in `DiskError` that libtorrent kept
+/// serving: re-check it, and back off as for a resume.
+///
+/// The phase moves to `Checking` here rather than waiting for a status update
+/// to report it. A small torrent can finish its check between two updates,
+/// and an update that reports `seeding` keeps `DiskError`, so without this a
+/// check that passed would leave the torrent in `DiskError` and re-checking
+/// at every backoff step for good. A check that fails posts its own
+/// `file_error`, which puts `DiskError` back.
+///
+/// Not counted in `disk_error_retry_attempts_total` or
+/// `disk_error_retry_errors_total`, which count resumes; the check it starts
+/// is counted in `torrents_checked_total` when it completes.
+fn recheck_unpaused_disk_error(
+    engine: &dyn TorrentEngine,
+    state: &StateMap,
+    clock: &Arc<dyn Clock>,
+    handle: libtorrent_safe::TorrentHandle,
+    profile_id: &ProfileId,
+) {
+    let outcome = engine.force_recheck(handle);
+    match &outcome {
+        Ok(()) => info!(
+            target: "torrentd_engine::alert_loop",
+            profile_id = %profile_id,
+            infohash = %handle.infohash,
+            "disk-error retry: re-checking a torrent libtorrent kept seeding after a file error",
+        ),
+        Err(e) => warn!(
+            target: "torrentd_engine::alert_loop",
+            profile_id = %profile_id,
+            infohash = %handle.infohash,
+            error.cause = %e,
+            "disk-error retry: re-check failed to start",
+        ),
+    }
+    state.update(&handle.infohash, |s| {
+        if outcome.is_ok() {
+            s.phase = TorrentPhase::Checking;
+        }
+        let attempts = s.retry.as_ref().map(|r| r.attempts).unwrap_or(0);
+        s.retry = Some(crate::state::RetryState::next(clock.now(), attempts));
+    });
 }
 
 /// Schedule another look at a due retry that was skipped without an attempt,
@@ -1539,6 +1598,65 @@ mod tests {
             state.get(&InfoHash([9u8; 20])).unwrap().retry.is_none(),
             "the timer retires once the check is over",
         );
+    }
+
+    fn rechecked(engine: &MockEngine) -> usize {
+        engine
+            .calls()
+            .iter()
+            .filter(|c| matches!(c, crate::mock::RecordedCall::ForceRecheck(_)))
+            .count()
+    }
+
+    #[test]
+    fn a_disk_error_libtorrent_kept_seeding_is_rechecked_not_retired() {
+        // A failed peer read posts `file_error` and nothing else: libtorrent
+        // neither errors nor pauses the torrent. Retiring the timer because
+        // `has_error` is false left a torrent that cannot serve a block with
+        // no retry at all; resuming it does nothing. A re-check is the probe
+        // that settles it, and it backs off like a resume.
+        let (engine, state, metrics) = run_due_retry_in(false, TorrentPhase::DiskError, 2);
+        assert_eq!(rechecked(&engine), 1, "the torrent was not re-checked");
+        assert!(!resumed(&engine), "an unpaused torrent was resumed");
+        let st = state.get(&InfoHash([9u8; 20])).unwrap();
+        assert_eq!(
+            st.phase,
+            TorrentPhase::Checking,
+            "a check that passes between two status updates must not leave it in DiskError",
+        );
+        let retry = st.retry.expect("the timer stays armed through the check");
+        assert_eq!(retry.attempts, 3, "the next attempt backs off");
+        assert!(
+            !metrics.calls().iter().any(|c| matches!(
+                c,
+                MetricCall::IncCounter { name, .. } if name.starts_with("disk_error_retry_")
+            )),
+            "the retry counters count resumes",
+        );
+    }
+
+    #[test]
+    fn a_recheck_that_fails_to_start_keeps_the_disk_error_and_backs_off() {
+        let engine = Arc::new(MockEngine::new());
+        engine.inject_error("force_recheck", crate::engine::EngineError::Shutdown);
+        let source: Arc<dyn AlertSource> = Arc::new(single_profile_source(
+            Arc::clone(&engine) as Arc<dyn TorrentEngine>
+        ));
+        let clock = Arc::new(MockClock::new());
+        let dyn_clock: Arc<dyn Clock> = Arc::clone(&clock) as Arc<dyn Clock>;
+        let metrics: Arc<dyn MetricsSink> = Arc::new(NoopSink);
+        let (state, h) = state_with_a_due_retry(clock.now());
+        state.update(&h.infohash, |s| {
+            s.has_error = false;
+            s.phase = TorrentPhase::DiskError;
+        });
+        execute_due_retries(&source, &state, &metrics, &dyn_clock, None, clock.now());
+        assert_eq!(rechecked(&engine), 1);
+        let st = state.get(&h.infohash).unwrap();
+        assert_eq!(st.phase, TorrentPhase::DiskError);
+        let retry = st.retry.expect("a failed re-check stays scheduled");
+        assert_eq!(retry.attempts, 2, "a failed re-check backs off");
+        assert!(retry.next_attempt > clock.now());
     }
 
     #[test]

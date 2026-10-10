@@ -40,14 +40,9 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     // monitor had fenced, which is exactly when someone looks.
                     //
                     // `Errored` / `DiskError` are deliberately *not* pinned
-                    // above this. They are cleared by a healthy `seeding`
-                    // update, which is how a torrent that recovered from a
-                    // disk error leaves `DiskError`; making them sticky would
-                    // strand it there. libtorrent pauses a torrent whose disk
-                    // error it cannot route to upload mode, so paused usually
-                    // shows — the state an operator acts on first — and if
-                    // the disk error is still there when it resumes, the
-                    // alert fires again.
+                    // above this: a torrent libtorrent error-paused reports
+                    // `Paused` — the state an operator acts on first — and
+                    // leaves it when the disk-error retry resumes it.
                     //
                     // `downloading_metadata` and `downloading` have phases of
                     // their own. Folding them into whatever came before left a
@@ -56,6 +51,23 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                     // out a check, deferring for as long. A torrent that was
                     // `DiskError` or `Errored` stays so through them: neither
                     // says the error cleared.
+                    //
+                    // `finished` and `seeding` keep `DiskError` too. Not every
+                    // `file_error_alert` comes with a libtorrent error: a disk
+                    // read for a peer's request that fails
+                    // (vendor/libtorrent/src/peer_connection.cpp,
+                    // `on_disk_read_complete`) rejects the request and posts
+                    // the alert, and nothing else — no `set_error`, no
+                    // `pause()` — so the torrent goes on reporting `seeding`
+                    // while it cannot serve a block. Mapping that to
+                    // `Seeding` hid it from the phase filter, `/status` and
+                    // the disk-error retry alike. The retry clears it: it
+                    // re-checks a torrent in `DiskError` with no libtorrent
+                    // error, which moves it to `Checking`, and the check's
+                    // verdict decides where it goes from there. `Errored` is
+                    // cleared by a healthy update as before: `torrent_error`
+                    // comes from `set_error`, so the error that recorded it
+                    // shows in `has_error` until it is gone.
                     let flags = TorrentFlags::from_bits_truncate(s.flags);
                     let sticky =
                         matches!(st.phase, TorrentPhase::DiskError | TorrentPhase::Errored);
@@ -66,6 +78,7 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                             0 | 1 | 7 => TorrentPhase::Checking,
                             2 if !sticky => TorrentPhase::AwaitingMetadata,
                             3 if !sticky => TorrentPhase::Incomplete,
+                            4 | 5 if st.phase == TorrentPhase::DiskError => st.phase,
                             4 | 5 => {
                                 if s.is_seeding {
                                     TorrentPhase::Seeding
@@ -215,8 +228,9 @@ mod tests {
 
     #[test]
     fn state_update_tracks_libtorrent_error_both_ways() {
-        // A read-class disk error leaves the torrent paused with an error set;
-        // `resume()` clears both. The retry timer keys on `has_error`, so it
+        // A disk error that reaches libtorrent's `handle_disk_error` (a failed
+        // check, say) leaves the torrent paused with an error set; `resume()`
+        // clears both. The retry timer keys on `has_error`, so it
         // must follow libtorrent in each direction, not latch.
         let state = StateMap::new();
         let metrics = RecordingSink::new();
@@ -322,6 +336,105 @@ mod tests {
             dispatch(&update(lt_state), &state, &metrics);
             assert_eq!(phase(&state), sticky);
         }
+    }
+
+    /// A disk read for a peer's request that fails posts `file_error` and
+    /// nothing else: libtorrent neither sets an error nor pauses the torrent,
+    /// and goes on reporting `seeding`. That report must not clear the
+    /// `DiskError` the alert recorded, or a torrent that cannot serve a block
+    /// lists as healthy. A paused report still wins, and `Errored` is still
+    /// cleared by a healthy one.
+    #[test]
+    fn a_peer_read_file_error_survives_a_seeding_report() {
+        let state = StateMap::new();
+        let metrics = RecordingSink::new();
+        let h = TorrentHandle {
+            id: 5,
+            infohash: ih(0x88),
+        };
+        seed_state(&state, h);
+        let update = |lt_state: u32, flags: TorrentFlags| Alert::StateUpdate {
+            hdr: AlertHeader {
+                kind: AlertKind::StateUpdate,
+                infohash: None,
+                handle: None,
+                timestamp_us: 0,
+            },
+            statuses: vec![TorrentStatusView {
+                handle: h,
+                state: lt_state,
+                flags: flags.bits(),
+                total_uploaded: 0,
+                total_payload_uploaded: 0,
+                upload_rate: 0,
+                download_rate: 0,
+                num_peers: 4,
+                num_seeds: 0,
+                num_connections: 4,
+                progress: 1.0,
+                has_metadata: true,
+                needs_save_resume: false,
+                is_finished: true,
+                is_seeding: true,
+                has_error: false,
+            }],
+        };
+        let phase = |state: &StateMap| state.get(&ih(0x88)).unwrap().phase;
+
+        dispatch(&update(5, TorrentFlags::empty()), &state, &metrics);
+        assert_eq!(phase(&state), TorrentPhase::Seeding);
+        {
+            let resume = MemoryResumeStore::new();
+            let torrents = MemoryTorrentStore::new();
+            let clock = MockClock::new();
+            let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+            let mut ctx = HandlerCtx {
+                state: &state,
+                resume: &resume,
+                torrents: &torrents,
+                metrics: &metrics,
+                clock: &clock,
+                engine: &engine,
+                profile_fenced: None,
+                profile_id: ProfileId::new("p"),
+                span: tracing::info_span!("test"),
+            };
+            crate::handlers::error::handle(
+                &Alert::FileError {
+                    hdr: AlertHeader {
+                        kind: AlertKind::FileError,
+                        infohash: Some(ih(0x88)),
+                        handle: None,
+                        timestamp_us: 0,
+                    },
+                    error_code: 13,
+                    filename: "data.bin".into(),
+                    operation: "file_read".into(),
+                    message: "Permission denied".into(),
+                },
+                &mut ctx,
+            );
+        }
+        assert_eq!(phase(&state), TorrentPhase::DiskError);
+
+        for lt_state in [5, 4] {
+            dispatch(&update(lt_state, TorrentFlags::empty()), &state, &metrics);
+            let st = state.get(&ih(0x88)).unwrap();
+            assert_eq!(
+                st.phase,
+                TorrentPhase::DiskError,
+                "a seeding report with no error cleared the peer-read disk error",
+            );
+            assert!(!st.has_error, "has_error still follows libtorrent");
+            assert!(st.retry.is_some(), "the retry that clears it stays armed");
+        }
+
+        dispatch(&update(5, TorrentFlags::PAUSED), &state, &metrics);
+        assert_eq!(phase(&state), TorrentPhase::Paused);
+
+        state.update(&ih(0x88), |st| st.phase = TorrentPhase::Errored);
+        dispatch(&update(5, TorrentFlags::empty()), &state, &metrics);
+        assert_eq!(phase(&state), TorrentPhase::Seeding);
     }
 
     /// `torrent_checked` leaves `phase` as it was before the check and says

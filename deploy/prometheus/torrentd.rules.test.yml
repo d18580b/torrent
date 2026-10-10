@@ -608,7 +608,7 @@ tests:
               profile_id: acct_a
               op: file_open
             exp_annotations:
-              summary: "File errors (file_open) in profile acct_a; the torrent is in the disk-error phase"
+              summary: "File errors (file_open) in profile acct_a; the journal names the torrent and file"
 
   # ---- boot and persistence ---------------------------------------------
   - interval: 1m

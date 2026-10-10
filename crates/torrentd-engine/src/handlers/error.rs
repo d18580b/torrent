@@ -54,15 +54,22 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             let Some(ih) = hdr.infohash else { return };
             let now = ctx.clock.now();
             // Record the error now rather than waiting for the next
-            // `state_update` to report it. libtorrent follows every
-            // `file_error_alert` a seeder can reach (a failed read, a failed
-            // check, a failed priority change) with `set_error` + `pause()`,
-            // but the status that carries `errc` arrives later. A retry timer
-            // that comes due in between would otherwise see no error and a
-            // phase other than `Checking`, and retire, leaving the torrent
-            // error-paused with no timer. Where libtorrent did not set an
-            // error (ENOMEM, or a write failure it routed to upload mode),
-            // the next status update for this torrent clears the flag again.
+            // `state_update` to report it. A `file_error_alert` from a failed
+            // check, a failed `read_piece` or a failed priority change comes
+            // with `set_error` + `pause()` (vendor/libtorrent/src/torrent.cpp),
+            // but the status that carries `errc` arrives later.
+            // A retry timer that comes due in between would otherwise see no
+            // error and a phase other than `Checking`, and retire, leaving
+            // the torrent error-paused with no timer.
+            //
+            // Where libtorrent did not set an error, the next status update
+            // clears the flag again and `DiskError` stays: a disk read for a
+            // peer's request that fails only rejects the request and posts
+            // this alert (vendor/libtorrent/src/peer_connection.cpp), so the
+            // torrent keeps reporting `seeding` while it cannot serve; ENOMEM
+            // and a write failure routed to upload mode leave no error
+            // either. The retry re-checks such a torrent, which is the one
+            // probe that settles whether its files can be read.
             ctx.state.update(&ih, |st| {
                 st.phase = TorrentPhase::DiskError;
                 st.has_error = true;

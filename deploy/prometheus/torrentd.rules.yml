@@ -302,7 +302,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "File errors ({{ $labels.op }}) in profile {{ $labels.profile_id }}; the torrent is in the disk-error phase"
+          summary: "File errors ({{ $labels.op }}) in profile {{ $labels.profile_id }}; the journal names the torrent and file"
 
       # ---- boot and persistence ----------------------------------------
       - alert: TorrentdBootLoadFailures
