@@ -1310,7 +1310,9 @@ fn bulk(api: &Api, pause: bool) -> Effect {
         let result = if pause {
             crate::api::call(api.client.pause_all_torrents()).await
         } else {
-            crate::api::call(api.client.resume_all_torrents()).await
+            // Unbounded: the daemon resumes 100 torrents a second, and
+            // answers once the last is.
+            crate::api::call_unbounded(api.client.resume_all_torrents()).await
         };
         crate::app::Msg::Torrents(Msg::Bulk { pause, result })
     })

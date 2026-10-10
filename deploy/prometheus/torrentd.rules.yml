@@ -236,12 +236,16 @@ groups:
           summary: "The previous shutdown left {{ $value }} resume saves unsaved; those torrents restarted from older state"
 
       # ---- libtorrent --------------------------------------------------
+      # Not only a slow alert loop: a bulk operation that pauses every
+      # torrent of a large profile at once (a fence, pause-all, setting it
+      # offline or online) raises a tracker alert per torrent within a second
+      # or so, more than the queue holds. Bulk resumes are paced and do not.
       - alert: TorrentdAlertQueueOverflow
         expr: increase(torrentd_alert_queue_overflows_total[15m]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "libtorrent dropped alerts for profile {{ $labels.profile_id }}; the alert loop is falling behind"
+          summary: "libtorrent dropped alerts for profile {{ $labels.profile_id }}; the alert loop is falling behind, or a fence, pause-all or set online/offline announced every torrent at once"
 
       - alert: TorrentdTrackerErrors
         # A fraction of announces, not any error: one dead tracker among many

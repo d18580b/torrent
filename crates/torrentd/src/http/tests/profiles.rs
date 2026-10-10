@@ -504,14 +504,18 @@ async fn states(cov: &Arc<Coverage>) {
     assert_eq!(detail["status"], "active");
     assert_eq!(detail["effective_state"], "online");
     assert_eq!(detail["paused_for_vpn"], 0);
-    assert_eq!(
+    // Resumed by a paced task that goes on after the response.
+    let resumed = || {
         calls(
             &eng_b,
-            |c| matches!(c, RecordedCall::ResumeTorrent(x) if *x == hb)
-        ),
-        1,
-        "the torrents the fence paused are resumed",
-    );
+            |c| matches!(c, RecordedCall::ResumeTorrent(x) if *x == hb),
+        )
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while resumed() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(resumed(), 1, "the torrents the fence paused are resumed");
 
     // An id no profile declares, and one that is not UTF-8.
     assert_problem(&set("typo", "offline").await, 404, "profile-not-found");
@@ -616,6 +620,207 @@ async fn bulk_operations_count_what_the_engine_refused() {
         );
     }
     h.assert_conformance();
+}
+
+/// A pause that lands while a lifted fence's paced resume is still going
+/// keeps: the profile's pause-all and the daemon's stop the run, and a
+/// torrent paused on its own is left out of it, so no later batch undoes the
+/// pause.
+#[tokio::test(start_paused = true)]
+async fn a_pause_during_a_paced_lift_is_not_undone_by_its_later_batches() {
+    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let n = u8::try_from(REANNOUNCE_BATCH + 50).unwrap();
+    for pause in [
+        "/v1/profiles/acct_a/pause-all",
+        "/v1/torrents/pause-all",
+        "one torrent",
+    ] {
+        let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+        let h = Harness::authed(&Coverage::new(), |s| install(s, vec![a], vec![]));
+        let handles: Vec<TorrentHandle> = (1..=n).map(|b| load(&h.state, b, "acct_a")).collect();
+        let last = handles[handles.len() - 1];
+        let entry = h
+            .state
+            .profiles
+            .resolve(&ProfileId::new("acct_a"))
+            .active()
+            .unwrap();
+        let run = crate::vpn_monitor::spawn_lift(
+            &h.state.profiles,
+            &h.state.metrics,
+            entry,
+            handles,
+            crate::vpn_monitor::Lift::SetOnline,
+        );
+        tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+        let resumed = |only: Option<TorrentHandle>| {
+            calls(
+                &eng_a,
+                |c| matches!(c, RecordedCall::ResumeTorrent(x) if only.is_none_or(|o| o == *x)),
+            )
+        };
+        assert_eq!(resumed(None), REANNOUNCE_BATCH, "{pause}: the first batch");
+
+        let path = if pause == "one torrent" {
+            format!("/v1/torrents/{}/pause", last.infohash.to_hex())
+        } else {
+            pause.to_owned()
+        };
+        let resp = h.write("POST", &path).await;
+        assert!(resp.status().is_success(), "{pause}: {}", resp.status());
+
+        let out = run.await.unwrap();
+        assert_eq!(
+            resumed(Some(last)),
+            0,
+            "{pause}: the paused torrent stays paused"
+        );
+        if pause == "one torrent" {
+            assert_eq!(
+                (out.resumed, out.excluded, out.halted),
+                (u64::from(n) - 1, 1, false),
+                "{pause}: the run goes on without it",
+            );
+        } else {
+            assert_eq!(
+                (out.resumed, out.not_reached, out.halted),
+                (
+                    REANNOUNCE_BATCH as u64,
+                    usize::from(n) - REANNOUNCE_BATCH,
+                    true
+                ),
+                "{pause}: the run stops",
+            );
+            assert_eq!(resumed(None), REANNOUNCE_BATCH, "{pause}: nothing after");
+            assert!(
+                !entry.is_resuming(),
+                "{pause}: and is dropped from the profile"
+            );
+        }
+    }
+}
+
+/// A pause that lands while a resume-all is still going keeps, in the profile
+/// being resumed and in those the request has not reached yet: the daemon's
+/// pause-all stops the whole request, a profile's pause-all stops it in that
+/// profile, and a torrent paused on its own is left out. The response counts
+/// only what was resumed and lists nothing in `skipped_profiles`.
+#[tokio::test(start_paused = true)]
+async fn a_pause_during_a_resume_all_is_not_undone_by_its_later_batches() {
+    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    // Both profiles' torrents fit in `load`'s one-byte infohashes.
+    let (batch, per) = (REANNOUNCE_BATCH, REANNOUNCE_BATCH + 20);
+    // (resume-all, the pause landing while acct_a's first batch is out,
+    // torrents resumed in acct_a, torrents resumed in acct_b)
+    let cases: [(&str, &str, usize, usize); 6] = [
+        (
+            "/v1/torrents/resume-all",
+            "/v1/torrents/pause-all",
+            batch,
+            0,
+        ),
+        (
+            "/v1/torrents/resume-all",
+            "/v1/profiles/acct_a/pause-all",
+            batch,
+            per,
+        ),
+        (
+            "/v1/torrents/resume-all",
+            "/v1/profiles/acct_b/pause-all",
+            per,
+            0,
+        ),
+        ("/v1/torrents/resume-all", "one in acct_b", per, per - 1),
+        (
+            "/v1/profiles/acct_a/resume-all",
+            "/v1/profiles/acct_a/pause-all",
+            batch,
+            0,
+        ),
+        (
+            "/v1/profiles/acct_a/resume-all",
+            "one in acct_a",
+            per - 1,
+            0,
+        ),
+    ];
+    for (resume, pause, want_a, want_b) in cases {
+        let (a, eng_a) = live("acct_a", ProfileStatus::Active);
+        let (b, eng_b) = live("acct_b", ProfileStatus::Active);
+        let h = Harness::authed(&Coverage::new(), |s| install(s, vec![a, b], vec![]));
+        let n = u8::try_from(per).unwrap();
+        let in_a: Vec<TorrentHandle> = (1..=n).map(|x| load(&h.state, x, "acct_a")).collect();
+        let in_b: Vec<TorrentHandle> = (1..=n).map(|x| load(&h.state, x + n, "acct_b")).collect();
+        let resumed = |eng: &MockEngine, only: Option<TorrentHandle>| {
+            calls(
+                eng,
+                |c| matches!(c, RecordedCall::ResumeTorrent(x) if only.is_none_or(|o| o == *x)),
+            )
+        };
+        // A torrent the run has not resumed yet: the state map hands a
+        // profile's torrents out in no set order, so it is picked once the
+        // first batch is out.
+        let unresumed = |eng: &MockEngine, of: &[TorrentHandle]| {
+            *of.iter()
+                .find(|t| resumed(eng, Some(**t)) == 0)
+                .expect("a torrent the first batch did not reach")
+        };
+
+        let (out, (paused, one)) = tokio::join!(h.write("POST", resume), async {
+            tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+            assert_eq!(
+                resumed(&eng_a, None),
+                REANNOUNCE_BATCH,
+                "{resume} / {pause}: the first batch is out"
+            );
+            let one = match pause {
+                "one in acct_a" => Some((&eng_a, unresumed(&eng_a, &in_a))),
+                "one in acct_b" => Some((&eng_b, unresumed(&eng_b, &in_b))),
+                _ => None,
+            };
+            let path = one.map_or_else(
+                || pause.to_owned(),
+                |(_, t)| format!("/v1/torrents/{}/pause", t.infohash.to_hex()),
+            );
+            (h.write("POST", &path).await, one)
+        });
+        assert!(
+            paused.status().is_success(),
+            "{resume} / {pause}: {}",
+            paused.status()
+        );
+        out.assert_status(kynos::http::StatusCode::OK);
+        let out: Value = out.json();
+
+        assert_eq!(
+            (resumed(&eng_a, None), resumed(&eng_b, None)),
+            (want_a, want_b),
+            "{resume} / {pause}: what was resumed in each profile",
+        );
+        assert_eq!(
+            out["torrent_count"],
+            want_a + want_b,
+            "{resume} / {pause}: the response counts only what was resumed"
+        );
+        assert_eq!(out["failed_count"], 0, "{resume} / {pause}");
+        assert_eq!(
+            out["skipped_profiles"],
+            json!([]),
+            "{resume} / {pause}: the operator's own pause is not a skipped profile"
+        );
+        if let Some((eng, t)) = one {
+            assert_eq!(
+                resumed(eng, Some(t)),
+                0,
+                "{resume} / {pause}: it stays paused"
+            );
+        }
+    }
 }
 
 #[tokio::test]

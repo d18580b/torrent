@@ -2250,7 +2250,7 @@
           "torrents"
         ],
         "summary": "Pause a torrent.",
-        "description": "Stops it announcing and serving peers until resumed. Allowed on a fenced\nprofile: pausing puts nothing back on the network.",
+        "description": "Stops it announcing and serving peers until resumed. Allowed on a fenced\nprofile: pausing puts nothing back on the network. A paced resume still\nrunning in the profile, a lifted fence's or a resume-all's, leaves it out.",
         "operationId": "pause_torrent",
         "parameters": [
           {
@@ -3885,7 +3885,7 @@
           "profiles"
         ],
         "summary": "Set one profile online or offline.",
-        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says. The setting is written to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the fence's pauses are undone and the\nVPN monitor watches the profile again, handshake included; if it fails,\n`409` and nothing changes. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
+        "description": "`offline` pauses the profile's whole session: no announce, no peer, no\nincoming connection, for every torrent in it and every torrent that\nreaches it later; a host profile with `dht` also has its DHT node stopped.\nAdds, adoptions, and resumes into it are refused with\n`409 profile-unavailable` (`offline`) until it is set online. `online`\nresumes the session (and its DHT), and every torrent goes back to what\nits own paused flag says. The setting is written to the state directory\nbefore it takes effect, so it survives a crash and a restart; a profile left offline\nstarts with its session paused, before any torrent is loaded into it.\n\nSetting a fenced (`vpn_down`) profile online is how the fence is lifted\nwithout a restart. The tunnel is checked first: its interface must hold\nthe address the session is bound to, and a packet from that address must\nroute by the tunnel. If it passes, the VPN monitor watches the profile\nagain, handshake included, and the fence's pauses are undone 100 torrents\na second, going on after the response, since each torrent resumed\nannounces to its trackers; if it fails, `409` and nothing changes. A profile that never came up keeps the setting\nfor its next boot. `offline_all`, while on, keeps every profile offline\nwhatever this sets.",
         "operationId": "set_profile_state",
         "parameters": [
           {
@@ -4498,7 +4498,7 @@
           "profiles"
         ],
         "summary": "Pause every torrent in one profile.",
-        "description": "A fenced (`vpn_down`) profile is paused too: its torrents are already\npaused, and pausing again is harmless. A profile that never came up has\nnothing loaded to pause and answers `409 profile-unavailable` with its\nbring-up failure. `failed_count` counts torrents the engine refused.",
+        "description": "A fenced (`vpn_down`) profile is paused too: its torrents are already\npaused, and pausing again is harmless. A profile that never came up has\nnothing loaded to pause and answers `409 profile-unavailable` with its\nbring-up failure. `failed_count` counts torrents the engine refused.\n\nA paced resume still running in the profile, a lifted fence's or a\nresume-all's, is stopped first, so it does not resume torrents after this\npaused them.",
         "operationId": "pause_profile",
         "parameters": [
           {
@@ -4699,7 +4699,7 @@
           "profiles"
         ],
         "summary": "Resume every torrent in one profile.",
-        "description": "Refused with `409 profile-unavailable` for a profile that never came up\n(nothing of it is loaded), for a fenced (`vpn_down`) one, whose torrents\nwere paused because the tunnel is gone and stay paused until the profile\nis set online and its tunnel checks healthy, and for an `offline` one.\n`failed_count` counts torrents the engine refused.",
+        "description": "Each torrent resumed announces to its trackers, so they are resumed 100 a\nsecond, and the response comes once the last is: about a second per 100\ntorrents in the profile. The resume goes on if the client stops waiting.\nA profile fenced while it runs stops it there: the profile is then listed\nin `skipped_profiles` (`vpn_down`), with how many torrents stayed paused.\n\nRefused with `409 profile-unavailable` for a profile that never came up\n(nothing of it is loaded), for a fenced (`vpn_down`) one, whose torrents\nwere paused because the tunnel is gone and stay paused until the profile\nis set online and its tunnel checks healthy, and for an `offline` one.\n`failed_count` counts torrents the engine refused.",
         "operationId": "resume_profile",
         "parameters": [
           {
@@ -4900,7 +4900,7 @@
           "torrents"
         ],
         "summary": "Pause every torrent in every profile.",
-        "description": "Every live profile is reached, fenced ones included: their torrents are\nalready paused, and pausing again is harmless. Profiles that never came up\nare listed in `skipped_profiles`, since nothing of theirs is loaded. A\nnonzero `failed_count` means some torrents are still running.",
+        "description": "Every live profile is reached, fenced ones included: their torrents are\nalready paused, and pausing again is harmless. Profiles that never came up\nare listed in `skipped_profiles`, since nothing of theirs is loaded. A\nnonzero `failed_count` means some torrents are still running.\n\nA paced resume still running in a profile, a lifted fence's or a\nresume-all's, is stopped first, so it does not resume torrents after this\npaused them.",
         "operationId": "pause_all_torrents",
         "responses": {
           "401": {
@@ -5024,7 +5024,7 @@
           "torrents"
         ],
         "summary": "Resume every torrent in every profile that is not fenced or offline.",
-        "description": "A fenced (`vpn_down`) or `offline` profile is skipped and listed in\n`skipped_profiles`, not refused wholesale: one account's dead tunnel must\nnot stop the others resuming, and resuming it is exactly what the\nprofile's own resume-all refuses. Profiles that never came up are listed\ntoo.",
+        "description": "A fenced (`vpn_down`) or `offline` profile is skipped and listed in\n`skipped_profiles`, not refused wholesale: one account's dead tunnel must\nnot stop the others resuming, and resuming it is exactly what the\nprofile's own resume-all refuses. Profiles that never came up are listed\ntoo.\n\nEach torrent resumed announces to its trackers, so each profile's are\nresumed 100 a second, one profile after another, and the response comes\nonce the last is: about a second per 100 torrents in the daemon. The\nresume goes on if the client stops waiting. A profile fenced while its\ntorrents are being resumed is listed in `skipped_profiles` (`vpn_down`)\nwith how many stayed paused. A pause that lands while it runs is kept in\nevery profile, including those not reached yet: the daemon's pause-all\nstops it, a profile's pause-all stops it in that profile, and a torrent\npaused on its own is left out. A profile so paused is not listed in\n`skipped_profiles`.",
         "operationId": "resume_all_torrents",
         "responses": {
           "401": {
@@ -10518,7 +10518,7 @@
               "$ref": "#/components/schemas/SkippedProfile"
             },
             "type": "array",
-            "description": "Profiles this request did not act on, each with why. Always empty for\na single profile's operation, which refuses instead."
+            "description": "Profiles this request did not act on, or not on all of, each with why.\nA single profile's operation refuses a profile it cannot act on, so\nlists one here only when a resume was cut short by a fence."
           }
         },
         "type": "object",

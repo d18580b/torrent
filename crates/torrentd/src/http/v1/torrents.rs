@@ -1698,7 +1698,8 @@ from_lookup!(PauseTorrentError);
 /// Pause a torrent.
 ///
 /// Stops it announcing and serving peers until resumed. Allowed on a fenced
-/// profile: pausing puts nothing back on the network.
+/// profile: pausing puts nothing back on the network. A paced resume still
+/// running in the profile, a lifted fence's or a resume-all's, leaves it out.
 #[kynos::post("/torrents/{infohash}/pause", tag = Torrents)]
 pub async fn pause_torrent(
     _caller: Scoped<Bearer, Write>,
@@ -1706,6 +1707,9 @@ pub async fn pause_torrent(
     Path(p): Path<TorrentPath>,
 ) -> Result<NoContent, PauseTorrentError> {
     let (st, engine) = loaded(&s, p.infohash.get())?;
+    if let Some(entry) = s.profiles.resolve(&st.profile_id).active() {
+        entry.exclude_from_resumes(st.handle);
+    }
     blocking(move || engine.pause_torrent(st.handle))
         .await
         .map_err(|e| PauseTorrentError::Internal {
