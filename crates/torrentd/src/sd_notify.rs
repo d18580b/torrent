@@ -17,6 +17,9 @@ use std::io;
 use std::os::linux::net::SocketAddrExt;
 use std::os::unix::net::SocketAddr;
 use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Send one notification datagram. `Ok(())` with no socket configured.
@@ -77,25 +80,75 @@ const EXTEND_EVERY: Duration = Duration::from_secs(10);
 
 /// Keeps systemd's start or stop timeout from firing while a phase that is
 /// making progress runs long — a boot loading 100K torrents, a drain saving
-/// them — by re-sending `EXTEND_TIMEOUT_USEC` until dropped or until `cap`
-/// has passed.
+/// them — by re-sending `EXTEND_TIMEOUT_USEC` until dropped or until its
+/// deadline has passed.
 ///
-/// The cap is what keeps this from defeating the timeout: a phase that is
-/// wedged rather than slow stops being extended once it has run past every
-/// bound it was given, and systemd's own timeout fires from the last
-/// extension. A no-op outside systemd, like every other notification here.
+/// The deadline is what keeps this from defeating the timeout: a phase that
+/// is wedged rather than slow stops being extended, and systemd's own timeout
+/// fires from the last extension. [`TimeoutExtender::start`] fixes it once,
+/// for a phase whose stages each carry their own bound;
+/// [`TimeoutExtender::start_while_progressing`] moves it forward whenever a
+/// [`Progress`] advances, for a phase whose length grows with its input. A
+/// no-op outside systemd, like every other notification here.
 #[derive(Debug)]
 pub struct TimeoutExtender(Option<tokio::task::JoinHandle<()>>);
 
+/// A counter a long phase advances as it gets through its work, read by
+/// [`TimeoutExtender::start_while_progressing`]. Cheap to clone and to
+/// advance, and live outside systemd too, so a caller never branches on it.
+#[derive(Clone, Debug, Default)]
+pub struct Progress(Arc<AtomicU64>);
+
+impl Progress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record that the phase got further.
+    pub fn advance(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 impl TimeoutExtender {
-    /// Start extending, on the current tokio runtime.
+    /// Start extending, on the current tokio runtime, until `cap` has passed
+    /// however the phase is getting on.
     pub fn start(cap: Duration) -> Self {
+        Self::spawn(cap, None)
+    }
+
+    /// Start extending, on the current tokio runtime, until `stall` has
+    /// passed with `progress` not advancing. Each advance the extender sees
+    /// gives the phase `stall` more from then, so a phase that keeps getting
+    /// further is never cut off, and one that stops is extended for at most
+    /// `stall` plus one re-send interval past its last advance.
+    pub fn start_while_progressing(stall: Duration, progress: &Progress) -> Self {
+        Self::spawn(stall, Some(progress.clone()))
+    }
+
+    fn spawn(window: Duration, progress: Option<Progress>) -> Self {
         if std::env::var_os("NOTIFY_SOCKET").is_none() {
             return Self(None);
         }
         Self(Some(tokio::spawn(async move {
-            let until = tokio::time::Instant::now() + cap;
-            while tokio::time::Instant::now() < until {
+            let mut seen = progress.as_ref().map(Progress::get);
+            let mut until = tokio::time::Instant::now() + window;
+            loop {
+                let now = tokio::time::Instant::now();
+                if let Some(p) = &progress {
+                    let current = p.get();
+                    if seen != Some(current) {
+                        seen = Some(current);
+                        until = now + window;
+                    }
+                }
+                if now >= until {
+                    break;
+                }
                 extend_timeout(EXTEND_BY);
                 tokio::time::sleep(EXTEND_EVERY).await;
             }
@@ -270,6 +323,118 @@ mod tests {
             listener.recv(&mut buf).is_err(),
             "one message per interval, not a stream of them"
         );
+    }
+
+    /// Every `EXTEND_TIMEOUT_USEC` waiting on `listener`, counted and taken.
+    fn drain_extensions(listener: &UnixDatagram) -> usize {
+        let mut buf = [0u8; 64];
+        let mut n = 0;
+        while let Ok(len) = listener.recv(&mut buf) {
+            assert_eq!(&buf[..len], b"EXTEND_TIMEOUT_USEC=30000000");
+            n += 1;
+        }
+        n
+    }
+
+    /// Run `body` on a paused-clock runtime with `$NOTIFY_SOCKET` pointing at
+    /// a fresh non-blocking listener, which it is handed.
+    fn with_paused_listener<F: std::future::Future<Output = ()>>(
+        body: impl FnOnce(UnixDatagram) -> F,
+    ) {
+        let _lk = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notify.sock");
+        let listener = UnixDatagram::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let _g = EnvGuard::set(&[("NOTIFY_SOCKET", Some(path.to_str().unwrap()))]);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(body(listener));
+    }
+
+    /// Advance the paused clock by `secs`, one re-send interval at a time,
+    /// draining as it goes so the datagram queue never fills, and return how
+    /// many extensions arrived.
+    async fn extensions_over(
+        listener: &UnixDatagram,
+        secs: u64,
+        progress: Option<&Progress>,
+    ) -> usize {
+        let mut n = 0;
+        for _ in 0..secs / EXTEND_EVERY.as_secs() {
+            if let Some(p) = progress {
+                p.advance();
+            }
+            tokio::time::sleep(EXTEND_EVERY).await;
+            n += drain_extensions(listener);
+        }
+        n
+    }
+
+    #[test]
+    fn the_extender_keeps_extending_while_progress_is_reported() {
+        with_paused_listener(|listener| async move {
+            let progress = Progress::new();
+            let stall = Duration::from_secs(60);
+            let _extender = TimeoutExtender::start_while_progressing(stall, &progress);
+
+            // Five stall windows of steady progress: never cut off.
+            let during = extensions_over(&listener, 300, Some(&progress)).await;
+            assert!(
+                during >= 30,
+                "one extension per interval while progressing, got {during}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_extender_stops_once_progress_stalls() {
+        with_paused_listener(|listener| async move {
+            let progress = Progress::new();
+            let stall = Duration::from_secs(60);
+            let _extender = TimeoutExtender::start_while_progressing(stall, &progress);
+
+            assert!(extensions_over(&listener, 120, Some(&progress)).await >= 12);
+            // Progress stops: about the stall window's worth, give or take
+            // the interval in which the last advance was seen (which side of
+            // a shared instant the paused clock runs each task on).
+            let after = extensions_over(&listener, 300, None).await;
+            assert!(
+                (4..=8).contains(&after),
+                "extended {after} times over a 60 s stall at one per 10 s",
+            );
+            assert_eq!(
+                extensions_over(&listener, 300, None).await,
+                0,
+                "a stalled phase is not extended again"
+            );
+        });
+    }
+
+    #[test]
+    fn the_extender_stops_when_progress_never_starts() {
+        with_paused_listener(|listener| async move {
+            let progress = Progress::new();
+            let _extender =
+                TimeoutExtender::start_while_progressing(Duration::from_secs(60), &progress);
+            let total = extensions_over(&listener, 600, None).await;
+            assert!((5..=7).contains(&total), "extended {total} times");
+        });
+    }
+
+    #[test]
+    fn the_capped_extender_stops_at_its_cap() {
+        with_paused_listener(|listener| async move {
+            let _extender = TimeoutExtender::start(Duration::from_secs(60));
+            let during = extensions_over(&listener, 600, None).await;
+            assert!(
+                (5..=7).contains(&during),
+                "extended {during} times under a 60 s cap"
+            );
+        });
     }
 
     #[test]

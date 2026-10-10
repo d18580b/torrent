@@ -424,10 +424,17 @@ pub fn is_config_refusal(e: &anyhow::Error) -> bool {
     e.downcast_ref::<ConfigRefused>().is_some()
 }
 
-/// The longest boot `EXTEND_TIMEOUT_USEC` keeps alive. Past this a boot is
-/// treated as wedged, and systemd's own start timeout fires from the last
-/// extension.
-const BOOT_EXTEND_CAP: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// How long boot `EXTEND_TIMEOUT_USEC` keeps a boot alive with no progress
+/// reported. The boot advances its [`sd_notify::Progress`] as the scans get
+/// through their entries and at each stage between them, so a boot still
+/// loading a large pool is extended however long it runs; one that has gone
+/// this long without getting further is treated as wedged, and systemd's own
+/// start timeout fires from the last extension.
+///
+/// Fifteen minutes, the whole boot's budget before progress was tracked:
+/// the longest stretch with no advance is a single store's directory read,
+/// which at 100K files on a cold disk takes minutes.
+const BOOT_STALL_BOUND: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// What the teardown after the resume drain is given: closing the sessions,
 /// the tunnels (up to 7 s an OpenVPN profile, in parallel), the kill switch.
@@ -693,9 +700,12 @@ pub async fn boot(
     // Tunnel bring-up (up to 30 s a profile) and the resume and torrent-dir
     // scans (minutes at 100K torrents) can outrun any fixed
     // `TimeoutStartSec`. Ask systemd for more time while boot runs — dropped,
-    // and so stopped, when `boot` returns — capped so a wedged boot still
-    // meets the timeout eventually.
-    let _extend_start = sd_notify::TimeoutExtender::start(BOOT_EXTEND_CAP);
+    // and so stopped, when `boot` returns — for as long as the boot keeps
+    // advancing `boot_progress`, so a wedged boot still meets the timeout
+    // `BOOT_STALL_BOUND` after it stops getting further.
+    let boot_progress = sd_notify::Progress::new();
+    let _extend_start =
+        sd_notify::TimeoutExtender::start_while_progressing(BOOT_STALL_BOUND, &boot_progress);
 
     warn_if_descriptors_are_short(&cfg);
     {
@@ -934,6 +944,7 @@ pub async fn boot(
         boot_engine,
     )
     .await?;
+    boot_progress.advance();
     // Every alert-referenced series exists from here, before the alert loop
     // or any request can move one. A profile that failed is seeded too: its
     // engine counters stay at zero, and `profile_boot_failed` says why.
@@ -1171,6 +1182,7 @@ pub async fn boot(
         // A file that cannot be read is skipped, logged and counted by the
         // store; only the directory itself failing to open stops the boot.
         let scan = resume_store.scan(&profile).context("scan resume dir")?;
+        boot_progress.advance();
         load_failures
             .entry(profile.clone())
             .or_default()
@@ -1192,6 +1204,7 @@ pub async fn boot(
                 if shutdown_requested(&mut boot_shutdown) {
                     anyhow::bail!("shutdown requested during the resume scan");
                 }
+                boot_progress.advance();
                 scan_fence.enforce_all(&profile_registry, &metrics);
                 profile_source.hold_alerts(&profile);
             }
@@ -1375,6 +1388,7 @@ pub async fn boot(
             continue;
         };
         let scan = torrent_store.scan(&profile).context("scan torrent dir")?;
+        boot_progress.advance();
         load_failures
             .entry(profile.clone())
             .or_default()
@@ -1389,6 +1403,7 @@ pub async fn boot(
                 if shutdown_requested(&mut boot_shutdown) {
                     anyhow::bail!("shutdown requested during the torrent-dir scan");
                 }
+                boot_progress.advance();
                 scan_fence.enforce_all(&profile_registry, &metrics);
                 profile_source.hold_alerts(&profile);
             }
