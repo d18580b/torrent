@@ -23,6 +23,7 @@ use torrentd_engine::TorrentEngine;
 use torrentd_engine::TorrentHandle;
 
 use crate::profile_state::DesiredStates;
+use crate::profile_state::PacedHolds;
 use crate::profile_state::Record;
 
 /// Mutable per-profile health, updated by the VPN monitor and read by `/profiles`.
@@ -65,6 +66,9 @@ pub struct ProfileEntry {
     /// The gate of every paced resume running in this profile, a lift's and
     /// each resume-all's. See [`ProfileEntry::open_gate`].
     gates: Mutex<Vec<Weak<ResumeGate>>>,
+    /// The torrents a paced set-online paused and has not resumed yet, shared
+    /// by every profile ([`ProfileRegistry::with_holds`]).
+    holds: Arc<PacedHolds>,
 }
 
 /// What the operator paused while one paced resume runs: a pause of the whole
@@ -179,6 +183,7 @@ impl ProfileEntry {
             }),
             resuming: Mutex::new(None),
             gates: Mutex::new(Vec::new()),
+            holds: Arc::new(PacedHolds::in_memory()),
         }
     }
 
@@ -244,6 +249,10 @@ impl ProfileEntry {
     /// torrent, so the walk's pauses stand. A lift's run is also dropped from
     /// the entry, so a kill-switch fence does not take it back and the next
     /// lift does not resume what the operator paused.
+    ///
+    /// What a paced set-online still holds ([`PacedHolds`]) is released too:
+    /// the operator's pause now stands over it, so the next boot does not load
+    /// it unpaused.
     pub fn halt_resumes(&self) {
         for gate in self.live_gates() {
             gate.halt();
@@ -251,14 +260,45 @@ impl ProfileEntry {
         if let Some(run) = self.resuming.lock().take() {
             run.cancelled.store(true, Ordering::SeqCst);
         }
+        if let Err(err) = self.holds.release_all(self.id()) {
+            self.holds_unwritten(&err);
+        }
     }
 
     /// Leave `h` out of every paced resume running in this profile, before a
-    /// pause of that one torrent. Once this returns none of them resumes it.
+    /// pause of that one torrent. Once this returns none of them resumes it,
+    /// and the next boot does not load it unpaused ([`PacedHolds`]).
     pub fn exclude_from_resumes(&self, h: TorrentHandle) {
         for gate in self.live_gates() {
             gate.exclude(h);
         }
+        if let Err(err) = self.holds.release(self.id(), [h.infohash]) {
+            self.holds_unwritten(&err);
+        }
+    }
+
+    /// Take `handles`, which are running again or were left out of a paced
+    /// resume for the operator's pause, out of what a paced set-online holds.
+    /// A no-op, writing nothing, for any it does not hold.
+    pub fn release_holds(&self, handles: &[TorrentHandle]) {
+        if let Err(err) = self
+            .holds
+            .release(self.id(), handles.iter().map(|h| h.infohash))
+        {
+            self.holds_unwritten(&err);
+        }
+    }
+
+    /// Log a [`PacedHolds`] release that could not be written. The record
+    /// then still names those torrents, and the next boot loads them
+    /// unpaused, so a pause the operator made since is not kept across it.
+    fn holds_unwritten(&self, err: &std::io::Error) {
+        tracing::error!(
+            profile_id = %self.id(),
+            error.cause = %err,
+            "could not write the record of what a paced set-online holds; a torrent paused \
+             since may come back running at the next boot",
+        );
     }
 
     fn live_gates(&self) -> Vec<Arc<ResumeGate>> {
@@ -267,10 +307,23 @@ impl ProfileEntry {
         gates.iter().filter_map(Weak::upgrade).collect()
     }
 
-    /// Clear `run` once it has finished, unless another has replaced it.
-    pub fn end_resume(&self, run: &Arc<PacedResume>) {
+    /// Clear `run` once it has finished, and release `reached`, the torrents
+    /// it resumed or left out for a pause, from what a paced set-online holds
+    /// ([`ProfileEntry::release_holds`]) - unless the run was stopped or
+    /// replaced first.
+    ///
+    /// A run that is no longer this profile's has been taken back by a
+    /// set-offline, a fence or a pause, or replaced by a newer lift, and
+    /// whatever stopped it decided what is held from then on: a set-offline
+    /// holds every torrent of the run, and a set-online after it may already
+    /// have held and paused the very torrents this run reached. Releasing
+    /// them then would leave those paused at the next boot. The check and the
+    /// release are made under the lock [`ProfileEntry::take_resume`] and
+    /// [`ProfileEntry::begin_resume`] take, so neither can land between them.
+    pub fn end_resume(&self, run: &Arc<PacedResume>, reached: &[TorrentHandle]) {
         let mut resuming = self.resuming.lock();
         if resuming.as_ref().is_some_and(|r| Arc::ptr_eq(r, run)) {
+            self.release_holds(reached);
             *resuming = None;
         }
     }
@@ -307,6 +360,9 @@ pub struct ProfileRegistry {
     failed: Vec<FailedProfile>,
     /// The operator's online/offline choice for each profile, persisted.
     states: DesiredStates,
+    /// What each profile's paced set-online paused and has not resumed yet,
+    /// persisted. The same `Arc` every entry holds.
+    holds: Arc<PacedHolds>,
 }
 
 /// Why a change of the profiles' online/offline states did not fully apply.
@@ -315,10 +371,58 @@ pub enum StateChangeError {
     /// The record could not be written, so nothing changed.
     #[error("the profiles' online/offline states could not be written: {0}")]
     Persist(#[from] std::io::Error),
-    /// The record changed, and these sessions refused the pause or resume
-    /// that applies it.
-    #[error("{} session(s) did not take the change", .0.len())]
-    Apply(Vec<(ProfileId, EngineError)>),
+    /// The record changed, and these sessions did not take the pause or
+    /// resume that applies it.
+    #[error(
+        "{} session(s) did not take the change: {}",
+        .0.len(),
+        .0.iter().map(|(id, why)| format!("{id}: {why}")).collect::<Vec<_>>().join("; ")
+    )]
+    Apply(Vec<(ProfileId, Refusal)>),
+}
+
+/// Why one session did not take an online/offline change.
+#[derive(Debug, thiserror::Error)]
+pub enum Refusal {
+    /// The session refused the pause or resume.
+    #[error(transparent)]
+    Engine(#[from] EngineError),
+    /// Going online, the record of the torrents its paced resume pauses
+    /// ([`PacedHolds`]) could not be written, so nothing was paused and the
+    /// session stays paused: resuming it unpaced would start every torrent at
+    /// once, and pausing them unrecorded would leave them paused after a
+    /// restart.
+    #[error("the record of what its paced resume holds could not be written: {0}")]
+    Holds(std::io::Error),
+}
+
+/// What setting a profile online needs from outside the registry: which of
+/// its torrents are running, and a way to start their paced resume.
+///
+/// A session-level resume starts every torrent whose own paused flag is clear
+/// at once, so going online pauses each of those first and hands them to
+/// [`OnlinePacing::start`] (`vpn_monitor::OnlinePace` in the daemon).
+pub trait OnlinePacing {
+    /// Every torrent `id` holds, each with whether its own paused flag is
+    /// clear, so the session resuming would start it.
+    fn torrents(&self, id: &ProfileId) -> Vec<(TorrentHandle, bool)>;
+    /// Resume `handles` in `entry` a batch at a time. Called once the
+    /// session has resumed, under the online/offline change's lock.
+    fn start(&self, entry: &ProfileEntry, handles: Vec<TorrentHandle>);
+}
+
+/// [`OnlinePacing`] for a registry whose sessions hold no torrent, in tests.
+#[cfg(test)]
+pub(crate) struct NoTorrents;
+
+#[cfg(test)]
+impl OnlinePacing for NoTorrents {
+    fn torrents(&self, _: &ProfileId) -> Vec<(TorrentHandle, bool)> {
+        Vec::new()
+    }
+    fn start(&self, _: &ProfileEntry, handles: Vec<TorrentHandle>) {
+        assert!(handles.is_empty(), "NoTorrents paces nothing");
+    }
 }
 
 /// A profile that could not be brought up.
@@ -445,10 +549,34 @@ pub(crate) fn test_host_entry(id: &str) -> ProfileEntry {
 
 impl ProfileRegistry {
     pub fn new(entries: Vec<ProfileEntry>) -> Self {
-        Self {
+        let mut registry = Self {
             entries,
             failed: Vec::new(),
             states: DesiredStates::in_memory(),
+            holds: Arc::new(PacedHolds::in_memory()),
+        };
+        registry.share_holds();
+        registry
+    }
+
+    /// The persisted record of what each profile's paced set-online holds.
+    /// The boot reads it as it loads each profile's torrents.
+    pub fn with_holds(mut self, holds: PacedHolds) -> Self {
+        self.holds = Arc::new(holds);
+        self.share_holds();
+        self
+    }
+
+    /// What each profile's paced set-online holds.
+    pub fn holds(&self) -> &PacedHolds {
+        &self.holds
+    }
+
+    /// Hand every entry the registry's record, so a pause in any profile
+    /// releases what it holds there.
+    fn share_holds(&mut self) {
+        for e in &mut self.entries {
+            e.holds = Arc::clone(&self.holds);
         }
     }
 
@@ -504,7 +632,16 @@ impl ProfileRegistry {
     /// A paused session still runs its DHT node, so a host profile with DHT
     /// has it stopped while offline and started again when online. Setting
     /// an unchanged value is a no-op in libtorrent.
-    fn apply_record(&self, record: &Record) -> Vec<(ProfileId, EngineError)> {
+    ///
+    /// A session going online is not resumed bare: that would start every
+    /// torrent in it at once ([`ProfileRegistry::hold_running`]). Going
+    /// offline stops the paced resume still running in the profile, and what
+    /// it had not reached is held for the next time it goes online.
+    fn apply_record(
+        &self,
+        record: &Record,
+        pacing: &dyn OnlinePacing,
+    ) -> Vec<(ProfileId, Refusal)> {
         let dht = |on: bool| Settings {
             enable_dht: Some(on),
             ..Settings::default()
@@ -513,20 +650,49 @@ impl ProfileRegistry {
         for e in &self.entries {
             let has_dht = e.config.dht_enabled();
             let outcome = if record.holds_offline(e.id()) {
-                e.engine.pause_session().and_then(|()| {
-                    if has_dht {
-                        e.engine.apply_settings(&dht(false))
-                    } else {
-                        Ok(())
-                    }
-                })
+                self.hold_unfinished(e);
+                e.engine
+                    .pause_session()
+                    .and_then(|()| {
+                        if has_dht {
+                            e.engine.apply_settings(&dht(false))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .map_err(Refusal::from)
             } else {
-                e.engine.resume_session().and_then(|()| {
-                    if has_dht {
-                        e.engine.apply_settings(&dht(true))
-                    } else {
-                        Ok(())
+                // Only a session paused now is going online; one already
+                // running has nothing to start. One whose state cannot be
+                // read is treated as paused: if it was running, its torrents
+                // are paused and paced back, rather than a paused one
+                // starting every torrent at once.
+                let paced = match e.engine.session_paused() {
+                    Ok(true) => self.hold_running(e, pacing),
+                    Ok(false) => Ok(Vec::new()),
+                    Err(err) => {
+                        tracing::warn!(
+                            profile_id = %e.id(),
+                            error.cause = %err,
+                            "could not read whether the profile's session is paused; pacing \
+                             the resume of its torrents as if it were",
+                        );
+                        self.hold_running(e, pacing)
                     }
+                };
+                paced.and_then(|paced| {
+                    e.engine.resume_session()?;
+                    // The session runs now, so the pace starts whatever the
+                    // DHT call returns: the torrents just paused are held,
+                    // and a retried set-online finds the session running
+                    // and would not reach them.
+                    if !paced.is_empty() {
+                        pacing.start(e, paced);
+                    }
+                    if has_dht {
+                        e.engine.apply_settings(&dht(true))?;
+                    }
+                    Ok(())
                 })
             };
             if let Err(err) = outcome {
@@ -536,19 +702,89 @@ impl ProfileRegistry {
         refused
     }
 
+    /// Before `e`'s paused session resumes: record, then pause, every torrent
+    /// in it that the resume would start, and return those with the ones an
+    /// earlier pace still holds, for [`OnlinePacing::start`] to resume a batch
+    /// at a time.
+    ///
+    /// The session is paused, so these pauses send no announce. The record
+    /// ([`PacedHolds`]) is written first and durably: the pauses are saved in
+    /// resume data, and it is what lets the boot load them unpaused if the
+    /// daemon stops before the pace reaches them. A failed write pauses
+    /// nothing, and the caller leaves the session paused.
+    fn hold_running(
+        &self,
+        e: &ProfileEntry,
+        pacing: &dyn OnlinePacing,
+    ) -> Result<Vec<TorrentHandle>, Refusal> {
+        let held = self.holds.held(e.id());
+        let mut running = Vec::new();
+        let mut paced = Vec::new();
+        for (h, is_running) in pacing.torrents(e.id()) {
+            if is_running {
+                running.push(h);
+                paced.push(h);
+            } else if held.contains(&h.infohash) {
+                paced.push(h);
+            }
+        }
+        self.holds
+            .hold(e.id(), running.iter().map(|h| h.infohash))
+            .map_err(Refusal::Holds)?;
+        for &h in &running {
+            // One that refuses the pause starts with the session, unpaced:
+            // the burst this avoids, one torrent large.
+            if let Err(err) = e.engine.pause_torrent(h) {
+                tracing::warn!(
+                    profile_id = %e.id(),
+                    infohash = %h.infohash,
+                    error.cause = %err,
+                    "could not pause a torrent before the profile went online; it starts with \
+                     the session rather than in its paced batch",
+                );
+            }
+        }
+        Ok(paced)
+    }
+
+    /// Stop the paced resume still running in `e` as it goes offline, and
+    /// hold what it was asked to resume for the next set-online, which paces
+    /// it with the rest. Those it had not reached are paused by it, and would
+    /// otherwise read as the operator's.
+    fn hold_unfinished(&self, e: &ProfileEntry) {
+        let Some(unfinished) = e.take_resume() else {
+            return;
+        };
+        if let Err(err) = self
+            .holds
+            .hold(e.id(), unfinished.iter().map(|h| h.infohash))
+        {
+            tracing::error!(
+                profile_id = %e.id(),
+                torrent_count = unfinished.len(),
+                error.cause = %err,
+                "could not record what a stopped paced resume had not reached; those torrents \
+                 stay paused when the profile is next set online",
+            );
+        }
+    }
+
     /// Change the online/offline record with `edit`, durably, then apply it
     /// to every live session and export it.
     ///
-    /// Blocking: it writes and fsyncs the record and makes one engine call
-    /// per profile. A failed write changes nothing. Changes are serialised,
-    /// so the sessions end each one in the state the record says.
+    /// Blocking: it writes and fsyncs the record and makes engine calls per
+    /// profile. A failed write changes nothing. Changes are serialised, so
+    /// the sessions end each one in the state the record says. A session that
+    /// goes online has its torrents resumed through `pacing`, a batch at a
+    /// time, from a task that outlives this call.
     pub fn change_states(
         &self,
         edit: impl FnOnce(&mut Record),
         metrics: &dyn MetricsSink,
+        pacing: &dyn OnlinePacing,
     ) -> Result<(), StateChangeError> {
         let refused = self.states.change(edit, |record| {
-            let refused = self.apply_record(record);
+            let refused = self.apply_record(record, pacing);
             self.export_record(record, metrics);
             refused
         })?;
@@ -764,12 +1000,12 @@ mod tests {
                 .collect()
         };
 
-        r.change_states(|rec| rec.offline_all = true, &metrics)
+        r.change_states(|rec| rec.offline_all = true, &metrics, &NoTorrents)
             .unwrap();
         assert_eq!(dht_settings(&with_mock), vec![Some(false)]);
         assert!(with_mock.session_paused().unwrap());
 
-        r.change_states(|rec| rec.offline_all = false, &metrics)
+        r.change_states(|rec| rec.offline_all = false, &metrics, &NoTorrents)
             .unwrap();
         assert_eq!(dht_settings(&with_mock), vec![Some(false), Some(true)]);
         assert!(!with_mock.session_paused().unwrap());
@@ -777,9 +1013,266 @@ mod tests {
         r.change_states(
             |rec| rec.set(&ProfileId::new("without"), DesiredState::Offline),
             &metrics,
+            &NoTorrents,
         )
         .unwrap();
         assert!(without_mock.session_paused().unwrap());
         assert!(dht_settings(&without_mock).is_empty());
+    }
+
+    /// An [`OnlinePacing`] over a fixed set of torrents, recording what it
+    /// was asked to pace.
+    struct Fixed {
+        torrents: Vec<(TorrentHandle, bool)>,
+        started: Mutex<Vec<Vec<TorrentHandle>>>,
+    }
+
+    impl OnlinePacing for Fixed {
+        fn torrents(&self, _: &ProfileId) -> Vec<(TorrentHandle, bool)> {
+            self.torrents.clone()
+        }
+        fn start(&self, _: &ProfileEntry, handles: Vec<TorrentHandle>) {
+            self.started.lock().push(handles);
+        }
+    }
+
+    fn handle(b: u8) -> TorrentHandle {
+        TorrentHandle {
+            id: u64::from(b),
+            infohash: torrentd_engine::InfoHash([b; 20]),
+        }
+    }
+
+    /// Going online pauses, after recording them, the torrents the session's
+    /// resume would start, before it resumes, and hands them to the pace with
+    /// what an earlier pace still held. A torrent the operator paused is in
+    /// neither. Going offline stops the pace and holds what it was asked to
+    /// resume, less what the operator paused while it ran.
+    #[test]
+    fn going_online_holds_and_pauses_what_would_start_then_paces_it() {
+        use torrentd_engine::DesiredState;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+
+        let mut e = test_host_entry("p");
+        let mock = Arc::new(MockEngine::new());
+        e.engine = mock.clone();
+        let r = ProfileRegistry::new(vec![e]);
+        let metrics = crate::metrics_sink::PromSink::new();
+        let id = ProfileId::new("p");
+        let entry = r.resolve(&id).active().unwrap();
+        // 1 and 2 run; 3 the operator paused; 4 an earlier pace still holds.
+        r.holds().hold(&id, [handle(4).infohash]).unwrap();
+        let pacing = Fixed {
+            torrents: vec![
+                (handle(1), true),
+                (handle(2), true),
+                (handle(3), false),
+                (handle(4), false),
+            ],
+            started: Mutex::new(Vec::new()),
+        };
+        let set = |state| {
+            r.change_states(|rec| rec.set(&id, state), &metrics, &pacing)
+                .unwrap()
+        };
+
+        set(DesiredState::Offline);
+        assert!(pacing.started.lock().is_empty(), "offline paces nothing");
+        set(DesiredState::Online);
+        let calls = mock.calls();
+        let paused_at = |h: TorrentHandle| {
+            calls
+                .iter()
+                .position(|c| matches!(c, RecordedCall::PauseTorrent(x) if *x == h))
+        };
+        let resumed = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::ResumeSession))
+            .unwrap();
+        for h in [handle(1), handle(2)] {
+            assert!(paused_at(h).unwrap() < resumed);
+        }
+        assert_eq!(paused_at(handle(3)), None);
+        assert_eq!(
+            *pacing.started.lock(),
+            vec![vec![handle(1), handle(2), handle(4)]]
+        );
+        let want: HashSet<_> = [1, 2, 4].map(|b| handle(b).infohash).into();
+        assert_eq!(r.holds().held(&id), want);
+
+        // Online again changes nothing: the session is running.
+        set(DesiredState::Online);
+        assert_eq!(pacing.started.lock().len(), 1);
+
+        // A pace running as the profile goes offline is stopped, and what it
+        // was asked to resume is held, less the one the operator paused.
+        r.holds().release_all(&id).unwrap();
+        let run = entry.begin_resume(vec![handle(5), handle(6)]);
+        entry.exclude_from_resumes(handle(6));
+        set(DesiredState::Offline);
+        assert!(run.cancelled());
+        assert_eq!(r.holds().held(&id), HashSet::from([handle(5).infohash]));
+        // And a pause of the whole profile releases every hold.
+        entry.halt_resumes();
+        assert!(r.holds().held(&id).is_empty());
+    }
+
+    /// A hold that cannot be written pauses nothing and leaves the session
+    /// paused, so it neither starts every torrent at once nor leaves them
+    /// paused unrecorded.
+    #[test]
+    fn a_hold_that_cannot_be_written_leaves_the_session_paused() {
+        use torrentd_engine::DesiredState;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = dir.path().join("state");
+        let (holds, _) = PacedHolds::load(state_dir.join("holds.json"));
+        std::fs::write(&state_dir, b"").unwrap();
+        let mut e = test_host_entry("p");
+        let mock = Arc::new(MockEngine::new());
+        e.engine = mock.clone();
+        let r = ProfileRegistry::new(vec![e]).with_holds(holds);
+        let metrics = crate::metrics_sink::PromSink::new();
+        let id = ProfileId::new("p");
+        let pacing = Fixed {
+            torrents: vec![(handle(1), true)],
+            started: Mutex::new(Vec::new()),
+        };
+        r.change_states(|rec| rec.set(&id, DesiredState::Offline), &metrics, &pacing)
+            .unwrap();
+        let err = r
+            .change_states(|rec| rec.set(&id, DesiredState::Online), &metrics, &pacing)
+            .unwrap_err();
+        assert!(
+            matches!(&err, StateChangeError::Apply(v) if matches!(v[..], [(_, Refusal::Holds(_))])),
+            "{err}"
+        );
+        assert!(mock.session_paused().unwrap());
+        assert!(!mock
+            .calls()
+            .iter()
+            .any(|c| matches!(c, RecordedCall::PauseTorrent(_))));
+        assert!(pacing.started.lock().is_empty());
+    }
+
+    /// A DHT start that fails after the session resumed still starts the
+    /// pace: the torrents the set-online paused are not left paused and held,
+    /// where a retry would not reach them because the session runs.
+    #[test]
+    fn a_failed_dht_start_still_paces_what_the_set_online_paused() {
+        use torrentd_engine::DesiredState;
+        use torrentd_engine::EngineError;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::ProfileNetwork;
+
+        let mut e = test_host_entry("p");
+        e.config.network = ProfileNetwork::Host {
+            listen_interfaces: "0.0.0.0:6881".to_string(),
+            dht: true,
+        };
+        let mock = Arc::new(MockEngine::new());
+        e.engine = mock.clone();
+        let r = ProfileRegistry::new(vec![e]);
+        let metrics = crate::metrics_sink::PromSink::new();
+        let id = ProfileId::new("p");
+        let pacing = Fixed {
+            torrents: vec![(handle(1), true)],
+            started: Mutex::new(Vec::new()),
+        };
+        r.change_states(|rec| rec.set(&id, DesiredState::Offline), &metrics, &pacing)
+            .unwrap();
+        mock.inject_error(
+            "apply_settings",
+            EngineError::MockInjected {
+                op: "apply_settings",
+                message: "boom".into(),
+            },
+        );
+        let err = r
+            .change_states(|rec| rec.set(&id, DesiredState::Online), &metrics, &pacing)
+            .unwrap_err();
+        assert!(
+            matches!(&err, StateChangeError::Apply(v) if matches!(v[..], [(_, Refusal::Engine(_))])),
+            "{err}"
+        );
+        assert!(!mock.session_paused().unwrap());
+        assert_eq!(*pacing.started.lock(), vec![vec![handle(1)]]);
+    }
+
+    /// A session whose paused state cannot be read is paced as if it were
+    /// paused, rather than resumed bare with every torrent at once.
+    #[test]
+    fn an_unreadable_session_state_is_paced_as_paused() {
+        use torrentd_engine::DesiredState;
+        use torrentd_engine::EngineError;
+        use torrentd_engine::MockEngine;
+        use torrentd_engine::RecordedCall;
+
+        let mut e = test_host_entry("p");
+        let mock = Arc::new(MockEngine::new());
+        e.engine = mock.clone();
+        let r = ProfileRegistry::new(vec![e]);
+        let metrics = crate::metrics_sink::PromSink::new();
+        let id = ProfileId::new("p");
+        let pacing = Fixed {
+            torrents: vec![(handle(1), true), (handle(2), false)],
+            started: Mutex::new(Vec::new()),
+        };
+        r.change_states(|rec| rec.set(&id, DesiredState::Offline), &metrics, &pacing)
+            .unwrap();
+        mock.inject_error(
+            "session_paused",
+            EngineError::MockInjected {
+                op: "session_paused",
+                message: "boom".into(),
+            },
+        );
+        r.change_states(|rec| rec.set(&id, DesiredState::Online), &metrics, &pacing)
+            .unwrap();
+        let calls = mock.calls();
+        let paused = calls
+            .iter()
+            .position(|c| matches!(c, RecordedCall::PauseTorrent(x) if *x == handle(1)))
+            .unwrap();
+        let resumed = calls
+            .iter()
+            .rposition(|c| matches!(c, RecordedCall::ResumeSession))
+            .unwrap();
+        assert!(paused < resumed);
+        assert_eq!(*pacing.started.lock(), vec![vec![handle(1)]]);
+        assert_eq!(r.holds().held(&id), HashSet::from([handle(1).infohash]));
+    }
+
+    /// A run that ends releases what it reached only while it is still the
+    /// profile's: one a set-offline took back, or a newer run replaced,
+    /// leaves the holds to whatever stopped it, which may have held those
+    /// same torrents again.
+    #[test]
+    fn only_a_run_still_current_releases_what_it_reached() {
+        let r = ProfileRegistry::new(vec![test_host_entry("p")]);
+        let id = ProfileId::new("p");
+        let entry = r.resolve(&id).active().unwrap();
+        let both = HashSet::from([handle(1).infohash, handle(2).infohash]);
+        r.holds()
+            .hold(&id, [handle(1).infohash, handle(2).infohash])
+            .unwrap();
+
+        let taken = entry.begin_resume(vec![handle(1)]);
+        entry.take_resume();
+        entry.end_resume(&taken, &[handle(1)]);
+        assert_eq!(r.holds().held(&id), both, "taken back: nothing released");
+
+        let replaced = entry.begin_resume(vec![handle(1)]);
+        let newer = entry.begin_resume(vec![handle(1), handle(2)]);
+        entry.end_resume(&replaced, &[handle(1)]);
+        assert_eq!(r.holds().held(&id), both, "replaced: nothing released");
+        assert!(entry.is_resuming(), "and the newer run is still recorded");
+
+        entry.end_resume(&newer, &[handle(1)]);
+        assert_eq!(r.holds().held(&id), HashSet::from([handle(2).infohash]));
+        assert!(!entry.is_resuming());
     }
 }

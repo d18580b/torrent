@@ -11,7 +11,9 @@
 //! leaves either the old record or the new one, and boot reads it before any
 //! session is given a torrent.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 
@@ -20,6 +22,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use torrentd_engine::batch_writer::write_atomic;
 use torrentd_engine::DesiredState;
+use torrentd_engine::InfoHash;
 use torrentd_engine::ProfileId;
 
 /// The file's name in the state directory.
@@ -160,6 +163,142 @@ impl DesiredStates {
     }
 }
 
+/// The holds file's name in the state directory, beside [`PROFILE_STATE_FILE`].
+pub const PACED_HOLDS_FILE: &str = "paced_holds.json";
+
+/// The torrents each profile's paced set-online paused itself, and has not
+/// resumed yet.
+///
+/// Setting an offline profile online resumes its torrents a batch at a time
+/// (`vpn_monitor::OnlinePace`): every torrent that was running is paused
+/// before the session resumes, then resumed in batches. Those pauses are
+/// saved in resume data like any other, and the boot does not clear a saved
+/// pause, since it cannot tell an operator's from this one. This record is
+/// how it tells: it is written before the pauses, and the boot loads every
+/// torrent it names unpaused (`startup`), as it was before the profile went
+/// offline.
+///
+/// An entry leaves the record once its torrent is running again or once the
+/// operator pauses it ([`crate::profile_registry::ProfileEntry::exclude_from_resumes`]
+/// and `halt_resumes`), so the boot never restarts what the operator paused.
+/// The file is `<state_dir>/paced_holds.json`, rewritten whole through
+/// [`write_atomic`] on each change, and only when the record changes.
+#[derive(Debug)]
+pub struct PacedHolds {
+    /// `None` in tests that do not persist.
+    path: Option<PathBuf>,
+    /// Profile id to the info-hashes held, as lowercase hex.
+    held: Mutex<BTreeMap<String, BTreeSet<String>>>,
+}
+
+impl PacedHolds {
+    /// Read `path`. A missing file holds nothing. An unreadable one holds
+    /// nothing either, and says why: the torrents it named stay paused, as
+    /// they would have before this record existed, and the next change
+    /// rewrites it.
+    pub fn load(path: PathBuf) -> (Self, Option<String>) {
+        let (held, unreadable) = match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(held) => (held, None),
+                Err(e) => (BTreeMap::new(), Some(e.to_string())),
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (BTreeMap::new(), None),
+            Err(e) => (BTreeMap::new(), Some(e.to_string())),
+        };
+        (
+            Self {
+                path: Some(path),
+                held: Mutex::new(held),
+            },
+            unreadable,
+        )
+    }
+
+    /// Holding nothing, persisted nowhere.
+    pub fn in_memory() -> Self {
+        Self {
+            path: None,
+            held: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// What `id` holds.
+    pub fn held(&self, id: &ProfileId) -> HashSet<InfoHash> {
+        self.held
+            .lock()
+            .get(id.as_str())
+            .into_iter()
+            .flatten()
+            .filter_map(|hex| InfoHash::from_hex(hex))
+            .collect()
+    }
+
+    /// Whether `id` holds `ih`.
+    pub fn holds(&self, id: &ProfileId, ih: &InfoHash) -> bool {
+        self.held
+            .lock()
+            .get(id.as_str())
+            .is_some_and(|set| set.contains(&ih.to_hex()))
+    }
+
+    /// Add `ihs` to what `id` holds, durably, before the caller pauses them.
+    pub fn hold(&self, id: &ProfileId, ihs: impl IntoIterator<Item = InfoHash>) -> io::Result<()> {
+        self.edit(|held| {
+            let set = held.entry(id.as_str().to_owned()).or_default();
+            let mut changed = false;
+            for ih in ihs {
+                changed |= set.insert(ih.to_hex());
+            }
+            changed
+        })
+    }
+
+    /// Take `ihs` out of what `id` holds, durably.
+    pub fn release(
+        &self,
+        id: &ProfileId,
+        ihs: impl IntoIterator<Item = InfoHash>,
+    ) -> io::Result<()> {
+        self.edit(|held| {
+            let Some(set) = held.get_mut(id.as_str()) else {
+                return false;
+            };
+            let mut changed = false;
+            for ih in ihs {
+                changed |= set.remove(&ih.to_hex());
+            }
+            if set.is_empty() {
+                held.remove(id.as_str());
+            }
+            changed
+        })
+    }
+
+    /// Take everything `id` holds out of the record, durably.
+    pub fn release_all(&self, id: &ProfileId) -> io::Result<()> {
+        self.edit(|held| held.remove(id.as_str()).is_some())
+    }
+
+    /// Apply `edit`, which says whether it changed anything, and write the
+    /// record when it did. On a write error the record is left as it was.
+    fn edit(
+        &self,
+        edit: impl FnOnce(&mut BTreeMap<String, BTreeSet<String>>) -> bool,
+    ) -> io::Result<()> {
+        let mut held = self.held.lock();
+        let mut next = held.clone();
+        if !edit(&mut next) {
+            return Ok(());
+        }
+        if let Some(path) = &self.path {
+            let bytes = serde_json::to_vec(&next).map_err(io::Error::other)?;
+            write_atomic(path, &bytes)?;
+        }
+        *held = next;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +388,47 @@ mod tests {
         assert!(err.is_err());
         assert!(!applied, "a change that was not persisted is not applied");
         assert!(!states.current().holds_offline(&id("b")));
+    }
+
+    /// What a set-online's pace holds is read back by the next boot, per
+    /// profile, and an entry released is gone from it.
+    #[test]
+    fn paced_holds_are_read_back_by_the_next_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PACED_HOLDS_FILE);
+        let (holds, unreadable) = PacedHolds::load(path.clone());
+        assert_eq!(unreadable, None, "a missing file holds nothing");
+        let ih = |b: u8| InfoHash([b; 20]);
+        holds.hold(&id("a"), [ih(1), ih(2), ih(3)]).unwrap();
+        holds.hold(&id("b"), [ih(9)]).unwrap();
+        holds.release(&id("a"), [ih(2)]).unwrap();
+        holds.release_all(&id("b")).unwrap();
+        drop(holds);
+
+        let (reloaded, unreadable) = PacedHolds::load(path);
+        assert_eq!(unreadable, None);
+        assert_eq!(reloaded.held(&id("a")), HashSet::from([ih(1), ih(3)]));
+        assert!(reloaded.held(&id("b")).is_empty());
+    }
+
+    /// An unreadable record holds nothing and says why, and a hold that
+    /// cannot be written leaves the record as it was, so the caller does not
+    /// pause what it could not record.
+    #[test]
+    fn paced_holds_fail_without_claiming_a_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PACED_HOLDS_FILE);
+        std::fs::write(&path, b"{not json").unwrap();
+        let (holds, unreadable) = PacedHolds::load(path);
+        assert!(unreadable.is_some());
+        assert!(holds.held(&id("a")).is_empty());
+
+        let state_dir = dir.path().join("state");
+        let (holds, _) = PacedHolds::load(state_dir.join(PACED_HOLDS_FILE));
+        std::fs::write(&state_dir, b"").unwrap();
+        assert!(holds.hold(&id("a"), [InfoHash([1; 20])]).is_err());
+        assert!(holds.held(&id("a")).is_empty());
+        // Nothing to change writes nothing, so it cannot fail.
+        holds.release(&id("a"), [InfoHash([1; 20])]).unwrap();
     }
 }

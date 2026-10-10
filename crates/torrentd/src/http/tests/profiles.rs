@@ -1030,3 +1030,266 @@ async fn with_no_live_profile_the_list_leads_with_a_failed_one() {
     assert_eq!(out["skipped_profiles"][0]["profile_id"], "acct_b");
     h.assert_conformance();
 }
+
+/// How many of `torrents` started after `engine`'s session was first paused,
+/// replaying its calls. A torrent starts when the session resumes with the
+/// torrent's own paused flag clear, or when the torrent is resumed while the
+/// session runs. `paused` had their own flag set to begin with.
+fn starts(engine: &MockEngine, torrents: &[TorrentHandle], paused: &[TorrentHandle]) -> usize {
+    let mut own: std::collections::HashMap<TorrentHandle, bool> =
+        torrents.iter().map(|h| (*h, paused.contains(h))).collect();
+    let (mut session_paused, mut counting, mut started) = (false, false, 0);
+    for c in engine.calls() {
+        match c {
+            RecordedCall::PauseSession => (session_paused, counting) = (true, true),
+            RecordedCall::ResumeSession => {
+                if session_paused && counting {
+                    started += own.values().filter(|p| !**p).count();
+                }
+                session_paused = false;
+            }
+            RecordedCall::PauseTorrent(h) => {
+                own.insert(h, true);
+            }
+            RecordedCall::ResumeTorrent(h) => {
+                let was_paused = own.insert(h, false) == Some(true);
+                started += usize::from(was_paused && !session_paused && counting);
+            }
+            _ => {}
+        }
+    }
+    started
+}
+
+/// A profile of `n` torrents on its own engine, the first of them paused by
+/// the operator.
+fn paced_profile(n: u8) -> (Harness, Arc<MockEngine>, Vec<TorrentHandle>) {
+    let (a, eng) = live("acct_a", ProfileStatus::Active);
+    let h = Harness::authed(&Coverage::new(), |s| install(s, vec![a], vec![]));
+    let handles: Vec<TorrentHandle> = (1..=n).map(|b| load(&h.state, b, "acct_a")).collect();
+    h.state.state.update(&handles[0].infohash, |st| {
+        st.phase = torrentd_engine::TorrentPhase::Paused;
+    });
+    (h, eng, handles)
+}
+
+/// Setting an offline profile online, by `PATCH` or by online-all, does not
+/// start its torrents all at once with the session: those that were running
+/// start a batch per pace, each window starting no more than a batch, and
+/// one the operator paused stays paused. Until its batch starts it, each is
+/// held in the record a restart loads unpaused.
+#[tokio::test(start_paused = true)]
+async fn setting_a_profile_online_starts_its_torrents_a_batch_per_pace() {
+    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
+    let running = usize::from(n) - 1;
+    let id = ProfileId::new("acct_a");
+    let patch = |state: &str| {
+        (
+            "PATCH",
+            "/v1/profiles/acct_a",
+            Some(json!({ "state": state })),
+        )
+    };
+    for (offline, online) in [
+        (patch("offline"), patch("online")),
+        (
+            ("POST", "/v1/profiles/offline-all", None),
+            ("POST", "/v1/profiles/online-all", None),
+        ),
+    ] {
+        let (h, eng, handles) = paced_profile(n);
+        let mine = handles[0];
+        for (method, path, body) in [offline, online.clone()] {
+            let token = h.tokens.write.clone();
+            h.send(method, path, Some(&token), body)
+                .await
+                .assert_status(kynos::http::StatusCode::OK);
+        }
+        assert_eq!(
+            h.state.profiles.holds().held(&id).len(),
+            running,
+            "{}: every one that was running is held",
+            online.1,
+        );
+        let mut want = 0;
+        while want < running {
+            want = (want + REANNOUNCE_BATCH).min(running);
+            tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+            assert_eq!(starts(&eng, &handles, &[mine]), want, "{}", online.1);
+            tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+        }
+        tokio::time::sleep(REANNOUNCE_PACE).await;
+        assert_eq!(starts(&eng, &handles, &[mine]), running, "{}", online.1);
+        assert_eq!(
+            calls(
+                &eng,
+                |c| matches!(c, RecordedCall::ResumeTorrent(x) if *x == mine)
+            ),
+            0,
+            "{}: the operator's pause stands",
+            online.1,
+        );
+        assert!(
+            h.state.profiles.holds().held(&id).is_empty(),
+            "{}: and nothing is held once every one is running",
+            online.1,
+        );
+    }
+}
+
+/// A torrent whose paced resume the session refuses is still paused by the
+/// pace, so it stays held for the next boot, while the rest are released as
+/// they run.
+#[tokio::test(start_paused = true)]
+async fn a_torrent_the_session_refuses_to_resume_stays_held() {
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let id = ProfileId::new("acct_a");
+    let (h, eng, _) = paced_profile(5);
+    for state in ["offline", "online"] {
+        if state == "online" {
+            // The first resume_torrent after this is the pace's first.
+            eng.inject_error(
+                "resume_torrent",
+                EngineError::MockInjected {
+                    op: "resume_torrent",
+                    message: "boom".into(),
+                },
+            );
+        }
+        let token = h.tokens.write.clone();
+        h.send(
+            "PATCH",
+            "/v1/profiles/acct_a",
+            Some(&token),
+            Some(json!({ "state": state })),
+        )
+        .await
+        .assert_status(kynos::http::StatusCode::OK);
+    }
+    tokio::time::sleep(2 * REANNOUNCE_PACE).await;
+    let entry = h.state.profiles.resolve(&id).active().unwrap();
+    assert!(!entry.is_resuming(), "the pace ended");
+    let refused = eng
+        .calls()
+        .into_iter()
+        .find_map(|c| match c {
+            RecordedCall::ResumeTorrent(x) => Some(x),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        calls(&eng, |c| matches!(c, RecordedCall::ResumeTorrent(_))),
+        4,
+        "every one that was running was asked for",
+    );
+    assert_eq!(
+        h.state.profiles.holds().held(&id),
+        std::collections::HashSet::from([refused.infohash]),
+        "only the refused one is still held",
+    );
+}
+
+/// A run a set-offline stopped notices it only at its next batch. A
+/// set-online before then holds and pauses again the torrents that run
+/// reached, and the stopped run must not release them when it notices:
+/// a restart before the new run reaches them would load them paused.
+#[tokio::test(start_paused = true)]
+async fn a_stopped_run_does_not_release_what_a_newer_set_online_holds() {
+    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
+    let running = usize::from(n) - 1;
+    let id = ProfileId::new("acct_a");
+    let (h, _eng, _) = paced_profile(n);
+    let set = |state: &str| {
+        let token = h.tokens.write.clone();
+        let body = json!({ "state": state });
+        let h = &h;
+        async move {
+            h.send("PATCH", "/v1/profiles/acct_a", Some(&token), Some(body))
+                .await
+                .assert_status(kynos::http::StatusCode::OK);
+        }
+    };
+
+    set("offline").await;
+    set("online").await;
+    tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+    // The first run has resumed its first batch; stop it and start another
+    // before it wakes for its second.
+    set("offline").await;
+    set("online").await;
+    // The first run wakes, sees it was stopped, and ends; the second has not
+    // yet reached its second batch.
+    tokio::time::sleep(REANNOUNCE_PACE * 3 / 4).await;
+    assert_eq!(
+        h.state.profiles.holds().held(&id).len(),
+        running,
+        "the newer run's holds stand until it reaches them",
+    );
+    tokio::time::sleep(3 * REANNOUNCE_PACE).await;
+    assert!(h.state.profiles.holds().held(&id).is_empty());
+}
+
+/// A profile set offline while its torrents are being started stops that
+/// there, and what it had not reached stays held; set online again, those
+/// start with the rest, still a batch per pace.
+#[tokio::test(start_paused = true)]
+async fn setting_a_profile_offline_mid_pace_stops_it_and_holds_the_rest() {
+    use torrentd_engine::port_forward::REANNOUNCE_BATCH;
+    use torrentd_engine::port_forward::REANNOUNCE_PACE;
+
+    let n = u8::try_from(2 * REANNOUNCE_BATCH + 50).unwrap();
+    let running = usize::from(n) - 1;
+    let id = ProfileId::new("acct_a");
+    let (h, eng, handles) = paced_profile(n);
+    let mine = handles[0];
+    let set = |state: &str| {
+        let token = h.tokens.write.clone();
+        let body = json!({ "state": state });
+        let h = &h;
+        async move {
+            h.send("PATCH", "/v1/profiles/acct_a", Some(&token), Some(body))
+                .await
+                .assert_status(kynos::http::StatusCode::OK);
+        }
+    };
+    let resumed = || calls(&eng, |c| matches!(c, RecordedCall::ResumeTorrent(_)));
+
+    set("offline").await;
+    set("online").await;
+    tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+    assert_eq!(resumed(), REANNOUNCE_BATCH, "the first batch");
+    set("offline").await;
+    tokio::time::sleep(3 * REANNOUNCE_PACE).await;
+    assert_eq!(resumed(), REANNOUNCE_BATCH, "nothing after the offline");
+    assert_eq!(
+        h.state.profiles.holds().held(&id).len(),
+        running,
+        "what it had not reached stays held, and the stopped run releases nothing",
+    );
+
+    let before = starts(&eng, &handles, &[mine]);
+    set("online").await;
+    let mut want = 0;
+    while want < running {
+        want = (want + REANNOUNCE_BATCH).min(running);
+        tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+        assert_eq!(starts(&eng, &handles, &[mine]) - before, want);
+        tokio::time::sleep(REANNOUNCE_PACE / 2).await;
+    }
+    tokio::time::sleep(REANNOUNCE_PACE).await;
+    assert!(h.state.profiles.holds().held(&id).is_empty());
+    assert_eq!(
+        calls(
+            &eng,
+            |c| matches!(c, RecordedCall::ResumeTorrent(x) if *x == mine)
+        ),
+        0
+    );
+}
