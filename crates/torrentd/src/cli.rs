@@ -66,7 +66,7 @@ pub enum Command {
         cmd: VpnCmd,
     },
     /// Remove the network state a daemon that did not exit cleanly left
-    /// behind: the `torrentd_ks` kill-switch table, and every WireGuard link a
+    /// behind: its uid's `torrentd_ks_<uid>` kill-switch table, and every WireGuard link a
     /// raised-interface record in the state directory vouches for, with its
     /// `ip rule`s.
     ///

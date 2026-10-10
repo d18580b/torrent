@@ -122,7 +122,7 @@ enable_lsd = false
 # shutdown_drain_secs = 60
 
 # Defence-in-depth kill switch. When true, torrentd installs a fail-closed
-# nftables table (`torrentd_ks`) confining the daemon's own egress to loopback
+# nftables table (`torrentd_ks_<uid>`) confining the daemon's own egress to loopback
 # and its vpn profiles' tunnel interfaces — so if a tunnel drops, the kernel
 # drops the traffic regardless of libtorrent's socket bind or the 30s monitor.
 # Removed cleanly on SIGTERM.

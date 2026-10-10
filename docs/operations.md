@@ -266,7 +266,7 @@ A `last_shutdown.json` that reported `kill_switch_removal_failed` is a
 different case. The exit was graceful and its tunnels were already down; only
 the removal of the nftables kill-switch table failed. The next boot replaces
 the table with `network_kill_switch = true` and removes it with the kill switch
-off. To remove it now: `sudo nft delete table inet torrentd_ks`.
+off. To remove it now: `sudo nft delete table inet torrentd_ks_$(id -u torrentd)`.
 
 ### Housekeeping
 
@@ -366,7 +366,7 @@ what it has a record of:
   anyway.
 - An OpenVPN profile's bring-up clears the rules its `openvpn-<iface>.table`
   record names, as long as the host has not rebooted.
-- The `torrentd_ks` table is replaced when `network_kill_switch = true`. When
+- The daemon's `torrentd_ks_<uid>` table is replaced when `network_kill_switch = true`. When
   it is `false`, for instance because you turned it off to debug, the boot
   removes the stale table before any session opens a socket and warns
   `removed a stale network kill-switch table left by an earlier run`. Left in
@@ -378,9 +378,13 @@ what it has a record of:
   check for the table and remove it by hand:
 
   ```bash
-  sudo nft list table inet torrentd_ks
-  sudo nft delete table inet torrentd_ks
+  sudo nft list table inet torrentd_ks_$(id -u torrentd)
+  sudo nft delete table inet torrentd_ks_$(id -u torrentd)
   ```
+
+  Only the daemon's own uid's table is removed: another uid's
+  `torrentd_ks_<uid>` is another daemon's kill switch, in force (running.md
+  §11, "Two daemons in one network namespace need separate uids").
 
 - A profile no longer in the config is taken down: a WireGuard link its
   `wireguard-<iface>.raised` record vouches for, and an OpenVPN profile's
