@@ -217,7 +217,7 @@ authentication posture, and at least one `[[profile]]`:
 | `log_level` | `info` |
 | `registry_path` | `<resume_dir>/../registry.db`, a SQLite database. A path ending in `.json` names a pre-SQLite registry file: it is imported into a database beside it with a `.db` extension. |
 | `enable_lsd` | `false` (ignored by `vpn` profiles, which disable it unconditionally) |
-| `vpn_handshake_max_age_secs` | `180` |
+| `vpn_handshake_max_age_secs` | `180` — how long a WireGuard profile with torrents that can send may go with no handshake answering them before it is fenced. An idle profile is not judged on its handshake; a quiet seeding one is, so set `PersistentKeepalive` on its peer (§11, drill 5). |
 | `shutdown_drain_secs` | `60` — how long a stop waits for outstanding resume saves (`1`–`3600`). `deploy/torrentd.service`'s `TimeoutStopSec=120` is sized to the default. A larger value is covered by the `EXTEND_TIMEOUT_USEC` the daemon sends while it stops, so `TimeoutStopSec` needs raising only for a stop that must fit without those extensions. |
 | `network_kill_switch` | `false` — **refused as uid 0 and beside an OpenVPN profile**; see §11.6 |
 | `connections_limit`, `file_pool_size`, `aio_threads`, `max_concurrent_http_announces`, `upload_rate_limit` | libtorrent's high-performance-seed preset, adjusted for servers — see `Settings::server_seed_overrides` for each value and why |
@@ -1512,6 +1512,27 @@ On a scratch pool, not your real one.
    paused (or stopped on an error): WireGuard handshakes on the first packet
    sent into the tunnel, and an empty or fully paused profile sends none. A
    poll whose handshake probe could not run leaves the clock where it was.
+
+   A tunnel that has handshaked is fenced with `reason=handshake_stale` on
+   the same condition: its latest handshake is older than
+   `vpn_handshake_max_age_secs`, **and** its profile has had a torrent that
+   can send for longer than that. An empty, fully paused or offline profile's
+   handshake ages without limit, because nothing is sent to renew it, and
+   says nothing about the tunnel; the threshold runs from the first poll
+   that sees a torrent there that can send.
+
+   **Keepalive.** A profile whose torrents can send but are quiet — seeding
+   in a swarm of seeds, with no peer connected and announces 30 minutes
+   apart — sends nothing for longer than the threshold either, and its
+   handshake goes stale with nobody to answer. The daemon cannot tell that
+   from a dead tunnel and fences it. Set `PersistentKeepalive = 25` in the
+   `[Peer]` section of the profile's WireGuard config: the link then sends a
+   keepalive every 25 s, WireGuard re-handshakes at least every two minutes,
+   and the handshake stays inside the default 180 s while the tunnel works.
+   The daemon applies the config as written (`wg setconf`) and adds no
+   keepalive of its own. Without it, raise `vpn_handshake_max_age_secs`
+   above the longest silence you expect, at the cost of detecting a dead
+   tunnel that much later.
 6. **Kill switch.** With `network_kill_switch = true`, `nft list table inet
    torrentd_ks` should show egress confined to loopback and the tunnel
    interfaces for the daemon's uid, one line per tunnel address pairing it

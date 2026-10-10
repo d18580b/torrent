@@ -923,6 +923,8 @@ mod tests {
 
     /// Stand in for the alert loop: once `engine` is asked to rebind, publish
     /// acct_a's listen outcome for `endpoint` (`failure` `None` for success).
+    /// A failure is followed, once the rebind reverts, by the session's
+    /// success on the previous port, 6881, which the revert waits for.
     fn answer_rebind(
         engine: &Arc<MockEngine>,
         listen: &Arc<ListenEvents>,
@@ -932,11 +934,14 @@ mod tests {
         let (engine, listen) = (engine.clone(), listen.clone());
         std::thread::spawn(move || {
             let deadline = Instant::now() + Duration::from_secs(5);
-            while !engine
-                .calls()
-                .iter()
-                .any(|c| matches!(c, torrentd_engine::RecordedCall::ApplySettings(_)))
-            {
+            let binds = || {
+                engine
+                    .calls()
+                    .iter()
+                    .filter(|c| matches!(c, torrentd_engine::RecordedCall::ApplySettings(_)))
+                    .count()
+            };
+            while binds() == 0 {
                 assert!(Instant::now() < deadline, "no rebind was attempted");
                 std::thread::sleep(Duration::from_millis(1));
             }
@@ -945,6 +950,13 @@ mod tests {
                 endpoint,
                 failure.map(str::to_string),
             );
+            if failure.is_some() {
+                while binds() < 2 {
+                    assert!(Instant::now() < deadline, "no revert was attempted");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                listen.publish(&ProfileId::new("acct_a"), "10.2.0.2:6881", None);
+            }
         })
     }
 

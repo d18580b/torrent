@@ -388,13 +388,20 @@ what it has a record of:
   its records. Anything else stays up. Remove it as
   [Retiring a profile](#retiring-a-profile) describes.
 
-**Adoptions (#109, #139).** An adoption writes its registry claim before the
-add. The verify queue is kept in `pool.db`, and the boot queues again every
-adoption that was still waiting in it, in its old order, once the scans have
-run: the boot logs `queued the adoptions left waiting for verification
-again`, and nothing needs clearing. `torrentd_pool_verify_queue_depth` shows
-them draining. An entry the scans loaded was added before the crash and is
-forgotten. An entry whose claim no longer names its profile is dropped.
+**Adoptions (#109, #139, #187).** An adoption writes its registry claim
+before the add. The verify queue is kept in `pool.db`, and the boot queues
+again every adoption that was still waiting in it, in its old order, once the
+scans have run: the boot logs `queued the adoptions left waiting for
+verification again`, and nothing needs clearing.
+`torrentd_pool_verify_queue_depth` shows them draining. An adoption keeps its
+entry until its verdict is recorded, not only until it is added, so a crash
+or a graceful restart while one is still hashing loses nothing: the scans
+load it, libtorrent hashes it again, and the boot logs `an adoption was added
+before the restart and is loaded; waiting for its verification`. It counts
+in `torrentd_pool_verify_in_flight` until that check ends, and its verdict is
+recorded as it would have been without the restart: a pass marks it
+`adopted`, and a failure pauses it and marks it `drifted`. An entry whose
+claim no longer names its profile is dropped.
 
 A torrent the session had added comes back from the `.torrent` and save path
 the add recorded, even with no resume file. What is left is a crash in the
