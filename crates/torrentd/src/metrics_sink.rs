@@ -121,6 +121,10 @@ pub const CATALOGUE: &[Series] = catalogue! {
     // engine: torrents and sessions
     "torrents_added_total" Counter Profile Zero => "Torrents a session accepted.";
     "torrents_removed_total" Counter Profile Zero => "Torrents removed from a session.";
+    "torrent_remove_cleanup_errors_total" Counter Profile ("store": torrentd_engine::metrics::REMOVE_CLEANUP_STORES) Zero =>
+        "Failed attempts to delete a removed torrent's resume file or its .torrent and save \
+         path, or to write or clear the tombstone that stands until they are gone; the next \
+         boot deletes what a tombstone names rather than loading it.";
     "torrent_add_errors_total" Counter Profile Zero => "Adds libtorrent rejected after accepting the call.";
     "torrents_finished_total" Counter Profile Zero => "Torrents that finished downloading.";
     "torrent_errors_total" Counter Profile Zero => "Torrents that entered libtorrent's error state.";

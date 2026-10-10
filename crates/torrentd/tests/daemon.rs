@@ -2263,3 +2263,96 @@ fn a_rescan_with_the_root_or_payload_gone_keeps_a_loaded_torrent_adopted() {
     sigterm(&child.0);
     assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
 }
+
+/// Issue #189: a `DELETE` answered `204` stays deleted across a SIGKILL.
+///
+/// The resume file and `.torrent` used to be deleted only when the alert
+/// loop handled `torrent_removed`, after the answer, with no directory fsync:
+/// a `kill -9` straight after the `204` left the resume file, and the next
+/// boot claimed it and loaded the torrent again, in 3 trials out of 3. Each
+/// round here adds a torrent, waits for its resume file, deletes it, kills
+/// the daemon at once, restarts it, and asks for the torrent.
+#[test]
+#[ignore = "spawns the real daemon + libtorrent; run with --ignored"]
+fn a_delete_answered_204_stays_deleted_across_a_sigkill() {
+    use base64::Engine as _;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path();
+    let addr = &free_http();
+    let cfg = write_config(p, free_port(), addr);
+    struct KillOnDrop(Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let spawn = || {
+        let child = KillOnDrop(
+            Command::new(env!("CARGO_BIN_EXE_torrentd"))
+                .arg("--config")
+                .arg(&cfg)
+                .spawn()
+                .expect("spawn daemon"),
+        );
+        wait_healthy(addr);
+        child
+    };
+    let profile_dir = |store: &str| p.join(store).join(PROFILE);
+
+    let mut child = spawn();
+    for round in 0..3 {
+        let torrent = metainfo(&format!("kill{round}"), "http://127.0.0.1:1/announce");
+        let ih = libtorrent_safe::info_hash_from_torrent(&torrent)
+            .unwrap()
+            .to_hex();
+        let (code, body) = http(
+            addr,
+            "POST",
+            "/v1/torrents",
+            Some(&format!(
+                "{{\"profile_id\":\"{PROFILE}\",\"source\":{{\"kind\":\"metainfo\",\
+                 \"data\":\"{}\"}}}}",
+                base64::engine::general_purpose::STANDARD.encode(&torrent),
+            )),
+        );
+        assert_eq!(code, 201, "round {round}: {body}");
+        let resume = profile_dir("resume").join(format!("{ih}.resume"));
+        assert!(
+            read_within(&resume, Duration::from_secs(10)).is_some(),
+            "round {round}: the add never wrote its resume file",
+        );
+
+        let (code, body) = http(addr, "DELETE", &format!("/v1/torrents/{ih}"), None);
+        assert_eq!(code, 204, "round {round}: {body}");
+        // SIGKILL: no drain, no alert handled after this.
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        for leftover in [
+            resume.clone(),
+            profile_dir("torrents").join(format!("{ih}.torrent")),
+            profile_dir("torrents").join(format!("{ih}.save_path")),
+        ] {
+            assert!(
+                !leftover.exists(),
+                "round {round}: {} outlived the 204",
+                leftover.display()
+            );
+        }
+
+        child = spawn();
+        let (code, body) = http(addr, "GET", &format!("/v1/torrents/{ih}"), None);
+        assert_eq!(
+            code, 404,
+            "round {round}: the deleted torrent came back: {body}"
+        );
+        assert!(
+            !profile_dir("resume").join(format!("{ih}.removed")).exists(),
+            "round {round}: the boot did not spend the tombstone",
+        );
+    }
+
+    sigterm(&child.0);
+    assert!(wait_exit(&mut child.0, Duration::from_secs(30)));
+}

@@ -2297,8 +2297,151 @@ async fn a_torrent_re_added_right_after_delete_keeps_its_files_and_entry() {
         "the new add's save path, not the removed torrent's"
     );
     let st = h.state.state.get(&ih).expect("the new torrent is tracked");
-    assert_eq!((st.handle, st.profile_id), (new, p));
+    assert_eq!((st.handle, st.profile_id.clone()), (new, p.clone()));
     assert_eq!(h.state.registry.lookup(&ih).unwrap().as_str(), "p");
+    assert!(
+        h.state.resume.tombstones(&p).unwrap().is_empty(),
+        "the removal's tombstone is spent, or the next boot deletes the re-add's files"
+    );
+}
+
+#[tokio::test]
+async fn delete_removes_the_stores_files_before_it_answers_and_the_removal_settles_its_tombstone() {
+    // The files used to go only when the session's `torrent_removed_alert`
+    // was handled, after the 204: a SIGKILL in between left the resume file
+    // for the next boot to load the torrent from.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p)
+    });
+    let engine = engine.unwrap();
+    let bytes = torrent_bytes('d');
+    let ih = libtorrent_safe::info_hash_from_torrent(&bytes).unwrap();
+    load(&h.state, &engine, ih, "p", TorrentPhase::Seeding);
+    let p = ProfileId::new("p");
+    h.state.torrents.write(&p, &ih, &bytes).unwrap();
+    h.state.torrents.write_save_path(&p, &ih, "/old").unwrap();
+    h.state.resume.write(&p, &ih, b"resume").unwrap();
+
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ih)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    assert!(!h.state.resume.exists(&p, &ih).unwrap());
+    assert_eq!(h.state.torrents.read(&p, &ih).unwrap(), None);
+    assert_eq!(h.state.torrents.read_save_path(&p, &ih).unwrap(), None);
+    assert_eq!(
+        h.state.resume.tombstones(&p).unwrap(),
+        vec![ih],
+        "the tombstone stands until the removal alert, the torrent's last"
+    );
+
+    // A resume save libtorrent queued before the removal lands after the
+    // request's delete; the removal's handler deletes it and spends the
+    // tombstone.
+    h.state.resume.write(&p, &ih, b"late").unwrap();
+    deliver(&h, "p", &removed(ih));
+    assert!(!h.state.resume.exists(&p, &ih).unwrap());
+    assert!(h.state.resume.tombstones(&p).unwrap().is_empty());
+}
+
+/// A resume store whose tombstone writes fail and whose files delete.
+#[derive(Debug, Default)]
+struct UntombstonableResume(torrentd_engine::MemoryResumeStore);
+impl torrentd_engine::ResumeStore for UntombstonableResume {
+    fn scan(
+        &self,
+        p: &ProfileId,
+    ) -> Result<
+        torrentd_engine::resume_store::Scan<libtorrent_safe::ResumeData>,
+        torrentd_engine::resume_store::ResumeStoreError,
+    > {
+        self.0.scan(p)
+    }
+    fn write(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+        d: &[u8],
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.write(p, ih, d)
+    }
+    fn delete(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.delete(p, ih)
+    }
+    fn exists(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<bool, torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.exists(p, ih)
+    }
+    fn write_tombstone(
+        &self,
+        _: &ProfileId,
+        _: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        Err(std::io::Error::from(std::io::ErrorKind::StorageFull).into())
+    }
+    fn clear_tombstone(
+        &self,
+        p: &ProfileId,
+        ih: &InfoHash,
+    ) -> Result<(), torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.clear_tombstone(p, ih)
+    }
+    fn tombstones(
+        &self,
+        p: &ProfileId,
+    ) -> Result<Vec<InfoHash>, torrentd_engine::resume_store::ResumeStoreError> {
+        self.0.tombstones(p)
+    }
+}
+
+#[tokio::test]
+async fn a_delete_whose_tombstone_write_fails_counts_it_and_still_answers_204() {
+    // A full disk must not block a delete, which is often how an operator
+    // frees space: the failed tombstone write is counted, and the request's
+    // own deletes carry the durability.
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = None;
+    let h = Harness::authed(&Coverage::new(), |s| {
+        engine = Some(fixture(s, dir.path()).p);
+        s.resume = Arc::new(UntombstonableResume::default());
+    });
+    let engine = engine.unwrap();
+    let bytes = torrent_bytes('t');
+    let ih = libtorrent_safe::info_hash_from_torrent(&bytes).unwrap();
+    load(&h.state, &engine, ih, "p", TorrentPhase::Seeding);
+    let p = ProfileId::new("p");
+    h.state.torrents.write(&p, &ih, &bytes).unwrap();
+    h.state.torrents.write_save_path(&p, &ih, "/old").unwrap();
+    h.state.resume.write(&p, &ih, b"resume").unwrap();
+
+    h.write("DELETE", &format!("/v1/torrents/{}", hex(ih)))
+        .await
+        .assert_status(StatusCode::NO_CONTENT);
+
+    assert!(!h.state.resume.exists(&p, &ih).unwrap());
+    assert_eq!(h.state.torrents.read(&p, &ih).unwrap(), None);
+    assert_eq!(h.state.torrents.read_save_path(&p, &ih).unwrap(), None);
+    assert!(h.state.resume.tombstones(&p).unwrap().is_empty());
+    assert!(h.state.registry.lookup(&ih).is_none());
+    let text = String::from_utf8(h.state.metrics.render()).unwrap();
+    let counted: Vec<_> = text
+        .lines()
+        .filter(|l| l.starts_with("torrentd_torrent_remove_cleanup_errors_total{"))
+        .collect();
+    assert_eq!(
+        counted,
+        ["torrentd_torrent_remove_cleanup_errors_total{profile_id=\"p\",store=\"tombstone\"} 1"],
+        "only the tombstone write failed: {text}"
+    );
 }
 
 #[tokio::test]

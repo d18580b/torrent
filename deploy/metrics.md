@@ -31,6 +31,7 @@ hold.
 | --- | --- | --- | --- | --- | --- |
 | `torrentd_torrents_added_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents a session accepted. |
 | `torrentd_torrents_removed_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents removed from a session. |
+| `torrentd_torrent_remove_cleanup_errors_total` | counter | `profile_id`; `store`: `resume`, `torrent`, `tombstone` | each profile | from boot, at 0 | Failed attempts to delete a removed torrent's resume file or its .torrent and save path, or to write or clear the tombstone that stands until they are gone; the next boot deletes what a tombstone names rather than loading it. |
 | `torrentd_torrent_add_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Adds libtorrent rejected after accepting the call. |
 | `torrentd_torrents_finished_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents that finished downloading. |
 | `torrentd_torrent_errors_total` | counter | `profile_id` | each profile | from boot, at 0 | Torrents that entered libtorrent's error state. |
