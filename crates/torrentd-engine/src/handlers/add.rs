@@ -11,7 +11,6 @@ use tracing::info;
 use tracing::warn;
 
 use crate::handlers::HandlerCtx;
-use crate::state::TorrentState;
 
 pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     match alert {
@@ -42,16 +41,11 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
                 );
                 return;
             };
-            let now = ctx.clock.now();
-            ctx.state.insert(
-                handle.infohash,
-                TorrentState::newly_added(handle, ctx.profile_id.clone(), now),
-            );
-            hold_if_fenced(handle, ctx);
-            queue_first_resume_save(handle, ctx);
+            let fresh = track(handle, ctx);
             info!(
                 target: "torrentd_engine::handler::add",
                 infohash = %handle.infohash,
+                already_tracked = !fresh,
                 "torrent added",
             );
             ctx.metrics.inc_counter(
@@ -134,6 +128,25 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
     }
 }
 
+/// Take a torrent the session added into the state map, hold it if its
+/// profile is fenced, and queue its first resume save. Returns whether the map
+/// had no entry for it yet.
+///
+/// For its `add_torrent_alert`, and for a torrent the session holds whose
+/// alert libtorrent dropped (`handlers::dropped`). Idempotent: where the boot
+/// scan already put the torrent in the map from the handle `add_torrent`
+/// returned, the entry is kept rather than reset. The hold and the save are
+/// asked again either way; a pause is idempotent, and a save already queued
+/// or in flight is not asked for twice.
+pub fn track(handle: TorrentHandle, ctx: &HandlerCtx<'_>) -> bool {
+    let fresh = ctx
+        .state
+        .track_added(handle, &ctx.profile_id, ctx.clock.now());
+    hold_if_fenced(handle, ctx);
+    queue_first_resume_save(handle, ctx);
+    fresh
+}
+
 /// Make an add durable now rather than at the next 30-minute sweep or the
 /// shutdown drain, where the torrent has no resume file yet: until one exists,
 /// a crash leaves the registry claiming a torrent no session reloads. That is
@@ -171,10 +184,11 @@ fn queue_first_resume_save(handle: TorrentHandle, ctx: &HandlerCtx<'_>) {
 /// Pause a torrent just inserted into the state map if its profile is fenced.
 ///
 /// The VPN monitor fences a profile by pausing the torrents the state map
-/// holds, and a torrent enters the map only here, when its `add_torrent_alert`
-/// is handled. One the session added before the fence and whose alert lands
-/// after it was not in the map the fence walked, so without this it would seed
-/// on in a profile whose tunnel is down.
+/// holds, and outside the boot scans a torrent enters the map only through
+/// [`track`]: when its `add_torrent_alert` is handled, or when an overflow
+/// that dropped it is reconciled. One the session added before the fence and
+/// whose alert lands after it was not in the map the fence walked, so without
+/// this it would seed on in a profile whose tunnel is down.
 ///
 /// The fence marks the profile before it walks the map, and this inserts
 /// before it asks. The `SeqCst` fence here pairs with the one in the VPN
@@ -510,6 +524,54 @@ mod tests {
         // Queued for the dispatcher, not left for the 30-minute sweep, and
         // without `ONLY_IF_MODIFIED`: nothing is on disk for it yet.
         assert_eq!(state.pending_resume_count(), 1);
+        assert_eq!(
+            state.dispatch_resume_saves(8),
+            vec![(ih, ResumeFlags::empty())],
+        );
+    }
+
+    /// The boot scan tracked the torrent from the handle `add_torrent`
+    /// returned, and a state update reached its entry before its
+    /// `add_torrent_alert` was handled. The alert keeps the entry rather than
+    /// resetting it, and still queues the first save.
+    #[test]
+    fn an_add_alert_for_a_torrent_already_tracked_keeps_its_entry() {
+        use crate::state::TorrentPhase;
+
+        let ih = InfoHash([0x82; 20]);
+        let profile = ProfileId::new("p");
+        let state = StateMap::new();
+        let resume = MemoryResumeStore::new();
+        let torrents = MemoryTorrentStore::new();
+        let metrics = NoopSink;
+        let clock = MockClock::new();
+        let engine: Arc<dyn TorrentEngine> = Arc::new(MockEngine::new());
+        let th = TorrentHandle {
+            id: 1,
+            infohash: ih,
+        };
+        assert!(state.track_added(th, &profile, clock.now()));
+        state.update(&ih, |st| {
+            st.phase = TorrentPhase::Seeding;
+            st.total_uploaded = 5;
+        });
+
+        let mut ctx = HandlerCtx {
+            state: &state,
+            resume: &resume,
+            torrents: &torrents,
+            metrics: &metrics,
+            clock: &clock,
+            engine: &engine,
+            profile_fenced: None,
+            profile_id: profile.clone(),
+            span: tracing::info_span!("test"),
+        };
+        handle(&add_alert(ih, Some(th), 0), &mut ctx);
+
+        let st = state.get(&ih).expect("still tracked");
+        assert_eq!((st.handle, &st.profile_id), (th, &profile));
+        assert_eq!((st.phase, st.total_uploaded), (TorrentPhase::Seeding, 5));
         assert_eq!(
             state.dispatch_resume_saves(8),
             vec![(ih, ResumeFlags::empty())],

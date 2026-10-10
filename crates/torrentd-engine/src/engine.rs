@@ -122,6 +122,15 @@ pub trait TorrentEngine: Send + Sync + std::fmt::Debug {
     ) -> Result<Option<FilePage>, EngineError>;
     /// The torrent's trackers, tier by tier, with their announce state.
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError>;
+    /// Every torrent the session holds, as the handles
+    /// [`TorrentEngine::add_torrent`] returned for them, in no order.
+    ///
+    /// Asked by the alert loop when libtorrent reports it dropped
+    /// `add_torrent_alert`s: the state map learns of a torrent from that
+    /// alert, so a torrent whose alert was lost would otherwise seed with
+    /// nothing tracking it. A torrent whose removal the session accepted is
+    /// not listed, though its `torrent_removed_alert` may still be queued.
+    fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError>;
     /// Destroy the session now, closing every peer and tracker socket, and
     /// answer every later call with [`EngineError::Shutdown`].
     ///
@@ -211,6 +220,9 @@ impl<T: TorrentEngine + ?Sized> TorrentEngine for Arc<T> {
     }
     fn torrent_trackers(&self, h: TorrentHandle) -> Result<Vec<TrackerEntry>, EngineError> {
         (**self).torrent_trackers(h)
+    }
+    fn torrents(&self) -> Result<Vec<TorrentHandle>, EngineError> {
+        (**self).torrents()
     }
     fn close(&self) {
         (**self).close()
