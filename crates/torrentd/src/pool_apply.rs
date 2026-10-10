@@ -448,6 +448,7 @@ fn apply_inner(
     // actually moved.
     let mut owned_size = ownership_size(pool, state);
     let mut guards = DeleteGuards::default();
+    let bucket = plan_trash_bucket(plan.id, plan.created_at);
 
     for step in steps {
         if step.status == step_status::DONE {
@@ -535,8 +536,10 @@ fn apply_inner(
         }
         let result = match step.op.as_str() {
             ops::MOVE_TORRENT => move_torrent(pool, source, state, &step, stop),
-            ops::DELETE_FILE => delete_file(pool, Path::new(&step.src), plan_id, &mut guards)
-                .map_err(StepFailure::Failed),
+            ops::DELETE_FILE => {
+                delete_file(pool, Path::new(&step.src), plan_id, &bucket, &mut guards)
+                    .map_err(StepFailure::Failed)
+            }
             other => Err(StepFailure::Failed(format!(
                 "unknown plan operation {other:?}"
             ))),
@@ -1115,12 +1118,14 @@ fn sync_parents(paths: &[&Path]) -> Result<(), String> {
 /// step instead of carrying it onto another volume, and the file is examined
 /// and moved through that parent's descriptor rather than by name from `/`.
 /// It is moved — `renameat2(RENAME_NOREPLACE)` — into
-/// `<root>/.torrentd-trash/<plan id>/`, never unlinked, and both directories
-/// are fsynced so the move survives a crash.
+/// `<root>/.torrentd-trash/<bucket>/`, never unlinked, and both directories
+/// are fsynced so the move survives a crash. `bucket` is the plan's
+/// [`plan_trash_bucket`].
 fn delete_file(
     pool: &PoolService,
     path: &Path,
     plan_id: i64,
+    bucket: &str,
     guards: &mut DeleteGuards,
 ) -> Result<(), String> {
     let Some((root_id, root, rel)) = pool.roots().iter().find_map(|(id, root)| {
@@ -1167,14 +1172,28 @@ fn delete_file(
     }
 
     let stamp = (row.size, row.mtime_ns, row.ino, row.dev);
-    move_into_trash(&root, path, &rel, stamp, &plan_id.to_string())?;
+    move_into_trash(&root, path, &rel, stamp, bucket)?;
     info!(
         target: "torrentd::pool::apply",
         plan_id,
+        bucket,
         path = %path.display(),
         "moved to the trash",
     );
     Ok(())
+}
+
+/// The directory under `<root>/.torrentd-trash/` a delete plan's files go
+/// to: `<plan id>-<created_at>`, the plan's id and the unix second it was
+/// created.
+///
+/// The id alone is not enough. Since schema v7 a discarded plan's id is never
+/// handed out again, but restoring an older `pool.db` takes the id sequence
+/// back with it, so the next plan can repeat an id whose trash is still on
+/// disk. The creation second ties the directory to one plan: a repeated id is
+/// created later than the plan that first held it.
+fn plan_trash_bucket(plan_id: i64, created_at: i64) -> String {
+    format!("{plan_id}-{created_at}")
 }
 
 /// Move the file at `rel` under `root` (`path` is the two joined, for
@@ -3003,7 +3022,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&f, vec![9u8; 48]).unwrap();
 
-        let e = delete_file(&pool, &f, 1, &mut Default::default()).unwrap_err();
+        let e = delete_file(&pool, &f, 1, "1-0", &mut Default::default()).unwrap_err();
         assert!(e.contains("changed since the scan"), "got {e}");
         assert!(f.exists());
     }
@@ -3018,19 +3037,19 @@ mod tests {
         pool.scan().unwrap();
 
         let sneaked = write(&root, "after/the/scan.bin", 8);
-        let e = delete_file(&pool, &sneaked, 1, &mut Default::default()).unwrap_err();
+        let e = delete_file(&pool, &sneaked, 1, "1-0", &mut Default::default()).unwrap_err();
         assert!(e.contains("never sanctioned"), "got {e}");
         assert!(sneaked.exists());
 
         let outside = dir.path().join("elsewhere.bin");
         std::fs::write(&outside, b"x").unwrap();
-        let e = delete_file(&pool, &outside, 1, &mut Default::default()).unwrap_err();
+        let e = delete_file(&pool, &outside, 1, "1-0", &mut Default::default()).unwrap_err();
         assert!(e.contains("outside every managed root"), "got {e}");
         assert!(outside.exists());
 
         // A traversal component walks back out of the root once resolved.
         let escaping = root.join("misc/../../elsewhere.bin");
-        let e = delete_file(&pool, &escaping, 1, &mut Default::default()).unwrap_err();
+        let e = delete_file(&pool, &escaping, 1, "1-0", &mut Default::default()).unwrap_err();
         assert!(e.contains("outside every managed root"), "got {e}");
         assert!(outside.exists());
     }
@@ -3084,14 +3103,14 @@ mod tests {
 
         // The executor still refuses it, for a plan built before the claim.
         let mut guards = DeleteGuards::default();
-        let e = delete_file(&pool, &alias, 1, &mut guards).unwrap_err();
+        let e = delete_file(&pool, &alias, 1, "1-0", &mut guards).unwrap_err();
         assert!(
             e.contains("same file") && e.contains("a torrent claims"),
             "got {e}"
         );
         assert!(alias.exists() && claimed_file.exists());
 
-        delete_file(&pool, &orphan, 1, &mut guards).expect("an unrelated orphan is deleted");
+        delete_file(&pool, &orphan, 1, "1-0", &mut guards).expect("an unrelated orphan is deleted");
         assert!(!orphan.exists());
     }
 
@@ -3616,10 +3635,10 @@ mod tests {
 
         let pool = service(dir.path(), true);
         pool.scan().unwrap();
-        delete_file(&pool, &f, 42, &mut Default::default()).unwrap();
+        delete_file(&pool, &f, 42, "42-1700000000", &mut Default::default()).unwrap();
 
         assert!(!f.exists());
-        let trashed = root.join(".torrentd-trash/42/misc/old.bin");
+        let trashed = root.join(".torrentd-trash/42-1700000000/misc/old.bin");
         assert_eq!(std::fs::read(&trashed).unwrap(), vec![7u8; 32]);
 
         pool.scan().unwrap();
@@ -3628,6 +3647,130 @@ mod tests {
         assert!(
             orphans.is_empty(),
             "the trash is never indexed: {orphans:?}"
+        );
+    }
+
+    /// A delete plan over the whole root, created at `created_at`.
+    fn delete_plan_at(pool: &PoolService, created_at: i64) -> i64 {
+        let root_id = pool.roots()[0].0;
+        let spec = torrentd_pool::plan::PlanSpec::DeleteOrphans {
+            root_id,
+            prefix: String::new(),
+        };
+        let steps = pool
+            .with_store(|st| torrentd_pool::plan::build(st, &spec, |id| pool.root_path_of(id)))
+            .unwrap()
+            .expect("plan builds");
+        let id = pool
+            .with_store(|st| st.create_plan("delete_orphans", "{}", created_at))
+            .unwrap();
+        pool.with_store_mut(|st| st.add_plan_steps(id, &steps))
+            .unwrap();
+        id
+    }
+
+    /// Every file under `dir`, relative to it.
+    fn files_under(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, at: &Path, out: &mut Vec<String>) {
+            for e in std::fs::read_dir(at).unwrap() {
+                let p = e.unwrap().path();
+                if p.is_dir() {
+                    walk(base, &p, out);
+                } else {
+                    out.push(p.strip_prefix(base).unwrap().display().to_string());
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+
+    /// Discard a delete plan once it has applied, then build another: the
+    /// second plan gets an id of its own, so its files go to a trash
+    /// directory of their own and emptying either never touches the other.
+    #[test]
+    fn a_plan_built_after_a_discarded_one_trashes_into_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        write(&root, "a/one.bin", 16);
+        let pool = service(dir.path(), true);
+        let (source, state) = engine_and_state();
+        pool.scan().unwrap();
+
+        let first = delete_plan_at(&pool, 0);
+        let out = apply(&pool, &source, &state, first, &|| false).unwrap();
+        assert_eq!(out.status, "applied", "{out:?}");
+        pool.with_store_mut(|st| st.delete_plan(first)).unwrap();
+
+        write(&root, "a/two.bin", 16);
+        pool.scan().unwrap();
+        let second = delete_plan_at(&pool, 0);
+        assert_ne!(
+            first, second,
+            "the discarded plan's id was handed out again"
+        );
+        let out = apply(&pool, &source, &state, second, &|| false).unwrap();
+        assert_eq!(out.status, "applied", "{out:?}");
+
+        let trash = root.join(torrentd_pool::plan::TRASH_DIR);
+        assert_eq!(
+            files_under(&trash.join(plan_trash_bucket(first, 0))),
+            ["a/one.bin"]
+        );
+        assert_eq!(
+            files_under(&trash.join(plan_trash_bucket(second, 0))),
+            ["a/two.bin"]
+        );
+    }
+
+    /// Restoring an older `pool.db` takes the plan id sequence back with it,
+    /// so the next plan repeats the id of one whose trash is still on disk.
+    /// Its trash directory is still its own.
+    #[test]
+    fn a_plan_that_repeats_an_id_after_a_restore_trashes_into_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let db = dir.path().join("pool.db");
+        let backup = dir.path().join("pool.db.backup");
+        write(&root, "a/one.bin", 16);
+        let (source, state) = engine_and_state();
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("VACUUM INTO ?1", [backup.to_str().unwrap()])
+            .unwrap();
+        let first = delete_plan_at(&pool, 1_700_000_000);
+        let out = apply(&pool, &source, &state, first, &|| false).unwrap();
+        assert_eq!(out.status, "applied", "{out:?}");
+        drop(pool);
+
+        // The restore: the backup, taken before the first plan existed,
+        // replaces the index and its write-ahead log.
+        for side in ["pool.db-wal", "pool.db-shm"] {
+            let _ = std::fs::remove_file(dir.path().join(side));
+        }
+        std::fs::rename(&backup, &db).unwrap();
+
+        let pool = service(dir.path(), true);
+        write(&root, "a/two.bin", 16);
+        pool.scan().unwrap();
+        let second = delete_plan_at(&pool, 1_700_000_500);
+        assert_eq!(second, first, "the restore took the id sequence back");
+        let out = apply(&pool, &source, &state, second, &|| false).unwrap();
+        assert_eq!(out.status, "applied", "{out:?}");
+
+        let trash = root.join(torrentd_pool::plan::TRASH_DIR);
+        assert_eq!(
+            files_under(&trash.join(plan_trash_bucket(first, 1_700_000_000))),
+            ["a/one.bin"]
+        );
+        assert_eq!(
+            files_under(&trash.join(plan_trash_bucket(second, 1_700_000_500))),
+            ["a/two.bin"]
         );
     }
 
@@ -3834,7 +3977,7 @@ mod tests {
         std::fs::rename(root.join("misc"), dir.path().join("moved-away")).unwrap();
         std::os::unix::fs::symlink(&outside, root.join("misc")).unwrap();
 
-        assert!(delete_file(&pool, &f, 1, &mut Default::default()).is_err());
+        assert!(delete_file(&pool, &f, 1, "1-0", &mut Default::default()).is_err());
         assert!(outside.join("victim.bin").exists());
     }
 }
