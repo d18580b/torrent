@@ -78,9 +78,13 @@ pub fn handle(alert: &Alert, ctx: &mut HandlerCtx<'_>) {
             // before the next update down the resume path, where `resume()`
             // is a no-op on an unpaused torrent that still counts as an
             // attempt and backs off, so peers whose reads keep failing could
-            // push the re-check out towards hourly. A check the retry started
-            // moves the torrent to `Checking` first, so a `file_error` from
-            // that check is still recorded as libtorrent's error-and-pause.
+            // push the re-check out towards hourly. Every re-check moves a
+            // torrent in `DiskError` to `Checking` first - the retry's own,
+            // the operator's `POST /v1/torrents/{ih}/recheck` and the pool's
+            // re-hash (`torrentd`'s `force_recheck_marking_checking`) - so a
+            // `file_error` from a check that fails before any update is still
+            // recorded as libtorrent's error-and-pause. A check started
+            // without that mark would have its failure read as a peer read.
             ctx.state.update(&ih, |st| {
                 let still_serving = st.phase == TorrentPhase::DiskError && !st.has_error;
                 st.phase = TorrentPhase::DiskError;
