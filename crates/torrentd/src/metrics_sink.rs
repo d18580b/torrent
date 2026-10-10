@@ -224,6 +224,21 @@ pub const CATALOGUE: &[Series] = catalogue! {
     "boot_disk_errors" Gauge Profile ("op": &[]) OnFirstEvent =>
         "disk_errors_total as of the first scrape, for each operation the boot counted one \
          under; fixed for the life of the process.";
+    "boot_resume_save_failures" Gauge Profile Owner("always") =>
+        "resume_save_failures_total as of the first scrape, which already holds what the boot \
+         counted; fixed for the life of the process.";
+    "boot_resume_save_dispatch_errors" Gauge Profile Owner("always") =>
+        "resume_save_dispatch_errors_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
+    "boot_torrent_file_persist_errors" Gauge Profile ("source": &["metadata", "api"]) Owner("always") =>
+        "torrent_file_persist_errors_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
+    "boot_fence_pause_errors" Gauge Profile Owner("always") =>
+        "profile_fence_pause_errors_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
+    "boot_disk_error_retry_errors" Gauge Profile Owner("always") =>
+        "disk_error_retry_errors_total as of the first scrape, which already holds what the \
+         boot counted; fixed for the life of the process.";
     // libtorrent session stats
     "libtorrent_net_sent_payload_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_payload_bytes.";
     "libtorrent_net_sent_bytes_total" Counter Profile OnFirstEvent => "libtorrent net.sent_bytes.";
@@ -376,8 +391,12 @@ pub struct BootCount {
 /// could not translate, and session alerts from the scans' backlog, and the stores and their
 /// directory fsyncs are written by both. The same backlog holds the adds
 /// libtorrent rejected, the torrents that entered its error state, the file
-/// errors it raised, the resume data it produced that could not be written,
-/// and the trackers' first answers.
+/// errors it raised, the resume saves it failed or could not be asked for and
+/// the resume data it produced that could not be written, and the trackers'
+/// first answers. The torrent-dir scan copies the pool library's .torrent
+/// files into the torrent store, and the boot pauses a scanned torrent whose
+/// profile is fenced. The disk-error retry's first resume comes a minute
+/// after the error, which a scrape interval that long can still precede.
 ///
 /// `disk_errors_total` appears with its first event, so its gauge does too:
 /// only for the operations the boot counted one under. `tracker_alerts_total`
@@ -436,6 +455,31 @@ pub const BOOT_COUNTS: &[BootCount] = &[
     BootCount {
         counter: "disk_errors_total",
         gauge: "boot_disk_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "resume_save_failures_total",
+        gauge: "boot_resume_save_failures",
+        only: None,
+    },
+    BootCount {
+        counter: "resume_save_dispatch_errors_total",
+        gauge: "boot_resume_save_dispatch_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "torrent_file_persist_errors_total",
+        gauge: "boot_torrent_file_persist_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "profile_fence_pause_errors_total",
+        gauge: "boot_fence_pause_errors",
+        only: None,
+    },
+    BootCount {
+        counter: "disk_error_retry_errors_total",
+        gauge: "boot_disk_error_retry_errors",
         only: None,
     },
 ];
@@ -1052,6 +1096,14 @@ mod tests {
         sink.add_counter("tracker_alerts_total", 9, &tracker("error"));
         let disk = |op| [("profile_id", "a"), ("op", op)];
         sink.add_counter("disk_errors_total", 2, &disk("file_open"));
+        sink.inc_counter("resume_save_failures_total", &p);
+        sink.add_counter("resume_save_dispatch_errors_total", 2, &p);
+        sink.inc_counter(
+            "torrent_file_persist_errors_total",
+            &[("profile_id", "a"), ("source", "api")],
+        );
+        sink.add_counter("profile_fence_pause_errors_total", 3, &p);
+        sink.inc_counter("disk_error_retry_errors_total", &p);
 
         let first = String::from_utf8(sink.render()).unwrap();
         let a = "{profile_id=\"a\"}";
@@ -1096,6 +1148,24 @@ mod tests {
                 "{op=\"file_open\",profile_id=\"a\"}".to_string(),
                 "2",
             ),
+            ("boot_resume_save_failures", a.to_string(), "1"),
+            ("boot_resume_save_failures", b.to_string(), "0"),
+            ("boot_resume_save_dispatch_errors", a.to_string(), "2"),
+            ("boot_resume_save_dispatch_errors", b.to_string(), "0"),
+            (
+                "boot_torrent_file_persist_errors",
+                "{profile_id=\"a\",source=\"api\"}".to_string(),
+                "1",
+            ),
+            (
+                "boot_torrent_file_persist_errors",
+                "{profile_id=\"a\",source=\"metadata\"}".to_string(),
+                "0",
+            ),
+            ("boot_fence_pause_errors", a.to_string(), "3"),
+            ("boot_fence_pause_errors", b.to_string(), "0"),
+            ("boot_disk_error_retry_errors", a.to_string(), "1"),
+            ("boot_disk_error_retry_errors", b.to_string(), "0"),
         ];
         for (name, labels, value) in &expected {
             assert_eq!(

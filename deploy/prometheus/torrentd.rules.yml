@@ -94,7 +94,9 @@ groups:
           summary: "Profile {{ $labels.profile_id }}'s tunnel is down; its torrents are fenced until the daemon restarts"
 
       - alert: TorrentdFencePauseFailed
-        expr: increase(torrentd_profile_fence_pause_errors_total[15m]) > 0
+        expr: >
+          increase(torrentd_profile_fence_pause_errors_total[15m]) > 0
+          or torrentd_boot_fence_pause_errors > 0
         labels:
           severity: critical
         annotations:
@@ -245,6 +247,8 @@ groups:
         expr: >
           increase(torrentd_resume_save_failures_total[15m]) > 0
           or increase(torrentd_resume_save_dispatch_errors_total[15m]) > 0
+          or torrentd_boot_resume_save_failures > 0
+          or torrentd_boot_resume_save_dispatch_errors > 0
         labels:
           severity: warning
         annotations:
@@ -335,6 +339,7 @@ groups:
           or increase(torrentd_disk_error_retry_errors_total[15m]) > 0
           or torrentd_boot_torrent_errors > 0
           or torrentd_boot_torrent_add_errors > 0
+          or torrentd_boot_disk_error_retry_errors > 0
         labels:
           severity: warning
         annotations:
@@ -379,7 +384,9 @@ groups:
           summary: "Loads or adds for profile {{ $labels.profile_id }} were refused by the assignment registry"
 
       - alert: TorrentdTorrentPersistFailed
-        expr: increase(torrentd_torrent_file_persist_errors_total[15m]) > 0
+        expr: >
+          increase(torrentd_torrent_file_persist_errors_total[15m]) > 0
+          or torrentd_boot_torrent_file_persist_errors > 0
         labels:
           severity: warning
         annotations:

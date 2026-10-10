@@ -73,6 +73,11 @@ hold.
 | `torrentd_boot_resume_write_errors` | gauge | `profile_id` | each profile | from boot: always | resume_write_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_tracker_alerts` | gauge | `profile_id`; `kind`: `warning`, `scrape_failed` | each profile | from boot: always | tracker_alerts_total for these kinds as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_boot_disk_errors` | gauge | `profile_id`; `op` | each profile | on first event | disk_errors_total as of the first scrape, for each operation the boot counted one under; fixed for the life of the process. |
+| `torrentd_boot_resume_save_failures` | gauge | `profile_id` | each profile | from boot: always | resume_save_failures_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_resume_save_dispatch_errors` | gauge | `profile_id` | each profile | from boot: always | resume_save_dispatch_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_torrent_file_persist_errors` | gauge | `profile_id`; `source`: `metadata`, `api` | each profile | from boot: always | torrent_file_persist_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_fence_pause_errors` | gauge | `profile_id` | each profile | from boot: always | profile_fence_pause_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
+| `torrentd_boot_disk_error_retry_errors` | gauge | `profile_id` | each profile | from boot: always | disk_error_retry_errors_total as of the first scrape, which already holds what the boot counted; fixed for the life of the process. |
 | `torrentd_libtorrent_net_sent_payload_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_payload_bytes. |
 | `torrentd_libtorrent_net_sent_bytes_total` | counter | `profile_id` | each profile | on first event | libtorrent net.sent_bytes. |
 | `torrentd_libtorrent_peers_connected` | gauge | `profile_id` | each profile | on first event | libtorrent peer.num_peers_connected. |
