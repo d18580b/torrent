@@ -2792,6 +2792,47 @@ mod tests {
         assert!(resumes(&engine).is_empty());
     }
 
+    /// A single resume re-checks the fence after `resume_torrent`, and pauses
+    /// the torrent again only when the profile was fenced while it went out.
+    #[test]
+    fn a_resume_pauses_its_torrent_again_only_when_the_profile_was_fenced_meanwhile() {
+        let id = ProfileId::new("acct_a");
+        for fenced in [true, false] {
+            let (entry, engine) = mock_entry(ProfileStatus::Active);
+            let profiles = ProfileRegistry::new(vec![entry]);
+            let held = engine.hold_next("resume_torrent");
+            let out = std::thread::scope(|s| {
+                let resuming = s.spawn(|| {
+                    resume_unless_fenced(
+                        &profiles,
+                        &id,
+                        engine.as_ref(),
+                        handle(1),
+                        &PromSink::new(),
+                    )
+                });
+                held.wait_entered();
+                if fenced {
+                    profiles
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .update_health(|h| h.status = ProfileStatus::VpnDown);
+                }
+                held.release();
+                resuming.join().unwrap().unwrap()
+            });
+            let (want, paused) = if fenced {
+                (SingleResume::Fenced, vec![handle(1)])
+            } else {
+                (SingleResume::Resumed, vec![])
+            };
+            assert_eq!(out, want, "fenced: {fenced}");
+            assert_eq!(pauses(&engine), paused, "fenced: {fenced}");
+            assert_eq!(resumes(&engine), [handle(1)], "fenced: {fenced}");
+        }
+    }
+
     /// An add re-checks the fence after `add_torrent` and pauses what it just
     /// added only when the profile was fenced in between.
     #[test]
