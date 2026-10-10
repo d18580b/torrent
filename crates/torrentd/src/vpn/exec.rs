@@ -170,7 +170,10 @@ pub(crate) fn run(
 }
 
 /// [`run`], requiring a zero exit. The error names the command and what it
-/// printed on stderr; stdin never appears in it.
+/// printed on stderr, verbatim. stdin is not copied into it, but a program
+/// that echoes its input on stderr puts that input there: `wg setconf` quotes
+/// the config line it cannot read, private key included. A caller whose stdin
+/// holds a secret redacts the error itself.
 pub(crate) fn run_ok(
     program: &str,
     args: &[&str],
