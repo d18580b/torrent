@@ -148,8 +148,11 @@ touches nothing until it is applied.
 
 - **`relocate`** moves one `matched` or `adopted` torrent's payload to a
   directory under a managed root. An adopted torrent moves through its
-  session. A cross-device move of an unloaded torrent's directory is refused:
-  move the data yourself and rescan.
+  session. A torrent no session holds is moved by the daemon only when
+  nothing owns it: one the registry assigns, the verify queue holds, or the
+  index records an owner for is refused until its profile loads it. A
+  cross-device move of an unloaded torrent's directory is refused: move the
+  data yourself and rescan.
 - **`delete_orphans`** moves every unclaimed file under a root, or a subtree of
   one, into the trash.
 

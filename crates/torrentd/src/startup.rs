@@ -1052,6 +1052,7 @@ pub async fn boot(
     if let Some(pool) = pool.as_ref() {
         pool.set_metrics(metrics.clone());
         pool.set_state(Arc::clone(&state));
+        pool.set_registry(Arc::clone(&registry));
         pool.set_torrent_store(Arc::clone(&torrent_store));
     }
 

@@ -64,26 +64,36 @@ pub fn apply(
     apply_inner(pool, source, state, plan_id, false, stop)
 }
 
-/// Whether the index accounts for everything the daemon currently serves.
+/// Whether the index accounts for everything the daemon owns.
 ///
-/// Claims are written by the matcher and by nothing else, so a loaded torrent
-/// the matcher has never placed contributes none — and its payload reads as an
-/// orphan.
+/// Claims are written by the matcher and by nothing else, so a torrent the
+/// matcher has never placed contributes none — and its payload reads as an
+/// orphan. Owned means loaded, assigned in the registry, or queued for
+/// verification: a torrent whose profile failed at boot is in no session, and
+/// its payload is still its own.
 fn check_index_accounts_for_live_state(pool: &PoolService, state: &StateMap) -> Result<(), String> {
-    let loaded: Vec<String> = state.infohashes().iter().map(|ih| ih.to_hex()).collect();
+    let owned = pool.owned_infohashes(state)?;
     let unindexed = pool
-        .with_store(|st| st.loaded_without_claims(&loaded))
+        .with_store(|st| st.loaded_without_claims(&owned))
         .map_err(|e| e.to_string())?;
     if !unindexed.is_empty() {
         return Err(format!(
-            "{} loaded torrent(s) have no claims in the index, so it cannot prove what is \
+            "{} torrent(s) the daemon owns (loaded, assigned to a profile, or queued for \
+             verification) have no claims in the index, so it cannot prove what is \
              unclaimed — the first is {}. Run `pool scan` (or POST /v1/pool/scan) and \
-             rebuild this plan.",
+             rebuild this plan; a torrent whose profile is down keeps refusing until its \
+             profile loads it or it is removed.",
             unindexed.len(),
             unindexed[0],
         ));
     }
     Ok(())
+}
+
+/// What the between-steps re-check of [`check_index_accounts_for_live_state`]
+/// watches: the loaded set and the registry each changing size.
+fn ownership_size(pool: &PoolService, state: &StateMap) -> (usize, usize) {
+    (state.len(), pool.registry_len())
 }
 
 /// What `apply_inner` answers when a shutdown stops it before the claim. The
@@ -180,9 +190,10 @@ fn apply_inner(
 
     // A delete plan over a large subtree runs for minutes. A `POST /torrents`
     // landing in that window makes the index incomplete again, so the
-    // precondition is re-established whenever the loaded set changes. `len()`
-    // is O(1); the full check only runs when it has actually moved.
-    let mut loaded_len = state.len();
+    // precondition is re-established whenever the loaded set or the registry
+    // changes. Both sizes are O(1); the full check only runs when one has
+    // actually moved.
+    let mut owned_size = ownership_size(pool, state);
     let mut guards = DeleteGuards::default();
 
     for step in steps {
@@ -206,7 +217,7 @@ fn apply_inner(
             out.status = plan_status::APPLYING.to_string();
             return Ok(out);
         }
-        if deletes && step.op == ops::DELETE_FILE && state.len() != loaded_len {
+        if deletes && step.op == ops::DELETE_FILE && ownership_size(pool, state) != owned_size {
             if let Err(e) = check_index_accounts_for_live_state(pool, state) {
                 // Stop, but as a *failed* plan rather than an early return:
                 // the plan is claimed at this point, and returning here would
@@ -229,7 +240,7 @@ fn apply_inner(
                 pool.count("pool_plan_failures_total", &[("kind", "index_diverged")]);
                 break;
             }
-            loaded_len = state.len();
+            owned_size = ownership_size(pool, state);
         }
         // Written before the action, so a crash leaves `in_progress` behind.
         // Steps were inserted `pending` up front and only updated afterwards,
@@ -383,8 +394,19 @@ fn move_torrent(
 
     let hash = libtorrent_safe::InfoHash::from_hex(&infohash).ok_or("bad infohash")?;
     let Some(st) = state.get(&hash) else {
-        // Not loaded: nothing is serving it, so torrentd can move the files
-        // itself. This is the `matched but not adopted` case.
+        // Not loaded. Only a torrent nothing owns - the `matched but not
+        // adopted` case - may have its files moved by torrentd itself. One a
+        // profile owns but did not load (its VPN failed at boot, say) still
+        // has its resume data, recorded save path and any queued adoption
+        // naming the source; renaming under them strands the payload when
+        // the profile comes back.
+        if let Some(why) = pool.unloaded_owner(&infohash)? {
+            return Err(format!(
+                "torrent {infohash} is not loaded, but {why}; it can be relocated only \
+                 while its session serves it, so bring its profile up and apply again"
+            )
+            .into());
+        }
         move_directory(Path::new(&step.src), Path::new(dst))?;
         record_new_base(pool, &infohash, Path::new(dst));
         return Ok(());
@@ -1452,6 +1474,221 @@ mod tests {
             .unwrap()
             .status;
         assert_eq!(status, torrentd_pool::model::plan_status::DRAFT);
+    }
+
+    /// A registry over `dir` assigning `ih` to profile `p`, handed to `pool`
+    /// as the daemon hands it the boot's.
+    fn assign(pool: &PoolService, dir: &Path, ih: &str) {
+        let registry = Arc::new(torrentd_engine::AssignmentRegistry::new_empty(
+            dir.join("registry.db"),
+        ));
+        registry
+            .assign(
+                libtorrent_safe::InfoHash::from_hex(ih).unwrap(),
+                torrentd_engine::ProfileId::new("p"),
+            )
+            .unwrap();
+        pool.set_registry(registry);
+    }
+
+    /// A torrent added through the API, with its payload under a root and its
+    /// `.torrent` outside the library, whose profile failed at boot: the
+    /// registry assigns it, no session holds it, and the index has never
+    /// placed it. Its payload reads as orphans, and the plan must refuse.
+    #[test]
+    fn applying_refuses_while_a_registered_unloaded_torrent_is_absent_from_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = write(&root, "api/feature.bin", 64);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        assign(&pool, dir.path(), &"cd".repeat(20));
+
+        // Nothing is loaded: the profile that owns the torrent is down.
+        let (source, state) = engine_and_state();
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert!(e.contains("no claims in the index"), "got {e}");
+        assert!(e.contains(&"cd".repeat(20)), "got {e}");
+        assert!(victim.exists(), "an owned torrent's payload was trashed");
+        let status = pool
+            .with_store(|st| st.plan(plan_id))
+            .unwrap()
+            .unwrap()
+            .status;
+        assert_eq!(status, torrentd_pool::model::plan_status::DRAFT);
+    }
+
+    /// A queued adoption is owned too, before any session holds it.
+    #[test]
+    fn applying_refuses_while_a_queued_adoption_is_absent_from_the_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        std::fs::create_dir_all(&root).unwrap();
+        let victim = write(&root, "queued/feature.bin", 64);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let ih = "ef".repeat(20);
+        pool.with_store(|st| {
+            st.enqueue_verify(&torrentd_pool::VerifyQueueRow {
+                infohash: ih.clone(),
+                profile: "p".into(),
+                torrent_path: dir.path().join("t.torrent"),
+                save_path: root.join("queued"),
+                owner_recorded: false,
+                trackers: vec![],
+            })
+        })
+        .unwrap();
+
+        let (source, state) = engine_and_state();
+        let e = apply(&pool, &source, &state, plan_id, &|| false).unwrap_err();
+        assert!(e.contains(&ih), "got {e}");
+        assert!(victim.exists(), "a queued adoption's payload was trashed");
+    }
+
+    /// A one-step relocate plan moving `ih`'s payload to `new` under the root.
+    fn relocate_plan(pool: &PoolService, ih: &str) -> i64 {
+        let spec = torrentd_pool::plan::PlanSpec::Relocate {
+            infohash: ih.to_owned(),
+            dest_root_id: pool.roots()[0].0,
+            dest_rel: "new".into(),
+        };
+        let steps = pool
+            .with_store(|st| torrentd_pool::plan::build(st, &spec, |id| pool.root_path_of(id)))
+            .unwrap()
+            .expect("plan builds");
+        let plan_id = pool
+            .with_store(|st| st.create_plan("relocate", "{}", 0))
+            .unwrap();
+        pool.with_store_mut(|st| st.add_plan_steps(plan_id, &steps))
+            .unwrap();
+        plan_id
+    }
+
+    /// Index `T` with its payload at `old/T/a.bin`, matched, and mark it
+    /// adopted as an adoption into a profile would.
+    fn adopted_at_old(pool: &PoolService, root: &Path, ih: &str) {
+        add_and_rematch(pool, ih, "T", Some(&root.join("old")), &[("T/a.bin", 100)]);
+        pool.with_store(|s| {
+            let (root_id, base) = s.adoption_base(ih)?.expect("matched with a base");
+            s.set_adoption(
+                ih,
+                AdoptionState::Adopted,
+                Some(root_id),
+                Some(&base),
+                None,
+                None,
+                None,
+            )
+        })
+        .unwrap();
+    }
+
+    /// An adopted torrent whose profile is down is still that profile's: its
+    /// resume data and recorded save path name the source, so torrentd must
+    /// not rename the directory under them.
+    #[test]
+    fn relocating_refuses_an_adopted_torrent_its_profile_did_not_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let src_file = write(&root, "old/T/a.bin", 100);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        adopted_at_old(&pool, &root, &ih);
+        let plan_id = relocate_plan(&pool, &ih);
+        assign(&pool, dir.path(), &ih);
+
+        let (source, state) = engine_and_state();
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (0, "failed"), "{out:?}");
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        assert_eq!(steps[0].status, step_status::FAILED);
+        let why = steps[0].error.clone().unwrap_or_default();
+        assert!(
+            why.contains("the registry assigns it to profile p"),
+            "{why}"
+        );
+        assert!(src_file.exists(), "the payload was renamed");
+        assert!(!root.join("new").exists());
+        let base = pool.with_store(|s| s.adoption_base(&ih)).unwrap();
+        assert_eq!(base.map(|(_, b)| b), Some("old".to_owned()));
+    }
+
+    /// The verify queue's persisted row names the source as the save path it
+    /// adds the torrent at, so a queued adoption is refused the same way.
+    #[test]
+    fn relocating_refuses_a_queued_adoption() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let src_file = write(&root, "old/T/a.bin", 100);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        add_and_rematch(
+            &pool,
+            &ih,
+            "T",
+            Some(&root.join("old")),
+            &[("T/a.bin", 100)],
+        );
+        let plan_id = relocate_plan(&pool, &ih);
+        pool.with_store(|st| {
+            st.enqueue_verify(&torrentd_pool::VerifyQueueRow {
+                infohash: ih.clone(),
+                profile: "p".into(),
+                torrent_path: dir.path().join("t.torrent"),
+                save_path: root.join("old"),
+                owner_recorded: false,
+                trackers: vec![],
+            })
+        })
+        .unwrap();
+
+        let (source, state) = engine_and_state();
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!(out.status, "failed", "{out:?}");
+        let why = pool.with_store(|st| st.plan_steps(plan_id)).unwrap()[0]
+            .error
+            .clone()
+            .unwrap_or_default();
+        assert!(why.contains("verify queue"), "{why}");
+        assert!(src_file.exists(), "the payload was renamed");
+    }
+
+    /// A `matched` torrent nothing owns is still moved by torrentd itself.
+    #[test]
+    fn relocating_moves_an_unowned_matched_torrent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let src_file = write(&root, "old/T/a.bin", 100);
+
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        add_and_rematch(
+            &pool,
+            &ih,
+            "T",
+            Some(&root.join("old")),
+            &[("T/a.bin", 100)],
+        );
+        let plan_id = relocate_plan(&pool, &ih);
+        // A registry that assigns some other torrent is no owner of this one.
+        assign(&pool, dir.path(), &"cd".repeat(20));
+
+        let (source, state) = engine_and_state();
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (1, "applied"), "{out:?}");
+        assert!(!src_file.exists());
+        assert!(root.join("new/T/a.bin").exists());
     }
 
     /// Index a torrent straight into the pool and re-match, as a rescan that
