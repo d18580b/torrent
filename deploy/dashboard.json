@@ -428,7 +428,7 @@
       "id": 30,
       "type": "timeseries",
       "title": "Verify queue",
-      "description": "Adoptions waiting to verify, and verifying now. A queue that holds work while nothing finishes is TorrentdPoolVerifyStuck. Exported only with [pool] configured.",
+      "description": "Adoptions waiting to verify and re-hashes POST /v1/pool/verifications queued, and both running now, together bounded by [pool] max_concurrent_verify. A queue that holds work while nothing finishes is TorrentdPoolVerifyStuck. Exported only with [pool] configured.",
       "datasource": { "type": "prometheus", "uid": "${datasource}" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 77 },
       "fieldConfig": { "defaults": { "unit": "short", "min": 0, "decimals": 0 }, "overrides": [] },
