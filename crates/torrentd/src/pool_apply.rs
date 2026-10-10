@@ -8,10 +8,12 @@
 //!   `applying` with a known last-completed step, which startup re-drives.
 //! * **Adopted payload moves through libtorrent.** `move_storage` keeps the
 //!   session's view of where the data lives consistent with reality; moving the
-//!   files underneath a seeding torrent does not. The step succeeds only once
-//!   libtorrent reports the move done and none of the torrent's files is left
-//!   at the source; across devices that move is libtorrent's own copy, which
-//!   torrentd does not verify.
+//!   files underneath a seeding torrent does not. The step is attempted only
+//!   when the session holds the torrent at the plan's source, and succeeds
+//!   only once libtorrent reports the move done, none of the torrent's files
+//!   is left at the source, and every one that was there is at the
+//!   destination; across devices that move is libtorrent's own copy, whose
+//!   contents torrentd does not verify.
 //! * **torrentd never moves a directory across devices itself.** An
 //!   unadopted directory is moved with a `rename`, and an `EXDEV` refuses the
 //!   step rather than copying, so the payload is never half in two places
@@ -432,6 +434,40 @@ fn move_torrent(
         .into());
     }
 
+    // `move_storage` moves from wherever the session holds the torrent, not
+    // from `step.src`, and libtorrent skips every source file that does not
+    // exist and still reports the move done. A session that disagrees with the
+    // index - a crash before the resume save after an earlier relocate, a
+    // rescan that re-placed the torrent - would move nothing, and the base and
+    // save path below would then point at an empty destination while the
+    // payload sat unclaimed at the source.
+    let src = Path::new(&step.src);
+    let held_at = engine
+        .torrent_details(st.handle)
+        .map_err(|e| format!("could not read where the session holds torrent {infohash}: {e}"))?
+        .save_path;
+    if !same_directory(Path::new(&held_at), src) {
+        return Err(format!(
+            "the session serves torrent {infohash} from {held_at}, but the plan moves it \
+             from {}; refusing, since libtorrent would move nothing from there. Reconcile \
+             the two (rescan, or move the torrent back), then build a new plan",
+            step.src,
+        )
+        .into());
+    }
+    // What the move has to carry. Checked again at the destination once
+    // libtorrent reports the move done, since that report alone does not
+    // prove a single file travelled.
+    let present = files_present_under(pool, &infohash, src)?;
+    if present.is_empty() {
+        return Err(format!(
+            "none of torrent {infohash}'s files is at {}; refusing to record a move of a \
+             payload that is not there",
+            step.src,
+        )
+        .into());
+    }
+
     // DontReplace stays as the last line against a file that lands between
     // the check above and libtorrent's own; a skip it makes is caught after
     // the move by `left_behind`.
@@ -458,7 +494,56 @@ fn move_torrent(
     // libtorrent serves from the new path either way, so the base and save
     // path above follow it; but a file it skipped is still at the source and
     // the step is not the move the plan asked for.
-    left_behind(pool, &infohash, Path::new(&step.src), dst)
+    left_behind(pool, &infohash, src, dst)?;
+    arrived(&present, src, dst)
+}
+
+/// Whether two spellings name the same directory: component-wise equal, or
+/// resolving to the same place once symlinks are followed.
+fn same_directory(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// The torrent's files, torrent-relative, that have an entry under `dir`.
+fn files_present_under(
+    pool: &PoolService,
+    infohash: &str,
+    dir: &Path,
+) -> Result<Vec<String>, String> {
+    let files = pool
+        .with_store(|s| s.torrent_files(infohash))
+        .map_err(|e| format!("could not read torrent {infohash}'s file list: {e}"))?;
+    Ok(files
+        .into_iter()
+        .filter(|f| f.is_on_disk() && dir.join(&f.rel_path).symlink_metadata().is_ok())
+        .map(|f| f.rel_path)
+        .collect())
+}
+
+/// Whether every file that was at the source before the move is now at the
+/// destination.
+///
+/// `storage_moved_alert` is posted even when libtorrent found nothing to move,
+/// so the report alone is not the move. A file missing here is an unknown
+/// outcome rather than a failure: libtorrent has already re-pointed the
+/// session, and a retry would move from a place the payload may have left.
+fn arrived(present: &[String], src: &Path, dst: &str) -> Result<(), StepFailure> {
+    let Some(rel) = present
+        .iter()
+        .find(|rel| Path::new(dst).join(rel).symlink_metadata().is_err())
+    else {
+        return Ok(());
+    };
+    Err(StepFailure::Unknown(format!(
+        "outcome unknown: libtorrent reported the torrent moved to {dst}, but {rel}, which \
+         was at {} before the move, is not there. Find where the payload is before resuming \
+         or discarding this plan",
+        src.display(),
+    )))
 }
 
 /// Whether a storage move libtorrent reported done left any of the torrent's
@@ -2227,6 +2312,194 @@ mod tests {
             mock.calls(),
         );
         assert!(src_file.exists() && foreign.exists());
+    }
+
+    /// A relocate of `T` from `old` to `new`, with `T` loaded in profile
+    /// `p`'s mock session at `held_at`. `move_storage` fails fast, so a step
+    /// that reaches it ends with the engine's error rather than a ten-minute
+    /// wait for an alert the mock never delivers.
+    fn loaded_relocate(
+        pool: &PoolService,
+        root: &Path,
+        ih: &str,
+        held_at: &Path,
+    ) -> (
+        i64,
+        Arc<torrentd_engine::MockEngine>,
+        Arc<dyn AlertSource>,
+        StateMap,
+    ) {
+        add_and_rematch(pool, ih, "T", Some(&root.join("old")), &[("T/a.bin", 100)]);
+        let plan_id = relocate_plan(pool, ih);
+        let mock = Arc::new(torrentd_engine::MockEngine::new());
+        mock.inject_error("move_storage", torrentd_engine::EngineError::Shutdown);
+        let hash = libtorrent_safe::InfoHash::from_hex(ih).unwrap();
+        let handle = mock.register_handle(hash);
+        mock.set_torrent_details(
+            handle,
+            libtorrent_safe::TorrentDetails {
+                save_path: held_at.to_string_lossy().into_owned(),
+                ..torrentd_engine::MockEngine::default_details()
+            },
+        );
+        let engine: Arc<dyn torrentd_engine::TorrentEngine> = mock.clone();
+        let source: Arc<dyn AlertSource> = Arc::new(torrentd_engine::ProfileSource::new(vec![(
+            torrentd_engine::ProfileId::new("p"),
+            engine,
+        )]));
+        let state = StateMap::new();
+        state.insert(
+            hash,
+            torrentd_engine::TorrentState::newly_added(
+                handle,
+                torrentd_engine::ProfileId::new("p"),
+                std::time::Instant::now(),
+            ),
+        );
+        (plan_id, mock, source, state)
+    }
+
+    fn moved_storage(mock: &torrentd_engine::MockEngine) -> bool {
+        mock.calls()
+            .iter()
+            .any(|c| matches!(c, torrentd_engine::RecordedCall::MoveStorage { .. }))
+    }
+
+    /// `move_storage` moves from where the session holds the torrent, and
+    /// reports done even when nothing was there. A session holding it away
+    /// from the plan's source refuses the step before the move, naming both,
+    /// and leaves the index where the payload is.
+    #[test]
+    fn a_session_holding_the_torrent_elsewhere_refuses_the_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let src_file = write(&root, "old/T/a.bin", 100);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        let elsewhere = root.join("elsewhere");
+        let (plan_id, mock, source, state) = loaded_relocate(&pool, &root, &ih, &elsewhere);
+
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (0, "failed"), "{out:?}");
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        assert_eq!(steps[0].status, step_status::FAILED);
+        let why = steps[0].error.clone().unwrap_or_default();
+        assert!(
+            why.contains(&*elsewhere.to_string_lossy())
+                && why.contains(&*root.join("old").to_string_lossy()),
+            "{why}"
+        );
+        assert!(
+            !moved_storage(&mock),
+            "move_storage was called: {:?}",
+            mock.calls()
+        );
+        assert!(src_file.exists());
+        let base = pool.with_store(|s| s.adoption_base(&ih)).unwrap();
+        assert_eq!(base.map(|(_, b)| b), Some("old".to_owned()));
+    }
+
+    /// A session that cannot say where it holds the torrent cannot be shown to
+    /// hold it at the source, so the step is refused before the move rather
+    /// than trusting `move_storage` to start from the right place.
+    #[test]
+    fn a_session_that_cannot_report_its_save_path_refuses_the_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let src_file = write(&root, "old/T/a.bin", 100);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        let (plan_id, mock, source, state) = loaded_relocate(&pool, &root, &ih, &root.join("old"));
+        mock.inject_error("torrent_details", torrentd_engine::EngineError::Shutdown);
+
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (0, "failed"), "{out:?}");
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        assert_eq!(steps[0].status, step_status::FAILED);
+        let why = steps[0].error.clone().unwrap_or_default();
+        assert!(
+            why.contains("could not read where the session holds torrent"),
+            "{why}"
+        );
+        assert!(
+            !moved_storage(&mock),
+            "move_storage was called: {:?}",
+            mock.calls()
+        );
+        assert!(src_file.exists());
+        let base = pool.with_store(|s| s.adoption_base(&ih)).unwrap();
+        assert_eq!(base.map(|(_, b)| b), Some("old".to_owned()));
+    }
+
+    /// The same directory spelled with a trailing separator is the source, and
+    /// the step goes on to the move.
+    #[test]
+    fn a_session_holding_the_torrent_at_the_source_reaches_the_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        write(&root, "old/T/a.bin", 100);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        let held_at = PathBuf::from(format!("{}/", root.join("old").display()));
+        let (plan_id, mock, source, state) = loaded_relocate(&pool, &root, &ih, &held_at);
+
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!(out.status, "failed", "{out:?}");
+        assert!(
+            moved_storage(&mock),
+            "move_storage was not called: {:?}",
+            mock.calls()
+        );
+    }
+
+    /// A session at the source with none of the payload there has nothing to
+    /// move, and libtorrent would report that nothing as done.
+    #[test]
+    fn a_source_holding_none_of_the_payload_refuses_the_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let src_file = write(&root, "old/T/a.bin", 100);
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let ih = "ab".repeat(20);
+        let (plan_id, mock, source, state) = loaded_relocate(&pool, &root, &ih, &root.join("old"));
+        std::fs::remove_file(&src_file).unwrap();
+
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (0, "failed"), "{out:?}");
+        let why = pool.with_store(|st| st.plan_steps(plan_id)).unwrap()[0]
+            .error
+            .clone()
+            .unwrap_or_default();
+        assert!(why.contains("none of torrent"), "{why}");
+        assert!(
+            !moved_storage(&mock),
+            "move_storage was called: {:?}",
+            mock.calls()
+        );
+    }
+
+    /// A move libtorrent reported done is confirmed at the destination: a file
+    /// that was at the source and is not there is an unknown outcome.
+    #[test]
+    fn a_file_missing_at_the_destination_after_a_move_is_an_unknown_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("old");
+        let dst = dir.path().join("new");
+        let dst_str = dst.to_string_lossy();
+        let present = vec!["T/a.bin".to_owned()];
+
+        match arrived(&present, &src, &dst_str) {
+            Err(StepFailure::Unknown(e)) => assert!(e.contains("T/a.bin"), "{e}"),
+            Err(StepFailure::Failed(e)) => panic!("recorded as failed: {e}"),
+            Ok(()) => panic!("a file missing at the destination was recorded as moved"),
+        }
+
+        write(&dst, "T/a.bin", 100);
+        arrived(&present, &src, &dst_str).unwrap_or_else(|_| panic!("the file arrived"));
     }
 
     /// A move libtorrent reported done that left a file at the source is the
