@@ -595,6 +595,29 @@ impl PoolService {
             .map(|(_, p)| p.clone())
     }
 
+    /// The directory the pool index says `ih`'s payload is in: its adoption
+    /// base under its root, which an adoption sets and a relocation moves.
+    /// `None` for a torrent with no adoption, a root no longer configured, or
+    /// an index that cannot be read.
+    pub fn adoption_save_path(&self, ih: &libtorrent_safe::InfoHash) -> Option<PathBuf> {
+        let hex = ih.to_hex();
+        let found = self.with_reader(|s| {
+            torrentd_pool::adopt::save_path_of(s, &hex, |id| self.root_path_of(id))
+        });
+        match found {
+            Ok(path) => path,
+            Err(e) => {
+                warn!(
+                    target: "torrentd::pool",
+                    infohash = %hex,
+                    error.cause = %e,
+                    "could not read a torrent's adoption base from the pool index",
+                );
+                None
+            }
+        }
+    }
+
     /// Stat the payload of the torrents an adopt is about to plan, marking any
     /// that changed since the last scan `drifted`.
     ///

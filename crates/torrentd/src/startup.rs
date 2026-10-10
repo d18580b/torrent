@@ -1254,7 +1254,8 @@ pub async fn boot(
             // The flags re-asserted are `torrentd_engine::policy`'s. PAUSED is
             // not cleared: resume data does not say why a torrent was paused,
             // and restarting one an operator paused is not recoverable.
-            let params = resume_scan_params(profile_cfg, data.into_inner(), torrent);
+            let relocated = relocated_save_path(&*torrent_store, pool.as_deref(), &profile, &ih);
+            let params = resume_scan_params(profile_cfg, data.into_inner(), torrent, relocated);
             // The account-isolation guard, on the trackers this resume data
             // would announce to — its own `trackers` list where it has one.
             // A file written before the profile's allow-list was set, or
@@ -1861,10 +1862,14 @@ fn session_settings(cfg: &Config) -> torrentd_engine::Settings {
 /// magnet still fetching it does, so DHT, PEX and LSD are disabled whatever the
 /// profile's posture: resume data written before magnets carried that guard
 /// does not carry it.
+///
+/// `save_path`, where given, replaces the one the resume data names
+/// ([`relocated_save_path`]).
 fn resume_scan_params(
     profile: &ProfileConfig,
     resume: Vec<u8>,
     torrent: Option<Vec<u8>>,
+    save_path: Option<String>,
 ) -> AddParams {
     let flags_set = if torrent.is_some() {
         torrentd_engine::resume_flags_set(profile)
@@ -1874,10 +1879,42 @@ fn resume_scan_params(
     AddParams::Resume {
         bytes: resume,
         torrent,
-        save_path: None,
+        save_path,
         flags_set,
         flags_clear: torrentd_engine::resume_flags_clear(),
     }
+}
+
+/// Where the resume scan re-adds a torrent the pool relocated, in place of
+/// the save path its resume file names.
+///
+/// A relocation records the payload's new directory twice once libtorrent
+/// reports the move done: as the adoption base in the pool index, and in the
+/// `.save_path` sidecar beside the `.torrent`. The resume file catches up only
+/// when its own save lands, so a crash in between leaves it naming the
+/// directory the payload left, and libtorrent, loading the torrent there,
+/// finds no files and drops it to 0%.
+///
+/// Where the sidecar and the pool index agree, that directory wins. Neither
+/// alone is enough: a sidecar rewrite that failed after a relocate leaves the
+/// sidecar naming the old directory while the resume file names the new, and
+/// a rescan can re-place an adoption base the session never moved to. Where
+/// they agree and the resume file already names the same directory, as it
+/// does for every adoption not mid-relocate, the override changes nothing.
+fn relocated_save_path(
+    store: &dyn TorrentStore,
+    pool: Option<&crate::pool_service::PoolService>,
+    profile: &ProfileId,
+    ih: &libtorrent_safe::InfoHash,
+) -> Option<String> {
+    let pool = pool?;
+    let sidecar = store.read_save_path(profile, ih).ok().flatten()?;
+    let sidecar_path = std::path::Path::new(&sidecar);
+    if !sidecar_path.is_absolute() {
+        return None;
+    }
+    let base = pool.adoption_save_path(ih)?;
+    (base.as_path() == sidecar_path).then_some(sidecar)
 }
 
 /// The torrents the boot scans hand each profile's session, held so the VPN
@@ -3888,6 +3925,63 @@ mod shutdown_report_tests {
         );
     }
 
+    /// The resume scan re-adds a relocated torrent where its sidecar and the
+    /// pool index both say its payload went, over a resume file that may
+    /// still name the old directory, and only where the two agree.
+    #[test]
+    fn the_resume_scan_follows_a_relocation_the_sidecar_and_pool_index_agree_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::Config::minimal_for_tests(dir.path(), false);
+        let pool = crate::pool_service::PoolService::open(&cfg)
+            .unwrap()
+            .unwrap();
+        let root = dir.path().join("pool");
+        let mut bare = b"d4:infod6:lengthi1e4:name1:a12:piece lengthi16384e6:pieces20:".to_vec();
+        bare.extend_from_slice(&[0u8; 20]);
+        bare.extend_from_slice(b"ee");
+        std::fs::write(dir.path().join("library/t.torrent"), &bare).unwrap();
+        let ih = libtorrent_safe::info_hash_from_torrent(&bare).unwrap();
+        pool.scan().unwrap();
+        let root_id = pool.roots()[0].0;
+        pool.with_store_mut(|s| {
+            s.set_adoption(
+                &ih.to_hex(),
+                torrentd_pool::AdoptionState::Adopted,
+                Some(root_id),
+                Some("shows"),
+                Some(1),
+                None,
+                None,
+            )
+        })
+        .unwrap();
+        let p = ProfileId::new("p");
+        let store = FsTorrentStore::new(dir.path().join("torrents"));
+        let moved_to = root.join("shows").to_string_lossy().into_owned();
+
+        // No sidecar, or no pool: the resume file's own save path.
+        assert_eq!(relocated_save_path(&store, Some(&pool), &p, &ih), None);
+        store.write_save_path(&p, &ih, &moved_to).unwrap();
+        assert_eq!(relocated_save_path(&store, None, &p, &ih), None);
+
+        // Both name the new directory: it replaces the resume file's.
+        assert_eq!(
+            relocated_save_path(&store, Some(&pool), &p, &ih).as_deref(),
+            Some(moved_to.as_str()),
+        );
+
+        // A sidecar whose rewrite after the move failed still names the old
+        // directory, which the resume file may already have left behind.
+        let old = root.join("tv").to_string_lossy().into_owned();
+        store.write_save_path(&p, &ih, &old).unwrap();
+        assert_eq!(relocated_save_path(&store, Some(&pool), &p, &ih), None);
+
+        // A torrent the pool never adopted keeps its resume file's path.
+        let other = libtorrent_safe::InfoHash([0x35; 20]);
+        store.write_save_path(&p, &other, &moved_to).unwrap();
+        assert_eq!(relocated_save_path(&store, Some(&pool), &p, &other), None);
+    }
+
     /// The hook boot installs on the resume store counts a write that fails
     /// on the batch writer and marks the torrent's file stale.
     #[test]
@@ -5636,12 +5730,12 @@ mod tests {
         let scans = [
             (
                 ih,
-                resume_scan_params(&profile, data, Some(a.clone())),
+                resume_scan_params(&profile, data, Some(a.clone()), None),
                 "resume",
             ),
             (
                 ih,
-                resume_scan_params(&profile, resume(&b, Some(a_url)).1, None),
+                resume_scan_params(&profile, resume(&b, Some(a_url)).1, None, None),
                 "resume",
             ),
             (
@@ -5664,7 +5758,7 @@ mod tests {
             &metrics,
             &profile,
             &ih,
-            &resume_scan_params(&profile, data, Some(b.clone())),
+            &resume_scan_params(&profile, data, Some(b.clone()), None),
             "resume",
         )
         .unwrap();
@@ -6873,7 +6967,7 @@ mod profile_construction_tests {
         for p in &cfg.profile {
             let engine = MockEngine::new();
             engine
-                .add_torrent(resume_scan_params(p, vec![1; 32], None))
+                .add_torrent(resume_scan_params(p, vec![1; 32], None, None))
                 .unwrap();
             engine
                 .add_torrent(torrent_dir_scan_params(p, vec![2; 32], "/data".into()))
@@ -6904,7 +6998,7 @@ mod profile_construction_tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = cfg_with(dir.path(), &[host("public", true)]);
         let p = &cfg.profile[0];
-        let flags = |torrent| match resume_scan_params(p, vec![1; 32], torrent) {
+        let flags = |torrent| match resume_scan_params(p, vec![1; 32], torrent, None) {
             AddParams::Resume { flags_set, .. } => flags_set,
             other => panic!("not a resume add: {other:?}"),
         };
