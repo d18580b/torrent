@@ -4,8 +4,10 @@
 //! shape everything here:
 //!
 //! * **The journal is written before the action.** Every step is marked in the
-//!   database, attempted, then marked again. A crash mid-apply leaves a plan in
-//!   `applying` with a known last-completed step, which startup re-drives.
+//!   database, attempted, then marked again, a batch of up to
+//!   [`JOURNAL_BATCH`] delete steps per commit. A stop between batches leaves
+//!   a plan in `applying` with a known last-completed step, which startup
+//!   re-drives; a crash inside a batch leaves its steps `in_progress`.
 //! * **Adopted payload moves through libtorrent.** `move_storage` keeps the
 //!   session's view of where the data lives consistent with reality; moving the
 //!   files underneath a seeding torrent does not. The step is attempted only
@@ -381,8 +383,9 @@ fn apply_inner(
 
     if let Some(stuck) = steps.iter().find(|s| s.status == step_status::IN_PROGRESS) {
         // Written before the attempt and cleared by the outcome, so finding
-        // one here means a previous run died mid-step. Whether it happened is
-        // unknown, and both re-running and skipping it can destroy data.
+        // one here means a previous run died mid-batch. Whether each step
+        // happened is unknown, and both re-running and skipping one can
+        // destroy data.
         //
         // Park it in `failed` rather than leaving it `applying`: a human has
         // to look either way, and `failed` is a state they can discard.
@@ -390,8 +393,21 @@ fn apply_inner(
         // Nothing marks the step resolved, so this refusal repeats on every
         // apply and every re-drive; the message says so, and names the only
         // way forward, rather than inviting a resume that cannot happen.
+        let more = steps
+            .iter()
+            .filter(|s| s.status == step_status::IN_PROGRESS)
+            .count()
+            - 1;
+        let others = if more == 0 {
+            String::new()
+        } else {
+            format!(
+                ", and so are {more} more of its steps, journalled in the same batch \
+                 (GET /v1/pool/plans/{plan_id}/steps lists each one)"
+            )
+        };
         let msg = format!(
-            "step {} ({}) was interrupted and its outcome is unknown. {}",
+            "step {} ({}) was interrupted and its outcome is unknown{others}. {}",
             stuck.seq,
             stuck.op,
             unknown_outcome_remedy(&stuck.src, stuck.dst.as_deref()),
@@ -450,157 +466,199 @@ fn apply_inner(
     let mut guards = DeleteGuards::default();
     let bucket = plan_trash_bucket(plan.id, plan.created_at);
 
+    let mut todo: Vec<PlanStepRow> = Vec::with_capacity(steps.len());
     for step in steps {
         if step.status == step_status::DONE {
             out.skipped += 1;
-            continue;
+        } else {
+            todo.push(step);
         }
-        // Between steps, never inside one: a step is journalled
-        // `in_progress` before it runs, and a process killed inside it leaves
-        // a step whose outcome is unknown and a plan parked for a human. Stop
-        // here instead and the plan stays `applying` with this step still
+    }
+    let mut rest = todo.as_slice();
+    while let Some(first) = rest.first() {
+        let (batch, after) = rest.split_at(journal_batch_len(rest));
+        rest = after;
+        // Between batches and between the steps of one, never inside a step.
+        // Stop here and the plan stays `applying` with this step still
         // `pending`, which the next boot re-drives from exactly here.
         if stop() {
             warn!(
                 target: "torrentd::pool::apply",
                 plan_id,
-                next_step = step.seq,
+                next_step = first.seq,
                 done = out.done,
                 "stopping between steps for shutdown; the plan resumes at the next boot",
             );
             out.status = plan_status::APPLYING.to_string();
             return Ok(out);
         }
-        if deletes && step.op == ops::DELETE_FILE && ownership_size(pool, state) != owned_size {
-            if let Err(e) = check_index_accounts_for_live_state(pool, source, state, &scope) {
-                // Stop, but as a *failed* plan rather than an early return:
-                // the plan is claimed at this point, and returning here would
-                // strand it in `applying` where nothing can apply, resume or
-                // discard it.
-                out.failed += 1;
-                out.status = plan_status::FAILED.to_string();
-                if let Err(se) = pool.with_store(|s| {
-                    s.set_step_status(plan_id, step.seq, step_status::FAILED, Some(&e))
-                }) {
-                    pool.note_store_error("set_step_status", &se);
-                }
-                error!(
-                    target: "torrentd::pool::apply",
-                    plan_id,
-                    step = step.seq,
-                    error.cause = %e,
-                    "stopping: the index no longer accounts for what is loaded",
-                );
-                pool.count("pool_plan_failures_total", &[("kind", "index_diverged")]);
-                break;
-            }
-            owned_size = ownership_size(pool, state);
-        }
         // Written before the action, so a crash leaves `in_progress` behind.
         // Steps were inserted `pending` up front and only updated afterwards,
         // which made "never started" and "started, outcome unknown"
-        // indistinguishable to the resume path.
+        // indistinguishable to the resume path. The whole batch is marked in
+        // one commit, so a crash inside it leaves every step of the batch
+        // `in_progress`, those done and those not yet started alike: each is
+        // a step whose outcome is unknown, as one interrupted step always
+        // was, and the remedy is the same rescan and rebuild.
         //
-        // A step whose start the journal cannot record is not run. Running it
-        // anyway moved files the journal still called `pending`, and the
+        // A batch whose start the journal cannot record is not run. Running
+        // it anyway moved files the journal still called `pending`, and the
         // `done` and plan-status writes that followed failed the same way,
         // so nothing recorded which files the plan had moved. Stop as a
-        // failed plan, like the divergence above, so the claimed plan is not
-        // stranded in `applying`: the step never ran, so applying the plan
-        // again starts it afresh. Where even that cannot be written, the
-        // plan stays `applying` with this step `pending`, which the next boot
-        // re-drives from exactly here.
-        if let Err(e) = pool
-            .with_store(|s| s.set_step_status(plan_id, step.seq, step_status::IN_PROGRESS, None))
-        {
-            pool.note_store_error("set_step_status", &e);
+        // failed plan, so the claimed plan is not stranded in `applying`:
+        // nothing in the batch ran, so applying the plan again starts it
+        // afresh. Where even that cannot be written, the plan stays
+        // `applying` with the batch `pending`, which the next boot re-drives
+        // from exactly here.
+        let started: Vec<(i64, &str, Option<&str>)> = batch
+            .iter()
+            .map(|s| (s.seq, step_status::IN_PROGRESS, None))
+            .collect();
+        if let Err(e) = pool.with_store_mut(|s| s.set_steps_status(plan_id, &started)) {
+            pool.note_store_error("set_steps_status", &e);
             let msg = format!("not started: the plan journal could not record the step: {e}");
             out.failed += 1;
             out.status = plan_status::FAILED.to_string();
             if let Err(se) = pool.with_store(|s| {
-                s.set_step_status(plan_id, step.seq, step_status::FAILED, Some(&msg))
+                s.set_step_status(plan_id, first.seq, step_status::FAILED, Some(&msg))
             }) {
                 pool.note_store_error("set_step_status", &se);
             }
             error!(
                 target: "torrentd::pool::apply",
                 plan_id,
-                step = step.seq,
-                op = %step.op,
-                src = %step.src,
+                step = first.seq,
+                op = %first.op,
+                src = %first.src,
                 error.cause = %e,
                 "stopping: the plan journal could not record a step as started",
             );
             pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
             break;
         }
-        let result = match step.op.as_str() {
-            ops::MOVE_TORRENT => move_torrent(pool, source, state, &step, stop),
-            ops::DELETE_FILE => {
-                delete_file(pool, Path::new(&step.src), plan_id, &bucket, &mut guards)
-                    .map_err(StepFailure::Failed)
-            }
-            other => Err(StepFailure::Failed(format!(
-                "unknown plan operation {other:?}"
-            ))),
-        };
 
-        match result {
-            Ok(()) => {
-                out.done += 1;
-                if let Err(e) = pool
-                    .with_store(|s| s.set_step_status(plan_id, step.seq, step_status::DONE, None))
-                {
-                    pool.note_store_error("set_step_status", &e);
-                }
-            }
-            Err(StepFailure::Unknown(e)) => {
-                // Not `failed`: the move may yet land. The step stays
-                // `in_progress` — the journal's own word for "started, verdict
-                // unknown" — so neither a resume nor a retry re-runs it, and
-                // the plan is parked for a human, who can see where the
-                // payload is before deciding.
-                out.failed += 1;
-                error!(
+        // Each step's outcome, recorded for the whole batch in one commit
+        // once it ends. A step the batch did not reach goes back to
+        // `pending`: it never ran, so a resume or a retry runs it.
+        let mut outcomes: Vec<(i64, &str, Option<String>)> = Vec::with_capacity(batch.len());
+        let mut halted = false;
+        let mut stopping = false;
+        for (i, step) in batch.iter().enumerate() {
+            if i > 0 && stop() {
+                warn!(
                     target: "torrentd::pool::apply",
                     plan_id,
-                    step = step.seq,
-                    op = %step.op,
-                    src = %step.src,
-                    error.cause = %e,
-                    "plan step outcome unknown",
+                    next_step = step.seq,
+                    done = out.done,
+                    "stopping between steps for shutdown; the plan resumes at the next boot",
                 );
-                pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
-                if let Err(se) = pool.with_store(|s| {
-                    s.set_step_status(plan_id, step.seq, step_status::IN_PROGRESS, Some(&e))
-                }) {
-                    pool.note_store_error("set_step_status", &se);
+                out.status = plan_status::APPLYING.to_string();
+                stopping = true;
+            } else if deletes
+                && step.op == ops::DELETE_FILE
+                && ownership_size(pool, state) != owned_size
+            {
+                match check_index_accounts_for_live_state(pool, source, state, &scope) {
+                    Ok(()) => owned_size = ownership_size(pool, state),
+                    Err(e) => {
+                        // Stop, but as a *failed* plan rather than an early
+                        // return: the plan is claimed at this point, and
+                        // returning here would strand it in `applying` where
+                        // nothing can apply, resume or discard it.
+                        out.failed += 1;
+                        out.status = plan_status::FAILED.to_string();
+                        error!(
+                            target: "torrentd::pool::apply",
+                            plan_id,
+                            step = step.seq,
+                            error.cause = %e,
+                            "stopping: the index no longer accounts for what is loaded",
+                        );
+                        pool.count("pool_plan_failures_total", &[("kind", "index_diverged")]);
+                        outcomes.push((step.seq, step_status::FAILED, Some(e)));
+                        halted = true;
+                    }
                 }
-                out.status = plan_status::FAILED.to_string();
+            }
+            if stopping || halted {
+                let unrun = &batch[outcomes.len()..];
+                outcomes.extend(unrun.iter().map(|s| (s.seq, step_status::PENDING, None)));
                 break;
             }
-            Err(StepFailure::Failed(e)) => {
-                out.failed += 1;
-                error!(
-                    target: "torrentd::pool::apply",
-                    plan_id,
-                    step = step.seq,
-                    op = %step.op,
-                    src = %step.src,
-                    error.cause = %e,
-                    "plan step failed",
-                );
-                pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
-                if let Err(se) = pool.with_store(|s| {
-                    s.set_step_status(plan_id, step.seq, step_status::FAILED, Some(&e))
-                }) {
-                    pool.note_store_error("set_step_status", &se);
+            let result = match step.op.as_str() {
+                ops::MOVE_TORRENT => move_torrent(pool, source, state, step, stop),
+                ops::DELETE_FILE => {
+                    delete_file(pool, Path::new(&step.src), plan_id, &bucket, &mut guards)
+                        .map_err(StepFailure::Failed)
                 }
-                // Stop at the first failure. Continuing would apply half a
-                // reorganisation and leave the operator reconciling it by hand.
-                out.status = plan_status::FAILED.to_string();
+                other => Err(StepFailure::Failed(format!(
+                    "unknown plan operation {other:?}"
+                ))),
+            };
+            match result {
+                Ok(()) => {
+                    out.done += 1;
+                    outcomes.push((step.seq, step_status::DONE, None));
+                }
+                Err(StepFailure::Unknown(e)) => {
+                    // Not `failed`: the move may yet land. The step stays
+                    // `in_progress` — the journal's own word for "started,
+                    // verdict unknown" — so neither a resume nor a retry
+                    // re-runs it, and the plan is parked for a human, who can
+                    // see where the payload is before deciding.
+                    out.failed += 1;
+                    error!(
+                        target: "torrentd::pool::apply",
+                        plan_id,
+                        step = step.seq,
+                        op = %step.op,
+                        src = %step.src,
+                        error.cause = %e,
+                        "plan step outcome unknown",
+                    );
+                    pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
+                    outcomes.push((step.seq, step_status::IN_PROGRESS, Some(e)));
+                    out.status = plan_status::FAILED.to_string();
+                    halted = true;
+                }
+                Err(StepFailure::Failed(e)) => {
+                    out.failed += 1;
+                    error!(
+                        target: "torrentd::pool::apply",
+                        plan_id,
+                        step = step.seq,
+                        op = %step.op,
+                        src = %step.src,
+                        error.cause = %e,
+                        "plan step failed",
+                    );
+                    pool.count("pool_plan_failures_total", &[("kind", "step_failed")]);
+                    outcomes.push((step.seq, step_status::FAILED, Some(e)));
+                    // Stop at the first failure. Continuing would apply half a
+                    // reorganisation and leave the operator reconciling it by
+                    // hand.
+                    out.status = plan_status::FAILED.to_string();
+                    halted = true;
+                }
+            }
+            if halted {
+                let unrun = &batch[outcomes.len()..];
+                outcomes.extend(unrun.iter().map(|s| (s.seq, step_status::PENDING, None)));
                 break;
             }
+        }
+        let recorded: Vec<(i64, &str, Option<&str>)> = outcomes
+            .iter()
+            .map(|(seq, status, error)| (*seq, *status, error.as_deref()))
+            .collect();
+        if let Err(e) = pool.with_store_mut(|s| s.set_steps_status(plan_id, &recorded)) {
+            pool.note_store_error("set_steps_status", &e);
+        }
+        if stopping {
+            return Ok(out);
+        }
+        if halted {
+            break;
         }
     }
 
@@ -617,6 +675,31 @@ fn apply_inner(
         "plan applied",
     );
     Ok(out)
+}
+
+/// The most delete steps one journal batch holds.
+///
+/// Every journal write is a commit of the index's writer, which runs
+/// `synchronous=FULL`: a WAL fsync each. Two per step made a 200,000-file
+/// delete plan spend 400,000 fsyncs on its journal alone. A batch is marked
+/// `in_progress` in one commit and its outcomes recorded in one more, so a
+/// plan costs two commits per batch. The bound is what a crash inside a batch
+/// leaves `in_progress` for a human to look at.
+pub(crate) const JOURNAL_BATCH: usize = 64;
+
+/// How many of `rest`'s leading steps the next journal batch holds: a run of
+/// up to [`JOURNAL_BATCH`] deletes, or one step of any other operation.
+///
+/// A move stays alone. Its outcome can be unknown with its payload in
+/// flight, and a crash beside it must not leave other steps' outcomes
+/// unknown too; a relocate plan has one step anyway.
+fn journal_batch_len(rest: &[PlanStepRow]) -> usize {
+    rest.iter()
+        .take(JOURNAL_BATCH)
+        .take_while(|s| s.op == ops::DELETE_FILE)
+        .count()
+        .max(1)
+        .min(rest.len())
 }
 
 /// How a step did not succeed.
@@ -2430,6 +2513,156 @@ mod tests {
         let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
         assert_eq!((out.done, out.status.as_str()), (1, "applied"), "{out:?}");
         assert!(!orphan.exists());
+    }
+
+    /// The statuses of `plan_id`'s steps, in order.
+    fn statuses(pool: &PoolService, plan_id: i64) -> Vec<String> {
+        pool.with_store(|st| st.plan_steps(plan_id))
+            .unwrap()
+            .into_iter()
+            .map(|s| s.status)
+            .collect()
+    }
+
+    /// A delete plan over 2,000 files journals in batches: the writer commits
+    /// O(steps / batch) times, not twice per step (4,000), and every step ends
+    /// `done`. Not 10,000: each step's own trash move fsyncs two directories,
+    /// so that many cost most of a minute on a disk, for the same proof.
+    #[test]
+    fn a_large_delete_plan_journals_a_batch_of_steps_per_commit() {
+        const FILES: usize = 2_000;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        for i in 0..FILES {
+            write(&root, &format!("junk/d{:02}/f{i:05}.bin", i % 20), 1);
+        }
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        assert_eq!(statuses(&pool, plan_id).len(), FILES);
+
+        let commits = pool.with_store(|st| st.count_commits());
+        let (source, state) = engine_and_state();
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!(
+            (out.done, out.failed, out.status.as_str()),
+            (FILES, 0, "applied"),
+            "{out:?}"
+        );
+        let commits = commits.load(std::sync::atomic::Ordering::Relaxed);
+        // Two per batch, the claim, and the plan's final status.
+        let bound = 2 * FILES.div_ceil(JOURNAL_BATCH) as u64 + 2;
+        assert!(
+            commits <= bound && commits < FILES as u64 / 10,
+            "{commits} commits for {FILES} steps; at most {bound} expected"
+        );
+        assert!(statuses(&pool, plan_id)
+            .iter()
+            .all(|s| s == step_status::DONE));
+        assert!(!root.join("junk/d00/f00000.bin").exists());
+    }
+
+    /// A shutdown inside a batch stops between two of its steps: the steps it
+    /// ran are `done`, the ones it did not reach go back to `pending` rather
+    /// than staying `in_progress`, and the boot re-drive finishes the plan.
+    #[test]
+    fn a_shutdown_inside_a_batch_leaves_the_steps_it_did_not_reach_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let orphans = [
+            write(&root, "junk/a.bin", 8),
+            write(&root, "junk/b.bin", 8),
+            write(&root, "junk/c.bin", 8),
+        ];
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+
+        let (source, state) = engine_and_state();
+        // Asked before each step: says stop once the first file is gone.
+        let stop = || orphans.iter().any(|o| !o.exists());
+        let out = apply(&pool, &source, &state, plan_id, &stop).unwrap();
+        assert_eq!((out.done, out.status.as_str()), (1, "applying"), "{out:?}");
+        assert_eq!(statuses(&pool, plan_id), ["done", "pending", "pending"]);
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, plan_status::APPLYING);
+
+        let out = apply_inner(&pool, &source, &state, plan_id, true, &|| false).unwrap();
+        assert_eq!(
+            (out.done, out.skipped, out.status.as_str()),
+            (2, 1, "applied"),
+            "{out:?}"
+        );
+        assert!(orphans.iter().all(|o| !o.exists()));
+    }
+
+    /// A step failing inside a batch stops the plan there: the steps before
+    /// it are `done`, it is `failed`, and the ones after go back to `pending`
+    /// with their files untouched.
+    #[test]
+    fn a_step_failing_inside_a_batch_leaves_the_steps_after_it_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        let orphans = [
+            write(&root, "junk/a.bin", 8),
+            write(&root, "junk/b.bin", 8),
+            write(&root, "junk/c.bin", 8),
+        ];
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        let steps = pool.with_store(|st| st.plan_steps(plan_id)).unwrap();
+        assert!(steps[1].src.ends_with("junk/b.bin"), "{steps:?}");
+        // Changed after the scan, so its delete is refused.
+        std::fs::write(&orphans[1], vec![1u8; 16]).unwrap();
+
+        let (source, state) = engine_and_state();
+        let out = apply(&pool, &source, &state, plan_id, &|| false).unwrap();
+        assert_eq!(
+            (out.done, out.failed, out.status.as_str()),
+            (1, 1, "failed"),
+            "{out:?}"
+        );
+        assert_eq!(statuses(&pool, plan_id), ["done", "failed", "pending"]);
+        assert!(!orphans[0].exists());
+        assert!(orphans[1].exists() && orphans[2].exists());
+    }
+
+    /// A crash inside a batch leaves every step of it `in_progress`, and the
+    /// re-drive refuses the plan with a message counting all of them.
+    #[test]
+    fn a_crash_inside_a_batch_refuses_the_plan_counting_every_unknown_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("pool");
+        for name in ["a", "b", "c"] {
+            write(&root, &format!("junk/{name}.bin"), 8);
+        }
+        let pool = service(dir.path(), true);
+        pool.scan().unwrap();
+        let plan_id = delete_plan(&pool);
+        pool.with_store_mut(|st| {
+            st.set_plan_status(plan_id, plan_status::APPLYING, None)?;
+            st.set_steps_status(
+                plan_id,
+                &[
+                    (0, step_status::IN_PROGRESS, None),
+                    (1, step_status::IN_PROGRESS, None),
+                    (2, step_status::IN_PROGRESS, None),
+                ],
+            )
+        })
+        .unwrap();
+
+        let (source, state) = engine_and_state();
+        let e = apply_inner(&pool, &source, &state, plan_id, true, &|| false).unwrap_err();
+        assert!(
+            e.contains("step 0 (delete_file) was interrupted")
+                && e.contains("2 more of its steps")
+                && e.contains(&format!("/v1/pool/plans/{plan_id}/steps")),
+            "{e}"
+        );
+        let plan = pool.with_store(|st| st.plan(plan_id)).unwrap().unwrap();
+        assert_eq!(plan.status, plan_status::FAILED);
     }
 
     /// A registry over `dir` assigning `ih` to profile `p`, handed to `pool`

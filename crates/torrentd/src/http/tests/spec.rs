@@ -274,7 +274,7 @@ fn every_page_limit_publishes_its_bounds() {
             );
         }
     }
-    assert_eq!(seen, 6, "every paged listing takes a `limit`");
+    assert_eq!(seen, 7, "every paged listing takes a `limit`");
 }
 
 #[test]

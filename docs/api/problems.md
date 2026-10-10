@@ -276,7 +276,7 @@ run at all, for example because the index could not be locked. `detail` names
 the failure.
 
 It is also the answer, on every apply, for a `failed` plan with a step still
-`in_progress`: that step's outcome is unknown, because a run died mid-step or
+`in_progress`: that step's outcome is unknown, because a run died mid-batch or
 a move's wait was cut off, and nothing marks it resolved. Applying it again
 never succeeds. Inspect the step's `src` (and `dst` for a move), rescan, then
 discard the plan and build a new one.

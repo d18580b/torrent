@@ -1516,7 +1516,8 @@ pub enum StepStatus {
     /// Not attempted.
     Pending,
     /// Attempted and not finished. Found on a plan nothing is applying, its
-    /// outcome is unknown: a run died mid-step, or a move's wait was cut off.
+    /// outcome is unknown: a run died inside the batch of up to 64 delete
+    /// steps journalled with it, or a move's wait was cut off.
     /// Nothing marks it resolved, so every apply refuses the plan; a human
     /// inspects `src` (and `dst` for a move), rescans, discards the plan, and
     /// builds a new one.
@@ -1624,13 +1625,85 @@ pub struct Plan {
     pub created_at: jiff::Timestamp,
     /// When an apply last finished, successfully or not; `null` before.
     pub applied_at: Option<jiff::Timestamp>,
-    /// Every step, in the order an apply runs them.
+    /// How many steps the plan has, and how many stand in each status: the
+    /// plan's progress, whatever its size.
+    pub step_counts: StepCounts,
+    /// The plan's first steps, at most 100, in the order an apply runs them.
+    /// `GET /v1/pool/plans/{plan_id}/steps` pages through all of them.
     pub steps: Vec<PlanStep>,
+    /// Pass as `cursor` to `GET /v1/pool/plans/{plan_id}/steps` for the steps
+    /// after `steps`; `null` when `steps` holds every step.
+    pub steps_next_cursor: Option<String>,
     /// For a plan that deletes data, the token `POST …/apply` must repeat;
-    /// `null` for any other. Derived from the steps, so it names this plan and
-    /// no other.
+    /// `null` for any other. Derived from every step, so it names this plan
+    /// and no other.
     pub confirm_token: Option<String>,
 }
+
+/// How many of a plan's steps stand in each status.
+#[derive(Debug, Default, Schema, Serialize, PartialEq, Eq)]
+pub struct StepCounts {
+    /// Every step of the plan.
+    pub total: u64,
+    /// Not attempted.
+    pub pending: u64,
+    /// Attempted and not finished.
+    pub in_progress: u64,
+    /// Done.
+    pub done: u64,
+    /// Failed.
+    pub failed: u64,
+    /// Not attempted, deliberately.
+    pub skipped: u64,
+}
+
+impl StepCounts {
+    /// The counts of `rows`, `(status, count)` pairs as the pool index holds
+    /// them.
+    fn of(rows: Vec<(String, u64)>) -> Result<Self, String> {
+        let mut c = Self::default();
+        for (status, n) in rows {
+            let slot =
+                match StepStatus::parse(&status).ok_or_else(|| unknown("step status", &status))? {
+                    StepStatus::Pending => &mut c.pending,
+                    StepStatus::InProgress => &mut c.in_progress,
+                    StepStatus::Done => &mut c.done,
+                    StepStatus::Failed => &mut c.failed,
+                    StepStatus::Skipped => &mut c.skipped,
+                };
+            *slot += n;
+            c.total += n;
+        }
+        Ok(c)
+    }
+}
+
+/// Steps a plan carries inline; the rest are paged from its steps listing.
+const PLAN_STEPS_INLINE: usize = crate::http::page::DEFAULT_LIMIT as usize;
+
+/// The cursor listing of plan `id`'s steps. It names the plan, so a cursor
+/// from one plan's steps is refused on another's.
+fn plan_steps_listing(id: i64) -> String {
+    format!("pool-plan-steps-{id}")
+}
+
+/// A step row as the API shows it.
+fn step_of(s: torrentd_pool::model::PlanStepRow) -> Result<PlanStep, String> {
+    Ok(PlanStep {
+        op: StepOp::parse(&s.op).ok_or_else(|| unknown("step op", &s.op))?,
+        status: StepStatus::parse(&s.status).ok_or_else(|| unknown("step status", &s.status))?,
+        seq: s.seq,
+        src: s.src,
+        dst: s.dst,
+        error: s.error,
+    })
+}
+
+page!(
+    /// One page of a plan's steps, in the order an apply runs them.
+    PlanStepPage,
+    PlanStep
+);
 
 /// A plan without its steps, as a listing carries it.
 #[derive(Debug, Schema, Serialize)]
@@ -1671,10 +1744,12 @@ fn summary_of(p: &torrentd_pool::model::PlanRow) -> Result<PlanSummary, String> 
 ///
 /// `Err` is the `detail` of a `500 internal`.
 ///
-/// Read on the read connection, in one snapshot, so the steps and the
-/// generation its confirm token binds are the same commit's; a plan written
-/// on the writer is visible once it commits. Blocking: call it on the
-/// blocking pool.
+/// Read on the read connection, in one snapshot, so the counts, the inline
+/// steps, and the generation its confirm token binds are the same commit's; a
+/// plan written on the writer is visible once it commits. The body carries
+/// [`PLAN_STEPS_INLINE`] steps at most, whatever the plan's size; only a
+/// plan that deletes data reads every step, to derive its token, and none
+/// of them reaches the body. Blocking: call it on the blocking pool.
 fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, String> {
     let fail = |e: torrentd_pool::PoolError| internal("reading a plan", e);
     let read = pool
@@ -1682,36 +1757,47 @@ fn load_plan(pool: &PoolService, id: i64) -> Result<Option<Plan>, String> {
             let Some(row) = st.plan(id)? else {
                 return Ok(None);
             };
-            Ok(Some((row, st.plan_steps(id)?, st.index_generation()?)))
+            let head = st.plan_steps_page(id, None, PLAN_STEPS_INLINE + 1)?;
+            let counts = st.plan_step_counts(id)?;
+            let token = if torrentd_pool::plan::is_destructive(&row.kind) {
+                let generation = st.index_generation()?;
+                Some(torrentd_pool::plan::confirm_token(
+                    id,
+                    generation,
+                    &st.plan_steps(id)?,
+                ))
+            } else {
+                None
+            };
+            Ok(Some((row, head, counts, token)))
         })
         .map_err(fail)?;
-    let Some((row, steps, generation)) = read else {
+    let Some((row, head, counts, confirm_token)) = read else {
         return Ok(None);
     };
-    let confirm_token = torrentd_pool::plan::is_destructive(&row.kind)
-        .then(|| torrentd_pool::plan::confirm_token(id, generation, &steps));
     let summary = summary_of(&row)?;
-    let steps = steps
+    let head = head
         .into_iter()
-        .map(|s| {
-            Ok(PlanStep {
-                op: StepOp::parse(&s.op).ok_or_else(|| unknown("step op", &s.op))?,
-                status: StepStatus::parse(&s.status)
-                    .ok_or_else(|| unknown("step status", &s.status))?,
-                seq: s.seq,
-                src: s.src,
-                dst: s.dst,
-                error: s.error,
-            })
-        })
+        .map(step_of)
         .collect::<Result<Vec<_>, String>>()?;
+    let (steps, steps_next_cursor) = paginate(
+        &plan_steps_listing(id),
+        head,
+        |s: &PlanStep| plan_key(s.seq),
+        &PageRequest {
+            after: None,
+            limit: PLAN_STEPS_INLINE,
+        },
+    );
     Ok(Some(Plan {
         id: summary.id,
         kind: summary.kind,
         status: summary.status,
         created_at: summary.created_at,
         applied_at: summary.applied_at,
+        step_counts: StepCounts::of(counts)?,
         steps,
+        steps_next_cursor,
         confirm_token,
     }))
 }
@@ -1765,7 +1851,8 @@ pub async fn list_plans(
     Ok(Json(PlanPage { items, next_cursor }))
 }
 
-/// A plan id as a cursor key: zero-padded, so byte order is numeric order.
+/// A plan id, or a step's `seq`, as a cursor key: zero-padded, so byte order
+/// is numeric order.
 fn plan_key(id: i64) -> String {
     format!("{id:0PLAN_KEY_WIDTH$}")
 }
@@ -1903,7 +1990,7 @@ fn create_plan_blocking(
         target: "torrentd::http::pool",
         plan_id = id,
         kind = %kind,
-        step_count = plan.steps.len(),
+        step_count = plan.step_counts.total,
         "plan created (nothing applied)",
     );
     Ok(Created::at(
@@ -1937,8 +2024,10 @@ pub enum GetPlanError {
 
 /// Describe a mutation plan.
 ///
-/// Its status, every step with where it stands, and — for a plan that deletes
-/// data — the confirm token applying it needs.
+/// Its status, how many steps stand in each status, its first 100 steps, and
+/// — for a plan that deletes data — the confirm token applying it needs. The
+/// body is bounded whatever the plan's size; `GET …/steps` pages through
+/// every step.
 #[kynos::get("/pool/plans/{plan_id}", tag = Pool)]
 pub async fn get_plan(
     _caller: Scoped<Bearer, Read>,
@@ -1951,6 +2040,119 @@ pub async fn get_plan(
         .map_err(|detail| GetPlanError::Internal { detail })?
         .map(Json)
         .ok_or(GetPlanError::PlanNotFound)
+}
+
+/// Why a plan's steps could not be listed.
+#[derive(Debug, thiserror::Error, ApiError)]
+#[problem(base = "https://github.com/d18580b/torrent/blob/master/docs/api/problems.md#")]
+pub enum ListPlanStepsError {
+    /// The cursor is not one this plan's steps listing issued.
+    #[error("the cursor is not one this listing issued; start again without one")]
+    #[problem(status = 400, title = "Invalid cursor")]
+    InvalidCursor,
+    /// The daemon has no `[pool]` section.
+    #[error("{NO_POOL}")]
+    #[problem(status = 404, title = "The pool is not configured")]
+    PoolNotConfigured,
+    /// No plan has this id.
+    #[error("no such plan")]
+    #[problem(status = 404, title = "Plan not found")]
+    PlanNotFound,
+    /// A query parameter breaks a documented constraint.
+    #[error("{summary}")]
+    #[problem(status = 422, title = "The request is invalid")]
+    ValidationFailed {
+        summary: String,
+        /// Every violated constraint.
+        #[problem(extension)]
+        errors: serde_json::Value,
+    },
+    /// The pool index failed; the daemon's log has the cause.
+    #[error("{detail}")]
+    #[problem(status = 500, title = "Internal error")]
+    Internal { detail: String },
+}
+from_invalid!(ListPlanStepsError);
+
+impl From<InvalidCursor> for ListPlanStepsError {
+    fn from(_: InvalidCursor) -> Self {
+        Self::InvalidCursor
+    }
+}
+
+/// Which page of a plan's steps.
+#[derive(Schema, QueryParams)]
+pub struct PlanStepQuery {
+    /// Resume after the last step of the previous page, or after a plan's
+    /// inline `steps`, with its `steps_next_cursor`.
+    pub cursor: Option<String>,
+    /// Steps per page; 100 when absent.
+    #[schema(minimum = 1, maximum = 1000)]
+    pub limit: Option<PageLimit>,
+}
+
+/// List a mutation plan's steps.
+///
+/// Every step with where it stands, in the order an apply runs them, a page
+/// at a time: a plan over a large subtree has a step per file. A cursor is
+/// bound to its plan, and refused on another's steps.
+#[kynos::get("/pool/plans/{plan_id}/steps", tag = Pool)]
+pub async fn list_plan_steps(
+    _caller: Scoped<Bearer, Read>,
+    Inject(s): Inject<Arc<AppState>>,
+    Path(p): Path<PlanPath>,
+    Query(q): Query<PlanStepQuery>,
+) -> Result<Json<PlanStepPage>, ListPlanStepsError> {
+    let pool = s
+        .pool
+        .clone()
+        .ok_or(ListPlanStepsError::PoolNotConfigured)?;
+    let id = p.plan_id;
+    let listing = plan_steps_listing(id);
+    let mut invalid = Invalid::new();
+    let page = PageRequest::parse(
+        &listing,
+        q.cursor.as_deref(),
+        q.limit.map(PageLimit::get),
+        |key| crate::http::page::is_padded_decimal(key, PLAN_KEY_WIDTH),
+        &mut invalid,
+    )?;
+    invalid.finish()?;
+    let after = page
+        .after
+        .as_deref()
+        .map(|k| {
+            k.parse::<i64>()
+                .map_err(|_| ListPlanStepsError::InvalidCursor)
+        })
+        .transpose()?;
+    // `limit + 1` rows off the primary key, on the read connection: one page
+    // whatever the plan's size, and never waiting for a scan.
+    let limit = page.limit;
+    let rows = blocking(move || {
+        pool.with_reader(|st| -> Result<_, torrentd_pool::PoolError> {
+            if st.plan(id)?.is_none() {
+                return Ok(None);
+            }
+            Ok(Some(st.plan_steps_page(
+                id,
+                after,
+                limit.saturating_add(1),
+            )?))
+        })
+    })
+    .await
+    .map_err(|e| ListPlanStepsError::Internal {
+        detail: internal("listing a plan's steps", e),
+    })?
+    .ok_or(ListPlanStepsError::PlanNotFound)?;
+    let items = rows
+        .into_iter()
+        .map(step_of)
+        .collect::<Result<Vec<_>, String>>()
+        .map_err(|detail| ListPlanStepsError::Internal { detail })?;
+    let (items, next_cursor) = paginate(&listing, items, |s: &PlanStep| plan_key(s.seq), &page);
+    Ok(Json(PlanStepPage { items, next_cursor }))
 }
 
 /// Why a plan was not discarded.
@@ -2209,6 +2411,7 @@ macro_rules! bodyless_routes {
             crate::http::v1::pool::check_pool_drift,
             crate::http::v1::pool::list_plans,
             crate::http::v1::pool::get_plan,
+            crate::http::v1::pool::list_plan_steps,
             crate::http::v1::pool::delete_plan,
         ])
     };

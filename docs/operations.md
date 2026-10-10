@@ -183,6 +183,19 @@ that way is not run: it fails with `not started: the plan journal could not
 record the step`, and nothing it would have moved is touched. A
 `failed` plan can be applied again.
 
+The journal is written a batch at a time. Every journal write is a commit
+of the index under `synchronous=FULL`, a WAL fsync each, and writing two per
+step cost a 200,000-file delete 400,000 fsyncs before any of its own. Up to
+64 consecutive `delete_file` steps are marked `in_progress` in one commit,
+run, and their outcomes recorded in one more; a `move_torrent` step is a
+batch of its own. A step a stop or a failure kept the batch from reaching
+goes back to `pending`. A process killed inside a batch leaves every step
+of it `in_progress`, see [After a crash](#after-a-crash).
+
+A plan's body carries how many steps stand in each status (`step_counts`)
+and its first 100 steps; poll it for progress. Page through every step with
+`GET /v1/pool/plans/$PLAN/steps`, which the script below does.
+
 **The trash.** A deleted file is moved, never unlinked, to
 `<root>/.torrentd-trash/<plan id>-<created_at>/<its path relative to the root>`,
 on the same filesystem, where `created_at` is the second the plan was created,
@@ -221,10 +234,21 @@ Before emptying a plan's trash directory:
    `delete_file` steps and every such step's file is in it:
 
    ```bash
+   # Every step of the plan, one JSON object per line, a page at a time.
+   steps() {
+     local cursor= page
+     while :; do
+       page=$(curl -s "localhost:8080/v1/pool/plans/$PLAN/steps?limit=1000${cursor:+&cursor=$cursor}" \
+                   -H "Authorization: Bearer $TOKEN")
+       jq -c '.items[]' <<<"$page"
+       cursor=$(jq -r '.next_cursor // empty' <<<"$page")
+       [ -n "$cursor" ] || break
+     done
+   }
    diff <(sudo -u torrentd find "$ROOT/.torrentd-trash/$BUCKET" -type f -printf '%P\n' | sort) \
-        <(jq -r --arg root "$ROOT/" '.steps[]
-            | select(.op == "delete_file" and .status == "done")
-            | .src | ltrimstr($root)' <<<"$plan" | sort)
+        <(steps | jq -r --arg root "$ROOT/" '
+            select(.op == "delete_file" and .status == "done")
+            | .src | ltrimstr($root)' | sort)
    ```
 
    A line marked `<` is a file the plan did not put there: leave the
@@ -511,9 +535,14 @@ curl -s "localhost:8080/v1/pool/plans?status=applying" -H "Authorization: Bearer
   `applied`, or `failed` at a step that fails.
 - A plan killed inside a step cannot be resumed. Whether that step happened is
   unknown, so the boot parks it as `failed` with that step still
-  `in_progress`. The journal line `resume failed` names the step and its path,
-  and applying it again fails the same way, since nothing marks the step
-  resolved. Look at that path, rescan, discard the plan, and build a new one.
+  `in_progress`. A delete plan is journalled up to 64 steps at a time, so a
+  kill anywhere in a batch leaves all of its steps `in_progress`, those that
+  ran and those that had not started alike. The journal line `resume failed`
+  names the first step and its path and counts the others, which
+  `GET /v1/pool/plans/$PLAN/steps` lists, and applying it again fails the same
+  way, since nothing marks a step resolved. Look at those paths, rescan,
+  discard the plan, and build a new one: the rescan finds which files are
+  still there, and the new plan deletes only those.
   For a relocate, look at its destination too, and find which of the two
   holds the complete payload before removing anything: a move whose wait was
   cut off can still finish and delete the source, so the destination may hold
