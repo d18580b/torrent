@@ -109,6 +109,26 @@ fn withheld_reloadable_keys(
 const NON_RELOADABLE_WARNING: &str =
     "SIGHUP: change to non-reloadable field requires daemon restart; ignored";
 
+/// What an ignored `[auth]` change is told, after `NON_RELOADABLE_WARNING`.
+///
+/// The generic line says a restart is needed; this one says what that costs
+/// for credentials, because the usual reason to edit `[auth]` under a live
+/// daemon is revoking a leaked `[[auth.token]]`, and a reload that answered
+/// `202` reads as done. The authenticator is built once at startup, so the
+/// removed token keeps every scope it had until the restart.
+const AUTH_NOT_RELOADED_WARNING: &str = "SIGHUP: [auth] is read only at startup; the running \
+     password, session TTL and [[auth.token]] table are unchanged, and a token removed from the \
+     file keeps working until the daemon restarts";
+
+/// The second line a non-reloadable change gets, where ignoring it has a
+/// consequence the generic warning does not convey.
+fn non_reloadable_consequence(field: &str) -> Option<&'static str> {
+    match field {
+        "auth" => Some(AUTH_NOT_RELOADED_WARNING),
+        _ => None,
+    }
+}
+
 /// What a change to a profile's identity is told.
 ///
 /// Safety Rule 7: identity-critical profile fields cannot change under a live
@@ -170,6 +190,9 @@ pub async fn run(
         }
         for nr in &diff.non_reloadable_changes {
             warn!(changed_field = %nr, "{NON_RELOADABLE_WARNING}");
+            if let Some(consequence) = non_reloadable_consequence(nr) {
+                warn!(changed_field = %nr, "{consequence}");
+            }
         }
         // A reloadable key the operator deleted. The sample config documents
         // deletion as the way back to the preset default, and that default is
@@ -538,6 +561,59 @@ mod tests {
             running.http_listen,
             std::net::SocketAddr::from(([127, 0, 0, 1], 8080)),
             "the running config keeps the address the daemon bound",
+        );
+    }
+
+    #[test]
+    fn a_static_token_removed_from_the_file_survives_every_reload_and_says_so() {
+        // The property: `[auth]` is restart-only, so a reload that drops a
+        // `[[auth.token]]` leaves the running daemon holding it, reports the
+        // change on every reload until the restart, and tells the operator
+        // the removed token still works. The 409 and the docs once said a
+        // reload revoked it.
+        use crate::auth::AuthConfig;
+        use crate::auth::Scope;
+        use crate::auth::TokenConfig;
+        let token = |name: &str| TokenConfig {
+            name: name.into(),
+            sha256: format!("{:0>64}", name.len()),
+            scopes: vec![Scope::Read, Scope::Write],
+        };
+        let auth = |tokens: Vec<TokenConfig>| AuthConfig {
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+            session_ttl_secs: 43_200,
+            token: tokens,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut boot = Config::minimal_for_tests(dir.path(), true);
+        boot.auth = Some(auth(vec![token("ci"), token("scrape")]));
+        let mut file = boot.clone();
+        file.auth = Some(auth(vec![token("scrape")]));
+
+        let first = Config::diff(&boot, &file);
+        assert_eq!(first.non_reloadable_changes, vec!["auth"]);
+        let running = running_config(&boot, &file, &first, true, first.log_level.is_some());
+        assert_eq!(
+            running.auth, boot.auth,
+            "the authenticator is the boot one, so the removed `ci` token still authenticates",
+        );
+        let second = Config::diff(&running, &file);
+        assert_eq!(
+            second.non_reloadable_changes,
+            vec!["auth"],
+            "the restart the first reload asked for has not happened",
+        );
+
+        let consequence = non_reloadable_consequence("auth").expect("auth has a second line");
+        assert!(
+            consequence
+                .contains("a token removed from the file keeps working until the daemon restarts"),
+            "{consequence}",
+        );
+        assert_eq!(
+            non_reloadable_consequence("http_listen"),
+            None,
+            "only a change whose cost the generic warning hides gets a second line",
         );
     }
 

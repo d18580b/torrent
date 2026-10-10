@@ -91,7 +91,9 @@ extension member.
 **409**, from `DELETE /v1/sessions/current`. The presented credential is a
 static token, or the daemon runs without authentication. Only a session token
 can be revoked here. To revoke a static token, remove it from the config and
-reload.
+restart the daemon. `[auth]` is read once, at startup: `SIGHUP` and
+`POST /v1/config/reload` log the change as needing a restart and leave the
+removed token working until then.
 
 ## `validation-failed`
 

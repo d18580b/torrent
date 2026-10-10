@@ -841,6 +841,12 @@ SIGHUP: change to non-reloadable field requires daemon restart; ignored
 and leaves the running daemon exactly as it was. Use
 `systemctl restart torrentd`.
 
+That includes revoking a static token. A `[[auth.token]]` entry deleted from
+the file keeps authenticating, with every scope it had, until the daemon
+restarts; the reload's `202` and the `SIGHUP` say nothing else, and the only
+trace is the warning above (`changed_field=auth`) and a second one naming the
+token table. To revoke a leaked token, remove its entry and restart.
+
 > **Bootstrapping order matters.** `--config` is required *before* any
 > subcommand and is read first, so `hash-password` cannot run until a config
 > file exists and parses. What it does *not* have to satisfy is the
@@ -894,7 +900,9 @@ until it expires (`expires_at` in the response; `[auth] session_ttl_secs`,
 60 seconds to 30 days, default 12 hours), is revoked with
 `DELETE /v1/sessions/current`, or the daemon restarts. An open
 `GET /v1/events` stream ends within a second of its session doing either.
-Each `[[auth.token]]` needs a name and a token of its own: two entries sharing
+A static token has no such call: `DELETE /v1/sessions/current` answers it
+`409 not-a-session`, and it stops working only once its entry is removed and
+the daemon restarted (a reload does not revoke it). Each `[[auth.token]]` needs a name and a token of its own: two entries sharing
 either are refused at startup.
 `GET /v1/sessions/current` describes whichever credential you present. The
 examples on this page call it `$TOKEN`; either kind works:
@@ -1157,7 +1165,7 @@ curl -sS -X POST -H "Authorization: Bearer $TOKEN" localhost:8080/v1/config/relo
 
 | Status | Meaning |
 | --- | --- |
-| `202` | Accepted. The reload runs asynchronously; watch the journal for its result. A request made while another reload is running is queued behind it and also gets `202`. |
+| `202` | Accepted. The reload runs asynchronously; watch the journal for its result. A request made while another reload is running is queued behind it and also gets `202`. It is also the answer when every change in the file needs a restart, and a reload never applies a restart-only key — among them `[auth]` (including a removed `[[auth.token]]`), `allow_unauthenticated`, `http_listen`, `trusted_proxies` and `allowed_hosts`. |
 | `409` | `reload-pending`: the reload queue, which `SIGHUP` shares and which holds eight pending requests, is full. Retry once the queued reloads have run; they read the same file. |
 | `503` | `reload-unavailable`: the daemon is shutting down, or was built without the reload channel wired up. |
 

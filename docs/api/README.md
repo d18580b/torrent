@@ -53,7 +53,7 @@ There are two kinds.
 
 | Kind | Prefix | Issued by | Scopes | Lifetime |
 | --- | --- | --- | --- | --- |
-| Static token | `tdp_` | `torrentd new-token --name … --scopes …`; only its SHA-256 goes in `[[auth.token]]` | as configured: any of `read`, `write`, `metrics` | until removed from the config |
+| Static token | `tdp_` | `torrentd new-token --name … --scopes …`; only its SHA-256 goes in `[[auth.token]]` | as configured: any of `read`, `write`, `metrics` | until removed from the config and the daemon restarted; a reload does not revoke it |
 | Session token | `tds_` | `POST /v1/sessions` with the operator password | `read`, `write` | `[auth] session_ttl_secs` (default 12 h), or until `DELETE /v1/sessions/current`; a restart ends every session |
 
 Each operation declares its scope in its `security` requirement, and that same
